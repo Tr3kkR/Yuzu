@@ -3740,6 +3740,1321 @@ std::size_t count_kind(Collector& got, const std::string& key, SparkEventKind ki
 
 } // namespace
 
+// ── File walkoff (#2012/#3840 PR-B2) ────────────────────────────────────────
+namespace {
+
+struct ScratchDir {
+    std::filesystem::path dir;
+    std::filesystem::path file;
+    explicit ScratchDir(const char* tag) {
+        dir = std::filesystem::temp_directory_path() /
+             ("spark_fileb2_" + std::string(tag) + "_" +
+              std::to_string(::GetCurrentProcessId()) + "_" +
+              std::to_string(yuzu::test::process_random_salt() % 1000000000));
+        std::filesystem::create_directories(dir);
+        file = dir / "watched.txt";
+        { std::ofstream(file) << "seed"; }
+    }
+    ~ScratchDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(dir, ec);
+    }
+    ScratchDir(const ScratchDir&) = delete;
+    ScratchDir& operator=(const ScratchDir&) = delete;
+    void write(const char* content) const { std::ofstream(file, std::ios::app) << content; }
+};
+
+/// Parks every probe whose base directory matches until release(); counts
+/// what it saw. Mirrors ProbeGate above but keyed on File's std::wstring
+/// probe_hook signature (spark_mechanism.hpp's FileMechanismTestControls).
+struct FileProbeGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open{false};
+    std::atomic<int> parked{0};
+    std::atomic<int> seen{0};
+    std::function<void(std::wstring_view)> hook_for(const std::filesystem::path& match_dir) {
+        const std::wstring match = match_dir.wstring();
+        return [this, match](std::wstring_view dir) {
+            seen.fetch_add(1, std::memory_order_relaxed);
+            if (dir != match)
+                return;
+            parked.fetch_add(1, std::memory_order_acq_rel);
+            std::unique_lock lk(mu);
+            cv.wait(lk, [&] { return open; });
+        };
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+    ~FileProbeGate() { release(); } // never leave a worker parked past the test
+};
+
+} // namespace
+
+TEST_CASE("File spark (real mechanism): a parked discovery probe on key A neither stalls arm(B) "
+          "nor holds arm(A) past its caller budget (#2012 PR-B2)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("iso_a"), b("iso_b");
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    FileMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.dir);
+    REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    // arm(A): its discovery probe parks on the worker. The caller must still
+    // get an answer within the budget (50 ms) plus scheduling slack - before
+    // PR-B2 this call did not return until the probe did (the whole
+    // discovery walk ran directly under mu_).
+    const auto spec_a = file_spec(a.file.string());
+    const auto t0 = std::chrono::steady_clock::now();
+    auto sa = engine.arm(*c, spec_a);
+    const auto arm_a_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    CHECK(sa.has_value()); // success-with-pending
+    INFO("arm(A) returned after " << arm_a_ms << " ms with A's probe parked");
+    CHECK(arm_a_ms < 2000);
+    CHECK(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // arm(B) while A's probe is still parked: same type, must not queue
+    // behind A.
+    const auto spec_b = file_spec(b.file.string());
+    const auto t1 = std::chrono::steady_clock::now();
+    auto sb = engine.arm(*c, spec_b);
+    const auto arm_b_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t1)
+            .count();
+    CHECK(sb.has_value());
+    INFO("arm(B) returned after " << arm_b_ms << " ms while A's probe was parked");
+    CHECK(arm_b_ms < 2000);
+    // ...and B is genuinely watching: a write fires it.
+    std::this_thread::sleep_for(200ms);
+    const auto b_before = count_kind(got, spark_key(spec_b), SparkEventKind::Fired);
+    CHECK(b_before == 0);
+    b.write("change");
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec_b), SparkEventKind::Fired) > b_before; },
+        8000ms));
+
+    // A missed its health grace while parked: Faulted, counted once as
+    // slow_op.
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, 3000ms));
+    CHECK(raw->stats().slow_op_total >= 1);
+
+    // Release the probe: the late result is committed (not dropped), the
+    // watch recovers.
+    gate.release();
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, 5000ms));
+    // A is really watching now: a real write fires it.
+    const auto before = count_kind(got, spark_key(spec_a), SparkEventKind::Fired);
+    a.write("real change");
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec_a), SparkEventKind::Fired) > before; }, 8000ms));
+    auto dc = file_debug_counters_for_test(*raw);
+    REQUIRE(dc.has_value());
+    CHECK(dc->probe_discarded == 0);
+    engine.stop();
+    CHECK(eventually([&] { return file_debug_counters_for_test(*raw)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File spark (real mechanism): disarm while the initial probe is still parked discards "
+          "the late result and frees the worker (#2012 PR-B2)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("late_discard");
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    FileMechanismTestControls ctl;
+    ctl.probe_hook = gate.hook_for(a.dir);
+    REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec_a = file_spec(a.file.string());
+    auto sa = engine.arm(*c, spec_a);
+    REQUIRE(sa.has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.disarm(*sa);
+    const auto disarm_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    INFO("disarm(A) returned after " << disarm_ms << " ms with A's probe parked");
+    CHECK(disarm_ms < 2000);
+    CHECK(engine.stats().armed_sparks == 0);
+
+    // Release the probe: its result belongs to a retired watch - the probe's
+    // own unassociated handle self-disposes, never committed, never emitted.
+    gate.release();
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->probe_workers_active == 0 && d->live_dirs == 0;
+        },
+        5000ms));
+    std::this_thread::sleep_for(200ms);
+    CHECK(count_kind(got, spark_key(spec_a), SparkEventKind::Fired) == 0);
+    CHECK(engine.stats().armed_faulted == 0);
+    engine.stop();
+}
+
+TEST_CASE("File mechanism (direct): an allocation failure after a probe launches successfully "
+          "does not permanently strand the watch (PR-B1 defect-pair analogue, PR #4225 review)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("strand_probe");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<int> probe_calls{0};
+    std::atomic<bool> strand_once{true};
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 30ms;
+        ctl.backend_retry_base = 40ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.probe_hook = [&](std::wstring_view) {
+            if (probe_calls.fetch_add(1, std::memory_order_acq_rel) == 0) {
+                std::this_thread::sleep_for(120ms); // past caller_wait_budget
+                throw std::runtime_error("injected backend failure (probe #1)");
+            }
+            // probe #2 (the Deferred retry): proceeds to a real establishment.
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            if (strand_once.exchange(false, std::memory_order_acq_rel))
+                throw std::runtime_error(
+                    "injected run_off_lock failure after a successful probe launch "
+                    "(models an allocation failure, PR #4225 review, ported to File)");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> delivered{0};
+    mech->start([&](const std::string&, SparkData) { delivered.fetch_add(1, std::memory_order_acq_rel); },
+                [&](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    REQUIRE(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_backend_failed >= 1;
+        },
+        3000ms));
+
+    std::this_thread::sleep_for(300ms);
+    a.write("change");
+    INFO("probe_calls=" << probe_calls.load() << " strand_hook_consumed="
+                        << !strand_once.load(std::memory_order_acquire));
+    CHECK(eventually([&] { return delivered.load(std::memory_order_acquire) >= 1; }, 6000ms));
+    {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK_FALSE(strand_once.load(std::memory_order_acquire)); // the hook did fire once
+    }
+    mech->stop();
+}
+
+// ── File walkoff (#2012/#3840 PR-B2), remaining acceptance criteria ─────────
+//
+// Several of the tests below were originally marked KNOWN SUSPECT: they were
+// derived by tracing spark_file.cpp against the PR-B2 plan's own
+// acceptance-criteria wording, and that trace suggested the implementation at
+// the time did not yet satisfy the criterion. A later round (see that round's
+// own report) fixed three such gaps — the consumed-completion recovery
+// (criterion #9), the missing needs_resync trigger sites (criterion #3 and
+// others), and the unconditional confirmation_due re-arm (criterion #7,
+// "STABLE ancestor" test below) — and updated each affected test's comment
+// in place from "KNOWN SUSPECT / expect RED" to "FIXED this round / expect
+// GREEN", still not yet Windows-verified. They are written (and kept) exactly
+// as the criterion specifies, because that is the only way to get a real
+// (Windows) answer — this file's own test suite cannot execute on this box.
+// Each such test's comment cites the exact spark_file.cpp behavior the trace
+// is based on so a DGRHP reviewer can check the reasoning independently
+// rather than re-deriving it from scratch.
+//
+// A second, now-historical caveat: attach_ancestor_locked() used to set
+// w.confirmation_due = true unconditionally, including on its "nothing
+// changed" branch — see the "STABLE ancestor" test below for the trace and
+// its fix. Before that fix, any OTHER test here that left a watch sheltered
+// under an ancestor for more than an instant would see probe_launched keep
+// climbing on its own, independent of whatever that test was actually
+// driving — every such OTHER test still asserts probe_launched with `>=`,
+// deltas, or explicit bounds, never `==` (not re-derived against the fixed
+// state machine this round — see this round's report).
+
+TEST_CASE("File mechanism (direct): an allocation failure immediately after a completion is "
+          "dequeued does not crash the owner, but is NOT proven to re-arm the affected watch "
+          "without another packet (#2012 PR-B2, criterion #9)",
+          "[spark][mechanism][windows][walkoff]") {
+    // completion_hook fires as the FIRST statement of process_completion_locked() (spark_file.cpp
+    // ~1452), before the read is reissued (stage_fire_locked at ~1044, the reissue call at
+    // ~1480) — modelling an allocation failure landing immediately after IOCP hands back a
+    // completion, before this pass has done anything with it. That completion is already gone
+    // from the IOCP queue and will never be redelivered (this file's header comment, rule 6), so
+    // recovery must not depend on another packet ever arriving.
+    //
+    // FIXED this round (code-read, not yet Windows-verified). The original defect:
+    // stage_fire_locked() does work.notices.reserve(...) (an allocation) BEFORE the
+    // ReadDirectoryChangesW reissue that follows it in process_completion_locked's real-dir
+    // branch; run()'s own per-pass top-of-loop reserve() calls covered probe_launches/
+    // stale_calls/dead_results/dead_watches/old_handles but NOT notices, and unwind_pass_locked()
+    // only restored an Emit notice whose is_resync was true — a plain fire notice was simply
+    // dropped on unwind, and nothing re-staged a probe or a reissue for the affected DirWatch.
+    // Worse, this specific test's own hook fires as process_completion_locked's FIRST statement —
+    // BEFORE stage_fire_locked is even reached — so a narrow catch around just that call would not
+    // have helped this scenario either. The fix has two parts: (1) a local try/catch around
+    // stage_fire_locked in process_completion_locked's real-dir branch, so a throw there falls
+    // back to a scalar-only coarse resync and the reissue still runs unconditionally; (2)
+    // FilePassWork now carries three preallocated scalars (`consumed`/`consumed_ok`/
+    // `consumed_is_anc`), stamped by run() BEFORE process_completion_locked is called, so
+    // unwind_pass_locked can recover this exact completion (reissue directly, or fall back to
+    // admission-deferral bookkeeping) no matter where inside the try a throw lands — including
+    // this test's own first-statement hook. If that fix is right, the SECOND CHECK below should
+    // now be GREEN on real Windows.
+    ScratchDir a("consumed");
+    ScratchDir sibling("consumed_sibling");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const auto spec_a = file_spec(a.file.string());
+    const auto spec_s = file_spec(sibling.file.string());
+    const std::string key_a = spark_key(spec_a);
+    const std::string key_s = spark_key(spec_s);
+    std::atomic<int> throws_left{1};
+    {
+        FileMechanismTestControls ctl;
+        ctl.completion_hook = [&](std::wstring_view dir) {
+            if (dir == a.dir.wstring() && throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::runtime_error("injected post-dequeue allocation failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> delivered_a{0};
+    std::atomic<int> delivered_sibling{0};
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == key_a)
+                delivered_a.fetch_add(1, std::memory_order_acq_rel);
+            else if (key == key_s)
+                delivered_sibling.fetch_add(1, std::memory_order_acq_rel);
+        },
+        [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch(key_a, spec_a.params).has_value());
+    REQUIRE(mech->watch(key_s, spec_s.params).has_value());
+    std::this_thread::sleep_for(300ms); // let both reads arm
+
+    a.write("first change - the hook throws once for THIS completion");
+    std::this_thread::sleep_for(400ms); // give the throwing pass time to run and unwind
+
+    // The owner thread itself must survive: an UNRELATED sibling watch, sharing the same
+    // mechanism/worker thread, still works normally after the throw.
+    sibling.write("sibling change");
+    CHECK(eventually([&] { return delivered_sibling.load(std::memory_order_acquire) >= 1; }, 5000ms));
+
+    // The affected watch: does it re-arm and fire on a LATER, independent write, with no other
+    // event in between? See the KNOWN SUSPECT note above.
+    a.write("second change - throws_left is now <= 0, the hook is inert from here on");
+    const bool a_recovered =
+        eventually([&] { return delivered_a.load(std::memory_order_acquire) >= 1; }, 4000ms);
+    INFO("delivered_a=" << delivered_a.load()
+                        << " (expected >= 1; if this is 0, see the KNOWN SUSPECT note above)");
+    CHECK(a_recovered);
+    mech->stop();
+}
+
+TEST_CASE("File spark (real mechanism): a change during the INITIAL establishment window, with a "
+          "prior fault edge, is observed via a late commitment - or is it? (#2012 PR-B2, "
+          "criterion #3)",
+          "[spark][mechanism][windows][walkoff]") {
+    // FIXED this round (code-read, not yet Windows-verified). The original defect:
+    // commit_probe_locked() only set needs_resync=true when was_reappearance was true, and
+    // probe_is_reappearance was set ONLY by reresolve_absent_locked() (the "an ancestor fired, a
+    // target might now exist" path) — a change landing during a PLAIN initial (or
+    // backend-retried) establishment probe, no ancestor involved at all, never set
+    // probe_is_reappearance, so commit never staged a synthetic fire for it. This test's own
+    // scenario is watch()'s "still outstanding past the caller budget" branch (the probe is
+    // parked past kFileCallerWaitBudget, so watch() publishes it to run()'s own sweep) — the fix
+    // wires exactly this site: watch() now sets needs_resync=true + bumps the epoch right there
+    // (mirroring spark_registry.cpp watch()'s identical "published-pending establishment"
+    // trigger), so the eventual commit_probe_locked (once the parked probe is released) sees
+    // needs_resync already set and stages the synthetic fire this test is checking for. If that
+    // fix is right, the final CHECK below should now be GREEN on real Windows.
+    ScratchDir a("late1");
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        ctl.health_grace = 60ms; // short: the parked probe WILL cross grace -> Faulted
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 1; }, 3000ms)); // grace tripped
+
+    // The change happens while establishment is still parked — no live ReadDirectoryChangesW is
+    // outstanding yet, so the kernel cannot observe it directly.
+    a.write("during-pending, before the probe ever commits");
+
+    gate.release();
+    CHECK(eventually([&] { return engine.stats().armed_faulted == 0; }, 5000ms)); // recovers
+
+    // No FURTHER write happens below this line — if a Fired event arrives, it can only be the
+    // synthetic fire the design calls for on late commitment.
+    const bool late_commit_observed = eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) >= 1; }, 3000ms);
+    INFO("Fired count after a late commitment WITH a prior fault edge: "
+         << count_kind(got, spark_key(spec), SparkEventKind::Fired)
+         << " (expected >= 1; if this is 0, see the KNOWN SUSPECT note above)");
+    CHECK(late_commit_observed);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a change during the INITIAL establishment window, with "
+          "NO prior fault edge at all, is observed via a late commitment - or is it? (#2012 "
+          "PR-B2, criterion #3, no-fault-edge variant)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Same fix as the sibling test above (watch()'s "still outstanding past the caller budget"
+    // branch now sets needs_resync). This variant proves the gap did not depend on grace-timing:
+    // the probe here is released well before health_grace, so armed_faulted
+    // NEVER goes to 1 — a Guardian consumer watching only for Faulted/Recovered edges gets NO
+    // signal whatsoever that anything might have changed. Synthetic fire is the ONLY mechanism
+    // that can still tell it — exactly why the plan calls this out explicitly ("Guardian does NOT
+    // re-evaluate on Recovered, this is the whole reason synthetic fire exists, don't let a test
+    // accidentally pass without actually exercising it").
+    ScratchDir a("late2");
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        ctl.health_grace = 5000ms; // long: released well before grace could ever trip
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec = file_spec(a.file.string());
+    auto sub = engine.arm(*c, spec);
+    REQUIRE(sub.has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    a.write("during-pending, no fault edge will ever be observed for this run");
+    std::this_thread::sleep_for(150ms); // well under the 5s grace
+    CHECK(engine.stats().armed_faulted == 0); // confirms this variant: no fault edge happened
+
+    gate.release();
+    std::this_thread::sleep_for(200ms); // let the commit land
+
+    const bool late_commit_observed = eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) >= 1; }, 3000ms);
+    INFO("Fired count after a late commitment with NO fault edge: "
+         << count_kind(got, spark_key(spec), SparkEventKind::Fired)
+         << " (expected >= 1; if this is 0, see the KNOWN SUSPECT note in the sibling test above)");
+    CHECK(late_commit_observed);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): shelter confirmation for a STABLE ancestor relationship "
+          "confirms once and stops (#2012 PR-B2, criterion #7, gap-3 fix)",
+          "[spark][mechanism][windows][walkoff]") {
+    // FIXED this round (code-read, not yet Windows-verified): attach_ancestor_locked() used to set
+    // w.confirmation_due = true UNCONDITIONALLY after its if/else (spark_file.cpp, previously
+    // ~1216), including the "same akey, nothing changed" duplicate-handle branch — so
+    // sweep_probes_locked's Idle case would clear the flag, launch a fresh confirmation probe,
+    // that probe would walk from the ORIGINAL target, find the SAME still-absent target and the
+    // SAME ancestor again, land right back on the duplicate-handle branch, and re-arm
+    // confirmation_due — an unbounded 50 ms poll loop, contradicting the code's own comment. The
+    // fix captures `same_shelter` (w.ancestor_key == akey, BEFORE any reassignment) and only
+    // re-arms confirmation_due when the shelter relationship is NEW or CHANGED
+    // (attach_ancestor_locked, near the end). For a target that never appears and an ancestor that
+    // never changes, this makes the launch sequence deterministic: exactly ONE initial probe (the
+    // fresh DirWatch's own first reservation, resolves Ancestor) plus exactly ONE confirmation
+    // probe (re-resolves the SAME ancestor, same_shelter == true, does not re-arm) — then nothing
+    // else should ever launch again while nothing on disk changes.
+    //
+    // IMPORTANT for every OTHER test with a sheltered watch: before this fix, a background
+    // confirmation loop ran for the lifetime of every such test, which is why they assert
+    // probe_launched with `>=`/deltas, never `==` — that reasoning is now obsolete for a STABLE
+    // shelter, but those other tests are left as-is (not this round's scope) since their windows
+    // were not specifically re-derived against the fixed state machine.
+    ScratchDir root("confirm_stable_root");
+    const auto target = root.dir / "never_appears" / "deep.txt"; // "never_appears" is never created
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    REQUIRE(engine.arm(*c, file_spec(target.string())).has_value());
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 1;
+        },
+        3000ms)); // sheltered under root.dir
+
+    // Wait until BOTH the initial probe and its one owed confirmation have deterministically
+    // landed (see the trace above) before sampling the baseline — this removes the ordering
+    // uncertainty a plain "sleep, then sample" would have (whether the confirmation probe happens
+    // to land before or after an arbitrary fixed delay).
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*raw)->probe_launched >= 2; }, 3000ms));
+    std::this_thread::sleep_for(200ms); // let the confirmation probe's own commit fully settle
+    const auto p0 = file_debug_counters_for_test(*raw)->probe_launched;
+    std::this_thread::sleep_for(500ms); // NOTHING on disk changes in this window
+    const auto p1 = file_debug_counters_for_test(*raw)->probe_launched;
+    INFO("probe_launched grew by " << (p1 - p0) << " over 500ms of a stable, unchanging shelter "
+                                   "(expected exactly 0 now that gap-3 is fixed: shelter "
+                                   "confirmation confirms once and stops)");
+    CHECK(p1 == p0);
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): shelter confirmation migrates to an intermediate "
+          "directory that appears mid-shelter, and the watch stays live throughout (#2012 PR-B2, "
+          "criterion #7)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("confirm_migrate_root");
+    const auto intermediate = root.dir / "appears_later";
+    const auto target = intermediate / "deep.txt";
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+    const auto spec = file_spec(target.string());
+    REQUIRE(engine.arm(*c, spec).has_value());
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 1;
+        },
+        3000ms)); // sheltered under root.dir
+
+    // The intermediate directory appears — a confirmation probe (whether it stops after one
+    // success or keeps firing, per the sibling "STABLE" test above) will eventually re-resolve
+    // DIRECTLY to it (Target mode: the directory itself now exists, regardless of whether
+    // deep.txt inside it does yet), releasing the root ancestor shelter entirely.
+    std::filesystem::create_directories(intermediate);
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 0 && d->live_dirs == 1;
+        },
+        5000ms));
+
+    // Confirmed live at the migrated location: creating the watched file itself now fires
+    // normally, with no gap in coverage.
+    { std::ofstream(target) << "seed"; }
+    std::this_thread::sleep_for(150ms);
+    const auto before = count_kind(got, spark_key(spec), SparkEventKind::Fired);
+    { std::ofstream(target, std::ios::app) << "change"; }
+    CHECK(eventually(
+        [&] { return count_kind(got, spark_key(spec), SparkEventKind::Fired) > before; }, 8000ms));
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a dead ancestor strips shelter from EVERY dependent, "
+          "including a Pending one, and each recovers without another ancestor event (#2012 "
+          "PR-B2, criterion #6)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("dead_anc_root");
+    const auto anc = root.dir / "anc";
+    std::filesystem::create_directories(anc);
+    const auto d1 = anc / "d1" / "f1.txt"; // "d1" never created — shelters under anc
+    const auto d2 = anc / "d2" / "f2.txt"; // ditto
+    const auto d3 = anc / "d3" / "f3.txt"; // ditto — kept Pending (gated) through the kill
+
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(anc / "d3"); // parks ONLY d3's establishment probe
+        ctl.ancestor_rearm_fail_hook = [&](std::wstring_view dir) {
+            return dir == anc.wstring(); // force the ancestor's OWN reissue to fail once it fires
+        };
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    const auto spec1 = file_spec(d1.string());
+    const auto spec2 = file_spec(d2.string());
+    const auto spec3 = file_spec(d3.string());
+    REQUIRE(engine.arm(*c, spec1).has_value());
+    REQUIRE(engine.arm(*c, spec2).has_value());
+    REQUIRE(engine.arm(*c, spec3).has_value()); // parks
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 1;
+        },
+        3000ms)); // d1, d2 sheltered; d3 still Pending
+
+    const auto p0 = file_debug_counters_for_test(*raw)->probe_launched;
+
+    // A direct child of anc (every ReadDirectoryChangesW here uses bWatchSubtree=FALSE, so d1/d2/
+    // d3's own subdirectories do NOT trigger this) fires the ancestor's own read; the hook forces
+    // its reissue to fail, driving invalidate_ancestor_locked() instead of the ordinary
+    // reresolve_absent_locked() path (the #829 fix this PR made).
+    { std::ofstream(anc / "trigger.txt") << "x"; }
+
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 0;
+        },
+        5000ms)); // the dead ancestor is torn down
+
+    // d1 and d2 (Idle at the time of death) each got a fresh probe staged — never a hope, an
+    // actual reservation (invalidate_ancestor_locked's own doc comment).
+    CHECK(eventually(
+        [&] { return file_debug_counters_for_test(*raw)->probe_launched >= p0 + 2; }, 3000ms));
+
+    // d3 (Pending, gated) is untouched by the invalidation ITSELF — single-flight defers to its
+    // own in-flight obligation — but its ancestor_key is cleared regardless (the "including a
+    // Pending one" half of this criterion, spark_file.cpp's invalidate_ancestor_locked: the clear
+    // runs BEFORE the Pending `continue`, unconditionally, for every dependent). Released now,
+    // d3's OWN probe (still running against the physically-unchanged anc directory) simply
+    // re-discovers anc and shelters there again, recreating a fresh ancestor slot — no SECOND
+    // ancestor event needed.
+    gate.release();
+
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 1; // d1, d2, and eventually d3 re-share one fresh slot
+        },
+        5000ms));
+    CHECK(engine.stats().armed_sparks == 3); // none of d1/d2/d3 was ever Lost through this
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a probe parked across stop() is counted on the shared F3 "
+          "counter until its worker exits (#2012 PR-B2, criterion #14)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("f3_orphan");
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    SparkEngine engine;
+    auto mech = make_file_mechanism(f3);
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    REQUIRE(engine.arm(*c, file_spec(a.file.string())).has_value()); // pending, parked
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    CHECK(f3->load() == 1); // admitted against the SHARED counter, not just the lane
+
+    const auto t0 = std::chrono::steady_clock::now();
+    engine.stop();
+    const auto stop_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0)
+            .count();
+    INFO("engine.stop() took " << stop_ms << " ms with one probe parked");
+    CHECK(stop_ms < 5000);
+    CHECK(raw->stats().quarantined_total == 1);
+    CHECK(f3->load() == 1); // still parked => still counted (F3 / §24)
+
+    gate.release();
+    CHECK(eventually([&] { return f3->load() == 0; }, 5000ms)); // worker exited => counter released
+    CHECK(eventually([&] { return file_debug_counters_for_test(*raw)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File mechanism (direct): stop() during watch()'s bounded wait cancels the "
+          "reservation - watch() still reports success (File's Decision #3), and the late result "
+          "is discarded, never committed (#2012 PR-B2, criterion #4)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Mechanism-direct (no engine) so the interleaving is under the test's control: watch() is
+    // inside its caller wait when stop() retires the reservation. NOTE this is a deliberately
+    // DIFFERENT assertion than spark_registry.cpp's identically-shaped test: Registry's watch()
+    // reports failure here; File's does NOT — spark_file.cpp:690's unconditional `return {};` in
+    // the `!live` branch (Decision #3, this file's header comment) means a caller racing stop()
+    // gets an honest "accepted, now gone" success, not an error. Do not copy Registry's
+    // CHECK_FALSE here — that would be testing the wrong mechanism's contract.
+    ScratchDir a("gen_race");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir);
+        ctl.caller_wait_budget = 3000ms; // long enough for stop() to land inside it
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> emits{0};
+    std::atomic<int> faults{0};
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1); },
+                [&](const std::string&, bool, std::string_view) { faults.fetch_add(1); });
+    const auto spec = file_spec(a.file.string());
+    std::expected<void, std::string> result;
+    std::thread watcher([&] { result = mech->watch(spark_key(spec), spec.params); });
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    std::this_thread::sleep_for(100ms); // the watcher is now inside wait_take()
+    mech->stop();                        // retires the reservation underneath it
+    gate.release();                      // the probe completes AFTER the retirement
+    watcher.join();
+    CHECK(result.has_value()); // File: success-with-nothing-behind-it, not an error (see NOTE)
+    auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->probe_discarded == 1);
+    CHECK(d->live_dirs == 0);
+    CHECK(emits.load() == 0);
+    CHECK(faults.load() == 0);
+    CHECK(eventually([&] { return file_debug_counters_for_test(*mech)->probe_workers_active == 0; },
+                     5000ms));
+}
+
+TEST_CASE("File mechanism (direct): an admission refusal is never counted as a backend failure "
+          "(and vice versa), and a refused probe recovers once the lane frees up (#2012 PR-B2, "
+          "criterion #5)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("admission_a"), c("admission_c");
+    const auto b_root = a.dir.parent_path() /
+                        ("admission_b_root_" + std::to_string(::GetCurrentProcessId()) + "_" +
+                         std::to_string(yuzu::test::process_random_salt() % 1000000000));
+    std::filesystem::create_directories(b_root); // B's OWN ancestor - no sharing with A or C
+    const auto b_target = b_root / "missing" / "f.txt";
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir); // parks A's probe, occupying the (capped) lane
+        ctl.probe_lane_cap = 1;
+        ctl.admission_backoff_seed = 40ms;
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {}, [](const std::string&, bool, std::string_view) {});
+
+    const auto spec_a = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value()); // parks, occupying the lane
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    // B: same mechanism, lane already at its cap of 1 -> an ADMISSION refusal, never a backend one.
+    const auto d0 = file_debug_counters_for_test(*mech);
+    REQUIRE(d0.has_value());
+    const auto spec_b = file_spec(b_target.string());
+    REQUIRE(mech->watch(spark_key(spec_b), spec_b.params).has_value()); // File never rejects arm()
+                                                                        // for this (Decision #3)
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d && d->probe_admission_rejected > d0->probe_admission_rejected;
+        },
+        3000ms));
+    {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->probe_backend_failed == d0->probe_backend_failed); // never counted as backend
+    }
+
+    // Release A: the lane frees up, B's admission retry (on its own seeded backoff) eventually
+    // gets in and establishes for real.
+    gate.release();
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d && d->live_ancestors == 1; // B's own absent-parent walk shelters under b_root
+        },
+        5000ms));
+
+    // C: a completely separate dir, this time with a THROWING probe hook - a genuine backend
+    // failure, never an admission one. apply_test_controls() treats a zero/default-constructed
+    // field as "leave unchanged" (FileMechanismTestControls's own doc comment), so a fresh `ctl`
+    // here does NOT reset what phase A set: probe_lane_cap is still pinned at 1 and
+    // admission_backoff_seed is still 40ms unless we say otherwise. The seed carrying over is
+    // benign (it only paces a retry that should never need to happen). The cap is not benign: B's
+    // shelter attach just above armed exactly one shelter-CONFIRMATION probe (the Gap-3 fix stops
+    // the confirmation loop after one attempt, but does not guarantee it has already landed by
+    // the time live_ancestors==1 is observed), so leaving the cap at 1 lets that still-in-flight
+    // confirmation probe race C's own probe for the single slot and admission-reject C - the
+    // #2012 PR-B2 flake this test exists to catch, not a fault in the production code. Lift the
+    // cap explicitly rather than relying on the (nonexistent) default-restoring behavior.
+    // kPhaseCLaneCap is deliberately NOT kProbeLaneCap (spark_file.cpp's own default of 16, and
+    // file-local to that TU besides - see the "shared-ancestor storm" test's kTestLaneCap for the
+    // same reasoning): the only requirement is a floor of 2 (B's at-most-one outstanding
+    // confirmation probe + C's own can never both be in flight), so an explicit, self-contained
+    // value keeps this test's correctness independent of whatever the production constant is.
+    constexpr std::size_t kPhaseCLaneCap = 4;
+    const auto d1 = file_debug_counters_for_test(*mech);
+    REQUIRE(d1.has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = [&](std::wstring_view dir) {
+            if (dir == c.dir.wstring())
+                throw std::runtime_error("injected genuine backend failure for C");
+        };
+        ctl.probe_lane_cap = kPhaseCLaneCap; // lift phase A's cap of 1 - see comment above
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    const auto spec_c = file_spec(c.file.string());
+    REQUIRE(mech->watch(spark_key(spec_c), spec_c.params).has_value());
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d && d->probe_backend_failed > d1->probe_backend_failed;
+        },
+        3000ms));
+    {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->probe_admission_rejected == d1->probe_admission_rejected); // never counted as
+                                                                             // admission
+    }
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): repeated admission refusal does not reset the health-grace "
+          "clock - grace is stamped once, at acceptance, never re-stamped by a retry (#2012 "
+          "PR-B2, criterion #5, grace half)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("grace_hog"), b("grace_victim");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    FileProbeGate gate;
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(a.dir); // parks for the WHOLE test (never released) - A
+                                               // permanently occupies the one-slot lane
+        ctl.probe_lane_cap = 1;
+        ctl.admission_backoff_seed = 20ms; // B retries admission often
+        ctl.health_grace = 150ms;          // B WILL cross grace while still being admission-refused
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::vector<std::pair<std::string, bool>> faults; // key, faulted
+    std::mutex faults_mu;
+    mech->start([](const std::string&, SparkData) {},
+                [&](const std::string& key, bool faulted, std::string_view) {
+                    std::lock_guard lk(faults_mu);
+                    faults.emplace_back(key, faulted);
+                });
+    const auto spec_a = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    const auto spec_b = file_spec(b.file.string());
+    const std::string key_b = spark_key(spec_b);
+    REQUIRE(mech->watch(key_b, spec_b.params).has_value());
+
+    // B never gets a lane slot (A holds it for the whole test) - it is repeatedly
+    // admission-refused on a 20ms-seeded schedule, well past its 150ms grace. If grace were
+    // (incorrectly) reset by each admission retry, B would never report Faulted; if it is
+    // correctly stamped once at acceptance, exactly one Faulted edge for B appears, promptly, and
+    // stays the only one no matter how many further admission retries happen afterward.
+    CHECK(eventually(
+        [&] {
+            std::lock_guard lk(faults_mu);
+            return std::count_if(faults.begin(), faults.end(), [&](const auto& p) {
+                       return p.first == key_b && p.second;
+                   }) >= 1;
+        },
+        3000ms));
+
+    std::this_thread::sleep_for(600ms); // several more admission-retry cycles (20ms seed, doubling)
+    {
+        std::lock_guard lk(faults_mu);
+        const auto b_faulted_edges = std::count_if(
+            faults.begin(), faults.end(), [&](const auto& p) { return p.first == key_b && p.second; });
+        CHECK(b_faulted_edges == 1); // grace_counted latches - never a second Faulted edge for B
+                                    // just because admission kept retrying
+    }
+    auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->probe_admission_rejected >= 2); // B really was retried more than once
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a packet dequeued immediately before stop() is observed does "
+          "not leave stop()'s drain waiting for a completion that can never arrive (#2012 PR-B2, "
+          "criterion #13)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Repeats a tight establish -> fire -> stop() cycle with NO delay between the write and
+    // stop(), so across enough iterations at least some runs land stop() while a real completion
+    // for this exact write is still in flight or just-dequeued on the owner thread — the
+    // pre-PR-B2 file.cpp:750 trap this file's run() header comment describes: io_pending must be
+    // cleared for the JUST-dequeued packet before stop_ is even checked, or the drain loop below
+    // it waits forever for a completion that will never come again. Mirrors the disarm-then-rearm
+    // #1927 test's own "repeat so one lucky interleaving can't mask a regression" rationale.
+    //
+    // NOT covered here (or anywhere in this round): a genuinely LOST completion forcing the
+    // shutdown-quarantine path (stop()'s `lost_completion` branch, spark_file.cpp ~766-796) — that
+    // requires GetQueuedCompletionStatus itself to fail mid-drain, which is not deterministically
+    // triggerable without a hook INSIDE stop()'s own drain loop, and no such hook exists yet. The
+    // timeout / control-wake / ordinary-failed-completion paths this criterion also lists are
+    // exercised incidentally elsewhere in this file: a Deferred retry (any parked-then-released
+    // test above) proves the timeout path schedules correctly; the "survives parent-dir delete"
+    // resilience test proves a failed completion is handled; every watch()/apply_test_controls()
+    // call in every test here posts a control wake and is processed correctly (the suite would
+    // hang otherwise).
+    ScratchDir a("packet_before_stop");
+    for (int i = 0; i < 25; ++i) {
+        INFO("iteration " << i);
+        auto mech = make_file_mechanism();
+        REQUIRE(mech != nullptr);
+        mech->start([](const std::string&, SparkData) {}, [](const std::string&, bool, std::string_view) {});
+        const auto spec = file_spec(a.file.string());
+        REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+        std::this_thread::sleep_for(30ms); // let the read genuinely arm
+        a.write("x");
+        // No sleep here: stop() races the completion this write just produced.
+        const auto t0 = std::chrono::steady_clock::now();
+        mech->stop();
+        const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t0)
+                                 .count();
+        CHECK(stop_ms < 1500);
+        CHECK(mech->stats().quarantined_total == 0); // a clean stop never needs to quarantine anything here
+    }
+}
+
+TEST_CASE("File mechanism (direct): a throwing emit is contained per key, and Decision #4's "
+          "whole-batch resync retry produces a BOUNDED number of duplicate deliveries to an "
+          "already-succeeded sibling key (#2012 PR-B2, criterion #11, emit half)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Two keys share ONE DirWatch (same parent dir, different filenames), both absent, so the
+    // dir is sheltered under an ancestor. Making the shared dir itself appear drives the ONE
+    // currently-working synthetic-fire trigger (reresolve_absent_locked -> a reappearance commit
+    // -> needs_resync=true, spark_file.cpp:1315-1318 — see the "late commitment" tests above for
+    // triggers the plan calls for that are not yet implemented). emit_ throws for key A on its
+    // first K=2 calls; key B never throws. Decision #4 (Dave, PR-B2 plan) is that a submit failure
+    // retries the WHOLE shared-dir batch, never per-key debt — so B is delivered the SAME resync
+    // notice again on every retry A's failure forces, even though B already succeeded. This test
+    // proves the bound actually holds (the plan's own wording: "needs an explicit acceptance test
+    // proving the duplicate-invalidation bound actually holds").
+    ScratchDir root("dispatch_fail_root");
+    const auto shared_dir = root.dir / "shared"; // absent until triggered below
+    const auto file_a = shared_dir / "a.txt";
+    const auto file_b = shared_dir / "b.txt";
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        FileMechanismTestControls ctl;
+        ctl.admission_backoff_seed = 30ms; // stage_resync_emit_locked's own failure path re-stages
+                                           // on this schedule (publish_pass_locked reuses
+                                           // admission_seed() for the resync retry backoff)
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    const auto spec_a = file_spec(file_a.string());
+    const auto spec_b = file_spec(file_b.string());
+    const std::string key_a = spark_key(spec_a);
+    const std::string key_b = spark_key(spec_b);
+    std::atomic<int> throws_left_for_a{2};
+    std::atomic<int> delivered_a{0};
+    std::atomic<int> delivered_b{0};
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == key_a) {
+                if (throws_left_for_a.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                    throw std::runtime_error("injected emit failure for A");
+                delivered_a.fetch_add(1, std::memory_order_acq_rel);
+            } else if (key == key_b) {
+                delivered_b.fetch_add(1, std::memory_order_acq_rel);
+            }
+        },
+        [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch(key_a, spec_a.params).has_value()); // creates the shared DirWatch
+    REQUIRE(mech->watch(key_b, spec_b.params).has_value()); // rides along, no new probe
+    std::this_thread::sleep_for(300ms); // let the shared dir settle, sheltered under root
+
+    std::filesystem::create_directories(shared_dir); // direct child of root -> reappearance trigger
+
+    CHECK(eventually([&] { return delivered_a.load(std::memory_order_acquire) >= 1; }, 6000ms));
+    {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        INFO("delivered_a=" << delivered_a.load() << " delivered_b=" << delivered_b.load()
+                            << " emit_failed=" << d->emit_failed
+                            << " resync_retries=" << d->resync_retries);
+        CHECK(delivered_a.load(std::memory_order_acquire) == 1); // exactly one success, once the
+                                                                  // throw budget is exhausted
+        CHECK(d->emit_failed == 2); // both of A's injected throws were counted, never silently lost
+        // B pays the Decision #4 cost: delivered once per resync attempt (bounded, not unbounded)
+        // - one original attempt plus one duplicate per retry A's failure forced.
+        CHECK(delivered_b.load(std::memory_order_acquire) == static_cast<int>(d->resync_retries) + 1);
+        CHECK(delivered_b.load(std::memory_order_acquire) <= 4); // an explicit bound, not just the
+                                                                  // equation above - the whole point
+                                                                  // of this test
+    }
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a throwing fault callback is contained - the owner keeps "
+          "running and an unrelated watch still works (#2012 PR-B2, criterion #11, fault half)",
+          "[spark][mechanism][windows][walkoff]") {
+    // NOTE ON THE OBSERVABLE CONTRACT (code-read, spark_file.cpp check_health_edge_locked ~976-
+    // 994): health_reported_faulted is stamped BEFORE the fault notice is dispatched,
+    // optimistically — there is no failed-dispatch re-stage path for Fault the way
+    // stage_resync_emit_locked has for a failed resync Emit (publish_pass_locked's
+    // succeeded_resync/failed_resync handling is Emit-only). So a THROWN fault_ callback's
+    // specific edge is not retried — this test does not assert on that (too easy to get subtly
+    // wrong from a trace alone); it asserts only the load-bearing "contained" half of the
+    // criterion: the throw is counted, and the mechanism keeps servicing other watches.
+    ScratchDir a("fault_throw"), sibling("fault_throw_sibling");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<int> fault_throws_left{1};
+    {
+        FileMechanismTestControls ctl;
+        ctl.health_grace = 60ms;
+        ctl.probe_hook = [&](std::wstring_view dir) {
+            if (dir == a.dir.wstring())
+                std::this_thread::sleep_for(200ms); // park past grace once, deterministically
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    const auto spec_a = file_spec(a.file.string());
+    const auto spec_s = file_spec(sibling.file.string());
+    const std::string key_a = spark_key(spec_a);
+    const std::string key_s = spark_key(spec_s);
+    std::atomic<int> sibling_delivered{0};
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == key_s)
+                sibling_delivered.fetch_add(1, std::memory_order_acquire);
+        },
+        [&](const std::string& key, bool faulted, std::string_view) {
+            if (key == key_a && faulted &&
+                fault_throws_left.fetch_sub(1, std::memory_order_acq_rel) > 0)
+                throw std::runtime_error("injected fault-dispatch failure");
+        });
+    REQUIRE(mech->watch(key_a, spec_a.params).has_value()); // parks past grace once
+    REQUIRE(mech->watch(key_s, spec_s.params).has_value());
+
+    // The mechanism keeps running despite the thrown fault_: the sibling watch still establishes
+    // and fires normally.
+    std::this_thread::sleep_for(300ms);
+    sibling.write("change");
+    CHECK(eventually([&] { return sibling_delivered.load(std::memory_order_acquire) >= 1; }, 8000ms));
+
+    auto d = file_debug_counters_for_test(*mech);
+    REQUIRE(d.has_value());
+    CHECK(d->fault_failed >= 1); // the throw was counted, never silently swallowed
+    mech->stop();
+}
+
+TEST_CASE("File spark (real mechanism): a shared ancestor's refcount survives one dependent's "
+          "removal and tears down only once the last one goes (#2012 PR-B2, criterion #8)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("shared_anc_root");
+    const auto d1 = root.dir / "dep1" / "f1.txt"; // "dep1" never created
+    const auto d2 = root.dir / "dep2" / "f2.txt"; // "dep2" never created
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    auto s1 = engine.arm(*c, file_spec(d1.string()));
+    auto s2 = engine.arm(*c, file_spec(d2.string()));
+    REQUIRE(s1.has_value());
+    REQUIRE(s2.has_value());
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 1; // ONE shared slot for root.dir, refcount 2
+        },
+        3000ms));
+
+    engine.disarm(*s1);
+    std::this_thread::sleep_for(200ms);
+    CHECK(file_debug_counters_for_test(*raw)->live_ancestors == 1); // still referenced by d2
+
+    engine.disarm(*s2);
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->live_ancestors == 0;
+        },
+        5000ms));
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->retiring == 0;
+        },
+        5000ms));
+    engine.stop();
+}
+
+TEST_CASE("File spark (real mechanism): a shared-ancestor storm keeps concurrent discovery "
+          "probes bounded by the lane cap and converges once the storm stops (#2012 PR-B2, "
+          "criterion #15, bounded-growth half)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("storm_root");
+    constexpr int kDeps = 30;
+    // Deliberately smaller than production's own default (kProbeLaneCap=16, file-local to
+    // spark_file.cpp's anonymous namespace and not visible to this TU) so the bound this test
+    // asserts is self-contained rather than tied to a constant it cannot see.
+    constexpr std::size_t kTestLaneCap = 8;
+    std::vector<SparkSpec> specs;
+    specs.reserve(kDeps);
+    for (int i = 0; i < kDeps; ++i)
+        specs.push_back(file_spec((root.dir / ("dep" + std::to_string(i)) / "f.txt").string()));
+
+    SparkEngine engine;
+    auto mech = make_file_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::File, std::move(mech)).has_value());
+    {
+        FileMechanismTestControls ctl;
+        ctl.probe_lane_cap = kTestLaneCap;
+        ctl.admission_backoff_seed = 15ms; // short: rejected probes retry quickly, sustaining load
+        REQUIRE(set_file_test_controls_for_test(*raw, std::move(ctl)));
+    }
+    auto c = engine.register_consumer("c", [](const SparkEvent&) {});
+    REQUIRE(c.has_value());
+    engine.start();
+    for (const auto& spec : specs)
+        REQUIRE(engine.arm(*c, spec).has_value());
+
+    std::size_t max_active = 0;
+    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
+    while (std::chrono::steady_clock::now() < deadline) {
+        // Storm: create then delete a direct child of root every pass - each edge re-fires the
+        // shared ancestor watch, restaging a reappearance probe for every still-Idle dependent.
+        const auto churn = root.dir / "churn.txt";
+        { std::ofstream(churn) << "x"; }
+        std::error_code ec;
+        std::filesystem::remove(churn, ec);
+        auto d = file_debug_counters_for_test(*raw);
+        if (d)
+            max_active = std::max(max_active, d->probe_workers_active);
+        std::this_thread::sleep_for(10ms);
+    }
+    INFO("max observed probe_workers_active=" << max_active << " (test cap=" << kTestLaneCap << ")");
+    CHECK(max_active <= kTestLaneCap);
+    CHECK(file_debug_counters_for_test(*raw)->probe_admission_rejected > 0); // the storm genuinely
+                                                                             // pressured the lane
+
+    // Convergence: once the storm stops, everything drains back to idle.
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*raw);
+            return d && d->probe_workers_active == 0;
+        },
+        5000ms));
+    engine.stop();
+}
+
+// ── File T6-analogue (#2012 PR-B2, criterion #15, reentrancy half) ──────────
+//
+// Unlike Registry, File's unwatch()/stop() do NOT block the calling thread on a
+// SEPARATE callback-owning thread finishing its work first (this file's header
+// comment, "OWNERSHIP / DISPATCH PROTOCOL" rule 4 — neither watch() nor
+// unwatch() ever calls emit()/fault() synchronously — and there is no
+// WaitForThreadpoolWaitCallbacks-shaped drain anywhere in File's unwatch()/
+// stop()). So the SPECIFIC deadlock T6 (#4181) found in Registry has no known
+// analogue in File's current design. This test is regression insurance, not a
+// suspected-red repro: if a future change to File's unwatch()/stop() ever
+// introduces a blocking cross-thread drain, this is the test that would catch
+// it. It is still built at the SUBPROCESS boundary (never in-process, mirroring
+// spark_registry.cpp's own T6) precisely because a wrong assumption here would
+// otherwise hang the whole test binary with no recovery.
+namespace {
+constexpr DWORD kT6FileDeadlockExitCode = 101; // distinct from Registry's kT6DeadlockExitCode (100)
+
+std::string t6_file_dir() {
+    char buf[1024]{};
+    const DWORD n = ::GetEnvironmentVariableA("YUZU_SPARK_T6_FILE_DIR", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf))
+        return std::string(buf, n);
+    return (std::filesystem::temp_directory_path() /
+           ("spark_t6_file_" + std::to_string(::GetCurrentProcessId())))
+        .string();
+}
+} // namespace
+
+#define YUZU_SPARK_T6_FILE_CHILD_CASE_NAME "File T6 child: inline same-type re-arm during disarm"
+
+TEST_CASE(YUZU_SPARK_T6_FILE_CHILD_CASE_NAME, "[.][t6-file-child]") {
+    namespace fs = std::filesystem;
+    const fs::path dir = t6_file_dir();
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    const fs::path target = dir / "a.txt";
+    const fs::path target2 = dir / "b.txt";
+    { std::ofstream(target) << "seed"; }
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::File, make_file_mechanism()).has_value());
+    std::atomic<bool> in_handler{false};
+    std::atomic<bool> go{false};
+    std::atomic<bool> rearmed{false};
+    std::atomic<bool> rearm_done{false};
+    std::atomic<int> fires{0};
+    std::mutex rearm_err_mu;
+    std::string rearm_err;
+    auto sub_k = engine.arm_inline(file_spec(target.string()), [&](const SparkEvent&) {
+        if (fires.fetch_add(1, std::memory_order_acq_rel) != 0)
+            return;
+        in_handler.store(true, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(1ms);
+        auto s2 = engine.arm_inline(file_spec(target2.string()), [](const SparkEvent&) {});
+        if (!s2) {
+            std::lock_guard lk(rearm_err_mu);
+            rearm_err = s2.error();
+        }
+        rearmed.store(s2.has_value(), std::memory_order_release);
+        rearm_done.store(true, std::memory_order_release);
+    });
+    REQUIRE(sub_k.has_value());
+    engine.start();
+    std::this_thread::sleep_for(250ms); // let the IOCP read arm
+
+    { std::ofstream(target, std::ios::app) << "change"; }
+    REQUIRE(eventually([&] { return in_handler.load(std::memory_order_acquire); }, 8000ms));
+
+    std::atomic<bool> disarm_done{false};
+    std::thread disarmer([&] {
+        engine.disarm(*sub_k);
+        disarm_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(300ms);
+    go.store(true, std::memory_order_release);
+
+    const bool completed =
+        eventually([&] { return disarm_done.load(std::memory_order_acquire); }, 5000ms);
+    if (!completed) {
+        std::fputs("T6-file child: disarm() did not complete while the Inline callback re-entered "
+                   "the same type - deadlock observed\n",
+                   stderr);
+        std::fflush(stderr);
+        ::TerminateProcess(::GetCurrentProcess(), kT6FileDeadlockExitCode);
+    }
+    CHECK(completed);
+    disarmer.join();
+    CHECK(eventually([&] { return rearm_done.load(std::memory_order_acquire); }, 5000ms));
+    {
+        std::lock_guard lk(rearm_err_mu);
+        INFO("same-type arm_inline from inside the Inline handler: "
+             << (rearm_done.load(std::memory_order_acquire)
+                     ? (rearm_err.empty() ? "returned ok" : rearm_err)
+                     : "did not return within 5s"));
+        CHECK(rearmed.load(std::memory_order_acquire));
+    }
+    engine.stop();
+    fs::remove_all(dir, ec);
+}
+
+TEST_CASE("File spark: same-type disarm() does not deadlock against an in-flight Inline callback "
+          "(T6-file analogue, subprocess boundary) (#2012 PR-B2, criterion #15, reentrancy half)",
+          "[spark][mechanism][windows][walkoff][t6]") {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    REQUIRE((exe_len > 0 && exe_len < MAX_PATH));
+    const std::string dir = (std::filesystem::temp_directory_path() /
+                             ("spark_t6_file_" + std::to_string(::GetCurrentProcessId())))
+                                .string();
+    REQUIRE(::SetEnvironmentVariableA("YUZU_SPARK_T6_FILE_DIR", dir.c_str()));
+
+    std::wstring cmd = L"\"";
+    cmd += exe;
+    cmd += L"\" \"";
+    {
+        const std::string name = YUZU_SPARK_T6_FILE_CHILD_CASE_NAME;
+        cmd.append(name.begin(), name.end());
+    }
+    cmd += L"\" --reporter compact --durations no";
+
+    const std::filesystem::path child_log =
+        std::filesystem::temp_directory_path() /
+        ("yuzu_test_spark_t6_file_child_" + std::to_string(::GetCurrentProcessId()) + ".log");
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    UniqueHandle hlog(::CreateFileW(child_log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    REQUIRE(hlog.valid());
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nullptr;
+    si.hStdOutput = hlog.h;
+    si.hStdError = hlog.h;
+    PROCESS_INFORMATION pi{};
+    const BOOL created = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                                          CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    UniqueHandle hthread(pi.hThread);
+    UniqueHandle hprocess(pi.hProcess);
+    hlog.reset();
+    REQUIRE(created);
+    hthread.reset();
+    const DWORD wr = ::WaitForSingleObject(hprocess.h, 30000);
+    if (wr == WAIT_TIMEOUT) {
+        ::TerminateProcess(hprocess.h, 9);
+        ::WaitForSingleObject(hprocess.h, 5000);
+    }
+    DWORD code = 0xFFFFFFFFu;
+    ::GetExitCodeProcess(hprocess.h, &code);
+    hprocess.reset();
+    ::SetEnvironmentVariableA("YUZU_SPARK_T6_FILE_DIR", nullptr);
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::string child_out;
+    {
+        std::ifstream in(child_log, std::ios::binary);
+        child_out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::filesystem::remove(child_log, ec);
+
+    INFO("T6-file child: WaitForSingleObject=" << wr << " (0=exited, 258=timeout->killed) exit code="
+                                               << code << " (0=completed, " << kT6FileDeadlockExitCode
+                                               << "=child saw the deadlock, 3=Catch2 matched no case)");
+    INFO("T6-file child output:\n" << child_out);
+    CHECK(wr == WAIT_OBJECT_0);
+    CHECK(code == 0);
+}
+
 TEST_CASE("Registry spark (real mechanism): a parked probe on key A neither stalls arm(B) nor "
           "holds arm(A) past its caller budget (#2012 PR-B1)",
           "[spark][mechanism][windows][walkoff]") {
@@ -6311,6 +7626,1081 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
          << "ms");
     // bulk_guard's destructor stops the engine and cleans up the registry
     // tree here, unconditionally.
+}
+
+// ── File walkoff (#2012/#3840 PR-B2), adversarial review round findings ────
+//
+// Fault-injection tests for the 8 HIGH-severity findings from the PR-B2
+// review (Kimi K3 + Codex Sol, cross-examined, adjudicated). Each finding was
+// the SAME underlying shape: a recovery/exception path silently assuming
+// another code path would finish work it started. Every test below targets
+// the SPECIFIC throw-point the fix closed, via a dedicated test hook
+// (FileMechanismTestControls), and asserts an outcome the PRE-fix code could
+// not have produced — not just "no crash". None of these have been run on
+// real Windows as of this round (see this round's own report); they are
+// written to the same falsifiable-outcome discipline as the rest of this
+// file's PR-B2 acceptance tests.
+
+TEST_CASE("File mechanism (direct): a throw inside create_ancestor_from_probe_locked's map "
+          "insertion never destroys a live kernel-owned read (#2012/#3840 PR-B2 review "
+          "finding 1)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Insert-then-arm fix: ancestors_.try_emplace(akey) now runs BEFORE any
+    // OS call, so a throw there (modelled by ancestor_insert_fail_hook) can
+    // never destroy a DirWatch the kernel is still writing into — nothing
+    // has been issued yet at that point. Pre-fix, the map insertion ran
+    // AFTER ReadDirectoryChangesW was already issued, so an equivalent throw
+    // there would have freed a live OVERLAPPED/buffer out from under the
+    // kernel (the #2839 UAF class).
+    yuzu::test::TempDir base("yuzu_test_spark_f1anc_");
+    std::error_code ec;
+    std::filesystem::create_directories(base.path, ec);
+    REQUIRE(!ec);
+    const auto absent = base.path / "gone" / "t.txt";
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<int> insert_hook_calls{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 40ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.ancestor_insert_fail_hook = [&](std::wstring_view) {
+            if (insert_hook_calls.fetch_add(1, std::memory_order_acq_rel) == 0)
+                throw std::runtime_error("injected ancestors_.try_emplace failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("k", FileSparkParams{absent.string()}).has_value());
+
+    REQUIRE(eventually(
+        [&] { return insert_hook_calls.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    {
+        // Falsifier part 1: the failed attempt left NOTHING live - the map
+        // was never touched (the hook fires strictly before try_emplace),
+        // and the failure was routed through fail_backend_locked/
+        // defer_backend_retry_locked, not a crash or a leaked handle.
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->live_ancestors == 0);
+        CHECK(d->probe_backend_failed >= 1);
+    }
+    // Falsifier part 2: the mechanism keeps making progress - the retry
+    // (hook now spent, self-disarmed) succeeds and creates the ancestor for
+    // real.
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->live_ancestors >= 1;
+        },
+        4000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): an ancestor completion consumed then lost mid-pass is "
+          "invalidated on the next sweep, not left dead with every dependent permanently "
+          "sheltered behind it (#2012/#3840 PR-B2 review finding 2)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Combines two EXISTING hooks (no new production surface needed):
+    // completion_hook (filtered to the ancestor's own directory) forces
+    // unwind_pass_locked's "never reached process_completion_locked at all"
+    // recovery branch; ancestor_rearm_fail_hook forces THAT branch's own
+    // route_noop_rearm() reissue attempt to fail too. Pre-fix, this left the
+    // ancestor sitting in ancestors_ forever - handle-less, not `removing`,
+    // never invalidated (sweep_probes_locked never iterated ancestors_ at
+    // all) - so the dependent stayed permanently "sheltered" behind a dead
+    // shelter with no future trigger. Post-fix, dead_pending_invalidate is
+    // stamped and swept on the very next (non-noexcept) pass.
+    yuzu::test::TempDir base("yuzu_test_spark_f2anc_");
+    std::error_code ec;
+    std::filesystem::create_directories(base.path, ec);
+    REQUIRE(!ec);
+    const auto absent = base.path / "gone" / "t.txt";
+    const std::wstring base_w = base.path.wstring();
+
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> completion_throw_armed{false}; // armed only once the ancestor is live
+    std::atomic<int> completion_throws{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 20ms;
+        ctl.completion_hook = [&](std::wstring_view dir) {
+            if (dir == base_w &&
+                completion_throw_armed.exchange(false, std::memory_order_acq_rel)) {
+                completion_throws.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected post-dequeue allocation failure (ancestor)");
+            }
+        };
+        ctl.ancestor_rearm_fail_hook = [&](std::wstring_view dir) { return dir == base_w; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("k", FileSparkParams{absent.string()}).has_value());
+
+    REQUIRE(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->live_ancestors >= 1;
+        },
+        3000ms));
+    std::this_thread::sleep_for(150ms); // let the ancestor's own read settle/arm fully
+    completion_throw_armed.store(true, std::memory_order_release);
+
+    { std::ofstream(base.path / "unrelated.txt") << "x"; } // real completion on the
+                                                            // ancestor's own read
+
+    REQUIRE(eventually(
+        [&] { return completion_throws.load(std::memory_order_acquire) >= 1; }, 3000ms));
+
+    const std::uint64_t launched_before = [&] {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        return d->probe_launched;
+    }();
+    // Falsifier: live_ancestors drops back to 0 (the dead ancestor is
+    // actually invalidated/erased) AND the dependent gets a fresh probe
+    // launched, once sweep_probes_locked's own ancestor loop finishes what
+    // unwind_pass_locked could only mark.
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->live_ancestors == 0;
+        },
+        4000ms));
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_launched > launched_before;
+        },
+        4000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a throw during a brand-new watch()'s registration rolls "
+          "back cleanly, so a later watch() for the same directory is not permanently deaf "
+          "(#2012/#3840 PR-B2 review finding 4)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("register_fail");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> hook_armed{true};
+    std::atomic<int> hook_hits{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.watch_register_fail_hook = [&](std::wstring_view) {
+            if (hook_armed.exchange(false, std::memory_order_acq_rel)) {
+                hook_hits.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected watch() registration allocation failure");
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(a.file.string());
+    const std::string key = spark_key(spec);
+
+    // Direct mechanism call (no SparkEngine/watch_guarded in front of it
+    // here) - the injected throw propagates straight to the caller.
+    CHECK_THROWS_AS(mech->watch(key, spec.params), std::runtime_error);
+    CHECK(hook_hits.load(std::memory_order_acquire) == 1);
+    {
+        // Falsifier part 1: before the fix, dirs_[dirkey] was already
+        // committed (fully or partially) by the time the throw could land,
+        // so a LATER watch() for the same directory would see fresh ==
+        // false and ride along with a slot that never reserved a probe -
+        // permanently deaf, reporting armed forever. After the fix, the
+        // rollback erases the whole entry.
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->live_dirs == 0);
+    }
+    // Falsifier part 2: a later watch() for the SAME directory (hook now
+    // spent, self-disarmed) succeeds AND actually reserves/launches a probe.
+    REQUIRE(mech->watch(key, spec.params).has_value());
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_launched >= 1;
+        },
+        3000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a throw inside reserve_probe_locked's own allocation "
+          "leaves the watch retryable, not permanently stranded Pending-with-no-call "
+          "(#2012/#3840 PR-B2 review finding 5)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("reserve_fail");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> force_first_probe_fail{true};
+    std::atomic<int> reserve_hook_calls{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 40ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.probe_hook = [&](std::wstring_view) {
+            if (force_first_probe_fail.exchange(false, std::memory_order_acq_rel))
+                throw std::runtime_error("injected first-probe backend failure");
+            // every later probe (the retries) resolves for real.
+        };
+        // Throw on the SECOND reserve_probe_locked call only (call #0 is
+        // watch()'s own initial reserve; call #1 is the Deferred retry's
+        // reserve, staged after the forced probe failure above) - a precise,
+        // deterministic target, not a single-shot-on-first-call gate.
+        ctl.reserve_probe_fail_hook = [&](std::wstring_view) {
+            if (reserve_hook_calls.fetch_add(1, std::memory_order_acq_rel) == 1)
+                throw std::runtime_error("injected reserve_probe_locked allocation failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    // Falsifier: before the fix, reserve_probe_locked stamped Pending +
+    // generation BEFORE building `job` - a throw at the injected point left
+    // the watch Pending with w.call == nullopt forever (sweep_probes_locked's
+    // Pending case is a no-op without a call). After the fix, `w` is
+    // untouched by the throw (still Deferred, already due), so the very next
+    // pass retries and eventually establishes for real.
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() &&
+                  d->probe_launched >= 2; // the forced-fail probe (#1) + the real
+                                          // retry that follows (#2, hook spent by then)
+        },
+        5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a throw inside resolve_probe_locked's own log call, after "
+          "the state transition, never strands a failed probe Pending-with-no-call "
+          "(#2012/#3840 PR-B2 review finding 6)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Needs a probe that genuinely resolves to r.has_value() && !r->ok (not
+    // WorkerThrew, which never reaches the log line at all) - a nonexistent
+    // drive root (#1927 shape) reaches its fixed point in microseconds and
+    // is guaranteed to keep failing, so every retry re-triggers the same
+    // code path deterministically.
+    char letter = 0;
+    {
+        const DWORD mask = ::GetLogicalDrives();
+        for (char cand = 'Z'; cand >= 'B'; --cand) {
+            if (!(mask & (1u << (cand - 'A')))) {
+                letter = cand;
+                break;
+            }
+        }
+    }
+    if (!letter) {
+        FAIL("no free drive letter (B-Z) available on this box - review finding 6's "
+             "log-ordering fix is unverified here");
+    }
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> log_hook_armed{true};
+    std::atomic<int> log_hook_hits{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 1ms; // force resolution onto the SWEEP path (run()'s own
+                                     // thread, report_health defaults true), not watch()'s
+                                     // own fast-resolve branch
+        ctl.backend_retry_base = 40ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.probe_hook = [](std::wstring_view) { std::this_thread::sleep_for(60ms); };
+        ctl.resolve_log_fail_hook = [&](std::wstring_view) {
+            if (log_hook_armed.exchange(false, std::memory_order_acq_rel)) {
+                log_hook_hits.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected resolve_probe_locked log allocation failure");
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(std::string(1, letter) + ":\\nonexistent\\dir\\file.txt");
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    REQUIRE(eventually([&] { return log_hook_hits.load(std::memory_order_acquire) >= 1; },
+                       4000ms));
+    const std::uint64_t launched_before = [&] {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        return d->probe_launched;
+    }();
+    // Falsifier: before the fix, resolve_probe_locked's own spdlog::warn ran
+    // BEFORE the Deferred transition - a throw there left the watch Pending
+    // with w.call already reset (consumed by the sweep's try_take before
+    // resolve_probe_locked was even called), permanently stuck. After the
+    // fix, the transition runs first regardless of whether the log throws,
+    // so the watch keeps retrying (this target can never succeed, but each
+    // retry launches a fresh doomed probe rather than none at all).
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_launched > launched_before;
+        },
+        4000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a commit failure landing inside watch()'s own caller-wait "
+          "window is still eventually reported via health grace, not silently pre-marked "
+          "reported-with-no-dispatch (#2012/#3840 PR-B2 review finding 7)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("attach_fail");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const std::wstring target_dir_w = a.dir.wstring();
+    {
+        FileMechanismTestControls ctl;
+        ctl.caller_wait_budget = 2000ms; // generous - the probe against a real, existing
+                                        // directory resolves in microseconds
+        ctl.health_grace = 60ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.attach_fail_hook = [&](std::wstring_view dir) { return dir == target_dir_w; };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> faults{0};
+    std::atomic<bool> last_faulted{false};
+    mech->start([](const std::string&, SparkData) {},
+                [&](const std::string&, bool faulted, std::string_view) {
+                    faults.fetch_add(1, std::memory_order_acq_rel);
+                    last_faulted.store(faulted, std::memory_order_release);
+                });
+    const auto spec = file_spec(a.file.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    // Falsifier: before the fix, the fast-resolve-then-attach-fails commit
+    // (routed unconditionally through fail_backend_locked) pre-stamped
+    // health_reported_faulted == health_desired_faulted (both true) into
+    // watch()'s own local, never-dispatched FilePassWork - grace's later
+    // diff-check (check_health_edge_locked) would then see no edge and
+    // never call fault_ at all: the watch reports healthy while genuinely
+    // dark, indefinitely. After the fix (routed through defer_backend_
+    // retry_locked when report_health is false, no health stamp),
+    // health_reported_faulted stays false until a DISPATCHED pass (health
+    // grace, through run()'s own sweep) actually reports it.
+    CHECK(eventually([&] { return faults.load(std::memory_order_acquire) >= 1; }, 4000ms));
+    CHECK(last_faulted.load(std::memory_order_acquire));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a key unwatch()'d and watch()'d again while its notice is "
+          "already staged does not receive a stale notice meant for the old registration "
+          "(#2012/#3840 PR-B2 review finding 8)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("key_gen");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    ISparkMechanism* raw = mech.get();
+    const auto spec = file_spec(a.file.string());
+    std::atomic<int> total_emits{0};
+    std::atomic<bool> reentrant_done{false};
+    std::atomic<bool> reentrant_watch_ok{false};
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            total_emits.fetch_add(1, std::memory_order_acq_rel);
+            // Reentrant unwatch()/watch() from INSIDE the emit callback is
+            // legal here: run_off_lock (which dispatches this callback) runs
+            // with mu_ released (this file's own OWNERSHIP/DISPATCH
+            // PROTOCOL rule 4/header comment) - not a same-thread relock.
+            if (!reentrant_done.exchange(true, std::memory_order_acq_rel)) {
+                const std::string other = (key == "A") ? "B" : "A";
+                raw->unwatch(other);
+                reentrant_watch_ok.store(raw->watch(other, spec.params).has_value(),
+                                         std::memory_order_release);
+            }
+        },
+        [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("A", spec.params).has_value());
+    REQUIRE(mech->watch("B", spec.params).has_value());
+    std::this_thread::sleep_for(300ms); // let both reads settle/arm
+
+    a.write("change"); // stages TWO Emit notices (one per key) in the SAME pass
+
+    CHECK(eventually([&] { return reentrant_done.load(std::memory_order_acquire); }, 3000ms));
+    std::this_thread::sleep_for(500ms); // let the whole pass finish dispatching both notices
+    CHECK(reentrant_watch_ok.load(std::memory_order_acquire));
+    // Falsifier: before the fix, key_index_ carried no per-key generation,
+    // so the OTHER key's already-staged notice (staged before this callback
+    // reentrantly unwatch()'d + watch()'d it) still passed notice_still_
+    // current's directory-identity-only check and dispatched anyway - 2
+    // emits for one file write. After the fix, the stale notice's
+    // generation no longer matches key_index_'s current one and is
+    // dropped - exactly 1 (the new registration correctly missed a change
+    // that happened before it existed).
+    CHECK(total_emits.load(std::memory_order_acquire) == 1);
+    mech->stop();
+}
+
+// ── File walkoff (#2012/#3840 PR-B2), round-3 fixes (transition table, ────
+// Astra table opine) — corrected round-2 findings 1/3/4/5/6/8/9/10, plus
+// three defects the table review itself surfaced (commit_probe_locked's
+// uncaught attach exception, the Idle-case resync/confirmation ordering,
+// and an over-eager version of the finding-9 fix that was reverted after
+// it broke the existing key_gen test above on real DGRHP hardware — see
+// that test's own falsifier for the corrected, narrower trigger).
+
+TEST_CASE("File mechanism (direct): a key joining an existing watch that is CURRENTLY faulted "
+          "gets its own fault status, not silent health for the rest of the fault's duration "
+          "(#2012/#3840 PR-B2 review finding 9)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir a("join_faulted");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> park_a{true};
+    {
+        FileMechanismTestControls ctl;
+        ctl.health_grace = 60ms;
+        ctl.probe_hook = [&](std::wstring_view) {
+            if (park_a.load(std::memory_order_acquire))
+                std::this_thread::sleep_for(500ms); // past grace, every retry, until released
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    const auto spec = file_spec(a.file.string());
+    std::atomic<int> a_faults{0}, b_faults{0};
+    mech->start([](const std::string&, SparkData) {},
+                [&](const std::string& key, bool faulted, std::string_view) {
+                    if (!faulted)
+                        return;
+                    if (key == "A")
+                        a_faults.fetch_add(1, std::memory_order_acq_rel);
+                    else if (key == "B")
+                        b_faults.fetch_add(1, std::memory_order_acq_rel);
+                });
+    REQUIRE(mech->watch("A", spec.params).has_value());
+    // A settles into a reported fault (desired == reported == true) before B ever joins.
+    REQUIRE(eventually([&] { return a_faults.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    std::this_thread::sleep_for(150ms); // let health_reported_faulted's stamp fully settle
+
+    // B joins the SAME already-faulted directory (Decision #3: joining a real, live watch
+    // rides along — no separate establishment). Falsifier: before the fix, B rode along
+    // silently healthy — check_health_edge_locked's own "desired == reported, no edge" guard
+    // means nothing would ever re-fan-out the existing fault to B until the fault actually
+    // CHANGES (which this test never lets happen). After the fix, watch()'s own join path
+    // forces a fresh mismatch, and finding 5's unconditional per-visit check re-fans it out.
+    REQUIRE(mech->watch("B", spec.params).has_value());
+    CHECK(eventually([&] { return b_faults.load(std::memory_order_acquire) >= 1; }, 3000ms));
+
+    park_a.store(false, std::memory_order_release);
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): an ordinary key joining an already-HEALTHY, settled shared "
+          "directory does NOT trigger a spurious synthetic resync to its siblings (#2012/#3840 "
+          "PR-B2 review finding 9, over-trigger regression)",
+          "[spark][mechanism][windows][walkoff]") {
+    // This is the DGRHP-caught regression itself, isolated: an earlier version of the finding-9
+    // fix bumped needs_resync unconditionally on every non-fresh watch() join (not just a
+    // faulted one), which fired a bogus resync Emit to every existing sibling key on every
+    // ordinary co-watch — breaking the key_gen test above (5 emits instead of 1) on real
+    // Windows hardware. Asserted directly here so a future change can't silently reintroduce it
+    // without tripping this test first.
+    ScratchDir a("join_healthy");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const auto spec = file_spec(a.file.string());
+    std::atomic<int> emits{0};
+    mech->start([&](const std::string&, SparkData) { emits.fetch_add(1, std::memory_order_acq_rel); },
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("A", spec.params).has_value());
+    std::this_thread::sleep_for(300ms); // let A's establishment fully settle, healthy
+
+    REQUIRE(mech->watch("B", spec.params).has_value()); // ordinary co-watch, nothing faulted
+    std::this_thread::sleep_for(500ms); // give a spurious resync every chance to fire if it exists
+    CHECK(emits.load(std::memory_order_acquire) == 0); // no change ever happened on disk
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a throw staging the owed shelter-confirmation probe leaves "
+          "confirmation_due set, not lost - the next Idle sweep retries it "
+          "(#2012/#3840 PR-B2 review finding 10)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("confirm_fail");
+    const auto target = root.dir / "never_appears" / "deep.txt";
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<int> reserve_hook_calls{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 20ms;
+        // Call #0 is watch()'s own initial reserve (fresh DirWatch, resolves Ancestor-mode).
+        // Call #1 is the owed shelter-confirmation probe's reservation
+        // (sweep_probes_locked's Idle+confirmation_due branch) - the precise, deterministic
+        // target for this fix.
+        ctl.reserve_probe_fail_hook = [&](std::wstring_view) {
+            if (reserve_hook_calls.fetch_add(1, std::memory_order_acq_rel) == 1)
+                throw std::runtime_error("injected confirmation-probe reservation failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(target.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    // Falsifier: before the fix, sweep_probes_locked's Idle case cleared confirmation_due
+    // BEFORE attempting the reservation - a throw there permanently lost the owed
+    // confirmation (no future trigger, since a STABLE shelter never re-arms it). After the
+    // fix, confirmation_due survives the failed attempt and the very next Idle sweep retries
+    // it, so probe_launched eventually reaches 2 (initial + the confirmation, once retried)
+    // despite exactly one injected failure in between.
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_launched >= 2;
+        },
+        5000ms));
+    CHECK(reserve_hook_calls.load(std::memory_order_acquire) >= 2); // the hook fired at least
+                                                                    // twice: the injected
+                                                                    // failure + a real retry
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): an allocation failure inside attach_ancestor_locked's own "
+          "early work (fold_ci) does not strand the watch Idle-with-nothing-owed "
+          "(#2012/#3840 PR-B2 review, round-3 table opine)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("commit_attach_fail_root");
+    const auto target = root.dir / "never_appears" / "deep.txt"; // resolves Ancestor-mode
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> fail_once{true};
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 40ms;
+        ctl.sweep_cadence = 20ms;
+        ctl.commit_attach_fail_hook = [&](std::wstring_view) {
+            if (fail_once.exchange(false, std::memory_order_acq_rel))
+                throw std::runtime_error("injected attach_ancestor_locked allocation failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    const auto spec = file_spec(target.string());
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+
+    // Falsifier: before the fix, w.probe/w.call were already reset to Idle/empty before
+    // attach_ancestor_locked ran - a throw inside it (fold_ci's own allocation) left the
+    // watch looking fully at rest, with no Deferred retry and no owner for establishment,
+    // permanently. After the fix, the throw is caught and routed through
+    // fail_backend_locked/defer_backend_retry_locked exactly like a genuine OS-call failure,
+    // so establishment keeps a scheduled retry and eventually succeeds (shelters under root).
+    CHECK_FALSE(fail_once.load(std::memory_order_acquire)); // never even reached the assertion
+                                                             // below if the hook never fired -
+                                                             // this proves it did
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_backend_failed >= 1 && d->live_ancestors == 1;
+        },
+        5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): an ordinary Emit notice left Outcome::Unattempted by a "
+          "same-pass run_off_lock failure is not silently lost "
+          "(#2012/#3840 PR-B2 review round-3 closure pass — replaces a false-green predecessor "
+          "that never actually proved the coincidence it claimed to test)",
+          "[spark][mechanism][windows][walkoff]") {
+    // The predecessor version of this test raced a real file write against a SEPARATE watch's
+    // exponentially-backing-off Deferred retry, asserting only eventual delivery - which passes
+    // whether or not the throw ever actually landed on the write's own staging pass (its own
+    // comment said as much: "Either way, B eventually receives its notice"). Astra's round-3
+    // opine caught this: the test can pass without exercising its advertised failure window.
+    //
+    // A genuinely race-free version turns out to need the SAME watch to supply both the notice
+    // AND the probe launch emit_bookkeeping_hook's precondition requires ("staged at least one
+    // probe launch") - a SEPARATE watch's due-timer cannot be made to coincide deterministically:
+    // wait_timeout_locked schedules run()'s own proactive wake for the EXACT instant any
+    // obligation becomes due, so "due but not yet swept" is not a window a test can reliably
+    // land in (confirmed empirically: a bounded retry-loop version of this test, giving a second
+    // watch a fresh near-immediate retry each attempt, still failed to coincide in 25 attempts on
+    // real hardware). This version instead forces B's OWN reissue to fail (real_rearm_fail_hook,
+    // no genuine OS-level failure needed) right after its real write has already staged the
+    // ordinary notice - deterministic, same pass, by construction, not a race.
+    //
+    // Note on coverage: B's own reissue-fail ALSO independently sets needs_resync=true as part of
+    // its ordinary gap-2 (loss of target coverage) handling - this test therefore exercises the
+    // SCENARIO (an Unattempted ordinary notice does not end up silently, permanently lost) with
+    // two cooperating recovery mechanisms in play, not a strict isolation of only the
+    // restore_unattempted_notices_locked fallback below. That fallback is still a real, necessary
+    // fix in its own right: it is the ONLY thing that saves an Unattempted ordinary notice in the
+    // narrower case where nothing else already set needs_resync for the same watch (e.g. a
+    // transient allocation failure hitting emit_bookkeeping_hook on an otherwise fully healthy
+    // pass with no reissue failure at all) - see restore_unattempted_notices_locked's own doc
+    // comment for the gap this closes (matching reconcile_notice_outcomes_locked's existing
+    // Failed-ordinary-Emit handling, which Unattempted lacked entirely before this fix).
+    ScratchDir b("unattempted2_b");
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> rearm_armed{false};
+    std::atomic<int> rearm_hits{0};
+    std::atomic<bool> hook_armed{false};
+    std::atomic<int> hook_hits{0};
+    std::atomic<int> b_delivered{0};
+    const std::wstring b_dir_w = b.dir.wstring();
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 20ms;
+        ctl.sweep_cadence = 10ms;
+        ctl.real_rearm_fail_hook = [&](std::wstring_view dir) {
+            if (dir == b_dir_w && rearm_armed.exchange(false, std::memory_order_acq_rel)) {
+                rearm_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.emit_bookkeeping_hook = [&] {
+            hook_hits.fetch_add(1, std::memory_order_acq_rel);
+            if (hook_armed.exchange(false, std::memory_order_acq_rel))
+                throw std::runtime_error("injected run_off_lock failure before notice dispatch");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == "B")
+                b_delivered.fetch_add(1, std::memory_order_acq_rel);
+        },
+        [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("B", file_spec(b.file.string()).params).has_value());
+    std::this_thread::sleep_for(150ms); // let B fully establish
+
+    rearm_armed.store(true, std::memory_order_release);
+    hook_armed.store(true, std::memory_order_release);
+    b.write("change"); // stage_fire_locked stages B's ordinary notice; the forced reissue
+                       // failure (same pass) stages a probe launch, which fires
+                       // emit_bookkeeping_hook before the notices loop ever runs
+
+    CHECK(eventually([&] { return rearm_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually([&] { return hook_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK_FALSE(hook_armed.load(std::memory_order_acquire)); // the throw actually fired
+    // Falsifier: B's write happens exactly once - without SOME recovery path (gap-2's own
+    // reissue-fail handling, and/or restore_unattempted_notices_locked's Unattempted fallback),
+    // delivered can never reach 1.
+    CHECK(eventually([&] { return b_delivered.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a throw inside reresolve_absent_locked after a successful "
+          "ancestor rearm still latches every dependent's reappearance, via the allocation-free "
+          "fallback (#2012/#3840 PR-B2 review finding 8, incompleteness note)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("reappear_throw_root");
+    const auto anc = root.dir / "anc";
+    std::filesystem::create_directories(anc);
+    const auto dep = anc / "child" / "target.txt"; // never created — shelters under anc
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::atomic<bool> armed{false}; // only after the initial establishment + owed shelter
+                                    // confirmation have already happened, so the hook cannot
+                                    // accidentally fail either of THOSE reservations instead
+    std::atomic<bool> fail_once{true};
+    {
+        // No dedicated hook exists for reresolve_absent_locked's own internal allocation (its
+        // candidates-vector reserve, or stage_probe_locked's own throw) - route through
+        // reserve_probe_fail_hook_, armed only once the dependent has a STABLE shelter, so the
+        // only reservation left for this directory is the reappearance-triggered one (the
+        // ancestor's OWN fire), not the dependent's initial establishment or its one owed
+        // confirmation probe.
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 20ms;
+        ctl.reserve_probe_fail_hook = [&](std::wstring_view dir) {
+            if (armed.load(std::memory_order_acquire) && dir == dep.parent_path().wstring() &&
+                fail_once.exchange(false, std::memory_order_acq_rel))
+                throw std::runtime_error("injected reresolve_absent_locked reservation failure");
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    const auto spec = file_spec(dep.string());
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch(spark_key(spec), spec.params).has_value());
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->live_ancestors == 1;
+        },
+        3000ms)); // sheltered under anc
+    // Matches the STABLE-shelter test's own reasoning: initial probe (#1, resolves Ancestor)
+    // plus the one owed confirmation probe (#2) are both deterministically done by here.
+    REQUIRE(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->probe_launched >= 2; }, 3000ms));
+    std::this_thread::sleep_for(200ms); // let the confirmation probe's own commit fully settle
+    armed.store(true, std::memory_order_release);
+
+    const auto p0 = file_debug_counters_for_test(*mech)->probe_launched;
+    // Fire the ancestor's own read (bWatchSubtree=FALSE, so only a DIRECT child of anc
+    // triggers this) - route_noop_rearm succeeds (io_pending becomes true), then
+    // reresolve_absent_locked runs and, per the hook above, throws once.
+    { std::ofstream(anc / "trigger.txt") << "x"; }
+
+    // Falsifier: before this fix, a throw here escaped process_completion_locked entirely with
+    // io_pending already true - unwind_pass_locked's consumed-completion guard requires
+    // !io_pending, so it could not help, and the dependent's reappearance signal was silently
+    // lost with no future trigger. After the fix, the local try/catch around
+    // reresolve_absent_locked falls back to mark_reappearance_locked, which marks the
+    // dependent confirmation_due - picked up by the next Idle sweep, launching a fresh probe.
+    CHECK(eventually(
+        [&] { return file_debug_counters_for_test(*mech)->probe_launched >= p0 + 1; }, 5000ms));
+    CHECK_FALSE(fail_once.load(std::memory_order_acquire)); // the hook did fire
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a real-directory completion's !ok branch recovers via "
+          "defer_backend_retry_locked when stage_probe_locked's own allocation throws "
+          "(#2012/#3840 PR-B2 review round-3 closure pass, process_completion_locked !ok "
+          "non-ancestor local catch)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Deterministic trigger for BOTH conditions this catch needs: notify_fail_hook forces the
+    // watch's own real completion to be treated as a backend failure (!ok) without a genuine
+    // OS-level failure; reserve_probe_fail_hook (existing seam) forces the resulting
+    // stage_probe_locked() call to throw. Falsifier: before this fix, w.handle was already reset
+    // by the !ok branch before stage_probe_locked ran - an uncaught throw there left the watch
+    // Idle with no probe, no confirmation, no grace check, permanently deaf while its own
+    // needs_resync one-shot falsely reported coverage restored.
+    ScratchDir root("handleloss_realdir");
+    const auto target = root.dir / "t.txt";
+    { std::ofstream(target) << "seed"; }
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const std::wstring target_dir_w = root.dir.wstring();
+    std::atomic<bool> notify_armed{false};
+    std::atomic<int> notify_hits{0};
+    std::atomic<bool> reserve_armed{false};
+    std::atomic<int> reserve_hits{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 20ms;
+        ctl.sweep_cadence = 10ms;
+        ctl.notify_fail_hook = [&](std::wstring_view dir) {
+            if (dir == target_dir_w && notify_armed.exchange(false, std::memory_order_acq_rel)) {
+                notify_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.reserve_probe_fail_hook = [&](std::wstring_view dir) {
+            if (dir == target_dir_w && reserve_armed.exchange(false, std::memory_order_acq_rel)) {
+                reserve_hits.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected stage_probe_locked allocation failure");
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> delivered{0};
+    mech->start([&](const std::string&, SparkData) { delivered.fetch_add(1); },
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("k", file_spec(target.string()).params).has_value());
+    std::this_thread::sleep_for(150ms); // let establishment settle
+
+    notify_armed.store(true, std::memory_order_release);
+    reserve_armed.store(true, std::memory_order_release);
+    { std::ofstream(target, std::ios::app) << "x"; } // real completion — overridden to !ok
+
+    CHECK(eventually([&] { return notify_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually([&] { return reserve_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_backend_failed >= 1;
+        },
+        3000ms)); // defer_backend_retry_locked ran — the catch's fallback, not a std::terminate
+                  // or a permanently-stranded watch
+    // Recovery: the fail-once hooks are spent, so the NEXT retry establishes normally and further
+    // real writes are delivered — no external rescue beyond the scheduled retry itself.
+    { std::ofstream(target, std::ios::app) << "y"; }
+    CHECK(eventually([&] { return delivered.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a real-directory reissue failure recovers via "
+          "defer_backend_retry_locked when the resulting stage_probe_locked's own allocation "
+          "throws (#2012/#3840 PR-B2 review round-3 closure pass, process_completion_locked "
+          "reissue-fail local catch)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("handleloss_reissue");
+    const auto target = root.dir / "t.txt";
+    { std::ofstream(target) << "seed"; }
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const std::wstring target_dir_w = root.dir.wstring();
+    std::atomic<bool> rearm_armed{false};
+    std::atomic<int> rearm_hits{0};
+    std::atomic<bool> reserve_armed{false};
+    std::atomic<int> reserve_hits{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.backend_retry_base = 20ms;
+        ctl.sweep_cadence = 10ms;
+        ctl.real_rearm_fail_hook = [&](std::wstring_view dir) {
+            if (dir == target_dir_w && rearm_armed.exchange(false, std::memory_order_acq_rel)) {
+                rearm_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.reserve_probe_fail_hook = [&](std::wstring_view dir) {
+            if (dir == target_dir_w && reserve_armed.exchange(false, std::memory_order_acq_rel)) {
+                reserve_hits.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected stage_probe_locked allocation failure");
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    std::atomic<int> delivered{0};
+    mech->start([&](const std::string&, SparkData) { delivered.fetch_add(1); },
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("k", file_spec(target.string()).params).has_value());
+    std::this_thread::sleep_for(150ms);
+
+    rearm_armed.store(true, std::memory_order_release);
+    reserve_armed.store(true, std::memory_order_release);
+    { std::ofstream(target, std::ios::app) << "x"; } // real completion — its own reissue is
+                                                     // forced to fail, then that failure's
+                                                     // stage_probe_locked is forced to throw
+
+    CHECK(eventually([&] { return rearm_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually([&] { return reserve_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_backend_failed >= 1;
+        },
+        3000ms));
+    { std::ofstream(target, std::ios::app) << "y"; }
+    CHECK(eventually([&] { return delivered.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): an ancestor's !ok completion recovers via "
+          "dead_pending_invalidate when invalidate_ancestor_locked's own allocation throws, "
+          "with MULTIPLE dependents all preserved (#2012/#3840 PR-B2 review round-3 closure "
+          "pass, process_completion_locked !ok ancestor local catch)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("handleloss_anc_ok");
+    const auto anc = root.dir / "anc";
+    std::filesystem::create_directories(anc);
+    const auto dep1 = anc / "child1" / "t1.txt"; // never created — shelters under anc
+    const auto dep2 = anc / "child2" / "t2.txt"; // never created — same ancestor
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const std::wstring anc_dir_w = anc.wstring();
+    std::atomic<bool> notify_armed{false};
+    std::atomic<int> notify_hits{0};
+    std::atomic<bool> invalidate_armed{false};
+    std::atomic<int> invalidate_hits{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 10ms;
+        ctl.notify_fail_hook = [&](std::wstring_view dir) {
+            if (dir == anc_dir_w && notify_armed.exchange(false, std::memory_order_acq_rel)) {
+                notify_hits.fetch_add(1, std::memory_order_acq_rel);
+                return true;
+            }
+            return false;
+        };
+        ctl.ancestor_invalidate_fail_hook = [&](std::wstring_view dir) {
+            if (dir == anc_dir_w && invalidate_armed.exchange(false, std::memory_order_acq_rel)) {
+                invalidate_hits.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected invalidate_ancestor_locked allocation failure");
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("d1", file_spec(dep1.string()).params).has_value());
+    REQUIRE(mech->watch("d2", file_spec(dep2.string()).params).has_value());
+    REQUIRE(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->live_ancestors == 1; // both share ONE ancestor slot
+        },
+        3000ms));
+    std::this_thread::sleep_for(100ms); // let both dependents' shelter settle fully
+
+    notify_armed.store(true, std::memory_order_release);
+    invalidate_armed.store(true, std::memory_order_release);
+    { std::ofstream(anc / "unrelated.txt") << "x"; } // real completion on the ancestor's own
+                                                     // read — overridden to !ok
+
+    CHECK(eventually([&] { return notify_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually([&] { return invalidate_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    // No crash, no UAF (ASan/general test-suite stability is part of what this proves), and both
+    // dependents eventually recover WITHOUT another externally-injected event: the marker gets
+    // swept, a fresh ancestor gets created, and both dependents' shelter/probe machinery resumes.
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_launched >= 2; // both dependents got a fresh probe
+        },
+        5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): an ancestor's failed rearm recovers via "
+          "dead_pending_invalidate when invalidate_ancestor_locked's own allocation throws, "
+          "with MULTIPLE dependents all preserved and the shared-slot amplifier closed "
+          "(#2012/#3840 PR-B2 review round-3 closure pass, process_completion_locked "
+          "failed-rearm local catch)",
+          "[spark][mechanism][windows][walkoff]") {
+    ScratchDir root("handleloss_anc_rearm");
+    const auto anc = root.dir / "anc";
+    std::filesystem::create_directories(anc);
+    const auto dep1 = anc / "child1" / "t1.txt";
+    const auto dep2 = anc / "child2" / "t2.txt";
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    const std::wstring anc_dir_w = anc.wstring();
+    std::atomic<bool> rearm_armed{false};
+    std::atomic<int> rearm_hits{0};
+    std::atomic<bool> invalidate_armed{false};
+    std::atomic<int> invalidate_hits{0};
+    {
+        FileMechanismTestControls ctl;
+        ctl.sweep_cadence = 10ms;
+        ctl.ancestor_rearm_fail_hook = [&](std::wstring_view dir) { return dir == anc_dir_w; };
+        ctl.ancestor_invalidate_fail_hook = [&](std::wstring_view dir) {
+            if (dir == anc_dir_w && invalidate_armed.exchange(false, std::memory_order_acq_rel)) {
+                invalidate_hits.fetch_add(1, std::memory_order_acq_rel);
+                throw std::runtime_error("injected invalidate_ancestor_locked allocation failure");
+            }
+        };
+        REQUIRE(set_file_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    mech->start([](const std::string&, SparkData) {},
+                [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("d1", file_spec(dep1.string()).params).has_value());
+    REQUIRE(mech->watch("d2", file_spec(dep2.string()).params).has_value());
+    REQUIRE(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->live_ancestors == 1;
+        },
+        3000ms));
+    std::this_thread::sleep_for(100ms);
+
+    invalidate_armed.store(true, std::memory_order_release);
+    { std::ofstream(anc / "unrelated.txt") << "x"; } // real completion; rearm is forced to fail
+                                                     // unconditionally (ancestor_rearm_fail_hook
+                                                     // has no fire-once guard, matching the
+                                                     // existing precedent test's usage), landing
+                                                     // in the failed-rearm catch
+
+    CHECK(eventually([&] { return invalidate_hits.load(std::memory_order_acquire) >= 1; }, 3000ms));
+    CHECK(eventually(
+        [&] {
+            auto d = file_debug_counters_for_test(*mech);
+            return d.has_value() && d->probe_launched >= 2;
+        },
+        5000ms));
+    mech->stop();
+}
+
+TEST_CASE("File mechanism (direct): a key joining a directory mid-resync-dispatch gets its own "
+          "settlement, not lost or perpetually re-triggered (#2012/#3840 PR-B2 review round-3 "
+          "closure pass, membership-join-during-resync-dispatch fix)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Deterministic construction, no timing race: `emit_` (called off-lock, no mu_ held) blocks
+    // on kA's first delivery — which is its reappearance-triggered resync notice, the same proven
+    // trigger the criterion #11 test above uses (create the previously-absent shared directory ->
+    // reresolve_absent_locked -> attach commit sets needs_resync -> next sweep stages the resync,
+    // setting resync_dispatch_in_flight) — giving the test a real, held-open window in which
+    // resync_dispatch_in_flight is DEFINITELY true to join kB onto the same directory, rather
+    // than hoping a throwing hook happens to coincide with one.
+    ScratchDir root("join_midflight");
+    const auto shared_dir = root.dir / "shared"; // absent until triggered below
+    const auto file_a = shared_dir / "a.txt";
+    const auto file_b = shared_dir / "b.txt";
+    auto mech = make_file_mechanism();
+    REQUIRE(mech != nullptr);
+    std::mutex block_mu;
+    std::condition_variable block_cv;
+    bool release_a{false};
+    std::atomic<bool> a_blocked{false};
+    std::atomic<bool> a_block_armed{true}; // only kA's very first delivery blocks
+    std::atomic<int> delivered_a{0}, delivered_b{0};
+    mech->start(
+        [&](const std::string& key, SparkData) {
+            if (key == "kA") {
+                if (a_block_armed.exchange(false, std::memory_order_acq_rel)) {
+                    std::unique_lock lk(block_mu);
+                    a_blocked.store(true, std::memory_order_release);
+                    block_cv.wait(lk, [&] { return release_a; });
+                }
+                delivered_a.fetch_add(1, std::memory_order_acq_rel);
+            } else if (key == "kB") {
+                delivered_b.fetch_add(1, std::memory_order_acq_rel);
+            }
+        },
+        [](const std::string&, bool, std::string_view) {});
+    REQUIRE(mech->watch("kA", file_spec(file_a.string()).params).has_value()); // creates the
+                                                                               // shared DirWatch,
+                                                                               // absent, sheltered
+    std::this_thread::sleep_for(300ms); // let it settle, sheltered under root
+
+    std::filesystem::create_directories(shared_dir); // reappearance trigger — eventually lands
+                                                      // kA blocked inside emit_, mid-dispatch
+
+    // RAII: if anything below throws (e.g. this REQUIRE) or the test otherwise unwinds early,
+    // release the blocked emit_ call regardless — without this, ~WindowsFileMechanism's stop()
+    // would join a worker thread parked in an unbounded condition_variable::wait, hanging the
+    // whole test binary instead of failing red (Kimi's closure-pass review, non-blocking finding
+    // b).
+    struct ReleaseOnExit {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& flag;
+        ~ReleaseOnExit() {
+            {
+                std::lock_guard lk(mu);
+                flag = true;
+            }
+            cv.notify_all();
+        }
+    } release_guard{block_mu, block_cv, release_a};
+
+    REQUIRE(eventually([&] { return a_blocked.load(std::memory_order_acquire); }, 5000ms));
+    // kA's resync dispatch is now genuinely held open off-lock, no mu_ — join kB onto the SAME
+    // now-live directory while it is still outstanding.
+    REQUIRE(mech->watch("kB", file_spec(file_b.string()).params).has_value());
+
+    { // let kA's blocked delivery proceed
+        std::lock_guard lk(block_mu);
+        release_a = true;
+    }
+    block_cv.notify_all();
+
+    // Falsifier: before the fix, kB rode along on the in-flight batch's stale w.keys snapshot
+    // (built before it joined) and could settle with no obligation of its own if that batch's
+    // outcome landed Submitted - a join in this exact window silently lost coverage. After the
+    // fix, kB gets its own fresh epoch (its resync eventually delivers too), and once BOTH keys
+    // are healthy and settled there is no unbounded re-trigger loop for an ordinary join.
+    CHECK(eventually([&] { return delivered_a.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    CHECK(eventually([&] { return delivered_b.load(std::memory_order_acquire) >= 1; }, 5000ms));
+    const auto emits_at_settle = [&] {
+        auto d = file_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        return d->synthetic_fires;
+    };
+    std::this_thread::sleep_for(300ms); // let any further legitimate settlement resync finish
+    const auto settled = emits_at_settle();
+    std::this_thread::sleep_for(400ms); // long enough to catch an unbounded re-trigger loop
+    CHECK(emits_at_settle() == settled); // settlement is stable — no perpetual re-fire
+    mech->stop();
 }
 
 #endif // _WIN32
