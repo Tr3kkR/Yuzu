@@ -23,12 +23,14 @@
 
 #include <libpq-fe.h>
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace yuzu::server;
@@ -208,6 +210,28 @@ private:
     std::optional<yuzu::server::pg::PgPool> pool_;
     std::unique_ptr<GatewayRouteStore> store_;
 };
+
+// Block until a backend OTHER than this polling connection is waiting on a
+// lock, or give up. Mirrors test_settings_routes_ota_audit.cpp's
+// wait_for_lock_waiter and the #4213 UP-3 self-heal side-lock rendezvous:
+// polling pg_stat_activity for genuinely-observed lock contention, rather
+// than sleeping a fixed duration, is what makes the rendezvous deterministic
+// instead of a timing assumption. A bounded ceiling exists so a genuine
+// absence of blocking FAILS the caller's REQUIRE rather than hanging.
+[[nodiscard]] bool wait_for_lock_waiter(PGconn* conn) {
+    for (int i = 0; i < 400; ++i) { // ~10s ceiling, far above any real wait
+        yuzu::server::pg::PgResult r{
+            PQexec(conn, "SELECT count(*) FROM pg_stat_activity "
+                         "WHERE datname = current_database() "
+                         "AND wait_event_type = 'Lock' "
+                         "AND pid <> pg_backend_pid()")};
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 &&
+            std::string(PQgetvalue(r.get(), 0, 0)) != "0")
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    return false;
+}
 
 } // namespace
 
@@ -803,31 +827,80 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines a negative persisted anchor",
 // ---------------------------------------------------------------------------
 // Governance fix #4 (cpp-safety + unhappy-path UP-4): the outer UPDATE in
 // sweep (a) re-asserts the expired predicate, not just `agent_id IN (...)` —
-// a row renewed to a future lease must never be tombstoned. Not a true
-// LOCK-TABLE rendezvous race (task spec marks that nice-to-have, not
-// required): this drives the same end state a race would produce, a row
-// whose lease is healthy by the time the outer UPDATE would touch it.
+// a row renewed to a future lease must never be tombstoned. A prior version
+// of this case renewed and COMMITTED before calling reap_stale_routes(),
+// which never exercises the re-assert at all: the inner subquery's own
+// snapshot already excludes a row that was renewed and committed first, so
+// the outer re-check is redundant with the subquery and the case passes
+// identically with FIX 4 present or reverted (a false green).
+//
+// The genuine race needs the renew to land INSIDE the reaper's
+// snapshot-to-row-lock window: a concurrent transaction commits a
+// future-lease UPDATE only AFTER the reaper's row-lock attempt blocks on it,
+// forcing PostgreSQL's EvalPlanQual to re-check the outer UPDATE's WHERE
+// against the freshly-committed row version. Deterministic via the #4213
+// UP-3 self-heal side-lock pattern: hold the row lock in an open
+// transaction, launch the reaper on its own thread, poll pg_stat_activity
+// until it is observed genuinely blocked, THEN commit.
 TEST_CASE("GatewayRouteStore[pg]: reap does not tombstone a row renewed to a future lease "
           "(outer-UPDATE re-assert, governance fix #4)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
-    REQUIRE(fx.store().register_fresh("agent-reap-renew", "session-1").value().won);
+    REQUIRE(fx.store().register_fresh("agent-reap-epq", "session-1").value().won);
     REQUIRE(fx.store()
-                .announce_connected("agent-reap-renew", "session-1", "c1", "n1", 30)
+                .announce_connected("agent-reap-epq", "session-1", "c1", "n1", 30)
                 .value()
                 .matched);
-    fx.raw_set_lease_until_ago("agent-reap-renew", 200); // past the 180s grace
-    auto renewed =
-        fx.store().renew_leases(std::vector<std::string>{"session-1"}, 3600); // future lease
-    REQUIRE(renewed.has_value());
-    CHECK(*renewed == 1);
+    fx.raw_set_lease_until_ago("agent-reap-epq", 200); // past the 180s grace, committed
 
-    auto out = fx.store().reap_stale_routes();
+    // Holder: BEGINs a future-lease UPDATE on the row and does NOT commit —
+    // this takes the row lock while leaving the OLD (expired, committed)
+    // lease_until the only version any OTHER transaction can see under READ
+    // COMMITTED. The reaper's inner subquery therefore still legitimately
+    // selects this agent_id as a candidate.
+    yuzu::server::pg::PgConn holder{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult begin{PQexec(holder.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        yuzu::server::pg::PgResult upd{PQexec(
+            holder.get(), "UPDATE gateway_route_store.agent_routes SET "
+                          "  lease_until = now() + interval '1 hour', updated_at = now() "
+                          "WHERE agent_id = 'agent-reap-epq'")};
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+
+    // Run the reaper on its own thread, against the SAME store (its pool has
+    // spare connections beyond the one the holder above uses directly). Its
+    // sweep-(a) outer UPDATE selects agent-reap-epq via the subquery, then
+    // blocks taking the row lock the holder connection is sitting on.
+    std::expected<ReapRoutesResult, GatewayRouteStoreError> out;
+    std::thread reaper([&] { out = fx.store().reap_stale_routes(); });
+
+    // Side connection used ONLY to observe pg_stat_activity — never touches
+    // the row itself, so its own presence cannot perturb the race.
+    yuzu::server::pg::PgConn watcher{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(watcher.get()) == CONNECTION_OK);
+    const bool blocked = wait_for_lock_waiter(watcher.get());
+    REQUIRE(blocked); // if nothing ever blocks, nothing locked the row, and
+                       // the race this test exists to force never happened.
+
+    // Only now does the future-lease version become visible to the blocked
+    // reaper — exactly the window governance fix #4's outer-WHERE re-assert
+    // defends via EvalPlanQual.
+    {
+        yuzu::server::pg::PgResult commit{PQexec(holder.get(), "COMMIT")};
+        REQUIRE(commit.status() == PGRES_COMMAND_OK);
+    }
+
+    reaper.join();
+
     REQUIRE(out.has_value());
-    CHECK(out->expired_leases_reaped == 0);
     CHECK_FALSE(out->clock_anomaly);
+    // The renewed-under-EPQ row must not be counted as reaped.
+    CHECK(out->expired_leases_reaped == 0);
 
-    auto row = fx.store().lookup_route("agent-reap-renew");
+    auto row = fx.store().lookup_route("agent-reap-epq");
     REQUIRE(row.has_value());
     REQUIRE(row->has_value());
     REQUIRE((*row)->session_id.has_value());
