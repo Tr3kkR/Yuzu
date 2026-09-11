@@ -6541,10 +6541,16 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     // Contained: the throw is a genuine backend failure (never WorkerThrew
     // silently discarded), and dispatches a fault — proving the mechanism's
     // own dispatch loop survives it, rather than crashing or wedging.
+    // Wait for the fault itself, not the backend-failure counter alone
+    // (#2012/#3840 PR-B3 review, K9/C1-04): resolve_probe() increments the
+    // counter BEFORE the mechanism thread reaches dispatch() at the bottom
+    // of its loop, so a wait keyed on the counter can observe a window where
+    // it's already incremented but the fault hasn't been delivered to `got`
+    // yet — an occasional false failure on a correctly-behaving mechanism.
     CHECK(eventually(
         [&] {
-            auto d = service_debug_counters_for_test(*mech);
-            return d && d->probe_backend_failed > 0;
+            std::lock_guard lk(got.mu);
+            return !got.faults.empty();
         },
         3000ms));
     {
@@ -6552,6 +6558,11 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
         REQUIRE_FALSE(got.faults.empty());
         CHECK(std::get<0>(got.faults.back()) == spark_key(spec_a));
         CHECK(std::get<1>(got.faults.back())); // faulted == true
+    }
+    {
+        auto d = service_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->probe_backend_failed > 0);
     }
     mech->stop();
 }
