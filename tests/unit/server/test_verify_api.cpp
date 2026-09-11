@@ -39,6 +39,7 @@ using yuzu::server::make_local_verify_api;
 using yuzu::server::ManagementGroup;
 using yuzu::server::ManagementGroupStore;
 using yuzu::server::VerifyCompareQuery;
+using yuzu::server::kMaxWindowDays;
 using yuzu::server::pg::PgPool;
 
 namespace {
@@ -130,6 +131,60 @@ TEST_CASE("VerifyApi: unknown/empty group is a precondition miss, NOT a degrade"
     CHECK_FALSE(result->truncated);
     CHECK(result->comparison.paired == 0);
     CHECK(result->comparison.insufficient); // paired == 0 -> nothing to compare
+}
+
+TEST_CASE("VerifyApi: window_days is clamped to [1, kMaxWindowDays], no bypass",
+          "[pg][verify_api]") {
+    // The internal std::clamp in compare() protects a FUTURE caller (e.g. a
+    // presentation-side client post-WS-B2) that forgets to clamp its own
+    // parsed window param. The empty-group path still runs build_comparison,
+    // which echoes the clamped window into comparison.window_days, so this
+    // asserts the clamp WITHOUT needing seeded cohort rows.
+    YUZU_REQUIRE_PG_DB_TPL(db, verify_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ManagementGroupStore groups{pool};
+    AppPerfCohortReader reader{pool};
+    REQUIRE(groups.is_open());
+
+    auto api = make_local_verify_api(groups, &reader);
+
+    VerifyCompareQuery q;
+    q.group_id = "no-such-group"; // precondition-miss path (present, not degrade)
+    q.app = "AcmeVPN.exe";
+    q.baseline_version = "4.2.0.0";
+    q.candidate_version = "4.3.0.0";
+
+    SECTION("over-cap window clamps down to kMaxWindowDays") {
+        q.window_days = 999;
+        const auto result = api->compare(q);
+        REQUIRE(result.has_value());
+        CHECK(result->comparison.window_days == kMaxWindowDays);
+    }
+    SECTION("zero window clamps up to 1") {
+        q.window_days = 0;
+        const auto result = api->compare(q);
+        REQUIRE(result.has_value());
+        CHECK(result->comparison.window_days == 1);
+    }
+    SECTION("negative window clamps up to 1") {
+        q.window_days = -5;
+        const auto result = api->compare(q);
+        REQUIRE(result.has_value());
+        CHECK(result->comparison.window_days == 1);
+    }
+    SECTION("lower in-range boundary (1) passes through unchanged") {
+        q.window_days = 1;
+        const auto result = api->compare(q);
+        REQUIRE(result.has_value());
+        CHECK(result->comparison.window_days == 1);
+    }
+    SECTION("upper in-range boundary (kMaxWindowDays) passes through unchanged") {
+        q.window_days = kMaxWindowDays;
+        const auto result = api->compare(q);
+        REQUIRE(result.has_value());
+        CHECK(result->comparison.window_days == kMaxWindowDays);
+    }
 }
 
 TEST_CASE("VerifyApi: compare pairs ONLY resolved group members, agent_id preserved",
