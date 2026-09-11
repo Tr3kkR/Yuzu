@@ -369,6 +369,14 @@ rule it replaces.
 > audit call at the WS-B2 cutover once core's REST-side audit covers the same view (avoiding a duplicate
 > row per view), not moving anything out of `*_ui.cpp`. No family has cut over yet, so this step has not
 > been exercised.
+>
+> **Update (2026-09-11, #4249): the seam template split into abstract + core-only headers.**
+> `network_api.hpp` now holds only the abstract `NetworkApi` interface (zero store references, not even
+> forward-declared); the store-backed factory (`make_local_network_api`) and its store forward-decls
+> moved to a new `network_api_local.hpp`, included only by the impl, `server.cpp`'s wiring, and tests —
+> never by a presentation TU. `scripts/ci/check-seam-closure.py` gained a fourth forbidden pattern,
+> `*_api_local.hpp`, so this boundary is CI-enforced, not conventional. This is the corrected two-header
+> shape the remaining families copy.
 
 **INV-31-6 — Every store that a component depends on appears in that component's readiness probe.**
 Stated as an invariant rather than a habit, because the existing `stores_ok` conjunction in `/readyz`

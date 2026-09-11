@@ -1,4 +1,4 @@
-#include "network_api.hpp"
+#include "network_api_local.hpp"
 
 #include "agent_registry.hpp"
 #include "dex_perf_rules.hpp" // kPerfTag*/parse_perf_* — the co-occurrence pressure inputs
