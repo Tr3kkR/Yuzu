@@ -5,7 +5,7 @@
 /// The httplib-coupled half of the unified A4 error/denial envelope. The pure
 /// JSON-string builders live in `rest_a4_envelope.hpp` (no httplib include, so
 /// they are testable in isolation via TestRouteSink). This header adds the thin
-/// `httplib::Response&`-taking wrapper that (1) mints or reuses the request's
+/// `httplib::Response&`-taking wrapper that (1) mints or reuses the response's
 /// `X-Correlation-Id` header so the header and the body's `correlation_id`
 /// always agree, then (2) returns the A4 body string. Kept out of the pure
 /// header so nothing that only needs the shape contract pulls in httplib.
