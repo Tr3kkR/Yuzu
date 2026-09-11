@@ -109,7 +109,7 @@ manually: alert on `yuzu_server_command_outbox_pending` growing without
 bound, or on `yuzu_server_command_outbox_deliver_retry_total` climbing
 steadily.
 
-### Gateway routing directory metrics (HA WS-4 4.1)
+### Gateway routing directory metrics (HA WS-4 4.1, desync counter added 4.2a)
 
 `GatewayRouteStore` (schema `gateway_route_store`) is the fenced agent→cluster
 routing directory written on the gateway-upstream connect/disconnect/heartbeat
@@ -120,10 +120,12 @@ epoch-fence design.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_gateway_route_write_failed_total` | counter | A `GatewayRouteStore` directory write that degraded instead of succeeding, labeled `op` (`register_fresh`\|`announce_connected`\|`deregister`\|`renew_leases`) and `reason` (`store_unavailable`\|`db_error`). **Fail-OPEN this slice** — the write is logged and the RPC proceeds regardless, since the directory is not yet dispatch-authoritative (4.1) — so this counter is the only signal a systemic Postgres write problem would otherwise leave invisible. |
+| `yuzu_server_gateway_route_desync_total` | counter | A directory session-guard that correctly REJECTED a write/lookup because the presented session doesn't own the row (`op` ∈ `renew_leases`\|`announce_connected`\|`deregister`\|`notify_stream_status`, `outcome` ∈ `shortfall`\|`session_mismatch`\|`unknown_session`). Distinct from the write-failed counter above — the call succeeded, the guard just refused to touch a row it doesn't own. A low background rate is expected (stale/superseded-session notifications); a sustained rise means the in-memory `gateway_sessions_` map and the durable directory have gone out of sync (HA WS-4 4.2a, `#4246` item #8). Deliberately excludes a benign `register_fresh` epoch-race loss. |
 
-There is deliberately no success/rate counter and no alert rule for this
-family yet — both land with the WS-4 4.2 fail-closed flip, once a reader
-depends on the directory being fresh.
+There is deliberately no success/rate counter and no alert rule for either
+metric in this family yet — both land with the WS-4 4.2b fail-closed flip,
+once a reader depends on the directory being fresh (`#4246` item #1 and the
+alert-rule half of item #8).
 
 ## SSO login metrics
 
