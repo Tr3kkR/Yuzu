@@ -6490,9 +6490,24 @@ TEST_CASE("Service mechanism (direct): probe-lane admission refusal is never cou
     CHECK(got.emit_count() == 0); // never established while refused, and no false Stopped either
 
     // Release A: the lane frees up, B's admission retry (on its own seeded
-    // backoff) eventually gets in and establishes for real.
+    // backoff) eventually gets in and establishes for real. Wait for B's OWN
+    // Stopped emit specifically, not just "any emit" (#2012/#3840 PR-B3
+    // review, found by this fix round's own DGRHP re-verification): A's real
+    // Winmgmt establishment can independently satisfy an "any emit" wait
+    // before B's admission-retry resolves, which this test doesn't actually
+    // care about — the busy-spin fix (next_retry cleared on Launched) made
+    // this pre-existing race visible by legitimately slowing a Pending
+    // watch's poll cadence down from an unbounded spin to kServicePollCadence.
     gate.release();
-    REQUIRE(eventually([&] { return got.emit_count() >= 1; }, 3000ms));
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(got.mu);
+            for (auto& [k, st] : got.emits)
+                if (k == spark_key(spec_b) && st == ServiceRunState::Stopped)
+                    return true;
+            return false;
+        },
+        3000ms));
     {
         std::lock_guard lk(got.mu);
         bool saw_b_stopped = false;
