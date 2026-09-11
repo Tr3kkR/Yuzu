@@ -1800,7 +1800,22 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!*exec_result) {
             res.status = 404;
-            res.set_content(detail::a4_error(res, "execution not found"), "application/json");
+            // #1552/#4030 anti-oracle (test_workflow_routes.cpp "zero-overlap
+            // confined caller gets the same 404 as a nonexistent id"): a
+            // per-request correlation_id in the BODY would let a confined
+            // caller distinguish "record exists but I can't see it" from
+            // "record does not exist" by diffing the two 404 bodies,
+            // defeating the whole point of this route's Gate 8 confinement
+            // fix. Both not-found branches below build the body via the pure
+            // `error_json_a4` builder with a fixed empty correlation_id
+            // (byte-identical by construction) rather than `a4_error`, which
+            // would echo the per-request header value into the body. The
+            // response still stamps a real `X-Correlation-Id` header
+            // (`ensure_correlation_id`) for grep-ability — only the body is
+            // exempt, and only on this route's two not-found branches.
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
             return;
         }
         const auto& exec = **exec_result;
@@ -1809,14 +1824,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // which audits every fetch) and none is added here; adding a
         // first-ever audit call to this route is a separate, unrelated
         // decision, out of scope for this fix. Denial 404-collapses
-        // identically to the not-found body above (#1552: same
-        // detail::a4_error call, same message -- correlation_id is the
-        // only per-request-varying field and is minted identically on
-        // every failure path regardless of which check caught it, so it
-        // is not an oracle; anti-enumeration is preserved).
+        // identically to the not-found body above (same fixed-empty-cid
+        // construction, see the comment there).
         if (!workflow_execution_visible(exec, gate.scope)) {
             res.status = 404;
-            res.set_content(detail::a4_error(res, "execution not found"), "application/json");
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
             return;
         }
 

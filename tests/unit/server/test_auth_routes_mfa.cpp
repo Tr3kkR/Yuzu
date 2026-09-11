@@ -981,12 +981,16 @@ TEST_CASE("POST /login/mfa/enroll still audits mfa.enroll.verified + "
     CHECK(step2->get_header_value("Set-Cookie").empty());
     // The one-time recovery-codes VALUE reveal stays withheld on deny -
     // only the fact that enrollment/codes were generated is unconditional.
-    // Exact-body match (security-guardian Gate 8 NICE), not just substring
-    // absence: this is the handler's own kFailureBody literal, so an exact
-    // match is strictly stronger and no more brittle than the substring
-    // check it replaces.
-    CHECK(step2->body ==
-          R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})");
+    // Field-level, not exact-body (#1552 sweep): the handler's kFailureBody
+    // is now `detail::a4_error`-backed, so the body carries a fresh
+    // per-request `correlation_id` the old literal didn't - code/message are
+    // still asserted exactly, which is the substantive claim this test
+    // makes (see the sibling fix in this file for the same reasoning:
+    // "POST /login/mfa with invalid pending token returns 401 + audit").
+    auto step2_json = nlohmann::json::parse(step2->body);
+    CHECK(step2_json["error"]["code"] == 401);
+    CHECK(step2_json["error"]["message"] == "Invalid verification code");
+    CHECK(step2_json["error"].contains("correlation_id"));
     // Exact counts (security-guardian Gate 8 NICE) - nothing else in this
     // fixture emits these actions, so == 1 also catches a future
     // duplicate-emission bug.
