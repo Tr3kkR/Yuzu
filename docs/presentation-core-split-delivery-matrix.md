@@ -7,7 +7,7 @@ tracks *what ships, in what order, who reviews it, and how we know it's done*. *
 with the ADRs, the ADR wins; on delivery status, this matrix is the source of truth.** The `/split`
 skill is a pointer to both and loses to both.
 
-**Verified against the tree 2026-09-10** (`origin/dev` @ `f9d1275c0`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2; the `network` family landed as the FIRST per-family in-process API seam — `NetworkApi`/`network_api.{hpp,cpp}` + `scripts/ci/check-seam-closure.py` — see the WS-A4 row). Re-stamp
+**Verified against the tree 2026-09-11** (`origin/dev` @ `f9d1275c0`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2; the `network` family landed as the FIRST per-family in-process API seam — `NetworkApi`/`network_api.{hpp,cpp}` + `scripts/ci/check-seam-closure.py` — see the WS-A4 row; #4249 then split that seam's factory header into `network_api.hpp` (abstract) + `network_api_local.hpp` (core-only), with the boundary between them CI-enforced, cutting the two-header shape the remaining families copy). Re-stamp
 this line whenever the table is revised — a matrix from a stale checkout is worse than none, and the
 current-state claims below were wrong in the first draft because they were copied from stale ADR status
 columns. Grep the tree, don't trust a doc.
@@ -48,22 +48,43 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   body makes the verb call) escapes **SILENTLY** — no warning, no failure (type-aware successor #2572). So WS-A4's contract-test half is DONE *for literal registrations*; what remains is the
   *per-family* seam enforcement (gates WS-B2) for the remaining families not yet done, and the handler→API seam
   refactor — do NOT rebuild the global test.
-- **The FIRST per-family seam landed: `network` (2026-09-10).** `NetworkApi` (`server/core/src/network_api.{hpp,cpp}`)
-  is an abstract in-process API whose method set equals the family's public REST resources
-  (`fleet_now` == `GET /api/v1/network/fleet`, `device_list` == `GET /api/v1/network/devices`); the
-  store-backed impl (`LocalNetworkApi`) is private behind `make_local_network_api(...)`, and the header
-  is store-dependency-free. **All three consumers now route through it** — the dashboard fragments
-  (`network_ui.cpp`), the REST handlers (`rest_api_v1.cpp`), and the MCP tools (`get_network_fleet`/
-  `list_network_devices` in `mcp_server.cpp`) — replacing the old ad-hoc `net_perf_fn` provider/memo that
-  `server.cpp` used to assemble. This is the **per-family pattern the remaining families copy**: API
-  methods == public REST resources; renderers/handlers consume the API's response shapes, never a raw
-  internal read model or a `Store*`; the store-backed impl stays private; the caller-context/audit-at-API
-  contract is deferred to the WS-A2r contract design (today's handlers still call `emit_behavioral_audit`
-  themselves, unchanged). **Enforcement scope is honest and partial**, piloted by the new
-  `scripts/ci/check-seam-closure.py` include-closure lint: the network dashboard/routes/model/api
-  translation units are ENFORCED store-free; `rest_api_v1.cpp` and `mcp_server.cpp` are multi-family TUs
-  holding real store access for many other families, so their network sections are
-  INSPECTED-NOT-ENFORCED (reviewed by hand, not gated) until a block- or symbol-scoped successor exists.
+- **The FIRST per-family seam landed: `network` (2026-09-10), then split into the two-header template
+  (2026-09-11, #4249).** The seam is now TWO headers, not one: `network_api.hpp` is the ABSTRACT
+  `NetworkApi` interface + `NetDeviceQuery` — a presentation TU's whole view of the family, with ZERO
+  store-type references, not even a forward-declaration; `network_api_local.hpp` is CORE-ONLY — it holds
+  the store-backed factory `make_local_network_api(...)`, the store forward-decls the factory signature
+  needs, and the lifetime contract doc — and is included only by `network_api.cpp` (the impl),
+  `server.cpp` (wiring), and `test_network_api.cpp` (tests), never by a route/renderer/model TU. The
+  method set equals the family's public REST resources (`fleet_now` == `GET /api/v1/network/fleet`,
+  `device_list` == `GET /api/v1/network/devices`). **All three consumers route through the abstract
+  header** — the dashboard fragments (`network_ui.cpp`), the REST handlers (`rest_api_v1.cpp`), and the
+  MCP tools (`get_network_fleet`/`list_network_devices` in `mcp_server.cpp`) — replacing the old ad-hoc
+  `net_perf_fn` provider/memo that `server.cpp` used to assemble. This two-header shape is the
+  **per-family pattern the remaining families copy**: API methods == public REST resources;
+  renderers/handlers consume the API's response shapes, never a raw internal read model or a `Store*`;
+  the store-backed impl and its factory stay in the `<family>_api_local.hpp` half; the
+  caller-context/audit-at-API contract is deferred to the WS-A2r contract design (today's handlers still
+  call `emit_behavioral_audit` themselves, unchanged). **Enforcement scope is honest and partial**,
+  piloted by `scripts/ci/check-seam-closure.py`'s include-closure lint: the network dashboard/routes/
+  model/api translation units are ENFORCED store-free, and #4249 added a FOURTH forbidden pattern,
+  `*_api_local.hpp`, so those same TUs are also enforced against reaching the core-only factory header —
+  the abstract/local boundary is CI-enforced, not conventional (pinned by
+  `tests/test_seam_closure_selftest.py` probes 7/8: a synthetic presentation TU reaching a
+  `*_api_local.hpp` fires and names the chain; one reaching only the abstract half passes).
+  `rest_api_v1.cpp` and `mcp_server.cpp` are multi-family TUs holding real store access for many other
+  families, so their network sections are INSPECTED-NOT-ENFORCED (reviewed by hand, not gated) until a
+  block- or symbol-scoped successor exists. **Two decisions recorded, not re-decided:**
+  (1) `network_api_local.hpp` itself IS in the lint's enforced TU set, so its own purity (forward-decls
+  only, zero store `#include`s) is lint-enforced, not review-only. (An earlier draft kept it out on the
+  belief it would self-match `*_api_local.hpp` by basename; governance disproved that — a TU is excluded
+  from its own include closure, so it never self-matches — and enforcing it closes the gap for free.)
+  The presentation-visible CONTRACT is a PAIR that moves together at WS-B2: `<family>_api.hpp` plus the
+  family's pure model header (`network_perf_model.hpp` here); an impure model header breaks the abstract
+  header even when the abstract header itself is clean, so families copy the pair. (2) the new pattern is a
+  NAMING CONVENTION, not a structural one — only a header literally named `*_api_local.hpp` is caught, so
+  a family that names its factory header differently (e.g. `<family>_factory.hpp`) is invisible to the
+  gate; the template therefore PRESCRIBES the `<family>_api.hpp` (abstract) + `<family>_api_local.hpp`
+  (core-only factory) names for every family that copies this pattern.
   **The pilot also closed an A1 dashboard-parity gap it surfaced**: `available_keys` (the cohort-picker
   tag-key list) was on the dashboard fragment but absent from the public REST/MCP fleet resource — now
   added to `NetPerfFleetNow` and serialized on `GET /api/v1/network/fleet` (JSON + OpenAPI) and MCP
@@ -170,7 +191,7 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 | **WS-A2r** | In-process public-API contracts, **read/command paths** (step 2, read half) | A | THIS | WS-A1 | — | architect | planned |
 | **WS-A2a** | In-process **admission / grant / finalisation-receipt** contracts (step 2, admission half) — **under the standing merge-gate** | A | THIS | WS-A1, WS-A6(c/d/h) | — | architect + security-guardian | blocked on interlock |
 | **WS-A3** | Capability parity — the ~40–60 missing public REST+MCP capabilities, **per family** (devices, settings, `/auto`, …) | A | THIS (ADR-0031 §3) | WS-0 | feeds A4 per-family | consistency-auditor + architect | planned |
-| **WS-A4** | **Logical seam enforcement + INV-31-4 contract test** — handlers/renderers call the API, never a store pointer; build fails on any registered route absent from the published OpenAPI; **at the WS-B2 cutover, remove the presentation-side handler's behavioural-PII audit call once core's REST-side audit covers the same view (audit continuity — not a `*_ui.cpp` relocation; see the current-state bullet above)**. **⚠️ The GLOBAL drift test (interlock-(j)'s testability half only, LEXICAL — see the current-state caveat above) SHIPPED out-of-band under #842/#3991/#3992** — see the "INV-31-4 global contract test EXISTS" current-state bullet above for detail. Interlock (j)'s **generated-projection** half (#2678) stays RED — **currently unscheduled, tracked in ADR-0032 (j), owned by no workstream row** (only (j)'s testability half was ever in WS-A4's scope). **The FIRST per-family in-process API seam landed on `network`** (`NetworkApi`, all 3 consumers routed, `scripts/ci/check-seam-closure.py` piloted — see the current-state bullet above for the pattern + honest enforcement scope + the `available_keys` A1-parity fix it surfaced and closed). **REMAINING for WS-A4:** the same seam on the other families (gates WS-B2) · handler→API seam refactor generally · the audit-removal-at-cutover step (not yet reached — no family has cut over). | A | THIS | WS-A2r, WS-A3 (that family) | **P (per family)** | architect + security-guardian + cpp-safety | **partial** — global drift test done (#842); ONE family (`network`) has the per-family seam done as the pilot; the remaining families + the general seam refactor + the cutover-time audit removal remain |
+| **WS-A4** | **Logical seam enforcement + INV-31-4 contract test** — handlers/renderers call the API, never a store pointer; build fails on any registered route absent from the published OpenAPI; **at the WS-B2 cutover, remove the presentation-side handler's behavioural-PII audit call once core's REST-side audit covers the same view (audit continuity — not a `*_ui.cpp` relocation; see the current-state bullet above)**. **⚠️ The GLOBAL drift test (interlock-(j)'s testability half only, LEXICAL — see the current-state caveat above) SHIPPED out-of-band under #842/#3991/#3992** — see the "INV-31-4 global contract test EXISTS" current-state bullet above for detail. Interlock (j)'s **generated-projection** half (#2678) stays RED — **currently unscheduled, tracked in ADR-0032 (j), owned by no workstream row** (only (j)'s testability half was ever in WS-A4's scope). **The FIRST per-family in-process API seam landed on `network`** (`NetworkApi`, all 3 consumers routed, `scripts/ci/check-seam-closure.py` piloted — see the current-state bullet above for the pattern + honest enforcement scope + the `available_keys` A1-parity fix it surfaced and closed). **The template is now the two-header shape** (`<family>_api.hpp` abstract + `<family>_api_local.hpp` core-only factory, boundary CI-enforced, #4249) — see the current-state bullet above. **REMAINING for WS-A4:** the same seam on the other families (gates WS-B2) · handler→API seam refactor generally · the audit-removal-at-cutover step (not yet reached — no family has cut over). | A | THIS | WS-A2r, WS-A3 (that family) | **P (per family)** | architect + security-guardian + cpp-safety | **partial** — global drift test done (#842); ONE family (`network`) has the per-family seam done as the pilot; the remaining families + the general seam refactor + the cutover-time audit removal remain |
 | **WS-A5** | Input confinement — **SHIPPED** (`authorize_list_read` / `require_list_read` live; #1714/#1715/#1716 CLOSED). Residual: **#2665** (additive vs interlock-(b) deny-precedence) + `evaluate_as_operator` seam (absent) | A | /auth | WS-0 | **E** | security-guardian | shipped; #2665 open |
 | **WS-A6** | Admission/grant/audit substrate — (c) D12 audit with indexed `use_case_run_id`, (d) P7 release-log store, (h) capability-declaration registry with full credential fields. (a) shipped. **Under merge-gate** | A | /auth + exec-plan | WS-0, WS-A5 | **E** | security-guardian + architect + docs-writer | (a) shipped; c/d/h absent |
 | **WS-B1** | Drogon build canary (G10) — Drogon linked in the Meson/vcpkg matrix incl. MSVC static linkage | B | THIS | WS-0 | **P** | build-ci + cross-platform | planned |

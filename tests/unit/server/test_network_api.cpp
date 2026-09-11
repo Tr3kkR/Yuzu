@@ -13,7 +13,7 @@
  * presentation/MCP caller will use it.
  */
 
-#include "network_api.hpp"
+#include "network_api_local.hpp"
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
