@@ -46,11 +46,20 @@ helping itself to the store-backed factory instead of receiving the abstract
 interface. It is NOT a ban on the header existing or being used: `server.cpp`
 (core wiring), the family's own `*_api.cpp` implementation, and the tests all
 include it legitimately, and none of those is in any family's enforced TU
-set. Being an include-closure check, this pattern carries exactly the SAME
-acknowledged escape as shape 2 above, in the same class and for the same
-reason: a presentation TU that hand-re-declares the factory's signature
-locally instead of including the header still links, and this script will
-never see it. Known and stated, not silent.
+set. The local header ITSELF, however, IS in the family's enforced TU set:
+a TU is excluded from its own include closure (closure() seeds `seen` with
+the TU), so it never self-matches this pattern, and enforcing it makes its
+own purity (forward declarations only, zero store `#include`s) lint-checked
+rather than review-only. Being an include-closure check, this pattern
+carries exactly the SAME acknowledged escape as shape 2 above, in the same
+class and for the same reason: a presentation TU that hand-re-declares the
+factory's signature locally instead of including the header still links,
+and this script will never see it. Two further NAME-LEVEL escapes are
+inherent to a basename glob and are stated here so the whole escape list
+lives in one place: a core-only factory header that is not literally named
+`*_api_local.hpp` (the template prescribes that name for every family), and
+the `.hpp`-only / case-sensitive match (a `.h`/`.hxx` or differently-cased
+spelling is not caught; the tree has neither). Known and stated, not silent.
 
 INCLUDE RESOLUTION: this project spells project-internal, cross-component
 headers `<yuzu/...>` (server/core/meson.build's own
@@ -152,10 +161,13 @@ FORBIDDEN_HEADER_PATTERNS = [
 ]
 
 # ── Family definitions ────────────────────────────────────────────────────
-# One family so far: `network` (WS-A4 item 1's pilot). `network_api.hpp` is
-# being introduced by a sibling, independent change (the in-process API this
-# family's presentation TUs are meant to call instead of a store) - see
-# `check_family()`'s handling of a declared-but-missing TU.
+# One family so far: `network` (WS-A4 item 1's pilot). The set covers the
+# presentation-side TUs plus BOTH halves of the seam header pair: the
+# abstract `network_api.hpp` and the core-only `network_api_local.hpp`
+# (#4249). Enforcing the local header pins its own purity (forward decls
+# only); it cannot self-match `*_api_local.hpp` because a TU is excluded
+# from its own closure. A declared-but-missing TU is a hard error - see
+# `check_family()`.
 FAMILIES = {
     "network": {
         "tus": [
@@ -163,6 +175,7 @@ FAMILIES = {
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
             "server/core/src/network_api.hpp",
+            "server/core/src/network_api_local.hpp",
         ],
     },
 }

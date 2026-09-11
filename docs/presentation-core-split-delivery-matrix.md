@@ -74,9 +74,13 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   `rest_api_v1.cpp` and `mcp_server.cpp` are multi-family TUs holding real store access for many other
   families, so their network sections are INSPECTED-NOT-ENFORCED (reviewed by hand, not gated) until a
   block- or symbol-scoped successor exists. **Two decisions recorded, not re-decided:**
-  (1) `network_api_local.hpp` itself is deliberately NOT in the lint's enforced TU set — it is core-only
-  by design and would trivially self-fail the new pattern via basename match; its own purity (forward-
-  decls only, zero store `#include`s) is review-enforced, not lint-enforced. (2) the new pattern is a
+  (1) `network_api_local.hpp` itself IS in the lint's enforced TU set, so its own purity (forward-decls
+  only, zero store `#include`s) is lint-enforced, not review-only. (An earlier draft kept it out on the
+  belief it would self-match `*_api_local.hpp` by basename; governance disproved that — a TU is excluded
+  from its own include closure, so it never self-matches — and enforcing it closes the gap for free.)
+  The presentation-visible CONTRACT is a PAIR that moves together at WS-B2: `<family>_api.hpp` plus the
+  family's pure model header (`network_perf_model.hpp` here); an impure model header breaks the abstract
+  header even when the abstract header itself is clean, so families copy the pair. (2) the new pattern is a
   NAMING CONVENTION, not a structural one — only a header literally named `*_api_local.hpp` is caught, so
   a family that names its factory header differently (e.g. `<family>_factory.hpp`) is invisible to the
   gate; the template therefore PRESCRIBES the `<family>_api.hpp` (abstract) + `<family>_api_local.hpp`

@@ -9,10 +9,12 @@
 ///
 /// Store types stay FORWARD-DECLARED here (zero store `#include`s) — this
 /// header is the core side of the ADR-0031 WS-A4 seam, not the store layer.
-
-#include "network_api.hpp"
+/// That purity is lint-enforced: this header is itself in the family's
+/// enforced closure set, so a store `#include` added here fails CI.
 
 #include <memory>
+
+#include "network_api.hpp"
 
 namespace yuzu::server {
 

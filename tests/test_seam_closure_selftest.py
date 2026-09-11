@@ -54,6 +54,8 @@ CHECKER_PATH = REPO_ROOT / "scripts" / "ci" / "check-seam-closure.py"
 # --- FROZEN CONSTANTS (the lock). Editing check-seam-closure.py's FAMILIES or
 # --- FORBIDDEN_HEADER_PATTERNS to change any of these must also edit the
 # --- matching value here - a loud, reviewed change, never a silent narrowing.
+# --- The comparison is LIST EQUALITY, so it is ORDER-SENSITIVE by design: a
+# --- pure re-order also trips it (both lists are printed side by side).
 EXPECTED_FAMILIES = {
     "network": {
         "tus": [
@@ -61,6 +63,7 @@ EXPECTED_FAMILIES = {
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
             "server/core/src/network_api.hpp",
+            "server/core/src/network_api_local.hpp",
         ],
     },
 }
@@ -106,9 +109,7 @@ def main() -> int:
               f"frozen {EXPECTED_FORBIDDEN_HEADER_PATTERNS!r}", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
-    #    on disk must fail the family check, never be silently skipped (this
-    #    is the exact contract network_api.hpp exercises today, ahead of the
-    #    sibling INV-31-4 change that creates it).
+    #    on disk must fail the family check, never be silently skipped.
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         src = root / "server" / "core" / "src"

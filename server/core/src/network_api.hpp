@@ -20,7 +20,6 @@
 /// `network_api_local.hpp` — this header names no store type at all, not even
 /// by forward declaration, so a presentation TU including it cannot reach one.
 
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
