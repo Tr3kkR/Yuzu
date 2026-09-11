@@ -8062,6 +8062,175 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
     // tree here, unconditionally.
 }
 
+/// Polls `got` for the first Fired SparkEvent matching `key`, returning its
+/// engine-stamped fire time (SparkEvent::at) or nullopt on timeout. Scans
+/// from the start each call rather than tracking a resume cursor - at
+/// kEstablishSamples-scale (<= 200 prior events) the O(n) rescan is a few
+/// hundred string comparisons, negligible next to the microsecond-scale
+/// latencies being measured, and it is simpler to read than cursor state
+/// shared across sequential calls for DIFFERENT keys.
+std::optional<std::chrono::system_clock::time_point> wait_for_fired(
+    Collector& got, const std::string& key, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const std::size_t n = got.count();
+        for (std::size_t i = 0; i < n; ++i) {
+            const SparkEvent ev = got.at(i);
+            if (ev.key == key && ev.kind == SparkEventKind::Fired)
+                return ev.at;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    return std::nullopt;
+}
+
+/// Real, distinct service names to drive kEstablishSamples INDEPENDENT
+/// establishment round-trips - capped at the host's real count (never
+/// cycled/wrapped) so a re-armed-under-a-new-key coalescing hand-off
+/// (spark_service.cpp's `else if (w->last)` immediate-state path, far
+/// cheaper than a fresh probe) never contaminates this series the way the
+/// bulk-arm case above explicitly accepts for its own, different purpose.
+std::vector<std::wstring> establish_e2e_service_names() {
+    SC_HANDLE scm =
+        ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    REQUIRE(scm != nullptr);
+    struct ScGuard {
+        SC_HANDLE h{nullptr};
+        ~ScGuard() {
+            if (h)
+                ::CloseServiceHandle(h);
+        }
+    } scm_guard{scm};
+    DWORD needed = 0, count = 0, resume = 0;
+    ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr,
+                            0, &needed, &count, &resume, nullptr);
+    resume = 0;
+    std::vector<BYTE> buf(needed);
+    REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                    buf.data(), static_cast<DWORD>(buf.size()), &needed, &count,
+                                    &resume, nullptr));
+    REQUIRE(count > 0);
+    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
+    std::vector<std::wstring> names;
+    names.reserve(count);
+    for (DWORD i = 0; i < count; ++i)
+        names.emplace_back(entries[i].lpServiceName);
+    return names;
+}
+
+TEST_CASE("Watch establishment (Service): end-to-end Add-accepted to first-trustworthy-state via "
+          "SparkEngine::arm() (E1 idle) (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][latency][establish]") {
+    // Fills the gap both S2/S3 and the bulk-arm case above leave open
+    // (#2012/#3840 PR-B3 kickoff doc, "Latency characterization"): S2/S3
+    // measure the raw OpenServiceW/NotifyServiceStatusChangeW calls
+    // directly, not through the mechanism; the bulk-arm case above measures
+    // only SparkEngine::arm()'s own synchronous return (an O(1) queue push,
+    // unaffected by PR-B3 - Service's watch()/unwatch() were already O(1)
+    // before this series, per the corrected kickoff doc's premise
+    // correction). Neither captures what a consumer actually waits on: the
+    // full round trip from arm() to the first real state delivered via the
+    // emit callback, which is exactly what PR-B3's probe-lane restructure
+    // changes the shape of (moves OpenServiceW off the shared mechanism
+    // thread onto SparkDetachedLane).
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
+        return;
+    }
+    const std::vector<std::wstring> names = establish_e2e_service_names();
+    const int n = std::min(kEstablishSamples, static_cast<int>(names.size()));
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::vector<std::int64_t> t_e2e;
+    int timed_out = 0;
+    for (int i = 0; i < n; ++i) {
+        const std::string name = yuzu::win::from_wide(names[static_cast<std::size_t>(i)].c_str());
+        const auto spec = service_spec(name);
+        const std::string key = spark_key(spec);
+        const auto t0 = std::chrono::system_clock::now();
+        auto r = engine.arm(*c, spec);
+        if (!r.has_value())
+            continue; // excluded, same posture as the bulk-arm case's arm failures
+        if (auto fired_at = wait_for_fired(got, key, 3000ms)) {
+            t_e2e.push_back(
+                std::chrono::duration_cast<std::chrono::microseconds>(*fired_at - t0).count());
+        } else {
+            ++timed_out;
+        }
+        engine.disarm(*r); // sequential isolation: next sample starts from a clean key set
+    }
+    engine.stop();
+
+    warn_establish("E1 Service end-to-end (idle)", "Add-accepted -> first Fired", t_e2e);
+    WARN("E1 Service end-to-end (idle): " << n << " services attempted, " << timed_out
+         << " timed out waiting for a Fired event (excluded from the series above)");
+}
+
+TEST_CASE("Watch establishment (Service): end-to-end Add-accepted to first-trustworthy-state via "
+          "SparkEngine::arm() UNDER SCM LOAD (E2) (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
+        return;
+    }
+    const std::vector<std::wstring> names = establish_e2e_service_names();
+    const int n = std::min(kEstablishSamples, static_cast<int>(names.size()));
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    // Same SCM-load shape as S3: two background OpenSCManagerW-churn
+    // threads for the duration of the measurement, started only after every
+    // REQUIRE above (same ordering rationale as S3's own comment - a failed
+    // precondition must never unwind past a live joinable thread).
+    std::atomic<bool> stop{false};
+    auto scm_churn = [&stop] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (SC_HANDLE h = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT))
+                ::CloseServiceHandle(h);
+        }
+    };
+    std::thread t1(scm_churn), t2(scm_churn);
+
+    std::vector<std::int64_t> t_e2e;
+    int timed_out = 0;
+    for (int i = 0; i < n; ++i) {
+        const std::string name = yuzu::win::from_wide(names[static_cast<std::size_t>(i)].c_str());
+        const auto spec = service_spec(name);
+        const std::string key = spark_key(spec);
+        const auto t0 = std::chrono::system_clock::now();
+        auto r = engine.arm(*c, spec);
+        if (!r.has_value())
+            continue;
+        if (auto fired_at = wait_for_fired(got, key, 3000ms)) {
+            t_e2e.push_back(
+                std::chrono::duration_cast<std::chrono::microseconds>(*fired_at - t0).count());
+        } else {
+            ++timed_out;
+        }
+        engine.disarm(*r);
+    }
+    engine.stop();
+
+    stop.store(true, std::memory_order_relaxed);
+    t1.join();
+    t2.join();
+
+    warn_establish("E2 Service end-to-end UNDER SCM LOAD", "Add-accepted -> first Fired", t_e2e);
+    WARN("E2 Service end-to-end UNDER SCM LOAD: " << n << " services attempted, " << timed_out
+         << " timed out waiting for a Fired event (excluded from the series above)");
+}
+
 // ── File walkoff (#2012/#3840 PR-B2), adversarial review round findings ────
 //
 // Fault-injection tests for the 8 HIGH-severity findings from the PR-B2
