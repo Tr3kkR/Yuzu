@@ -19,7 +19,7 @@ This document analyzes the capabilities of leading commercial endpoint-managemen
 | **Auth Model** | Windows AD (Kerberos), 2FA email | PBKDF2 sessions, OIDC/PKCE, API tokens, mTLS |
 | **Content Delivery** | Background Channel (HTTPS) + Nomad P2P | HTTP content staging + execution |
 | **Policy Engine — Server side** | Guaranteed State (proprietary-script check/fix) | PolicyStore with CEL expressions + triggers |
-| **Policy Engine — Real-time agent-side enforcement** | Guaranteed State (kernel-event-driven enforcement, pre-login activation, offline-capable) | **System Guardian** — agent-side guard engine using kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS). PRs 1-2 shipped (proto, server store, agent scaffolding); PR 3+ in flight per `docs/yuzu-guardian-windows-implementation-plan.md`. Phase 16 of the roadmap. |
+| **Policy Engine — Real-time agent-side enforcement** | Guaranteed State (kernel-event-driven enforcement, pre-login activation, offline-capable) | **System Guardian** — agent-side guard engine using kernel-backed user-mode APIs (RegNotifyChangeKeyValue, ETW, WFP, SCM on Windows; inotify/netlink/D-Bus on Linux; Endpoint Security on macOS). As of 2026-09-07: `GuardianEngine`, `BaselineStore`, Windows registry/service/file guards, Linux `guard_systemd`, `/guaranteed-state` UI shipped (59 merged PRs); Spark detection engine (ADR-0021) wired but inert (`prefer_spark` off); macOS not started — see `docs/roadmap.md` Phase 16. |
 | **API** | Consumer API (.NET SDK) | REST API v1 (70+ endpoints) + gRPC + MCP |
 | **Dashboard** | ASP.NET web portal | HTMX server-rendered + SSE |
 | **DMZ Support** | Dedicated DMZ Server (Response Stack) | Gateway node (Erlang, can be DMZ-deployed) |
@@ -38,7 +38,7 @@ This document analyzes the capabilities of leading commercial endpoint-managemen
 
 **Commercial peers' advantages over Yuzu (gaps to close):**
 - **Proprietary peer scripting** — composable agent-side scripting with SQL, tables, control flow
-- **Connector framework** — 12 bidirectional integrations (SCCM, Intune, ServiceNow, etc.)
+- **Connector framework** — 12 bidirectional integrations (SCCM, Intune, ServiceNow, etc.). *Roadmap Phase 9 was deferred by owner decision 2026-09-07, pending an ADR-1005 Decision 2 review of where connector ingestion belongs (core mechanism vs use-case engine); see `docs/roadmap.md` Phase 9 banner.*
 - **Response visualization** — chart types, custom processors, server-side rendering
 - **Software catalog** — normalized vendor/title/version with AI auto-curation
 - **Nomad P2P** — peer-to-peer content distribution with bandwidth optimization
@@ -578,7 +578,7 @@ This is the closest Yuzu can get to the category leader's proprietary scripting 
 | Phase | Priority | Effort | Enterprise Value | Parity Impact |
 |-------|----------|--------|------------------|-----------------------|
 | **8: Visualization** | HIGH | Small | HIGH | Closes visible UX gap |
-| **9: Connectors** | CRITICAL | Large | CRITICAL | #1 gap — every enterprise RFP asks for this |
+| **9: Connectors** | CRITICAL | Large | CRITICAL | #1 gap — every enterprise RFP asks for this. **Deferred 2026-09-07** by owner decision, pending an ADR-1005 Decision 2 placement review (core mechanism vs use-case engine); see `docs/roadmap.md` Phase 9 banner |
 | **10: Catalog** | HIGH | Medium | HIGH | License compliance is a primary use case |
 | **11: Consumer** | MEDIUM | Medium | MEDIUM | Platform extensibility |
 | **12: Agent Caps** | MEDIUM | Medium | LOW-MEDIUM | Completes capability map to 184/184 |
@@ -592,7 +592,7 @@ This is the closest Yuzu can get to the category leader's proprietary scripting 
 ```
 Phase 8 (Visualization) ──── 1 sprint ──── Immediate visual impact
     │
-Phase 9 (Connectors) ─────── 2 sprints ─── Biggest enterprise gap
+Phase 9 (Connectors) ─────── DEFERRED 2026-09-07 (owner decision; placement review pending — see docs/roadmap.md)
     │
 Phase 10 (Catalog) ────────── 1 sprint ──── Builds on 9.8 normalization
     │
