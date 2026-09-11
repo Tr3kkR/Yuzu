@@ -702,6 +702,32 @@ spec:
           Requires agent v0.12.0+.
         validation:
           pattern: "^[0-9]+$"
+      usage_enabled:
+        type: string
+        displayName: Application Usage Capture Enabled
+        description: >
+          Enable or disable the `usage` derived fold (usage → $Usage_Live /
+          $Usage_Daily), a checked_transaction-based pairing of the process
+          source's started/stopped events into per-executable run/duration
+          aggregates plus a per-day distinct-user count. **ON by default
+          ("true")** — joining power/removable as a works-council-class
+          source shipping enabled; process, tcp, service, user and perf are
+          already default-on as machine-scope operational telemetry.
+          The SOC 2 data inventory classifies $Usage_Live/$Usage_Daily as
+          usage-class / behavioral-adjacent: $Usage_Live persists the owning
+          pid and user for each open run, and the per-day username
+          membership (queryable via tar.sql) reveals which applications run
+          on a device, when, and by whom. Treat as co-determination-relevant,
+          same basis as power/removable.
+          Forward-only, no retrospective backfill: disabling and later
+          re-enabling always re-baselines from the moment of re-enable, never
+          a retrospective fold over whatever process history accrued during
+          the disabled window — this is a lifecycle-state-machine property,
+          not a best-effort marker check. Set to "false" to opt out.
+          Requires agent v0.12.0+; older agents silently ignore.
+          Valid: "true" | "false".
+        validation:
+          pattern: "^(true|false)$"
       network_capture_method:
         type: string
         displayName: Network Capture Method

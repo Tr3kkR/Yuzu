@@ -5,6 +5,8 @@
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
                                      // X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
+#include "app_perf_compare.hpp" // app_perf_param_valid/kAppPerfParamCap — this validation
+                              // chokepoint owns its dependency (relocated from dex_app_perf_model.hpp, #4250)
 
 #include <algorithm>
 #include <cctype>

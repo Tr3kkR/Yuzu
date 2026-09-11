@@ -438,6 +438,44 @@ jobs:
           python3 scripts/ci/check-api-parity.py --selftest
           python3 scripts/ci/check-api-parity.py
 
+      # MCP retry_after_ms hard rule (A5, ADR-1005 exec-plan Decision 16 /
+      # routed-concerns.md's A5 row): every NEW MCP tool's store/query-fault
+      # error branch must carry a retry_after_ms hint or an inline
+      # `// retry-hint-exempt:` comment. Diff-aware (new kTools[] entries
+      # only) — see that script's module docstring for why this is NOT a
+      # repo-wide retrofit gate. pull_request only: on push (merge to
+      # dev/main) new tools were already gated at PR time, same reasoning as
+      # the Plugin README touch rule job. Reuses trusted_inputs' own base_sha
+      # (#2826) rather than re-deriving from the raw PR event field — this
+      # job already has that output one hop away; a second independent
+      # derivation of "the right base" is exactly the class of drift #2826
+      # was about.
+      - name: MCP retry_after_ms hard rule (A5)
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ needs.trusted_inputs.outputs.base_sha }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Regression guard first: fail fast, with a clear message, if the
+          # gate's own extraction logic is broken -- rather than silently
+          # degrading to zero findings (exactly how the balanced-brace defect
+          # found on PR #4261 hid for an entire fix round).
+          python3 scripts/ci/check-mcp-retry-hints.py --selftest
+          # Fail CLOSED, matching the script's own HEAD-unreadable path (its
+          # module docstring: "an unreadable target must never look like a
+          # clean gate"). An empty/all-zero BASE_SHA means the diff this gate
+          # depends on cannot be computed -- that is a CI-input defect to
+          # investigate, not a condition that should silently look green
+          # (colleague review on PR #4261: the prior exit-0-and-skip here
+          # directly contradicted the script's stated fail-closed philosophy).
+          if [ -z "$BASE_SHA" ] || [ "$BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "::error::Base commit unavailable (BASE_SHA='$BASE_SHA') -- cannot diff, failing closed."
+            exit 1
+          fi
+          git fetch --depth=1 origin "$BASE_SHA"
+          python3 scripts/ci/check-mcp-retry-hints.py "$BASE_SHA" "$HEAD_SHA" --summary
+
   # ── Lint (disabled — clang-format reorders Windows headers and breaks MSVC builds) ──
   # lint:
   #   name: "Lint (clang-format)"

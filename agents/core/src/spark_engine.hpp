@@ -602,14 +602,14 @@ private:
     /// drop-oldest queue (deliver()) can therefore be pushed by a noisy key's
     /// synthetic fire into evicting a quiet key's only fire, a detection-
     /// latency/fairness cost, and nothing here dedups on the wire (Guardian's
-    /// decide_emit re-emits Drift past debounce_ms regardless). STILL OPEN for
-    /// FILE and SERVICE (PR-B2/PR-B3): a
-    /// File watch() still blocks for the OS-call duration - spark_file's
-    /// arm_ancestor deadline (#1980) bounds the NUMBER of slow probes to ~one,
-    /// not the wall-clock of any one probe (fs::is_directory is uninterruptible,
-    /// so a hung probe on a dead UNC path holds File's lock for the full OS
-    /// network timeout); Service's queue-push watch()/unwatch() are already
-    /// O(1) but its SCM open/notify run head-of-line on its worker.
+    /// decide_emit re-emits Drift past debounce_ms regardless). LANDED for FILE
+    /// (PR-B2, #2012): watch()'s discovery/ancestor-walk probe now runs on a
+    /// detached F3-counted worker, bounded on the control path by
+    /// kFileCallerWaitBudget, with the same reservation-before-publication
+    /// shape as Registry above - a hung probe on a dead UNC path no longer
+    /// holds File's lock for the OS network timeout. STILL OPEN for SERVICE
+    /// (PR-B3, not yet landed): its queue-push watch()/unwatch() are already
+    /// O(1) but its SCM open/notify still run head-of-line on its worker.
     /// Populated in register_mechanism() under mu_, in lockstep with
     /// mechanisms_, and — like mechanisms_ — never erased thereafter, so a
     /// std::mutex& obtained via .at(type) is safe to hold across the blocking

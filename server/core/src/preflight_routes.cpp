@@ -569,8 +569,15 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             return;
         if (!run_store_) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
-                            "application/json");
+            // No retry_after_ms: run_store_ is wired exactly once, in
+            // register_routes() at server construction (server.cpp), with no
+            // runtime setter. A null value here is a permanent "this server
+            // was deployed without the store configured" condition — no
+            // amount of client retrying resolves it. Contrast the genuine,
+            // retryable store-fault branch below (list_runs_checked).
+            res.set_content(
+                detail::a4_error(res, "pre-flight run store is unavailable on this server"),
+                "application/json");
             return;
         }
         // `limit`: default matches the fragment rail's own cap (12); callers
@@ -601,8 +608,10 @@ void PreflightRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
                                                      static_cast<int>(limit));
         if (!rows_or) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "pre-flight run store is unavailable on this server"),
-                            "application/json");
+            res.set_content(
+                detail::a4_error(res, "pre-flight run store is unavailable on this server",
+                                 {.retry_after_ms = 2000}),
+                "application/json");
             return;
         }
         const auto& rows = *rows_or;

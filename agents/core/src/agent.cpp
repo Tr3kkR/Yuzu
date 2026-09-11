@@ -1240,14 +1240,15 @@ public:
                         spdlog::warn("SparkEngine: register {} mechanism failed: {}",
                                      spark_type_token(type), r.error());
                 };
-                try_register(SparkType::File, make_file_mechanism());
-                // Registry takes the shared F3 counter (#2012/#3840 PR-B1): its
-                // detached probe/drain workers are admitted against
-                // spark_detached_workers_, which guardian_active_io_workers()
-                // sums. Passed unconditionally - the platform split lives inside
-                // the factory (real on Windows, nullptr elsewhere), same as the
-                // zero-argument forms. File/Service keep the zero-argument form
-                // until their own restructures (PR-B2/PR-B3) add lanes.
+                // File and Registry both take the shared F3 counter (#2012/#3840
+                // PR-B1 for Registry, PR-B2 for File): their detached discovery
+                // workers are admitted against spark_detached_workers_, which
+                // guardian_active_io_workers() sums. Passed unconditionally - the
+                // platform split lives inside each factory (real on Windows,
+                // nullptr elsewhere), same as the zero-argument forms. Service
+                // keeps the zero-argument form until its own restructure (PR-B3)
+                // adds a lane.
+                try_register(SparkType::File, make_file_mechanism(spark_detached_workers_));
                 try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
                 try_register(SparkType::Service, make_service_mechanism());
                 spark_engine_->start();

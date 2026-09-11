@@ -860,6 +860,7 @@ tar_test_exe = executable(
     'unit/test_tar_capability_table.cpp',
     'unit/test_tar_warehouse.cpp',
     'unit/test_tar_aggregator.cpp',
+    'unit/test_tar_usage.cpp',
     'unit/test_tar_perf.cpp',
     'unit/test_tar_proc_perf.cpp',
     'unit/test_app_perf_rollup_query.cpp',
@@ -888,6 +889,7 @@ tar_test_exe = executable(
     '../agents/plugins/tar/src/tar_software_core.cpp',
     '../agents/plugins/tar/src/tar_schema_registry.cpp',
     '../agents/plugins/tar/src/tar_aggregator.cpp',
+    '../agents/plugins/tar/src/tar_usage.cpp',
     '../agents/plugins/tar/src/tar_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_perf.cpp',
     '../agents/plugins/tar/src/tar_proc_stream.cpp',
@@ -1124,6 +1126,7 @@ if build_server
       'unit/server/test_dex_app_perf_ui.cpp',
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
+      'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin

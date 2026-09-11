@@ -25,9 +25,11 @@
 
 #include "verify_routes.hpp"
 #include "test_route_sink.hpp"
+#include "test_verify_api_double.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -90,7 +92,8 @@ struct VerifyHarness {
             return true;
         };
 
-        routes.register_routes(sink, auth_fn, perm_fn, groups_fn, cohort_fn, audit_fn);
+        auto api = std::make_shared<yuzu::server::test::FnVerifyApi>(cohort_fn);
+        routes.register_routes(sink, auth_fn, perm_fn, groups_fn, audit_fn, api);
     }
 };
 

@@ -29,6 +29,38 @@ Neither shape exists in the family this script covers today; if one is ever
 introduced, this check will pass while the seam is actually broken. That is a
 known, stated gap - not a silent one.
 
+ABSTRACT-VS-LOCAL SEAM (#4249): the fourth forbidden pattern,
+`*_api_local.hpp`, is NOT a store-layer header - it is the CORE-ONLY half of
+a family's in-process API. #4249 splits `network_api.hpp` into the ABSTRACT
+interface (what a presentation TU is allowed to call) and a new
+`network_api_local.hpp` holding the store-backed FACTORY
+(`make_local_network_api`) that wires that interface up to real stores. The
+local header deliberately carries NO store `#include`s of its own - only
+forward declarations - so the three store patterns above CANNOT see a
+presentation TU that wrongly includes it, and the abstract/local boundary
+would be convention only. Naming the local header itself is what makes the
+boundary enforced rather than advisory. WHAT IT CATCHES: any enforced family
+TU (route / renderer / model / the abstract API header) that reaches a
+`*_api_local.hpp` anywhere in its include closure - i.e. a presentation TU
+helping itself to the store-backed factory instead of receiving the abstract
+interface. It is NOT a ban on the header existing or being used: `server.cpp`
+(core wiring), the family's own `*_api.cpp` implementation, and the tests all
+include it legitimately, and none of those is in any family's enforced TU
+set. The local header ITSELF, however, IS in the family's enforced TU set:
+a TU is excluded from its own include closure (closure() seeds `seen` with
+the TU), so it never self-matches this pattern, and enforcing it makes its
+own purity (forward declarations only, zero store `#include`s) lint-checked
+rather than review-only. Being an include-closure check, this pattern
+carries exactly the SAME acknowledged escape as shape 2 above, in the same
+class and for the same reason: a presentation TU that hand-re-declares the
+factory's signature locally instead of including the header still links,
+and this script will never see it. Two further NAME-LEVEL escapes are
+inherent to a basename glob and are stated here so the whole escape list
+lives in one place: a core-only factory header that is not literally named
+`*_api_local.hpp` (the template prescribes that name for every family), and
+the `.hpp`-only / case-sensitive match (a `.h`/`.hxx` or differently-cased
+spelling is not caught; the tree has neither). Known and stated, not silent.
+
 INCLUDE RESOLUTION: this project spells project-internal, cross-component
 headers `<yuzu/...>` (server/core/meson.build's own
 `include_directories(['include', '../../common/include'])`), so ANGLE
@@ -89,7 +121,7 @@ class Roots(NamedTuple):
 
 DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE)
 
-# ── Forbidden store-layer header patterns ────────────────────────────────
+# ── Forbidden header patterns (store layer + the core-only API half) ─────
 # Evidence (see the PR description / junior report for the exact commands):
 #   - `ls server/core/src/*_store.hpp` -> 43 files, every server store header
 #     in the tree (device_store.hpp, quarantine_store.hpp, ... including
@@ -109,17 +141,46 @@ DEFAULT_ROOTS = Roots(ROOT, SERVER_SRC, SERVER_INCLUDE, COMMON_INCLUDE)
 #     `PgResult`/`PgConn` RAII) - a TU that includes one of these can issue
 #     raw SQL against the pool directly, bypassing any store class entirely,
 #     which the `*_store.hpp` pattern alone would not catch.
+#   - `*_api_local.hpp` (#4249) is the ONLY non-store pattern here: it
+#     enforces the ABSTRACT-vs-LOCAL seam boundary within a family's own
+#     in-process API. The local header declares the store-backed factory
+#     (`make_local_network_api`) but holds only FORWARD DECLARATIONS of the
+#     stores it wires, so the three patterns above are blind to it - a
+#     presentation TU including it would reach the factory with a clean
+#     store closure. It is legitimately included by `server.cpp` (core
+#     wiring), by the family's own `*_api.cpp` implementation, and by tests
+#     - none of which is in any family's enforced TU set - but NEVER by a
+#     route / renderer / model TU, which is exactly what this pattern gates.
+#     See the module docstring's "ABSTRACT-VS-LOCAL SEAM" section for the
+#     acknowledged hand-re-declaration escape it shares with shape 2.
 FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",
     "agent_registry.hpp",
     "pg/*.hpp",
+    "*_api_local.hpp",
 ]
 
 # ── Family definitions ────────────────────────────────────────────────────
-# One family so far: `network` (WS-A4 item 1's pilot). `network_api.hpp` is
-# being introduced by a sibling, independent change (the in-process API this
-# family's presentation TUs are meant to call instead of a store) - see
-# `check_family()`'s handling of a declared-but-missing TU.
+# Two families so far: `network` (WS-A4 item 1's pilot) and `verify` (WS-A4
+# #4250, the SECOND family through the seam). Each set covers the
+# presentation-side TUs plus BOTH halves of the seam header pair: the
+# abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
+# the local header pins its own purity (forward decls only); it cannot
+# self-match `*_api_local.hpp` because a TU is excluded from its own closure.
+# A declared-but-missing TU is a hard error - see `check_family()`.
+#
+# `verify`'s closure was NOT clean before #4250's rewire: `verify_routes.hpp`
+# used to include `dex_app_perf_model.hpp` (for the retired `AppPerfCohortFn`)
+# AND `dex_routes.hpp` (for `DexRoutes::AuditFn`) - the latter transitively
+# reaches `dex_app_perf_ui.hpp` -> `dex_app_perf_model.hpp` regardless, which
+# itself `#include`s `app_perf_daily_store.hpp` + `app_perf_fleet_store.hpp`
+# (both `*_store.hpp`). The rewire (1) replaced the cohort provider with the
+# `VerifyApi` seam, (2) relocated the pure `app_perf_param_valid`/
+# `kAppPerfParamCap` validator out of `dex_app_perf_model.hpp` into the
+# already-pure `app_perf_compare.hpp`, and (3) defined `VerifyRoutes::AuditFn`
+# LOCALLY (same shape as `DexRoutes::AuditFn`/`NetworkRoutes::AuditFn`)
+# instead of borrowing `dex_routes.hpp` for one type alias - which is what
+# actually makes this family's closure clean, not merely dropping one include.
 FAMILIES = {
     "network": {
         "tus": [
@@ -127,6 +188,15 @@ FAMILIES = {
             "server/core/src/network_ui.cpp",
             "server/core/src/network_perf_model.cpp",
             "server/core/src/network_api.hpp",
+            "server/core/src/network_api_local.hpp",
+        ],
+    },
+    "verify": {
+        "tus": [
+            "server/core/src/verify_routes.cpp",
+            "server/core/src/verify_ui.cpp",
+            "server/core/src/verify_api.hpp",
+            "server/core/src/verify_api_local.hpp",
         ],
     },
 }
@@ -237,7 +307,8 @@ def chain_to(target: Path, parent: dict[Path, Path], tu_path: Path):
 def is_forbidden_header(abspath: Path, root: Path = ROOT,
                          patterns=FORBIDDEN_HEADER_PATTERNS):
     """Returns (True, matched_pattern) if `abspath` matches any forbidden
-    store-layer pattern - checked against BOTH the bare basename (so
+    pattern (store-layer, or the core-only `*_api_local.hpp` seam half) -
+    checked against BOTH the bare basename (so
     `*_store.hpp` fires regardless of which directory the header lives
     under, closing the angle-bracket `<yuzu/server/scim_store.hpp>` escape)
     and the root-relative path (so a directory-qualified pattern like
@@ -288,9 +359,9 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
             chain = chain_to(f, parent, tu)
             chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
             gh("error",
-               f"check-seam-closure: family {name!r}: {rel_tu} reaches store "
-               f"header {f.relative_to(roots.root)} (matches forbidden "
-               f"pattern {pat!r}) via include chain: {chain_str}")
+               f"check-seam-closure: family {name!r}: {rel_tu} reaches "
+               f"forbidden header {f.relative_to(roots.root)} (matches "
+               f"forbidden pattern {pat!r}) via include chain: {chain_str}")
             ok = False
     return ok
 
@@ -304,8 +375,8 @@ def run_check() -> int:
             ok = False
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
-              f"{'y' if checked == 1 else 'ies'} checked, all closures "
-              f"store-free)")
+              f"{'y' if checked == 1 else 'ies'} checked, all closures free "
+              f"of store-layer and core-only `*_api_local.hpp` headers)")
     return 0 if ok else 1
 
 

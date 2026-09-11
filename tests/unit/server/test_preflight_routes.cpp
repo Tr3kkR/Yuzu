@@ -575,6 +575,13 @@ TEST_CASE("preflight routes: GET /api/v1/preflight/runs 503s (not an empty "
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->body.find("run-starved-1") == std::string::npos);
+    // #2146 Batch A retry-hint audit: this genuine store-fault (not the
+    // unwired-pointer case above) must carry a retry hint matching the MCP
+    // twin's own kMcpStoreFaultShortRetryMs (2000ms) — see mcp_server.cpp's
+    // list_preflight_runs handler and mcp_retry.hpp.
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["error"].contains("retry_after_ms"));
+    CHECK(body["error"]["retry_after_ms"].get<int>() == 2000);
 }
 
 TEST_CASE("preflight routes: GET /api/v1/preflight/runs 400s on an invalid limit",

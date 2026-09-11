@@ -165,7 +165,8 @@
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
-#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
+#include "network_api_local.hpp" // ADR-0031 WS-A4: core-only /network seam factory
+#include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "inventory_ci_join.hpp"
@@ -1358,22 +1359,36 @@ public:
                               {"reason", std::string(yuzu::server::kReasonBodyType)}});
         }
         // #3685: Destructive-class targeting refusal. Seeded on `command`
-        // (REST `/api/command`) and `mcp` (MCP `execute_instruction`, both
+        // (REST `/api/command`), `mcp` (MCP `execute_instruction`, both
         // the C8 pre-mint gate and the main-handler backstop share this one
-        // label — mutually exclusive per request, so no double-count) —
-        // deliberately NOT `instruction_execute`: that route has no
-        // Destructive gate yet (tracked as a residual parity follow-up), and
-        // seeding it here would publish a series claiming a reachability
-        // that does not exist, which is exactly what the per-route seeding
-        // above exists to avoid.
+        // label — mutually exclusive per request, so no double-count),
+        // `dashboard`, and — since Wave 7 PR7.2's BR-001 fix wired
+        // `evaluate_destructive_targeting` into `/api/instructions/{id}/execute`
+        // (workflow_routes.cpp) — `instruction_execute` too (the exclusion
+        // this comment used to state, "that route has no Destructive gate
+        // yet", is stale: it does now). `workflow`: the SAME
+        // evaluate_destructive_targeting call, now run as a whole-request
+        // preflight over every step of `/api/workflows/{id}/execute` before
+        // WorkflowEngine::execute() is invoked at all — a genuinely NEW
+        // emission point, not a relabeling of the per-step dispatch_fn refusal
+        // (that refusal has no metrics/audit_fn/req access and stays a silent
+        // failed-step result by construction).
         // "dashboard" seeded alongside the other two (PR6.0b): a series created
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
+        // its Destructive sibling above, since `evaluate_destructive_targeting`
+        // is called generically for any classified capability on all of them
+        // (a Forensics row is never Destructive, but reaches the same gate).
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
         // #2557: `destructive_no_visible_target` is emitted ONLY by
         // `/api/command`'s confine-to-visible-agents 404 arm today — unlike
         // its `destructive_untargeted` sibling above, MCP's execute_instruction
@@ -8746,13 +8761,13 @@ public:
     /// skipped.
     ///
     /// PRODUCTION TRIGGER — LIVE: the operator decommission surface that calls this
-    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on a SCOPED
-    /// CONJUNCTION over every securable the cascade erases through —
-    /// `SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`
-    /// (app_perf_daily is DEX behavioural PII) — plus audit-before-erase fail-closed
-    /// (Decision 11). ADDING A STORE BELOW? Add its governing securable's Delete to
-    /// that conjunction too; the drift guard in test_agent_decommission.cpp fails
-    /// until you do.
+    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on ONE scoped
+    /// securable, `Decommission:Delete` (ADR-0024 Decision 9, amended Wave 7
+    /// PR7.2) — a device-level erasure grant covering the cascade's whole blast
+    /// radius — plus audit-before-erase fail-closed (Decision 11). ADDING A STORE
+    /// BELOW? Add it to `AgentDecommissionStores`, `agent_decommission.cpp`'s
+    /// registration list, and `kCascadeStoreCount` — the securable no longer
+    /// changes.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
@@ -15212,7 +15227,8 @@ private:
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
-            });
+            },
+            &metrics_); // #4252 — platform-support-matrix-stale counter
 
         // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
@@ -15417,36 +15433,17 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
-        app_perf_providers.cohort =
-            [this](std::string_view group_id, std::string_view app, std::string_view baseline,
-                   std::string_view candidate, int window_days) -> std::optional<CohortRead> {
-            if (!app_perf_cohort_reader_ || !mgmt_group_store_)
-                return std::nullopt;
-            // Resolve members (one bounded read, lease released), THEN read their raw
-            // B1 rows (a second bounded read) — never a lease held across the other
-            // (ADR-0012 §1). The /auto VERIFY compare engine pairs these per machine.
-            const auto members = mgmt_group_store_->get_members(std::string(group_id));
-            std::vector<std::string> agent_ids;
-            agent_ids.reserve(members.size());
-            for (const auto& m : members)
-                agent_ids.push_back(m.agent_id);
-            CohortRead out;
-            out.member_count = static_cast<std::int64_t>(agent_ids.size());
-            if (agent_ids.empty())
-                return out; // empty/unknown group → member_count 0, no rows (not a degrade)
-            bool truncated = false;
-            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate,
-                                                                 window_days, truncated);
-            if (!rows)
-                return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
-            out.rows = std::move(*rows);
-            out.truncated = truncated;
-            return out;
-        };
-        // COPY the cohort provider (std::function is copyable) so the /auto VERIFY
-        // routes keep a live seam even after app_perf_providers is moved into the
-        // REST + MCP registrars below.
-        AppPerfCohortFn verify_cohort_fn = app_perf_providers.cohort;
+        // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
+        // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
+        // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
+        // dashboard fragments, the REST GET /api/v1/dex/perf/compare twin and the
+        // MCP compare_app_perf_versions tool, so all three can never disagree
+        // (same pattern as `network_api` above/below). `mgmt_group_store_` fails
+        // startup CLOSED (ADR-0012 §1) so it is always live here;
+        // `app_perf_cohort_reader_` is nullable until its own Postgres pool is
+        // ready, degrading every `compare()` call to the AUTHORITATIVE nullopt.
+        auto verify_api =
+            make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -15961,13 +15958,15 @@ private:
             audit_fn, preflight_run_store_.get());
 
         // VerifyRoutes — /auto Stage 3 VERIFY: the cohort-paired before/after
-        // app-perf evidence (UAT non-functional). Reads the shipped B1 store via the
-        // COPIED cohort provider; the pure compare engine pairs each machine. The
-        // aggregate read is an operational `dex.app_perf.compare` audit (set-and-
-        // proceed — the accountability that stands in for the absent floor); the
-        // per-machine drill is the audited PII surface. EVIDENTIAL only — no verdict,
-        // NO cohort floor (real canaries are 2-3 devices). Shares the /auto auth +
-        // group list with PreflightRoutes.
+        // app-perf evidence (UAT non-functional). Reads via the shared VerifyApi
+        // seam (ADR-0031 WS-A4 #4250) — the SAME instance the REST + MCP compare
+        // twins below use, so all three surfaces can never disagree; the pure
+        // compare engine pairs each machine. The aggregate read is an operational
+        // `dex.app_perf.compare` audit (set-and-proceed — the accountability that
+        // stands in for the absent floor); the per-machine drill is the audited
+        // PII surface. EVIDENTIAL only — no verdict, NO cohort floor (real
+        // canaries are 2-3 devices). Shares the /auto auth + group list with
+        // PreflightRoutes.
         verify_routes_ = std::make_unique<VerifyRoutes>();
         verify_routes_->register_routes(
             *web_server_, auth_fn, perm_fn,
@@ -15978,7 +15977,7 @@ private:
                         out.emplace_back(g.id, g.name);
                 return out;
             },
-            std::move(verify_cohort_fn), audit_fn);
+            audit_fn, verify_api);
 
         // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
         // a go-cohort (mid-run, no completion required), stages + executes an
@@ -16301,6 +16300,14 @@ private:
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
         wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
+        // BR-001 — the SAME capability_registry_ classifier /api/command, MCP
+        // execute_instruction and the exec console consult, so a fourth
+        // operator-facing dispatch surface cannot disagree with them about
+        // whether a plugin.action is Destructive or Forensics. Wired
+        // UNCONDITIONALLY, exactly like set_capability_classify_fn on
+        // DashboardRoutes/McpServer above: capability_registry_ is a plain
+        // ServerImpl member, never conditional on another store's presence.
+        wf_deps.capability_registry = &capability_registry_;
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*
@@ -17499,7 +17506,11 @@ private:
             // visible_set_fn's permission-agnostic join would leak a
             // multi-role operator's OTHER groups' device ids into GET
             // /api/v1/dex/app / GET /api/v1/dex/overview.
-            dex_visible_fn);
+            dex_visible_fn,
+            // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
+            // above and the MCP compare_app_perf_versions tool below use, so
+            // all three GET /api/v1/dex/perf/compare siblings never disagree.
+            verify_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -17912,7 +17923,12 @@ private:
                        std::optional<int> validity_days,
                        const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
                     return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by, "mcp");
-                });
+                },
+                // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
+                // and the REST GET /api/v1/dex/perf/compare twin use, so all
+                // three compare_app_perf_versions/compare siblings never
+                // disagree.
+                verify_api);
         }
 
         // -- Listen -----------------------------------------------------------

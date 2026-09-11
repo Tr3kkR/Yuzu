@@ -1071,25 +1071,25 @@ const std::string& openapi_spec() {
         // so the emitted OpenAPI JSON is byte-identical to the unsplit form.
         R"json(,
     "/guaranteed-state/rules": {
-      "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "403": {"description": "Service-scoped API token — the rule catalogue isn't owned by any one IT service, so this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "service unavailable"}}},
+      "get": {"summary": "List Guaranteed State rules", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "responses": {"200": {"description": "List of rules", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}}, "403": {"description": "Service-scoped API token — the rule catalogue isn't owned by any one IT service, so this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Guaranteed-state store degraded, retryable (A4 envelope, retry_after_ms: 5000)"}}},
       "post": {"summary": "Create a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. rule_id must match [A-Za-z0-9._-]+. Structured authoring: pass spark/assertion/remediation {type, params} blocks; remediation.params resilience policy is validated (mode persist|backoff|bounded + bounds). Validation failures use the A4 error envelope.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"201": {"description": "Rule created"}, "400": {"description": "Missing required fields, invalid JSON, or invalid resilience params"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "409": {"description": "Conflicting rule_id or name"}, "503": {"description": "service unavailable"}}}
     },
     "/guaranteed-state/schemas": {
       "get": {"summary": "Guard authoring schema registry", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Static catalog of spark/assertion/remediation types with per-type JSON Schemas (discriminated subschemas for value-dependent formats; resilience policy subschema for remediation). Cacheable via ETag/If-None-Match (304).", "responses": {"200": {"description": "Schema catalog"}, "304": {"description": "Not modified (ETag matched)"}}}
     },
     "/guaranteed-state/rules/{rule_id}": {
-      "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "403": {"description": "Service-scoped API token — this read cannot be confined to the token's service."}, "404": {"description": "Rule not found"}}},
-      "put": {"summary": "Update a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. Version is incremented on every successful update.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"200": {"description": "Rule updated"}, "400": {"description": "Invalid JSON"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "404": {"description": "Rule not found"}, "409": {"description": "Conflicting name"}}},
+      "get": {"summary": "Get a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "403": {"description": "Service-scoped API token — this read cannot be confined to the token's service."}, "404": {"description": "Rule not found"}, "503": {"description": "Guaranteed-state store degraded, retryable (A4 envelope, retry_after_ms: 5000)"}}},
+      "put": {"summary": "Update a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Write. Version is incremented on every successful update.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": true, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateRule"}}}}, "responses": {"200": {"description": "Rule updated"}, "400": {"description": "Invalid JSON"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "404": {"description": "Rule not found"}, "409": {"description": "Conflicting name"}, "503": {"description": "The pre-update rule lookup hit a degraded guaranteed-state store, retryable (A4 envelope, retry_after_ms: 5000)"}}},
       "delete": {"summary": "Delete a Guaranteed State rule", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Delete.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Rule deleted"}, "403": {"description": "Service-scoped API token — rule authoring cannot be confined to the token's service."}, "404": {"description": "Rule not found"}}}
     },
     "/guaranteed-state/rules/{rule_id}/status": {
-      "get": {"summary": "Per-guard fleet-wide agent-status drilldown (#4037)", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_list_read, the SAME sole gate GET /guaranteed-state/status uses (ADR-0017 admit-then-filter) — never a bare perm_fn. Returns agent_id/state/updated_at for EVERY agent that has reported this ONE rule's state fleet-wide. A service-scoped API token is refused outright (a rule has no single owning IT service to confine to); a management-group-confined grant's visible-agent set filters the returned rows. Raw census — does not apply the dashboard fragment's own offline-agent-folds-to-unknown rollup. MCP twin: get_guardian_rule_status.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-agent status rows for this rule", "content": {"application/json": {"schema": {"type": "array", "items": {"type": "object", "properties": {"agent_id": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}}}}}}}, "403": {"description": "Service-scoped API token, or no GuaranteedState:Read grant anywhere"}, "404": {"description": "rule_id names no rule"}, "503": {"description": "Store degraded, gate unwired, or the guaranteed_state.rule.view audit row could not persist (FAIL-CLOSED, Sec-Audit-Failed: true)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}}}}}}
+      "get": {"summary": "Per-guard fleet-wide agent-status drilldown (#4037)", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_list_read, the SAME sole gate GET /guaranteed-state/status uses (ADR-0017 admit-then-filter) — never a bare perm_fn. Returns agent_id/state/updated_at for EVERY agent that has reported this ONE rule's state fleet-wide. A service-scoped API token is refused outright (a rule has no single owning IT service to confine to); a management-group-confined grant's visible-agent set filters the returned rows. Raw census — does not apply the dashboard fragment's own offline-agent-folds-to-unknown rollup. MCP twin: get_guardian_rule_status.", "parameters": [{"name": "rule_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-agent status rows for this rule", "content": {"application/json": {"schema": {"type": "array", "items": {"type": "object", "properties": {"agent_id": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}}}}}}}, "403": {"description": "Service-scoped API token, or no GuaranteedState:Read grant anywhere"}, "404": {"description": "rule_id names no rule"}, "503": {"description": "Store degraded (retryable, A4 envelope with retry_after_ms: 5000), gate unwired (non-retryable), or the guaranteed_state.rule.view audit row could not persist (FAIL-CLOSED, Sec-Audit-Failed: true, also retry_after_ms: 5000)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}}}}}}
     },
     "/guaranteed-state/agents/{agent_id}/rules": {
-      "get": {"summary": "Per-device all-guards view (#4037)", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (management-group aware) via the SAME scoped_perm_fn gate GET /guaranteed-state/device-compliance uses. Every guard's state for ONE device, unscoped to any Baseline — genuinely distinct from device-compliance, which is scoped to one named Baseline (requires both agent_id AND baseline, and returns a baseline-shaped response). A device with no reported guards returns an empty guards[] array, not an error. MCP twin: get_guardian_device_guards.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Every guard's state for this device", "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}}}}, "total_guards": {"type": "integer"}}}}}}, "503": {"description": "Scoped-permission gate unwired, store degraded, or the guardian.device.view audit row could not persist (FAIL-CLOSED, Sec-Audit-Failed: true)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}}}}}}
+      "get": {"summary": "Per-device all-guards view (#4037)", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (management-group aware) via the SAME scoped_perm_fn gate GET /guaranteed-state/device-compliance uses. Every guard's state for ONE device, unscoped to any Baseline — genuinely distinct from device-compliance, which is scoped to one named Baseline (requires both agent_id AND baseline, and returns a baseline-shaped response). A device with no reported guards returns an empty guards[] array, not an error. MCP twin: get_guardian_device_guards.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Every guard's state for this device", "content": {"application/json": {"schema": {"type": "object", "properties": {"agent_id": {"type": "string"}, "guards": {"type": "array", "items": {"type": "object", "properties": {"rule_id": {"type": "string"}, "name": {"type": "string"}, "state": {"type": "string"}, "updated_at": {"type": "string"}}}}, "total_guards": {"type": "integer"}}}}}}, "503": {"description": "Scoped-permission gate unwired (non-retryable), store degraded (retryable, A4 envelope with retry_after_ms), or the guardian.device.view audit row could not persist (FAIL-CLOSED, Sec-Audit-Failed: true)", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}}}}}}
     },
     "/guaranteed-state/push": {
-      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "403": {"description": "Service-scoped API token — a full_sync push is fleet-wide by nature and cannot be confined to the token's service; the single most severe instance of this confinement-gap class on this branch."}, "503": {"description": "service unavailable"}}}
+      "post": {"summary": "Queue a Guaranteed State rule push to agents", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Push. Returns 202 Accepted — agent delivery is asynchronous. The server resolves the scope and delivers each in-scope agent a per-agent filtered rule set (os_target + scope_expr).", "requestBody": {"content": {"application/json": {"schema": {"type": "object", "properties": {"scope": {"type": "string", "description": "Scope DSL selector (empty = all agents)"}, "full_sync": {"type": "boolean", "default": false}}}}}}, "responses": {"202": {"description": "Push queued"}, "400": {"description": "Invalid JSON body"}, "403": {"description": "Service-scoped API token — a full_sync push is fleet-wide by nature and cannot be confined to the token's service; the single most severe instance of this confinement-gap class on this branch."}, "503": {"description": "Guaranteed-state rule store degraded or unreachable — the push is refused rather than fanned out empty (ADR-0038), retryable (A4 envelope, retry_after_ms)"}}}
     },
     "/guaranteed-state/events": {
       "get": {"summary": "Query Guaranteed State events", "tags": ["Guaranteed State"], "description": "Two gated shapes behind one route. An agent-scoped query (non-empty agent_id, max 256 chars, no control characters) requires per-device-scoped GuaranteedState:Read (management-group aware; a service-scoped token is confined to its own service's agents) and returns that device's individual-identifying behavioural signal history. A fleet-wide query (no agent_id) requires global GuaranteedState:Read AND denies a service-scoped token outright (403) — the fleet fan-out returns every reporting agent's agent_id + detail_json, which the bare service-token role check alone would not confine. BOTH shapes emit a dex.device.view audit (target_type Agent for the per-device shape, GuaranteedState for the fleet shape) and FAIL CLOSED — 503 + Sec-Audit-Failed: true (retryable, A4 envelope with retry_after_ms) — if that audit row cannot persist, parity with GET /api/v1/dex/devices/{id}. Limit is capped at 1000 at the REST boundary.", "parameters": [{"name": "rule_id", "in": "query", "schema": {"type": "string"}}, {"name": "agent_id", "in": "query", "schema": {"type": "string", "maxLength": 256}}, {"name": "severity", "in": "query", "schema": {"type": "string"}}, {"name": "limit", "in": "query", "schema": {"type": "integer", "default": 100, "maximum": 1000}}, {"name": "offset", "in": "query", "schema": {"type": "integer", "default": 0}}], "responses": {"200": {"description": "Matching events", "content": {"application/json": {"schema": {"type": "array", "items": {"$ref": "#/components/schemas/GuaranteedStateEvent"}}}}}, "400": {"description": "Invalid limit/offset, or agent_id too long / contains a control character"}, "403": {"description": "A service-scoped token queried the fleet-wide (no agent_id) shape, or an agent-scoped query named a device outside the caller's scope"}, "503": {"description": "Audit row could not persist — behavioural data withheld on both the agent-scoped and fleet-wide shapes; carries Sec-Audit-Failed: true and is retryable (A4 envelope).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
@@ -1107,7 +1107,7 @@ const std::string& openapi_spec() {
         // is byte-identical to the unsplit form.
         R"json(,
     "/guaranteed-state/device-compliance": {
-      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found); a behavioral-PII read, so it FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist — parity with GET /dex/devices/{id}. Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (stores / scoped-permission fn unwired — non-transient, do not retry) OR the guardian.device.view audit row could not persist so the read is refused without durable evidence (FAIL-CLOSED, CC7.2 — transient: Sec-Audit-Failed: true + retry_after_ms, retry after the audit subsystem recovers). A4 envelope.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "Name-anchored, device-applicable Guardian compliance", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read, per-device scoped (global grant passes fleet-wide; otherwise the caller must hold Read via a management group the device is in). Looks up the Baseline by NAME (a stable constant such as 'ServiceNow Compliance', not a churning baseline_id) and returns the Guards ACTUALLY APPLICABLE to this device, each with the device's last reported (Observe-mode) verdict. One Baseline carries a SUPERSET of Guards, each scoped via scope_expr so the push arms a different subset per machine; the denominator here is the deployed_snapshot intersected with the Guards this device has reported, so an out-of-scope Guard is absent and each machine shows only its own applicable Guards. total_guards is that applicable count, not the snapshot size. A not-deployed Baseline returns deployed:false with empty guards (consumer renders 'No Baseline Deployed'). updated_at carries staleness. Audited as guardian.device.view (success/not_found); a behavioral-PII read, so it FAILS CLOSED (503 + Sec-Audit-Failed) if the audit row cannot persist — parity with GET /dex/devices/{id}. Honest in-scope-but-unreported 'pending' (per-device scope_expr evaluation) is a deferred upgrade.", "parameters": [{"name": "baseline", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Baseline NAME (unique). URL-encode spaces, e.g. ServiceNow%20Compliance."}, {"name": "agent_id", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "Per-device applicable baseline status", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GuaranteedStateDeviceComplianceStatus"}}}}, "400": {"description": "Missing baseline/agent_id, over-length query parameter, or a parameter containing control characters (bytes < 0x20) (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "403": {"description": "Caller lacks GuaranteedState:Read on the device's scope — auth/RBAC-layer denial body, not the A4 envelope; exact shape varies by denial reason (RBAC vs service-scope)"}, "404": {"description": "Baseline name not found (A4 envelope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Either the route is misconfigured (stores / scoped-permission fn unwired — non-transient, do not retry, no retry_after_ms) OR the baseline store or guaranteed-state store degrades (transient, retry_after_ms: 5000) OR the guardian.device.view audit row could not persist so the read is refused without durable evidence (FAIL-CLOSED, CC7.2 — transient: Sec-Audit-Failed: true + retry_after_ms, retry after the audit subsystem recovers). A4 envelope.", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when the read was refused because the audit row could not persist (CC7.2 fail-closed); retry after the audit subsystem recovers."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/guaranteed-state/alerts": {
       "get": {"summary": "Guaranteed State alerts", "tags": ["Guaranteed State"], "description": "Requires GuaranteedState:Read. Placeholder — alert aggregation lands in Guardian PR 11.", "responses": {"200": {"description": "Alerts list (empty in PR 2)"}}}
@@ -1745,7 +1745,8 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn) {
+    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1762,7 +1763,7 @@ void RestApiV1::register_routes(
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn));
+                    std::move(dex_visible_fn), std::move(verify_api));
 }
 
 void RestApiV1::register_routes(
@@ -1786,7 +1787,8 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn) {
+    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -5769,8 +5771,9 @@ void RestApiV1::register_routes(
         auto defs_result = instruction_store->query_definitions(q);
         if (!defs_result) {
             res.status = 503;
-            res.set_content(detail::a4_error(res, "instruction store read failed"),
-                            "application/json");
+            res.set_content(
+                detail::a4_error(res, "instruction store read failed", {.retry_after_ms = 5000}),
+                "application/json");
             return;
         }
         JArr arr;
@@ -5794,8 +5797,10 @@ void RestApiV1::register_routes(
                  auto def_result = instruction_store->get_definition(id);
                  if (!def_result) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "instruction store read failed"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "instruction store read failed",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  if (!*def_result) {
@@ -5827,8 +5832,10 @@ void RestApiV1::register_routes(
                  auto def_result = instruction_store->get_definition(id);
                  if (!def_result) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "instruction store read failed"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "instruction store read failed",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  if (!*def_result) {
@@ -5868,10 +5875,15 @@ void RestApiV1::register_routes(
         auto packs_result = product_pack_store->list(q);
         if (!packs_result) {
             res.status = product_pack_error_status(packs_result.error());
-            res.set_content(detail::a4_error(res, product_pack_client_message(
-                                                       "GET /api/v1/product-packs",
-                                                       packs_result.error())),
-                            "application/json");
+            // Only the genuine DB/lease-fault (503) classification is transient —
+            // a 400 validation/business-rule error is never retryable.
+            res.set_content(
+                detail::a4_error(res,
+                                 product_pack_client_message("GET /api/v1/product-packs",
+                                                             packs_result.error()),
+                                 res.status == 503 ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                                    : detail::A4ErrorOpts{}),
+                "application/json");
             return;
         }
         JArr arr;
@@ -5895,10 +5907,15 @@ void RestApiV1::register_routes(
                  auto pack_result = product_pack_store->get(id);
                  if (!pack_result) {
                      res.status = product_pack_error_status(pack_result.error());
-                     res.set_content(detail::a4_error(res, product_pack_client_message(
-                                                                "GET /api/v1/product-packs/{id}",
-                                                                pack_result.error())),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res,
+                                          product_pack_client_message(
+                                              "GET /api/v1/product-packs/{id}",
+                                              pack_result.error()),
+                                          res.status == 503
+                                              ? detail::A4ErrorOpts{.retry_after_ms = 5000}
+                                              : detail::A4ErrorOpts{}),
+                         "application/json");
                      return;
                  }
                  if (!*pack_result) {
@@ -10522,8 +10539,10 @@ void RestApiV1::register_routes(
                  auto rows = guaranteed_state_store->list_rules();
                  if (!rows) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "guaranteed-state store degraded",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  JArr arr;
@@ -10719,8 +10738,10 @@ void RestApiV1::register_routes(
                  auto row = guaranteed_state_store->get_rule(id);
                  if (!row) {
                      res.status = 503;
-                     res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
-                                     "application/json");
+                     res.set_content(
+                         detail::a4_error(res, "guaranteed-state store degraded",
+                                          {.retry_after_ms = 5000}),
+                         "application/json");
                      return;
                  }
                  if (!*row) {
@@ -10779,8 +10800,10 @@ void RestApiV1::register_routes(
             auto row = guaranteed_state_store->get_rule(rule_id);
             if (!row) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 return;
             }
             const bool found = static_cast<bool>(*row);
@@ -10812,8 +10835,10 @@ void RestApiV1::register_routes(
             auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
             if (!rows) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 return;
             }
             JArr arr;
@@ -10870,7 +10895,8 @@ void RestApiV1::register_routes(
                  if (!existing) {
                      res.status = 503;
                      res.set_content(
-                         detail::error_json_a4(503, "guaranteed-state store degraded", cid),
+                         detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                               {.retry_after_ms = 5000}),
                          "application/json");
                      return;
                  }
@@ -11143,8 +11169,10 @@ void RestApiV1::register_routes(
             // 503, never the misleading 400 "invalid scope expression".
             if (pushed == -2) {
                 res.status = 503;
-                res.set_content(detail::a4_error(res, "guaranteed-state store degraded"),
-                                "application/json");
+                res.set_content(
+                    detail::a4_error(res, "guaranteed-state store degraded",
+                                     {.retry_after_ms = 5000}),
+                    "application/json");
                 audit_fn(req, "guaranteed_state.push", "denied", "GuaranteedState", "",
                          "store degraded scope=\"" + sanitize_audit_string(scope) + "\"");
                 return;
@@ -12559,7 +12587,7 @@ void RestApiV1::register_routes(
     // route already audits its success path under that verb.
     sink.Get(
         "/api/v1/dex/perf/compare",
-        [perm_fn, audit_fn, app_perf_providers,
+        [perm_fn, audit_fn, verify_api,
          deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
             if (deny_fleet_wide_service_scoped(
                     req, res, "dex.app_perf.compare", "GuaranteedState",
@@ -12570,7 +12598,7 @@ void RestApiV1::register_routes(
                 return;
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
-            if (!app_perf_providers.cohort) {
+            if (!verify_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(
                                     503, "service unavailable", cid, /*retry_after_ms=*/5000,
@@ -12622,8 +12650,9 @@ void RestApiV1::register_routes(
             }
             window = std::clamp(window, 1, AppPerfDailyStore::kRetentionDays);
 
-            auto cohort = app_perf_providers.cohort(group_id, app, baseline, candidate, window);
-            if (!cohort) { // AUTHORITATIVE degrade (member resolution OR row read)
+            VerifyCompareQuery vq{group_id, app, baseline, candidate, window};
+            auto result = verify_api->compare(vq);
+            if (!result) { // AUTHORITATIVE degrade (member resolution OR row read)
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "app-perf cohort read degraded", cid,
@@ -12632,10 +12661,8 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const PairedComparison c =
-                build_comparison(cohort->rows, yuzu::util::canon_version(baseline),
-                                 yuzu::util::canon_version(candidate), window);
-            const std::int64_t no_data = cohort_no_data(c, cohort->member_count);
+            const PairedComparison& c = result->comparison;
+            const std::int64_t no_data = cohort_no_data(c, result->member_count);
 
             // OPERATIONAL audit, set-and-proceed (NOT fail-closed — this is an
             // aggregate, the per-machine drill is the fail-closed surface). Records
@@ -12646,7 +12673,7 @@ void RestApiV1::register_routes(
             detail::emit_behavioral_audit(
                 audit_fn, req, res, "dex.app_perf.compare", "success", "GuaranteedState", group_id,
                 "app=" + audit_token(app) + " base=" + audit_token(baseline) + " cand=" +
-                    audit_token(candidate) + " cohort=" + std::to_string(cohort->member_count) +
+                    audit_token(candidate) + " cohort=" + std::to_string(result->member_count) +
                     " paired=" + std::to_string(c.paired) + " view=aggregate cid=" + cid);
 
             const std::string cpu = JObj()
@@ -12674,7 +12701,7 @@ void RestApiV1::register_routes(
                                         .add("baseline_version", baseline)
                                         .add("candidate_version", candidate)
                                         .add("window_days", static_cast<int64_t>(window))
-                                        .add("cohort_size", cohort->member_count)
+                                        .add("cohort_size", result->member_count)
                                         .add("paired", c.paired)
                                         .add("baseline_only", c.baseline_only)
                                         .add("candidate_only", c.candidate_only)
@@ -12684,7 +12711,7 @@ void RestApiV1::register_routes(
                                         // truncated=true → the cohort exceeded the read
                                         // cap; the counts above are UNRELIABLE (a machine
                                         // that ran both may be mis-read as baseline_only).
-                                        .add("truncated", cohort->truncated)
+                                        .add("truncated", result->truncated)
                                         .raw("cpu", cpu)
                                         .raw("ws", ws)
                                         .raw("distribution", dist)
@@ -13514,8 +13541,10 @@ void RestApiV1::register_routes(
             }
             if (!statuses_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
                              "agent_id={}",
                              cid, agent_id);
@@ -13530,8 +13559,10 @@ void RestApiV1::register_routes(
             auto rule_names_result = guaranteed_state_store->rule_names_for(rule_ids);
             if (!rule_names_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
                              "agent_id={}",
                              cid, agent_id);
@@ -13633,8 +13664,10 @@ void RestApiV1::register_routes(
             }
             if (!rows) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 return;
             }
             JArr arr;
@@ -13838,8 +13871,10 @@ void RestApiV1::register_routes(
             auto guard_ids_result = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
             if (!guard_ids_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "baseline store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "baseline store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 spdlog::warn("guardian.device.view baseline store degraded (503) cid={} "
                              "agent_id={}",
                              cid, agent_id);
@@ -13861,8 +13896,10 @@ void RestApiV1::register_routes(
             auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
             if (!rule_names_result || !statuses_result) {
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid),
-                                "application/json");
+                res.set_content(
+                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                          {.retry_after_ms = 5000}),
+                    "application/json");
                 spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
                              agent_id);
                 return;
