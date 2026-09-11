@@ -19,6 +19,7 @@
  *   - Detail agent grid switches to decile bucketing above 1024 agents.
  */
 
+#include "command_capability.hpp" // BR-001: CommandCapability / CommandCapabilityRegistry fixture
 #include "execution_event_bus.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
@@ -40,9 +41,11 @@
 #include "../test_helpers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -54,6 +57,41 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 
 namespace {
+
+// BR-001 — a small, independent fixture (never the real catalogue — that is
+// test_command_capability.cpp's job), mirroring test_command_routes.cpp's
+// kFixture: one Forensics row (byte-identical to the real
+// app_usage.summary row, capability_decls/plugin_action_catalogue_app_usage.hpp)
+// for the single-target gate, one Destructive row (byte-identical to
+// test_command_routes.cpp's tar.purge_source row) proving the same gate also
+// covers Destructive rows reached through this route, and the pre-existing
+// "test"/"list" pair used by every other test in this file deliberately stays
+// OUT of this fixture so it keeps classifying as Unclassified (ClassifyMiss),
+// pinning that an unclassified instruction's dispatch is untouched by this fix.
+inline constexpr std::array<CommandCapability, 2> kBr001Fixture{{
+    {
+        .plugin = "app_usage",
+        .action = "summary",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Forensics",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "tar",
+        .action = "purge_source",
+        .dispatch_class = DispatchClass::Destructive,
+        .mutability = Mutability::Irreversible,
+        .securable = "Infrastructure",
+        .operation = yuzu::server::authz::Operation::Delete,
+        .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+}};
 
 // ResponseStore is now a migrated Postgres store (ADR-0039) — shares the
 // "responsestore" template key with test_response_store.cpp (identical setup).
@@ -75,6 +113,12 @@ struct ExecHarness {
     /// earlier revision declared it after `sink` and asserted the wrong
     /// invariant in a comment; structure, not prose (governance, cpp-safety).
     yuzu::MetricsRegistry metrics;
+    /// BR-001 — the SAME capability_registry `command_routes.hpp`'s Deps
+    /// carries, wired unconditionally (production never leaves it null; see
+    /// `WorkflowRoutes::Deps::capability_registry`'s doc comment). Declared
+    /// before `sink` for the same borrowed-pointer-lifetime reason as
+    /// `metrics`/`registry` in `CommandHarness` (test_command_routes.cpp).
+    CommandCapabilityRegistry capability_registry{std::span<const CommandCapability>(kBr001Fixture)};
     yuzu::server::test::TestRouteSink sink;
 
     /// Optional shared admission budget (ADR-0034). Default nullptr keeps every
@@ -128,6 +172,15 @@ struct ExecHarness {
     /// non-default values.
     std::string dispatch_cmd_override;
     int dispatch_sent_override{0};
+    /// BR4-001 regression net: fires synchronously from inside cmd_dispatch,
+    /// after that step's dispatch is captured, so a test can mutate an
+    /// instruction definition BETWEEN one step's dispatch and the NEXT step's
+    /// dispatch_fn re-read of it — reproducing, deterministically and on one
+    /// thread, the same "definition changed after the route's preflight but
+    /// before dispatch_fn's own re-read" window a genuine concurrent editor
+    /// would race into. Default empty (no-op) so no pre-existing test using
+    /// cmd_dispatch is affected.
+    std::function<void()> dispatch_side_effect;
     /// #3424/#3511 Gate 8 round-4 (quality-engineer): override the zero-reach
     /// discriminator fields the stub's ConfinedDispatchOutcome carries, so a
     /// test can exercise each of the 4-way 503 split's branches instead of
@@ -320,6 +373,8 @@ struct ExecHarness {
             // into dispatch.
             last_dispatch_exec_visible = caller.exec_visible;
             last_dispatch_caller = caller;
+            if (dispatch_side_effect)
+                dispatch_side_effect();
             return {.sent = dispatch_sent_override,
                    .scope_parse_error = dispatch_scope_parse_error_override,
                    .denied_quarantined_count = dispatch_denied_quarantined_count_override,
@@ -364,6 +419,7 @@ struct ExecHarness {
         wf_deps.execution_event_bus = event_bus.get();
         wf_deps.stream_budget = stream_budget; // ADR-0034 admission (nullptr = unmetered)
         wf_deps.metrics = &metrics;            // #2500 targeting-refusal counter
+        wf_deps.capability_registry = &capability_registry; // BR-001 targeting gate
         routes.register_routes(sink, std::move(wf_deps));
     }
 
@@ -386,14 +442,19 @@ struct ExecHarness {
         }
     }
 
-    /// Insert a definition by id with a friendly display name.
-    void make_def(const std::string& id, const std::string& name) {
+    /// Insert a definition by id with a friendly display name. `plugin`/
+    /// `action` default to the pre-existing "test"/"list" pair every other
+    /// test in this file relies on (deliberately absent from
+    /// `kBr001Fixture`, so it classifies Unclassified/ClassifyMiss); BR-001
+    /// tests pass a pair present in that fixture instead.
+    void make_def(const std::string& id, const std::string& name,
+                  const std::string& plugin = "test", const std::string& action = "list") {
         InstructionDefinition d;
         d.id = id;
         d.name = name;
         d.type = "question";
-        d.plugin = "test";
-        d.action = "list";
+        d.plugin = plugin;
+        d.action = action;
         auto created = instructions->create_definition(d);
         REQUIRE(created.has_value());
     }
@@ -411,6 +472,31 @@ struct ExecHarness {
                                  "  steps:\n"
                                  "    - instruction: " +
                                  instruction_id + "\n";
+        auto id = workflows->create_workflow(yaml);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    /// BR4-001: two-step workflow, one step per instruction id, both
+    /// executed in order — needed to reproduce the late-mutation race
+    /// (mutate the SECOND step's instruction from a dispatch_side_effect
+    /// fired while dispatching the FIRST).
+    std::string make_workflow2(const std::string& display_name,
+                                const std::string& instruction_id_1,
+                                const std::string& instruction_id_2) {
+        REQUIRE(workflows);
+        const std::string yaml = "kind: Workflow\n"
+                                 "metadata:\n"
+                                 "  displayName: " +
+                                 display_name +
+                                 "\n"
+                                 "spec:\n"
+                                 "  steps:\n"
+                                 "    - instruction: " +
+                                 instruction_id_1 +
+                                 "\n"
+                                 "    - instruction: " +
+                                 instruction_id_2 + "\n";
         auto id = workflows->create_workflow(yaml);
         REQUIRE(id.has_value());
         return *id;
@@ -2204,6 +2290,368 @@ TEST_CASE("#2500 — an explicit agent_ids list wins over a broadcast request",
     CHECK(h.dispatch_calls == 1);
     REQUIRE(h.last_dispatch_agent_ids.size() == 1);
     CHECK(h.last_dispatch_agent_ids[0] == "agent-1");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BR-001 (branch review) — this route is a FOURTH real CommandRequest/
+// dispatch producer (`/api/command`, MCP `execute_instruction`, and the exec
+// console are the other three) that never called
+// `dispatch_destructive_gate.hpp`'s Forensics single-target rule /
+// Destructive broadcast refusal. `kBr001Fixture` classifies "app_usage"/
+// "summary" as Forensics and "tar"/"purge_source" as Destructive; the
+// pre-existing "test"/"list" default stays unclassified so every test above
+// this section is unaffected.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("BR-001 — a Forensics action with 0 agent_ids is refused",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-BR1", "Forensics read", "app_usage", "summary");
+
+    auto res = h.sink.Post("/api/instructions/def-BR1/execute", R"({"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["code"] == 400);
+    CHECK(body["error"]["message"].get<std::string>().find("forensic read") !=
+          std::string::npos);
+    CHECK(body["meta"]["api_version"] == "v1");
+
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
+
+    bool denied_audit = false;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "instruction.execute" && a.result == "denied" &&
+            a.detail == "reason=forensic_untargeted" && a.target_id == "def-BR1")
+            denied_audit = true;
+    CHECK(denied_audit);
+}
+
+TEST_CASE("BR-001 — a Forensics action with 2 agent_ids is refused",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-BR2", "Forensics read", "app_usage", "summary");
+
+    auto res = h.sink.Post("/api/instructions/def-BR2/execute",
+                           R"({"agent_ids":["agent-1","agent-2"]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("BR-001 — a Forensics action with a scope key is refused",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-BR3", "Forensics read", "app_usage", "summary");
+
+    // A single explicit agent_id ALONGSIDE a scope key must still refuse —
+    // the Forensics rule (like the Destructive one) rejects broadcast/scope
+    // fan-out even when a well-formed agent_ids list is also present.
+    auto res = h.sink.Post("/api/instructions/def-BR3/execute",
+                           R"({"agent_ids":["agent-1"],"scope":"__all__"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("BR-001 — a Forensics action with exactly 1 agent_id and no scope dispatches",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-BR4", "Forensics read", "app_usage", "summary");
+    h.dispatch_cmd_override = "cmd-br4";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/instructions/def-BR4/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 1);
+    CHECK(h.last_dispatch_agent_ids[0] == "agent-1");
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "forensic_untargeted"}})
+              .value() == 0.0);
+}
+
+TEST_CASE("BR-001 — a Destructive action with 0 agent_ids is refused (same gate, not just Forensics)",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-BR5", "Purge source", "tar", "purge_source");
+
+    auto res = h.sink.Post("/api/instructions/def-BR5/execute", R"({"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"].get<std::string>().find("destructive action") !=
+          std::string::npos);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"},
+                        {"reason", "destructive_untargeted"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("BR-001 — a non-Forensics/non-Destructive (unclassified) instruction is unaffected",
+          "[pg][workflow][executions][execute][targeting]") {
+    // The regression net: this is the SAME "test"/"list" default already
+    // used by every pre-existing test in this file, exercised through the
+    // exact "genuinely omitted target still broadcasts" shape #2500 pins
+    // above, to prove BR-001's fix changes nothing for an unclassified
+    // instruction.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-BR6", "Unclassified");
+    h.dispatch_cmd_override = "cmd-br6";
+    h.dispatch_sent_override = 3;
+
+    auto res = h.sink.Post("/api/instructions/def-BR6/execute", R"({"params":{}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(h.dispatch_calls == 1);
+    CHECK(h.last_dispatch_agent_ids.empty());
+    CHECK(h.last_dispatch_scope == "__all__");
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "forensic_untargeted"}})
+              .value() == 0.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"},
+                        {"reason", "destructive_untargeted"}})
+              .value() == 0.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BR2-001 (round-2 branch review) — the workflow execute route's OWN step
+// dispatcher is a second real CommandRequest producer, distinct from
+// /api/instructions/:id/execute (BR-001 above): a workflow can wrap the same
+// Forensics-classified instruction and reach cmd_dispatch_concurrency/
+// cmd_dispatch directly via dispatch_fn, bypassing BR-001's route-level gate
+// entirely. These pin that the SAME evaluate_destructive_targeting call now
+// runs inside dispatch_fn itself, so no sibling route can rediscover this gap.
+//
+// BR3-001 (round-3 branch review): BR2-001's per-step gate genuinely refuses
+// dispatch, but dispatch_fn has no metrics/audit_fn/req/res of its own, so the
+// refusal was silently absorbed into that ONE step's failed-step result while
+// the outer route still unconditionally audited "workflow.execute"/"success"
+// once WorkflowEngine::execute() returned. The fix preflights every step
+// against the SAME evaluate_destructive_targeting call BEFORE execute() is
+// ever invoked, so a would-be-refused step now refuses the WHOLE request up
+// front — audited, metered, 400 — rather than becoming a quietly-swallowed
+// per-step failure inside a 202. The first test below is updated in place to
+// assert the new outer-refusal shape; it previously asserted 202 (the
+// per-step-only refusal BR2-001 shipped).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("BR3-001 — a workflow step naming a Forensics instruction with 2 agent_ids is refused "
+          "up front, audited and metered, before WorkflowEngine::execute runs",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-1", "Forensics read", "app_usage", "summary");
+    auto wf_id = h.make_workflow("wf-br2-1", "def-BR2-1");
+    h.dispatch_cmd_override = "cmd-br2-1";
+    h.dispatch_sent_override = 2;
+
+    auto res =
+        h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(res);
+    // BR3-001: the preflight now refuses the WHOLE request (400) before
+    // WorkflowEngine::execute() is ever called — dispatch_calls == 0 because
+    // the per-step dispatch_fn closure (BR2-001's own gate) is never reached
+    // at all this time, not merely because it refused internally.
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.last_dispatch_agent_ids.empty());
+
+    // An audit row for the denial — this is the whole point of BR3-001: a
+    // security-relevant refusal must not be silently absorbed into a 202.
+    bool found_denied_audit = false;
+    for (const auto& call : h.audit_calls) {
+        if (call.action == "workflow.execute" && call.result == "denied") {
+            found_denied_audit = true;
+            CHECK(call.target_type == "workflow");
+            CHECK(call.target_id == wf_id);
+            CHECK(call.detail == "reason=forensic_untargeted");
+        }
+    }
+    CHECK(found_denied_audit);
+
+    // The rejection metric fired on the NEW `route="workflow"` series — a new
+    // emission point, distinct from `route="instruction_execute"`.
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "workflow"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("BR2-001 — a workflow step naming a Forensics instruction with exactly 1 agent_id dispatches",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-2", "Forensics read", "app_usage", "summary");
+    auto wf_id = h.make_workflow("wf-br2-2", "def-BR2-2");
+    h.dispatch_cmd_override = "cmd-br2-2";
+    h.dispatch_sent_override = 1;
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 1);
+    CHECK(h.last_dispatch_agent_ids[0] == "agent-A");
+}
+
+TEST_CASE("BR2-001 — a workflow step naming a Destructive instruction with 0 agent_ids is refused",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-3", "Destructive purge", "tar", "purge_source");
+    auto wf_id = h.make_workflow("wf-br2-3", "def-BR2-3");
+    h.dispatch_cmd_override = "cmd-br2-3";
+    h.dispatch_sent_override = 5;
+
+    // NOTE: the OUTER route (POST /api/workflows/:id/execute) already refuses
+    // an empty `agent_ids` array with 400 BEFORE any step ever reaches
+    // dispatch_fn (pre-existing "agent_ids array is required" check) — so this
+    // case pins that pre-existing defense-in-depth layer, not BR2-001's new
+    // per-step gate itself (BR2-001's own multi-agent/scope cases above DO
+    // reach and are refused by the new gate, since the outer check only
+    // rejects an EMPTY list, not a list of size > 1). The safety property that
+    // matters either way: dispatch_calls stays 0.
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":[]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+}
+
+TEST_CASE("BR2-001 — a workflow step naming an unclassified instruction is unaffected",
+          "[pg][workflow][executions][execute][targeting]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR2-4", "Unclassified");
+    auto wf_id = h.make_workflow("wf-br2-4", "def-BR2-4");
+    h.dispatch_cmd_override = "cmd-br2-4";
+    h.dispatch_sent_override = 3;
+
+    auto res = h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 202);
+    CHECK(h.dispatch_calls == 1);
+    REQUIRE(h.last_dispatch_agent_ids.size() == 2);
+}
+
+// BR4-001 (round-4 branch review): BR3-001's preflight (above) reads each
+// step's instruction definition ONCE, before WorkflowEngine::execute() runs
+// at all. If a definition changes AFTER that read but BEFORE dispatch_fn's
+// own re-read of the SAME instruction — a concurrent PATCH to the
+// instruction landing mid-execution — the preflight's classification is
+// stale. dispatch_fn's per-step gate (BR2-001) still correctly refuses the
+// actual dispatch on its fresh re-read, so no forbidden send ever reaches an
+// agent; the gap was purely in the route's own audit/metric: it still
+// unconditionally logged "workflow.execute"/"success" and returned 202,
+// because WorkflowEngine::execute() reports a per-step dispatch refusal as
+// an ordinary failed step, not as a targeting denial. This reproduces the
+// race deterministically, single-threaded, via dispatch_side_effect: step 1
+// dispatches successfully, and AS PART OF that dispatch the test mutates
+// step 2's instruction from unclassified to Forensics — a change the
+// preflight (which ran before either step dispatched) could never have
+// seen.
+TEST_CASE("BR4-001 — a step mutated to Forensics between preflight and its own dispatch is "
+          "denied with an audit event and the rejection metric, not a bare success/202",
+          "[pg][workflow][executions][execute][targeting][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/true);
+    h.make_def("def-BR4-1a", "Step one (unclassified)");
+    h.make_def("def-BR4-1b", "Step two (unclassified at preflight time)");
+    auto wf_id = h.make_workflow2("wf-br4-1", "def-BR4-1a", "def-BR4-1b");
+    h.dispatch_cmd_override = "cmd-br4-1";
+    h.dispatch_sent_override = 2;
+
+    h.dispatch_side_effect = [&h]() {
+        // Only step 1 (def-BR4-1a, still "test"/"list") should ever reach
+        // cmd_dispatch — step 2 must be refused by dispatch_fn's own gate
+        // before it gets this far. Mutate step 2's definition here, exactly
+        // between step 1's dispatch and step 2's dispatch_fn re-read.
+        auto current = h.instructions->get_definition("def-BR4-1b");
+        REQUIRE(current.has_value());
+        REQUIRE(current->has_value());
+        auto def = **current;
+        def.plugin = "app_usage";
+        def.action = "summary"; // Forensics — single-target rule
+        auto updated = h.instructions->update_definition(def);
+        REQUIRE(updated.has_value());
+    };
+
+    auto res =
+        h.sink.Post("/api/workflows/" + wf_id + "/execute", R"({"agent_ids":["agent-A","agent-B"]})");
+    REQUIRE(res);
+    // The request was admitted and an execution was created — this is an
+    // async-accepted endpoint, and the underlying dispatch was genuinely
+    // blocked, so 202 stands; what must change is the audit/metric record of
+    // WHAT happened inside.
+    CHECK(res->status == 202);
+    // Exactly one real dispatch (step 1) — step 2 never reaches cmd_dispatch.
+    CHECK(h.dispatch_calls == 1);
+
+    bool found_success_audit = false;
+    bool found_denied_audit = false;
+    for (const auto& call : h.audit_calls) {
+        if (call.action != "workflow.execute")
+            continue;
+        if (call.result == "success")
+            found_success_audit = true;
+        if (call.result == "denied") {
+            found_denied_audit = true;
+            CHECK(call.target_type == "workflow");
+            CHECK(call.target_id == wf_id);
+            CHECK(call.detail.find("reason=forensic_untargeted") != std::string::npos);
+        }
+    }
+    // The whole point of BR4-001: the late refusal is audited as "denied",
+    // and the route does NOT ALSO claim "success" for the same request.
+    CHECK(found_denied_audit);
+    CHECK_FALSE(found_success_audit);
+
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "workflow"}, {"reason", "forensic_untargeted"}})
+              .value() == 1.0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

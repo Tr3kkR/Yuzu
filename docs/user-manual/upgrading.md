@@ -22,6 +22,35 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Breaking: `GET /api/v1/openapi.json` now requires authentication (#2057)
+
+The OpenAPI spec endpoint used to be public — any unauthenticated client could
+fetch it to learn the REST surface. It now gates `Infrastructure:Read`, the
+same permission the MCP `yuzu://openapi` resource twin already required, so
+the two surfaces agree.
+
+**Breaking for pre-auth tooling.** A script, health-checker, or API-client
+codegen step that fetched the spec before logging in now gets `401` instead
+of the document:
+
+```json
+{"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}}
+```
+
+**What to do.** Fetch the spec with a session cookie or an API token, same as
+any other `/api/v1/*` route:
+
+```bash
+# Session cookie (dashboard-style login)
+curl -c cookies.txt -X POST http://localhost:8080/login \
+    -d "username=admin&password=<password>"
+curl -b cookies.txt http://localhost:8080/api/v1/openapi.json
+
+# API token
+curl -H "Authorization: Bearer <api-token>" \
+    http://localhost:8080/api/v1/openapi.json
+```
+
 ## Agent OTA pulls are now bounded per peer (#913, #911) — behaviour change
 
 `DownloadUpdate` is now admitted through a per-peer gate. A refused pull returns
@@ -3137,6 +3166,59 @@ If a migration fails:
 5. Open an issue with the full error line, the source/target version numbers, and the output of the `schema_meta` query above.
 
 ## Upgrade notes by release
+
+### vNEXT — Decommission securable replaces the SLE/Inventory/GuaranteedState conjunction (breaking for custom roles)
+
+`DELETE /api/v1/sle/agents/{id}` (the whole-device erasure cascade — see
+[REST API § Software Licensing (SLE)](rest-api.md#software-licensing-sle)) used to gate on a
+**three-securable conjunction**: `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and**
+`GuaranteedState:Delete`, all required together. A companion Wave 7 PR7.2 package adds a sixth
+per-agent store (`app_usage`) to the cascade, and rather than grow the conjunction to a fourth
+securable, ADR-0024 Decision 9 was amended ahead of that landing to promote a single dedicated
+**`Decommission`** securable — the route now
+gates on **`Decommission:Delete` alone**, replacing the old conjunction outright (not adding to it).
+
+**Seeded roles are auto-preserved** — the same `INSERT OR IGNORE` role-default seeding as the SLE
+securable above runs on every boot, so `Administrator` (full CRUD via the generic per-securable
+loop) and `ITServiceOwner` (a targeted `Decommission:Delete` grant) pick up the new securable
+automatically on upgrade, with no operator action required.
+
+**A previously revoked decommission ability is NOT silently regained.** If you had used
+`remove_permission()` to revoke `ITServiceOwner`'s `SoftwareLicensing:Delete`,
+`Inventory:Delete`, or `GuaranteedState:Delete` specifically to strip its decommission ability
+under the old conjunction, the upgrade detects that revocation and carries it forward onto the new
+`Decommission:Delete` grant automatically — `ITServiceOwner` stays unable to decommission a device
+after upgrading, exactly as before. No operator action is needed for this case; it is the inverse
+of the custom-role gap above (a seeded role *losing* access it deliberately had revoked is checked
+for, not just a custom role *gaining* an unrelated 403).
+
+**This is breaking only for a custom role.** Any custom role an operator built by hand-assembling
+the old three-securable conjunction (`SoftwareLicensing:Delete` + `Inventory:Delete` +
+`GuaranteedState:Delete`) specifically to reach this endpoint will start getting `403 Decommission:Delete`
+on its next call — **the three old grants no longer suffice**, because the route no longer checks
+them at all. Audit your custom roles before upgrading:
+
+```sql
+SELECT pr.principal_type, pr.principal_id, pr.role_name
+  FROM rbac_store.principal_roles pr
+  JOIN rbac_store.role_permissions rp ON rp.role_name = pr.role_name
+  WHERE rp.securable_type IN ('SoftwareLicensing', 'Inventory', 'GuaranteedState')
+    AND rp.operation = 'Delete'
+    AND rp.effect = 'allow'
+  GROUP BY pr.principal_type, pr.principal_id, pr.role_name
+  HAVING COUNT(DISTINCT rp.securable_type) = 3;
+```
+
+The old gate was a strict three-way AND — all three grants required together, `effect = 'allow'`
+on each. Matching on any ONE of the three (or including an explicit `effect = 'deny'` row, a legal
+`role_permissions` state) over-reports: a role holding, say, only `Inventory:Delete` for an
+unrelated purpose never had decommission ability under the old conjunction, and granting it
+`Decommission:Delete` now would be a NEW grant, not a preserved one.
+
+Grant `Decommission:Delete` to any custom role in that list that must retain the ability to erase a
+decommissioned device's data. `SoftwareLicensing:Delete`, `Inventory:Delete`, and
+`GuaranteedState:Delete` continue to gate their own unrelated surfaces exactly as before — only the
+erasure cascade's gate moved.
 
 ### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse, #2964 rotation sweep)
 

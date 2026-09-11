@@ -1626,9 +1626,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     prior_failed_count = st->failed_count;
                     if (st->locked) {
                         res.status = 401;
-                        res.set_content(
-                            R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
-                            "application/json");
+                        res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                        "application/json");
                         // Metric + a rate-limited log line ONLY — deliberately
                         // no audit row AND no analytics event per blocked
                         // attempt. Under a sustained brute-force against a
@@ -1698,9 +1697,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             }
             if (!break_glass_login) {
                 res.status = 401;
-                res.set_content(
-                    R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
                 // Governance UP-2: metric + rate-limited log, NOT a per-attempt
                 // audit row. sso-only rejects EVERY local login and this path
                 // never feeds lockout, so a per-attempt `audit_log` would let a
@@ -1733,9 +1731,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto role_opt = auth_mgr_.verify_password(username, password);
         if (!role_opt) {
             res.status = 401;
-            res.set_content(
-                R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "Invalid username or password"),
+                            "application/json");
             audit_log(req, "auth.login_failed", "error", "User", username);
             emit_event("auth.login_failed", req,
                        {{"source_ip", req.remote_addr}, {"username", username}}, {},
@@ -1794,7 +1791,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             // outage. Does NOT change the fail-closed decision.
                             res.set_header("Retry-After", "2");
                             res.set_content(
-                                R"({"error":{"code":503,"message":"authentication store is temporarily unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})",
+                                detail::a4_error(res, "authentication store is temporarily unavailable",
+                                                 {.retry_after_ms = 2000}),
                                 "application/json");
                             if (auto* m = auth_mgr_.metrics_registry()) {
                                 // Both counters, matching the mfa_status / mfa_init
@@ -1878,8 +1876,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 res.status = 503;
                 res.set_header("Retry-After", "2"); // #2396 honest backoff hint
                 res.set_content(
-                    R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                    R"(unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(res, "authentication store is temporarily unavailable",
+                                     {.retry_after_ms = 2000}),
                     "application/json");
                 if (auto* m = auth_mgr_.metrics_registry()) {
                     m->counter("yuzu_auth_secret_unavailable_total", {{"route", "login"}})
@@ -2003,7 +2001,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // operator explicitly enabled.
                 res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":503,"message":"MFA enrollment is required but the authentication store is unavailable"},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(
+                        res, "MFA enrollment is required but the authentication store is unavailable"),
                     "application/json");
                 audit_log_for_principal(req, "mfa.enroll.required", "error", username,
                                         auth::role_to_string(*role_opt), "User", username,
@@ -2025,10 +2024,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                     res.set_header("Retry-After", "2"); // #2396 honest backoff hint (503 only)
                 res.set_content(
                     store_unavailable
-                        ? R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                          R"(unavailable","retry_after_ms":2000},"meta":{"api_version":"v1"}})"
-                        : R"({"error":{"code":500,"message":"Could not initiate MFA enrollment"},)"
-                          R"("meta":{"api_version":"v1"}})",
+                        ? detail::a4_error(res, "authentication store is temporarily unavailable",
+                                           {.retry_after_ms = 2000})
+                        : detail::a4_error(res, "Could not initiate MFA enrollment"),
                     "application/json");
                 if (store_unavailable) {
                     if (auto* m = auth_mgr_.metrics_registry()) {
@@ -2070,7 +2068,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             if (at_capacity) {
                 res.status = 503;
                 res.set_content(
-                    R"({"error":{"code":503,"message":"too many pending authentications, retry shortly"},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(res, "too many pending authentications, retry shortly"),
                     "application/json");
                 // Observable load-shed (governance sec-MED / UP-D3): a
                 // counter for alerting + a (per-event, not audit) warn.
@@ -2133,9 +2131,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 // other failure branches (no oracle on which credential/
                 // state step failed).
                 res.status = 401;
-                res.set_content(
-                    R"({"error":{"code":401,"message":"Invalid username or password"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
                 audit_log_for_principal(req, "auth.login", "failure", username,
                                         auth::role_to_string(*role_opt), "User", username,
                                         "reason=session_mint_failed;cause=undifferentiated");
@@ -2190,7 +2187,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (challenge_at_capacity) {
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"too many pending authentications, retry shortly"},"meta":{"api_version":"v1"}})",
+                detail::a4_error(res, "too many pending authentications, retry shortly"),
                 "application/json");
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_mfa_pending_load_shed_total", {{"kind", "challenge"}})
@@ -2223,9 +2220,12 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // vs code-rejected vs attempts-exhausted) — distinguishing them
         // on the wire gives an attacker a token-validity oracle. The
         // discriminator lives in the audit `detail` column only
-        // (Gate 4 consistency N1 + security oracle).
-        static constexpr const char* kFailureBody =
-            R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})";
+        // (Gate 4 consistency N1 + security oracle). `kFailureBody(res)`
+        // (not a compile-time constant) so each 401 mints its own
+        // correlation id.
+        auto kFailureBody = [](httplib::Response& r) {
+            return detail::a4_error(r, "Invalid verification code");
+        };
 
         auto pending = extract_form_value(req.body, "mfa_pending_token");
         auto code = extract_form_value(req.body, "code");
@@ -2250,7 +2250,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         if (!found) {
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log(req, "mfa.login.failed", "error", "User", "",
                       "pending token invalid or expired");
             emit_event("mfa.login.failed", req,
@@ -2266,7 +2266,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // already consumed at lookup time, so this is terminal.
         if (entry.kind == PendingKind::enrollment) {
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "enrollment token used at login-challenge endpoint");
@@ -2276,7 +2276,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.login.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "auth_db unavailable");
@@ -2330,10 +2330,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         if (store_unavailable) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                R"(unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
+                            "application/json");
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_verify"}})
                     .increment();
@@ -2376,7 +2374,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 pending_size = mfa_pending_.size();
             }
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.login.failed", "error", uname,
                                     auth::role_to_string(urole), "User", uname,
                                     exhausted ? "attempts exhausted"
@@ -2428,7 +2426,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // covers why the audit reason below doesn't assert
             // post_mint_recheck=true - cpp-expert Gate 8).
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "reason=session_mint_failed;cause=undifferentiated;method=" +
@@ -2479,8 +2477,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // `is_login` rate-limit predicate so the provisional secret can't be
     // brute-forced. Uniform 401 body on every failure mode.
     sink.Post("/login/mfa/enroll", [this](const httplib::Request& req, httplib::Response& res) {
-        static constexpr const char* kFailureBody =
-            R"({"error":{"code":401,"message":"Invalid verification code"},"meta":{"api_version":"v1"}})";
+        auto kFailureBody = [](httplib::Response& r) {
+            return detail::a4_error(r, "Invalid verification code");
+        };
 
         auto pending = extract_form_value(req.body, "mfa_pending_token");
         auto code = extract_form_value(req.body, "code");
@@ -2501,7 +2500,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         }
         if (!found) {
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log(req, "mfa.enroll.failed", "error", "User", "",
                       "pending token invalid or expired");
             return;
@@ -2511,7 +2510,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // endpoint — the inverse of the guard in /login/mfa.
         if (entry.kind != PendingKind::enrollment) {
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "login-challenge token used at enrollment endpoint");
@@ -2525,7 +2524,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // a distinct status during a store outage (Hermes L-1). The
             // real reason is in the audit detail only.
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.enroll.failed", "error", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "auth_db unavailable");
@@ -2584,19 +2583,15 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
             res.status = 409;
-            res.set_content(
-                R"({"error":{"code":409,"message":"MFA is already enrolled on this account"},)"
-                R"("meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "MFA is already enrolled on this account"),
+                            "application/json");
             return;
         }
 
         if (store_unavailable) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                R"(unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
+                            "application/json");
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_enroll"}})
                     .increment();
@@ -2641,7 +2636,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                 pending_size = mfa_pending_.size();
             }
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(
                 req, "mfa.enroll.failed", "error", uname, auth::role_to_string(urole), "User",
                 uname,
@@ -2695,7 +2690,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // out regardless of enrollment status. The recovery-codes
             // one-time reveal is correctly withheld on this path too.
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "auth.login", "failure", entry.username,
                                     auth::role_to_string(entry.role), "User", entry.username,
                                     "reason=session_mint_failed;cause=undifferentiated;"
@@ -2741,8 +2736,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
     // hit this endpoint with auth_source != "local"/"oidc" — they get a
     // 400 (session step-up is the wrong tool for token rotation).
     sink.Post("/login/mfa/stepup", [this](const httplib::Request& req, httplib::Response& res) {
-        static constexpr const char* kFailureBody =
-            R"({"error":{"code":401,"message":"MFA step-up failed"},"meta":{"api_version":"v1"}})";
+        auto kFailureBody = [](httplib::Response& r) {
+            return detail::a4_error(r, "MFA step-up failed");
+        };
 
         auto session = require_auth(req, res);
         if (!session)
@@ -2807,18 +2803,14 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         auto* db = auth_mgr_.auth_db_ptr();
         if (!db) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"auth_db unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "auth_db unavailable"), "application/json");
             return;
         }
 
         auto code = extract_form_value(req.body, "code");
         if (code.empty()) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"missing code"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "missing code"), "application/json");
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
                                     auth::role_to_string(session->role), "User",
                                     session->username, "missing code");
@@ -2863,10 +2855,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         if (store_unavailable) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"authentication store is temporarily )"
-                R"(unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "authentication store is temporarily unavailable"),
+                            "application/json");
             if (auto* m = auth_mgr_.metrics_registry()) {
                 m->counter("yuzu_auth_secret_unavailable_total", {{"route", "mfa_stepup"}})
                     .increment();
@@ -2886,7 +2876,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
 
         if (!matched) {
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
                                     auth::role_to_string(session->role), "User",
                                     session->username,
@@ -2916,7 +2906,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
             // a session; if mark_session_mfa_verified can't find it, the
             // session was concurrently invalidated. Fail closed.
             res.status = 401;
-            res.set_content(kFailureBody, "application/json");
+            res.set_content(kFailureBody(res), "application/json");
             audit_log_for_principal(req, "mfa.step_up.failed", "error", session->username,
                                     auth::role_to_string(session->role), "User",
                                     session->username, "session vanished during step-up");
@@ -2989,9 +2979,7 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         std::shared_lock oidc_lock(oidc_mu_);
         if (!oidc_provider_ || !oidc_provider_->is_enabled()) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"OIDC not configured"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "OIDC not configured"), "application/json");
             return;
         }
         // Use the configured redirect URI only — never derive from the
@@ -2999,7 +2987,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         if (cfg_.oidc_redirect_uri.empty()) {
             res.status = 500;
             res.set_content(
-                R"({"error":{"code":500,"message":"OIDC redirect_uri not configured — set --oidc-redirect-uri or YUZU_OIDC_REDIRECT_URI"},"meta":{"api_version":"v1"}})",
+                detail::a4_error(res, "OIDC redirect_uri not configured — set "
+                                       "--oidc-redirect-uri or YUZU_OIDC_REDIRECT_URI"),
                 "application/json");
             spdlog::error("OIDC auth flow blocked: redirect_uri not configured");
             return;
