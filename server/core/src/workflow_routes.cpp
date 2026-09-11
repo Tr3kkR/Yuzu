@@ -1295,16 +1295,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         if (expression.empty()) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "expression required"), "application/json");
             return;
         }
 
         auto parsed = yuzu::scope::parse(expression);
         if (!parsed) {
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", parsed.error()}}).dump(), "application/json");
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
             return;
         }
 
@@ -1322,9 +1320,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
             return;
         }
 
@@ -1336,16 +1333,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 q.limit = std::stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
             return;
         }
         if (q.limit <= 0) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"limit must be a positive integer"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "limit must be a positive integer"),
+                            "application/json");
             return;
         }
 
@@ -1353,11 +1348,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!workflows_result) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "list_workflows", workflows_result.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "list_workflows", workflows_result.error())),
                 "application/json");
             return;
         }
@@ -1392,9 +1384,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
             return;
         }
 
@@ -1405,9 +1396,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 yaml_source = j.value("yaml_source", "");
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
                 return;
             }
         } else {
@@ -1419,16 +1408,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (yuzu::server::is_generic_db_error(result.error())) {
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json({{"error", {{"code", 503},
-                                               {"message", yuzu::server::genericize_db_error(
-                                                               "create_workflow", result.error())}}},
-                                    {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
+                    detail::a4_error(res, yuzu::server::genericize_db_error(
+                                              "create_workflow", result.error())),
                     "application/json");
                 return;
             }
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "workflow.create", "success", "workflow", *result, "");
@@ -1447,9 +1433,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1458,19 +1442,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!workflow_result) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "get_workflow", workflow_result.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "get_workflow", workflow_result.error())),
                 "application/json");
             return;
         }
         if (!*workflow_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"workflow not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow not found"), "application/json");
             return;
         }
         const auto& workflow = **workflow_result;
@@ -1506,9 +1485,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1521,11 +1498,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!del && yuzu::server::is_generic_db_error(del.error())) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "delete_workflow", del.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "delete_workflow", del.error())),
                 "application/json");
             return;
         }
@@ -1550,9 +1524,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
             return;
         }
 
@@ -1568,17 +1541,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
             return;
         }
 
         if (agent_ids.empty()) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"agent_ids array is required"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "agent_ids array is required"),
+                            "application/json");
             return;
         }
 
@@ -1600,12 +1570,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!workflow_result) {
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json(
-                        {{"error", {{"code", 503},
-                                    {"message", yuzu::server::genericize_db_error(
-                                                    "get_workflow", workflow_result.error())}}},
-                         {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
+                    detail::a4_error(res, yuzu::server::genericize_db_error(
+                                              "get_workflow", workflow_result.error())),
                     "application/json");
                 return;
             }
@@ -1622,24 +1588,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     auto step_def_result = instruction_store->get_definition(step.instruction_id);
                     if (!step_def_result) {
                         res.status = 503;
-                        res.set_content(
-                            nlohmann::json({{"error", {{"code", 503},
-                                                       {"message", "instruction store unavailable"}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
-                            "application/json");
+                        res.set_content(detail::a4_error(res, "instruction store unavailable"),
+                                        "application/json");
                         return;
                     }
                     if (!*step_def_result) {
                         res.status = 400;
                         res.set_content(
-                            nlohmann::json({{"error",
-                                             {{"code", 400},
-                                              {"message", "workflow step '" + step.label +
-                                                              "' references unknown instruction: " +
-                                                              step.instruction_id}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+                            detail::a4_error(res, "workflow step '" + step.label +
+                                                      "' references unknown instruction: " +
+                                                      step.instruction_id),
                             "application/json");
                         return;
                     }
@@ -1659,16 +1617,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     if (blocked) {
                         res.status = 403;
                         res.set_content(
-                            nlohmann::json(
-                                {{"error",
-                                  {{"code", 403},
-                                   {"message",
-                                    "workflow step '" + step.label + "' references instruction '" +
-                                        step.instruction_id + "' which requires approval (mode: " +
+                            detail::a4_error(
+                                res, "workflow step '" + step.label +
+                                        "' references instruction '" + step.instruction_id +
+                                        "' which requires approval (mode: " +
                                         step_def.approval_mode +
-                                        "). Submit each instruction individually for approval."}}},
-                                 {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+                                        "). Submit each instruction individually for approval."),
                             "application/json");
                         return;
                     }
@@ -1785,16 +1739,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (yuzu::server::is_generic_db_error(result.error())) {
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json({{"error", {{"code", 503},
-                                               {"message", yuzu::server::genericize_db_error(
-                                                               "execute", result.error())}}},
-                                    {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
+                    detail::a4_error(res, yuzu::server::genericize_db_error(
+                                              "execute", result.error())),
                     "application/json");
                 return;
             }
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
@@ -1825,9 +1776,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // time (security-guardian Gate 2 finding #2).
         if (!fleet_read_fn) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         auto gate = fleet_read_fn(req, res, "Workflow", "Read");
@@ -1835,9 +1784,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return; // gate already wrote the response.
         if (!workflow_engine) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1846,19 +1793,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!exec_result) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "get_execution", exec_result.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "get_execution", exec_result.error())),
                 "application/json");
             return;
         }
         if (!*exec_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // #1552/#4030 anti-oracle (test_workflow_routes.cpp "zero-overlap
+            // confined caller gets the same 404 as a nonexistent id"): a
+            // per-request correlation_id in the BODY would let a confined
+            // caller distinguish "record exists but I can't see it" from
+            // "record does not exist" by diffing the two 404 bodies,
+            // defeating the whole point of this route's Gate 8 confinement
+            // fix. Both not-found branches below build the body via the pure
+            // `error_json_a4` builder with a fixed empty correlation_id
+            // (byte-identical by construction) rather than `a4_error`, which
+            // would echo the per-request header value into the body. The
+            // response still stamps a real `X-Correlation-Id` header
+            // (`ensure_correlation_id`) for grep-ability — only the body is
+            // exempt, and only on this route's two not-found branches.
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
             return;
         }
         const auto& exec = **exec_result;
@@ -1867,13 +1824,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // which audits every fetch) and none is added here; adding a
         // first-ever audit call to this route is a separate, unrelated
         // decision, out of scope for this fix. Denial 404-collapses
-        // identically to the not-found body above (byte-identical -- same
-        // literal string, anti-enumeration).
+        // identically to the not-found body above (same fixed-empty-cid
+        // construction, see the comment there).
         if (!workflow_execution_visible(exec, gate.scope)) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
             return;
         }
 
@@ -2180,9 +2137,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!instruction_store || !instruction_store->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "instruction store not available"),
+                            "application/json");
             return;
         }
 
@@ -2193,16 +2149,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto def_result = instruction_store->get_definition(def_id);
         if (!def_result) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "instruction store not available"),
+                            "application/json");
             return;
         }
         if (!*def_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "instruction definition not found"),
+                            "application/json");
             return;
         }
         const auto& def = **def_result;
@@ -2213,9 +2167,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             j = nlohmann::json::parse(req.body);
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
             return;
         }
 
@@ -2236,9 +2188,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          std::string("reason=") + std::string(kReasonBodyType));
             }
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                            "application/json");
             return;
         }
 
@@ -2268,11 +2219,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          std::string("reason=") + bv->reason);
             }
             res.status = 400;
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
-                "application/json");
+            res.set_content(detail::a4_error(res, bv->message), "application/json");
             return;
         }
 
@@ -2292,9 +2239,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
             return;
         }
 
@@ -2314,7 +2259,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           def_id, def.approval_mode);
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"approval system unavailable — cannot execute approval-gated instruction"},"meta":{"api_version":"v1"}})",
+                detail::a4_error(
+                    res, "approval system unavailable — cannot execute approval-gated instruction"),
                 "application/json");
             return;
         }
@@ -2361,9 +2307,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (!result) {
                     spdlog::error("approval submit failed for '{}': {}", def_id, result.error());
                     res.status = 500;
-                    res.set_content(
-                        R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
-                        "application/json");
+                    res.set_content(detail::a4_error(res, "failed to create approval request"),
+                                    "application/json");
                     return;
                 }
                 audit_fn(req, "instruction.approval_required", "pending", "instruction", def_id,
@@ -2472,9 +2417,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                               execution_id);
             }
             res.status = 500;
-            res.set_content(
-                R"({"error":{"code":500,"message":"dispatch failed"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "dispatch failed"), "application/json");
             return;
         }
 
@@ -2510,34 +2453,75 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // than a bare string -- `reason` names the branch and
                 // `retry_after_ms: null` is present per rest_a4_envelope.hpp's
                 // contract that the key is ALWAYS present, never omitted.
+                // `reason` is a route-local extension beyond A4ErrorOpts'
+                // fixed field set (retry_after_ms/remediation/permission/
+                // approval_id/status_url only) — built by hand rather than
+                // via `detail::a4_error` so `reason` survives, with
+                // `correlation_id` added via `detail::ensure_correlation_id`
+                // to still satisfy A4's required-field set.
                 res.status = 400;
                 res.set_content(
                     nlohmann::json({{"error",
                                      {{"code", 400},
                                       {"message", "invalid scope: " + *scope_parse_error},
                                       {"reason", "invalid_scope"},
-                                      {"retry_after_ms", nullptr}}},
+                                      {"retry_after_ms", nullptr},
+                                      {"correlation_id", detail::ensure_correlation_id(res)}}},
                                     {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
                 return;
             }
             res.status = 503;
+            // Same route-local `reason`-carrying extension as the
+            // scope_parse_error branch above — hand-built, not
+            // `detail::a4_error`, to keep `reason` alongside the A4-required
+            // `correlation_id`.
             if (containment_unreadable) {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "containment state is unreadable — dispatch is "
+                                               "failing closed and reaching no agent; check the "
+                                               "quarantine store"},
+                                   {"reason", "containment_unreadable"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
             } else if (denied_quarantined_count > 0) {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "every target is quarantined — dispatch was "
+                                               "withheld, not attempted"},
+                                   {"reason", "quarantined"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
             } else if (unknown_plugin_count > 0) {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "the dispatched plugin is not in any target's "
+                                               "reported inventory — dispatch was withheld, not "
+                                               "attempted"},
+                                   {"reason", "plugin_not_found"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
             } else {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"no agents reached: every target was unreachable or excluded by an in-flight per-device concurrency claim. Check yuzu_server_dispatch_concurrency_skipped_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(
+                        res, "no agents reached: every target was unreachable or excluded by an "
+                             "in-flight per-device concurrency claim. Check "
+                             "yuzu_server_dispatch_concurrency_skipped_total before treating this "
+                             "as an agent-connectivity fault."),
                     "application/json");
             }
             return;
@@ -2587,9 +2571,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store || !product_pack_store->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"product pack store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "product pack store not available"),
+                            "application/json");
             return;
         }
 
@@ -2601,9 +2584,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 q.limit = std::stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
             return;
         }
 
@@ -2635,9 +2617,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store || !product_pack_store->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"product pack store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "product pack store not available"),
+                            "application/json");
             return;
         }
 
@@ -2648,9 +2629,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 yaml_bundle = j.value("yaml_source", "");
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
                 return;
             }
         } else {
@@ -2813,9 +2792,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -2831,9 +2808,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!*pack_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"product pack not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "product pack not found"), "application/json");
             return;
         }
         auto& pack = *pack_result;
@@ -2852,9 +2827,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 

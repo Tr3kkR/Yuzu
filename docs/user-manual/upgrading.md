@@ -22,6 +22,35 @@ This guide covers upgrading Yuzu components (server, agent, gateway) between ver
 
 **Rule of thumb:** agents and gateway should be the same minor version as the server, or one minor version behind. The server is always upgraded first.
 
+## ⚠️ Breaking: `GET /api/v1/openapi.json` now requires authentication (#2057)
+
+The OpenAPI spec endpoint used to be public — any unauthenticated client could
+fetch it to learn the REST surface. It now gates `Infrastructure:Read`, the
+same permission the MCP `yuzu://openapi` resource twin already required, so
+the two surfaces agree.
+
+**Breaking for pre-auth tooling.** A script, health-checker, or API-client
+codegen step that fetched the spec before logging in now gets `401` instead
+of the document:
+
+```json
+{"error":{"code":401,"message":"unauthorized"},"meta":{"api_version":"v1"}}
+```
+
+**What to do.** Fetch the spec with a session cookie or an API token, same as
+any other `/api/v1/*` route:
+
+```bash
+# Session cookie (dashboard-style login)
+curl -c cookies.txt -X POST http://localhost:8080/login \
+    -d "username=admin&password=<password>"
+curl -b cookies.txt http://localhost:8080/api/v1/openapi.json
+
+# API token
+curl -H "Authorization: Bearer <api-token>" \
+    http://localhost:8080/api/v1/openapi.json
+```
+
 ## Agent OTA pulls are now bounded per peer (#913, #911) — behaviour change
 
 `DownloadUpdate` is now admitted through a per-peer gate. A refused pull returns

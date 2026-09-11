@@ -4548,9 +4548,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // tier_allows-then-perm_fn order. This resources/read branch, like every other
             // branch in this method, emits no audit row on tier denial (unlike tools/call's
             // mcp_audit("denied", ...)) — the whole resources/read surface predates
-            // per-call audit, tracked by the same #2713 follow-up. Deliberately NOT
-            // unauthenticated like /api/v1/openapi.json — that posture is a tracked
-            // pre-existing gap (#2057), not a precedent to follow.
+            // per-call audit, tracked by the same #2713 follow-up. #2057 (REST
+            // GET /api/v1/openapi.json was unauthenticated) is now closed — that
+            // route gates Infrastructure:Read too, so the two surfaces share the
+            // same posture rather than this one being the odd one out.
             //
             // Shared tier-denial remediation text for these two branches only — NOT the
             // same scope as tools/call's kTierRemediation (declared later, inside that
