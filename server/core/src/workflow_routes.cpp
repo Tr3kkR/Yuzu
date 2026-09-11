@@ -1,6 +1,8 @@
 #include "workflow_routes.hpp"
 
+#include "command_capability.hpp"        // CommandCapability / ClassificationError / CommandCapabilityRegistry
 #include "compliance_eval.hpp"
+#include "dispatch_destructive_gate.hpp" // BR-001: evaluate_destructive_targeting / requires_explicit_targets
 #include "dispatch_target_shape.hpp" // check_targeting_shape — the omitted-vs-supplied rule (#2500)
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -122,6 +124,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     auto* response_store = deps.response_store;
     auto* execution_event_bus = deps.execution_event_bus;
     auto* metrics = deps.metrics;
+    auto* capability_registry = deps.capability_registry; // BR-001
     auto cmd_dispatch = std::move(deps.command_dispatch_fn);
     auto cmd_dispatch_concurrency = std::move(deps.command_dispatch_fn_concurrency);
     // K-R7-02 / PLAN-006: per-request DispatchCaller derivation. A missing
@@ -1295,16 +1298,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         if (expression.empty()) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"expression required"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "expression required"), "application/json");
             return;
         }
 
         auto parsed = yuzu::scope::parse(expression);
         if (!parsed) {
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", parsed.error()}}).dump(), "application/json");
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
             return;
         }
 
@@ -1322,9 +1323,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
             return;
         }
 
@@ -1336,16 +1336,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 q.limit = std::stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
             return;
         }
         if (q.limit <= 0) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"limit must be a positive integer"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "limit must be a positive integer"),
+                            "application/json");
             return;
         }
 
@@ -1353,11 +1351,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!workflows_result) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "list_workflows", workflows_result.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "list_workflows", workflows_result.error())),
                 "application/json");
             return;
         }
@@ -1392,9 +1387,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
             return;
         }
 
@@ -1405,9 +1399,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 yaml_source = j.value("yaml_source", "");
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
                 return;
             }
         } else {
@@ -1419,16 +1411,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (yuzu::server::is_generic_db_error(result.error())) {
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json({{"error", {{"code", 503},
-                                               {"message", yuzu::server::genericize_db_error(
-                                                               "create_workflow", result.error())}}},
-                                    {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
+                    detail::a4_error(res, yuzu::server::genericize_db_error(
+                                              "create_workflow", result.error())),
                     "application/json");
                 return;
             }
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
         audit_fn(req, "workflow.create", "success", "workflow", *result, "");
@@ -1447,9 +1436,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1458,19 +1445,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!workflow_result) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "get_workflow", workflow_result.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "get_workflow", workflow_result.error())),
                 "application/json");
             return;
         }
         if (!*workflow_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"workflow not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow not found"), "application/json");
             return;
         }
         const auto& workflow = **workflow_result;
@@ -1506,9 +1488,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!workflow_engine) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1521,11 +1501,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!del && yuzu::server::is_generic_db_error(del.error())) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "delete_workflow", del.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "delete_workflow", del.error())),
                 "application/json");
             return;
         }
@@ -1543,16 +1520,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post(R"(/api/workflows/([^/]+)/execute)", [auth_fn, perm_fn, audit_fn, emit_fn,
                                                     workflow_engine, instruction_store,
                                                     cmd_dispatch, cmd_dispatch_concurrency,
-                                                    caller_fn,
-                                                    approval_manager](const httplib::Request& req,
-                                                                      httplib::Response& res) {
+                                                    caller_fn, approval_manager,
+                                                    capability_registry, metrics](  // BR2-001/BR3-001
+                                                        const httplib::Request& req,
+                                                        httplib::Response& res) {
         if (!perm_fn(req, res, "Workflow", "Execute"))
             return;
         if (!workflow_engine || !workflow_engine->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"workflow engine not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "workflow engine not available"),
+                            "application/json");
             return;
         }
 
@@ -1568,17 +1545,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
             return;
         }
 
         if (agent_ids.empty()) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"agent_ids array is required"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "agent_ids array is required"),
+                            "application/json");
             return;
         }
 
@@ -1600,12 +1574,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (!workflow_result) {
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json(
-                        {{"error", {{"code", 503},
-                                    {"message", yuzu::server::genericize_db_error(
-                                                    "get_workflow", workflow_result.error())}}},
-                         {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
+                    detail::a4_error(res, yuzu::server::genericize_db_error(
+                                              "get_workflow", workflow_result.error())),
                     "application/json");
                 return;
             }
@@ -1622,24 +1592,16 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     auto step_def_result = instruction_store->get_definition(step.instruction_id);
                     if (!step_def_result) {
                         res.status = 503;
-                        res.set_content(
-                            nlohmann::json({{"error", {{"code", 503},
-                                                       {"message", "instruction store unavailable"}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
-                            "application/json");
+                        res.set_content(detail::a4_error(res, "instruction store unavailable"),
+                                        "application/json");
                         return;
                     }
                     if (!*step_def_result) {
                         res.status = 400;
                         res.set_content(
-                            nlohmann::json({{"error",
-                                             {{"code", 400},
-                                              {"message", "workflow step '" + step.label +
-                                                              "' references unknown instruction: " +
-                                                              step.instruction_id}}},
-                                            {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+                            detail::a4_error(res, "workflow step '" + step.label +
+                                                      "' references unknown instruction: " +
+                                                      step.instruction_id),
                             "application/json");
                         return;
                     }
@@ -1659,16 +1621,12 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     if (blocked) {
                         res.status = 403;
                         res.set_content(
-                            nlohmann::json(
-                                {{"error",
-                                  {{"code", 403},
-                                   {"message",
-                                    "workflow step '" + step.label + "' references instruction '" +
-                                        step.instruction_id + "' which requires approval (mode: " +
+                            detail::a4_error(
+                                res, "workflow step '" + step.label +
+                                        "' references instruction '" + step.instruction_id +
+                                        "' which requires approval (mode: " +
                                         step_def.approval_mode +
-                                        "). Submit each instruction individually for approval."}}},
-                                 {"meta", {{"api_version", "v1"}}}})
-                                .dump(),
+                                        "). Submit each instruction individually for approval."),
                             "application/json");
                         return;
                     }
@@ -1676,12 +1634,153 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
+        // --- BR3-001 (branch-review round 3): preflight destructive/forensic --
+        // targeting for EVERY step before workflow_engine->execute() is called
+        // at all. BR2-001 (below, inside dispatch_fn) correctly gates the
+        // per-step dispatch on evaluate_destructive_targeting, so a bad-target
+        // Forensics/Destructive step genuinely reaches zero agents — but
+        // dispatch_fn has no metrics/audit_fn/req/res (it returns
+        // std::expected<std::string,std::string>, consumed internally by
+        // WorkflowEngine::execute), so that refusal was silently absorbed into
+        // the one step's own failed-step result while THIS route
+        // unconditionally audited "workflow.execute"/"success" once execute()
+        // returned — regardless of whether every step actually ran.
+        // docs/observability-conventions.md: "Denied operations MUST emit an
+        // audit event." Preflighting every step against the SAME
+        // evaluate_destructive_targeting call closes that gap: any step that
+        // would be refused refuses the WHOLE request up front — audited,
+        // metered, 400 — and execute() is never invoked. dispatch_fn's own
+        // per-step gate stays in place as defense-in-depth for a workflow
+        // definition mutated between this preflight and execute(), or a future
+        // dispatch_fn caller that skips this preflight — BR4-001 (round 4)
+        // closed that specific race's own audit/metric gap: dispatch_fn now
+        // reports a late refusal back to this route via the
+        // late_targeting_denied/late_targeting_reason pair declared just above
+        // the dispatch_fn definition below, so a definition mutated in the
+        // window between this preflight and dispatch_fn's re-read still gets a
+        // denied audit event and the rejection metric, instead of the blanket
+        // "success" this route audits once execute() returns an execution id.
+        //
+        // Unwired instruction_store/capability_registry: skip the preflight
+        // entirely rather than fail closed on a structural absence neither of
+        // this route's other checks treats as fatal — dispatch_fn's own guards
+        // ("instruction store not available" / "capability registry not
+        // available") remain the backstop for that case, unchanged from today.
+        if (instruction_store && instruction_store->is_open() && capability_registry) {
+            auto preflight_wf = workflow_engine->get_workflow(workflow_id);
+            if (!preflight_wf) {
+                res.status = 503;
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                    {"message", yuzu::server::genericize_db_error(
+                                                    "get_workflow", preflight_wf.error())}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            // Not-found falls through unchanged, same as the approval
+            // pre-validation above — execute() below reports the canonical
+            // "workflow not found" error this preflight would otherwise skip
+            // ahead of.
+            if (*preflight_wf) {
+                for (const auto& step : (*preflight_wf)->steps) {
+                    // ADR-0058: get_definition returns std::expected — a
+                    // genuine DB error fails the WHOLE request closed (503);
+                    // "no such instruction" is not a targeting decision this
+                    // preflight can make, so it defers to the existing per-step
+                    // handling (the approval block above, or dispatch_fn's own
+                    // "unknown instruction" failure) as the backstop.
+                    auto step_def_result = instruction_store->get_definition(step.instruction_id);
+                    if (!step_def_result) {
+                        res.status = 503;
+                        res.set_content(
+                            nlohmann::json(
+                                {{"error",
+                                  {{"code", 503},
+                                   {"message", yuzu::server::genericize_db_error(
+                                                   "workflow preflight instruction lookup",
+                                                   step_def_result.error())}}},
+                                 {"meta", {{"api_version", "v1"}}}})
+                                .dump(),
+                            "application/json");
+                        return;
+                    }
+                    if (!*step_def_result)
+                        continue;
+                    const auto& step_def = **step_def_result;
+                    // SAME chokepoint dispatch_fn's own per-step gate below
+                    // uses — evaluate_destructive_targeting from
+                    // dispatch_destructive_gate.hpp, not a copy. scope_key_present
+                    // is always false: WorkflowStep carries no per-step scope
+                    // field, exactly matching dispatch_fn's own derivation.
+                    const auto gate = yuzu::server::evaluate_destructive_targeting(
+                        capability_registry->classify(step_def.plugin, step_def.action),
+                        /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                        /*scope_key_present=*/false,
+                        /*agent_id_count=*/agent_ids.size());
+                    if (gate.verdict != yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted)
+                        continue;
+                    // Counted on the SAME series as the instruction-execute,
+                    // /api/command, MCP and dashboard refusals, with this
+                    // route's own `route="workflow"` label — a NEW emission
+                    // point, not a reuse of "instruction_execute".
+                    if (metrics) {
+                        try {
+                            metrics
+                                ->counter("yuzu_server_dispatch_target_rejected_total",
+                                          {{"route", "workflow"},
+                                           {"reason", std::string(gate.refusal_reason)}})
+                                .increment();
+                        } catch (const std::exception& e) {
+                            spdlog::error(
+                                "dispatch_target_rejected_total counter threw for {}:{} "
+                                "(reason={}): {}",
+                                step_def.plugin, step_def.action, gate.refusal_reason, e.what());
+                        } catch (...) {
+                            spdlog::error(
+                                "dispatch_target_rejected_total counter threw for {}:{} "
+                                "(reason={})",
+                                step_def.plugin, step_def.action, gate.refusal_reason);
+                        }
+                    }
+                    audit_fn(req, "workflow.execute", "denied", "workflow", workflow_id,
+                             "reason=" + std::string(gate.refusal_reason));
+                    res.status = 400;
+                    res.set_content(
+                        nlohmann::json({{"error", {{"code", 400},
+                                                   {"message", std::string(gate.refusal_message)}}},
+                                        {"meta", {{"api_version", "v1"}}}})
+                            .dump(),
+                        "application/json");
+                    return;
+                }
+            }
+        }
+
+        // BR4-001 (branch-review round 4): dispatch_fn's per-step gate below is the
+        // correct backstop for a workflow/instruction definition mutated between this
+        // route's own preflight (above) and execute() reaching this step — it still
+        // refuses the actual agent dispatch — but that refusal reaches
+        // WorkflowEngine::execute as an ordinary failed-step result, indistinguishable
+        // from any other step failure, and this route unconditionally audits
+        // "workflow.execute"/"success" once execute() returns an execution id
+        // regardless of what happened inside. execute() runs dispatch_fn synchronously
+        // on THIS thread (no background thread, no async handoff — the whole step loop
+        // completes before execute() returns below), so a plain by-reference capture
+        // set inside dispatch_fn is safely observable here immediately after execute()
+        // returns, with no cross-thread lifetime concern.
+        bool late_targeting_denied = false;
+        std::string late_targeting_reason;
+
         // Create a dispatch function that uses the real command dispatch.
         // caller is captured by value (workflow_engine->execute invokes this
         // synchronously below, but a value capture is lifetime-safe
         // regardless) so every step narrows to AND identifies the operator.
         auto dispatch_fn =
-            [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller](
+            [instruction_store, &cmd_dispatch, &cmd_dispatch_concurrency, caller,
+             capability_registry, &late_targeting_denied, &late_targeting_reason](  // BR2-001/BR4-001
                 const std::string& instruction_id, const std::string& agent_ids_json,
                 const std::string& parameters_json) -> std::expected<std::string, std::string> {
             // Look up the instruction definition to get plugin + action
@@ -1744,6 +1843,44 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 }
             } catch (...) {}
 
+            // BR2-001 (round-2 branch review): the instruction-execute route's
+            // BR-001 fix gated `/api/instructions/{id}/execute` but this SIBLING
+            // route's own step dispatcher — reached from workflow execution, not
+            // that route — was a second real CommandRequest producer nobody had
+            // wired. SAME chokepoint (dispatch_destructive_gate.hpp), not a copy:
+            // a Forensics/Destructive-classified step now refuses a multi-agent
+            // or omitted-scope target instead of fanning out to every `target_ids`
+            // entry. `metrics`/`audit_fn` are not threaded into this per-step
+            // closure (it returns std::expected<std::string,std::string>, not an
+            // httplib::Response, and has no `req` to audit against) — the refusal
+            // surfaces as a failed step through workflow_engine's own per-step
+            // error/audit path exactly like every other dispatch_fn failure above
+            // (instruction store down, unknown instruction, no agents reached).
+            if (!capability_registry)
+                return std::unexpected<std::string>("capability registry not available");
+            {
+                const auto gate = yuzu::server::evaluate_destructive_targeting(
+                    capability_registry->classify(def.plugin, def.action),
+                    /*valid_nonempty_agent_ids=*/!target_ids.empty(),
+                    /*scope_key_present=*/false,
+                    /*agent_id_count=*/target_ids.size());
+                switch (gate.verdict) {
+                case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                    break;
+                case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted:
+                    // BR4-001: surfaced to the route below so a refusal reached via a
+                    // late (post-preflight) definition mutation still gets the denied
+                    // audit event and rejection metric a step-level failure alone
+                    // cannot carry (dispatch_fn has no audit_fn/metrics of its own —
+                    // see the capture-site comment above).
+                    late_targeting_denied = true;
+                    late_targeting_reason = std::string(gate.refusal_reason);
+                    return std::unexpected<std::string>(std::string(gate.refusal_message));
+                }
+            }
+
             // Dispatch via gRPC. PR 2: workflow-step dispatch path
             // does not yet wire execution_id correlation (CONSIST-2 /
             // sec-M2 — PR 2.x will close); pass empty execution_id so
@@ -1785,20 +1922,48 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (yuzu::server::is_generic_db_error(result.error())) {
                 res.status = 503;
                 res.set_content(
-                    nlohmann::json({{"error", {{"code", 503},
-                                               {"message", yuzu::server::genericize_db_error(
-                                                               "execute", result.error())}}},
-                                    {"meta", {{"api_version", "v1"}}}})
-                        .dump(),
+                    detail::a4_error(res, yuzu::server::genericize_db_error(
+                                              "execute", result.error())),
                     "application/json");
                 return;
             }
             res.status = 400;
-            res.set_content(nlohmann::json({{"error", result.error()}}).dump(), "application/json");
+            res.set_content(detail::a4_error(res, result.error()), "application/json");
             return;
         }
-        audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
-                 "execution_id=" + *result);
+        if (late_targeting_denied) {
+            // BR4-001: at least one step's dispatch was refused by the SAME
+            // evaluate_destructive_targeting chokepoint the preflight above uses —
+            // just reached late, via a definition that changed after the preflight
+            // read it. The dispatch itself was correctly blocked (dispatch_fn's
+            // return), but that alone leaves no denied audit event and no rejection
+            // metric — docs/observability-conventions.md: "Denied operations MUST
+            // emit an audit event." Counted on the SAME series/route label as the
+            // preflight's own denial so the two paths are equally visible.
+            if (metrics) {
+                try {
+                    metrics
+                        ->counter("yuzu_server_dispatch_target_rejected_total",
+                                  {{"route", "workflow"}, {"reason", late_targeting_reason}})
+                        .increment();
+                } catch (const std::exception& e) {
+                    spdlog::error(
+                        "dispatch_target_rejected_total counter threw for late workflow "
+                        "targeting refusal (reason={}): {}",
+                        late_targeting_reason, e.what());
+                } catch (...) {
+                    spdlog::error(
+                        "dispatch_target_rejected_total counter threw for late workflow "
+                        "targeting refusal (reason={})",
+                        late_targeting_reason);
+                }
+            }
+            audit_fn(req, "workflow.execute", "denied", "workflow", workflow_id,
+                     "reason=" + late_targeting_reason + " (late; execution_id=" + *result + ")");
+        } else {
+            audit_fn(req, "workflow.execute", "success", "workflow", workflow_id,
+                     "execution_id=" + *result);
+        }
         emit_fn("workflow.executed", req);
         res.set_header(
             "HX-Trigger",
@@ -1825,9 +1990,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // time (security-guardian Gate 2 finding #2).
         if (!fleet_read_fn) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         auto gate = fleet_read_fn(req, res, "Workflow", "Read");
@@ -1835,9 +1998,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return; // gate already wrote the response.
         if (!workflow_engine) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -1846,19 +2007,29 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!exec_result) {
             res.status = 503;
             res.set_content(
-                nlohmann::json({{"error", {{"code", 503},
-                                           {"message", yuzu::server::genericize_db_error(
-                                                           "get_execution", exec_result.error())}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
+                detail::a4_error(res, yuzu::server::genericize_db_error(
+                                          "get_execution", exec_result.error())),
                 "application/json");
             return;
         }
         if (!*exec_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            // #1552/#4030 anti-oracle (test_workflow_routes.cpp "zero-overlap
+            // confined caller gets the same 404 as a nonexistent id"): a
+            // per-request correlation_id in the BODY would let a confined
+            // caller distinguish "record exists but I can't see it" from
+            // "record does not exist" by diffing the two 404 bodies,
+            // defeating the whole point of this route's Gate 8 confinement
+            // fix. Both not-found branches below build the body via the pure
+            // `error_json_a4` builder with a fixed empty correlation_id
+            // (byte-identical by construction) rather than `a4_error`, which
+            // would echo the per-request header value into the body. The
+            // response still stamps a real `X-Correlation-Id` header
+            // (`ensure_correlation_id`) for grep-ability — only the body is
+            // exempt, and only on this route's two not-found branches.
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
             return;
         }
         const auto& exec = **exec_result;
@@ -1867,13 +2038,13 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // which audits every fetch) and none is added here; adding a
         // first-ever audit call to this route is a separate, unrelated
         // decision, out of scope for this fix. Denial 404-collapses
-        // identically to the not-found body above (byte-identical -- same
-        // literal string, anti-enumeration).
+        // identically to the not-found body above (same fixed-empty-cid
+        // construction, see the comment there).
         if (!workflow_execution_visible(exec, gate.scope)) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"execution not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            detail::ensure_correlation_id(res);
+            res.set_content(detail::error_json_a4(404, "execution not found", ""),
+                            "application/json");
             return;
         }
 
@@ -2174,15 +2345,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                        instruction_store, cmd_dispatch,
                                                        cmd_dispatch_concurrency, caller_fn,
                                                        execution_tracker, approval_manager,
-                                                       metrics](const httplib::Request& req,
+                                                       metrics,
+                                                       capability_registry](const httplib::Request& req,
                                                                 httplib::Response& res) {
         if (!perm_fn(req, res, "Execution", "Execute"))
             return;
         if (!instruction_store || !instruction_store->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "instruction store not available"),
+                            "application/json");
             return;
         }
 
@@ -2193,16 +2364,14 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto def_result = instruction_store->get_definition(def_id);
         if (!def_result) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"instruction store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "instruction store not available"),
+                            "application/json");
             return;
         }
         if (!*def_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "instruction definition not found"),
+                            "application/json");
             return;
         }
         const auto& def = **def_result;
@@ -2213,9 +2382,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             j = nlohmann::json::parse(req.body);
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
             return;
         }
 
@@ -2236,9 +2403,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          std::string("reason=") + std::string(kReasonBodyType));
             }
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"request body must be a JSON object"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "request body must be a JSON object"),
+                            "application/json");
             return;
         }
 
@@ -2268,11 +2434,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                          std::string("reason=") + bv->reason);
             }
             res.status = 400;
-            res.set_content(
-                nlohmann::json({{"error", {{"code", 400}, {"message", bv->message}}},
-                                {"meta", {{"api_version", "v1"}}}})
-                    .dump(),
-                "application/json");
+            res.set_content(detail::a4_error(res, bv->message), "application/json");
             return;
         }
 
@@ -2292,9 +2454,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
             return;
         }
 
@@ -2314,7 +2474,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                           def_id, def.approval_mode);
             res.status = 503;
             res.set_content(
-                R"({"error":{"code":503,"message":"approval system unavailable — cannot execute approval-gated instruction"},"meta":{"api_version":"v1"}})",
+                detail::a4_error(
+                    res, "approval system unavailable — cannot execute approval-gated instruction"),
                 "application/json");
             return;
         }
@@ -2361,9 +2522,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 if (!result) {
                     spdlog::error("approval submit failed for '{}': {}", def_id, result.error());
                     res.status = 500;
-                    res.set_content(
-                        R"({"error":{"code":500,"message":"failed to create approval request"},"meta":{"api_version":"v1"}})",
-                        "application/json");
+                    res.set_content(detail::a4_error(res, "failed to create approval request"),
+                                    "application/json");
                     return;
                 }
                 audit_fn(req, "instruction.approval_required", "pending", "instruction", def_id,
@@ -2389,6 +2549,110 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // a non-array `agent_ids` and a non-string `scope` are refused above, so
         // reaching this point empty now means the caller genuinely named no
         // target rather than named one the parser threw away.
+        //
+        // BR-001 (branch review) — the ONE exception to the broadcast contract
+        // just stated: a `def.plugin`/`def.action` classified Destructive or
+        // Forensics (`dispatch_destructive_gate.hpp`'s `requires_explicit_
+        // targets`) refuses an omitted/broadcast/multi-agent target instead of
+        // reaching every agent. This route resolves a free-form plugin.action
+        // pair and can fan it out exactly like the three siblings the same
+        // header already documents (`/api/command` [command_routes.cpp], MCP
+        // `execute_instruction` [mcp_server.cpp], the exec console
+        // [dashboard_routes.cpp]) — it was simply the fourth real
+        // CommandRequest producer nobody had wired yet. SAME chokepoint, not a
+        // copy: `evaluate_destructive_targeting` and both refusal strings come
+        // from `dispatch_destructive_gate.hpp` unchanged, so this surface
+        // cannot drift from the other three.
+        //
+        // #4254: two sibling call sites in this same file guard
+        // `capability_registry` before dereferencing it (the dispatch_fn
+        // closure above, and the BR3-001 preflight block) — this site
+        // originally did not. Production always wires this member (mirrors
+        // command_routes::Deps::capability_registry, never conditional), so
+        // this is defense-in-depth, not a live gap; guard it anyway so a test
+        // harness that leaves it unwired gets the same clear 503 the sibling
+        // sites answer with, rather than a null dereference.
+        if (!capability_registry) {
+            res.status = 503;
+            res.set_content(
+                R"({"error":{"code":503,"message":"capability registry not available"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+        {
+            const auto gate = yuzu::server::evaluate_destructive_targeting(
+                capability_registry->classify(def.plugin, def.action),
+                /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
+                // scope_expr is already the post-validation shape the
+                // header's caller contract requires (check_targeting_shape
+                // above refused a supplied-but-empty scope as `scope_empty`),
+                // never a raw extraction result.
+                /*scope_key_present=*/!scope_expr.empty(),
+                /*agent_id_count=*/agent_ids.size());
+            // Exhaustive, no `default:` — the same switch shape the other
+            // three callers use over this enum (ClassifyMiss is an
+            // enumerator the caller must handle, never a skippable `if`).
+            switch (gate.verdict) {
+            case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
+                // ReadOnly/Mutating, non-Forensics: this gate does not apply
+                // and dispatch proceeds exactly as before this fix.
+                break;
+            case yuzu::server::DestructiveTargetingVerdict::ClassifyMiss:
+                // Policy B, same choice as the other three callers
+                // (dispatch_destructive_gate.hpp's file doc comment): this
+                // route has no downstream classify-based backstop of its
+                // own, so an early denial here would be a NEW policy rather
+                // than a shared one — out of scope for a fix that closes the
+                // targeting gap for a row that DOES classify as Destructive/
+                // Forensics. An Unclassified/Ambiguous plugin.action keeps
+                // today's (pre-fix) behaviour unchanged.
+                break;
+            case yuzu::server::DestructiveTargetingVerdict::Targeted:
+                // Explicit target(s) named correctly for this capability's
+                // class — proceed to dispatch below. The shared
+                // dispatch_confined seam (#1788), reached via cmd_dispatch/
+                // cmd_dispatch_concurrency, still narrows agent_ids to the
+                // operator's visible set downstream exactly as it does for
+                // every other dispatch arm through this route.
+                break;
+            case yuzu::server::DestructiveTargetingVerdict::RefuseUntargeted: {
+                // Counted on the SAME series as the /api/command, MCP and
+                // dashboard refusals, with this surface's own `route` label.
+                if (metrics) {
+                    try {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "instruction_execute"},
+                                       {"reason", std::string(gate.refusal_reason)}})
+                            .increment();
+                    } catch (const std::exception& e) {
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason={}): {}",
+                                     def.plugin, def.action, gate.refusal_reason, e.what());
+                    } catch (...) {
+                        spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
+                                     "(reason={})",
+                                     def.plugin, def.action, gate.refusal_reason);
+                    }
+                }
+                if (audit_fn) {
+                    audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                             std::string("reason=") + std::string(gate.refusal_reason));
+                }
+                // Same envelope shape this route already answers with for
+                // every other targeting refusal above (#2500) — never a new
+                // response shape for this fifth reason string.
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json({{"error", {{"code", 400},
+                                               {"message", std::string(gate.refusal_message)}}},
+                                    {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            }
+        }
 
         // PR 2: create the execution row BEFORE dispatch so the
         // execution_id is known when cmd_dispatch generates command_id —
@@ -2472,9 +2736,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                               execution_id);
             }
             res.status = 500;
-            res.set_content(
-                R"({"error":{"code":500,"message":"dispatch failed"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "dispatch failed"), "application/json");
             return;
         }
 
@@ -2510,34 +2772,75 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 // than a bare string -- `reason` names the branch and
                 // `retry_after_ms: null` is present per rest_a4_envelope.hpp's
                 // contract that the key is ALWAYS present, never omitted.
+                // `reason` is a route-local extension beyond A4ErrorOpts'
+                // fixed field set (retry_after_ms/remediation/permission/
+                // approval_id/status_url only) — built by hand rather than
+                // via `detail::a4_error` so `reason` survives, with
+                // `correlation_id` added via `detail::ensure_correlation_id`
+                // to still satisfy A4's required-field set.
                 res.status = 400;
                 res.set_content(
                     nlohmann::json({{"error",
                                      {{"code", 400},
                                       {"message", "invalid scope: " + *scope_parse_error},
                                       {"reason", "invalid_scope"},
-                                      {"retry_after_ms", nullptr}}},
+                                      {"retry_after_ms", nullptr},
+                                      {"correlation_id", detail::ensure_correlation_id(res)}}},
                                     {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
                 return;
             }
             res.status = 503;
+            // Same route-local `reason`-carrying extension as the
+            // scope_parse_error branch above — hand-built, not
+            // `detail::a4_error`, to keep `reason` alongside the A4-required
+            // `correlation_id`.
             if (containment_unreadable) {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "containment state is unreadable — dispatch is "
+                                               "failing closed and reaching no agent; check the "
+                                               "quarantine store"},
+                                   {"reason", "containment_unreadable"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
             } else if (denied_quarantined_count > 0) {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"every target is quarantined — dispatch was withheld, not attempted","reason":"quarantined","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "every target is quarantined — dispatch was "
+                                               "withheld, not attempted"},
+                                   {"reason", "quarantined"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
             } else if (unknown_plugin_count > 0) {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"the dispatched plugin is not in any target's reported inventory — dispatch was withheld, not attempted","reason":"plugin_not_found","retry_after_ms":null},"meta":{"api_version":"v1"}})",
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "the dispatched plugin is not in any target's "
+                                               "reported inventory — dispatch was withheld, not "
+                                               "attempted"},
+                                   {"reason", "plugin_not_found"},
+                                   {"retry_after_ms", nullptr},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
                     "application/json");
             } else {
                 res.set_content(
-                    R"({"error":{"code":503,"message":"no agents reached: every target was unreachable or excluded by an in-flight per-device concurrency claim. Check yuzu_server_dispatch_concurrency_skipped_total before treating this as an agent-connectivity fault."},"meta":{"api_version":"v1"}})",
+                    detail::a4_error(
+                        res, "no agents reached: every target was unreachable or excluded by an "
+                             "in-flight per-device concurrency claim. Check "
+                             "yuzu_server_dispatch_concurrency_skipped_total before treating this "
+                             "as an agent-connectivity fault."),
                     "application/json");
             }
             return;
@@ -2587,9 +2890,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store || !product_pack_store->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"product pack store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "product pack store not available"),
+                            "application/json");
             return;
         }
 
@@ -2601,9 +2903,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 q.limit = std::stoi(req.get_param_value("limit"));
         } catch (const std::exception&) {
             res.status = 400;
-            res.set_content(
-                R"({"error":{"code":400,"message":"invalid numeric query parameter"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                            "application/json");
             return;
         }
 
@@ -2635,9 +2936,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store || !product_pack_store->is_open()) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"product pack store not available"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "product pack store not available"),
+                            "application/json");
             return;
         }
 
@@ -2648,9 +2948,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 yaml_bundle = j.value("yaml_source", "");
             } catch (const std::exception&) {
                 res.status = 400;
-                res.set_content(
-                    R"({"error":{"code":400,"message":"invalid request body"},"meta":{"api_version":"v1"}})",
-                    "application/json");
+                res.set_content(detail::a4_error(res, "invalid request body"), "application/json");
                 return;
             }
         } else {
@@ -2813,9 +3111,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 
@@ -2831,9 +3127,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         if (!*pack_result) {
             res.status = 404;
-            res.set_content(
-                R"({"error":{"code":404,"message":"product pack not found"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "product pack not found"), "application/json");
             return;
         }
         auto& pack = *pack_result;
@@ -2852,9 +3146,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         if (!product_pack_store) {
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
 

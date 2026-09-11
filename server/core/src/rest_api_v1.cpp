@@ -1038,7 +1038,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Step an active JIT elevation down early", "tags": ["Authentication"], "description": "Cookie session only; no MFA step-up (reduces privilege). Always 200; whether a window was active is recorded in the role.elevation.revoked audit detail.", "responses": {"200": {"description": "{status: ok}"}, "401": {"description": "Not authenticated"}}}
     },
     "/openapi.json": {
-      "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "security": [], "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}}}
+      "get": {"summary": "OpenAPI 3.0 specification", "tags": ["Documentation"], "description": "Requires Infrastructure:Read (#2057 — was unauthenticated; the top-level security schemes apply, no per-route override). Matches the MCP yuzu://openapi resource's gate.", "responses": {"200": {"description": "OpenAPI 3.0 JSON spec"}, "401": {"description": "Not authenticated"}, "403": {"description": "Missing Infrastructure:Read"}}}
     },)json"
         // Split: keep each raw-string literal under MSVC's 16,380-byte C2026 cap
         // (adjacent literals concatenate; emitted OpenAPI JSON is byte-identical).
@@ -1962,7 +1962,15 @@ void RestApiV1::register_routes(
                  [](const httplib::Request&, httplib::Response& res) { res.status = 204; });
 
     // ── OpenAPI spec endpoint (/api/v1/openapi.json) ─────────────────────
-    sink.Get("/api/v1/openapi.json", [](const httplib::Request&, httplib::Response& res) {
+    // #2057: was unauthenticated. Gated on the same (securable, operation)
+    // pair as the MCP twin `yuzu://openapi` resource (mcp_server.cpp,
+    // `tier_allows(..., "Infrastructure", "Read")` + `perm_fn(..., "Infrastructure",
+    // "Read")`), matching the sibling `/api/v1/discover/*` docs surface
+    // (discover_routes.cpp). `perm_fn` writes its own A4 denial body + header
+    // on refusal, so no separate envelope call is needed here.
+    sink.Get("/api/v1/openapi.json", [perm_fn](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Infrastructure", "Read"))
+            return;
         res.set_content(openapi_spec(), "application/json");
     });
 

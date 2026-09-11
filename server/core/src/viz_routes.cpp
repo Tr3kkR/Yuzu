@@ -45,6 +45,7 @@
 #include "fleet_topology_types.hpp"
 #include "http_route_sink.hpp"
 #include "offline_endpoint_store.hpp"
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
 
 #include <yuzu/metrics.hpp>
 
@@ -62,13 +63,12 @@ namespace yuzu::server {
 
 namespace {
 
-/// Build a uniform JSON error envelope. Status code mirrors HTTP status.
-/// Schema is stable so MCP / SDK clients can parse without ambiguity --
-/// matches the shape used by `/api/responses/...` etc.
-std::string error_envelope(int code, std::string_view message) {
-    nlohmann::json j = {{"error", {{"code", code}, {"message", message}}},
-                        {"meta", {{"api_version", "v1"}}}};
-    return j.dump();
+/// A4 JSON error envelope (`detail::a4_error`, `rest_a4_envelope_http.hpp`).
+/// `code` derives from `res.status`, which every call site sets immediately
+/// before calling this — kept as a thin file-local wrapper rather than
+/// inlining `detail::a4_error` at all 13 call sites.
+std::string error_envelope(httplib::Response& res, std::string_view message) {
+    return detail::a4_error(res, message);
 }
 
 bool parse_bool_param(const httplib::Request& req, std::string_view key, bool default_value) {
@@ -167,7 +167,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
         res.status = 503;
         res.set_content(
-            error_envelope(503, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
+            error_envelope(res, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
             "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "", "kill_switch");
@@ -177,7 +177,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // ── 2. Store availability ────────────────────────────────────────────
     if (!store_) {
         res.status = 503;
-        res.set_content(error_envelope(503, "fleet topology store not available"),
+        res.set_content(error_envelope(res, "fleet topology store not available"),
                         "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "store_null");
@@ -199,7 +199,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
             machines_max = std::stoi(req.get_param_value("machines_max"));
             if (machines_max <= 0 || machines_max > kMachinesMaxCeiling) {
                 res.status = 400;
-                res.set_content(error_envelope(400, "machines_max must be in [1, 100000]"),
+                res.set_content(error_envelope(res, "machines_max must be in [1, 100000]"),
                                 "application/json");
                 if (audit_fn_)
                     audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
@@ -211,7 +211,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
         // std::stoi throws std::invalid_argument on non-numeric and
         // std::out_of_range on overflow; both land here.
         res.status = 400;
-        res.set_content(error_envelope(400, "invalid machines_max"), "application/json");
+        res.set_content(error_envelope(res, "invalid machines_max"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "", "bad_machines_max");
         return;
@@ -234,7 +234,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     } catch (const std::exception& ex) {
         spdlog::error("VizRoutes: store->get threw: {}", ex.what());
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch failed"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch failed"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "fetch_threw");
         return;
@@ -242,7 +242,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     // PR 2 invariant UP-9: get() never returns null. Defensive belt anyway.
     if (!snap) {
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch returned null"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch returned null"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "failure", "FleetTopology", "", "snap_null");
         return;
@@ -298,8 +298,7 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
     if (static_cast<int>(snap->machines.size()) > machines_max) {
         res.status = 413;
         res.set_content(
-            error_envelope(413,
-                           "fleet topology exceeds machines_max -- raise the cap or scope down"),
+            error_envelope(res, "fleet topology exceeds machines_max -- raise the cap or scope down"),
             "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.fleet_topology", "denied", "FleetTopology", "",
@@ -356,7 +355,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
         res.status = 503;
         res.set_content(
-            error_envelope(503, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
+            error_envelope(res, "viz endpoint disabled by operator (yuzu_viz_disabled)"),
             "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "denied", "HostTopology", agent_id, "kill_switch");
@@ -366,7 +365,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     // ── 2. Store availability ─────────────────────────────────────────────
     if (!store_) {
         res.status = 503;
-        res.set_content(error_envelope(503, "fleet topology store not available"),
+        res.set_content(error_envelope(res, "fleet topology store not available"),
                         "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "store_null");
@@ -388,7 +387,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     } catch (const std::exception& ex) {
         spdlog::error("VizRoutes: store->get threw (host_topology): {}", ex.what());
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch failed"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch failed"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "fetch_threw");
         return;
@@ -397,7 +396,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     // an unguarded deref here is a remotely reachable post-auth crash.
     if (!snap) {
         res.status = 500;
-        res.set_content(error_envelope(500, "topology fetch returned null"), "application/json");
+        res.set_content(error_envelope(res, "topology fetch returned null"), "application/json");
         if (audit_fn_)
             audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "snap_null");
         return;
@@ -441,7 +440,7 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
         }
     }
     res.status = 404;
-    res.set_content(error_envelope(404, "host not found"), "application/json");
+    res.set_content(error_envelope(res, "host not found"), "application/json");
     if (audit_fn_)
         audit_fn_(req, "viz.host_topology", "failure", "HostTopology", agent_id, "not_found");
 }
