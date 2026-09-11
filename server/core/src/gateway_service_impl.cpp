@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "agent_service_impl.hpp"
 #include "analytics_event_store.hpp"
 #include "audit_store.hpp"
 #include "enrollment_token_rejection.hpp"
@@ -27,6 +28,42 @@
 
 namespace yuzu::server::detail {
 
+namespace {
+
+// HA WS-4 slice 4.1: lease TTL for GatewayRouteStore rows. The gateway's own
+// heartbeat-forwarding cadence batches on a ~1s flush interval
+// (gateway/config/sys.config's heartbeat_batch_interval_ms), but the
+// underlying signal this lease must survive is the AGENT's own heartbeat
+// interval — default 30s (agents/core/include/yuzu/agent/agent.hpp,
+// Config::heartbeat_interval) — since BatchHeartbeat's renew_leases call
+// below only fires once per agent heartbeat. 3x that (90s) tolerates a
+// couple of missed heartbeats without the route reading stale; INERT this
+// slice (nothing reads is_stale yet) but the margin is chosen now so a
+// future reader doesn't inherit an accidentally-tight TTL.
+constexpr int kGatewayRouteLeaseTtlSecs = 90;
+
+// HA WS-4 slice 4.1: fail-OPEN observability for the (write-only, INERT)
+// gateway route directory (gateway_route_store.hpp). A degraded write here
+// NEVER fails the RPC — nothing reads this store for dispatch yet — but IS
+// logged and counted so a systemic Postgres problem is visible before any
+// future reader ever depends on this data being fresh.
+void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
+                                GatewayRouteStoreError err) {
+    const char* reason =
+        err == GatewayRouteStoreError::store_unavailable ? "store_unavailable" : "db_error";
+    spdlog::warn("[gateway] GatewayRouteStore {} degraded ({}) — proceeding (directory write is "
+                 "fail-open, INERT this slice: nothing reads it for dispatch yet)",
+                 op, reason);
+    if (metrics) {
+        metrics
+            ->counter("yuzu_server_gateway_route_write_failed_total",
+                      {{"op", std::string(op)}, {"reason", reason}})
+            .increment();
+    }
+}
+
+} // namespace
+
 // -- Constructor --------------------------------------------------------------
 
 GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, EventBus& bus,
@@ -35,7 +72,19 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                                                        yuzu::MetricsRegistry* metrics,
                                                        AgentHealthStore* health_store)
     : registry_(registry), bus_(bus), auth_mgr_(auth_mgr), auto_approve_(auto_approve),
-      metrics_(metrics), health_store_(health_store) {}
+      metrics_(metrics), health_store_(health_store) {
+    if (metrics_) {
+        metrics_->describe(
+            "yuzu_server_gateway_route_write_failed_total",
+            "HA WS-4 4.1: GatewayRouteStore directory writes (register_fresh/"
+            "announce_connected/deregister/renew_leases) that degraded instead of "
+            "succeeding, by op and reason. Fail-OPEN this slice - the RPC proceeds "
+            "regardless, since nothing reads this store for dispatch yet - so this "
+            "counter is the only signal a systemic write failure would otherwise "
+            "leave invisible.",
+            "counter");
+    }
+}
 
 // -- ProxyRegister ------------------------------------------------------------
 
@@ -395,8 +444,69 @@ gw_enrolled:
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
 
-    auto session_id =
-        "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+    // HA WS-4 4.1 (routed-concern: gateway routing directory): a gateway
+    // circuit-recovery replay resends ProxyRegister carrying the ORIGINAL
+    // session id in the x-yuzu-session-id metadata — the same key + reader
+    // AgentServiceImpl::Subscribe uses on the direct path, reused here so
+    // the two paths cannot silently drift onto different metadata keys.
+    // Only trust it as a re-announce if that session is STILL known
+    // server-side (belt-and-braces against a forged/stale value); anything
+    // else falls through to minting a fresh session exactly as before.
+    std::string presented_session;
+    if (context) {
+        presented_session = AgentServiceImpl::client_metadata_value(
+            *context, AgentServiceImpl::kSessionMetadataKey);
+    }
+    bool presented_session_known = false;
+    if (!presented_session.empty()) {
+        std::lock_guard lock(sessions_mu_);
+        auto it = gateway_sessions_.find(presented_session);
+        presented_session_known = it != gateway_sessions_.end() && it->second == info.agent_id();
+    }
+
+    std::string session_id;
+    if (presented_session_known) {
+        // -- Re-announce: reuse the caller's still-known session -------------
+        //
+        // Architecture-review decision (HA WS-4 4.1): minting a fresh
+        // session+epoch here would let a delayed/zombie replay of an OLDER
+        // connection's ProxyRegister clobber the route a NEWER connection
+        // already won — the epoch fence in gateway_route_store.hpp exists
+        // precisely to stop that, and register_fresh must therefore NOT be
+        // called on this branch. Reusing the presented session also fixes
+        // the pre-existing S'-vs-S session-mismatch this replay case had:
+        // the response and the in-proc `gateway_sessions_`/registry mapping
+        // now agree with the session the gateway actually holds.
+        session_id = presented_session;
+        if (gateway_route_store_) {
+            std::vector<std::string> renew_ids{session_id};
+            if (auto res = gateway_route_store_->renew_leases(renew_ids, kGatewayRouteLeaseTtlSecs);
+                !res) {
+                record_route_store_failure(metrics_, "renew_leases", res.error());
+            }
+        }
+        spdlog::debug("[gateway] ProxyRegister: re-announcing known session {} for agent {}",
+                     session_id, info.agent_id());
+    } else {
+        // -- Fresh registration (unchanged behavior) --------------------------
+        session_id =
+            "gw-session-" + auth::AuthManager::bytes_to_hex(auth::AuthManager::random_bytes(16));
+        if (gateway_route_store_) {
+            if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id);
+                !res) {
+                record_route_store_failure(metrics_, "register_fresh", res.error());
+            } else if (!res->won) {
+                // A newer connection's register_fresh already won the epoch race
+                // (out-of-order delivery, gateway_route_store.hpp). Inert this
+                // slice — nothing dispatches through this store yet — so just
+                // note it; this session still enrolls and connects normally.
+                spdlog::debug("[gateway] ProxyRegister: register_fresh for agent {} session {} "
+                              "lost the epoch race to a newer connection",
+                              info.agent_id(), session_id);
+            }
+        }
+    }
+
     response->set_session_id(session_id);
     response->set_accepted(true);
     response->set_enrollment_status("enrolled");
@@ -516,6 +626,39 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
             }
         }
         ++acked;
+    }
+
+    // HA WS-4 4.1: batch-renew the route lease for every session in this
+    // heartbeat batch, in ONE call (gateway_route_store.hpp's renew_leases is
+    // itself a single batched statement) — matches BatchHeartbeat's own
+    // batching rather than one write per agent per interval. Collected from
+    // the raw request (not gated on "known"/ingest success above): a lease
+    // renewal is about session liveness, independent of whether ingest
+    // happened to throw on that entry this cycle.
+    //
+    // Trust rationale (asymmetric with ProxyRegister's known-session gate, by
+    // design): renew matches on session_id ALONE, with no agent_id correlation
+    // or gateway_sessions_ membership check. This is defense-in-depth only, not
+    // a hole in the threat model: the gateway upstream is mTLS-authenticated
+    // trusted infrastructure, and session_id is a server-minted 128-bit random
+    // token, so renewing a foreign session requires a compromised/buggy gateway
+    // that also knows that token. A 4.2 hardening option (if the directory
+    // becomes dispatch-authoritative) is to correlate agent_id per renewed
+    // session; recorded in the ADR-2002 §7 4.2 obligations.
+    if (gateway_route_store_) {
+        std::vector<std::string> session_ids;
+        session_ids.reserve(static_cast<std::size_t>(request->heartbeats_size()));
+        for (const auto& hb : request->heartbeats()) {
+            if (!hb.session_id().empty())
+                session_ids.push_back(hb.session_id());
+        }
+        if (!session_ids.empty()) {
+            if (auto res =
+                    gateway_route_store_->renew_leases(session_ids, kGatewayRouteLeaseTtlSecs);
+                !res) {
+                record_route_store_failure(metrics_, "renew_leases", res.error());
+            }
+        }
     }
 
     response->set_acknowledged_count(acked);
@@ -688,6 +831,19 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                                     request->wire_capabilities().end());
         registry_.set_gateway_route(agent_id, request->gateway_node(),
                                     std::move(wire_capabilities));
+        // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
+        // cross-replica routing directory (gateway_route_store.hpp) — INERT
+        // this slice, nothing reads it for dispatch yet. Fail-open: a
+        // degraded write here does NOT fail this notification or touch
+        // registry_.set_gateway_route above.
+        if (gateway_route_store_) {
+            if (auto res = gateway_route_store_->announce_connected(
+                    agent_id, session_id, request->cluster_id(), request->gateway_node(),
+                    kGatewayRouteLeaseTtlSecs);
+                !res) {
+                record_route_store_failure(metrics_, "announce_connected", res.error());
+            }
+        }
         spdlog::info("[gateway] Agent {} stream CONNECTED at gateway node '{}' ({} wire "
                      "capabilit{})",
                      agent_id, request->gateway_node(), request->wire_capabilities_size(),
@@ -702,6 +858,16 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // clear call is needed here.
         registry_.clear_stream_if_session(agent_id, session_id);
         registry_.remove_agent_if_session(agent_id, session_id);
+        // HA WS-4 4.1: mirror the DISCONNECTED fact into the durable routing
+        // directory too — session-guarded (gateway_route_store.hpp), so a
+        // stale/superseded session's DISCONNECTED can't tear down a newer
+        // re-home. Fail-open: a degraded write here does not affect the
+        // registry cleanup above.
+        if (gateway_route_store_) {
+            if (auto res = gateway_route_store_->deregister(agent_id, session_id); !res) {
+                record_route_store_failure(metrics_, "deregister", res.error());
+            }
+        }
         {
             std::lock_guard lock(sessions_mu_);
             gateway_sessions_.erase(session_id);

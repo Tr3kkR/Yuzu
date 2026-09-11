@@ -210,7 +210,7 @@ HTTP status codes follow standard conventions: `200` for success, `201` for reso
 | `permission` | on permission denials | The `"SecurableType:Operation"` the caller was denied (e.g. `"Tag:Write"`) — the §A4 *kPermissionDenied* specialisation. Absent on whole-route admin gates that are not tied to a single securable, and absent on most service-scoped-token confinement denials even where the route IS tied to one — the caller is denied regardless of grant, so naming one would be a false self-remediation claim (`docs/adr/1006-service-scope-default-deny.md`). One documented exception: a confinement denial that fires *after* the route's own permission gate already confirmed the caller holds that exact grant still names it — there `.permission` is informational, not a remediation hint (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5(a)). `GET /api/v1/inventory/software` no longer illustrates this — its after-gate deny was retired (#3290, provably dead: it fired after `perm_fn`, and the route migrated onto `require_fleet_read` entirely). No live example currently exists: an exhaustive check of every remaining `deny_fleet_wide_service_scoped` call site (20 in `rest_api_v1.cpp`, 5 in `mcp_server.cpp` as of #3290 Phase 2 bucket 1a) found none currently match this exception's shape (`.claude/routed-concerns-access-control.md`, "Service-scoped API token confinement" clause 5) — `deny_service_scoped_schedule` and the one MCP site that did fire after its gate (`get_dex_group_app_perf`) were retired outright, not left as non-matching candidates. The exception clause still governs the next one that appears. |
 | `approval_id` + `status_url` | reserved | The §A4 *kApprovalRequired* specialisation. Reserved for the Phase-2 approval re-dispatch flow; not populated by current denials (an approval-gated operation is denied with `permission` + `remediation` today, because no pollable approval exists yet). `status_url` points at `GET /api/v1/approvals/{id}`. |
 
-The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. It does **not** yet cover literally every path — `compliance_routes.cpp` and several `auth_routes.cpp` MFA-flow branches still emit legacy shapes (tracked as #1552) — so automation crossing surfaces should treat the enrichment fields as present-when-available.
+The R2 A4 completion (2026-07) routed the RBAC/tier denial gates (`require_admin`, `require_permission`, and the service-scope denials in the auth layer) and the ~156 legacy `error_json` sites in `rest_api_v1.cpp` through this one envelope. The #1552 sweep PR-1 (2026-09) converted 8 more route files — `auth_routes.cpp` (including its MFA-flow branches), `workflow_routes.cpp`, `webhook_routes.cpp`, `settings_routes.cpp`, `file_retrieval_routes.cpp`, `viz_routes.cpp`, `offload_routes.cpp`, and `sle_routes.cpp` (audited, already compliant via its own local builder) — so it does **not** yet cover literally every path, but the remaining gap is now precisely enumerated rather than open-ended: 7 more route files (`compliance_routes.cpp`, `discovery_routes.cpp`, `command_routes.cpp`, `dashboard_api_routes.cpp`, `notification_routes.cpp`, `schedule_routes.cpp`, `nvd_routes.cpp`, tracked as #1552's PR-2), roughly 86 hand-rolled sites still inline in `server.cpp` itself (not yet decomposed into a `*_routes.cpp` file), and the pre-routing chokepoint's own "no session" 401 (`server.cpp`, `{"error":{"code","message"},"meta"}` with no `correlation_id` — every unauthenticated `/api/v1/*` request hits this before any route's own A4 gate runs; tracked as #2003). Automation crossing surfaces should treat the enrichment fields as present-when-available until all three close.
 
 **Per-principal quota cap (PR 4.4, ADR-1005 class engine principals).** REST traffic from an **engine principal** session (`principal_kind=="engine"`, username `engine:<slug>`) is subject to a per-principal cap enforced at the server's single pre-routing chokepoint — before the request reaches any route handler. Two independent dimensions are checked: an in-flight **concurrency** cap and a per-principal token-bucket **rate** cap (see `docs/user-manual/engine-principals.md` for the operator-facing tuning guide). Exhausting either dimension returns `429` with the standard A4 envelope plus an HTTP `Retry-After` header (whole seconds, rounded up from `retry_after_ms`):
 
@@ -276,6 +276,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/export/json-to-csv` | 100 MiB | `json_to_csv_export` | Unbounded by design — converts a full exported dataset to CSV, and its size follows directly from the caller's own prior query. Kept at httplib's backstop, same treatment as `ota_upload`, rather than squeezed or given an arbitrary MiB judgment-call number. |
 | POST | `/api/nvd/match` | 8 MiB | `nvd_match` | ‡ No aggregate contract; reasoned to this content's own realistic scale (one device's software census, generously overestimated at ~200 bytes/item ⇒ 40000+ items) rather than borrowed from a sibling class. |
 | POST | `/api/v1/ca/import-chain` | 256 KiB | `ca_import_chain` | Mirrors the handler's own 256 KiB bound exactly. |
+| POST | `/api/v1/ca/issue-code-signing` | 64 KiB | `ca_issue_code_signing` | Code-signing leaf issuance via CSR custody (gap-matrix #10); mirrors the handler's own `kMaxIssueCodeSigningBody` exactly. |
 | POST | `/api/v1/ca/revoke` | 64 KiB | `ca_revoke` | Mirrors the handler's own `kMaxRevokeBody` exactly. |
 | POST | `/api/v1/secrets/kek/` | 64 KiB | `kek_ops` | Covers both `/rotate` and `/rewrap` — both take zero body fields and share the handler's own `kMaxKekBody`. |
 | POST | `/api/settings/ca/import-chain` | 512 KiB | `ca_import_chain_dashboard` | † 2× the REST JSON twin's cap — reasoned headroom for form-encoding overhead, not a measured worst case. |
@@ -1932,6 +1933,63 @@ will not see it until the next successful publish. Errors: `400` (missing/invali
 serial, unknown field, bad JSON), `403` (missing `Security:Delete`), `404` (serial
 not found or already revoked), `413` (body too large), `503` (CA unavailable).
 
+#### `POST /api/v1/ca/issue-code-signing` (gap-matrix #10)
+
+Issue a code-signing leaf certificate via CSR custody — the operator holds the
+private key and submits only a PKCS#10 CSR; the server never sees the key. See
+`docs/pki-architecture.md` "Code-signing certificate issuance" and
+`docs/user-manual/agent-plugins.md` "Plugin Signing" for the full workflow.
+**Permission:** `Security:Write`. MCP twin: `issue_code_signing_cert` (same
+schema, supervised-tier + approval-gated like every other `Security:Write` MCP
+tool). Request body (max 64 KiB):
+
+```json
+{
+  "csr_pem": "-----BEGIN CERTIFICATE REQUEST-----\n...",
+  "label": "plugin-signer-2026",
+  "validity_days": 365
+}
+```
+
+`csr_pem` is required. `label` is required and becomes the leaf's subject CN —
+must match `^[A-Za-z0-9._-]{1,64}$` (never an agent-style
+`yuzu://…/agent/…` URI SAN). `validity_days` is optional, `[1, 730]`, default
+`365`, refused outright (not silently clamped) if requested out of range;
+always further clamped so the leaf cannot outlive the issuing CA. Unknown JSON
+fields are rejected. Usage is hard-pinned to `codeSigning` only — never
+`clientAuth`/`serverAuth` — which is what makes this route safe to expose while
+the general `POST /api/v1/ca/issue` stays deferred (see `pki-architecture.md`).
+Response:
+
+```json
+{
+  "certificate_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "chain_pem": "-----BEGIN CERTIFICATE-----\n...",
+  "serial_hex": "3A4B5C6D...",
+  "not_after": "2027-09-10T00:00:00Z",
+  "purpose": "code-signing",
+  "meta": { "api_version": "v1" }
+}
+```
+
+`chain_pem` is the issuing cert plus, in subordinate-CA mode, the parent chain
+above it — feed both `certificate_pem` and `chain_pem` to `openssl cms -sign
+-certfile` to build a signature an agent can chain to its trust anchor. Errors
+use the A4 envelope: `400` (missing/invalid `csr_pem`, invalid `label`,
+`validity_days` out of range, a signing key below the strength floor — the
+accepted set is RSA 2048-16384 bits or EC P-256/P-384/P-521; Ed25519 and Ed448
+are rejected, since `openssl cms -sign` cannot use them — unknown field, bad
+JSON), `403` (missing
+`Security:Write`), `409` (no CA root — generate default certs first), `413`
+(body too large), `503` (CA unavailable). Audited as `ca.cert.issued`
+(`target_type=CodeSigningCertificate`, `target_id=<label or serial>`,
+`detail` carries `purpose=code-signing`) — the same action name an agent-leaf
+issuance uses, distinguished by `target_type` (`CodeSigningCertificate` vs
+`AgentCertificate`), with `purpose` as a secondary discriminator. Revoking the issued leaf uses the
+existing `POST /api/v1/ca/revoke` above; **revocation does not yet reach the
+agent-side plugin-load verifier via the CRL** — see
+`docs/pki-architecture.md`'s caveat before relying on this operationally.
+
 #### Subordinate-CA (root your CA in an enterprise PKI)
 
 By default Yuzu's CA is a self-signed install root (`trust mode: built-in`). An
@@ -3084,8 +3142,8 @@ row fails to persist, the response carries a `Sec-Audit-Failed: true` header
 | `policy.remediate` | Manual remediation triggered via `POST /api/policies/{id}/remediate`. `result` ∈ {`success`, `denied`, `error`}. Success detail `execution_id=<id> agents=<n>` (`agents` = delivered count, see the route doc); denied detail carries the reason (e.g. fragment defines no `fix` instruction, no non-compliant agents, a target is already claimed for remediation, or a target has reached its fix-retry cap for this policy); `error` is a genuine store/evaluator degrade, distinct from `denied`. |
 | `quarantine.enable` | Device quarantined |
 | `quarantine.disable` | Device released from quarantine |
-| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. |
-| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type=AgentCertificate`, `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
+| `ca.cert.issued` | Internal CA signed a per-agent client certificate at enrollment. `target_type=AgentCertificate`, `target_id=<serial>`, `result=success`. Also emitted by `POST /api/v1/ca/issue-code-signing` (gap-matrix #10) / MCP `issue_code_signing_cert`: `target_type=CodeSigningCertificate`, `target_id=<label>` on a rejected request or `<serial_hex>` on success, `detail` carries `purpose=code-signing`; `result=success`, `result=denied` (no CA root, or a bad/unparseable CSR), or `result=failure` (a genuine 5xx — key-load, signing, or `ca_store` write failure). |
+| `ca.cert.revoked` | Certificate revoked via `POST /api/v1/ca/revoke`. `target_type` is derived from the revoked cert's `purpose` — `AgentCertificate` for an agent leaf, `CodeSigningCertificate` for a code-signing leaf (gap-matrix #10), or the neutral `Certificate` when the serial is not found or the `ca_store` read fails; `target_id=<serial>`. `result=success`; `result=denied` with `detail="serial not found or already revoked"` for an unknown/already-revoked serial (reject without state change, matches every destructive sibling); `result=failure` (ADR-0053) for a genuine ca_store DB/lease error — kept distinct from `denied` so a database outage is never audited as a rejected revoke attempt. |
 | `ca.crl.published` | CRL (re)published after a revocation. `target_type=Security`, `target_id=<serial that triggered it>`. `result=success`, or `result=failure` when the CRL could not be rebuilt/recorded (the revocation still stands; the public CRL is momentarily stale). |
 | `ca.root_csr.exported` | The install CA's CSR was exported via `GET /api/v1/ca/root-csr` (subordinate-CA setup). `target_type=CaRoot`, `target_id=root`. `result=success`, or `result=failure` if generation failed. |
 | `ca.subordinate.imported` | An enterprise-signed intermediate was imported via `POST /api/v1/ca/import-chain` (or the dashboard wrapper). `target_type=CaRoot`, `target_id=root`. `result=success` on a validated switch to subordinate mode; `result=denied` when the uploaded material is rejected (not a CA / wrong key / does not chain); `result=failure` on a server-side persistence error. `detail` carries `reason=...` on rejection and `via=dashboard` for the panel path. |
@@ -5368,7 +5426,7 @@ unversioned `GET /api/schedules` documented above — a distinct, untouched capa
 
 Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
-**Permission:** None (public endpoint).
+**Permission:** `Infrastructure:Read` (#2057 — was unauthenticated; now matches the MCP `yuzu://openapi` resource twin's gate, `mcp_server.cpp`).
 
 **Response:** OpenAPI 3.x JSON document describing all v1 endpoints, schemas, and authentication methods.
 
@@ -5376,7 +5434,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 ### Discovery (A2)
 
-Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Unlike `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
+Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Like `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
 All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
@@ -7288,6 +7346,7 @@ List all Guaranteed State rules.
 - **4xx:** `403` if a service-scoped API token queries this route — the rule catalogue isn't owned by any one IT service, so there's no per-target shape to confine against; the bare permission gate alone checks only the token's ITServiceOwner role, never its own service-tag scope.
 - **5xx:** `503` if the store is unavailable.
 - **Audit:** `guaranteed_state.rule.read` (`denied` only — an ordinary successful list read is not audited).
+- **MCP twin:** `list_guardian_rules` (#4037) — same store call, same service-scoped-token deny.
 
 #### `POST /api/v1/guaranteed-state/rules`
 
@@ -7347,6 +7406,25 @@ Delete a rule.
 - **4xx:** `404` if the rule does not exist; `403` if a service-scoped API token calls this route (same reasoning as create/update above).
 - **Audit:** `guaranteed_state.rule.delete`.
 
+#### `GET /api/v1/guaranteed-state/rules/{rule_id}/status`
+
+Per-guard fleet-wide agent-status drilldown (#4037, api-parity #2146 Batch A) — agent_id/state/updated_at for **every** agent that has reported this ONE rule's state. Machine-readable twin of the dashboard's per-guard fleet compliance census (`/guardian/guard/{id}`).
+
+- **Permission:** `GuaranteedState:Read` via `AuthRoutes::require_list_read`, this route's **sole** authorization gate (ADR-0017 admit-then-filter) — the same chokepoint `GET .../status` uses, not a bare `perm_fn`. A service-scoped API token is refused outright (a rule has no single owning IT service to confine to); a management-group-confined grant's visible-agent set filters the returned rows.
+- **Response:** `data[]` of `{agent_id, state, updated_at}`, `pagination.total`. Raw census — does **not** apply the dashboard fragment's own offline-agent-folds-to-unknown rollup (same posture `GET .../status` already established for the identical class of data).
+- **4xx:** `404` if `rule_id` names no rule; `403` for a service-scoped token or no `GuaranteedState:Read` grant anywhere.
+- **5xx:** `503` if the store is degraded, the gate is unwired, or the `guaranteed_state.rule.view` audit row cannot persist (fail-closed, `Sec-Audit-Failed: true`).
+- **Audit:** `guaranteed_state.rule.view` (`success`/`not_found`), `target_type=GuaranteedState`, `target_id=<rule_id>` — the SAME verb the per-guard dashboard drilldown emits (not `guardian.device.view`; a fleet-wide-per-rule read is a different shape from a per-device read). MCP twin: `get_guardian_rule_status` (`audit_persisted:false` posture instead of fail-closed).
+
+#### `GET /api/v1/guaranteed-state/agents/{agent_id}/rules`
+
+Per-device all-guards view (#4037, api-parity #2146 Batch A) — every guard's state for ONE device, unscoped to any Baseline. Machine-readable twin of the dashboard's per-device Guardian lens (`/fragments/device/guardian`). Genuinely distinct from `GET .../device-compliance` below, which answers "is this device compliant with this ONE named Baseline" (requires both `agent_id` **and** `baseline`, and returns a baseline-shaped response) — this route has no `baseline` parameter and returns every guard the device has EVER reported, regardless of Baseline membership.
+
+- **Permission:** `GuaranteedState:Read`, per-device scoped (management-group aware) — same `scoped_perm_fn(GuaranteedState, Read, agent_id)` gate `GET .../device-compliance` and the dashboard Guardian device lens both use.
+- **Response:** `data.agent_id`, `data.guards[]` of `{rule_id, name, state, updated_at}`, `data.total_guards`. A device with no reported guards returns an empty `guards[]`, not an error.
+- **5xx:** `503` if the scoped-permission gate is unwired, the store is degraded, or the `guardian.device.view` audit row cannot persist (fail-closed).
+- **Audit:** `guardian.device.view`, `target_type=Agent`, `target_id=<agent_id>` — the SAME verb `GET .../status/{agent_id}` and the dashboard Guardian device lens emit. MCP twin: `get_guardian_device_guards` (`audit_persisted:false` posture instead of fail-closed).
+
 #### `POST /api/v1/guaranteed-state/push`
 
 Queue a push of the active rule set to scoped agents. Returns `202 Accepted` — agent delivery is asynchronous. The fan-out is live: the server resolves `scope` to the in-scope agents and delivers each a per-agent filtered rule set (only rules whose `os_target` and `scope_expr` match that agent).
@@ -7374,6 +7452,7 @@ Query Guaranteed State events (rule violations, remediations, agent sync events)
 - **4xx:** `400` on non-integer or negative `limit` / `offset`, or on an `agent_id` over 256 characters / containing a control character. `403` if a service-scoped token queries the fleet-wide shape, or names a device outside its own service's scope.
 - **Ruleless DEX signal observations share this endpoint.** Filter `rule_id=__observation__` to retrieve `event_type=<obs_type>` rows (`process.crashed`, `process.hung`, `service.crashed`, `os.boot`, … — fleet-wide signals recorded independent of any rule; `severity` is a fixed `info`; `expected_value` empty). See [DEX signal observations](guaranteed-state.md#dex-signal-observations) and the [DEX dashboard](dex.md).
 - **Audit (behavioral PII):** BOTH shapes emit a **`dex.device.view`** audit row on every read — the per-device shape returns that device's signal history (`detail_json` reveals which apps a person runs) and audits `target_type=Agent`, `target_id=<agent_id>` (the same verb as the dashboard per-device drill-down); the fleet-wide shape returns every reporting agent's rows and audits `target_type=GuaranteedState`, `target_id=` (empty — no single agent). **Fail-closed on both shapes:** the audit fires before the data is serialized; if the audit row cannot persist, the endpoint returns `503` + `Sec-Audit-Failed: true` and serves no data (parity with `GET /api/v1/dex/devices/{id}`). A service-scoped token denied the fleet-wide shape also gets a `dex.device.view` `denied` audit row, so a rejected probe still leaves a trace.
+- **MCP twin:** `list_guardian_events` (#4037) — same dual gate shape, same query params. `audit_persisted:false` posture instead of REST's fail-closed (JSON-RPC has no `Sec-Audit-Failed` header channel). The fleet-wide branch's confinement gap (#3238) is **not** closed by this twin — it deliberately keeps the same bare-`perm_fn` posture REST has today rather than inventing a different MCP-only gate.
 
 #### `GET /api/v1/guaranteed-state/status`
 
@@ -7404,6 +7483,7 @@ actually covers the agents it should.
 - **Permission:** `GuaranteedState:Read` (non-service-scoped; management-group confined via `AuthRoutes::require_list_read`, ADR-0017)
 - **Response keys:** `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules` (field names match the agent-side proto `GuaranteedStateStatus`).
 - **4xx/5xx:** `403` for a service-scoped token, a caller with no `GuaranteedState:Read` grant anywhere, **or an unreachable/corrupt RBAC or management-group store for an ordinary caller** — `authorize_list_read` fails closed to the SAME `403` as a genuine no-grant denial, not a `503`, for every non-engine caller (the two are not currently distinguished in the response code). `503` only for: an unwired list-read gate or a null Guaranteed State store (server misconfiguration, no `retry_after_ms`); a Guaranteed State store query-time degrade (transient, `retry_after_ms: 5000`); or, for an **engine-principal** caller specifically, an unreachable/unopened RBAC store (engine sessions get a distinct `503` here, unlike human/service sessions) — never a silent `0`.
+- **MCP twin:** `get_guardian_status` (#4037) — calls the SAME `guardian_status_rollup` builder and the SAME `require_list_read` gate (via `McpServer::set_list_read_fn`, wired from the identical server.cpp lambda REST uses), so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
 #### `GET /api/v1/guaranteed-state/status/{agent_id}`
 

@@ -1,5 +1,7 @@
 #include "webhook_routes.hpp"
 
+#include "rest_a4_envelope_http.hpp" // detail::a4_error
+
 #include <nlohmann/json.hpp>
 
 namespace yuzu::server {
@@ -34,9 +36,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                     return;
                 if (!webhook_store || !webhook_store->is_open()) {
                     res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
-                        "application/json");
+                    res.set_content(detail::a4_error(res, "webhook store unavailable"),
+                                    "application/json");
                     return;
                 }
                 // list() is type-distinguishable (ADR-0036/postgres-store-
@@ -45,9 +46,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                 auto webhooks = webhook_store->list();
                 if (!webhooks) {
                     res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"webhook store degraded"},"meta":{"api_version":"v1"}})",
-                        "application/json");
+                    res.set_content(detail::a4_error(res, "webhook store degraded"),
+                                    "application/json");
                     return;
                 }
                 nlohmann::json arr = nlohmann::json::array();
@@ -74,9 +74,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      return;
                  if (!webhook_store || !webhook_store->is_open()) {
                      res.status = 503;
-                     res.set_content(
-                         R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
-                         "application/json");
+                     res.set_content(detail::a4_error(res, "webhook store unavailable"),
+                                     "application/json");
                      return;
                  }
                  nlohmann::json body;
@@ -85,18 +84,14 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                  } catch (...) {
                      audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_json");
                      res.status = 400;
-                     res.set_content(
-                         R"({"error":{"code":400,"message":"invalid JSON"},"meta":{"api_version":"v1"}})",
-                         "application/json");
+                     res.set_content(detail::a4_error(res, "invalid JSON"), "application/json");
                      return;
                  }
                  auto url = body.value("url", "");
                  if (url.empty()) {
                      audit_fn(req, "webhook.create", "failure", "webhook", "", "url_required");
                      res.status = 400;
-                     res.set_content(
-                         R"({"error":{"code":400,"message":"url is required"},"meta":{"api_version":"v1"}})",
-                         "application/json");
+                     res.set_content(detail::a4_error(res, "url is required"), "application/json");
                      return;
                  }
                  auto event_types = body.value("event_types", "*");
@@ -110,16 +105,14 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                      if (result.error() == WebhookWriteError::invalid_url) {
                          audit_fn(req, "webhook.create", "failure", "webhook", "", "invalid_url");
                          res.status = 400;
-                         res.set_content(
-                             R"({"error":{"code":400,"message":"url must be http:// or https://"},"meta":{"api_version":"v1"}})",
-                             "application/json");
+                         res.set_content(detail::a4_error(res, "url must be http:// or https://"),
+                                         "application/json");
                      } else {
                          audit_fn(req, "webhook.create", "failure", "webhook", "",
                                   std::string(audit_detail_for(result.error())));
                          res.status = 503;
-                         res.set_content(
-                             R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
-                             "application/json");
+                         res.set_content(detail::a4_error(res, "webhook store unavailable"),
+                                         "application/json");
                      }
                      return;
                  }
@@ -148,9 +141,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        return;
                    if (!webhook_store) {
                        res.status = 503;
-                       res.set_content(
-                           R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                           "application/json");
+                       res.set_content(detail::a4_error(res, "service unavailable"),
+                                       "application/json");
                        return;
                    }
                    auto id = std::stoll(req.matches[1].str());
@@ -171,9 +163,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
                                 std::string(audit_detail_for(result.error())));
                        res.status = 503;
-                       res.set_content(
-                           R"({"error":{"code":503,"message":"webhook store unavailable"},"meta":{"api_version":"v1"}})",
-                           "application/json");
+                       res.set_content(detail::a4_error(res, "webhook store unavailable"),
+                                       "application/json");
                        return;
                    }
                    if (*result) {
@@ -184,9 +175,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                        audit_fn(req, "webhook.delete", "failure", "webhook", std::to_string(id),
                                 "not_found");
                        res.status = 404;
-                       res.set_content(
-                           R"({"error":{"code":404,"message":"webhook not found"},"meta":{"api_version":"v1"}})",
-                           "application/json");
+                       res.set_content(detail::a4_error(res, "webhook not found"),
+                                       "application/json");
                    }
                });
 
@@ -197,9 +187,8 @@ void mount(HttpRouteSink& sink, WebhookRoutes::PermFn perm_fn, WebhookRoutes::Au
                     return;
                 if (!webhook_store) {
                     res.status = 503;
-                    res.set_content(
-                        R"({"error":{"code":503,"message":"service unavailable"},"meta":{"api_version":"v1"}})",
-                        "application/json");
+                    res.set_content(detail::a4_error(res, "service unavailable"),
+                                    "application/json");
                     return;
                 }
                 auto webhook_id = std::stoll(req.matches[1].str());

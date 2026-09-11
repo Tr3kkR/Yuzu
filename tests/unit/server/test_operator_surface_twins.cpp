@@ -65,7 +65,9 @@
 
 #include <algorithm>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -489,6 +491,14 @@ constexpr TwinRow kExpectedTwins[] = {
     {"get_dex_health", "GuaranteedState", "Read", true},
     {"get_dex_trends", "GuaranteedState", "Read", true},
     {"get_dex_overview", "GuaranteedState", "Read", true},
+    // #4037 — Guardian read twins (api-parity #2146 Batch A). Pinned against
+    // rest_api_v1.cpp's /api/v1/guaranteed-state/{status,rules,events,
+    // rules/{id}/status,agents/{id}/rules} routes.
+    {"get_guardian_status", "GuaranteedState", "Read", true},
+    {"list_guardian_rules", "GuaranteedState", "Read", true},
+    {"list_guardian_events", "GuaranteedState", "Read", true},
+    {"get_guardian_rule_status", "GuaranteedState", "Read", true},
+    {"get_guardian_device_guards", "GuaranteedState", "Read", true},
 };
 
 } // namespace
@@ -541,19 +551,25 @@ TEST_CASE("operator surface MCP twins: every tool satisfies the A5 contract",
         REQUIRE(schema_it != schemas.end());
         CHECK(schema_it->schema_json.find("\"type\":\"object\"") != std::string::npos);
         CHECK(schema_it->schema_json.find("\"properties\"") != std::string::npos);
-        // A bare {"type":"object","properties":{}} with no further structure would
-        // be the free-form-object footgun the spec forbids for a tool that DOES
-        // take an argument (an empty schema then accepts anything, undocumented).
-        // #4027's three list_tar_* tools are genuinely zero-argument reads (same
-        // shape as list_agents, not in this table) — {"type":"object",
-        // "properties":{}} is the CORRECT, most literal schema for "takes no
-        // arguments," not the footgun; exempted here rather than weakened for
-        // every other row, which still must take ≥1 property.
-        if (expected.tool != "list_tar_process_tree_devices" &&
-            expected.tool != "list_tar_capture_sources_devices" &&
-            expected.tool != "list_tar_retention_paused") {
+        // A bare {"type":"object","properties":{}} with no further structure
+        // would be the free-form-object footgun the spec forbids for any
+        // tool that DOES take an argument — the original 11 rows here all
+        // do. A tool that genuinely takes ZERO arguments (#4027's three
+        // list_tar_* tools, same shape as list_agents; #4037's
+        // get_guardian_status/list_guardian_rules — the same "{}" shape
+        // get_guardian_schemas already uses, outside this array) is not a
+        // footgun; "{}" correctly documents "no arguments," it isn't a
+        // lazily-typed free-form object. Exempted explicitly so the check
+        // stays a real signal for every tool that DOES take arguments.
+        static const std::unordered_set<std::string_view> kNoArgTools = {
+            "list_tar_process_tree_devices",
+            "list_tar_capture_sources_devices",
+            "list_tar_retention_paused",
+            "get_guardian_status",
+            "list_guardian_rules",
+        };
+        if (!kNoArgTools.contains(expected.tool))
             CHECK(schema_it->schema_json != R"({"type":"object","properties":{}})");
-        }
     }
 }
 

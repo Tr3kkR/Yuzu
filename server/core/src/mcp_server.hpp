@@ -8,8 +8,12 @@
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
+#include "auth_routes.hpp" // #4037: ListReadGate — get_guardian_status's require_list_read confinement seam
 #include "authz_gates.hpp" // #3290 Phase 2: authz::FleetReadGate — query_installed_software's real confinement seam
 #include "authz_model.hpp" // #1788: VisibleSet — MCP dispatch confinement (in_scope/filter_to_scope)
+#include "ca_routes.hpp" // IssueCodeSigningFn/CodeSigningIssuance (free at yuzu::server scope, unlike
+                         // CaRoutes::PublishCrlFn below) — reused verbatim by issue_code_signing_cert
+                         // rather than re-declared, so the two error-prefix constants stay one copy.
 #include "ca_store.hpp"
 #include "command_capability.hpp" // #3685: CommandCapability / ClassificationError — ClassifyFn's return type
 #include "dispatch_caller.hpp" // PLAN-006: DispatchCaller — the principal threaded to dispatch_fn
@@ -497,6 +501,30 @@ public:
                                            const std::string& operation)>;
     void set_fleet_read_fn(FleetReadFn fn) { fleet_read_fn_ = std::move(fn); }
 
+    /// #4037 — the injected-callback twin of `AuthRoutes::require_list_read`
+    /// (ADR-0017), backing `get_guardian_status`'s real confinement. Same
+    /// shape as `RestApiV1::ListReadFn`/`ListReadGate` (auth_routes.hpp) reused
+    /// verbatim, not redefined, so the REST `GET /guaranteed-state/status`
+    /// list-read gate and this MCP twin cannot drift — server.cpp wires the
+    /// SAME `list_read_fn` lambda into both surfaces (one conversion, two
+    /// surfaces, mirroring `fleet_read_fn`/`set_fleet_read_fn` immediately
+    /// above). Route-class distinction from `FleetReadFn` above (ADR-1006
+    /// Decision 2, closes #3218): `require_list_read` is the sole gate on
+    /// fleet-wide ROLLUP routes — it refuses a service-scoped session
+    /// outright, since a rollup has no per-service slice to narrow to — and
+    /// is NOT interchangeable with `require_fleet_read`. MUST be this tool's
+    /// SOLE authorization gate — never stacked with `perm_fn`/`tier_allows`
+    /// for the same `(securable_type, operation)` (same BLOCKING defect class
+    /// `require_fleet_read`'s own doc comment warns against; `require_list_read`
+    /// already replicates the MCP-tier ladder internally). Unset (default-
+    /// constructed) ⇒ the tool fails CLOSED (503 "unwired"), mirroring
+    /// `RestApiV1`'s own unwired contract for the identical seam.
+    using ListReadFn =
+        std::function<yuzu::server::ListReadGate(const httplib::Request&, httplib::Response&,
+                                                  const std::string& securable_type,
+                                                  const std::string& operation)>;
+    void set_list_read_fn(ListReadFn fn) { list_read_fn_ = std::move(fn); }
+
     /// #4143 review fix (external colleague review, BLOCKING, confirmed against
     /// ADR-0017 INV-4/INV-7 by direct source inspection): `list_tar_process_
     /// tree_devices`/`list_tar_capture_sources_devices` previously intersected
@@ -692,7 +720,13 @@ public:
                             // — WorkflowEngine was not previously threaded into McpServer at
                             // all. Trailing optional dep; nullptr leaves the three tools
                             // answering an internal-error JSON-RPC response.
-                            WorkflowEngine* workflow_engine = nullptr);
+                            WorkflowEngine* workflow_engine = nullptr,
+                            // gap-matrix #10 (ADR-1005 A5 parity): backs issue_code_signing_cert
+                            // — the MCP twin of POST /api/v1/ca/issue-code-signing. Trailing
+                            // optional dep; unset leaves the tool answering "CA not available"
+                            // (kInternalError), the same degradation ca_store==nullptr produces
+                            // for list_issued_certs/revoke_certificate above.
+                            IssueCodeSigningFn issue_code_signing_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -788,7 +822,9 @@ public:
                          ProductPackStore* product_pack_store = nullptr,
                          // #4030: backs list_workflows/get_workflow/get_workflow_execution —
                          // forwarded to build_handler.
-                         WorkflowEngine* workflow_engine = nullptr);
+                         WorkflowEngine* workflow_engine = nullptr,
+                         // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
+                         IssueCodeSigningFn issue_code_signing_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -833,7 +869,9 @@ public:
                          // #4029 — backs list_product_packs/get_product_pack.
                          ProductPackStore* product_pack_store = nullptr,
                          // #4030: backs list_workflows/get_workflow/get_workflow_execution.
-                         WorkflowEngine* workflow_engine = nullptr);
+                         WorkflowEngine* workflow_engine = nullptr,
+                         // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
+                         IssueCodeSigningFn issue_code_signing_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
@@ -867,6 +905,8 @@ private:
     UploadGrantListReadFn upload_grant_list_read_fn_;
     // #3290 Phase 2 — see set_fleet_read_fn above.
     FleetReadFn fleet_read_fn_;
+    // #4037 — see set_list_read_fn above.
+    ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
