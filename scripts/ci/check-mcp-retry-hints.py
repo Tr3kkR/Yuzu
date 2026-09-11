@@ -62,15 +62,27 @@ MCP_SERVER_CPP = "server/core/src/mcp_server.cpp"
 
 KTOOLS_NAME = re.compile(r'^\s*\{"([a-z_][a-z0-9_]*)",', re.MULTILINE)
 
-CALL_ASSIGNED_GUARD = re.compile(
+# Matches only the PREFIX up to and including the guard's opening brace --
+# deliberately does NOT try to capture the body itself. A naive
+# `\{([^{}]*)\}` body capture cannot cross any brace, and this codebase's own
+# canonical call shape (`a4_error(code, message, {}, retry_after_ms)`, with
+# `{}` as the empty options/remediation argument) contains exactly one nested
+# brace pair -- so that naive form silently produces ZERO matches on every
+# converted site in this PR, the precise shape this gate exists to police
+# (found by colleague review on PR #4261, both an external adversarial pass
+# and direct human reproduction of the regex against this file's own code).
+# find_balanced_block() below does real depth-counted extraction instead,
+# the same algorithm find_tool_block() already uses for the outer scan.
+CALL_ASSIGNED_GUARD_PREFIX = re.compile(
     r"auto\s+(\w+)\s*=\s*[\w:>*.&()_,\s\-]*?\([^;]*\);"
     r"\s*(?:if\s*\(!\1(?:_or)?\)|if\s*\(!\1\.has_value\(\)\))"
-    r"\s*\{([^{}]*)\}",
+    r"\s*\{",
     re.DOTALL,
 )
 
 ERROR_CALL = re.compile(r"(error_response|a4_error|error_response_a4)\s*\(")
 EXEMPT_COMMENT = re.compile(r"//\s*retry-hint-exempt:\s*\S")
+LINE_COMMENT = re.compile(r"//[^\n]*")
 TOOL_BLOCK_START = "if (tool_name == \"{name}\") {{"
 
 
@@ -88,32 +100,45 @@ def tool_names(text: str) -> set[str]:
     return set(KTOOLS_NAME.findall(text))
 
 
-def find_tool_block(text: str, name: str) -> str | None:
-    marker = TOOL_BLOCK_START.format(name=re.escape(name)).replace(re.escape(name), name)
-    m = re.search(r'if \(tool_name == "' + re.escape(name) + r'"\) \{', text)
-    if not m:
-        return None
-    start = m.end()
+def find_balanced_block(text: str, open_brace_pos: int) -> str:
+    """Given the index of an opening '{' (already consumed -- open_brace_pos
+    is the position RIGHT AFTER it), return everything up to its matching
+    '}', honoring nesting. Same depth-counting algorithm as find_tool_block,
+    factored out so both callers get real brace-balanced extraction instead
+    of a bounded-lookahead regex that breaks on the first nested '{'."""
     depth = 1
-    i = start
+    i = open_brace_pos
     while depth > 0 and i < len(text):
         if text[i] == "{":
             depth += 1
         elif text[i] == "}":
             depth -= 1
         i += 1
-    return text[start:i]
+    return text[open_brace_pos:i - 1]
+
+
+def find_tool_block(text: str, name: str) -> str | None:
+    m = re.search(r'if \(tool_name == "' + re.escape(name) + r'"\) \{', text)
+    if not m:
+        return None
+    return find_balanced_block(text, m.end())
 
 
 def scan_block(name: str, block: str) -> list[tuple[str, str]]:
     """Return (varname, status) for every call-assigned error guard in one
     tool's handler block."""
     out = []
-    for m in CALL_ASSIGNED_GUARD.finditer(block):
-        varname, body = m.group(1), m.group(2)
+    for m in CALL_ASSIGNED_GUARD_PREFIX.finditer(block):
+        varname = m.group(1)
+        body = find_balanced_block(block, m.end())
         if not ERROR_CALL.search(body):
             continue
-        if "retry_after_ms" in body:
+        # Strip line comments before the retry_after_ms substring check so a
+        # stray `// TODO: retry_after_ms` note can't spoof an "ok" verdict --
+        # real code only. EXEMPT_COMMENT below deliberately checks the
+        # UNSTRIPPED body, since that marker is itself a comment.
+        code_only = LINE_COMMENT.sub("", body)
+        if "retry_after_ms" in code_only:
             status = "ok"
         elif EXEMPT_COMMENT.search(body):
             status = "exempt"
@@ -123,12 +148,100 @@ def scan_block(name: str, block: str) -> list[tuple[str, str]]:
     return out
 
 
+def selftest() -> int:
+    """Regression guard for the exact defect a colleague review found on PR
+    #4261: the prior body-capture regex (`\\{([^{}]*)\\}`) could not cross any
+    brace, so it silently produced ZERO matches -- not even a flagged gap --
+    on this codebase's own canonical call shape, which nests an empty `{}`
+    options/remediation argument inside the guard body. Run standalone:
+    `python3 check-mcp-retry-hints.py --selftest`."""
+    cases: list[tuple[str, str, str]] = [
+        (
+            "canonical shape, hint present -> ok",
+            'if (tool_name == "fake_tool") {\n'
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            '        res.set_content(a4_error(kInternalError, "down", {},\n'
+            "                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),\n"
+            '                        "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "ok",
+        ),
+        (
+            "canonical shape, hint MISSING -> gap (the bug: this used to match nothing at all)",
+            'if (tool_name == "fake_tool") {\n'
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            '        res.set_content(a4_error(kInternalError, "down", {}),\n'
+            '                        "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "gap",
+        ),
+        (
+            "canonical shape, exempt comment -> exempt",
+            'if (tool_name == "fake_tool") {\n'
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            "        // retry-hint-exempt: not found, terminal\n"
+            '        res.set_content(a4_error(kInternalError, "down", {}),\n'
+            '                        "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "exempt",
+        ),
+        (
+            "stray comment mentioning retry_after_ms must NOT spoof ok",
+            'if (tool_name == "fake_tool") {\n'
+            "    auto rows = store->call();\n"
+            "    if (!rows) {\n"
+            "        // TODO: retry_after_ms\n"
+            '        res.set_content(a4_error(kInternalError, "down", {}),\n'
+            '                        "application/json");\n'
+            "        return;\n"
+            "    }\n"
+            "}",
+            "gap",
+        ),
+    ]
+    failures = 0
+    for label, src, expected in cases:
+        block = find_tool_block(src, "fake_tool")
+        if block is None:
+            print(f"selftest FAIL [{label}]: find_tool_block returned None")
+            failures += 1
+            continue
+        results = scan_block("fake_tool", block)
+        if len(results) != 1:
+            print(f"selftest FAIL [{label}]: expected exactly 1 finding, got {len(results)}: {results}")
+            failures += 1
+            continue
+        _, status = results[0]
+        if status != expected:
+            print(f"selftest FAIL [{label}]: expected status={expected!r}, got {status!r}")
+            failures += 1
+    if failures:
+        print(f"\ncheck-mcp-retry-hints selftest: FAIL ({failures}/{len(cases)} case(s))")
+        return 1
+    print(f"check-mcp-retry-hints selftest: OK ({len(cases)}/{len(cases)} case(s))")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("base", nargs="?", default="origin/dev")
     ap.add_argument("head", nargs="?", default="HEAD")
     ap.add_argument("--summary", action="store_true")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the regex/extractor regression suite and exit, ignoring base/head")
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
 
     base_src = git_show(args.base, MCP_SERVER_CPP)
     head_src = git_show(args.head, MCP_SERVER_CPP)

@@ -14604,9 +14604,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!preflight_run_store_) {
-                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
-                                             "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                    // No retry_after_ms: preflight_run_store_ is wired exactly
+                    // once at server construction, no runtime setter — a null
+                    // value here is a permanent deployment-config condition,
+                    // not one a client can retry past. Matches the REST twin
+                    // (preflight_routes.cpp's unwired-pointer branch).
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable"),
                                     "application/json");
                     return;
                 }
@@ -14655,9 +14658,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
                     return;
                 if (!preflight_run_store_) {
-                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
-                                             "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                    // No retry_after_ms: preflight_run_store_ is wired exactly
+                    // once at server construction, no runtime setter — a null
+                    // value here is a permanent deployment-config condition,
+                    // not one a client can retry past. Matches the REST twin
+                    // (deployment_routes.cpp's unwired-pointer branch).
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable"),
                                     "application/json");
                     return;
                 }

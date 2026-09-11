@@ -492,12 +492,14 @@ void DeploymentRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, Perm
             return;
         if (!preflight_store_) {
             res.status = 503;
-            // retry_after_ms=2000 matches the MCP twin's kMcpStoreFaultShortRetryMs
-            // (mcp_retry.hpp) — the two surfaces must not disagree on how long a
-            // caller should back off for the identical condition.
+            // No retry_after_ms: preflight_store_ is wired exactly once, in
+            // register_routes() at server construction (server.cpp), with no
+            // runtime setter. A null value here is a permanent "this server
+            // was deployed without the store configured" condition — no
+            // amount of client retrying resolves it. Contrast the genuine,
+            // retryable store-fault branch below (get_run_checked).
             res.set_content(
-                detail::a4_error(res, "pre-flight run store is unavailable on this server",
-                                 {.retry_after_ms = 2000}),
+                detail::a4_error(res, "pre-flight run store is unavailable on this server"),
                 "application/json");
             return;
         }
