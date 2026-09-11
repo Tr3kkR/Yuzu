@@ -29,6 +29,7 @@
 #include "tar_proc_stream.hpp"
 #include "tar_module_etw.hpp"
 #include "tar_db.hpp"
+#include "tar_usage.hpp"
 #include "tar_fleet_snapshot.hpp"
 #include "tar_status_format.hpp"
 #include "tar_netconn.hpp"
@@ -781,6 +782,22 @@ public:
         if (db_->get_config("mapdrive_enabled", "").empty()) {
             db_->set_config("mapdrive_enabled", "false");
         }
+        // Wave 7 PR7.2b: boot is one of the THREE call sites (boot, configure,
+        // fast-tick) that must all reconcile the `usage` fold's lifecycle
+        // through this SAME function -- see tar_usage.hpp's file banner for
+        // why a boot-time path that instead wrote its own marker directly
+        // (the original PR7.2 shape) could stamp coverage while the source
+        // was disabled, or race a later enable-edge rebaseline into
+        // retrospectively over-collecting the disabled window. A best-effort
+        // attempt here is a latency optimisation only -- run_usage_fold()
+        // itself calls the identical function on every fast tick, so a
+        // failure here is never fatal, only slower to notice.
+        if (auto baseline = yuzu::tar::usage::usage_ensure_baselined(*db_, now_epoch_seconds());
+            !baseline.has_value()) {
+            spdlog::warn("TAR: boot-time usage baseline attempt failed ({}); the fast-tick fold "
+                        "will retry it",
+                        baseline.error());
+        }
 #ifdef _WIN32
         // Construct the Windows ETW image-load collector; the session is STARTED
         // LAZILY by collect_fast on the first tick where module_enabled is true (so
@@ -1128,6 +1145,11 @@ private:
     // High-water mark of ProcEventRing::dropped() already logged, so the overflow
     // warning fires on each new drop rather than every tick. Guarded by collect_mu_.
     std::uint64_t last_logged_dropped_{0};
+    // Epoch seconds of the last `usage` fold failure warning -- rate-limits
+    // run_usage_fold() failure logging to once per minute (Wave 7 PR7.2b) so
+    // a persistently wedged fold does not spam every fast tick. Guarded by
+    // collect_mu_ (only read/written from collect_fast_impl).
+    int64_t usage_last_fold_warn_ts_{0};
 
     // ── M2: gap-free module/image-load stream (Windows ETW; null elsewhere) ───
     // Unlike the always-on process stream, this is OPT-IN (module_enabled,
@@ -1367,6 +1389,24 @@ private:
                 }
 
                 db_->set_state(proc_key, processes_to_json(current).dump());
+            }
+        }
+
+        // `usage` derived fold (Wave 7 PR7.2b): ONE call, after BOTH process
+        // feeders above have had their chance to insert this tick (the
+        // gap-free stream branch or the snapshot-diff poll branch -- they are
+        // mutually exclusive per tick; the one-time boot-backfill, the third
+        // feeder, always runs at init, strictly before any fast tick can
+        // reach here). Still under collect_mu_ (this whole function runs
+        // under the caller's lock_guard). Gates itself on usage_enabled AND
+        // process_enabled, and on the lifecycle state internally -- a
+        // disabled or not-yet-baselined source is not a failure.
+        if (auto fold = yuzu::tar::usage::run_usage_fold(*db_, ts); !fold.ok) {
+            if (ts - usage_last_fold_warn_ts_ >= 60) {
+                spdlog::warn("TAR: usage fold failed this tick ({}) -- hwm unchanged, retrying "
+                            "next tick",
+                            fold.error);
+                usage_last_fold_warn_ts_ = ts;
             }
         }
 
@@ -2435,6 +2475,41 @@ private:
         // operator runs WHEN TAR IS MISBEHAVING block for a full rollup pass.
         for (const auto& line : yuzu::tar::format_retention_guard_lines(retention_guard_))
             ctx.write_output(line);
+
+        // Usage-fold health (run_usage_fold, tar_usage.cpp) — the derived
+        // process-pairing fold behind the app_usage plugin has no channel of
+        // its own out of tar.db: it is not a CursorSource and has no
+        // collector, so unlike every capture source above it was previously
+        // readable ONLY by the (not yet landed) single-target Forensics-
+        // gated `app_usage` plugin's own `summary` action. Emitted
+        // UNCONDITIONALLY, same key-always-present NFR-visibility contract
+        // as process/module/nstat above (no agent /metrics endpoint; `tar
+        // status` is the operator/agentic surface). `usage_lifecycle_state`
+        // is the one status line worth reading FIRST: "collecting" is the
+        // only state under which any of the counters below are currently
+        // advancing.
+        {
+            const char* lifecycle = "disabled";
+            switch (yuzu::tar::usage::usage_lifecycle_state(*db_)) {
+                case yuzu::tar::usage::LifecycleState::Disabled: lifecycle = "disabled"; break;
+                case yuzu::tar::usage::LifecycleState::PendingBaseline:
+                    lifecycle = "baseline_pending"; break;
+                case yuzu::tar::usage::LifecycleState::Active: lifecycle = "collecting"; break;
+            }
+            ctx.write_output(std::format("config|usage_lifecycle_state|{}", lifecycle));
+        }
+        ctx.write_output(
+            std::format("config|usage_gap_count|{}", db_->get_config("usage_gap_count", "0")));
+        ctx.write_output(std::format("config|usage_gap_lost_events|{}",
+                                     db_->get_config("usage_gap_lost_events", "0")));
+        ctx.write_output(
+            std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
+        ctx.write_output(std::format("config|usage_expiry_declined_count|{}",
+                                     db_->get_config("usage_expiry_declined_count", "0")));
+        ctx.write_output(std::format("config|usage_coverage_since|{}",
+                                     db_->get_config("usage_coverage_since", "-")));
+        ctx.write_output(
+            std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
 
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");

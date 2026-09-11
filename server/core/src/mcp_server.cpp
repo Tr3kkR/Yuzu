@@ -1260,7 +1260,10 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
      "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
-     "ticket is minted or consumed, matching REST POST /api/command. "
+     "ticket is minted or consumed, matching REST POST /api/command. A SECOND, STRICTER "
+     "EXCEPTION (Wave 7 PR7.2b): a Forensics-classified plugin.action pair requires EXACTLY ONE "
+     "explicit, in-scope agent_id - not merely non-empty agent_ids, and scope is refused outright "
+     "even when it would resolve to one device - a forensic read is per-device by nature. "
      "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
@@ -2749,7 +2752,13 @@ constexpr std::string_view kRbacSecurables[] = {
     // Enrollment (auto-approve rules + pending-agent visibility), OidcConfig
     // (OIDC SSO config read — deliberately NOT "Directory", see the naming
     // trap called out in the issue and in discovery_routes.cpp).
-    "Directory", "Enrollment", "OidcConfig"};
+    "Directory", "Enrollment", "OidcConfig",
+    "Forensics",
+    // Decommission has NO MCP consumer by design — the erasure verb is
+    // REST-only (ADR-1005 twin-existence exception #2102). It is listed so
+    // the seeded-catalogues binding test in test_rbac_store.cpp keeps the
+    // two mirrors equal.
+    "Decommission"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -4548,9 +4557,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // tier_allows-then-perm_fn order. This resources/read branch, like every other
             // branch in this method, emits no audit row on tier denial (unlike tools/call's
             // mcp_audit("denied", ...)) — the whole resources/read surface predates
-            // per-call audit, tracked by the same #2713 follow-up. Deliberately NOT
-            // unauthenticated like /api/v1/openapi.json — that posture is a tracked
-            // pre-existing gap (#2057), not a precedent to follow.
+            // per-call audit, tracked by the same #2713 follow-up. #2057 (REST
+            // GET /api/v1/openapi.json was unauthenticated) is now closed — that
+            // route gates Infrastructure:Read too, so the two surfaces share the
+            // same posture rather than this one being the odd one out.
             //
             // Shared tier-denial remediation text for these two branches only — NOT the
             // same scope as tools/call's kTierRemediation (declared later, inside that
@@ -5346,7 +5356,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             const auto gate = yuzu::server::evaluate_destructive_targeting(
                                 classify_fn_(p, a),
                                 /*valid_nonempty_agent_ids=*/args.contains("agent_ids"),
-                                /*scope_key_present=*/args.contains("scope"));
+                                /*scope_key_present=*/args.contains("scope"),
+                                /*agent_id_count=*/
+                                (args.contains("agent_ids") && args["agent_ids"].is_array())
+                                    ? args["agent_ids"].size()
+                                    : 0);
                             // #3685 governance round: exhaustive switch, no
                             // `default:` arm — matches REST's `/api/command`
                             // switch over the SAME enum (server.cpp) and the
@@ -5462,9 +5476,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                         metrics
                                             ->counter("yuzu_server_dispatch_target_rejected_total",
                                                       {{"route", "mcp"},
-                                                       {"reason",
-                                                        std::string(yuzu::server::
-                                                                        kReasonDestructiveUntargeted)}})
+                                                       {"reason", std::string(gate.refusal_reason)}})
                                             .increment();
                                     } catch (...) { // NOLINT(bugprone-empty-catch)
                                     }
@@ -5485,19 +5497,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // correlation_id=<cid>`) — genuine parity, not just a
                                 // shared mechanism, so audit-log tooling can rely on
                                 // one convention across both arms of this switch.
+                                // Wave 7 PR7.2: this arm now also covers a Forensics
+                                // single-target refusal (reason=forensic_untargeted).
                                 const bool audit_ok = mcp_audit(
                                     "denied",
-                                    std::string("reason=destructive_untargeted ") +
-                                        yuzu::server::detail::sanitize_detail_value(p) + ":" +
-                                        yuzu::server::detail::sanitize_detail_value(a) +
+                                    std::string("reason=") + std::string(gate.refusal_reason) +
+                                        " " + yuzu::server::detail::sanitize_detail_value(p) +
+                                        ":" + yuzu::server::detail::sanitize_detail_value(a) +
                                         " correlation_id=" + cid);
+                                // #3937 follow-up: branch the remediation text by
+                                // refusal reason — a Forensics single-target refusal
+                                // is a distinct, read-only classification and must
+                                // not claim the action "is classified Destructive"
+                                // (dispatch_destructive_gate.hpp's
+                                // remediation_for_refusal_reason).
                                 res.set_content(
-                                    a4_error(kInvalidParams,
-                                             yuzu::server::kDestructiveUntargetedMessage,
-                                             "this plugin.action is classified Destructive: "
-                                             "name explicit agent_ids (no scope, no broadcast) "
-                                             "and re-call; no approval ticket was created or "
-                                             "consumed",
+                                    a4_error(kInvalidParams, gate.refusal_message,
+                                             std::string(yuzu::server::remediation_for_refusal_reason(
+                                                 gate.refusal_reason)) +
+                                                 "; no approval ticket was created or consumed",
                                              -1, cid, audit_ok),
                                     "application/json");
                                 return;
@@ -10900,7 +10918,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto gate = yuzu::server::evaluate_destructive_targeting(
                         classify_fn_(plugin, action),
                         /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
-                        /*scope_key_present=*/!scope.empty());
+                        /*scope_key_present=*/!scope.empty(),
+                        /*agent_id_count=*/agent_ids.size());
                     // #3685 governance round: exhaustive switch, no `default:`
                     // arm — matches REST's `/api/command` switch over the SAME
                     // enum (server.cpp), the C8 pre-mint site above, and the
@@ -10934,9 +10953,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 metrics
                                     ->counter("yuzu_server_dispatch_target_rejected_total",
                                               {{"route", "mcp"},
-                                               {"reason",
-                                                std::string(yuzu::server::
-                                                                kReasonDestructiveUntargeted)}})
+                                               {"reason", std::string(gate.refusal_reason)}})
                                     .increment();
                             } catch (...) { // NOLINT(bugprone-empty-catch)
                             }
@@ -10946,16 +10963,26 @@ McpServer::HandlerFn McpServer::build_handler(
                         // denial-audit row — same convention as the C8 pre-mint
                         // site above (audit_persisted doc comment ~3763, the
                         // denied_ok = mcp_audit(...) working example ~5424).
+                        // Wave 7 PR7.2: this arm now also covers a Forensics
+                        // single-target refusal (reason=forensic_untargeted).
                         const bool audit_ok = mcp_audit(
                             "denied",
-                            std::string("destructive_untargeted ") +
+                            // "reason=" prefix -- matches the C8 pre-mint site
+                            // above; governance Gate 4 consistency-auditor
+                            // finding: this site previously omitted it despite
+                            // the adjacent comment claiming parity, so a
+                            // `reason=(\S+)` audit-log parser silently lost
+                            // the reason on every refusal routed through here.
+                            std::string("reason=") + std::string(gate.refusal_reason) + " " +
                                 yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                 yuzu::server::detail::sanitize_detail_value(action) +
                                 " correlation_id=" + cid);
+                        // #3937 follow-up: branch the remediation text by refusal
+                        // reason — see the C8 pre-mint site above.
                         res.set_content(
-                            a4_error(kInvalidParams, yuzu::server::kDestructiveUntargetedMessage,
-                                     "this plugin.action is classified Destructive: name "
-                                     "explicit agent_ids (no scope, no broadcast) and re-call",
+                            a4_error(kInvalidParams, gate.refusal_message,
+                                     yuzu::server::remediation_for_refusal_reason(
+                                         gate.refusal_reason),
                                      -1, cid, audit_ok),
                             "application/json");
                         return;
