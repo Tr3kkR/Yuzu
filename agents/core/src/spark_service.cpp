@@ -993,11 +993,18 @@ ServiceRunState map_terminal(DWORD s) {
 struct PendingEmit {
     std::string key;
     ServiceRunState state;
+    /// The staging watch's `probe_gen` at push time (#2012/#3840 PR-B3
+    /// review) — `drop_stale()` compares this against the CURRENT watch
+    /// mapped to `key` right before dispatch, so a same-tick remove+re-add
+    /// of `key` (staged under the OLD watch, delivered after the drain
+    /// re-maps it to a NEW one) is discarded rather than misattributed.
+    std::uint64_t gen{0};
 };
 struct PendingFault {
     std::string key;
     bool faulted;
     std::string reason;
+    std::uint64_t gen{0}; ///< see PendingEmit::gen
 };
 
 /// Pending-operation state of one watch's establishment — INDEPENDENT of its
@@ -1116,22 +1123,24 @@ struct SvcWatch {
 
     // ── PR-B3 (#2012/#3840): async establishment state ─────────────────────
     ProbeState probe{ProbeState::Idle};
-    /// Mechanism-global, bumped at every probe reservation (defense-in-depth
-    /// only, mirrors spark_registry.cpp's probe_gen — Service has a single
-    /// thread ever launching or committing a probe for a given SvcWatch, so
-    /// unlike Registry there is no separate caller-thread racing the
-    /// commit; a generation mismatch at resolve time would indicate a
-    /// same-object double-launch bug, not an expected race, and is guarded
-    /// against defensively rather than relied upon).
+    /// Mechanism-global, bumped at every probe reservation. Staged into every
+    /// PendingEmit/PendingFault at push time and checked against the CURRENT
+    /// watch's value by drop_stale() right before dispatch — the guard the
+    /// governance review found write-only is now genuinely relied upon: it
+    /// is what discards a same-tick stale-generation delivery (a probe
+    /// result staged for this watch, then superseded by a Remove+Add of its
+    /// key before dispatch runs). See drop_stale()'s own doc comment.
     std::uint64_t probe_gen{0};
     /// Engaged from an admitted launch until resolve_probe() consumes it.
     std::optional<DetachedCall<ServiceProbeResult>> call;
-    /// When the CURRENT establishment obligation was (re)accepted — reset on
-    /// every begin_probe() call, whether the initial arm, an admission
-    /// retry, or a backend-failure retry (mirrors spark_registry.cpp's
-    /// accepted_at: grace is measured from the most recent attempt, not the
-    /// original request, so a persistently-failing service stays faulted
-    /// for as long as establishment keeps failing).
+    /// When the CURRENT obligation was accepted — set ONLY on a fresh
+    /// obligation (Idle->Pending: a brand-new Add, or a live watch's re-arm
+    /// after full success), NEVER reset by a retry of an already-Deferred
+    /// obligation (mirrors spark_registry.cpp's accepted_at: "grace runs
+    /// from the MOST RECENT ACCEPTANCE, not the most recent attempt" — a
+    /// governance review finding: resetting on every retry let a
+    /// persistently lane-rejected watch push its own grace deadline forward
+    /// forever, so it never faulted).
     Clock::time_point accepted_at{};
     bool grace_counted{false};
     /// Admission (lane-rejection) retry count, for the backoff doubling —
@@ -1323,13 +1332,18 @@ private:
             return;
         }
         teardown_watch(w);
-        // Grace runs from the MOST RECENT attempt, not the original request —
-        // a persistently-failing service stays faulted for as long as
-        // establishment keeps failing, mirrors spark_registry.cpp.
-        w.accepted_at = Clock::now();
-        w.grace_counted = false;
-        w.probe = ProbeState::Pending;
-        w.probe_gen = ++gen_;
+
+        // A retry of an obligation already Deferred (admission backoff OR a
+        // resolved backend/absent retry cadence) is NOT a fresh obligation —
+        // accepted_at/grace_counted must NOT reset here (#2012/#3840 PR-B3
+        // review): resetting on every retry let a persistently-rejected
+        // watch push its own grace deadline forward forever, starving the
+        // health-grace fault this field exists to produce. Only Idle->Pending
+        // (a brand-new Add, or a live watch's re-arm after full success) is a
+        // fresh obligation. Mirrors spark_registry.cpp: "grace runs from the
+        // MOST RECENT ACCEPTANCE, not the most recent attempt."
+        const bool fresh_obligation = (w.probe != ProbeState::Deferred);
+
         std::shared_ptr<const ServiceProbeHook> hook;
         {
             // See apply_test_controls()'s own comment — probe_hook_ needs
@@ -1338,18 +1352,56 @@ private:
             std::lock_guard lk(mu_);
             hook = probe_hook_;
         }
-        auto lr = probe_lane_.launch(ServiceProbeJob{scm_core_, w.name, std::move(hook)});
-        if (lr.status == DetachedLaunch::Launched) {
-            w.call = std::move(lr.call);
+
+        // Construct the job (copies w.name) and launch it BEFORE mutating any
+        // watch state (#2012/#3840 PR-B3 review): the lane's OWN allocation
+        // failures already convert to LaunchFailed internally, but building
+        // the ServiceProbeJob aggregate argument itself runs in THIS frame,
+        // outside that containment — an uncaught throw here would propagate
+        // into run()'s outer catch and tear down the WHOLE mechanism over one
+        // watch's transient allocation failure. Contain it exactly like an
+        // admission rejection: this watch's obligation is retried, nothing
+        // else is affected.
+        bool launched = false;
+        DetachedLaunch status = DetachedLaunch::LaunchFailed;
+        try {
+            auto lr = probe_lane_.launch(ServiceProbeJob{scm_core_, w.name, std::move(hook)});
+            status = lr.status;
+            if (status == DetachedLaunch::Launched) {
+                w.call = std::move(lr.call);
+                launched = true;
+            }
+        } catch (...) {
+            status = DetachedLaunch::LaunchFailed;
+        }
+
+        if (fresh_obligation) {
+            w.accepted_at = Clock::now();
+            w.grace_counted = false;
+        }
+        w.probe_gen = ++gen_;
+
+        if (launched) {
+            w.probe = ProbeState::Pending;
+            // Clear a stale due-in-the-past deadline (#2012/#3840 PR-B3
+            // review): left unchanged, a Deferred->Pending transition kept
+            // its just-expired next_retry, which the wait-timeout computation
+            // below (Pending or not) keeps seeing as a past deadline and
+            // clamps the alertable wait to 0 — a busy-spin for the entire
+            // duration of a hung OpenServiceW (#3840's own incident class).
+            // The kServicePollCadence "any_pending" cap already bounds a
+            // Pending watch's polling interval; this deadline would only
+            // ever make that WORSE, never better.
+            w.next_retry = {};
             probe_launched_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        // Admission refused (lane cap) or the OS refused the worker thread —
-        // never a backend (OpenServiceW) attempt, so this is NOT a fault
-        // edge: the obligation is retained and retried on a short doubling
-        // backoff, distinct from a genuine backend failure's fixed
-        // kAbsentRetryMs cadence below.
-        if (lr.status == DetachedLaunch::Rejected)
+        // Admission refused (lane cap), the OS refused the worker thread, or
+        // job construction itself threw — never a backend (OpenServiceW)
+        // attempt, so this is NOT a fault edge: the obligation is retained
+        // and retried on a short doubling backoff, distinct from a genuine
+        // backend failure's fixed kAbsentRetryMs cadence below.
+        if (status == DetachedLaunch::Rejected)
             probe_admission_rejected_.fetch_add(1, std::memory_order_relaxed);
         else
             probe_launch_failed_.fetch_add(1, std::memory_order_relaxed);
@@ -1402,7 +1454,7 @@ private:
             if (!w.faulted) {
                 w.faulted = true;
                 for (const auto& k : w.keys)
-                    faults.push_back({k, true, "OpenService probe failed"});
+                    faults.push_back({k, true, "OpenService probe failed", w.probe_gen});
             }
             // ProbeState::Deferred (not Idle) — a due next_retry with probe
             // still Idle would never be picked up by run()'s retry scan,
@@ -1410,6 +1462,12 @@ private:
             // in this session's own review before landing: the ONLY prior
             // arm_watch()-based design had no ProbeState to get out of sync).
             w.probe = ProbeState::Deferred;
+            // Already resolved (definitively, if unsuccessfully) — the retry
+            // scan's Deferred grace-check exists to surface an obligation
+            // that never even got a chance to run, not to re-grace one that
+            // already has a classified outcome and its own fault signal
+            // above (#2012/#3840 PR-B3 review).
+            w.grace_counted = true;
             w.next_retry = Clock::now() + std::chrono::milliseconds(kAbsentRetryMs);
             return;
         }
@@ -1421,7 +1479,7 @@ private:
                 if (w.faulted) {
                     w.faulted = false;
                     for (const auto& k : w.keys)
-                        faults.push_back({k, false, "recovered"});
+                        faults.push_back({k, false, "recovered", w.probe_gen});
                 }
             } else {
                 spdlog::warn("spark_service: OpenService failed for a watched service (err={})",
@@ -1429,12 +1487,16 @@ private:
                 if (!w.faulted) {
                     w.faulted = true;
                     for (const auto& k : w.keys)
-                        faults.push_back({k, true, "OpenService failed"});
+                        faults.push_back({k, true, "OpenService failed", w.probe_gen});
                 }
             }
             // Deferred, not Idle — an absent service needs its periodic
             // re-poll picked up by the retry scan too; see the comment above.
             w.probe = ProbeState::Deferred;
+            // See the grace_counted comment on the branch above — this
+            // outcome (including the deliberately-non-faulted "genuinely
+            // absent" case) is already definitively classified.
+            w.grace_counted = true;
             w.next_retry = Clock::now() + std::chrono::milliseconds(kAbsentRetryMs);
             return;
         }
@@ -1452,10 +1514,13 @@ private:
             if (!w.faulted) {
                 w.faulted = true;
                 for (const auto& k : w.keys)
-                    faults.push_back({k, true, "NotifyServiceStatusChange failed"});
+                    faults.push_back({k, true, "NotifyServiceStatusChange failed", w.probe_gen});
             }
             // Deferred, not Idle — see the comment on the two branches above.
             w.probe = ProbeState::Deferred;
+            // See the grace_counted comment above — already definitively
+            // classified (faulted), nothing left for grace to surface.
+            w.grace_counted = true;
             w.next_retry = Clock::now() + std::chrono::milliseconds(kAbsentRetryMs);
             return;
         }
@@ -1469,7 +1534,7 @@ private:
         if (w.faulted) {
             w.faulted = false;
             for (const auto& k : w.keys)
-                faults.push_back({k, false, "recovered"});
+                faults.push_back({k, false, "recovered", w.probe_gen});
         }
         w.next_retry = {}; // event-driven now; no polling backstop needed while armed
     }
@@ -1478,8 +1543,13 @@ private:
     // outstanding past kServiceHealthGrace without resolving — the probe
     // itself keeps running past this point; this only surfaces the delay to
     // consumers instead of leaving them silently waiting (mirrors
-    // spark_registry.cpp's grace_check_locked). Called only while
-    // w.probe==Pending and no result is available yet.
+    // spark_registry.cpp's grace_check_locked). Called while w.probe==Pending
+    // with no result yet available, OR while w.probe==Deferred and not yet
+    // due (#2012/#3840 PR-B3 review) — the Deferred call site only reaches a
+    // watch that is STILL AWAITING ITS FIRST RESOLUTION (admission-rejected,
+    // never launched a probe at all): resolve_probe() sets grace_counted on
+    // every Deferred it itself produces from a DEFINITIVE outcome, so this
+    // never re-fires for an already-classified absent/backend-failed watch.
     void grace_check(SvcWatch& w, Clock::time_point now, std::vector<PendingFault>& faults) {
         if (w.grace_counted || now - w.accepted_at <= health_grace())
             return;
@@ -1488,7 +1558,8 @@ private:
             w.faulted = true;
             health_edges_.fetch_add(1, std::memory_order_relaxed);
             for (const auto& k : w.keys)
-                faults.push_back({k, true, "service watch establishment pending past grace"});
+                faults.push_back(
+                    {k, true, "service watch establishment pending past grace", w.probe_gen});
         }
     }
 
@@ -1497,7 +1568,39 @@ private:
             return;
         w.last = mapped;
         for (const auto& k : w.keys)
-            out.push_back({k, mapped});
+            out.push_back({k, mapped, w.probe_gen});
+    }
+
+    // Drops any staged emit/fault whose `gen` no longer matches the CURRENT
+    // watch mapped to its `key` (#2012/#3840 PR-B3 review) — closes the
+    // same-tick window where a probe/grace/fired-scan result is staged
+    // BEFORE the command drain processes a Remove+Add of that same key: the
+    // stale entry would otherwise be delivered to the REPLACEMENT
+    // subscription instead of being discarded (the kickoff doc's own
+    // required stale-generation guard, ~/.claude/plans/spark-2012-3840-prb3-
+    // service-KICKOFF.md:254-255). gen_ is mechanism-wide monotonic
+    // (bumped on every begin_probe()), so an exact match against the watch
+    // CURRENTLY owning `key` is a sufficient test either way a staged entry
+    // can go stale: the key was removed entirely (no longer in key_svc_),
+    // remapped to a brand-new SvcWatch (a different, higher gen_), or the
+    // SAME watch has since started a newer probe (also a different, higher
+    // gen_ — and in that case the newer probe's own result supersedes this
+    // one regardless, so discarding it is correct, not just safe). Only
+    // called right before the ONE dispatch() that follows a command drain
+    // in the same iteration (other dispatch() call sites have no drain in
+    // between, so nothing to filter).
+    template <typename T>
+    void drop_stale(std::vector<T>& v) {
+        v.erase(std::remove_if(v.begin(), v.end(),
+                               [this](const T& e) {
+                                   auto kit = key_svc_.find(e.key);
+                                   if (kit == key_svc_.end())
+                                       return true; // no longer watched at all
+                                   auto sit = svcs_.find(kit->second);
+                                   return sit == svcs_.end() ||
+                                          sit->second->probe_gen != e.gen;
+                               }),
+                v.end());
     }
 
     void dispatch(std::vector<PendingEmit>& emits, std::vector<PendingFault>& faults) {
@@ -1530,6 +1633,19 @@ private:
             for (auto& [name, wp] : svcs_) {
                 if (wp->probe == ProbeState::Pending)
                     any_pending = true;
+                if (wp->probe == ProbeState::Deferred && !wp->grace_counted) {
+                    // An admission-rejected obligation may not be due for
+                    // retry (a doubling backoff) well past when its grace
+                    // deadline elapses — without this, the thread could sleep
+                    // straight through it and only notice on some unrelated
+                    // wake (#2012/#3840 PR-B3 review, mirrors
+                    // spark_registry.cpp's next_wake_locked).
+                    const auto grace_deadline = wp->accepted_at + health_grace();
+                    if (!have_deadline || grace_deadline < next) {
+                        next = grace_deadline;
+                        have_deadline = true;
+                    }
+                }
                 if (wp->next_retry == std::chrono::steady_clock::time_point{})
                     continue; // event-driven, no polling backstop
                 if (!have_deadline || wp->next_retry < next) {
@@ -1613,9 +1729,20 @@ private:
                         } else {
                             grace_check(*wp, now2, faults);
                         }
-                    } else if (wp->probe == ProbeState::Deferred && wp->next_retry <= now2) {
-                        begin_probe(*wp); // may deliver APCs via its own SleepEx(0,TRUE)
-                                          // (teardown_watch)
+                    } else if (wp->probe == ProbeState::Deferred) {
+                        if (wp->next_retry <= now2) {
+                            begin_probe(*wp); // may deliver APCs via its own
+                                              // SleepEx(0,TRUE) (teardown_watch)
+                        } else {
+                            // Not yet due for retry — still grace-check it
+                            // (#2012/#3840 PR-B3 review): a no-op once
+                            // resolve_probe() has already classified this
+                            // Deferred definitively (grace_counted set there),
+                            // but for an admission-rejected obligation that
+                            // has never actually run a probe, this is the
+                            // ONLY path that can ever surface its grace fault.
+                            grace_check(*wp, now2, faults);
+                        }
                     }
                 }
             }
@@ -1654,9 +1781,9 @@ private:
                         // Same UP-2 fix as the Linux mechanism: hand a
                         // newly-coalescing key the fault status too, not just
                         // the cached state.
-                        emits.push_back({cmd.key, *w->last});
+                        emits.push_back({cmd.key, *w->last, w->probe_gen});
                         if (w->faulted)
-                            faults.push_back({cmd.key, true, "OpenService failed"});
+                            faults.push_back({cmd.key, true, "OpenService failed", w->probe_gen});
                     }
                 } else { // Cmd::Remove
                     auto kit = key_svc_.find(cmd.key);
@@ -1778,6 +1905,14 @@ private:
                                            }),
                             retiring_.end());
 
+            // Drop anything staged above (poll-scan, fired-scan) whose key
+            // was remapped to a different watch — or whose SAME watch
+            // already relaunched a newer probe — by the command drain that
+            // ran in between (#2012/#3840 PR-B3 review, kickoff doc's
+            // required stale-generation discard). No-op for the common case
+            // where nothing changed underneath a staged entry.
+            drop_stale(emits);
+            drop_stale(faults);
             dispatch(emits, faults);
         }
 
