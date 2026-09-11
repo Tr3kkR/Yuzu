@@ -684,6 +684,235 @@ bool AuthManager::session_generation_view_stale() const {
 
 // ── Authentication ──────────────────────────────────────────────────────────
 
+std::expected<UserEntry, AuthManager::UserLookupMiss>
+AuthManager::find_user_or_hydrate(const std::string& username) {
+    {
+        std::shared_lock lock(mu_);
+        auto it = users_.find(username);
+        if (it != users_.end())
+            return it->second;
+    }
+    if (!auth_db_)
+        return std::unexpected(UserLookupMiss::NotFound); // cfg-file mode: the map IS the truth
+
+    // Cold cache (#4020): the row may exist in AuthDB even though this process
+    // never cached it. Read it OUTSIDE mu_ (durable PG I/O, same lock ordering as
+    // the other AuthDB-first paths). get_user filters is_active, so a
+    // soft-deleted account stays a miss here.
+    auto db_user = auth_db_->get_user(username);
+    if (!db_user) {
+        // Gate 2/4 re-review follow-up (security-guardian + authdb, converged
+        // independently): InvalidUsername (get_user()'s own input-validation
+        // rejection, #2755e3871) is NOT a store-health signal - it's a
+        // rejected-shape input, the same class as a plain miss from the
+        // caller's point of view. Routing it through the DbError branch below
+        // would log a real attack attempt as a false "AuthDB lookup failed",
+        // masking a genuine outage during exactly that attack.
+        if (db_user.error() == yuzu::server::AuthDBError::UserNotFound ||
+            db_user.error() == yuzu::server::AuthDBError::InvalidUsername)
+            return std::unexpected(UserLookupMiss::NotFound);
+        spdlog::error("AuthManager: AuthDB lookup for '{}' failed on a cold cache - failing "
+                      "closed (no credential check)",
+                      username);
+        return std::unexpected(UserLookupMiss::DbError);
+    }
+
+    // Gate 5 CH-1 re-review follow-up: stamp BEFORE the possible emplace, not
+    // after - try_emplace no-ops if a concurrent write already installed an
+    // entry, and this call must never touch that entry's version once it
+    // exists (see the no-op comment below).
+    db_user->role_version = next_role_version_();
+    std::unique_lock lock(mu_);
+    // try_emplace, never insert_or_assign: an upsert_user (new password) or
+    // reactivate_user that landed while the read above was in flight has already
+    // installed a NEWER entry than the row we hold; clobbering it would make the
+    // new password fail until the next restart. Whatever is cached now wins.
+    auto [it, inserted] = users_.try_emplace(username, std::move(*db_user));
+    (void)inserted;
+    return it->second;
+}
+
+std::optional<Role>
+AuthManager::recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                                  [[maybe_unused]] std::uint64_t pre_check_version,
+                                                  std::string_view context) {
+    if (!auth_db_)
+        return pre_check_role; // cfg-file mode: users_ IS the truth, nothing to re-check
+    // TEST-ONLY seam (see set_role_recheck_race_hook_for_test's doc): fires
+    // before this call's own row-locked read starts - a no-op (nullptr) in
+    // production. Row-locking (below) means a hook that synchronously calls
+    // update_role() here would self-deadlock (this thread would hold the row
+    // lock later while its own hook blocks on it) - test seams that need a
+    // GENUINE race drive the writer from a separate thread instead; see
+    // set_role_recheck_race_hook_for_test's doc for the current contract.
+    if (role_recheck_race_hook_for_test_)
+        role_recheck_race_hook_for_test_();
+    // #4107: row-locked re-check, closes the same-process divergence residual
+    // by construction (serializes against any concurrent update_role()/
+    // reactivate_user()) rather than detecting it after the fact via a
+    // version counter - see recheck_role_locked's header doc for the full
+    // mechanism. `pre_check_version` is now unused THROUGHOUT this function
+    // (fjarvis Gate 8 catch: an earlier version of this comment wrongly
+    // claimed the cfg-file-mode branch above used it - it doesn't, that
+    // branch only reads `pre_check_role`). Kept in the signature only to
+    // avoid touching both call sites in this same round - cleanup tracked
+    // as a follow-up.
+    std::optional<Role> result;
+    auto outcome = auth_db_->recheck_role_locked(username, [&](Role db_role) {
+        // Invoked while AuthDB holds this row's lock - see the header doc.
+        // Lock ORDERING invariant (cpp-expert Gate 8 catch): this is the
+        // first place in this file mu_ is acquired from INSIDE an open
+        // AuthDB transaction. Safe only because every AuthDB write this file
+        // makes (update_role/reactivate_user/remove_user) completes its own
+        // DB call BEFORE ever touching mu_ (the file-wide "never hold mu_
+        // across a DB call" discipline, stated where each of those calls
+        // takes mu_) - so no code path can be holding mu_ while ALSO
+        // attempting to open a transaction that needs this same row lock,
+        // which would deadlock against this one. A future change that holds
+        // mu_ and then calls an AuthDB write method would break this.
+        //
+        // TEST-ONLY seam (see set_role_recheck_inside_lock_hook_for_test's
+        // doc): a no-op (nullptr) in production.
+        if (role_recheck_inside_lock_hook_for_test_)
+            role_recheck_inside_lock_hook_for_test_();
+        std::unique_lock lock(mu_);
+        auto it = users_.find(username);
+        if (it != users_.end()) {
+            it->second.role = db_role;
+            it->second.role_version = next_role_version_();
+        }
+        // else: the entry vanished from the cache mid-recheck. Provably
+        // unreachable today (cpp-expert Gate 8 verified this by tracing):
+        // the only eraser of a specific username is remove_user(), whose own
+        // DB write takes this SAME row lock, so its cache-erase (which runs
+        // strictly after its own DB commit) cannot land before a callback
+        // that already observed the row as active. Not a silent bypass if
+        // this invariant is ever broken by a future change - `result` still
+        // gets set to the DB-confirmed role either way, which is the
+        // conservative choice (the row lock already proved the account is
+        // active; a merely-absent cache entry is this process's own
+        // bookkeeping lagging, not a signal to deny).
+        result = db_role;
+    });
+    if (!outcome) {
+        // #4020 Gate 3 quality-engineer follow-up: only a genuine UserNotFound
+        // (soft-deleted/removed) means the cache is actually stale - evicting on
+        // ANY failure (a transient QueryFailed/StoreBusy from pool contention)
+        // would erase a perfectly valid, freshly-verified entry over a
+        // momentary DB hiccup on an otherwise-successful credential check,
+        // forcing a needless re-hydrate on this user's very next request. Fail
+        // closed for THIS call either way (a DB outage must not silently fall
+        // back to trusting a role we can no longer confirm), but only evict when
+        // we've actually confirmed removal (External adversarial review,
+        // fjarvis, C1: mirrors the reasoning that made this the right call for
+        // a concurrent remove_user() specifically).
+        if (yuzu::server::AuthDBError::UserNotFound == outcome.error()) {
+            spdlog::warn("{}: user '{}' not active in AuthDB", context, username);
+            std::unique_lock lock(mu_);
+            users_.erase(username);
+        } else {
+            spdlog::error("{}: AuthDB re-check for '{}' failed (store error, not a removal) - "
+                         "failing closed without touching the cache",
+                         context, username);
+        }
+        return std::nullopt;
+    }
+    return result;
+}
+
+bool AuthManager::post_mint_role_recheck(const std::string& username, Role minted_role,
+                                         std::string_view context) {
+    // #4107 check-then-mint gap (external adversarial review, fjarvis, PR
+    // #4076): recheck_role_after_credential_check's row-locked read closes
+    // the SAME-process/cross-replica divergence race for the read itself,
+    // but a demotion committing strictly AFTER that read and before this
+    // session's mint completes still lands a session stamped with the
+    // pre-demote role - and that demote's own sweep (update_role's
+    // std::erase_if) already ran before this session existed, so it can't
+    // catch it either.
+    //
+    // Closed here via the SAME pattern this codebase already uses for the
+    // structurally identical OIDC/SAML deprovision-race (docs/
+    // auth-architecture.md, "post-mint re-check"): mint normally, then
+    // immediately re-verify against the authority and revoke-and-deny if it
+    // diverged, rather than serializing the mint inside the row lock.
+    // Serializing was considered and explicitly rejected for that race
+    // class - it would require holding AuthDB's row lock across a
+    // SessionStore call, violating this codebase's "never hold one store's
+    // pool lease while calling another" discipline (docs/
+    // auth-architecture.md §3) - SessionStore's shared write-generation row
+    // is exactly the kind of cross-store lock that could deadlock against
+    // AuthDB's row lock under the wrong interleaving.
+    //
+    // Ordering proof (why this closes the race rather than merely
+    // narrowing it, for the SAME-PROCESS case): a racing update_role()
+    // commits its AuthDB UPDATE BEFORE taking mu_ to sweep sessions_ (see
+    // update_role's own body). persist_new_session's mint-write and
+    // update_role's sweep both take mu_, so one strictly happens-before
+    // the other. If the mint happens-before the sweep, the sweep (running
+    // after) finds and erases this just-minted session - self-healed. If
+    // the sweep happens-before the mint, the sweep's own UPDATE already
+    // committed before the sweep ran, which is before the mint, which is
+    // before this call - so this call's fresh AuthDB read is guaranteed to
+    // observe it. Cross-replica: this needs no mu_ analogue at all (authdb
+    // Gate 8 correction to an earlier draft of this comment, which wrongly
+    // reached for one) - mu_ is per-process and has no cross-replica
+    // meaning. The actual argument is simpler and stronger: this call's
+    // own SELECT (get_user(), a bare autocommit read, no held transaction)
+    // runs strictly AFTER persist_new_session returns, and ordinary READ
+    // COMMITTED visibility on a single-primary Postgres instance guarantees
+    // it observes any commit that landed before it, regardless of which
+    // connection or replica issued either statement - no replica-local
+    // state or clock needs to agree with any other's. This reasoning
+    // assumes single-primary Postgres; it would need re-deriving under
+    // read-replica routing, the same caveat ADR-2001's own analogous
+    // cross-replica guarantee (docs/adr/2001-scim-oidc-identity-linkage.md,
+    // "Known residuals") flags for its own case.
+    //
+    // Residual this does NOT close (same one ADR-2001/OIDC's own post-mint
+    // recheck discloses for its structurally identical race): a demote
+    // landing strictly between this call's own read and the response/
+    // Set-Cookie actually reaching the client is not observable to this
+    // function at all - closing that would mean holding this transaction
+    // open all the way to the HTTP response, which is a different, larger
+    // change than a role recheck.
+    //
+    // wipe_user_sessions_durable/invalidate_user_sessions delete the
+    // durable row directly rather than working off a stale local list,
+    // which is what makes the revoke-on-divergence half of this function
+    // (not just the read half above) cross-replica-correct too.
+    //
+    // Returns true (nothing to do) in cfg-file mode - `users_` IS the
+    // truth there, nothing to diverge from.
+    if (!auth_db_)
+        return true;
+    auto post = auth_db_->get_user(username);
+    if (!post) {
+        const bool removed = yuzu::server::AuthDBError::UserNotFound == post.error();
+        spdlog::warn("{}: post-mint re-check for '{}' {} - revoking the session just minted",
+                    context, username, removed ? "found the account no longer active"
+                                                : "hit a store error (failing closed)");
+        auto revoke = invalidate_user_sessions(username);
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
+        }
+        (void)revoke; // best-effort revoke; the mint is already denied to the caller either way
+        return false;
+    }
+    if (post->role != minted_role) {
+        spdlog::warn("{}: post-mint re-check for '{}' found the role changed {} -> {} during "
+                    "the mint (concurrent role-change race) - revoking the session just minted",
+                    context, username, role_to_string(minted_role), role_to_string(post->role));
+        auto revoke = invalidate_user_sessions(username);
+        if (metrics_) {
+            metrics_->counter("yuzu_auth_role_recheck_post_mint_denied_total").increment();
+        }
+        (void)revoke;
+        return false;
+    }
+    return true;
+}
+
 std::optional<std::string> AuthManager::authenticate(const std::string& username,
                                                      const std::string& password) {
     // Time the PBKDF2 verify path. Histogram is observed even on failure
@@ -693,10 +922,12 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
     // 100k iterations runs ~50-150 ms on commodity hardware.
     const auto t_start = std::chrono::steady_clock::now();
 
-    std::unique_lock lock(mu_);
-
-    auto it = users_.find(username);
-    if (it == users_.end()) {
+    // Cache-or-AuthDB lookup (#4020); a COPY, so PBKDF2 below runs off mu_.
+    auto entry = find_user_or_hydrate(username);
+    if (!entry) {
+        if (entry.error() == UserLookupMiss::DbError)
+            return std::nullopt; // AuthDB unreachable: fail closed, already logged, not a
+                                 // bad-username signal (no unknown_user histogram sample)
         spdlog::warn("Auth failed: unknown user '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -709,10 +940,10 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         return std::nullopt;
     }
 
-    auto salt = hex_to_bytes(it->second.salt_hex);
+    auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
 
-    if (!constant_time_compare(hash, it->second.hash_hex)) {
+    if (!constant_time_compare(hash, entry->hash_hex)) {
         spdlog::warn("Auth failed: bad password for '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -725,30 +956,39 @@ std::optional<std::string> AuthManager::authenticate(const std::string& username
         return std::nullopt;
     }
 
-    // If using DB, verify user is still active in DB (could have been soft-deleted)
-    if (auth_db_) {
-        auto db_user = auth_db_->get_user(username);
-        if (!db_user) {
-            spdlog::warn("Auth failed: user '{}' not active in AuthDB", username);
-            return std::nullopt;
-        }
-    }
+    // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
+    // this the authoritative role for the session about to be minted (#4020 +
+    // Gate 2/3 governance follow-ups — see recheck_role_after_credential_check's
+    // doc for the full rationale, including the row-lock serialization #4107
+    // added to close the same-process divergence race).
+    auto current_role = recheck_role_after_credential_check(username, entry->role,
+                                                             entry->role_version, "Auth failed");
+    if (!current_role)
+        return std::nullopt;
+    entry->role = *current_role;
 
     auto token = generate_session_token();
     yuzu::server::SessionWriteParams params;
     params.username = username;
     params.display_name = username; // local auth: username IS the human label
-    params.role = role_to_string(it->second.role);
+    params.role = role_to_string(entry->role);
     params.auth_source = "local";
     params.session_lifetime_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(kSessionDuration).count();
     // password login carries no MFA proof yet — a step-up stamps it later.
-    // Release the map lock before the write-through: persist_new_session does
-    // durable PG I/O and re-takes mu_ to cache (non-recursive) — never hold mu_
-    // across it. `params` stays valid after unlock.
-    lock.unlock();
+    // TEST-ONLY seam (see set_post_mint_race_hook_for_test's doc): fires
+    // here, squarely inside the #4107 check-then-mint window - the row lock
+    // has already released (recheck above returned) but the session has not
+    // yet been minted. A no-op (nullptr) in production.
+    if (post_mint_race_hook_for_test_)
+        post_mint_race_hook_for_test_();
+    // mu_ is not held here: persist_new_session does durable PG I/O and
+    // re-takes mu_ to cache (non-recursive) — never hold mu_ across it.
     if (!persist_new_session(token, params))
         return std::nullopt; // durable-write failure → login not honored (ADR-0007)
+    // #4107 check-then-mint gap: see post_mint_role_recheck's own doc.
+    if (!post_mint_role_recheck(username, entry->role, "Auth failed"))
+        return std::nullopt;
 
     spdlog::info("User '{}' authenticated (role={})", username, params.role);
     if (metrics_) {
@@ -768,9 +1008,10 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
     // session creation. Histogram labels match authenticate() so dashboards
     // continue to roll up "password verify" cost across both call sites.
     const auto t_start = std::chrono::steady_clock::now();
-    std::shared_lock lock(mu_);
-    auto it = users_.find(username);
-    if (it == users_.end()) {
+    auto entry = find_user_or_hydrate(username); // cache-or-AuthDB (#4020), a COPY
+    if (!entry) {
+        if (entry.error() == UserLookupMiss::DbError)
+            return std::nullopt; // fail closed; logged by the helper, not an unknown_user sample
         spdlog::warn("verify_password failed: unknown user '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -782,9 +1023,9 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
         }
         return std::nullopt;
     }
-    auto salt = hex_to_bytes(it->second.salt_hex);
+    auto salt = hex_to_bytes(entry->salt_hex);
     auto hash = pbkdf2_sha256(password, salt, kPbkdf2Iterations);
-    if (!constant_time_compare(hash, it->second.hash_hex)) {
+    if (!constant_time_compare(hash, entry->hash_hex)) {
         spdlog::warn("verify_password failed: bad password for '{}'", username);
         if (metrics_) {
             const auto elapsed =
@@ -796,15 +1037,14 @@ std::optional<Role> AuthManager::verify_password(const std::string& username,
         }
         return std::nullopt;
     }
-    auto role = it->second.role;
-    lock.unlock();
-    if (auth_db_) {
-        auto db_user = auth_db_->get_user(username);
-        if (!db_user) {
-            spdlog::warn("verify_password failed: user '{}' not active in AuthDB", username);
-            return std::nullopt;
-        }
-    }
+    // Re-verify against AuthDB: catches a soft-deleted/removed user AND makes
+    // this the authoritative role for the caller (same rationale as
+    // authenticate() — see recheck_role_after_credential_check's doc).
+    auto current_role = recheck_role_after_credential_check(
+        username, entry->role, entry->role_version, "verify_password failed");
+    if (!current_role)
+        return std::nullopt;
+    auto role = *current_role;
     if (metrics_) {
         const auto elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count();
@@ -834,6 +1074,18 @@ std::string AuthManager::create_local_session(const std::string& username, Role 
         spdlog::error("create_local_session: durable persist failed for '{}'", username);
         return {};
     }
+    // #4107 check-then-mint gap: see post_mint_role_recheck's own doc. This
+    // function's `role` parameter can be arbitrarily stale by the time this
+    // point is reached (its callers include /login/mfa's TOTP/recovery-code
+    // verify, which reads a role from an earlier verify_password() call
+    // across an entire TOTP-verification round trip, NOT /login/mfa/stepup -
+    // that route re-proves MFA on an existing session and never calls this
+    // function) - the fresh re-read here closes the gap
+    // regardless of how wide that earlier window was. Same empty-token
+    // fail-safe contract as the durable-write-failure branch above: no
+    // session, degrades to "not authenticated" at the caller's cookie set.
+    if (!post_mint_role_recheck(username, role, "create_local_session"))
+        return {};
     // Stamp last_login_at on every successful login, not just the
     // MFA-verified TOTP path. The MFA-verified TOTP path already does
     // this as part of its counter UPDATE so calling here is harmless
@@ -1100,6 +1352,39 @@ void AuthManager::expire_session_for_test(const std::string& token, std::chrono:
     it->second.expires_at -= offset;
     it->second.steady_expires -=
         std::chrono::duration_cast<std::chrono::steady_clock::duration>(offset);
+}
+
+void AuthManager::set_role_recheck_race_hook_for_test(std::function<void()> hook) {
+    role_recheck_race_hook_for_test_ = std::move(hook);
+}
+
+void AuthManager::set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook) {
+    role_recheck_inside_lock_hook_for_test_ = std::move(hook);
+}
+
+void AuthManager::set_post_mint_race_hook_for_test(std::function<void()> hook) {
+    post_mint_race_hook_for_test_ = std::move(hook);
+}
+
+std::optional<Role> AuthManager::cached_role_for_test(const std::string& username) const {
+    std::shared_lock lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end())
+        return std::nullopt;
+    return it->second.role;
+}
+
+std::optional<std::uint64_t>
+AuthManager::cached_role_version_for_test(const std::string& username) const {
+    std::shared_lock lock(mu_);
+    auto it = users_.find(username);
+    if (it == users_.end())
+        return std::nullopt;
+    return it->second.role_version;
+}
+
+std::uint64_t AuthManager::next_role_version_() {
+    return role_version_epoch_.fetch_add(1, std::memory_order_relaxed);
 }
 
 std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::string& username) {
@@ -1527,6 +1812,12 @@ bool AuthManager::upsert_user(const std::string& username, const std::string& pa
     entry.role = role;
     entry.salt_hex = salt_hex;
     entry.hash_hex = hash;
+    // Gate 5 CH-1 re-review follow-up: a process-wide stamp, not a carried-
+    // forward per-username counter - see UserEntry::role_version's doc for why
+    // a per-username scheme (this call's first shape) still let the wholesale
+    // entry-replace below reopen the ABA hole through remove_user()+
+    // reactivate_user()/a cold re-hydrate, which reset the OLD counter to 0.
+    entry.role_version = next_role_version_();
     users_[username] = std::move(entry);
 
     if (role_changed) {
@@ -1638,12 +1929,106 @@ bool AuthManager::reactivate_user(const std::string& username) {
         return false;
     }
 
+    // Gate 5 CH-1 re-review follow-up (cpp-safety + cpp-expert, converged
+    // independently): AuthDB::get_user() has no knowledge of role_version, so
+    // `*entry` defaults it to 0 - a wholesale entry-replace exactly like
+    // upsert_user()'s, and needs the same process-wide stamp for the same
+    // reason: every writer pairs `.role`/`.role_version` together (an
+    // invariant #4107's row-locking rewrite still relies on for cache
+    // write-ordering, even though nothing compares this value for
+    // correctness anymore - see UserEntry::role_version's doc).
+    entry->role_version = next_role_version_();
+
     std::unique_lock lock(mu_);
     users_[username] = *entry;
     return true;
 }
 
 std::optional<Role> AuthManager::get_user_role(const std::string& username) const {
+    // Gate 3 governance BLOCKING finding (cpp-safety), fix shape confirmed via
+    // Sol/codex opine: this was a pure `users_` cache read with NO AuthDB
+    // fallback at all - completely independent of authenticate()/
+    // verify_password(), which #4020's other fixes never reach from here.
+    // `auth_routes.cpp`'s legacy API-token session synthesis calls this
+    // EVERY request (`synth.role = get_user_role(principal_id).value_or(user)`)
+    // - its own adjacent (pre-existing, not written by this change) comment
+    // already asserts the intent ("queries the current role on every call, so
+    // a creator who's been demoted... will produce a user-role session"),
+    // which the cache-only implementation never actually delivered. A
+    // DEMOTED user's still-valid token (tokens are NOT revoked on a role
+    // change, by design - the documented contract is "inherits the creator's
+    // CURRENT role", not "frozen at mint time") kept resolving to their
+    // pre-demotion role indefinitely on any manager whose cache was ever
+    // warmed for that username.
+    //
+    // (Removal is a narrower residual: production's actual user-deletion
+    // paths - the dashboard DELETE and SCIM deprovision, both via
+    // deprovision_revoke.hpp/ADR-2001 - already revoke a removed principal's
+    // API tokens credentials-FIRST, before AuthManager::remove_user() is ever
+    // called, so a removed user's token already fails validation before
+    // reaching this method in production. This fix does not depend on that
+    // and also covers removal for any future/direct caller of remove_user()
+    // that bypasses the orchestrator.)
+    //
+    // Fix: when AuthDB is configured, this is now ALWAYS authoritative - no
+    // cache read, no cache fallback on a miss or a store error (falling back
+    // to `users_` on a DB error would silently reopen the exact stale-
+    // privilege gap this exists to close, the one time it matters most:
+    // while the store degrades). `users_`/`mu_` need no change - a `const`
+    // method may freely call through the already-non-const-pointee `AuthDB*`.
+    // Config-file mode (no `auth_db_`) is unchanged: the cache IS the truth
+    // there, exactly as before.
+    //
+    // Cost (deliberately accepted for this P0, not silently overlooked): an
+    // unconditional PG round-trip on every legacy-API-token-authenticated
+    // request - this repo's session/token validation paths use generation-
+    // gated or TTL caches specifically to avoid this class of cost, and this
+    // method does not. A per-entry TTL was considered and rejected here: it
+    // would convert a correctness BLOCKING closure into an explicitly-
+    // accepted stale-privilege window, and adds refresh/single-flight/outage
+    // semantics not worth inventing under this fix's time budget. If
+    // profiling later shows this cost matters, the durable answer is a
+    // generation-gated cache modeled on SessionStore/RbacStore (~1s
+    // propagation, single-flight refresh, mutation-time generation bump) -
+    // not a bare TTL.
+    if (auth_db_) {
+        auto db_user = auth_db_->get_user(username);
+        if (!db_user) {
+            // Gate 3 re-review follow-up (cpp-expert + authdb, converged): log
+            // a genuine store error distinctly from a plain not-found, so a PG
+            // outage that silently floors every legacy-token session to
+            // Role::user (auth_routes.cpp's `.value_or(Role::user)`) leaves an
+            // operational trail instead of zero diagnostic signal - mirrors
+            // find_user_or_hydrate's own UserNotFound-vs-DbError split in this
+            // same file.
+            // Gate 2/4 re-review follow-up (security-guardian + authdb,
+            // converged): InvalidUsername (get_user()'s own input-validation
+            // rejection, #2755e3871) is a rejected-shape input, not a store
+            // health signal - bucket it with UserNotFound so a real attack
+            // attempt is never logged as a false store-error, masking a
+            // genuine outage during exactly that attack.
+            if (db_user.error() != yuzu::server::AuthDBError::UserNotFound &&
+                db_user.error() != yuzu::server::AuthDBError::InvalidUsername) {
+                spdlog::error("get_user_role: AuthDB lookup for '{}' failed (store error, not "
+                             "a genuine miss) - returning nullopt",
+                             username);
+                // Gate 5 chaos-injector CH-3/UP-6 follow-up: a log line alone is
+                // invisible exactly while the store is already stressed (the
+                // scenario that matters). This is the ONLY caller-visible signal
+                // that auth_routes.cpp's `.value_or(Role::user)` is about to
+                // floor a legacy-token-authenticated request's role down - narrows
+                // the observability gap; the honest fix (this call returning
+                // std::expected so callers can distinguish "not found" from
+                // "store degraded" and respond accordingly, e.g. 503 instead of a
+                // silent floor) touches 6 call sites and is a follow-up, not this
+                // metric.
+                if (metrics_)
+                    metrics_->counter("yuzu_auth_get_user_role_store_error_total").increment();
+            }
+            return std::nullopt;
+        }
+        return db_user->role;
+    }
     std::shared_lock lock(mu_);
     auto it = users_.find(username);
     if (it == users_.end())
@@ -1670,6 +2055,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         auto it = users_.find(username);
         if (it != users_.end()) {
             it->second.role = new_role;
+            it->second.role_version = next_role_version_(); // keeps .role/.role_version paired - see UserEntry::role_version's doc
         }
 
         // Invalidate sessions so the user picks up the new role on next login
@@ -1691,6 +2077,7 @@ bool AuthManager::update_role(const std::string& username, Role new_role) {
         return false;
     }
     it->second.role = new_role;
+    it->second.role_version = next_role_version_(); // keeps .role/.role_version paired, same as the AuthDB-backed branch above
 
     // Invalidate sessions so the user picks up the new role on next login
     // Prevents stale session role from granting old privileges

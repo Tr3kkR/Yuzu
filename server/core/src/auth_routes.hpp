@@ -320,6 +320,21 @@ public:
     /// types serving different route classes (rollup vs. per-agent list),
     /// and their caller-class ladders are similar in SHAPE, not identical in
     /// every branch's guard condition.
+    ///
+    /// #4031 UPDATE: unlike `require_list_read` (whose own doc comment above
+    /// still names this as an open gap a future caller must close itself),
+    /// this gate DOES now apply `authz_topology_floor.hpp`'s floor: a
+    /// non-admin session is denied a floored securable
+    /// (`topology_floor_applies`) whenever RBAC enforcement is not in effect,
+    /// mirroring `require_permission`'s own legacy-branch floor check
+    /// (same audit-reason prefix, same `yuzu_auth_topology_floor_denied_total`
+    /// counter — see `authz_gates.cpp`). `RbacStore::authorize_list_read`'s
+    /// own legacy-open branch has no floor concept of its own (a data-layer
+    /// primitive must not depend on `Session`), so this gate's own
+    /// pre-check is the only thing standing between a disabled-RBAC install
+    /// and a silent full-fleet AdmitAll on a securable seeded admin-only —
+    /// `Enrollment:Read` (GET /api/v1/enrollment/pending-agents) is the
+    /// first floored securable ever routed through this gate.
     [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
     require_fleet_read(const httplib::Request& req, httplib::Response& res,
                        const std::string& securable_type, const std::string& operation);

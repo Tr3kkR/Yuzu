@@ -147,7 +147,7 @@ Each parameter descriptor supports:
 | `displayName` | string | No | -- | Human-readable label for the dashboard form. |
 | `description` | string | No | `""` | Parameter description. |
 | `default` | varies | No | -- | Default value if not provided. Must match the declared type. |
-| `validation` | object | No | -- | Validation constraints. See below. |
+| `validation` | object | No | -- | Validation constraints. See below. Also summarised into the plugin README's Inputs table (Constraints column, e.g. `enum: a, b · minLength 1`) and carried verbatim in the `content/plugin-docs` manifest (`inputs[].constraints`). |
 
 #### `spec.parameters.properties.<name>.validation`
 
@@ -173,6 +173,10 @@ Each column object:
 |---|---|---|---|---|
 | `name` | string | Yes | -- | Column identifier. |
 | `type` | string | Yes | -- | Column type. Values: `bool`, `int32`, `int64`, `string`, `datetime`, `guid`, `clob`. See [Section 11](#11-result-column-type-system). |
+| `description` | string | No | -- | Documentation only: what the column carries. Rendered into the plugin README's Outputs table and the `content/plugin-docs` manifest by `tools/plugin-doc-gen` (`docs/plugin-readme-standard.md` rule 8). Every server consumer of `result.columns` (`result_envelope.cpp`, `response_templates_engine.cpp`) reads only `name` and `type`; the extra keys pass through the embedded `result_schema` untouched. |
+| `values` | list of string | No | -- | Documentation only: the closed vocabulary the column may carry (e.g. `[ok, warning, failing, unknown, unsupported]`). Meaningful only on a `string` column. Not enforced at runtime; `tools/plugin-doc-gen` validates the shape of these four keys (a list where a list is meant, `platforms` drawn from the vocabulary below) and fails its `--check` otherwise. |
+| `example` | string | No | -- | Documentation only: one representative value. |
+| `platforms` | list of string | No | -- | Documentation only: the platforms on which the column carries a real value, from `windows`, `linux`, `darwin`. Omitted means every platform the definition lists. |
 
 #### `spec.result.aggregation`
 

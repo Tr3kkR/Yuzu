@@ -31,7 +31,9 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
+#include "test_verify_api_double.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -245,6 +247,12 @@ struct RestGsHarness {
     // default (so the audit/scope/render paths are reachable); left empty when
     // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
     yuzu::server::AppPerfProviders app_perf_providers_;
+    // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing GET
+    // /api/v1/dex/perf/compare (replaces the retired AppPerfCohortFn-in-
+    // AppPerfProviders ad-hoc cohort provider). Left null when wire_app_perf is
+    // false — same "provider absent → 503" branch every other app-perf seam
+    // above exercises.
+    std::shared_ptr<const yuzu::server::VerifyApi> verify_api_;
     // Rows the wired fleet provider returns (default empty). A test sets this before
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
@@ -257,9 +265,27 @@ struct RestGsHarness {
     yuzu::server::DexPerfFn dex_perf_fn_ = [](const std::string&) {
         return yuzu::server::DexPerfSnapshot{};
     };
-    yuzu::server::NetPerfFn net_perf_fn_ = [](const std::string&) {
-        return yuzu::server::NetPerfSnapshot{};
-    };
+    std::shared_ptr<const yuzu::server::NetworkApi> net_perf_fn_ =
+        std::make_shared<yuzu::server::test::FnNetworkApi>(
+            [](const std::string&) { return yuzu::server::NetPerfSnapshot{}; });
+
+    // #4035: the DexFleet provider for GET /dex/{health,trends,overview,
+    // catalogue/group}. Default DexFleet{} (all-zero: no online agents) so
+    // every EXISTING test in this file is unaffected; a test targeting these
+    // 4 new routes' fleet-dependent shape sets dex_fleet_override_ before
+    // constructing the harness is not possible (register_routes captures the
+    // lambda at construction) — so instead the lambda reads this field LIVE
+    // at request time, letting a test mutate it after construction.
+    yuzu::server::DexFleet dex_fleet_override_;
+
+    // #4035 hardening (governance): the visible-agent-set resolver for GET
+    // /api/v1/dex/app and GET /api/v1/dex/overview (ADR-0017 World A
+    // confinement — ind. of the service-scoped-token deny belt above).
+    // nullopt (default) = unfiltered, matching every EXISTING test in this
+    // file (and matching an unwired dex_visible_fn / RBAC-off / global-read
+    // production posture). A test proving confinement sets this to a
+    // specific agent set before issuing the request.
+    std::optional<std::set<std::string>> dex_visible_override_;
 
     // What the wired VERIFY cohort provider returns (default = present-but-empty
     // CohortRead → the compare reads "insufficient"). A test sets member_count +
@@ -471,9 +497,15 @@ struct RestGsHarness {
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
             };
-            app_perf_providers_.cohort =
-                [this](std::string_view, std::string_view, std::string_view, std::string_view, int)
-                -> std::optional<yuzu::server::CohortRead> { return cohort_read_; };
+            // ADR-0031 WS-A4 #4250: the shared VerifyApi seam (replaces the
+            // retired AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort
+            // provider) — a FnVerifyApi wraps the SAME `cohort_read_` fixture
+            // so every existing test in this file keeps its meaning
+            // unchanged. Left null (see the member's doc comment) when
+            // wire_app_perf is false, same "provider absent → 503" branch.
+            verify_api_ = std::make_shared<yuzu::server::test::FnVerifyApi>(
+                [this](std::string_view, std::string_view, std::string_view, std::string_view,
+                      int) -> std::optional<yuzu::server::CohortRead> { return cohort_read_; });
         }
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -525,7 +557,27 @@ struct RestGsHarness {
                                   }}
                                 : RestApiV1::ExecVisibleFn{},
                             wire_list_read_fn_ ? RestApiV1::ListReadFn{list_read_fn}
-                                               : RestApiV1::ListReadFn{});
+                                               : RestApiV1::ListReadFn{},
+                            /*fleet_read_fn=*/{},
+                            // #4033: this harness doesn't exercise GET
+                            // /api/v1/devices or the agent-count preview —
+                            // unwired defaults (fail-closed / legacy-open
+                            // respectively) are correct no-ops here.
+                            /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
+                            // #4035: reads dex_fleet_override_ LIVE at request
+                            // time (see that field's doc comment).
+                            RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }},
+                            // #4035 hardening (governance): reads
+                            // dex_visible_override_ LIVE at request time
+                            // (ignores `username` — this stub doesn't model
+                            // per-username resolution, only whether the
+                            // caller's set is engaged).
+                            RestApiV1::DexVisibleFn{
+                                [this](const std::string&) { return dex_visible_override_; }},
+                            // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing
+                            // GET /api/v1/dex/perf/compare (see verify_api_'s doc
+                            // comment above).
+                            verify_api_);
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
@@ -1992,6 +2044,288 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     REQUIRE(res->body.find(R"("/dex/devices/{id}":)") != std::string::npos);
     // And the embedded spec remains valid JSON after the insertion.
     REQUIRE_NOTHROW(nlohmann::json::parse(res->body));
+}
+
+// ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
+
+TEST_CASE("REST dex/app: blast-radius drill, audited, service-scoped token denied",
+          "[pg][rest][dex][app]") {
+    RestGsHarness h;
+    h.seed_obs("a1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("a2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["process_name"].get<std::string>() == "chrome.exe");
+    CHECK(j["data"]["crashes"].get<int64_t>() == 2);
+    CHECK(j["data"]["distinct_devices"].get<int64_t>() == 2);
+    REQUIRE(j["data"]["devices"].is_array());
+    CHECK(j["data"]["devices"].size() == 2);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.app.view" && a.result == "success")
+            audited = true;
+    CHECK(audited);
+
+    // missing required name -> 400
+    auto missing = h.sink.Get("/api/v1/dex/app?window=all");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+
+    // service-scoped token -> 403, denied audit only
+    RestGsHarness h2;
+    h2.session_token_scope_service = "printers";
+    auto denied = h2.sink.Get("/api/v1/dex/app?name=chrome.exe");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap — GET /api/v1/dex/app's devices[] list previously ALWAYS
+// passed visible=nullptr to the shared builder regardless of the caller's
+// management-group scope, unlike its own /fragments/dex/app dashboard
+// fragment (which confines via resolve_visible). A management-group-confined
+// operator could read affected agent_ids fleet-wide through this route even
+// though the equivalent dashboard fragment would have hidden them.
+TEST_CASE("REST dex/app: devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][rest][dex][app][scope]") {
+    RestGsHarness h;
+    h.seed_obs("s1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("s2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    // Unconfined (default, matches production RBAC-off / global-read): both
+    // devices are visible.
+    auto unconfined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(unconfined);
+    CHECK(unconfined->status == 200);
+    auto uj = nlohmann::json::parse(unconfined->body);
+    CHECK(uj["data"]["devices"].size() == 2);
+
+    // Confined to WS-1 only (simulating a management-group-scoped operator):
+    // WS-2 must NEVER appear, even though the aggregate crash COUNT still
+    // reflects the whole fleet (the SCOPING NOTE's tracked, separate,
+    // aggregate-numerator follow-up — not this fix's scope).
+    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
+    auto confined = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    auto cj = nlohmann::json::parse(confined->body);
+    REQUIRE(cj["data"]["devices"].is_array());
+    CHECK(cj["data"]["devices"].size() == 1);
+    CHECK(cj["data"]["devices"][0]["agent_id"].get<std::string>() == "WS-1");
+    for (const auto& d : cj["data"]["devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+
+    // Confined to a DISJOINT set (simulating an operator with no visibility
+    // into either device): devices[] is empty, never a 403/404 — matching
+    // the fragment's own admit-then-filter posture (ADR-0017 INV-2: engaged-
+    // empty is a legitimate, distinct outcome from "unfiltered").
+    h.dex_visible_override_ = std::set<std::string>{};
+    auto empty_scope = h.sink.Get("/api/v1/dex/app?name=chrome.exe&window=all");
+    REQUIRE(empty_scope);
+    CHECK(empty_scope->status == 200);
+    auto ej = nlohmann::json::parse(empty_scope->body);
+    CHECK(ej["data"]["devices"].empty());
+}
+
+TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
+          "[pg][rest][dex][apps]") {
+    RestGsHarness h;
+    h.seed_obs("b1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("b2", "WS-2", "process.hung", "notepad.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : j["data"]["apps"])
+        if (a["subject"].get<std::string>() == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    CHECK(h.audit_log.empty()); // fleet aggregate — no per-agent identity
+}
+
+TEST_CASE("REST dex/catalogue/group: family drill, unknown family -> 404, no audit",
+          "[pg][rest][dex][catalogue][group]") {
+    RestGsHarness h;
+    h.seed_obs("c1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/catalogue/group?name=" +
+                          std::string("App%20reliability") + "&window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["group_name"].get<std::string>() == "App reliability");
+    CHECK(j["data"]["total_type_count"].get<int64_t>() > 0);
+    CHECK(h.audit_log.empty());
+
+    auto unknown = h.sink.Get("/api/v1/dex/catalogue/group?name=NoSuchFamily");
+    REQUIRE(unknown);
+    CHECK(unknown->status == 404);
+
+    auto missing = h.sink.Get("/api/v1/dex/catalogue/group");
+    REQUIRE(missing);
+    CHECK(missing->status == 400);
+}
+
+TEST_CASE("REST dex/health: composite score suppressed with no reporting agents, no audit",
+          "[pg][rest][dex][health]") {
+    RestGsHarness h;
+    h.seed_obs("d1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    // No dex_fleet_override_ set -> windows_online stays 0 -> suppressed.
+    auto res = h.sink.Get("/api/v1/dex/health?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["score"].is_null());
+    CHECK(j["data"]["reporting"].get<int64_t>() == 0);
+    CHECK(h.audit_log.empty());
+
+    // With a reporting fleet, the score is a real number.
+    h.dex_fleet_override_.windows_online = 5;
+    auto res2 = h.sink.Get("/api/v1/dex/health?window=all");
+    REQUIRE(res2);
+    auto j2 = nlohmann::json::parse(res2->body);
+    CHECK_FALSE(j2["data"]["score"].is_null());
+}
+
+TEST_CASE("REST dex/trends: cross-OS + per-family day counts, no audit",
+          "[pg][rest][dex][trends]") {
+    RestGsHarness h;
+    h.seed_obs("e1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    auto res = h.sink.Get("/api/v1/dex/trends?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["families"].is_array());
+    REQUIRE(j["data"]["days"].is_array());
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST dex/overview: fleet summary, audited, service-scoped token denied",
+          "[pg][rest][dex][overview]") {
+    RestGsHarness h;
+    h.seed_obs("f1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("f2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"]["top_apps"].is_array());
+    bool saw_chrome = false;
+    for (const auto& a : j["data"]["top_apps"])
+        if (a["subject"].get<std::string>() == "chrome.exe")
+            saw_chrome = true;
+    CHECK(saw_chrome);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.overview.view" && a.result == "success")
+            audited = true;
+    CHECK(audited);
+
+    RestGsHarness h2;
+    h2.session_token_scope_service = "printers";
+    auto denied = h2.sink.Get("/api/v1/dex/overview");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+// #4035 hardening (governance): closure evidence for the ADR-0017 World A
+// confinement gap on GET /api/v1/dex/overview's top_devices[] — same defect
+// class and same fix as GET /api/v1/dex/app above.
+TEST_CASE("REST dex/overview: top_devices[] confined to the caller's visible set "
+          "(ADR-0017 World A — regression coverage for the governance fix)",
+          "[pg][rest][dex][overview][scope]") {
+    RestGsHarness h;
+    h.seed_obs("t1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("t2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+
+    auto unconfined = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(unconfined);
+    CHECK(unconfined->status == 200);
+    auto uj = nlohmann::json::parse(unconfined->body);
+    REQUIRE(uj["data"]["top_devices"].is_array());
+    CHECK(uj["data"]["top_devices"].size() == 2);
+
+    h.dex_visible_override_ = std::set<std::string>{"WS-1"};
+    auto confined = h.sink.Get("/api/v1/dex/overview?window=all");
+    REQUIRE(confined);
+    CHECK(confined->status == 200);
+    auto cj = nlohmann::json::parse(confined->body);
+    REQUIRE(cj["data"]["top_devices"].is_array());
+    CHECK(cj["data"]["top_devices"].size() == 1);
+    CHECK(cj["data"]["top_devices"][0]["agent_id"].get<std::string>() == "WS-1");
+    for (const auto& d : cj["data"]["top_devices"])
+        CHECK(d["agent_id"].get<std::string>() != "WS-2");
+}
+
+TEST_CASE("REST dex/devices/{id}/history: per-device signal history, audited dex.device.view "
+          "(same verb the score-only route uses), out-of-scope device -> 403",
+          "[pg][rest][dex][device][history]") {
+    RestGsHarness h;
+    h.seed_obs("g1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("g2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/history?window=all");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    REQUIRE(j["data"]["history"].is_array());
+    bool saw_it = false, saw_other = false;
+    for (const auto& r : j["data"]["history"]) {
+        if (r["obs_type"].get<std::string>() == "process.crashed")
+            saw_it = true;
+        if (r["subject"].get<std::string>() == "boot")
+            saw_other = true; // WS-2's row must never leak into WS-1's history
+    }
+    CHECK(saw_it);
+    CHECK_FALSE(saw_other);
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.device.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+
+    h.deny_scoped_agent = "WS-9";
+    auto denied = h.sink.Get("/api/v1/dex/devices/WS-9/history");
+    REQUIRE(denied);
+    CHECK(denied->status == 403);
+}
+
+TEST_CASE("REST dex/devices/{id}/observations/{event_id}: single-observation detail, audited, "
+          "foreign event_id -> 404 (same as genuinely-absent, no oracle)",
+          "[pg][rest][dex][device][observation]") {
+    RestGsHarness h;
+    h.seed_obs("h1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("h2", "WS-2", "os.boot", "boot", "windows", "2026-06-10T08:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/dex/devices/WS-1/observations/h1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["event_id"].get<std::string>() == "h1");
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    CHECK(j["data"]["obs_type"].get<std::string>() == "process.crashed");
+    bool audited = false;
+    for (const auto& a : h.audit_log)
+        if (a.action == "dex.observation.view" && a.target_id == "WS-1")
+            audited = true;
+    CHECK(audited);
+
+    // h2 belongs to WS-2, not WS-1 -- same 404 as a genuinely-absent event.
+    auto foreign = h.sink.Get("/api/v1/dex/devices/WS-1/observations/h2");
+    REQUIRE(foreign);
+    CHECK(foreign->status == 404);
+    auto absent = h.sink.Get("/api/v1/dex/devices/WS-1/observations/no-such-event");
+    REQUIRE(absent);
+    CHECK(absent->status == 404);
 }
 
 TEST_CASE("REST dex/devices/{id}: out-of-scope device → 403, no data leak, no audit",
@@ -3714,4 +4048,191 @@ TEST_CASE("REST gs.device-compliance: rule_names_for chunks the IN-list past 500
         ++resolved;
     }
     CHECK(resolved == 600);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4037 — per-guard fleet-wide agent-status drilldown
+// (GET /api/v1/guaranteed-state/rules/{rule_id}/status)
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST gs.rule-status: returns agent_id/state/updated_at for every reporting agent",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    CHECK(j["data"].size() == 2);
+    CHECK(j["pagination"]["total"].get<int>() == 2);
+    std::unordered_map<std::string, std::string> by_agent;
+    for (auto& row : j["data"])
+        by_agent[row["agent_id"].get<std::string>()] = row["state"].get<std::string>();
+    CHECK(by_agent["WS-1"] == "errored");
+    CHECK(by_agent["WS-2"] == "compliant");
+}
+
+TEST_CASE("REST gs.rule-status: unknown rule_id → 404 (not a store degrade)",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/no-such-rule/status",
+                          h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("REST gs.rule-status: an unwired list_read_fn fails closed (503)",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/true, /*wire_app_perf=*/true,
+                    /*with_exec_visible=*/true, /*resp_pool=*/nullptr,
+                    /*wire_list_read_fn=*/false);
+    h.seed_rule("r1", "rule-one");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+}
+
+TEST_CASE("REST gs.rule-status: a service-scoped token is denied outright (same posture as "
+          "the fleet /status route)",
+          "[pg][rest][guaranteed_state][rule_status]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-one");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status",
+                          h.service_scoped_token_headers("printers"));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("REST gs.rule-status: a management-group-confined grant sees only visible agents "
+          "(AdmitScoped) — same require_list_read composition proof as the fleet /status "
+          "route's own [adr0017] test above, pinned here because this route's C++ post-filter "
+          "(agent_rule_statuses(rule_id) has no scope parameter of its own) is a genuinely "
+          "different code path from /status's SQL-pushed errored_rule_count(agent_scope)",
+          "[pg][rest][guaranteed_state][rule_status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value()); // WS-1 visible; WS-2 is not
+    // Group-SCOPED grant, deliberately NOT a global RbacStore::assign_role — carol
+    // can see only what RegionA can see, exactly the AdmitScoped fixture shape used
+    // by the fleet /status route's own [adr0017] tests above.
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+
+    h.seed_rule("r1", "rule-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z"); // visible
+    h.seed_status("e2", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z"); // NOT visible
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    // Only WS-1's row is returned — WS-2 is out of carol's management-group scope.
+    CHECK(j["data"].size() == 1);
+    CHECK(j["data"][0]["agent_id"].get<std::string>() == "WS-1");
+    CHECK(j["pagination"]["total"].get<int>() == 1);
+}
+
+TEST_CASE("REST gs.rule-status: AdmitScoped with zero visible agents returns an empty list, "
+          "not a 403 (INV-2) — the caller has a real grant, it simply resolves to no visible "
+          "agents",
+          "[pg][rest][guaranteed_state][rule_status][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+
+    ManagementGroup g;
+    g.name = "EmptyRegion";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    // No members added — dana's group is real and her grant is real, but it
+    // contains no agents.
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "dana", "GsReader"}).has_value());
+    h.session_user = "dana";
+
+    h.seed_rule("r1", "rule-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/rules/r1/status", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    REQUIRE(j["data"].is_array());
+    CHECK(j["data"].empty());
+    CHECK(j["pagination"]["total"].get<int>() == 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #4037 — per-device all-guards view
+// (GET /api/v1/guaranteed-state/agents/{agent_id}/rules)
+// ═════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("REST gs.device-all-guards: every guard's state for one device, unscoped to any "
+          "Baseline",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    h.seed_rule("r2", "guard-two");
+    h.seed_status("e1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:00:00Z");
+    h.seed_status("e2", "WS-1", "r2", "guard.compliant", "2026-06-20T10:00:00Z");
+    // Different device — must NOT appear in WS-1's response.
+    h.seed_status("e3", "WS-2", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-1/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["agent_id"].get<std::string>() == "WS-1");
+    CHECK(j["data"]["total_guards"].get<int>() == 2);
+    REQUIRE(j["data"]["guards"].is_array());
+    CHECK(j["data"]["guards"].size() == 2);
+    std::unordered_map<std::string, std::string> by_rule;
+    for (auto& g : j["data"]["guards"])
+        by_rule[g["rule_id"].get<std::string>()] = g["state"].get<std::string>();
+    CHECK(by_rule["r1"] == "errored");
+    CHECK(by_rule["r2"] == "compliant");
+}
+
+TEST_CASE("REST gs.device-all-guards: a device with no reported guards returns an empty list, "
+          "not an error",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/never-seen/rules");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["data"]["total_guards"].get<int>() == 0);
+    CHECK(j["data"]["guards"].empty());
+}
+
+TEST_CASE("REST gs.device-all-guards: scoped_perm_fn denies the queried device → 403",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h;
+    h.deny_scoped_agent = "WS-9";
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-9/rules");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_scoped_agent_id == "WS-9"); // scoped by the queried device
+}
+
+TEST_CASE("REST gs.device-all-guards: an unwired scoped_perm_fn fails closed (503)",
+          "[pg][rest][guaranteed_state][device_guards]") {
+    RestGsHarness h(/*live_deps=*/true, /*wire_scoped_perm=*/false);
+    auto res = h.sink.Get("/api/v1/guaranteed-state/agents/WS-1/rules");
+    REQUIRE(res);
+    CHECK(res->status == 503);
 }

@@ -157,6 +157,19 @@ grpc::Status check(apb::AgentService::Stub& stub, const std::string& claimed) {
     return stub.CheckForUpdate(&ctx, req, &resp);
 }
 
+grpc::Status register_agent(apb::AgentService::Stub& stub, const std::string& agent_id) {
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id(agent_id);
+    req.mutable_info()->set_hostname("test-host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+
+    apb::RegisterResponse resp;
+    grpc::ClientContext ctx;
+    ctx.set_deadline(std::chrono::system_clock::now() + std::chrono::seconds(10));
+    return stub.Register(&ctx, req, &resp);
+}
+
 double suppressed(const yuzu::MetricsRegistry& m, const char* reason) {
     return const_cast<yuzu::MetricsRegistry&>(m)
         .counter("yuzu_ota_identity_audit_suppressed_total",
@@ -255,4 +268,63 @@ TEST_CASE("OTA audit bound: a foreign-CA impostor cannot spend the victim's allo
     auto st = check(*victim_stub, "somebody-else");
     CHECK(st.error_code() == grpc::StatusCode::UNAUTHENTICATED);
     CHECK(suppressed(h.metrics, "agent_id_mismatch") - victim_before == 0);
+}
+
+TEST_CASE("gap-matrix #10: a code-signing-only leaf under the trusted CA is refused before "
+          "Register (mTLS purpose check)",
+          "[ota][identity][mtls][code-signing]") {
+    // The whole security argument for exposing POST /api/v1/ca/issue-code-signing
+    // without reopening the #1118 agent-impersonation deferral rests on ONE
+    // empirical fact: a leaf whose EKU is code_signing ONLY (no client_auth)
+    // can never complete the mTLS handshake as a CLIENT certificate, so it can
+    // never reach Register/CheckForUpdate/Subscribe at all — regardless of
+    // what its CN says. Prove that fact directly rather than assuming it: mint
+    // a code_signing-only leaf under the server's own trusted CA with
+    // CN=<a real agent_id>, present it as the client cert, and confirm the
+    // connection itself is refused (TLS handshake failure surfaces to the
+    // client as UNAVAILABLE — grpc never lets the RPC reach the server, so
+    // Register's own logic is never even entered).
+    const Pki server_pki = make_pki("Yuzu Test CA", "localhost", /*client_auth=*/false);
+
+    ca::LeafParams lp;
+    lp.subject.common_name = "agent-1"; // a real, existing agent_id
+    lp.subject.organization = "YuzuTest";
+    lp.validity = ca::validity_days_from_now(1);
+    lp.usage.code_signing = true; // HARD-PINNED shape — no client_auth, no server_auth
+    auto leaf = ca::issue_leaf(server_pki.ca_cert, server_pki.ca_key, ca::KeyAlgo::EcP256, lp);
+    REQUIRE(leaf.has_value());
+    // Confirm the fixture actually produced the shape under test — a mistake
+    // here would make the rest of this test vacuous.
+    REQUIRE_FALSE(lp.usage.client_auth);
+    REQUIRE_FALSE(lp.usage.server_auth);
+
+    MtlsHarness h;
+    h.start(server_pki, server_pki.ca_cert);
+    auto stub = h.connect(server_pki.ca_cert, leaf->private_key_pem, leaf->cert_pem);
+
+    // Register — the exact RPC the #1118 identity gate lives on the far side
+    // of — never gets a chance to run: the channel itself fails.
+    auto st = register_agent(*stub, "agent-1");
+    CHECK(st.error_code() == grpc::StatusCode::UNAVAILABLE);
+
+    // Same refusal on CheckForUpdate, for good measure: this is a TLS-layer
+    // rejection, not something specific to one RPC.
+    auto st2 = check(*stub, "agent-1");
+    CHECK(st2.error_code() == grpc::StatusCode::UNAVAILABLE);
+
+    // Control: the SAME CA, SAME CN, but a conforming client_auth leaf DOES
+    // complete the handshake and reach the server — isolating the refusal
+    // above to the EKU shape, not e.g. a CN/CA mismatch in this fixture.
+    ca::LeafParams client_lp;
+    client_lp.subject.common_name = "agent-1";
+    client_lp.subject.organization = "YuzuTest";
+    client_lp.validity = ca::validity_days_from_now(1);
+    client_lp.usage.client_auth = true;
+    auto conforming =
+        ca::issue_leaf(server_pki.ca_cert, server_pki.ca_key, ca::KeyAlgo::EcP256, client_lp);
+    REQUIRE(conforming.has_value());
+    auto conforming_stub =
+        h.connect(server_pki.ca_cert, conforming->private_key_pem, conforming->cert_pem);
+    auto ok_st = check(*conforming_stub, "agent-1");
+    CHECK(ok_st.error_code() != grpc::StatusCode::UNAVAILABLE);
 }

@@ -24,6 +24,7 @@
 #include "agent_registry.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
+#include "gateway_route_store.hpp"
 
 // Forward declarations
 namespace yuzu::server {
@@ -54,6 +55,13 @@ public:
                                yuzu::MetricsRegistry* metrics = nullptr,
                                AgentHealthStore* health_store = nullptr);
 
+    /// HA WS-4 slice 4.1: born-on-PG agent->cluster routing directory (see
+    /// gateway_route_store.hpp). Written on connect/heartbeat/disconnect below;
+    /// INERT this slice — nothing reads it for dispatch yet. nullptr (default,
+    /// and set back to nullptr in server.cpp's stop() before the store resets)
+    /// disables the writes — every write site below is fail-OPEN and tolerates
+    /// a null store the same way it tolerates a degraded write.
+    void set_gateway_route_store(GatewayRouteStore* store) { gateway_route_store_ = store; }
     void set_mgmt_group_store(ManagementGroupStore* store) { mgmt_group_store_ = store; }
     void set_inventory_store(InventoryStore* store) { inventory_store_ = store; }
     void set_software_inventory_store(SoftwareInventoryStore* store) {
@@ -153,6 +161,7 @@ private:
     auth::AutoApproveEngine& auto_approve_;
     yuzu::MetricsRegistry* metrics_{nullptr};
     AgentHealthStore* health_store_{nullptr};
+    GatewayRouteStore* gateway_route_store_{nullptr};
     ManagementGroupStore* mgmt_group_store_{nullptr};
     InventoryStore* inventory_store_{nullptr};
     SoftwareInventoryStore* software_inventory_store_{nullptr};

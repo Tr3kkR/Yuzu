@@ -31,6 +31,9 @@
 %%%   circuit_breaker_reset_timeout_ms    — initial open duration (default 10000)
 %%%   circuit_breaker_max_reset_timeout_ms — max backoff cap (default 300000)
 %%%   registration_replay_spacing_ms      — gap between replay RPCs (default 20)
+%%   cluster_id                          — this gateway's trust-zone/region id,
+%%                                          stamped on every StreamStatusNotification
+%%                                          (default <<"default">>; ADR-2002 §7)
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_upstream).
@@ -82,9 +85,16 @@
     cb_timer        :: reference() | undefined,
     %% Registration replay on upstream reconnect
     replay_spacing  :: non_neg_integer(),
-    replay_queue    :: [{binary(), map()}],  %% agents still to re-proxy ([] = idle)
+    replay_queue    :: [{binary(), binary() | undefined, map()}],  %% agents still to re-proxy ([] = idle)
     %% Guardian drift-event forwards in flight (bounded by MAX_GUARDIAN_INFLIGHT)
-    guardian_pids   :: #{pid() => true}
+    guardian_pids   :: #{pid() => true},
+    %% HA WS-4 4.1 — the trust-zone/region cluster id this gateway belongs to
+    %% (agents are pinned to one cluster, ADR-2002 §7). Stamped onto every
+    %% StreamStatusNotification so the server's routing directory can record
+    %% which cluster owns an agent's live stream. Read once at init; a
+    %% pre-WS-4 build has no such config and the env default (<<"default">>)
+    %% keeps a single-cluster deployment's id stable and non-empty.
+    cluster_id      :: binary()
 }).
 
 %%%===================================================================
@@ -137,10 +147,11 @@ init([]) ->
     BaseTimeout = application:get_env(yuzu_gw, circuit_breaker_reset_timeout_ms, ?DEFAULT_CB_RESET_MS),
     MaxTimeout  = application:get_env(yuzu_gw, circuit_breaker_max_reset_timeout_ms, ?DEFAULT_CB_MAX_RESET_MS),
     ReplaySpacing = application:get_env(yuzu_gw, registration_replay_spacing_ms, ?DEFAULT_REPLAY_SPACING_MS),
+    ClusterId = ensure_binary(application:get_env(yuzu_gw, cluster_id, <<"default">>)),
 
     logger:info("Upstream client started (circuit breaker: threshold=~b, base_timeout=~bms, "
-                "replay_spacing=~bms)",
-                [Threshold, BaseTimeout, ReplaySpacing]),
+                "replay_spacing=~bms, cluster_id=~s)",
+                [Threshold, BaseTimeout, ReplaySpacing, ClusterId]),
 
     {ok, #state{
         notify_pids     = #{},
@@ -153,7 +164,8 @@ init([]) ->
         cb_timer        = undefined,
         replay_spacing  = ReplaySpacing,
         replay_queue    = [],
-        guardian_pids   = #{}
+        guardian_pids   = #{},
+        cluster_id      = ClusterId
     }}.
 
 handle_call(circuit_state, _From, #state{cb_state = CbState} = State) ->
@@ -183,7 +195,7 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_call}, State}.
 
 handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
-            #state{notify_pids = Pids, cb_state = CbState} = State) ->
+            #state{notify_pids = Pids, cb_state = CbState, cluster_id = ClusterId} = State) ->
     %% Don't spawn notifications if circuit is open
     case CbState of
         open ->
@@ -201,6 +213,11 @@ handle_cast({notify_stream_status, AgentId, SessionId, Event, PeerAddr},
                         event        => case Event of connected -> 'CONNECTED'; disconnected -> 'DISCONNECTED' end,
                         peer_addr    => PeerAddr,
                         gateway_node => atom_to_binary(node(), utf8),
+                        %% HA WS-4 4.1 — this gateway's configured cluster id
+                        %% (yuzu_gw env `cluster_id` / YUZU_GW_CLUSTER_ID), so
+                        %% the server's routing directory can record which
+                        %% cluster owns this agent's live stream.
+                        cluster_id   => ClusterId,
                         %% CC-03: advertised on every notification (connect and
                         %% disconnect alike) — the server only needs to observe
                         %% it once per gateway build, and sending it unconditionally
@@ -296,7 +313,7 @@ handle_cast(_Msg, State) ->
 handle_info(replay_next, #state{replay_queue = []} = State) ->
     %% Queue drained — replay complete.
     {noreply, State};
-handle_info(replay_next, #state{replay_queue = [{AgentId, RegisterReq} | Rest],
+handle_info(replay_next, #state{replay_queue = [{AgentId, SessionId, RegisterReq} | Rest],
                                 replay_spacing = Spacing} = State) ->
     State2 =
         case check_circuit(State) of
@@ -319,7 +336,21 @@ handle_info(replay_next, #state{replay_queue = [{AgentId, RegisterReq} | Rest],
                         schedule_replay_next(Rest, Spacing),
                         State1#state{replay_queue = Rest};
                     _ ->
-                        Result = do_rpc('ProxyRegister', RegisterReq, register),
+                        %% HA WS-4 4.1 — carry the agent's EXISTING session
+                        %% id as `x-yuzu-session-id` outgoing metadata (the
+                        %% same header key Subscribe reads,
+                        %% yuzu_gw_agent_service.erl) on the replay
+                        %% ProxyRegister ONLY. This is a re-proxy of an
+                        %% agent connection the gateway already holds, not a
+                        %% new agent — the metadata lets the server treat it
+                        %% as a re-announce of the existing session rather
+                        %% than minting a new one on every upstream
+                        %% reconnect (which would otherwise let a zombie
+                        %% replay clobber a live agent's route once the
+                        %% routing directory is dispatch-authoritative,
+                        %% WS-4 4.2). No SessionId (register_agent/5
+                        %% back-compat path) sends the request as before.
+                        Result = do_rpc_replay('ProxyRegister', RegisterReq, register, SessionId),
                         case Result of
                             {ok, _} ->
                                 logger:debug("Registration replay: re-proxied ~s", [AgentId]);
@@ -503,6 +534,24 @@ rpc_types('ForwardGuardianMessage') -> {'yuzu.gateway.v1.ForwardGuardianRequest'
                                         'yuzu.gateway.v1.ForwardGuardianAck'}.
 
 do_rpc(Method, Request, Tag) ->
+    do_rpc(Method, Request, Tag, ctx:background()).
+
+%% @doc Like do_rpc/3 but for the registration-replay path (HA WS-4 4.1):
+%% attaches the agent's EXISTING session id as `x-yuzu-session-id` outgoing
+%% gRPC metadata, via grpcbox's ctx-carried metadata (grpcbox_metadata:
+%% append_to_outgoing_ctx/2 + grpcbox_client_stream's metadata_headers/1,
+%% which turns it into real request headers — this is the standard grpcbox
+%% client mechanism, not a new wire path). Undefined/empty SessionId (the
+%% register_agent/5 back-compat path) sends the request with no such header,
+%% same as before this change.
+do_rpc_replay(Method, Request, Tag, SessionId) when is_binary(SessionId), SessionId =/= <<>> ->
+    Ctx = grpcbox_metadata:append_to_outgoing_ctx(
+            ctx:background(), #{<<"x-yuzu-session-id">> => SessionId}),
+    do_rpc(Method, Request, Tag, Ctx);
+do_rpc_replay(Method, Request, Tag, _SessionId) ->
+    do_rpc(Method, Request, Tag, ctx:background()).
+
+do_rpc(Method, Request, Tag, Ctx) ->
     {InputType, OutputType} = rpc_types(Method),
     Def = #grpcbox_def{
         service       = 'yuzu.gateway.v1.GatewayUpstream',
@@ -512,7 +561,7 @@ do_rpc(Method, Request, Tag) ->
     },
     Path = <<"/yuzu.gateway.v1.GatewayUpstream/", (atom_to_binary(Method, utf8))/binary>>,
     StartTime = erlang:monotonic_time(millisecond),
-    Result = grpcbox_client:unary(ctx:background(), Path, Request, Def,
+    Result = grpcbox_client:unary(Ctx, Path, Request, Def,
                                   #{channel => default_channel}),
     Duration = erlang:monotonic_time(millisecond) - StartTime,
     case Result of

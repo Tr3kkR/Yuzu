@@ -257,7 +257,14 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {telemetry_gauge_interval_ms, 10000},
 
     %% Consistent hash ring: virtual nodes per physical node
-    {hash_ring_vnodes, 256}
+    {hash_ring_vnodes, 256},
+
+    %% HA WS-4 4.1 -- the trust-zone/region cluster id this gateway belongs
+    %% to; agents are pinned to one cluster (ADR-2002 §7). Stamped onto
+    %% every StreamStatusNotification sent upstream so the server's
+    %% routing directory can record which cluster owns an agent's live
+    %% stream. Override: YUZU_GW_CLUSTER_ID
+    {cluster_id, <<"default">>}
 ]}
 ```
 
@@ -499,6 +506,12 @@ Test-only dependencies (loaded in the `test` profile):
 The current gateway runs as a single Erlang node. Planned clustering support
 will enable multiple gateway nodes to form a distributed cluster for
 horizontal scaling and fault tolerance.
+
+> **Note:** the `cluster_id` config key (see [Configuration](#configuration))
+> already exists and is stamped onto every `StreamStatusNotification` as a
+> routing-directory tag (HA WS-4 4.1, ADR-2002 §7) — but multi-node gateway
+> clustering as described below is not yet implemented; today `cluster_id`
+> only labels which trust-zone/region a single gateway node belongs to.
 
 ### Planned Features
 

@@ -1,5 +1,5 @@
 ---
-status: proposed
+status: accepted
 date: 2026-08-04
 owner: "@Doomgoose (Alex Young)"
 deciders: "@Doomgoose (author). PR1.5b, dev-team wave-1 package p5-plugin-config-plane."
@@ -10,6 +10,8 @@ context-refs: ["#2568", "#2580", "docs/postgres-store-playbook.md"]
 ---
 
 # 3005 — Plugin config/secret plane + per-action kill switch
+
+> **Implementation status (2026-09-07 ADR reconciliation):** Shipped — `PluginConfigStore::get_kill_switch`/`set_kill_switch` (`server/core/src/plugin_config_store.hpp:29,188,192`) and `plugin_config_routes.{hpp,cpp}` exist and are wired. Shipped: PR #3134 ("feat(server): plugin config/secret/kill-switch plane + typed schedule params (PR1.5a/b)"), merged 2026-08-15.
 
 ## Context
 

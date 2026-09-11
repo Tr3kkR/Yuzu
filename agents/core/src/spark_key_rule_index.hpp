@@ -59,6 +59,16 @@ public:
     ///         nullopt when the rule was unknown OR the key still has siblings.
     std::optional<std::string> remove_rule(std::string_view rule_id);
 
+    /// remove_rule() without the returned key copy - the ONE allocation remove_rule
+    /// performs - so it is genuinely noexcept: every step is a find on stored strings
+    /// or an erase by iterator. For callers that only need to drop a mapping and
+    /// already know (or do not need) the key: GuardianSparkRuntime's claim-index
+    /// release, which runs on noexcept and destructor paths (rung 9c R5.2,
+    /// adversarial re-review r3 C2/C3). Idempotent - a no-op for an unknown rule.
+    /// @return true IFF the rule's key now has zero rules (the ->0 edge); false when
+    ///         the rule was unknown or siblings remain.
+    bool erase_rule(std::string_view rule_id) noexcept;
+
     /// Rules currently mapped to `spark_key`, in deterministic (sorted) order;
     /// empty for an unknown key. This is the fan-out set an event resolves to.
     [[nodiscard]] std::vector<std::string> rules_for(std::string_view spark_key) const;
@@ -82,6 +92,26 @@ private:
     // remove_rule() work from a rule_id alone and lets add() detect a key move.
     std::map<std::string, std::string, std::less<>> by_rule_;
 };
+
+inline bool SparkKeyRuleIndex::erase_rule(std::string_view rule_id) noexcept {
+    // Same walk as remove_rule, minus its key copy: rit->second (the stored key) and
+    // rit->first (the stored rule_id) drive both lookups directly, and every erase is
+    // by iterator. Nothing here can allocate, so nothing here can throw.
+    auto rit = by_rule_.find(rule_id);
+    if (rit == by_rule_.end()) return false;
+    const auto kit = by_key_.find(rit->second);
+    const bool have_node = kit != by_key_.end();
+    auto sit = have_node ? kit->second.find(rit->first) : std::set<std::string>::iterator{};
+    const bool have_sit = have_node && sit != kit->second.end();
+    by_rule_.erase(rit); // invalidates rit; kit/sit already captured
+    if (have_sit)
+        kit->second.erase(sit);
+    if (have_node && kit->second.empty()) {
+        by_key_.erase(kit);
+        return true; // ->0 edge
+    }
+    return false;
+}
 
 inline bool SparkKeyRuleIndex::add(std::string_view spark_key, std::string_view rule_id) {
     if (auto rit = by_rule_.find(rule_id); rit != by_rule_.end()) {

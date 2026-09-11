@@ -7,20 +7,23 @@
 /// This is the GDPR-erasure MECHANISM half; the per-store `delete_agent` methods
 /// exist on each store but had ZERO production callers before this seam (they
 /// were invoked only from unit tests). The PRODUCTION TRIGGER is now LIVE:
-/// `DELETE /api/v1/sle/agents/{id}` — see `sle_routes.cpp`. It is gated on a SCOPED
-/// CONJUNCTION over every securable this cascade erases THROUGH, not just the one the
-/// route is named for: `SoftwareLicensing:Delete` (software_licensing) AND
-/// `Inventory:Delete` (inventory, software_inventory, device_inventory) AND
-/// `GuaranteedState:Delete` (app_perf_daily — DEX behavioural PII), plus
-/// audit-before-erase fail-closed. It calls `ServerImpl::decommission_agent`, which
-/// builds this cascade. §27 builds the fan-out AND wires its first production caller.
+/// `DELETE /api/v1/sle/agents/{id}` — see `sle_routes.cpp`. It is gated on ONE
+/// SCOPED securable, `Decommission:Delete` (ADR-0024 Decision 9, amended Wave 7
+/// PR7.2), that authorizes for the cascade's WHOLE blast radius rather than the
+/// per-store securables each store's READ routes gate on, plus audit-before-erase
+/// fail-closed. It calls `ServerImpl::decommission_agent`, which builds this
+/// cascade. §27 builds the fan-out AND wires its first production caller.
 ///
-/// STANDING RULE — if you add a store to `AgentDecommissionStores`, you MUST add its
-/// governing securable's `Delete` to that conjunction (or state in a comment which
-/// existing conjunct already governs it). The drift guard in
-/// `test_agent_decommission.cpp` fails if the store list grows, so the two cannot
-/// silently diverge — they already did once, leaving `app_perf_daily` erasable by a
-/// principal with no GuaranteedState right at all.
+/// STANDING RULE — the gate is the single `Decommission:Delete` securable, so
+/// adding a store no longer changes WHO can decommission — but it DOES widen WHAT
+/// the securable destroys, so when you add a store to `AgentDecommissionStores`
+/// you MUST: (a) append the store here, (b) register it in
+/// `agent_decommission.cpp`'s registration list, (c) bump `kCascadeStoreCount` in
+/// `test_agent_decommission.cpp`, (d) add the store to the blast-radius lists in
+/// `sle_routes.hpp`/`.cpp`, `rest_api_v1.cpp`'s delete block, ADR-0024 Decisions
+/// 9/11, and `rest-api.md`. The drift guard in `test_agent_decommission.cpp` fails
+/// until (c) is done, so the store list and the documented radius cannot silently
+/// diverge.
 ///
 /// ACCOUNTABLE, aggregated. Each per-store `delete_agent` now RETURNS a bool
 /// status: true iff the delete actually committed, false on a transient failure

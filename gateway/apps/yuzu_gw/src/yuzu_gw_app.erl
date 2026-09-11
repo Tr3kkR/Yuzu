@@ -193,6 +193,9 @@ apply_env_overrides() ->
         {"YUZU_GW_CB_FAILURE_THRESHOLD",   circuit_breaker_failure_threshold, fun list_to_integer/1},
         {"YUZU_GW_CB_RESET_TIMEOUT_MS",    circuit_breaker_reset_timeout_ms,  fun list_to_integer/1},
         {"YUZU_GW_CB_MAX_RESET_TIMEOUT_MS", circuit_breaker_max_reset_timeout_ms, fun list_to_integer/1},
+        %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
+        %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
+        {"YUZU_GW_CLUSTER_ID", cluster_id, fun list_to_binary/1},
         {"YUZU_GW_TLS_ENABLED", tls_enabled, fun
             ("true")  -> true;
             ("false") -> false;

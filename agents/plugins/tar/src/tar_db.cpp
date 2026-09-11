@@ -651,6 +651,54 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         spdlog::info("TarDatabase: migrated to schema version 5 (legacy tar_events retired)");
     }
 
+    // Version 6: the `usage` derived fold's supplementary table + the two
+    // UNIQUE indexes it and usage_live's fold logic depend on (Wave 7
+    // PR7.2b). usage_live and usage_daily themselves come from the schema
+    // registry's usual CREATE-TABLE-IF-NOT-EXISTS path (create_warehouse_
+    // tables() above) once the "usage" CaptureSourceDef is registered --
+    // this migration is the SINGLE source of usage_daily_user and both
+    // indexes; there is no generate_warehouse_ddl special case for them. A
+    // fresh DB runs v2->v6 sequentially in this one open() call, so it
+    // reaches v6 with no usage_daily/usage_live rows to reconcile -- the
+    // indexes are created against empty tables and can never fail on a
+    // pre-existing duplicate.
+    if (db.schema_version() == 5) {
+        std::lock_guard lock(db.mu_);
+        char* emsg = nullptr;
+        sqlite3_exec(raw_db, "SAVEPOINT v6_migration", nullptr, nullptr, nullptr);
+        bool ok = true;
+        for (const char* stmt :
+             {"CREATE TABLE IF NOT EXISTS usage_daily_user (day_ts INTEGER NOT NULL, "
+              "exe_key TEXT NOT NULL, user TEXT NOT NULL, PRIMARY KEY(day_ts, exe_key, user))",
+              "CREATE UNIQUE INDEX IF NOT EXISTS usage_daily_day_exe_uq ON usage_daily(day_ts, "
+              "exe_key)",
+              "CREATE UNIQUE INDEX IF NOT EXISTS usage_live_pid_exe_uq ON usage_live(pid, "
+              "exe_key)"}) {
+            if (sqlite3_exec(raw_db, stmt, nullptr, nullptr, &emsg) != SQLITE_OK) {
+                spdlog::error("TarDatabase: v6 migration statement failed: {} ({})",
+                              emsg ? emsg : "unknown", stmt);
+                sqlite3_free(emsg);
+                emsg = nullptr;
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            db.set_config_locked("schema_version", "6");
+            sqlite3_exec(raw_db, "RELEASE v6_migration", nullptr, nullptr, nullptr);
+            spdlog::info(
+                "TarDatabase: migrated to schema version 6 (usage_daily_user + usage indexes)");
+        } else {
+            // Schema stays at 5 -- usage_live/usage_daily DDL from the registry
+            // still exists (create_warehouse_tables ran unconditionally above),
+            // but without these indexes the fold's DELETE-then-INSERT open-run
+            // lifecycle relies on an application-level invariant instead of a
+            // DB-enforced one. Retried on the next open.
+            sqlite3_exec(raw_db, "ROLLBACK TO v6_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v6_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally
     // impossible and the authorizer restricts reads to registry-known warehouse
@@ -1404,6 +1452,29 @@ std::expected<int, std::string> TarDatabase::purge_source(const std::string& sou
         // step() can race this changes() read (the #1033 hazard needs a shared,
         // concurrently-used handle). O(1) vs stepping RETURNING rows on a bulk
         // delete.
+        total += sqlite3_changes(db_);
+    }
+
+    // usage_daily_user (Wave 7 PR7.2b) has no tier of its own in the schema
+    // registry -- its shape (PRIMARY KEY(day_ts, exe_key, user), no `id`
+    // column; see this file's v6 migration) does not fit the generic
+    // per-tier layout the loop above walks, so the granularity walk above
+    // never reaches it and an operator-initiated `tar.purge_source usage`
+    // would otherwise leave every username behind (docs/tar-dashboard.md
+    // §3.4's purge promise). Purge it here, in the SAME transaction as the
+    // registered "usage" tiers above, so it erases atomically with
+    // everything else -- and it must never resurrect on re-enable: the
+    // lifecycle's PendingBaseline gate (tar_usage.cpp) always requires a
+    // fresh baseline before the next fold, which never reads usage_daily_
+    // user at all.
+    if (source == "usage") {
+        if (sqlite3_exec(db_, "DELETE FROM usage_daily_user", nullptr, nullptr, &err_msg) !=
+            SQLITE_OK) {
+            std::string e = err_msg ? err_msg : "unknown";
+            sqlite3_free(err_msg);
+            sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+            return std::unexpected("purge failed on usage_daily_user: " + e);
+        }
         total += sqlite3_changes(db_);
     }
 
@@ -2517,6 +2588,87 @@ TarDatabase::execute_atomic_batch(const std::vector<std::string>& statements) {
     }
     out.failed.assign(statements.size(), 1);
     return out;
+}
+
+bool TransactionHandle::exec(const std::string& sql) {
+    if (poisoned_)
+        return false; // already aborted or failed -- do not autocommit past it
+
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, sql.c_str(), nullptr, nullptr, err.addr()) == SQLITE_OK)
+        return true;
+
+    fail(err.text());
+    return false;
+}
+
+void TransactionHandle::fail(std::string reason) {
+    if (!poisoned_) // first failure wins -- see the class doc for why this is load-bearing
+        error_ = std::move(reason);
+    poisoned_ = true;
+}
+
+std::expected<void, std::string> TarDatabase::checked_transaction(
+    const std::function<std::expected<void, std::string>(TransactionHandle&)>& operation) {
+    std::lock_guard lock(mu_);
+    if (!db_)
+        return std::unexpected("database not open");
+
+    SqliteErrMsg err;
+    if (sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, err.addr()) != SQLITE_OK) {
+        spdlog::error("TarDatabase::checked_transaction BEGIN failed: {}", err.text());
+        return std::unexpected(std::string("BEGIN failed: ") + err.text());
+        // No transaction was opened, so nothing to roll back.
+    }
+
+    TransactionHandle handle(db_);
+    std::expected<void, std::string> op_result;
+    try {
+        op_result = operation(handle);
+    } catch (const std::exception& e) {
+        handle.fail(std::string("exception: ") + e.what());
+    } catch (...) {
+        handle.fail("unknown exception");
+    }
+
+    // Poisoned wins regardless of what `operation` returned -- a callback
+    // that ignores one intermediate `raw()` failure and returns success
+    // anyway must not be able to erase that failure. See TransactionHandle's
+    // doc comment.
+    const bool ok = op_result.has_value() && !handle.poisoned();
+    // Poisoned takes precedence when both fired: it is the more specific
+    // diagnostic (a real SQLite error) over the callback's own postcondition
+    // text, and is the only one of the two that can fire alongside a
+    // has_value() op_result (the "ignored intermediate failure" case).
+    std::string failure_reason;
+    if (!ok)
+        failure_reason = handle.poisoned() ? handle.error() : op_result.error();
+
+    if (ok) {
+        if (sqlite3_exec(db_, "COMMIT", nullptr, nullptr, err.addr()) == SQLITE_OK)
+            return {};
+        spdlog::error("TarDatabase::checked_transaction COMMIT failed: {}", err.text());
+        failure_reason = std::string("COMMIT failed: ") + err.text();
+    }
+
+    // Rolled back (or never should have been committed) -- same wedge
+    // handling as execute_atomic_batch: ask sqlite3_get_autocommit rather
+    // than assume, because a ROLLBACK failure can mean SQLite already rolled
+    // back on its own OR that the connection is genuinely stuck inside a
+    // transaction that will never commit. See that method's doc comment for
+    // the full reasoning; this is the identical pattern, reused rather than
+    // reinvented.
+    const int rb = sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, err.addr());
+    if (rb != SQLITE_OK && sqlite3_get_autocommit(db_) == 0) {
+        spdlog::error("TarDatabase: checked_transaction ROLLBACK failed and the connection is "
+                      "STILL in a transaction ({}). Closing the TAR database: further writes "
+                      "would be reported as durable and then lost. TAR storage is offline on "
+                      "this endpoint until the agent restarts.",
+                      err.text());
+        sqlite3_close_v2(db_);
+        db_ = nullptr;
+    }
+    return std::unexpected(failure_reason);
 }
 
 bool TarDatabase::execute_sql_range(const std::string& sql, int64_t from, int64_t to) {

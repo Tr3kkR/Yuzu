@@ -39,9 +39,11 @@
 #include <yuzu/plugin.h>
 
 #include <cstddef>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 
 namespace yuzu::agent {
 
@@ -75,6 +77,31 @@ public:
     Result run(const YuzuPluginDescriptor* descriptor, std::string_view action,
                std::span<const YuzuParam> params = {},
                std::size_t capture_cap = kCaptureMaxBytes);
+};
+
+/// A plugin context for an in-process host that is not the agent daemon
+/// (tools/plugin-capture). Carries the configuration map every plugin reads
+/// through `yuzu_ctx_get_config`; no KV store and no trigger engine, so the
+/// storage and trigger ABI calls fail closed exactly as they do under the
+/// agent when those services are absent. Hand `get()` to `descriptor->init`
+/// before the first dispatch and to `descriptor->shutdown` after the last,
+/// in that order, so a plugin whose init is load-bearing (reads its config,
+/// opens a store, stashes the context) behaves as it does under the real
+/// host. The context must outlive every dispatch made against it.
+class YUZU_EXPORT StandalonePluginContext {
+public:
+    StandalonePluginContext(std::string plugin_name,
+                            std::unordered_map<std::string, std::string> config);
+    StandalonePluginContext(const StandalonePluginContext&) = delete;
+    StandalonePluginContext& operator=(const StandalonePluginContext&) = delete;
+
+    [[nodiscard]] YuzuPluginContext* get() const noexcept;
+
+private:
+    // PluginContextImpl is private to agent.cpp (it is what every yuzu_ctx_*
+    // accessor reinterpret_casts a YuzuPluginContext* to); owned through a
+    // type-erased deleter defined there.
+    std::unique_ptr<void, void (*)(void*)> impl_;
 };
 
 } // namespace yuzu::agent

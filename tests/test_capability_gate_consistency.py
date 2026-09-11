@@ -88,12 +88,14 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_disk_actions.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
 ]
 # 3 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
 # disk_actions and the trailing 4 is power_health
 # (battery/thermal/power_plan/set_power_plan), both Wave 6.
-EXPECTED_TOTAL_ROWS = 193
+# Wave 7 PR7.1: +2 autoruns (list/catalog).
+EXPECTED_TOTAL_ROWS = 195
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
@@ -253,7 +255,7 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
         # anticipate) must fail loud here, not read as "no gate = fine".
         self.assertEqual(
             len(fragment_rows), pair_only_count,
-            f"parsed {pair_only_count} plugin/action pairs across the eight fragments but "
+            f"parsed {pair_only_count} plugin/action pairs across the {len(FRAGMENT_FILES)} fragments but "
             f"only {len(fragment_rows)} had an associated .execute_gate — the row/gate "
             "regex has drifted apart from the fragment file format (or a row is missing "
             "its .execute_gate field, which should be a COMPILE failure via each "
@@ -262,9 +264,9 @@ class TestGateConsistencyOnRealTree(unittest.TestCase):
         )
         self.assertEqual(
             len(fragment_rows), EXPECTED_TOTAL_ROWS,
-            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the eight "
+            f"expected exactly {EXPECTED_TOTAL_ROWS} total capability rows across the {len(FRAGMENT_FILES)} "
             f"fragments, found {len(fragment_rows)} — update EXPECTED_TOTAL_ROWS if a row "
-            "was deliberately added or removed, after confirming the eight per-file counts "
+            f"was deliberately added or removed, after confirming the {len(FRAGMENT_FILES)} per-file counts "
             "in the #1398 design doc's row-count audit are updated too",
         )
         self.assertNotIn(

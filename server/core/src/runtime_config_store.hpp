@@ -16,15 +16,29 @@
 /// convenience wrapper — deliberately NOT widened. Every current call site
 /// was audited (kickoff review, 2026-08-25): DEX alert-routing knobs are
 /// deny-or-benign (a degraded read just means no routes/defaults, not a
-/// security decision); `plugin_signing_required` feeds only a UI status
-/// badge and an admin-only manual-fetch distribution endpoint (`GET
-/// /api/v1/agent/plugin-policy` — server-side pack-install enforcement is
-/// gated by `ProductPackStore::require_signed_packs_`, set from the CLI
-/// flag at boot, never from this store; confirmed no agent code consumes
-/// that route today, `agents/` grep). If a future caller wires either into
-/// a real grant/enforce/skip decision, it MUST switch to `get()` and treat
-/// `unexpected` as fail-closed — this deferral is explicit, per the
-/// playbook's "say so" escape hatch, not an oversight.
+/// security decision).
+///
+/// `plugin_signing_required` migrated OFF `get_value()` onto `get()` as of
+/// #4028's fix round: both its readers (`GET /api/v1/agent/plugin-policy`
+/// and the Settings dashboard fragment, `settings_routes.cpp`) now fail
+/// the READ closed (503 / a distinct "status unknown" state) on a genuine
+/// store error, since the flag's value IS what those two surfaces exist to
+/// serve (I3: the caller could not tell a degraded read from a healthy
+/// "not required"). This is a display-honesty fix, not an
+/// enforcement-bypass fix: the flag itself has never gated a live
+/// grant/enforce/skip decision, on this store or any other. **Do not cite
+/// `ProductPackStore::require_signed_packs_` as this flag's enforcement
+/// backstop** — an earlier fix-round draft did, and it is a different
+/// artifact class entirely (`ProductPackStore` gates YAML product-pack
+/// content: `InstructionDefinition`/`PolicyFragment`/`Workflow`
+/// documents, never a compiled plugin binary). Plugin-binary signature
+/// verification, where an agent is configured for it, is local to that
+/// agent via its own `--plugin-require-signature`/`--plugin-trust-bundle`
+/// flags — entirely independent of this store, confirmed by an `agents/`
+/// grep showing no agent code reads this key or this route at all. See
+/// `docs/user-manual/rest-api.md`'s "When a change takes effect" table,
+/// `plugin_signing_required` row, for the authoritative operator-facing
+/// statement of this.
 ///
 /// Substrate contract (ADR-0008): the store holds a `pg::PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned,

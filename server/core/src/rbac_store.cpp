@@ -556,7 +556,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 27> types = {
+    const std::array<std::string_view, 38> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -583,7 +583,92 @@ void RbacStore::seed_defaults() {
         // mutating action). Administrator-only via the CRUD loop below —
         // same PluginConfig/UploadGrant precedent, deliberately absent from
         // the explicit Viewer read-list further down this function.
-        "PowerManagement"};
+        "PowerManagement",
+        // #4030/#4032: WorkflowEngine's multi-step-orchestration securable.
+        // `workflow_routes.cpp` has gated `GET/POST/DELETE /api/workflows*`
+        // + `POST .../execute` on `perm_fn(req, res, "Workflow", <op>)`
+        // since WorkflowEngine's introduction, but "Workflow" was never
+        // added here (or mirrored into mcp_server.cpp's `kRbacSecurables[]`)
+        // — `securable_types` carries no FK from `role_permissions`, so a
+        // `grant(role, "Workflow", op)` call silently inserted a row naming
+        // a type RBAC's own catalogue didn't recognise: no role, including
+        // Administrator, could ever be granted Workflow:* while RBAC was
+        // enabled. Scoped to Workflow ONLY — the identical bug also exists
+        // on ProductPack/Directory (tracked generally by #4032), fixed
+        // independently by #4029/#4031 in their own worktrees to avoid a
+        // cross-worktree merge conflict on this shared array.
+        "Workflow",
+        // #4029 prerequisite fix: `ProductPack` is used as an RBAC securable
+        // string by the already-shipped `/api/product-packs*` routes
+        // (workflow_routes.cpp, `perm_fn(req, res, "ProductPack", "Read"/
+        // "Write"/"Delete")`) but was never seeded here or into
+        // mcp_server.cpp's `kRbacSecurables[]` mirror — `role_permissions.
+        // securable_type` carries a hard FK to `securable_types(name)`, so no
+        // role, not even Administrator, could ever be granted ProductPack:*
+        // while RBAC is enabled. Administrator gets full CRUD for free via
+        // the types-loop below; Read is additionally granted to Operator/
+        // PlatformEngineer/Viewer further down (the same population that
+        // already holds InstructionDefinition:Read) — Write/Delete stay
+        // Administrator-only, matching the issue's scoped ask.
+        "ProductPack",
+        // #4028 (api-parity programme #2146) — Settings read-twins, split
+        // along sensitivity lines rather than one blanket Settings:Read
+        // (per the issue's own scoping note). All four are Administrator-
+        // only via the CRUD loop below, deliberately absent from every
+        // other role's explicit grant list further down (incl. Viewer's
+        // blanket read-list) — matching today's admin_fn_-only gate on the
+        // 8 /fragments/settings/* routes this PR twins. Every (securable,
+        // "Read") pair here is ALSO added to authz_topology_floor.hpp's
+        // kTopologyFloor[], so an RBAC-off deployment stays admin-gated
+        // instead of silently widening to any authenticated user.
+        "TlsConfig",       // TLS + HTTPS listener config (tls/https fragments)
+        "PluginSigning",   // plugin code-signing trust bundle (distinct from
+                           // PluginConfig, which gates per-plugin runtime
+                           // kill-switch config — a different domain)
+        "ServerConfig",    // gateway/server-config/mcp/data-retention fragments
+        "AnalyticsConfig", // analytics fragment (ClickHouse integration)
+        // #4031 prerequisite 1: "Directory" is called at discovery_routes.cpp
+        // (perm_fn(..., "Directory", "Read"/"Write")) but was NEVER seeded
+        // here — role_permissions.securable_type has a hard FK to
+        // securable_types(name), so no role, including Administrator, could
+        // ever be granted Directory:Read/Write. Seeded to Administrator (CRUD
+        // via the loop below) + Viewer (Read, below) — same precedent as
+        // UserManagement (also PII-bearing identity data; Operator/
+        // PlatformEngineer deliberately do NOT get it, narrower than the
+        // Inventory/SoftwareLicensing fleet-metadata pattern since this is
+        // AD/Entra-synced email/UPN/group-membership PII, not device
+        // inventory). Scoped to ONLY this securable — the identical bug on
+        // ProductPack/Workflow is #4029/#4030's job, not this PR's (#4032
+        // tracks the general pattern).
+        "Directory",
+        // #4031 routes 3-4 (auto-approve rules + pending-agent visibility):
+        // previously admin_fn_-gated (a role check, not RBAC), so no
+        // securable existed at all. Read granted to Administrator ONLY via
+        // the CRUD loop below, matching today's admin-only gate — see
+        // authz_topology_floor.hpp for why this pair must ALSO be floored so
+        // RBAC-off doesn't silently widen admin-only to any-authenticated-user.
+        "Enrollment",
+        // #4031 route 5 (OIDC SSO config read, GET /fragments/settings/directory
+        // despite the path). Deliberately NOT named "Directory" — that would
+        // collide with the AD/Entra directory-sync securable seeded above for
+        // a wholly unrelated capability (the naming trap the issue calls out).
+        // Read granted to Administrator ONLY, same admin-only-gate parity and
+        // same topology-floor requirement as Enrollment above.
+        "OidcConfig",
+        // Wave 7 forensics class: execution_artifacts, app_usage, later
+        // shell_history/yara_scan. Administrator CRUD via the loop below;
+        // deliberately ABSENT from the Viewer read-list.
+        "Forensics",
+        // Wave 7 PR7.2: the device-level securable ADR-0024 Decision 9
+        // promoted when the erasure gate's conjunction reached a fourth
+        // securable (app_usage_store, Forensics). `Decommission:Delete` is
+        // the ONLY consumed operation (the DELETE /sle/agents/{id} cascade,
+        // sle_routes.cpp); Administrator gets CRUD via the loop (the
+        // PowerManagement/PluginConfig precedent — unused ops are harmless
+        // and keep the loop uniform); ITServiceOwner gets a TARGETED
+        // Decommission:Delete grant below (see that grant's comment).
+        "Decommission"
+    };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "
              "ON CONFLICT (name) DO NOTHING",
@@ -595,6 +680,13 @@ void RbacStore::seed_defaults() {
          "'gates the /api/v1/sle/* detected-licence reads and the agent-decommission erasure; "
          "the /inventory software catalog remains under Inventory:Read' "
          "WHERE name = 'SoftwareLicensing' AND description = ''");
+    // Wave 7 PR7.2: describe the Decommission securable — set only when
+    // empty, same shape as the SoftwareLicensing UPDATE above.
+    exec("UPDATE rbac_store.securable_types SET description = "
+         "'gates the whole-device erasure cascade behind DELETE "
+         "/api/v1/sle/agents/{id}; per-device scoped; Delete is the only "
+         "consumed operation' "
+         "WHERE name = 'Decommission' AND description = ''");
 
     // Operations. "Rotate" (dev P2 #11, SOC 2 CC6.3, merged from origin/dev):
     // ApiToken-specific self-service rotation
@@ -689,7 +781,14 @@ void RbacStore::seed_defaults() {
         for (std::string_view o : {"Read", "Write", "Execute", "Delete"})
             grant("PlatformEngineer", t, o);
     for (std::string_view t : {"Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
-                               "SoftwareLicensing", "Inventory"})
+                               "SoftwareLicensing", "Inventory",
+                               // #4030: Workflow — read-only, matching Schedule's footprint. Not
+                               // added to the InstructionDefinition/InstructionSet CRUD loop above:
+                               // the issue scopes this prerequisite to granting Read only.
+                               "Workflow",
+                               // #4029: read visibility on installed product packs, matching the
+                               // existing InstructionDefinition:Read population's consistency.
+                               "ProductPack"})
         grant("PlatformEngineer", t, "Read");
     for (std::string_view o : {"Read", "Write", "Delete"})
         grant("PlatformEngineer", "Policy", o);
@@ -724,11 +823,16 @@ void RbacStore::seed_defaults() {
     grant("Operator", "FileRetrieval", "Write");
     grant("Operator", "GuaranteedState", "Read");
     grant("Operator", "GuaranteedState", "Push");
+    // #4029: read visibility on installed product packs.
+    grant("Operator", "ProductPack", "Read");
     // PR1.5/1.6: read visibility only — config and grant LIFECYCLE stay
     // privileged operations, and PluginSecret is deliberately absent here
     // (secret material is never Operator-readable).
     grant("Operator", "PluginConfig", "Read");
     grant("Operator", "UploadGrant", "Read");
+    // #4030: Workflow — read-only (the issue's prerequisite scopes this fix to
+    // granting Read; not added to the CRUD loop above, unlike Schedule/Execution).
+    grant("Operator", "Workflow", "Read");
 
     // ApiTokenManager. "Rotate" merged from origin/dev (P2 #11, SOC 2 CC6.3
     // — self-service human token rotation; same population that already
@@ -746,16 +850,167 @@ void RbacStore::seed_defaults() {
             grant("ITServiceOwner", t, o);
     }
     grant("ITServiceOwner", "GuaranteedState", "Push");
+    // #4030: Workflow — read-only (issue's prerequisite scope is Read only; not
+    // added to the CRUD loop above, unlike Schedule/Execution).
+    grant("ITServiceOwner", "Workflow", "Read");
+    // Wave 7 PR7.2: preserves the SEEDED population that could decommission
+    // under the old SoftwareLicensing∧Inventory∧GuaranteedState:Delete
+    // conjunction (ITSO held CRUD on all three above) — scoped per-device
+    // by the route's gate as before. Deliberately NOT in the ITSO crud_ops
+    // list above: Read/Write/Execute/Approve on Decommission are
+    // meaningless — do not widen.
+    //
+    // Adversarial review finding: grant()'s revoked_seed_defaults check only
+    // matches the EXACT (role, securable, operation) triple, and
+    // Decommission:Delete never existed before this migration, so an
+    // operator who had revoked ANY of the three OLD conjunct grants
+    // specifically to strip ITServiceOwner's decommission ability would
+    // otherwise regain it silently the moment this seed runs. Carry that
+    // prior intent forward onto the new securable BEFORE calling grant():
+    // if any of the three old grants is recorded revoked for
+    // ITServiceOwner, record the SAME revocation against Decommission:Delete
+    // and — critically — also DELETE any role_permissions row already
+    // granted for it. Round 1's fix inserted only the marker: on an
+    // UPGRADING replica, seed_defaults() had already run once before this
+    // block existed (or runs the CRUD/targeted-grant sequence earlier in
+    // THIS same pass, above), so a Decommission:Delete row can already be
+    // present in role_permissions — grant()'s `WHERE NOT EXISTS` guard only
+    // stops a FUTURE (re-)insert, it does not retroactively strip a row
+    // that's already there. Mirror remove_permission()'s own marker+DELETE
+    // pair exactly (same rationale: a hard DELETE with a separate bookkeeping
+    // marker, never a fabricated 'deny' row — see remove_permission()'s own
+    // comment for why) rather than relying on grant()'s guard alone.
+    //
+    // Governance round 5 (Blocker 1): the marker-insert + DELETE pair above
+    // used to run unconditionally on EVERY seed_defaults() call (every server
+    // boot), gated only on the marker's presence — never on whether the row
+    // had since been explicitly RE-GRANTED by an operator via set_permission()
+    // (which writes role_permissions directly and never touches
+    // revoked_seed_defaults). Reproduced: revoke an old grant -> first boot
+    // carries the marker forward and deletes the row (correct, one-time
+    // migration) -> operator explicitly re-grants Decommission:Delete ->
+    // next restart's seed_defaults() deleted the just-re-granted row again,
+    // because the DELETE's only gate was "does the marker exist", and the
+    // marker is permanent bookkeeping, not a one-shot flag.
+    //
+    // The carry-forward is a MIGRATION, not a standing invariant. Detect
+    // "already migrated" the same way the rest of this file treats one-time
+    // state (schema_meta-style: presence of the marker row IS the completion
+    // flag) — probe for the marker BEFORE inserting it, and only run the
+    // insert+DELETE pair when it is not yet present. On the common
+    // no-prior-revocation install this WHERE EXISTS clause is always false,
+    // so the marker row is never inserted and the whole probe/insert/delete
+    // sequence re-runs as a harmless no-op on EVERY boot, not once — "fires
+    // exactly once" describes only the revoked-conjunction install, not the
+    // ordinary case (governance Gate 4 happy-path finding). Once the marker
+    // DOES exist (the revoked-conjunction install), grant()'s own `WHERE NOT
+    // EXISTS` guard is what keeps suppressing a FUTURE reseed of a row an
+    // operator explicitly removed; it does not care about the marker's age,
+    // so it stays correct with the DELETE gone.
+    // Governance round 6: the marker-presence probe below used to conflate a
+    // query FAILURE (transient PG connection/timeout error) with genuine
+    // ABSENCE — both left `decommission_marker_present == false`, silently
+    // re-entering the insert+DELETE branch on a boot that merely hit a PG
+    // hiccup, which reopens round 5's exact bug on a narrower trigger. A
+    // failed probe must SKIP this migration attempt for the current boot
+    // (logged, like every other statement in this function), never be
+    // read as "not yet migrated, do the migration."
+    //
+    // Adversarial review Wave 7 PR7.2b fix round 1 (third instance of this
+    // fail-open class, after rounds 5/6 above): the probe, the marker
+    // INSERT, and the permission DELETE used to run as three SEPARATE
+    // autocommit statements outside any lock, with the INSERT/DELETE bool
+    // results discarded entirely. A transient failure between the marker
+    // INSERT and the permission DELETE durably recorded "migration
+    // complete" via the marker while silently failing to honor the
+    // operator's revocation — grant()'s WHERE NOT EXISTS guard then saw the
+    // marker and skipped re-inserting, so the pre-migration grant the
+    // operator revoked survived, unrevoked, with no error anywhere. Now one
+    // transaction under kRevokeCoordLockSql (the SAME lock grant()/
+    // remove_permission() take for this identical revoke/grant coherence
+    // problem — see that constant's own comment), every statement's result
+    // checked, and the trailing grant() call runs ONLY once this boot's
+    // attempt was decisive (committed, whether or not there was anything to
+    // carry forward) — never after an ambiguous partial failure.
+    bool decommission_migrated = false;
+    if (exec("BEGIN")) {
+        pg::PgTxn txn(c);
+        if (exec(kRevokeCoordLockSql)) {
+            pg::PgResult marker = pg::exec_params(
+                c,
+                "SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = "
+                "'ITServiceOwner' AND securable_type = 'Decommission' AND operation = 'Delete'",
+                std::vector<std::string>{});
+            if (marker.status() != PGRES_TUPLES_OK) {
+                spdlog::error(
+                    "RbacStore: seed_defaults Decommission carry-forward probe failed: {}",
+                    PQerrorMessage(c));
+            } else if (PQntuples(marker.get()) > 0) {
+                decommission_migrated = true; // already migrated on an earlier boot
+            } else if (exec("INSERT INTO rbac_store.revoked_seed_defaults (role_name, "
+                            "securable_type, operation) SELECT 'ITServiceOwner', "
+                            "'Decommission', 'Delete' WHERE EXISTS ("
+                            "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = "
+                            "'ITServiceOwner' AND "
+                            "  ((securable_type = 'SoftwareLicensing' AND operation = 'Delete') "
+                            "OR "
+                            "   (securable_type = 'Inventory' AND operation = 'Delete') OR "
+                            "   (securable_type = 'GuaranteedState' AND operation = 'Delete'))"
+                            ") ON CONFLICT DO NOTHING") &&
+                      exec("DELETE FROM rbac_store.role_permissions WHERE role_name = "
+                          "'ITServiceOwner' AND "
+                          "securable_type = 'Decommission' AND operation = 'Delete' AND EXISTS ("
+                          "  SELECT 1 FROM rbac_store.revoked_seed_defaults WHERE role_name = "
+                          "'ITServiceOwner' AND "
+                          "  securable_type = 'Decommission' AND operation = 'Delete'"
+                          ")")) {
+                // Succeeds (as valid, zero-or-one-row SQL statements) whether
+                // or not an old revocation actually existed to carry forward
+                // -- the WHERE EXISTS clauses correctly no-op either way, so
+                // reaching here always means this boot's attempt is decisive.
+                decommission_migrated = true;
+            }
+            // Reassign, don't just call: `commit()` can itself fail (e.g. a
+            // connection loss at exactly the COMMIT statement) even after
+            // every preceding statement succeeded (governance Gate 3
+            // cpp-safety finding) -- PQexec("COMMIT") returning anything but
+            // PGRES_COMMAND_OK means the txn destructor's ROLLBACK is what
+            // actually ran, so `decommission_migrated` must reflect that or
+            // the trailing grant() below runs unconditionally on a migration
+            // that never durably committed.
+            if (decommission_migrated)
+                decommission_migrated = txn.commit();
+            // else: probe, insert, delete, or commit failed -- txn
+            // destructor rolls back everything (including a lock-only
+            // transaction with no writes); decommission_migrated stays
+            // false either way.
+        }
+    }
+    if (decommission_migrated)
+        grant("ITServiceOwner", "Decommission", "Delete");
+    else
+        spdlog::warn("RbacStore: seed_defaults Decommission carry-forward not migrated this "
+                    "boot; ITServiceOwner Decommission:Delete grant deferred, will retry next "
+                    "boot");
 
     // Viewer: read on all except Infrastructure.
     // #2376 (task A) — Viewer held Security:Read (the only non-Administrator
     // role that did), so it keeps equivalent access on the new
     // EnginePrincipal securable.
-    for (std::string_view t : {"UserManagement", "InstructionDefinition", "InstructionSet",
-                               "Execution", "Schedule", "Approval", "Tag", "AuditLog", "Response",
-                               "ManagementGroup", "ApiToken", "Security", "Policy", "DeviceToken",
-                               "SoftwareDeployment", "License", "FileRetrieval", "GuaranteedState",
-                               "Inventory", "SoftwareLicensing", "EnginePrincipal"})
+    // #4031: Directory (AD/Entra-synced user/group PII) joins on the same
+    // reasoning as UserManagement just above it — both are identity data,
+    // and Viewer already reads UserManagement. Enrollment/OidcConfig
+    // deliberately do NOT join this list — see their seeding comment in
+    // types[] above ("Administrator ONLY, matching today's admin-only gate").
+    for (std::string_view t : {"UserManagement", "Directory", "InstructionDefinition",
+                               "InstructionSet", "Execution", "Schedule", "Approval", "Tag",
+                               "AuditLog", "Response", "ManagementGroup", "ApiToken", "Security",
+                               "Policy", "DeviceToken", "SoftwareDeployment", "License",
+                               "FileRetrieval", "GuaranteedState", "Inventory",
+                               "SoftwareLicensing", "EnginePrincipal",
+                               "Workflow", // #4030: read-only, matching Schedule's footprint.
+                               // #4029: read visibility on installed product packs.
+                               "ProductPack"})
         grant("Viewer", t, "Read");
 
     // Reviewer.

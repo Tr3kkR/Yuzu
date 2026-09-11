@@ -59,7 +59,49 @@ enum class KvInsert { Inserted, Exists, Error };
 /// conflict), or op failed.
 enum class KvRename { Renamed, NotFound, Conflict, Error };
 
-class YUZU_EXPORT KvStore {
+/// The storage contract GuardianLifecycleJournal requires: the 8 KvStore methods it
+/// calls, with signatures identical to KvStore's own. This is a NARROW seam (#4153),
+/// not a general KvStore abstraction - it exists solely so the journal's concurrency
+/// checkpoints can run against an in-memory test double instead of real SQLite I/O.
+/// Production always constructs the journal with a real KvStore.
+///
+/// Contract every implementation MUST keep - the journal's multi-caller safety
+/// argument (see guardian_lifecycle_journal.hpp's CONCURRENCY block) rests on it:
+///   * each call serialises itself (one lock covers the whole call, exactly like
+///     KvStore's single std::mutex mu_);
+///   * each call returns an OWNING snapshot (a copy), never a reference into
+///     internal state, and releases its lock before returning;
+///   * a call never invokes a callback, blocks on another participant, or calls
+///     back into the journal while holding its lock.
+/// A future second consumer of this interface must not weaken any of the three.
+class YUZU_EXPORT IJournalStore {
+public:
+    virtual ~IJournalStore() = default;
+
+    [[nodiscard]] virtual int pragma_synchronous() = 0;
+
+    [[nodiscard]] virtual std::expected<KvNamespaceSize, KvStoreError>
+    namespace_size(std::string_view plugin, std::string_view prefix) = 0;
+
+    [[nodiscard]] virtual std::expected<std::vector<KvKeySize>, KvStoreError>
+    list_keys_sized(std::string_view plugin, std::string_view prefix) = 0;
+
+    [[nodiscard]] virtual std::expected<std::optional<std::string>, KvStoreError>
+    get_entry(std::string_view plugin, std::string_view key) = 0;
+
+    [[nodiscard]] virtual KvInsert insert_if_absent(std::string_view plugin, std::string_view key,
+                                                    std::string_view value) = 0;
+
+    [[nodiscard]] virtual KvRename rename_key(std::string_view plugin, std::string_view from_key,
+                                              std::string_view to_key) = 0;
+
+    [[nodiscard]] virtual int del_keys(std::string_view plugin,
+                                       const std::vector<std::string>& keys) = 0;
+
+    virtual bool set(std::string_view plugin, std::string_view key, std::string_view value) = 0;
+};
+
+class YUZU_EXPORT KvStore final : public IJournalStore {
 public:
     /**
      * Open (or create) the KV store database at the given path.
@@ -76,7 +118,7 @@ public:
     KvStore& operator=(const KvStore&) = delete;
 
     /** Store a key-value pair for the given plugin. Returns true on success. */
-    bool set(std::string_view plugin, std::string_view key, std::string_view value);
+    bool set(std::string_view plugin, std::string_view key, std::string_view value) override;
 
     /** Retrieve a value. Returns std::nullopt if the key does not exist. */
     std::optional<std::string> get(std::string_view plugin, std::string_view key);
@@ -117,7 +159,7 @@ public:
      * counts CHARACTERS and would silently under-count every multibyte value.
      */
     [[nodiscard]] std::expected<KvNamespaceSize, KvStoreError>
-    namespace_size(std::string_view plugin, std::string_view prefix);
+    namespace_size(std::string_view plugin, std::string_view prefix) override;
 
     /**
      * Per-row keys and value BYTE lengths for a (plugin, prefix) scan, WITHOUT
@@ -132,7 +174,7 @@ public:
      * byte parity with KvRow::value.size() (see namespace_size()).
      */
     [[nodiscard]] std::expected<std::vector<KvKeySize>, KvStoreError>
-    list_keys_sized(std::string_view plugin, std::string_view prefix);
+    list_keys_sized(std::string_view plugin, std::string_view prefix) override;
 
     /**
      * Fallible, byte-exact point read: the single-key sibling of list_entries().
@@ -143,7 +185,7 @@ public:
      * truncation and a corrupt value reaches the parser intact.
      */
     [[nodiscard]] std::expected<std::optional<std::string>, KvStoreError>
-    get_entry(std::string_view plugin, std::string_view key);
+    get_entry(std::string_view plugin, std::string_view key) override;
 
     /**
      * Insert only if (plugin, key) is absent. Uses INSERT ... ON CONFLICT DO
@@ -152,7 +194,7 @@ public:
      * truthful.
      */
     [[nodiscard]] KvInsert insert_if_absent(std::string_view plugin, std::string_view key,
-                                            std::string_view value);
+                                            std::string_view value) override;
 
     /**
      * Atomically rename (plugin, from_key) → (plugin, to_key) via a single UPDATE
@@ -160,14 +202,15 @@ public:
      * Used for the quarantine move - never a non-atomic copy+delete.
      */
     [[nodiscard]] KvRename rename_key(std::string_view plugin, std::string_view from_key,
-                                      std::string_view to_key);
+                                      std::string_view to_key) override;
 
     /**
      * Delete a set of keys for a plugin in ONE transaction. Returns the number
      * actually removed (via RETURNING, not sqlite3_changes()). All-or-nothing: on
      * error the transaction rolls back and 0 is returned.
      */
-    [[nodiscard]] int del_keys(std::string_view plugin, const std::vector<std::string>& keys);
+    [[nodiscard]] int del_keys(std::string_view plugin,
+                               const std::vector<std::string>& keys) override;
 
     /**
      * The effective `PRAGMA synchronous` level (0=OFF, 1=NORMAL, 2=FULL,
@@ -175,7 +218,7 @@ public:
      * FULL; the caller SOFT-warns on anything less (never a hard abort - config
      * drift must not kill an agent).
      */
-    [[nodiscard]] int pragma_synchronous();
+    [[nodiscard]] int pragma_synchronous() override;
 
     /**
      * TEST-ONLY: turn on SQLite extended result codes for this connection.

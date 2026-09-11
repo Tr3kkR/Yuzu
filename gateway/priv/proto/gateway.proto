@@ -79,6 +79,12 @@ message StreamStatusNotification {
   // priv/proto/yuzu/gateway/v1/gateway.proto) must carry it identically or
   // gpb drops it on one of the two build paths.
   repeated string wire_capabilities = 6;
+
+  // Gateway cluster this agent is connected through (trust zone / region).
+  // The gateway is the only party that knows this; the server records it in
+  // the agent→cluster routing directory (HA WS-4). Empty from a gateway
+  // build predating WS-4.
+  string cluster_id = 7;
 }
 
 message StreamStatusAck {

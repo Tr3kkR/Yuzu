@@ -1149,6 +1149,12 @@ TEST_CASE("is_login_exempt_path: unrelated API paths are NOT exempt",
     CHECK_FALSE(is_login_exempt_path("/mcp/v1/tools"));
     CHECK_FALSE(is_login_exempt_path("/dashboard"));
     CHECK_FALSE(is_login_exempt_path("/scimv2/Users")); // no slash — not a prefix match
+    // #2057: /api/v1/openapi.json used to be listed here (see the removed
+    // "regression" assertion below's git history) — it no longer is. The
+    // route now gates Infrastructure:Read itself (rest_api_v1.cpp), so the
+    // pre-routing chokepoint must resolve a session for it like every other
+    // /api/v1/* route rather than skip straight to the handler.
+    CHECK_FALSE(is_login_exempt_path("/api/v1/openapi.json"));
 }
 
 TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
@@ -1160,7 +1166,6 @@ TEST_CASE("is_login_exempt_path: every pre-existing exempt path is unchanged",
     CHECK(is_login_exempt_path("/api/health"));
     CHECK(is_login_exempt_path("/auth/oidc/start"));
     CHECK(is_login_exempt_path("/auth/callback"));
-    CHECK(is_login_exempt_path("/api/v1/openapi.json"));
     CHECK(is_login_exempt_path("/auth/saml/start"));
     CHECK(is_login_exempt_path("/saml/acs"));
     CHECK(is_login_exempt_path("/api/v1/ca/root"));

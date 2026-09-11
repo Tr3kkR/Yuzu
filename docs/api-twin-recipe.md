@@ -398,24 +398,31 @@ if (!audit_ok)
 ```
 
 **Honesty note on this example** — these three snippets are real, current code and correctly
-demonstrate each posture, but they are not, today, three surfaces serving *literally* the same
-route: the per-device drill (`dex.device.app_perf.view`) has a REST route and a dashboard fragment
-but **no MCP twin yet** (verified: no reference to `app_perf_providers.device` anywhere in
-`mcp_server.cpp`), and `compare_app_perf_versions` is a different, fleet/cohort-scoped route in the
-same DEX app-perf family that happens to have all three failure-posture concerns worked out on its
-MCP side. Use these two snippets to learn the *shape* of each posture; don't infer that this
-specific triplet of routes has full three-way parity today — it doesn't. A codebase-wide search
-for one *single* route with a genuine REST+fragment+MCP triplet turned up none as clean as this
-recipe would like; the `network`/`fleet`/`devices` and `engine-principals`/`access-reviews` families
-come closest to full REST+MCP parity but predate the fragment layer or don't have one.
+demonstrate each posture. *(Correction, #4035:* the per-device drill's MCP gap this paragraph
+originally described is now closed — `get_dex_device_app_perf` (`mcp_server.cpp`) is the MCP twin,
+calling the shared `dex_device_app_perf_json` builder (`dex_read_model.hpp`) the REST route also
+calls, per Rule 1. `dex.device.app_perf.view` is now a genuine REST+fragment+MCP triplet, one of the
+first in the tree — but `compare_app_perf_versions` is still a *different*, fleet/cohort-scoped route
+in the same DEX app-perf family, not a fourth surface of the same capability; see the correction
+below about which posture it actually demonstrates.) A codebase-wide search for one *single* route
+with a genuine REST+fragment+MCP triplet otherwise turned up none as clean as this recipe would
+like; the `network`/`fleet`/`devices` and `engine-principals`/`access-reviews` families come closest
+to full REST+MCP parity but predate the fragment layer or don't have one.
 
 Also worth knowing: for MCP, the generic per-tool audit wrapper `mcp_audit` (`mcp_server.cpp:3959`)
-stamps the audit action as `"mcp." + tool_name` by default; several tools (including
-`compare_app_perf_versions` above) instead call `try_persist_audit` directly with the REST-side
-domain verb (`dex.app_perf.compare`) so the audit trail reads the same regardless of transport.
-**Prefer the domain verb over the generic `mcp.<tool_name>` action** when a REST twin with an
-established verb already exists — that keeps the audit log queryable by capability rather than by
-transport.
+stamps the audit action as `"mcp." + tool_name` by default; several tools call `try_persist_audit`
+directly with the REST-side domain verb instead, so the audit trail reads the same regardless of
+transport — `get_dex_signal_detail` and #4035's `get_dex_device_score`/`get_dex_device_app_perf` are
+real examples of this. **Prefer the domain verb over the generic `mcp.<tool_name>` action** when a
+REST twin with an established verb already exists — that keeps the audit log queryable by capability
+rather than by transport. *(Correction, #4035: `compare_app_perf_versions` — cited above as an
+example of this — does NOT actually do it. Re-reading its handler in full: the only audit call is
+the generic `mcp_audit("success", ...)`, which persists `action="mcp.compare_app_perf_versions"`, not
+the domain verb `dex.app_perf.compare` this paragraph claimed. Its DENIAL path
+(`deny_fleet_wide_service_scoped`) does correctly use the domain verb, and
+`docs/user-manual/rest-api.md`'s own MCP tool table already documents the success-path discrepancy
+correctly — this recipe doc was the one that had it wrong. Treat `get_dex_signal_detail` as this
+rule's verified worked example instead.)*
 
 ### One more asymmetry: read vs. mutate
 

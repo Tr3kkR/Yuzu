@@ -348,11 +348,12 @@ struct Config {
     // (constrained break-glass). See docs/auth-architecture.md "Hardened mode".
     //
     // "standard" (default) leaves local-password login enabled. "sso-only"
-    // disables the local-password path fleet-wide — only OIDC SSO mints a
-    // session — EXCEPT for a single designated break-glass account that is
+    // disables the local-password path fleet-wide — only an SSO provider mints
+    // a session — EXCEPT for a single designated break-glass account that is
     // exempt ONLY while armed (an out-of-band host operator ran
-    // --break-glass-arm within the window). sso-only refuses to start without
-    // OIDC configured (it would otherwise lock every operator out).
+    // --break-glass-arm within the window). sso-only refuses to start unless an
+    // SSO provider is configured — OIDC, or (Linux/macOS, HTTPS on) SAML — since
+    // it would otherwise lock every operator out (gate: sso_boot_guard.hpp).
     std::string auth_mode{"standard"}; // "standard" | "sso-only"
     /// Username of the single local account exempt from sso-only while armed.
     /// Empty = no break-glass account. Must exist and have MFA enrolled

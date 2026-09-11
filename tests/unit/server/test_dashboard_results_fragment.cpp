@@ -177,6 +177,68 @@ TEST_CASE("/fragments/results: admitted + scoped gate hides out-of-scope rows "
     CHECK_FALSE(contains(res->body, "2 agents"));
 }
 
+// #4027 fix round 2 (adversarial review CDX-P2-08): GET /api/v1/tar/retention-paused's
+// explicit service-scoped-token 403 (dashboard_routes.cpp, ahead of fleet_read_fn_)
+// must emit a durable audit row, not just a metric — this is the exact regression the
+// finding caught (the check replaced perm_fn_/require_permission's service-scope
+// default-deny branch, which DID audit via AuthRoutes::audit_log). Lives here rather
+// than test_dashboard_tar_fragments.cpp because the path under test returns before
+// gather_tar_retention_paused/response_store/mgmt_group_store are ever touched, so it
+// needs none of that file's real-Postgres ManagementGroupStorePg fixture — same
+// minimal-registration pattern as the /fragments/results tests above, self-contained
+// rather than reusing FragmentResultsHarness (whose auth_fn has no service-scope hook).
+TEST_CASE("GET /api/v1/tar/retention-paused: service-scoped token denial is audited, "
+          "not just counted",
+          "[server][dashboard][tar][auth]") {
+    yuzu::MetricsRegistry metrics;
+    DashboardRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+
+    struct AuditRow {
+        std::string action, result, target_type, target_id, detail;
+    };
+    std::vector<AuditRow> audits;
+
+    auto auth_fn = [](const httplib::Request&,
+                      httplib::Response&) -> std::optional<auth::Session> {
+        auth::Session s;
+        s.username = "svc-op";
+        s.role = auth::Role::admin;
+        s.token_scope_service = "printers"; // non-empty -> service-scoped token
+        return s;
+    };
+    auto perm_fn = [](const httplib::Request&, httplib::Response&, const std::string&,
+                      const std::string&) -> bool { return true; };
+    auto audit_fn = [&audits](const httplib::Request&, const std::string& action,
+                              const std::string& result, const std::string& target_type,
+                              const std::string& target_id, const std::string& detail) {
+        audits.push_back({action, result, target_type, target_id, detail});
+    };
+
+    routes.register_routes(
+        sink, auth_fn, perm_fn, audit_fn,
+        /*response_store=*/nullptr, /*mgmt_group_store=*/nullptr, /*registry=*/nullptr,
+        /*tag_store=*/nullptr, /*event_bus=*/nullptr,
+        /*agents_json_fn=*/[] { return std::string{"[]"}; },
+        /*dispatch_fn=*/DashboardRoutes::DispatchFn{},
+        /*caller_fn=*/DashboardRoutes::CallerFn{},
+        /*resolve_fn=*/[](const std::string&) { return std::pair<std::string, std::string>{}; },
+        &metrics, /*instruction_store=*/nullptr);
+    // fleet_read_fn_ deliberately left UNWIRED — the service-scope check must
+    // deny (and audit) BEFORE the route ever reaches it; if this test somehow
+    // needed a wired gate to pass, that would itself prove the ordering broke.
+
+    auto res = sink.Get("/api/v1/tar/retention-paused");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(contains(res->body, "service-scoped"));
+
+    REQUIRE(audits.size() == 1);
+    CHECK(audits[0].action == "tar.retention_paused.view");
+    CHECK(audits[0].result == "denied");
+    CHECK(audits[0].target_type == "Infrastructure");
+}
+
 // #3565: this codebase has a documented prior incident (authz_model.hpp's
 // own doc comment on VisibleSet{}) of an engaged-empty scope (deny_all())
 // being mishandled as unfiltered/nullopt, serving the whole fleet to a

@@ -32,6 +32,16 @@ logged + skipped (per-channel isolation; e.g. PushNotifications-Platform is
 absent on some builds) — the catalogue row then honestly reads zero for that
 device while other devices still report.
 
+**Machine-readable access to one family.** `GET /api/v1/dex/catalogue/group`
+and the MCP twin `get_dex_catalogue_group` (#4035, api-parity #2146 Batch A)
+each take a `name` parameter that must **exactly** match one of the 13
+display-group names `dex_signal_groups()` defines (e.g. `App reliability`,
+`System stability`, `Network`) — the same names the `/dex` Catalogue dashboard
+tab's family cards use. An unknown name is rejected (`404` on REST,
+`kInvalidParams` on MCP) rather than silently returning an empty result. See
+`docs/user-manual/rest-api.md` "DEX (Digital Employee Experience)" for the
+full response shape.
+
 ## Uniform observation shape
 
 Every signal maps onto the same shape — on the wire (`detail_json`), in the

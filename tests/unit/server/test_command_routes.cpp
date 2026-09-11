@@ -18,12 +18,15 @@
  */
 
 #include "command_routes.hpp"
+#include "management_group_store.hpp"
+#include "test_mgmt_group_pg_helper.hpp"
 #include "test_route_sink.hpp"
 
 #include "agent_registry.hpp"
 #include "capability_decls/core_dispatch_capabilities.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
+#include "dispatch_destructive_gate.hpp"
 #include "event_bus.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -62,8 +65,10 @@ agent_pb::AgentInfo make_agent_info(const std::string& id) {
 // A small, independent fixture (never the real catalogue — that is
 // test_command_capability.cpp's job): one ReadOnly row for the ordinary
 // dispatch-success tests, one Destructive row for the destructive-gate
-// path (fix #5).
-inline constexpr std::array<CommandCapability, 2> kFixture{{
+// path (fix #5), and one Forensics row (Wave 7 PR7.2's single-target rule)
+// mirroring the shape a real Forensics-securable row takes (a companion
+// package's app_usage.last_used, for one) rather than reclassifying it here.
+inline constexpr std::array<CommandCapability, 3> kFixture{{
     {
         .plugin = "noop",
         .action = "run",
@@ -85,6 +90,17 @@ inline constexpr std::array<CommandCapability, 2> kFixture{{
         .risk_tier = yuzu::server::authz::RiskTier::High,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "app_usage",
+        .action = "last_used",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Forensics",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
     },
 }};
 
@@ -145,14 +161,18 @@ struct CommandHarness {
     Deps deps;
     yuzu::server::test::TestRouteSink sink;
 
-    CommandHarness() {
+    // Wave 7 PR7.2: an optional real ManagementGroupStore, so the Forensics
+    // single-target composition tests below can drive an actual in-scope
+    // dispatch rather than only the fail-closed-empty confinement arm every
+    // other case here exercises (mgmt_group_store stays nullptr by default).
+    explicit CommandHarness(ManagementGroupStore* mg = nullptr) {
         (void)registry.register_agent(make_agent_info("dev-A"));
         (void)registry.register_agent(make_agent_info("dev-B"));
 
         deps.metrics = &metrics;
         deps.registry = &registry;
         deps.capability_registry = &capability_registry;
-        deps.mgmt_group_store = nullptr;
+        deps.mgmt_group_store = mg;
         deps.result_set_store = nullptr;
         deps.tag_store = nullptr;
         deps.custom_properties_store = nullptr;
@@ -294,6 +314,28 @@ struct CommandHarness {
         register_command_routes(sink, deps);
     }
 };
+
+/// Wave 7 PR7.2: makes `agents` visible to the harness's "tester" principal
+/// (the session `auth_fn` always mints) via a group `tester` holds a role
+/// on — the same shape as test_dashboard_destructive_gate.cpp's helper of
+/// the same name, needed here so the Forensics single-target composition
+/// test below can drive a real Targeted dispatch rather than only the
+/// fail-closed-empty confinement arm.
+void grant_visibility(ManagementGroupStore& mg, std::initializer_list<std::string> agents) {
+    ManagementGroup g;
+    g.name = "All Devices";
+    g.membership_type = "static";
+    auto gid = mg.create_group(g);
+    REQUIRE(gid.has_value());
+    for (const auto& a : agents)
+        REQUIRE(mg.add_member(*gid, a).has_value());
+    GroupRoleAssignment ra;
+    ra.group_id = *gid;
+    ra.principal_type = "user";
+    ra.principal_id = "tester";
+    ra.role_name = "ITServiceOwner";
+    REQUIRE(mg.assign_role(ra).has_value());
+}
 
 } // namespace
 
@@ -699,4 +741,85 @@ TEST_CASE("/api/command: emit_event(command.dispatched) throwing increments the 
               .counter("yuzu_server_dispatch_fanout_throw_total",
                        {{"route", "command"}, {"phase", "emit_event(command.dispatched)"}})
               .value() == 1);
+}
+
+// ── Wave 7 PR7.2: Forensics single-target rule through the REAL /api/command
+// producer surface (not just evaluate_destructive_targeting in isolation) ──
+
+TEST_CASE("/api/command: a Forensics action with ZERO targets (agent_ids omitted) is refused "
+          "with the forensic-specific message",
+          "[command_routes][security]") {
+    CommandHarness h;
+    auto res = h.sink.Post("/api/command", R"({"plugin":"app_usage","action":"last_used"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"] == std::string(yuzu::server::kForensicUntargetedMessage));
+    bool saw_reason = false;
+    for (const auto& c : h.audit_calls)
+        if (c.detail.find(std::string(yuzu::server::kReasonForensicUntargeted)) !=
+            std::string::npos)
+            saw_reason = true;
+    CHECK(saw_reason);
+}
+
+TEST_CASE("/api/command: a Forensics action with TWO explicit targets is refused — the rule is "
+          "exactly-one, not merely non-empty",
+          "[command_routes][security]") {
+    CommandHarness h;
+    auto res = h.sink.Post(
+        "/api/command",
+        R"({"plugin":"app_usage","action":"last_used","agent_ids":["dev-A","dev-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"] == std::string(yuzu::server::kForensicUntargetedMessage));
+}
+
+TEST_CASE("/api/command: a Forensics action with a scope key alongside a single agent_id is "
+          "refused — scope fan-out is never admitted for a forensic read",
+          "[command_routes][security]") {
+    CommandHarness h;
+    auto res = h.sink.Post(
+        "/api/command",
+        R"({"plugin":"app_usage","action":"last_used","agent_ids":["dev-A"],"scope":"__all__"})");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"] == std::string(yuzu::server::kForensicUntargetedMessage));
+}
+
+TEST_CASE("/api/command: a Forensics action with exactly ONE explicit, in-scope target DOES "
+          "dispatch",
+          "[pg][command_routes][security]") {
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    REQUIRE(mg.is_open());
+    grant_visibility(mg, {"dev-A", "dev-B"});
+
+    CommandHarness h{&mg};
+    auto res = h.sink.Post(
+        "/api/command", R"({"plugin":"app_usage","action":"last_used","agent_ids":["dev-A"]})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["status"] == "sent");
+    CHECK(j["agents_reached"] == 1);
+    CHECK(h.send_to_ids_called == std::vector<std::string>{"dev-A"});
+}
+
+TEST_CASE("/api/command: a Forensics action's single target falling outside the caller's "
+          "visible set is a 404, distinct from the untargeted 400",
+          "[pg][command_routes][security]") {
+    yuzu::test::ManagementGroupStorePg mg_bundle;
+    ManagementGroupStore& mg = *mg_bundle;
+    REQUIRE(mg.is_open());
+    grant_visibility(mg, {"dev-A"}); // dev-B deliberately NOT granted
+
+    CommandHarness h{&mg};
+    auto res = h.sink.Post(
+        "/api/command", R"({"plugin":"app_usage","action":"last_used","agent_ids":["dev-B"]})");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(h.send_to_ids_called.empty());
 }
