@@ -255,6 +255,11 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
     // side of the kill race the child landed on.
     int natural_exits = 0;
     for (int i = 0; i < 40; ++i) {
+        // The 5000ms deadline is deliberately generous relative to the line
+        // cap (which should fire almost immediately) -- keep it that way if
+        // this test is ever edited: the else branch below only stays
+        // load-independent of K1's tight-margin race because deadline_hit
+        // needs the WHOLE 5s, not a few ms, to beat line_cap_stop.
         SubprocessResult result = run_bounded_subprocess(
             {"/bin/sh", "-c", "printf 'a\\nb\\n'; exit 3"},
             SubprocessOptions{.deadline = 5000ms, .max_lines = 2, .stop_after_max_lines = true});
@@ -268,11 +273,17 @@ TEST_CASE("run_bounded_subprocess: a natural nonzero exit survives the stop_afte
             // correctly credits `exited`, not `line_limit`, even though the
             // cap was also hit.
             CHECK(result.termination_reason == TerminationReason::exited);
-        } else {
-            // The kill won: reason must actually be line_limit, not some
-            // OTHER kill path (the deadline-drain escape hatch, or a real
-            // unrelated signal death) silently absorbed by the same -1
-            // sentinel and mistaken for the race this test targets.
+        } else if (!result.timed_out) {
+            // The kill won, and it wasn't the deadline (that's the
+            // unconditional CHECK_FALSE(timed_out) above's job to catch --
+            // the runner checks deadline/cancel before line_cap every poll
+            // iteration, so under EXTREME starvation the 5s deadline could
+            // in principle win first; guard here rather than assume it
+            // can't, matching K1's own considered stance on this box's
+            // documented contention history). So reason must actually be
+            // line_limit, not some OTHER kill path (a real unrelated signal
+            // death) silently absorbed by the same -1 sentinel and mistaken
+            // for the race this test targets.
             CHECK(result.termination_reason == TerminationReason::line_limit);
         }
     }
@@ -327,13 +338,15 @@ TEST_CASE("a natural exit racing the deadline is reported exited, never deadline
     // a CPU-contention condition, not a sanitizer-instrumentation effect
     // (this loop's own child processes are never sanitizer-instrumented;
     // only the parent test binary is). This floor is CONFIRMED linkage-
-    // independent, not just theorised: 3 full-suite trials against the
-    // pre-#4019 dynamic-linkage build and 3 against the post-fix
-    // static-linkage build hit this exact floor 3/3 and 2/3 respectively --
-    // near-identical rates on both, on a box that (per BigColin's own
-    // standing multi-session usage) is realistically never fully idle, only
-    // ever "not deliberately co-scheduled with Coverage." A run that trips
-    // this floor without an intentionally co-scheduled job is consistent
+    // independent, not just theorised: 3 FULL ~2977-case suite runs (not
+    // the isolated [subprocess]-tag runs this fix was otherwise verified
+    // against, which stay clean -- this floor only shows up late in a long
+    // run) against the pre-#4019 dynamic-linkage build and 3 against the
+    // post-fix static-linkage build hit this exact floor 3/3 and 2/3
+    // respectively -- near-identical rates on both, WITHOUT an
+    // intentionally co-scheduled Coverage job (BigColin's own standing
+    // multi-session usage was ambient load enough on its own). A run that
+    // trips this floor without an intentionally co-scheduled job is consistent
     // with that same contention story, not evidence against it. Ruled OUT
     // as the fix here: bumping 40 to a larger N (more exposure to the same
     // contention, no reason to expect a different ratio) and a bounded
