@@ -2854,13 +2854,17 @@ public:
         // error = the store call itself failed).
         metrics_.describe("yuzu_server_gateway_route_reap_total",
                           "gateway_route_store reap_stale_routes() pass outcomes, by outcome "
-                          "(ok|declined|error). declined = the pass was skipped by the "
+                          "(ok|recovered|declined|error). declined = the pass was skipped by the "
                           "clock-guarded-retention anomaly guard (implausible or unparseable "
                           "now()/anchor reading, or an anomaly that has not yet persisted across "
-                          "a full decline-and-retry) and reaped nothing; error = the store call "
-                          "failed outright (pool/query degradation). This is the observable "
-                          "signal for the clock-guarded-retention part-1 carve-out and the "
-                          "decline-once/drain-on-repeat part-4 guard documented in "
+                          "a full decline-and-retry) and reaped nothing; recovered = an anomaly "
+                          "PERSISTED across a full decline pass and this pass drained the "
+                          "capped sweeps as genuine elapsed downtime (PR #4299 round-2 review) "
+                          "-- a sustained recovered rate means the reaper is recovering from a "
+                          "clock anomaly or a real gap and is worth an operator look; error = "
+                          "the store call failed outright (pool/query degradation). This is the "
+                          "observable signal for the clock-guarded-retention part-1 carve-out "
+                          "and the decline-once/drain-on-repeat part-4 guard documented in "
                           "gateway_route_store.hpp's reap_stale_routes header.",
                           "counter");
         // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
@@ -2868,9 +2872,9 @@ public:
         // kQuarantineGateOutcomes/kSystemReservedPushes idiom above — so
         // `absent()` on any one of them means "never happened", not "nobody
         // has looked yet". Without this, a healthy server that never once
-        // declines/errors reads identically to one whose reap job never runs
-        // at all.
-        for (const char* outcome : {"ok", "declined", "error"})
+        // declines/recovers/errors reads identically to one whose reap job
+        // never runs at all.
+        for (const char* outcome : {"ok", "recovered", "declined", "error"})
             metrics_.counter("yuzu_server_gateway_route_reap_total", {{"outcome", outcome}});
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
@@ -15237,6 +15241,23 @@ private:
                                     metrics_
                                         .counter("yuzu_server_gateway_route_reap_total",
                                                  {{"outcome", "declined"}})
+                                        .increment();
+                                } else if (reaped->recovered) {
+                                    // PR #4299 round-2 review (FIX B): a
+                                    // recovery pass ran the capped sweeps
+                                    // just like an "ok" pass, but it drained
+                                    // whatever accumulated behind a
+                                    // persisted clock anomaly -- distinct
+                                    // enough (can mass-reap a genuine gap)
+                                    // to warrant its own metric outcome
+                                    // rather than reading identically to a
+                                    // routine tick.
+                                    spdlog::info("gateway_route_store reap recovered: an "
+                                                 "anomaly persisted across a full decline pass "
+                                                 "and this pass drained the backlog");
+                                    metrics_
+                                        .counter("yuzu_server_gateway_route_reap_total",
+                                                 {{"outcome", "recovered"}})
                                         .increment();
                                 } else {
                                     metrics_

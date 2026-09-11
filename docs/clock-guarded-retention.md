@@ -179,19 +179,40 @@ unconditional per-predicate cap):
    later transient glitch is judged fresh against the new anchor rather than free-riding on a stale
    recovery. **Why this mattered**: the carved-out version wedged PERMANENTLY after any routine >24h
    gap (weekend shutdown, DR failover, extended maintenance) — `now - anchor` only grows while
-   declined, so every subsequent pass declined forever with no recovery path; a persistent clock
-   problem (never resolving) correctly never recovers on its own by the same logic, and needs an
-   **operator re-anchor**: reset `route_meta.reap_anchor_ms` (and, for cleanliness,
-   `route_meta.reap_declined_anchor_ms`) to the corrected current epoch-ms once the underlying clock
-   is fixed — see the code comment at `gateway_route_store.cpp`'s anomaly-detection site. Every
+   declined, so every subsequent pass declined forever with no recovery path. **Corrected (round-2
+   review): there is no permanent wedge either way.** A skew that persists into the next pass
+   presents the SAME frozen anchor, which is exactly the `declined_anchor == anchor` match, so it
+   RECOVERS on that pass — it does not "correctly never recover on its own." A continuously-drifting
+   clock instead OSCILLATES (decline, recover, decline, recover, ...) roughly every other pass, since
+   a recovered pass re-anchors to that pass's `now_ms` unconditionally, and the next pass judges
+   itself fresh against the new anchor. The **operator re-anchor** (reset `route_meta.reap_anchor_ms`
+   and, for cleanliness, `route_meta.reap_declined_anchor_ms` to the corrected current epoch-ms once
+   the underlying clock is fixed) is an OPTIONAL escape hatch to stop that oscillation, not a
+   requirement to un-wedge anything — see the code comment at `gateway_route_store.cpp`'s
+   anomaly-detection site. Every
    decline is `spdlog::warn`'d AND counted:
    `yuzu_server_gateway_route_reap_total{outcome="declined"}` (incremented at the reap call site in
-   `server.cpp`, pre-seeded across `ok`/`declined`/`error` since PR #4299). This is a DEDICATED
-   reap-outcome counter, distinct from `yuzu_server_gateway_route_desync_total`/`_write_failed_total`,
-   which cover the WRITE path (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not
-   a reap pass's own outcome. A reap pass that fails outright (pool/query degradation, distinct from a
-   clock-anomaly decline) is counted the same way under `outcome="error"`; a clean accepted OR
-   recovered pass is `outcome="ok"`.
+   `server.cpp`, pre-seeded across `ok`/`recovered`/`declined`/`error` since PR #4299 round-2). This
+   is a DEDICATED reap-outcome counter, distinct from
+   `yuzu_server_gateway_route_desync_total`/`_write_failed_total`, which cover the WRITE path
+   (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not a reap pass's own outcome.
+   A reap pass that fails outright (pool/query degradation, distinct from a clock-anomaly decline) is
+   counted the same way under `outcome="error"`; a clean, ORDINARY accepted pass is `outcome="ok"`; a
+   pass that ran via the recovery branch above is its own `outcome="recovered"` (PR #4299 round-2
+   review, `ReapRoutesResult::recovered`) — a recovery can drain a large backlog in one go, so it is
+   metric-distinguishable from a routine `ok` tick rather than reading identically to one.
+
+   **Cross-type recovery is anchor-value-keyed, not direction-keyed (PR #4299 round-2 review).** The
+   `declined_anchor == anchor` match above is blind to whether THIS pass's own anomaly is forward- or
+   backward-classified, or whether it matches the classification of the pass that froze
+   `declined_anchor` in the first place — so a forward-skew decline followed by a BACKWARD-skew repeat
+   at that SAME anchor also satisfies the match and recovers. This is deliberate and safe: the
+   recovery branch always computes its reap cutoffs from THIS pass's own `now_ms` (the real, current
+   DB clock read that pass), never from the anchor. A forward-skewed `now_ms` is itself the
+   corrupted/huge reading, so only a forward-classified recovery can mass-reap; a backward-classified
+   pass has a normal (or genuinely small) `now_ms`, so it can only UNDER-reap relative to an ordinary
+   pass — a live row with a future lease is never brought into range by a smaller `now_ms`. Adding
+   anomaly-type keying on top of the anchor-value key is therefore unnecessary.
 
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
 regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a

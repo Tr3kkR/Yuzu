@@ -141,11 +141,19 @@ struct DeregisterResult {
 /// DECLINED because a clock-guard-critical reading (DB `now()` or the
 /// persisted `route_meta` anchor) was unusable — implausibly ahead of, or
 /// behind, the anchor, or unparseable/negative. A declined pass reaps
-/// nothing and leaves the anchor unchanged.
+/// nothing and leaves the anchor unchanged. `recovered` is true iff this
+/// pass was NOT declined but DID run via the decline-once/drain-on-repeat
+/// recovery branch (an anomaly persisted across a full decline pass — see
+/// the reap_stale_routes() header below and docs/clock-guarded-retention.md)
+/// — distinct from an ordinary accepted pass, since a recovery can drain a
+/// large backlog in one go and is worth its own metric outcome
+/// (`yuzu_server_gateway_route_reap_total{outcome="recovered"}`, PR #4299
+/// round-2 review). `clock_anomaly` and `recovered` are mutually exclusive.
 struct ReapRoutesResult {
     int expired_leases_reaped{0}; ///< predicate (a): lease_until past the grace window
     int tombstones_reaped{0};     ///< predicate (b): NULL-lease rows past the purge age
     bool clock_anomaly{false};
+    bool recovered{false};
 };
 
 /// A durable agent→cluster route, as read by `lookup_route`. Timestamps are
@@ -253,8 +261,12 @@ public:
     ///    `yuzu_server_gateway_route_reap_total{outcome="declined"}`
     ///    (incremented at the server.cpp reap call site). A failed pass
     ///    (store/query error, distinct from a declined one) is counted the
-    ///    same way under `outcome="error"`; a clean accepted OR recovered
-    ///    pass is `outcome="ok"`.
+    ///    same way under `outcome="error"`; a clean, ordinary accepted pass
+    ///    is `outcome="ok"`; a pass that ran via this recovery branch (this
+    ///    method's `ReapRoutesResult::recovered`) is its own
+    ///    `outcome="recovered"` (PR #4299 round-2 review) — worth
+    ///    distinguishing since a recovery pass can drain a large backlog in
+    ///    one go, unlike a routine `ok` pass.
     /// SINGLE-WRITER today (advisory lock scoped to one dedicated key); becomes
     /// PG-shared-state under the same ADR-0012 lock when a 2nd replica lands
     /// (matches every other reaper in the register).

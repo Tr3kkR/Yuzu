@@ -467,6 +467,12 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     int expired_leases_reaped = 0;
     int tombstones_reaped = 0;
     bool clock_anomaly = false;
+    // Hoisted out of the lambda (was a lambda-local at the recovery-detection
+    // site) so the recovery outcome survives past with_txn_for's return, into
+    // ReapRoutesResult::recovered (PR #4299 round-2 review) — the caller
+    // (server.cpp) needs it to emit a distinct `outcome="recovered"` metric,
+    // separate from an ordinary `outcome="ok"` pass.
+    bool recovered_from_prior_decline = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kReapWriteTimeout, [&](PGconn* c) -> bool {
         // Fixed key, deliberately NOT salted per-instance/per-test: Postgres advisory
@@ -554,18 +560,48 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // reads normally against the unmoved anchor and is an ordinary
         // accepted pass, not a recovery).
         //
-        // OPERATOR RE-ANCHOR PROCEDURE: a pass that is genuinely stuck (the
-        // clock itself is still wrong on pass 2, so the SAME anomaly keeps
-        // reporting against an ever-different anchor and never lines up with
-        // the declined marker) never recovers on its own — by design, since
-        // recovery must not fire on an ongoing skew. An operator can force
-        // recovery by resetting `route_meta.reap_anchor_ms` (and, for
-        // cleanliness, deleting `route_meta.reap_declined_anchor_ms`) to the
-        // corrected current epoch-ms once the underlying clock problem is
-        // fixed — the next pass then has a fresh, correct anchor and proceeds
-        // normally. See docs/clock-guarded-retention.md's GatewayRouteStore
-        // entry for the full record.
-        bool recovered_from_prior_decline = false;
+        // ACTUAL RECOVERY BEHAVIOUR (corrected — a prior revision of this
+        // comment claimed the opposite): a decline never advances
+        // `reap_anchor_ms`, so a skew that PERSISTS into the next pass
+        // presents the IDENTICAL frozen anchor again — and that is exactly
+        // the "declined_anchor == anchor" match below, which RECOVERS. There
+        // is no permanent wedge: a genuinely-stuck (still-wrong) clock does
+        // not keep "reporting against an ever-different anchor" — the anchor
+        // cannot move while declined, so pass 2 against the same anchor
+        // recovers-and-drains rather than declining forever. A
+        // CONTINUOUSLY-DRIFTING clock instead OSCILLATES: pass 1 declines
+        // (freezing the anchor), pass 2 recovers (advancing the anchor to
+        // that pass's now_ms UNCONDITIONALLY), and if the clock is still
+        // skewed relative to the NEW anchor, the next pass declines again —
+        // roughly one decline every other pass, never a lasting wedge.
+        //
+        // OPERATOR RE-ANCHOR PROCEDURE: this is therefore an OPTIONAL escape
+        // hatch to STOP that decline/recover oscillation under a
+        // persistently-wrong clock, not a requirement to un-wedge anything.
+        // An operator can force a clean re-sync by resetting
+        // `route_meta.reap_anchor_ms` (and, for cleanliness, deleting
+        // `route_meta.reap_declined_anchor_ms`) to the corrected current
+        // epoch-ms once the underlying clock problem is fixed — the next
+        // pass then has a fresh, correct anchor and proceeds normally without
+        // the oscillation. See docs/clock-guarded-retention.md's
+        // GatewayRouteStore entry for the full record.
+        //
+        // CROSS-TYPE RECOVERY IS SAFE (FIX C, PR #4299 round-2 review):
+        // recovery below is keyed on the ANCHOR VALUE only
+        // (`declined_anchor == anchor`), never on which of forward_skew /
+        // backward_skew fired THIS pass vs. which one fired the pass that
+        // froze `declined_anchor`. So a forward-skew decline followed by a
+        // BACKWARD-skew repeat at that SAME anchor also recovers — this is
+        // deliberate and safe: the recovery branch always computes its reap
+        // cutoffs from THIS pass's own now_ms (the real, current DB clock),
+        // never from the anchor. A forward-skewed now_ms is itself the
+        // corrupted/huge reading, so a forward recovery can mass-reap. A
+        // backward-classified pass has a normal (or genuinely small) now_ms,
+        // so it can only UNDER-reap relative to a normal pass — a live row
+        // with a future lease is never brought into range by a SMALLER
+        // now_ms. Only the forward direction can mass-reap, and that is the
+        // direction this guard exists to gate; adding anomaly-type keying on
+        // top would be unnecessary complexity.
         if (forward_skew || backward_skew) {
             pg::PgResult dr = pg::exec_params(
                 c,
@@ -765,7 +801,8 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     }
     return ReapRoutesResult{.expired_leases_reaped = expired_leases_reaped,
                             .tombstones_reaped = tombstones_reaped,
-                            .clock_anomaly = clock_anomaly};
+                            .clock_anomaly = clock_anomaly,
+                            .recovered = recovered_from_prior_decline};
 }
 
 } // namespace yuzu::server
