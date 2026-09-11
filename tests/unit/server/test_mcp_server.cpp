@@ -3918,6 +3918,39 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards returns every guard's state 
     CHECK(ts.audit_log.back() == "guardian.device.view|success");
 }
 
+// #2146 Batch A audit (2026-09-10): get_guardian_status's degraded-query
+// branch (guardian_status_rollup returning nullopt) silently omitted
+// retry_after_ms while the REST twin GET /guaranteed-state/status correctly
+// carries retry_after_ms=5000 for the identical condition -- an agentic
+// worker had no machine-readable signal to back off and retry. Same
+// unreachable-pool mechanism as "MCP list_executions: a degraded tracker
+// surfaces a store-fault error" above: a real (non-null) GuaranteedStateStore
+// bound to a pool that cannot connect deterministically fails its own query,
+// no live database needed, no [pg] tag.
+TEST_CASE("MCP get_guardian_status: a degraded store carries retry_after_ms, "
+          "matching the REST twin (#2146 Batch A retry-hint audit)",
+          "[mcp][integration][guardian]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    GuaranteedStateStore broken(unreachable);
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &broken;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 5000);
+}
+
 // ── Compliance/policy REST v1 read twins (api-parity #4034) ─────────────────
 // McpTestServer wires policy_store=nullptr (no live Postgres in this fixture,
 // matching the pre-existing #3559 item 3 ComplianceHarness gap on the REST
