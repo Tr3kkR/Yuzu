@@ -214,6 +214,26 @@ unconditional per-predicate cap):
    pass — a live row with a future lease is never brought into range by a smaller `now_ms`. Adding
    anomaly-type keying on top of the anchor-value key is therefore unnecessary.
 
+   **The decline-once/drain-on-repeat recovery above is the SKEW path only — a corrupt PERSISTED
+   anchor uses a DIFFERENT mechanism (PR #4299 round-3 review).** An unparseable or negative
+   `route_meta.reap_anchor_ms` reading never reaches the skew logic at all — it is a separate guard,
+   checked first, because it is a durably PERSISTED value rather than a fresh-every-pass `now()`
+   reading: this method is the anchor's sole writer and always writes a sanitised non-negative i64,
+   so an invalid stored value can only be external tampering/corruption. Declining it without
+   repair (the pre-round-3 behaviour) wedged EVERY future pass permanently, since the skew
+   recovery's `declined_anchor == anchor` match is never reached from this branch. The fix is
+   SELF-HEAL, not drain-on-repeat: on a corrupt persisted anchor, re-anchor `reap_anchor_ms` to
+   this pass's own already-sanitised `now_ms` (never the anchor's old value), clear
+   `reap_declined_anchor_ms` (a stale skew marker must not be judged against the freshly
+   re-anchored value), and decline only THIS one pass. The next pass then reads back a valid,
+   now()-derived anchor and proceeds as an ordinary accepted pass. Drain-on-repeat is deliberately
+   NOT used here: a corrupt/garbage anchor is not evidence of genuine elapsed downtime the way a
+   persisting skew is, and auto-draining on evidence of tampering risks a mass-reap against
+   garbage data. Net effect: neither anomaly class — skew or corrupt-anchor — leaves the reaper
+   permanently wedged, but they recover via two distinct mechanisms (decline-once/drain-on-repeat
+   vs. self-heal-and-re-anchor), and only the skew path is the "no permanent wedge either way"
+   claim above.
+
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
 regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a
 batch of already-stale routes on the first pass is an acceptable worst case, never non-reproducible

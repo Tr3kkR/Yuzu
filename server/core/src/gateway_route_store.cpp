@@ -464,6 +464,16 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     // persisted route_meta anchor so a forward- or backward-skewed reading is
     // DECLINED, not acted on. Every accepted pass is unconditionally capped
     // per predicate.
+    //
+    // PRECISION NOTE (PR #4299 round-3 review, LOW): Postgres `now()` is
+    // `transaction_timestamp()` — stable for the whole transaction, but fixed
+    // at TRANSACTION START, not at the moment this statement executes. Under
+    // advisory-lock contention this reading can therefore be stale by
+    // whatever the lock-wait took. The direction is safe either way (a stale,
+    // slightly-earlier reading can only make this pass UNDER-reap relative to
+    // one taken this instant — never mass-reap), and it stays in the SAME
+    // clock domain as the lease_until/updated_at authors, which is the
+    // property this guard actually depends on.
     int expired_leases_reaped = 0;
     int tombstones_reaped = 0;
     bool clock_anomaly = false;
@@ -501,6 +511,13 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
             const std::string now_raw = PQgetvalue(nr.get(), 0, 0);
             auto parsed_now = parse_reap_i64(now_raw);
             if (!parsed_now || *parsed_now < 0) {
+                // NOT a wedge risk (PR #4299 round-3 review verified this):
+                // nothing is persisted on this branch — the next pass issues
+                // its own fresh `SELECT now()` and is judged entirely on that
+                // fresh reading, independent of this one. Contrast the
+                // PERSISTED-anchor parse guard below, which self-heals
+                // because ITS bad reading otherwise durably wedges every
+                // future pass.
                 spdlog::warn("GatewayRouteStore::reap_stale_routes declined: unparseable or "
                              "negative now() reading '{}'",
                              now_raw);
@@ -525,11 +542,58 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
             const std::string anchor_raw = PQgetvalue(ar.get(), 0, 0);
             auto parsed_anchor = parse_reap_i64(anchor_raw);
             if (!parsed_anchor || *parsed_anchor < 0) {
+                // SELF-HEAL (PR #4299 round-3 review, confirmed by both
+                // Codex + Kimi): unlike the now()-reading guard above (bad
+                // reading, nothing persisted, next pass is fresh — never a
+                // wedge), this branch guards a PERSISTED value. This method
+                // is the SOLE writer of `route_meta.reap_anchor_ms` and
+                // always writes a sanitised non-negative i64 (the write
+                // below, and the recovery-branch write further down), so an
+                // unparseable/negative reading here can only be external
+                // tampering or corruption. Declining without repairing it
+                // (the pre-fix behaviour) wedges EVERY future pass forever:
+                // this guard runs before the decline-once/drain-on-repeat
+                // skew logic below, so that recovery path never even gets a
+                // chance to engage, and only manual DB repair could recover.
+                //
+                // Do NOT drain-on-repeat here the way the skew path does — a
+                // corrupt/garbage anchor is not evidence of genuine elapsed
+                // downtime, and auto-draining on evidence of tampering risks
+                // a mass-reap against garbage data. Instead, RE-ANCHOR to
+                // THIS pass's own already-sanitised `now_ms` (read once above
+                // under the same advisory lock) and decline only this one
+                // pass. Also clear `reap_declined_anchor_ms`: a skew-decline
+                // marker recorded against the now-discarded corrupt anchor
+                // must not be judged against the freshly re-anchored value.
+                // The NEXT pass then reads back a valid, now()-derived
+                // anchor and proceeds as an ordinary accepted pass with a
+                // full grace window — no permanent wedge, no drain-on-
+                // garbage.
                 spdlog::warn("GatewayRouteStore::reap_stale_routes declined: unparseable or "
-                             "negative persisted anchor '{}'",
-                             anchor_raw);
+                             "negative persisted anchor '{}' — self-healing by re-anchoring to "
+                             "now_ms {}",
+                             anchor_raw, now_ms);
+                pg::PgResult reheal = pg::exec_params(
+                    c,
+                    "INSERT INTO gateway_route_store.route_meta (key, value) VALUES "
+                    "('reap_anchor_ms', $1) ON CONFLICT (key) DO UPDATE SET "
+                    "value=EXCLUDED.value",
+                    std::vector<std::string>{std::to_string(now_ms)});
+                if (reheal.status() != PGRES_COMMAND_OK) {
+                    err = "reap anchor self-heal failed";
+                    return false;
+                }
+                pg::PgResult clr = pg::exec_params(
+                    c,
+                    "DELETE FROM gateway_route_store.route_meta WHERE "
+                    "key='reap_declined_anchor_ms'",
+                    std::vector<std::string>{});
+                if (clr.status() != PGRES_COMMAND_OK) {
+                    err = "reap declined-anchor clear failed (self-heal)";
+                    return false;
+                }
                 clock_anomaly = true;
-                return true; // decline, anchor unchanged
+                return true; // decline this pass; anchor is now repaired for the next one
             }
             anchor = *parsed_anchor;
         }

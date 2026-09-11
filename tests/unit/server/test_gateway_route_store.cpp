@@ -1034,7 +1034,20 @@ TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a backward-
     CHECK_FALSE(fx.raw_get_reap_declined_anchor().has_value());
 }
 
-TEST_CASE("GatewayRouteStore[pg]: reap declines a non-numeric (junk) persisted anchor",
+// PR #4299 round-3 review (Codex + Kimi panel, both confirmed): a prior
+// revision of this test asserted the persisted anchor stayed "not-a-number"
+// forever, which was itself proof of the defect — an unparseable/negative
+// PERSISTED anchor declined EVERY pass permanently (the decline-once/
+// drain-on-repeat recovery below it is never reached, since this guard runs
+// first and always takes the early `return true`). The fix SELF-HEALS: pass
+// 1 re-anchors `reap_anchor_ms` to that pass's own sanitised `now_ms` and
+// clears any stale `reap_declined_anchor_ms`, declining only that one pass;
+// pass 2 then reads back a VALID anchor and runs as an ordinary accepted
+// pass with a full grace window. This test proves both halves: the anchor
+// is repaired (no longer the junk string) after pass 1, and pass 2 actually
+// reaps the genuinely-expired row while leaving the live one untouched.
+TEST_CASE("GatewayRouteStore[pg]: reap self-heals a non-numeric (junk) persisted anchor, "
+          "then recovers on the next pass",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
     auto baseline = fx.store().reap_stale_routes();
@@ -1051,33 +1064,72 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines a non-numeric (junk) persisted a
                 .announce_connected("agent-junk-stale", "s-stale", "c1", "n1", 30)
                 .value()
                 .matched);
-    fx.raw_set_lease_until_ago("agent-junk-stale", 200);
+    fx.raw_set_lease_until_ago("agent-junk-stale", 200); // past the 180s grace
 
     fx.raw_set_reap_anchor("not-a-number");
 
-    auto out = fx.store().reap_stale_routes();
-    REQUIRE(out.has_value());
-    CHECK(out->clock_anomaly);
-    CHECK(out->expired_leases_reaped == 0);
-    CHECK(out->tombstones_reaped == 0);
+    const std::int64_t now_before = fx.raw_db_now_ms();
 
-    auto anchor_after = fx.raw_get_reap_anchor();
-    REQUIRE(anchor_after.has_value());
-    CHECK(*anchor_after == "not-a-number");
+    // Pass 1: DECLINES (this pass reaps nothing) but SELF-HEALS the anchor —
+    // it must no longer be the junk string, and it must be a plausible
+    // now()-based numeric value, not left corrupt for the guard to trip on
+    // again next pass.
+    auto out1 = fx.store().reap_stale_routes();
+    REQUIRE(out1.has_value());
+    CHECK(out1->clock_anomaly);
+    CHECK_FALSE(out1->recovered);
+    CHECK(out1->expired_leases_reaped == 0);
+    CHECK(out1->tombstones_reaped == 0);
 
-    auto live = fx.store().lookup_route("agent-junk-live");
-    REQUIRE(live.has_value());
-    REQUIRE(live->has_value());
-    REQUIRE((*live)->session_id.has_value());
-    CHECK(*(*live)->session_id == "s-live");
-    auto stale = fx.store().lookup_route("agent-junk-stale");
-    REQUIRE(stale.has_value());
-    REQUIRE(stale->has_value());
-    REQUIRE((*stale)->session_id.has_value());
-    CHECK(*(*stale)->session_id == "s-stale");
+    auto anchor_after1 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after1.has_value());
+    CHECK(*anchor_after1 != "not-a-number");
+    const std::int64_t anchor1 = std::strtoll(anchor_after1->c_str(), nullptr, 10);
+    CHECK(anchor1 >= now_before);
+    CHECK(anchor1 < now_before + 60'000); // sane, not some other garbage value
+
+    // Any stale declined-anchor marker must not survive the self-heal — it
+    // was recorded (if at all) against the discarded junk anchor and would
+    // otherwise cause a spurious recovery against the freshly re-anchored
+    // value.
+    CHECK_FALSE(fx.raw_get_reap_declined_anchor().has_value());
+
+    // Neither row was touched by the declined pass.
+    auto live1 = fx.store().lookup_route("agent-junk-live");
+    REQUIRE(live1.has_value());
+    REQUIRE(live1->has_value());
+    REQUIRE((*live1)->session_id.has_value());
+    CHECK(*(*live1)->session_id == "s-live");
+    auto stale1 = fx.store().lookup_route("agent-junk-stale");
+    REQUIRE(stale1.has_value());
+    REQUIRE(stale1->has_value());
+    REQUIRE((*stale1)->session_id.has_value());
+    CHECK(*(*stale1)->session_id == "s-stale");
+
+    // Pass 2: an ORDINARY accepted pass against the repaired anchor — reaps
+    // the genuinely-expired row, leaves the live one alone. If the anchor
+    // were still "not-a-number" this pass would decline again instead.
+    auto out2 = fx.store().reap_stale_routes();
+    REQUIRE(out2.has_value());
+    CHECK_FALSE(out2->clock_anomaly);
+    CHECK_FALSE(out2->recovered);
+    CHECK(out2->expired_leases_reaped == 1);
+    CHECK(out2->tombstones_reaped == 0);
+
+    auto live2 = fx.store().lookup_route("agent-junk-live");
+    REQUIRE(live2.has_value());
+    REQUIRE(live2->has_value());
+    REQUIRE((*live2)->session_id.has_value());
+    CHECK(*(*live2)->session_id == "s-live"); // untouched
+
+    auto stale2 = fx.store().lookup_route("agent-junk-stale");
+    REQUIRE(stale2.has_value());
+    REQUIRE(stale2->has_value());
+    CHECK_FALSE((*stale2)->session_id.has_value()); // tombstoned
 }
 
-TEST_CASE("GatewayRouteStore[pg]: reap declines a negative persisted anchor",
+TEST_CASE("GatewayRouteStore[pg]: reap self-heals a negative persisted anchor, then recovers "
+          "on the next pass",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
     auto baseline = fx.store().reap_stale_routes();
@@ -1094,30 +1146,59 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines a negative persisted anchor",
                 .announce_connected("agent-neg-stale", "s-stale", "c1", "n1", 30)
                 .value()
                 .matched);
-    fx.raw_set_lease_until_ago("agent-neg-stale", 200);
+    fx.raw_set_lease_until_ago("agent-neg-stale", 200); // past the 180s grace
 
     fx.raw_set_reap_anchor("-5");
 
-    auto out = fx.store().reap_stale_routes();
-    REQUIRE(out.has_value());
-    CHECK(out->clock_anomaly);
-    CHECK(out->expired_leases_reaped == 0);
-    CHECK(out->tombstones_reaped == 0);
+    const std::int64_t now_before = fx.raw_db_now_ms();
 
-    auto anchor_after = fx.raw_get_reap_anchor();
-    REQUIRE(anchor_after.has_value());
-    CHECK(*anchor_after == "-5");
+    // Pass 1: DECLINES but SELF-HEALS — the anchor must no longer be
+    // negative, and must be a plausible now()-based value.
+    auto out1 = fx.store().reap_stale_routes();
+    REQUIRE(out1.has_value());
+    CHECK(out1->clock_anomaly);
+    CHECK_FALSE(out1->recovered);
+    CHECK(out1->expired_leases_reaped == 0);
+    CHECK(out1->tombstones_reaped == 0);
 
-    auto live = fx.store().lookup_route("agent-neg-live");
-    REQUIRE(live.has_value());
-    REQUIRE(live->has_value());
-    REQUIRE((*live)->session_id.has_value());
-    CHECK(*(*live)->session_id == "s-live");
-    auto stale = fx.store().lookup_route("agent-neg-stale");
-    REQUIRE(stale.has_value());
-    REQUIRE(stale->has_value());
-    REQUIRE((*stale)->session_id.has_value());
-    CHECK(*(*stale)->session_id == "s-stale");
+    auto anchor_after1 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after1.has_value());
+    CHECK(*anchor_after1 != "-5");
+    const std::int64_t anchor1 = std::strtoll(anchor_after1->c_str(), nullptr, 10);
+    CHECK(anchor1 >= now_before);
+    CHECK(anchor1 < now_before + 60'000);
+
+    CHECK_FALSE(fx.raw_get_reap_declined_anchor().has_value());
+
+    auto live1 = fx.store().lookup_route("agent-neg-live");
+    REQUIRE(live1.has_value());
+    REQUIRE(live1->has_value());
+    REQUIRE((*live1)->session_id.has_value());
+    CHECK(*(*live1)->session_id == "s-live");
+    auto stale1 = fx.store().lookup_route("agent-neg-stale");
+    REQUIRE(stale1.has_value());
+    REQUIRE(stale1->has_value());
+    REQUIRE((*stale1)->session_id.has_value());
+    CHECK(*(*stale1)->session_id == "s-stale");
+
+    // Pass 2: an ORDINARY accepted pass against the repaired anchor.
+    auto out2 = fx.store().reap_stale_routes();
+    REQUIRE(out2.has_value());
+    CHECK_FALSE(out2->clock_anomaly);
+    CHECK_FALSE(out2->recovered);
+    CHECK(out2->expired_leases_reaped == 1);
+    CHECK(out2->tombstones_reaped == 0);
+
+    auto live2 = fx.store().lookup_route("agent-neg-live");
+    REQUIRE(live2.has_value());
+    REQUIRE(live2->has_value());
+    REQUIRE((*live2)->session_id.has_value());
+    CHECK(*(*live2)->session_id == "s-live"); // untouched
+
+    auto stale2 = fx.store().lookup_route("agent-neg-stale");
+    REQUIRE(stale2.has_value());
+    REQUIRE(stale2->has_value());
+    CHECK_FALSE((*stale2)->session_id.has_value()); // tombstoned
 }
 
 // ---------------------------------------------------------------------------

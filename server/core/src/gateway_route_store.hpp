@@ -140,8 +140,15 @@ struct DeregisterResult {
 /// `SessionStore::ReapOutcome` (session_store.hpp): true iff the pass was
 /// DECLINED because a clock-guard-critical reading (DB `now()` or the
 /// persisted `route_meta` anchor) was unusable — implausibly ahead of, or
-/// behind, the anchor, or unparseable/negative. A declined pass reaps
-/// nothing and leaves the anchor unchanged. `recovered` is true iff this
+/// behind, the anchor, or unparseable/negative. A declined pass always reaps
+/// nothing. A skew (implausibly-ahead/-behind) decline leaves the anchor
+/// UNCHANGED; an unparseable/negative PERSISTED anchor instead SELF-HEALS —
+/// this method is the anchor's sole writer, so a bad reading there can only
+/// be corruption/tampering, and the anchor is rewritten to this pass's own
+/// now_ms (never drained) so the next pass proceeds normally rather than
+/// wedging forever (PR #4299 round-3 review; see
+/// gateway_route_store.cpp's persisted-anchor guard and
+/// docs/clock-guarded-retention.md). `recovered` is true iff this
 /// pass was NOT declined but DID run via the decline-once/drain-on-repeat
 /// recovery branch (an anomaly persisted across a full decline pass — see
 /// the reap_stale_routes() header below and docs/clock-guarded-retention.md)
