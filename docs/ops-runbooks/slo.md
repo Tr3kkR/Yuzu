@@ -13,6 +13,22 @@ something Yuzu itself emits** — verified present in the scrape config
 hit in `server/core/src`. Said explicitly in §1 below; do not read this
 paragraph's "verified present" as covering all five uniformly.
 
+**Total-outage blind spot (governance UP6-13/sre6p6-2, tracked #4290) — read
+this before treating any SLO below as evidence of outage detection.** Every
+metric in sections 1-5 below is emitted BY the process that fails closed.
+During a total server or PostgreSQL outage, none of these series goes
+*bad* — they go **absent**, and an absent series computes as "budget not
+burned": a 30-day window spanning a complete outage reads as 100% met on
+every one of the five SLOs. The one rule that would catch this — an
+`up == 0` dead-man's-switch — is proposed in §1 below and **not shipped**.
+This is not merely a §1 caveat: it applies identically to sections 2-5,
+which do not separately restate it. **Do not present this document as
+clean evidence of outage detection until #4290 ships** — it is evidence
+that the instruments are individually correct (verified: every metric
+exists at its cited line, every alert matches on `expr`, `for`, and
+`severity`), which is a narrower claim than "these SLOs would have caught
+the outage."
+
 **PO decision 2026-09-07** — the targets in this document were set by the
 product owner on that date and are to be **re-baselined after 90 days of
 production data**. No production Yuzu fleet exists yet (`docs/capability-map.md`
@@ -310,7 +326,7 @@ real infrastructure defects that attempt found (a merge order and a
 from-scratch startup path that both silently produce zero loaded rules;
 verification commands that pass in exactly that broken case; reload
 staleness; a missing self-scrape job; a missing retention flag) — is
-tracked separately from this branch (issues #2857, #4140). The honest
+tracked separately from this branch (issue #2857). The honest
 claim on this branch is **"these 115 rules exist and parse"** (`promtool
 check rules`, above — a real, CI-checkable fact) — **not** "these rules
 are evaluated by a live system," which this branch cannot substantiate

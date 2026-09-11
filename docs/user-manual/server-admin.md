@@ -208,6 +208,29 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — emergency session revocation by restart reverses (breaking for operator muscle memory, #4283)
+
+**On `v0.13.0` and every earlier release, sessions are in-memory only, and
+restarting the server is the fastest fleet-wide emergency session
+revocation there is — no database access needed.** A future release adds
+a PostgreSQL-backed durable `SessionStore` (HA WS-1/1a, ADR-2002 §4):
+**once you are running a build that includes it, this reverses** — a
+restart no longer revokes anything (the durable session row survives and
+is live again the moment the server comes back up). An admin acting on
+pre-upgrade training believes a restart signed out a compromised session
+and it did not.
+
+**If you are reading this because you just upgraded:** check whether your
+build includes durable sessions before relying on restart as a revocation
+tool — see `docs/ops-runbooks/auth-db-recovery.md`'s "Not in v0.13.0"
+section for how to tell, and use the documented REST revocation call
+instead if you cannot confirm which behaviour your build has. That same
+section also discloses a known, unresolved gap in REST-based revocation
+during an actual Postgres outage (tracked **#4283**) — durable sessions
+do not yet have a fully reliable outage-time revocation path, so treat
+"restart" and "REST revocation" both as unreliable during a Postgres
+outage until #4283 closes.
+
 ### vNEXT — gateway management plane now pins its peer (#1422, breaking for custom gateway configs)
 
 The gateway's `:50063` command plane requires, on any network-reachable

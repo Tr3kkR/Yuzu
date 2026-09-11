@@ -344,7 +344,7 @@ pass in exactly that broken case; a rejected rules reload leaves a stale
 rule count that still looks fine; no self-scrape job existed to observe
 the process's own health; no retention flag existed, so a 30-day SLO
 window silently read a 15-day TSDB), and the fixes for all of them, are
-tracked separately from this branch (issues #2857, #4140). This branch's
+tracked separately from this branch (issue #2857). This branch's
 own assurance claims do not depend on that work having merged.
 
 **Also found while auditing #2857:** the now-deleted
@@ -372,13 +372,24 @@ rules ship" is not read as "every alert this project has ever had still
 ships". Tracked: **issue #4231** (the coverage gap for these seven,
 confirmed by two independent measurements to affect no audit/auth/certificate-expiry
 signal and no shipped rig — the deleted file was never loaded by anything).
-**Residual, honestly stated rather than closed:** #4231 is a governance/GRC
-tracking issue, not something an operator upgrading this software would
-ever read — nothing in `docs/user-manual/` mentions this retirement, and
-no per-alert successor issue has been filed for any of the seven yet. If
-the coverage they represented (gateway health, stalled-pipeline detection,
-zero-agents) is still wanted, filing those seven successor issues — and a
-user-manual mention, not only this table — is the remaining work. Incident
+**Risk-register entry (governance co6-1 — a disclosure and an issue number
+are not a risk acceptance; this is the acceptance record WS-A's own
+deliverable set requires):**
+
+| Field | Value |
+|---|---|
+| Risk | Detection coverage lost for 3 live-emitted signals (`YuzuGatewayUpstreamErrors`, `YuzuGatewayMemoryHigh`, `YuzuGatewayHighChurn` — confirmed by `architect` at Gate 3 to cover metrics the gateway still emits) plus 4 further conditions with no canonical successor (`YuzuNoAgentsConnected`, `YuzuCommandProcessingStalled`, `YuzuFleetUnhealthy`, `YuzuHeartbeatsStopped`) |
+| Likelihood | Low-to-medium — none of the seven conditions is observed to have fired historically in this project's operating history; the underlying metrics are real and could still breach |
+| Impact | Medium — none is an audit/auth/certificate-expiry signal (SOC 2 evidence-chain-critical), but three cover real gateway health degradation and four cover fleet-visibility failure modes an operator would otherwise want paged |
+| Mitigation (interim) | Tracked in issue #4231; the underlying metrics remain live and queryable ad hoc even without an alert rule |
+| Accepted by | Product Owner (Nathan Dornbrook), 2026-09-11, as part of this evidence-production round — accepting the gap as-is for this release rather than blocking on writing seven new alert rules first |
+| Review date | Next Workstream D quarterly control review, or before this branch's PR merges to `dev`, whichever is sooner |
+| Residual gap this acceptance does NOT cover | The acceptance is recorded here, in a GRC/governance document — **not yet propagated to operator-facing documentation.** Nothing in `docs/user-manual/` mentions this retirement, and no per-alert successor issue has been filed for any of the seven. That propagation (a `docs/user-manual/` note plus seven successor issues, if the coverage is still wanted) remains open work, distinct from — and not satisfied by — the risk acceptance above. |
+
+If the coverage they represented (gateway health, stalled-pipeline
+detection, zero-agents) is still wanted, filing those seven successor
+issues — and a user-manual mention, not only this table — is the
+remaining work. Incident
 response lifecycle and capacity plans for 1k/5k/10k+ agents remain
 undocumented — not addressed by this change, still open.
 

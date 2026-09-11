@@ -1,73 +1,23 @@
 # Yuzu Security Whitepaper
 
-> **This document describes unreleased `dev`-branch software, not something
-> you can install today.** Its anchor commit is a development checkout, not
-> a tagged release — you cannot pull, download, or deploy the version this
-> document is written against. **The latest release you actually can
-> install is `v0.13.0`** (2026-07-11), and it is **missing six of the
-> control families this document describes as shipped** — full list, with
-> each one verified against the codebase (not asserted from memory), in
-> "Version anchor" immediately below. **If you are evaluating `v0.13.0` for
-> installation, read that list before relying on anything else in this
-> document — do not assume dev-HEAD posture for a control this document
-> doesn't call out as `v0.13.0`-present.**
+<!-- yuzu:anchor release=v0.13.0 -->
 
 **Audience:** a prospective customer's security reviewer performing technical
 due diligence (Workstream G, `docs/enterprise-readiness-soc2-first-customer.md`
-§3.7). **Every claim below cites the repo document it summarises** — this
-whitepaper adds no new controls and asserts nothing that isn't already true
-in the codebase or an existing doc. Where a control is **planned, not
-shipped**, that is stated explicitly; overclaiming a gap is worse than
-disclosing one to this audience.
+§3.7). **Every claim in the body below describes `v0.13.0`, the latest
+tagged release, and is verifiable at that tag** (`git show
+v0.13.0:<path>`) — this whitepaper adds no new controls and asserts
+nothing that isn't already true in the codebase or an existing doc at that
+release. **Controls that exist only on `dev`-HEAD (not yet released) are
+not described in the body at all — they are collected in the "Not in
+v0.13.0" appendix at the end of this document**, each with its own
+machine-checkable marker, so a reviewer evaluating `v0.13.0` can read the
+body straight through without separately cross-referencing a banner.
 
-**Last updated:** 2026-09-07. Re-review this document whenever any cited
-source doc materially changes (its own change-log/date is the trigger).
-
-**Version anchor — status, plainly.** This document is written against
-`dev` @ `d295db964` (2026-09-07), an unreleased development checkout — **not
-a version you can download or install.** It is not the same thing as "the
-current shipped product." **The latest tagged release — the version an
-installing customer actually receives — is `v0.13.0`** (2026-07-11).
-**Six control families below are `dev`-only: in `dev`, not yet released,**
-absent from `v0.13.0` and from every earlier tagged release. Each is
-verified against the codebase (`git log` / `git diff v0.13.0..d295db964 --
-<file>` / `git cat-file -e v0.13.0:<path>`), not asserted from memory:
-
-- **In `dev`, not yet released:** the PostgreSQL-backed audit store
-  (ADR-0040) — `v0.13.0`'s audit trail is still the legacy SQLite
-  `audit.db` (§3.5/§4/§7).
-- **In `dev`, not yet released:** the `CaStore` PostgreSQL migration
-  (ADR-0053) — `v0.13.0` still uses `ca.db` (§2.1, matrix "CA / key
-  custody").
-- **In `dev`, not yet released:** the `RbacStore` PostgreSQL migration
-  (ADR-0041) (§3.5, matrix "RBAC configuration").
-- **In `dev`, not yet released:** the `ManagementGroupStore` PostgreSQL
-  migration (ADR-0042) — a substantial rewrite between `v0.13.0` and this
-  anchor (826 insertions/533 deletions in `management_group_store.cpp`
-  alone); `v0.13.0`'s management groups are SQLite-backed (§3.5's
-  management-group scoping claims).
-- **In `dev`, not yet released:** `SessionStore` (durable, PostgreSQL-backed
-  operator sessions, HA WS-1/1a, ADR-2002 §4) —
-  `server/core/src/session_store.hpp` does not exist at all in `v0.13.0`
-  (confirmed: `git cat-file -e v0.13.0:server/core/src/session_store.hpp`
-  fails). A `v0.13.0` deployment's sessions are in-memory only and do NOT
-  survive a restart — the opposite of what
-  `docs/ops-runbooks/auth-db-recovery.md`'s corrected guidance states for
-  `dev`-HEAD (§3.1's "Durable operator sessions" claim is dev-only).
-- **In `dev`, not yet released:** MCP Streamable HTTP transport
-  (`mcp_transport.hpp`, `mcp_session.hpp`, ADR-1005 execution-plan Decision
-  15 / track 2f) — neither file exists in `v0.13.0` (same `git cat-file -e`
-  check). §8's "is live" claim is dev-only; a `v0.13.0` deployment has the
-  older, non-session MCP transport only.
-
-**Every other claim in this document that is not listed above as
-`dev`-only should still be re-verified against your specific installed
-version before you rely on it** — this list is the six differences this
-review found, not a certified-complete diff; when in doubt, check the
-codebase at your installed tag rather than assume dev-HEAD posture.
-ADR-1005 (§9) is accepted as of 2026-09-07 (#4099) but is itself a
-`dev`-only fact at this writing — it has not yet reached a tagged release
-either.
+**Last updated:** 2026-09-11. Re-review this document whenever any cited
+source doc materially changes, or whenever a new release is tagged (the
+appendix's "planned" items may have shipped by then — re-verify against
+your own tag, do not assume this document has been updated for it).
 
 **Threat model status.** No platform-level threat model exists in the
 repository; domain threat models exist for authentication/MFA
@@ -101,26 +51,24 @@ upstream mutual TLS"):**
 "Mutual TLS between every hop" would overclaim the agent→gateway leg —
 correct only for direct-connect agents and the two gateway↔server hops.
 
-**Storage substrate split (ADR-0006):** the server's control-plane state
-lives in PostgreSQL — the server **fails closed at boot** (refuses to start,
-no SQLite fallback) if `--postgres-dsn`/`YUZU_POSTGRES_DSN` is unset or
-unreachable. The agent stays SQLite (local, per-endpoint, federated edge
-warehouse — no shared multi-tenant database on the endpoint side). See
-ADR-0006/0007/0008/0012 and `docs/postgres-store-playbook.md`.
+<!-- yuzu:claim id=postgres-substrate-mandatory status=shipped evidence=server/core/src/server.cpp#no PostgreSQL DSN -->
+**Storage substrate split (ADR-0006):** `--postgres-dsn`/`YUZU_POSTGRES_DSN`
+is mandatory — the server **fails closed at boot** (refuses to start, no
+SQLite fallback) if it is unset or unreachable, and several server stores
+(offline-endpoint tracking, pre-flight runs, deployment runs, vulnerability
+findings, software/device inventory, app-performance rollups) are already
+PostgreSQL-backed at this release. **The `auth`, `ca_store`, and audit
+schemas are the exception at `v0.13.0` — they remain SQLite files
+(`auth.db`, `ca.db`, `audit.db`) pending their own migration** (see the
+appendix for what changes once each does; `docs/ops-runbooks/auth-db-recovery.md`
+covers the `auth` case operationally). The agent stays SQLite regardless
+(local, per-endpoint, federated edge warehouse — no shared multi-tenant
+database on the endpoint side). See ADR-0006/0007/0008/0012 and
+`docs/postgres-store-playbook.md`.
 
-**Optional HA profile:** a Patroni-managed three-node PostgreSQL topology
-with automatic failover is available (`docs/user-manual/ha-postgres.md`) —
-measured failover RTO **~30-40 seconds** (correction: a prior revision of
-this document said "~15-40s", which matched no source in this repo; the
-cited doc's own "What you get" section states "~30-40 seconds" from its
-failover smoke test). **This is a different mechanism, and a different
-number, from the restore-from-backup RTO in §5 below** — failover promotes
-a standby without rebuilding the server (seconds); restore-from-backup
-rebuilds from a backup file (minutes) — do not conflate the two. RPO=0
-while a synchronous standby holds (`quorum3` durability profile, the
-shipped default). This is **available, not the default single-node
-deployment**; see `docs/ops-runbooks/slo.md` §1 for how the
-server-listener SLO differs from this database-layer figure.
+A Patroni-managed HA PostgreSQL profile with automatic failover, and a
+second server replica, are both **not shipped at `v0.13.0`** — see the
+appendix.
 
 ## 2. Cryptography
 
@@ -136,12 +84,13 @@ deployment gets TLS without the operator doing anything, while an operator
 who explicitly passes `--no-tls`/`--no-https` gets a loud startup warning
 banner but is not prevented from disabling it (a deliberate posture for
 local UAT/demo/dev work — see `docs/pki-architecture.md`). Agent enrollment
+<!-- yuzu:claim id=ca-store-sqlite status=shipped evidence=server/core/src/ca_store.cpp#sqlite3 -->
 issues per-agent leaf certificates signed by that CA; the CA root **private
 key is never stored in the database** — CA metadata, issued-cert inventory,
-and CRL version history live in the `ca_store` PostgreSQL schema (ADR-0053;
-migrated from the legacy `ca.db` SQLite file — see this document's version
-anchor above for which builds still use the SQLite form), with the key
-itself behind a `KeyProvider` abstraction holding only an opaque `key_ref`.
+and CRL version history live in a local **SQLite `ca.db` file at this
+release** (ADR-0053 plans a PostgreSQL migration — see appendix), with the
+key itself behind a `KeyProvider` abstraction holding only an opaque
+`key_ref` regardless of which database backs the metadata.
 Full design, the `sign_agent_csr` chokepoint shared by direct and
 gateway-proxied enrollment, revocation semantics, and the enterprise
 CA-subordination path (Settings → Internal CA → "Subordinate this CA"):
@@ -155,27 +104,35 @@ do not internet-expose the agent gRPC port (`:50051`) directly; see
 
 ### 2.2 Secrets at rest
 
-Application secrets (credentials, tokens, key material) are never a plain
-Postgres column: each is either a verify-only hash (passwords, API tokens)
-or an envelope-encrypted blob via `SecretCodec`, wrapping a per-secret DEK
-under a KEK obtained through a pluggable `KeyProvider`/`KekProvider` seam.
-Design and threat model: `docs/adr/0010-secrets-at-rest-envelope-encryption.md`.
+<!-- yuzu:claim id=secretcodec-partial-coverage status=shipped evidence=server/core/src/offline_endpoint_store.hpp#SecretCodec -->
+Where a secret is stored in a PostgreSQL-backed store, it is never a plain
+column: each is either a verify-only hash (passwords, API tokens) or an
+envelope-encrypted blob via `SecretCodec`, wrapping a per-secret DEK under a
+KEK obtained through a pluggable `KeyProvider`/`KekProvider` seam — shipped
+today for the stores that use it (e.g. `offline_endpoint_store.hpp`,
+`vuln_finding_store.hpp`). **This is not yet universal: the MFA TOTP
+secret in the still-SQLite `auth.db` is plaintext at rest at this release**
+(the `0600` file mode is its only protection today) — see
+`docs/ops-runbooks/auth-db-recovery.md` and the appendix below for the
+planned encryption. Design and threat model:
+`docs/adr/0010-secrets-at-rest-envelope-encryption.md`.
 
 ## 3. Authentication and authorization
 
 ### 3.1 Session and login
 
+<!-- yuzu:claim id=session-cookie-attrs status=shipped evidence=server/core/src/auth_routes.cpp#session_cookie_attrs -->
+<!-- yuzu:claim id=session-inactivity-timeout status=shipped evidence=server/core/src/main.cpp#--session-inactivity-secs -->
 Session-cookie authentication with PBKDF2-hashed local passwords, or SSO.
 Session cookies ship `HttpOnly; SameSite=Lax`, plus `Secure` whenever HTTPS
 is enabled (`AuthRoutes::session_cookie_attrs`, `server/core/src/auth_routes.cpp`)
 — **shipped**, not planned. Absolute session lifetime is 8 hours; a sliding
 **inactivity (idle) timeout** (`--session-inactivity-secs`) additionally
-expires a cookie session after a configurable idle period, durably mirrored
-to the session store so the idle clock survives a restart or replica
-failover — **shipped** (`docs/security-reviews/inactivity-timeout-2026-06-30.md`,
-`server/core/src/session_store.hpp` `last_activity_ms`). See
-`docs/auth-architecture.md` "Durable operator sessions" for the full
-mechanism.
+expires a cookie session after a configurable idle period — **shipped at
+this release, but sessions themselves are in-memory only** (see below):
+the idle clock does not survive a restart at `v0.13.0` because nothing
+about a session does. Cross-restart durability of the idle clock (and of
+the session itself) is a `dev`-only property — see the appendix.
 
 ### 3.2 SSO — OIDC and SAML
 
@@ -211,23 +168,25 @@ enforcement layered on top of SAML SSO login. Full reference:
 
 ### 3.5 RBAC and management groups
 
+<!-- yuzu:claim id=rbac-store-sqlite status=shipped evidence=server/core/src/rbac_store.cpp#sqlite3 -->
+<!-- yuzu:claim id=authorize-list-read-docs-only status=planned evidence=server/core/src/authz_gates.cpp#authorize_list_read -->
 Role-based access control with a granular permission model
 (`docs/user-manual/rbac.md`) and hierarchical management groups that scope
 an operator's visibility/authority to a confined subset of the fleet
-(`docs/user-manual/management-groups.md`). `RbacStore` is PostgreSQL-backed
-(ADR-0041); a bare global `require_permission` on a list route is a
+(`docs/user-manual/management-groups.md`). `RbacStore` is a **SQLite
+`rbac.db` file at this release** (ADR-0041 plans a PostgreSQL migration —
+see appendix); a bare global `require_permission` on a list route is a
 known-inert pattern for a confined operator and fails open if the RBAC
-store is unreadable/degraded. List-shaped reads (fleet-wide queries, not
-single-resource lookups) are **required** to go through the admit-then-filter
-`authorize_list_read` chokepoint (ADR-0017) on **migrated** routes — this is
-policy for all new work, not yet complete coverage of every existing route:
-`docs/auth-architecture.md` names a handful of fleet-wide reads not yet on
-this chokepoint (`GET /api/v1/execution-statistics/agents` and the workflow
-executions LIST fragment, tracked #3526; `/fragments/results` additionally
-has no audit trail at all, tracked #3528). See `docs/auth-architecture.md`
-"Granular RBAC (Phase 3)" and "The authorization topology floor (#2376)" for
-the full migrated/unmigrated inventory — do not cite this control as
-covering every list route without checking that inventory first.
+store is unreadable/degraded. **The admit-then-filter `authorize_list_read`
+chokepoint (ADR-0017) is a documented design target, not yet implemented
+in code at `v0.13.0`** — `authorize_list_read`/`authz_gates.cpp` do not
+exist at this tag (confirmed: `git grep -l authorize_list_read v0.13.0`
+matches only `docs/` and `CLAUDE.md`, no source file). At this release,
+list-shaped reads rely on the bare-global-permission pattern described
+above for every route, with the same confined-operator caveat that applies
+fleet-wide, not only to the unmigrated handful the `dev`-HEAD chokepoint
+still has open. See the appendix for the `dev`-HEAD state of this
+chokepoint.
 
 ### 3.6 API tokens and service automation
 
@@ -280,16 +239,20 @@ signature over the row sequence that would let a reviewer *prove* a row was
 not altered or removed out-of-band (e.g. a direct database edit by someone
 holding PostgreSQL access). Treat this as an access-control/operational
 control (who can reach the database), not a cryptographic integrity
-guarantee, until a hash-chain or equivalent mechanism ships. As of ADR-0040
-the audit store is PostgreSQL-backed with **no SQLite fallback**
-(construction fails closed). **The `503`/`Sec-Audit-Failed` fail-hard write
-behaviour is scoped to behavioural-PII REST reads specifically** (the
-`rest_audit.hpp` `emit_behavioral_audit` chokepoint) — **not** a blanket
+guarantee, until a hash-chain or equivalent mechanism ships.
+
+<!-- yuzu:claim id=audit-store-sqlite status=shipped evidence=server/core/src/audit_store.cpp#sqlite3_prepare_v2 -->
+<!-- yuzu:claim id=rest-audit-fail-closed status=shipped evidence=server/core/src/rest_audit.hpp#emit_behavioral_audit -->
+**At `v0.13.0` the audit store is the legacy SQLite `audit.db`** — the
+PostgreSQL migration (ADR-0040) has not landed yet (see appendix for what
+changes once it does). The `rest_audit.hpp` `emit_behavioral_audit`
+chokepoint and its `503`/`Sec-Audit-Failed` fail-hard behaviour on
+behavioural-PII REST reads are **already shipped at this release**,
+independent of which database backs the store — **not** a blanket
 guarantee across every ingress: dashboard HTML routes and MCP tool calls are
 "set-and-proceed" on an audit-write failure (the request completes even if
 the audit row did not persist), a different posture from REST's fail-closed
-one. Reads deny on degrade for the REST audit query surface (`503`, never a
-false-empty response). A clock-guarded, capped retention sweep bounds how
+one. A clock-guarded, capped retention sweep bounds how
 fast the evidence table can drain even under a forward clock jump on the
 PostgreSQL host — the guard
 declines a pass it cannot trust rather than risk over-deleting, and every
@@ -328,21 +291,27 @@ The actual drill transcripts (four attempts total, RTO/RPO figures, every
 defect found and how each was fixed and verified), the corrected
 procedure, and the corrected `scripts/yuzu-backup.sh`/`yuzu-restore.sh`
 are tracked in **issue #4135** — not part of this document's or this
-branch's documentation set. The optional
-HA-Postgres profile's separately-measured failover figures (an unrelated,
-already-shipped mechanism, not affected by the DR-procedure split):
-`docs/user-manual/ha-postgres.md`.
+branch's documentation set.
 
-**Planned, not yet shipped:** a direct `/readyz`-content availability probe
-(today's proxy is Prometheus scrape health of the `/metrics` endpoint, not a
-dedicated blackbox probe of `/readyz` itself — untracked; proposed, see
-`docs/ops-runbooks/slo.md` §1's correction, neither #2956 nor #2459 names
-this gap); a second
-server replica (ADR-2002 Phase B) to raise the single-replica 99.5%/30d
-availability target to 99.9%/30d; a scheduled (cron/systemd-timer) backup
-job (today's procedure is a documented manual/scriptable command, not an
-automatically-scheduled one, and this branch's copy carries none of the
-fixes tracked in issue #4135).
+**Not shipped at `v0.13.0` (see appendix): the HA-Postgres/Patroni profile
+and its measured failover figures, and a second server replica (ADR-2002
+Phase B).** Single-node PostgreSQL and a single server process are what
+this release actually runs.
+
+**Planned, not yet shipped at any tag:** a direct `/readyz`-content
+availability probe (today's proxy is Prometheus scrape health of the
+`/metrics` endpoint, not a dedicated blackbox probe of `/readyz` itself —
+untracked; proposed, see `docs/ops-runbooks/slo.md` §1's correction,
+neither #2956 nor #2459 names this gap); a scheduled (cron/systemd-timer)
+backup job (today's procedure is a documented manual/scriptable command,
+not an automatically-scheduled one, and this branch's copy carries none of
+the fixes tracked in issue #4135). **This document does not present the
+five-SLO set as clean evidence of outage detection** — `docs/ops-runbooks/slo.md`
+states, and this document defers to it, that a total server/Postgres
+outage makes every one of the five metrics go absent rather than bad, and
+an absent series computes as budget-not-burned; the missing `up == 0`
+dead-man's-switch rule that would catch this is tracked as **#4290** and
+not yet shipped.
 
 ## 6. Supply chain integrity
 
@@ -375,39 +344,98 @@ ordering, kill switches, and audit pattern as every other ingress:
 `docs/mcp-server.md`. Tool annotations (destructive-hint truthfulness,
 bounded input/output schemas, honest `retry_after_ms`) are a machine-verifiable
 contract, not prose-only documentation — `docs/agentic-first-principle.md`
-invariant A5. **Correction — shipped, not planned:** a spec-compliant MCP
-**Streamable HTTP transport** — the session-lifecycle + transport pre-check
-half of ADR-1005 execution-plan Decision 15 / track 2f (in-memory,
-principal-bound session ids, GET SSE channel, `notifications/progress`) —
-**is live** (`server/core/src/mcp_transport.hpp`, `mcp_session.hpp`;
-`docs/mcp-server.md` "Phase 2.5 (Implemented — MCP Streamable HTTP
-transport, track 2f PR 1 + PR 2)"). Track 2f's Phase 3 (further hardening
-beyond PR 1/PR 2) remains planned — see `docs/mcp-server.md` for the
-current boundary between what has shipped and what hasn't within this
-track.
+invariant A5. **The spec-compliant MCP Streamable HTTP transport (session
+ids, GET SSE channel, `notifications/progress`) is a `dev`-only addition —
+`v0.13.0` has the older, non-session MCP transport only.** See the
+appendix.
 
 ## 9. Headless platform posture (ADR-1005)
 
-**ADR-1005 is accepted (2026-09-07, #4099)** — as of the version anchor
-above, this is a `dev`-only fact; it has not reached a tagged release (see
-the version anchor at the top of this document). **Its requirement is
-prospective, not a present-tense universal claim about every existing
-capability:** on acceptance, its Decisions govern *new and changed*
-capabilities from the acceptance date forward — that a capability be
-reachable by an authenticated external principal via both versioned REST
-**and** MCP (or a recorded exception in the ADR-1005 ledger), no UI-only
-capability surface — and do **not** retroactively condemn the surfaces the
-ADR itself records as grandfathered as of acceptance. On-behalf-of header
-assertions are rejected at every ingress except the four health-probe
-paths (so a header-stamping proxy cannot crash-loop the server) — this
-Interim rule binds immediately on acceptance, unlike the prospective
-Decisions above. **Phase 7 (the NVD-sync strangler re-home) has not
-started** — do not represent that migration as complete or in-flight to a
-reviewer. Full policy: `docs/adr/1005-headless-platform-use-case-engines.md`
-(see its grandfather-clause enumeration for what is exempted and why);
-current phase status: `docs/adr-1005-execution-plan.md`.
+**Not in `v0.13.0` — see the appendix.** ADR-1005 was accepted 2026-09-07,
+two months after the `v0.13.0` tag; nothing in this section applies to
+that release.
 
 ---
+
+## Not in v0.13.0 — planned for a future release
+
+**Everything below describes `dev`-HEAD (this checkout), not the
+installed release most readers have.** Re-verify against your own tag
+before relying on any of it (`git cat-file -e <your-tag>:<path>`,
+`git show <your-tag>:<path>` for a substring) — this appendix is not
+re-checked every time a new release cuts.
+
+<!-- yuzu:claim id=ha-postgres-patroni status=planned evidence=docs/user-manual/ha-postgres.md#Patroni -->
+- **HA-Postgres profile (ADR-2002, Patroni-managed 3-node topology with
+  automatic failover).** `docs/user-manual/ha-postgres.md` does not exist
+  at `v0.13.0`. At `dev`-HEAD this is available (not the default
+  single-node deployment) with measured failover RTO ~30-40 seconds and
+  RPO=0 while a synchronous standby holds (`quorum3` durability profile).
+  A second server replica (raising the single-replica 99.5%/30d
+  availability target to 99.9%/30d) is a further, separate, still-planned
+  step (ADR-2002 Phase B) not shipped even at `dev`-HEAD.
+- **`CaStore` PostgreSQL migration (ADR-0053).** `v0.13.0` uses a SQLite
+  `ca.db` file; `dev`-HEAD moves CA metadata, issued-cert inventory, and
+  CRL version history into the `ca_store` PostgreSQL schema. The key
+  material itself is unaffected either way (always behind `KeyProvider`,
+  never in either database).
+- **`AuditStore` PostgreSQL migration (ADR-0040).** `v0.13.0` uses a
+  SQLite `audit.db` file; `dev`-HEAD moves it to PostgreSQL with no
+  SQLite fallback (construction fails closed). The `rest_audit.hpp`
+  fail-closed write behaviour described in §4 above is unaffected either
+  way — it predates and does not depend on this migration.
+- **`RbacStore` PostgreSQL migration (ADR-0041) and the `authorize_list_read`
+  admit-then-filter chokepoint (ADR-0017).** `v0.13.0` uses a SQLite
+  `rbac.db` file and has no `authorize_list_read` implementation anywhere
+  in source (confirmed: `git grep -l authorize_list_read v0.13.0` matches
+  only documentation). At `dev`-HEAD, `RbacStore` is PostgreSQL-backed and
+  list-shaped reads on **migrated routes** go through the chokepoint — this
+  is policy for new work, not complete coverage of every existing route
+  even at `dev`-HEAD (`docs/auth-architecture.md` names the still-unmigrated
+  handful, tracked #3526/#3528).
+- **`ManagementGroupStore` PostgreSQL migration (ADR-0042).** `v0.13.0`'s
+  management groups are SQLite-backed; a substantial rewrite lands at
+  `dev`-HEAD (826 insertions/533 deletions in `management_group_store.cpp`
+  alone, relative to `v0.13.0`).
+- **`SessionStore` (durable, PostgreSQL-backed operator sessions, HA
+  WS-1/1a, ADR-2002 §4).** `server/core/src/session_store.hpp` does not
+  exist at all in `v0.13.0`. At `dev`-HEAD, sessions (including the idle
+  inactivity clock from §3.1 above) write-through to PostgreSQL and
+  survive a restart, crash, or replica failover — the opposite of
+  `v0.13.0`'s in-memory-only behaviour. This reverses long-standing
+  operator guidance about what a restart accomplishes for emergency
+  session revocation; see `docs/ops-runbooks/auth-db-recovery.md`'s "Not
+  in v0.13.0" section for the corrected, honestly-caveated guidance
+  (including the known gap in outage-time containment, tracked **#4283**)
+  and `docs/user-manual/server-admin.md`'s Upgrade Notes for the
+  operator-facing warning.
+- **Envelope-encrypted MFA secrets (ADR-0010, applied to `auth`).**
+  `v0.13.0`'s `mfa_totp_secret` column is plaintext, `0600`-file-protected
+  only (§2.2 above). At `dev`-HEAD it is `SecretCodec`-wrapped like the
+  stores in §2.2 that already have it, which also means a Postgres dump
+  alone stops being a complete backup — see
+  `docs/ops-runbooks/auth-db-recovery.md`'s appendix for the KEK-pairing
+  backup procedure this introduces.
+- **MCP Streamable HTTP transport** (`mcp_transport.hpp`, `mcp_session.hpp`,
+  ADR-1005 execution-plan Decision 15 / track 2f) — neither file exists in
+  `v0.13.0`. At `dev`-HEAD this session-lifecycle + transport pre-check
+  layer (in-memory, principal-bound session ids, GET SSE channel,
+  `notifications/progress`) is implemented (`docs/mcp-server.md` "Phase
+  2.5"); Track 2f's Phase 3 (further hardening) remains planned even at
+  `dev`-HEAD.
+- **ADR-1005 headless platform posture.** Accepted 2026-09-07 (#4099),
+  `dev`-only — no tagged release carries it. Its Decisions are
+  prospective (govern new/changed capabilities from acceptance forward,
+  do not retroactively condemn grandfathered surfaces); the on-behalf-of
+  rejection at every ingress except the four health-probe paths is an
+  Interim rule binding immediately on acceptance. Phase 7 (the NVD-sync
+  strangler re-home) has not started. Full policy:
+  `docs/adr/1005-headless-platform-use-case-engines.md`; phase status:
+  `docs/adr-1005-execution-plan.md`.
+
+**This list reflects what this review found, not a certified-complete
+diff.** When in doubt about any OTHER claim in the body above, check the
+codebase at your installed tag rather than assume it holds.
 
 ## Sources cited in this document
 

@@ -31,10 +31,10 @@ The overlay wiring `docs/prometheus/yuzu-alerts.yml` into a running UAT
 Prometheus is infrastructure with its own executable failure modes
 (stickiness against the native startup scripts, false-positive checks,
 reload-staleness, missing self-scrape, missing retention config) and is tracked
-separately from this branch. See issues #2857 (the original wiring gap)
-and #4140 (the startup-script
-stickiness gap that overlay cannot close from inside itself) for status.
-This branch carries none of that overlay's files.
+separately from this branch. See issue #2857 for status — including the
+startup-script stickiness gap that the overlay cannot close from inside
+itself (`win-start-UAT.sh`'s base-only `up -d` reproduces the 0-rules
+bug). This branch carries none of that overlay's files.
 
 ## Port assignments
 
