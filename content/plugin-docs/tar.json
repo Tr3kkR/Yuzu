@@ -2814,13 +2814,13 @@
       "changelog.d/2f-pr3a-mcp-terminal-starvation.fixed.md",
       "changelog.d/3885-dashboard-destructive-targeting.security.md",
       "changelog.d/4027-tar-read-twins.added.md",
+      "changelog.d/4269-tar-usage-source.added.md",
       "changelog.d/5.2-tar-arp-posix.added.md",
       "changelog.d/5.2-tar-mapdrive-macos.added.md",
       "changelog.d/5.2-tar-popen-rehome.changed.md",
       "changelog.d/6.2b-tar-cursor-seam.added.md",
       "changelog.d/6.2b-tar-power-source.added.md",
-      "changelog.d/6.3-tar-removable-source.added.md",
-      "changelog.d/wave7-pr72b-tar-usage-source.added.md"
+      "changelog.d/6.3-tar-removable-source.added.md"
     ],
     "definitions": [
       "content/definitions/tar.yaml",
