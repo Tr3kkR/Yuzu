@@ -202,18 +202,24 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // The agent-decommission cascade's production caller: fans delete_agent across
     // every registered per-agent store, durably erasing the machine's stored rows
     // (including the Decision-11 user_ref personal data — the reason this route
-    // exists). Gate: a SCOPED CONJUNCTION over all THREE securables the cascade's
-    // five stores are governed by (D-9) — SoftwareLicensing:Delete (software_licensing)
-    // AND Inventory:Delete (inventory, software_inventory, device_inventory — the
-    // ADR-0016 stores) AND GuaranteedState:Delete (app_perf_daily — DEX behavioural
-    // PII). Authorize for the FULL blast radius, not just the route's name. On the
-    // seeded matrix this changes nothing (Administrator + ITServiceOwner hold full
-    // CRUD on all three), but RBAC is operator-editable, and a custom role holding
-    // only some of them must not be able to erase data it cannot otherwise touch —
-    // it could otherwise DESTROY a device's app-perf series it has no right to READ.
-    // Every check is scoped, so a group-confined ITSO cannot erase an out-of-scope
-    // device, while require_scoped_permission's global step still admits global
-    // holders fleet-wide.
+    // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
+    // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for
+    // the cascade's WHOLE blast radius, not the individual securables that govern
+    // each store's READ. The radius is FIVE stores: InventoryStore,
+    // SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by
+    // `Inventory`), AppPerfDailyStore (read-gated by `GuaranteedState` — DEX
+    // behavioural PII), and SoftwareLicensingStore (read-gated by
+    // `SoftwareLicensing`). A companion package (Wave 7 PR7.2) adds a sixth store,
+    // AppUsageStore (read-gated by `Forensics`). Compat: the seeded
+    // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
+    // via seed_defaults() with no migration); an operator-authored custom role that
+    // had assembled the old per-store Delete grants is refused (403 naming
+    // `Decommission:Delete`) until granted the new securable — breaking by design,
+    // per PLAN-01 ruling (b): one nameable grant for what the operation destroys,
+    // not a hand-maintained conjunction that silently widens with every store this
+    // route touches. The old per-store Delete grants are NOT revoked and keep
+    // gating their own stores' other routes. Scoped, so a group-confined holder
+    // cannot erase an out-of-scope device.
     //
     // TWO durable audit events (spdlog alone is not GDPR Art.17 evidence):
     //   1. AUDIT-BEFORE-ERASE, FAIL-CLOSED (`sle.agent.decommission|attempt`): when
@@ -238,20 +244,11 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 send_json(res, 503, a4_error(503, "scope gate not configured", cid));
                 return;
             }
-            // THE FULL BLAST RADIUS — one Delete check per securable the cascade
-            // erases THROUGH, not one for the securable the route is NAMED for. Keep
-            // this list in lockstep with AgentDecommissionStores (the drift guard in
-            // test_agent_decommission.cpp fails if a store is added without a gate).
-            if (!scoped_perm_fn_(req, res, "SoftwareLicensing", "Delete", agent_id))
-                return; // the gate wrote its own 401/403
-            // inventory + software_inventory + device_inventory (ADR-0016 stores).
-            if (!scoped_perm_fn_(req, res, "Inventory", "Delete", agent_id))
-                return; // the gate wrote its own 401/403
-            // app_perf_daily — DEX behavioural PII, governed by GuaranteedState (its
-            // read routes gate on GuaranteedState:Read). Without this check a role
-            // holding the two above but NOT GuaranteedState:Delete could DESTROY a
-            // device's per-app performance series it cannot even READ.
-            if (!scoped_perm_fn_(req, res, "GuaranteedState", "Delete", agent_id))
+            // ONE scoped gate for the cascade's whole blast radius (ADR-0024
+            // Decision 9, amended Wave 7 PR7.2). Keep this in lockstep with
+            // AgentDecommissionStores (the drift guard in test_agent_decommission.cpp
+            // fails if a store is added without bumping kCascadeStoreCount).
+            if (!scoped_perm_fn_(req, res, "Decommission", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {
                 send_json(res, 503, a4_error(503, "decommission cascade not configured", cid, 5000));

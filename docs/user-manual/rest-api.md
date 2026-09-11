@@ -6130,9 +6130,9 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf, and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
-**Permission:** a **per-device-scoped conjunction over every securable the cascade erases through** — `SoftwareLicensing:Delete` **and** `Inventory:Delete` **and** `GuaranteedState:Delete`. A role missing any one of the three is `403`'d (the seeded Administrator/ITServiceOwner roles hold all three; a custom role must be granted the full set).
+**Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
 Two durable audit events: `sle.agent.decommission|attempt` is written **before** the erasure and **fails closed** — if it cannot persist, nothing is erased (`503` + `Sec-Audit-Failed`); the outcome row (`success`/`partial`) follows with the per-store breakdown.
 
@@ -6161,7 +6161,7 @@ Per-store outcomes: `deleted` (the DELETE **committed**), `skipped` (store not c
 | Status | Condition |
 |---|---|
 | 401 | Unauthenticated |
-| 403 | Caller lacks any one of the three per-device-scoped `Delete` permissions |
+| 403 | Caller lacks the per-device-scoped `Decommission:Delete` permission |
 | 500 | One or more stores `failed` — the A4 body carries the per-store breakdown in `error.details.stores`; the cascade is **idempotent**, re-issue the DELETE to retry the failures |
 | 503 + `Sec-Audit-Failed` | The attempt audit row could not persist — fail-closed, **nothing was erased** |
 | 503 | Scope gate or cascade not configured (A4 envelope) |
@@ -8279,6 +8279,20 @@ not apply here.
 ```json
 {"error": {"code": 400, "message": "destructive action requires explicit in-scope agent_ids; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
 ```
+
+**Forensics-class capabilities are SINGLE-TARGET — exactly one explicit, in-scope `agent_id`,
+no `scope` (Wave 7 PR7.2).** A row on the `Forensics` securable (e.g. `execution_artifacts.
+shimcache`) is `ReadOnly`, not `Destructive`, but a forensic read is per-device by nature: naming
+zero ids, more than one id, or any `scope` (including `"__all__"`) is refused before the read
+reaches an agent, with its own distinct message:
+
+```json
+{"error": {"code": 400, "message": "forensic read requires exactly one explicit in-scope agent_id; broadcast and scope fan-out are refused"}, "meta": {"api_version": "v1"}, "audit_emitted": true}
+```
+
+A Forensics read that names its one target confines to the caller's visible agents exactly like
+a Destructive row — the 404 `no reachable in-scope agent` body above answers an out-of-group id
+the same way.
 
 `audit_emitted` follows this file's usual convention (see `DELETE /api/v1/sessions?username=<name>` above):
 present and `false` only when the paired `command.dispatch` audit row failed to persist (the response also
