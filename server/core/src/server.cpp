@@ -14908,6 +14908,14 @@ private:
                 // is idempotent, advisory-lock-serialised across replicas, and
                 // a bounded index-scan DELETE, so the tighter cadence is cheap.
                 constexpr int kEventOutboxReapEveryNTicks = 30; // ~60s at 2s/tick
+                // HA WS-4 4.2a (#4246 item #7): gateway route directory
+                // hygiene reaper cadence. The directory is INERT (nothing
+                // reads it for dispatch yet), so this is background hygiene,
+                // not correctness-critical cleanup — a ~5m cadence (matching
+                // the concurrency-claim reconciler above) is plenty; the
+                // reaper's own clock-guard (advisory lock + persisted
+                // anchor) is what makes a slower or missed tick harmless.
+                constexpr int kGatewayRouteReapEveryNTicks = 150; // ~5 minutes at 2s/tick
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -15172,6 +15180,32 @@ private:
                                              published.error());
                                 metrics_.counter("yuzu_exec_outbox_store_degrade_total")
                                     .increment();
+                            }
+                        }
+
+                        // 2i) HA WS-4 4.2a (#4246 item #7): gateway route
+                        // directory hygiene reap — sweeps expired-lease-past-
+                        // grace and NULL-lease tombstone rows. Best-effort:
+                        // the directory is still INERT (nothing reads it for
+                        // dispatch), so a degraded/failed pass is logged, not
+                        // escalated. WS-10 ReplicaSafe — its own advisory
+                        // lock + persisted clock anchor make a concurrent
+                        // per-replica tick safe (background_jobs.hpp).
+                        if (gateway_route_store_ && gateway_route_store_->is_open() &&
+                            tick % kGatewayRouteReapEveryNTicks == 0) {
+                            YUZU_ASSERT_BACKGROUND_JOB("gateway_route_store.reap_stale_routes");
+                            if (auto reaped = gateway_route_store_->reap_stale_routes()) {
+                                if (reaped->expired_leases_reaped > 0 ||
+                                    reaped->tombstones_reaped > 0)
+                                    spdlog::info("gateway_route_store reap: {} expired lease(s), "
+                                                 "{} tombstone(s) reaped",
+                                                 reaped->expired_leases_reaped,
+                                                 reaped->tombstones_reaped);
+                                if (reaped->clock_anomaly)
+                                    spdlog::warn("gateway_route_store reap declined: "
+                                                 "clock anomaly detected");
+                            } else {
+                                spdlog::warn("gateway_route_store reap failed (store error)");
                             }
                         }
 

@@ -90,9 +90,10 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (41 passes). Verified against the source sweep
-/// 2026-09-07 per the SWEEP METHODOLOGY above; keep the count tripwire in
-/// `test_background_jobs.cpp` in step with any add/remove here.
+/// The exhaustive inventory (43 passes). Verified against the source sweep
+/// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
+/// `gateway_route_store.reap_stale_routes`, 2026-09-11); keep the count
+/// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
     {"session_clock_monitor.observe", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
@@ -123,6 +124,10 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "clock-guarded + pg_try_advisory_xact_lock"},
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "MUST run per-replica — cross-replica SSE delivery (ADR-2002 §5); NEVER leader-gate"},
+    {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
+     "clock-guarded (SessionStore shape, clock-guard parts 1 & 4 carved out) + advisory-lock "
+     "own-statement; DB-clock-authored leases — every replica may tick it, all but the "
+     "advisory-lock holder skip; matches the other reaper classifications (WS-4 4.2a)"},
     {"result_set_store.counts", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "read-only gauge refresh"},
 
