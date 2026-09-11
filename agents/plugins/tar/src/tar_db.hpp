@@ -28,6 +28,7 @@
 #include <expected>
 #include <filesystem>
 #include <atomic>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -36,6 +37,74 @@
 struct sqlite3; // Forward declaration
 
 namespace yuzu::tar {
+
+/**
+ * Transaction-scoped handle passed to a `TarDatabase::checked_transaction`
+ * operation. Wraps the live connection for the duration of ONE strict
+ * transaction; never store it, never use it after the operation returns.
+ *
+ * `exec()` is the safe path: it refuses to touch SQLite once the handle is
+ * already `poisoned()`, which is how "stop issuing statements once the
+ * transaction has aborted" is enforced without every caller having to
+ * remember to check first. A caller driving `raw()` directly (parameterized
+ * prepare/bind/step, unavoidable for anything with bound values) owns that
+ * same discipline itself: check `poisoned()` before issuing more SQL, and
+ * call `fail()` on any non-success return so the failure is recorded even
+ * though `exec()` never saw it.
+ *
+ * `poisoned()` is deliberately independent of the operation callback's own
+ * return value. `checked_transaction` commits only when BOTH the callback
+ * returned success AND the handle was never poisoned -- so a callback that
+ * forgets to check one intermediate `raw()` step and returns success anyway
+ * cannot erase that step's failure. That is the whole point of this type:
+ * a later success must never be able to paper over an earlier one.
+ */
+class TransactionHandle {
+public:
+    TransactionHandle(const TransactionHandle&) = delete;
+    TransactionHandle& operator=(const TransactionHandle&) = delete;
+
+    /**
+     * Run one complete SQL statement (no bound parameters -- use `raw()` for
+     * those). No-ops and returns false immediately, without touching SQLite,
+     * once the handle is already poisoned: a statement issued after an
+     * aborted transaction would run as an autocommit the eventual ROLLBACK
+     * cannot undo (the same hazard `execute_atomic_batch`'s doc comment
+     * describes).
+     */
+    [[nodiscard]] bool exec(const std::string& sql);
+
+    /**
+     * The live connection, for prepare/bind/step call sites that need bound
+     * parameters. The caller MUST call `fail()` on any non-success return
+     * from that sequence -- `checked_transaction` only ever sees failures
+     * reported through this handle, never SQLite return codes it didn't
+     * witness itself.
+     */
+    [[nodiscard]] sqlite3* raw() const noexcept { return db_; }
+
+    /**
+     * Record a failure from a `raw()`-driven statement. Poisons the handle
+     * exactly like a failed `exec()`. `reason` becomes the transaction's
+     * reported error if this is the first failure recorded; keep it
+     * diagnostic (the SQLite error text) and never include a bound
+     * parameter's value -- this store holds usernames.
+     */
+    void fail(std::string reason);
+
+    /// True once `exec()` or `fail()` has recorded a failure.
+    [[nodiscard]] bool poisoned() const noexcept { return poisoned_; }
+
+    [[nodiscard]] const std::string& error() const noexcept { return error_; }
+
+private:
+    friend class TarDatabase;
+    explicit TransactionHandle(sqlite3* db) : db_(db) {}
+
+    sqlite3* db_;
+    bool poisoned_{false};
+    std::string error_;
+};
 
 struct TarEvent {
     int64_t id{0};            // row id (0 for new events)
@@ -650,6 +719,53 @@ public:
      * offline on that endpoint until the agent restarts.
      */
     BatchResult execute_atomic_batch(const std::vector<std::string>& statements);
+
+    /**
+     * Run `operation` as ONE strict, all-or-nothing transaction while holding
+     * `mu_` for the whole thing -- same isolation rationale as
+     * `execute_atomic_batch` above, but a STRONGER contract: there is no
+     * per-statement-tolerant data segment here. `execute_atomic_batch`'s
+     * tolerance (one broken table must not stop every other table's
+     * retention) is deliberate and correct for that use; it is wrong for a
+     * caller where a partial commit is a silent, permanent loss of the only
+     * copy of something -- a consent-boundary marker, an identity-bearing
+     * row's sole re-derivation state. Use `checked_transaction` for those;
+     * leave `execute_atomic_batch`/`execute_atomic_batch_gated`-style callers
+     * on the tolerant path they were built for.
+     *
+     * `operation` receives a `TransactionHandle` scoped to this transaction.
+     * It must not call any OTHER `TarDatabase` method that takes `mu_` --
+     * that would deadlock (`mu_` is not reentrant) -- and must not perform
+     * collection, network calls, or any other external I/O while the
+     * transaction is held open; drive it from already-materialized data.
+     *
+     * Commits iff `operation` returns a value AND the handle was never
+     * poisoned (see `TransactionHandle`) AND `COMMIT` itself succeeds.
+     * Rolls back on any other outcome, including an exception unwinding out
+     * of `operation` -- caught here, never propagated, always converted to a
+     * rollback. If `ROLLBACK` itself fails with the transaction still open,
+     * this closes the connection exactly the way `execute_atomic_batch`
+     * does (`db_` nulled under `mu_`, reusing the `if (!db_)` fail-closed
+     * check every method already has) -- see that method's doc comment for
+     * why that is the honest outcome rather than leaving a wedged
+     * transaction for the next writer to silently join.
+     *
+     * There is no `CommittedResult` carried in the return type: a caller
+     * that needs to report what it wrote should capture into a variable it
+     * owns from inside `operation` and trust that variable only once this
+     * call returns a value -- a `checked_transaction` success IS the
+     * commit-happened signal. Keeping the primitive's own return type void
+     * avoids coupling its contract to any one caller's result shape (the
+     * first real user is Wave 7 PR7.2b's usage fold; it is not the last).
+     *
+     * @return {} iff the transaction committed; otherwise a diagnostic
+     *         string (SQLite error text or `operation`'s own postcondition
+     *         message) -- never a bound parameter's value, per
+     *         `TransactionHandle::fail`.
+     */
+    [[nodiscard]] std::expected<void, std::string>
+    checked_transaction(const std::function<std::expected<void, std::string>(TransactionHandle&)>&
+                            operation);
 
     /**
      * Execute parameterized SQL with two int64 bind values.

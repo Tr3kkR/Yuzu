@@ -1101,6 +1101,18 @@ the 50 ms health grace produces a Faulted/Recovered pair, and an Ancestor->Targe
 appearance is emitted at commit rather than inline. File (PR-B2) and Service (PR-B3)
 remain the open half of this dependency.
 
+**#2012/#3840 PR-B2 (landed, File added)**: the File mechanism's `watch()` now follows
+the same shape as Registry above - reserves under its own lock, runs the discovery
+probe (target open / nearest-ancestor walk) on a detached F3-counted worker, waits at
+most `kFileCallerWaitBudget` (50 ms) on the control path and otherwise publishes the
+probe to the mechanism's own IOCP-driven sweeper. `unwatch()` was already O(1) (no
+blocking callback drain to hand off, unlike Registry). The #4181 same-type reentrant
+disarm deadlock is now closed on both Registry and File paths; Service (PR-B3) remains
+the last open half. Costs mirror Registry's: a consumed target completion is covered by
+a synthetic resync fire rather than redelivering the lost notification, a shared
+ancestor's fan-out uses whole-batch retry (never per-key debt, Dave's decision #4), and
+an Ancestor->Target appearance is emitted via the same commit-time resync path.
+
 ## Health / status surface — the #1939 checklist
 
 Per ADR-1005 (headless platform) a new capability lands on REST **and** MCP, or

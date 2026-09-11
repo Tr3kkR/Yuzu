@@ -5,7 +5,7 @@
 /// split (ADR-0031, WS-A4/WS-A2r pilot). Abstract, ZERO store-shaped
 /// dependencies — only the pure `network_perf_model.hpp` types + std headers,
 /// so this header can be included by a future presentation-side client
-/// without dragging AgentRegistry/TagStore/pg:: along.
+/// without dragging the server's store/registry/pg:: layer along.
 ///
 /// The method set == the public REST resources it stands in front of
 /// (`GET /api/v1/network/fleet`, `GET /api/v1/network/devices`) so a
@@ -15,8 +15,11 @@
 /// client after the WS-B2 cutover. Adding a method here without a
 /// corresponding public REST/MCP resource would reintroduce a private core
 /// API and defeat the point of the seam.
+///
+/// The store-backed factory (`make_local_network_api`) lives in the core-only
+/// `network_api_local.hpp` — this header names no store type at all, not even
+/// by forward declaration, so a presentation TU including it cannot reach one.
 
-#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -24,12 +27,6 @@
 #include "network_perf_model.hpp"
 
 namespace yuzu::server {
-
-class TagStore;
-namespace detail {
-class AgentHealthStore;
-class AgentRegistry;
-} // namespace detail
 
 /// Parameters for the ONE device list — mirrors GET /api/v1/network/devices'
 /// query params (metric, filter=not_reporting, cooc, key, cohort_value,
@@ -70,24 +67,5 @@ public:
     [[nodiscard]] virtual std::vector<NetPerfDeviceRow>
     device_list(const NetDeviceQuery& q) const = 0;
 };
-
-/// Factory for the store-backed implementation (`LocalNetworkApi`,
-/// network_api.cpp — kept out of this header so the header stays free of
-/// store includes). `tags` is nullable — a null TagStore degrades to no
-/// cohort resolution / empty `available_keys`, same posture as the prior
-/// server.cpp assembly. The returned object is non-copyable (holds a mutex
-/// for its internal 5s TTL memo) — held by shared_ptr so it composes with
-/// the existing `std::function`-based route-provider wiring.
-///
-/// LIFETIME CONTRACT (load-bearing for the per-family seam pattern this pilots):
-/// `health`, `registry` and `*tags` are borrowed, NOT owned — they MUST outlive
-/// every call to the returned API. Today `ServerImpl` guarantees this by joining
-/// the web thread (`web_server_->stop()`) before it destroys these stores, so no
-/// handler can reach the API after they die. A future family copying this shape
-/// MUST preserve that ordering (or hold the API with a lifetime <= its stores) —
-/// this snapshot-at-construction idiom UAFs if the stores are torn down first.
-[[nodiscard]] std::shared_ptr<NetworkApi>
-make_local_network_api(detail::AgentHealthStore& health, detail::AgentRegistry& registry,
-                       TagStore* tags);
 
 } // namespace yuzu::server

@@ -336,6 +336,153 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        wire reference: `docs/user-manual/rest-api.md`'s Settings routes,
        `docs/mcp-server.md`'s MCP-tier reference.
 
+   - **2026-09 — the legacy unversioned `/api/*` admin plane, class-level
+     entry (107 routes).** Enumerated by grepping every `sink.Get/Post/Put/
+     Delete(...)` registration in `server/core/src` for an `/api/*` path
+     that is NOT `/api/v1/*` (the `/api/executions*` family above and the
+     four health-probe paths in the first ledger entry are separate,
+     already-recorded exceptions and are excluded from the count). These
+     routes predate ADR-1005 by construction — grandfathered under this
+     ADR's prospective-only binding (see "Binding status" above), same
+     "maintenance, not a violation" posture as the other entries in this
+     ledger — but had never been individually inventoried, so a reviewer
+     had no citable list distinguishing "known legacy debt" from "a new
+     UI-only capability slipped in disguised as a settings route." This
+     entry is that inventory, not a re-classification: nothing below
+     changes behavior or authorization posture.
+     - Only **2 of the 107** already have a genuine `/api/v1` twin (`GET
+       /api/audit` → `GET /api/v1/audit`; `GET /api/me` → `GET
+       /api/v1/me`) — both pre-existing, unrelated to this ledgering pass.
+       Everything else is `/api/settings/*` admin/config surface (user
+       management, OIDC/SAML/TLS/cert-upload config, enrollment tokens,
+       pending-agent approve/deny, MFA admin, plugin signing, agent-update
+       upload/rollout, MCP settings, DEX-alert routing, management-group
+       create, CA import-chain/revoke) or a handful of sibling
+       non-`/settings` admin routes (`/api/command`, `/api/policies*`,
+       `/api/policy-fragments*`, `/api/webhooks*`, `/api/workflows*`,
+       `/api/product-packs*`, `/api/notifications*`, `/api/nvd/*`,
+       `/api/patches*`, `/api/deployment-jobs*`, `/api/discovery/*`,
+       `/api/directory/*`, `/api/dashboard/*`, `/api/scope/*`,
+       `/api/help*`, `/api/analytics/*`, `/api/instructions/*/execute`,
+       `/api/compliance*`) — marked **settings-plane exception** with a
+       **2027-Q1** proposed re-home target (PO-adjustable; no committed
+       date until an owning module is scoped). `/fragments/*` surfaces
+       (e.g. `/fragments/auto/*`, `/fragments/tar/*`,
+       `/fragments/device/live/*`, `/fragments/executions`) remain under
+       item 1 above; they carry no migration date — tracked separately.
+
+     | Method | Path | Owning file | Replacement `/api/v1` path | Target quarter |
+     |---|---|---|---|---|
+     | POST | `/api/settings/ca/import-chain` | `ca_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/ca/revoke` | `ca_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/command` | `command_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/compliance` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/compliance/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/policies` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/policies/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/policies/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/disable` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/enable` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/evaluate` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/invalidate` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/remediate` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/invalidate-all` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/policy-fragments` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policy-fragments` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/policy-fragments/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/agents` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/analytics/recent` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/analytics/status` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/audit` | `dashboard_api_routes.cpp` | `GET /api/v1/audit` | 2026-Q4 |
+     | POST | `/api/export/json-to-csv` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/me` | `dashboard_api_routes.cpp` | `GET /api/v1/me` | 2026-Q4 |
+     | POST | `/api/scope/validate` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/group-from-results` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/tar-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | PUT | `/api/directory/group-mappings` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/directory/status` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/directory/sync` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/directory/users` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/discovery/results` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/discovery/scan` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/patches` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/patches/deploy` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/patches/deployments` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/patches/deployments/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/patches/deployments/([a-f0-9]+)/cancel` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/notifications` | `notification_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/notifications/(\d+)/dismiss` | `notification_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/notifications/(\d+)/read` | `notification_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/nvd/match` | `nvd_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/nvd/status` | `nvd_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/nvd/sync` | `nvd_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help/autocomplete` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help/html` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help/palette` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/api-tokens` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/api-tokens/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/auto-approve` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/auto-approve/(\d+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/auto-approve/(\d+)/toggle` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/auto-approve/mode` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/cert-paste` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/cert-upload` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/dex-alerts/blast` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/dex-alerts/cohort-export` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/dex-alerts/routing` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/enrollment-tokens` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/enrollment-tokens/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/enrollment-tokens/batch` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/management-groups` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/management-groups/([a-f0-9]+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mcp` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/disable` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/init` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/recovery-codes` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/verify` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/oidc` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/oidc/test` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/pending-agents/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/(.+)/approve` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/(.+)/deny` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/bulk-approve` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/bulk-deny` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/plugin-signing/clear` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/plugin-signing/require` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/plugin-signing/upload` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/tls` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/updates/([^/]+)/([^/]+)/([^/]+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/updates/upload` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/users` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/users/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/users/(.+)/role` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/webhooks` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/webhooks` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/webhooks/(\d+)` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/webhooks/(\d+)/deliveries` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/instructions/([^/]+)/execute` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/product-packs` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/product-packs` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/product-packs/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/product-packs/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/scope/estimate` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/workflow-executions/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/workflows` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/workflows` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/workflows/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/workflows/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/workflows/([^/]+)/execute` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+
+     `/fragments/*` surfaces remain under item 1; they carry no migration date — tracked separately.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

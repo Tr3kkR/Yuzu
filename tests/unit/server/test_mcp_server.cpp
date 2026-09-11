@@ -1897,8 +1897,9 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // + 1 (#4029: ProductPack prerequisite fix) = 29,
     // + 4 #4028 additions (TlsConfig, PluginSigning, ServerConfig,
     // AnalyticsConfig — Settings read-twins) = 33,
-    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36.
-    CHECK(rbac_securables_for_test().size() == 36);
+    // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36,
+    // + 2 Wave 7 (Forensics, Decommission — PR7.2) = 38.
+    CHECK(rbac_securables_for_test().size() == 38);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -3915,6 +3916,39 @@ TEST_CASE("MCP Guardian: get_guardian_device_guards returns every guard's state 
     CHECK(data["guards"].size() == 2);
     CHECK(data["total_guards"].get<int>() == 2);
     CHECK(ts.audit_log.back() == "guardian.device.view|success");
+}
+
+// #2146 Batch A audit (2026-09-10): get_guardian_status's degraded-query
+// branch (guardian_status_rollup returning nullopt) silently omitted
+// retry_after_ms while the REST twin GET /guaranteed-state/status correctly
+// carries retry_after_ms=5000 for the identical condition -- an agentic
+// worker had no machine-readable signal to back off and retry. Same
+// unreachable-pool mechanism as "MCP list_executions: a degraded tracker
+// surfaces a store-fault error" above: a real (non-null) GuaranteedStateStore
+// bound to a pool that cannot connect deterministically fails its own query,
+// no live database needed, no [pg] tag.
+TEST_CASE("MCP get_guardian_status: a degraded store carries retry_after_ms, "
+          "matching the REST twin (#2146 Batch A retry-hint audit)",
+          "[mcp][integration][guardian]") {
+    pg::PgPool unreachable{{.conninfo = "host=127.0.0.1 port=1 dbname=yuzu connect_timeout=1",
+                            .size = 1,
+                            .connect_timeout_s = 1}};
+    REQUIRE(unreachable.valid());
+    GuaranteedStateStore broken(unreachable);
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &broken;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":58,"params":{"name":"get_guardian_status"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 5000);
 }
 
 // ── Compliance/policy REST v1 read twins (api-parity #4034) ─────────────────
@@ -9622,7 +9656,11 @@ TEST_CASE("MCP #3685: Destructive + omitted target is refused with the new envel
     CHECK_FALSE(dispatched);
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
-    CHECK(ts.audit_details.back().find("destructive_untargeted") != std::string::npos);
+    // Exact prefix, not just a substring match (governance Gate 4
+    // consistency-auditor: this OPERATOR-tier backstop arm used to omit
+    // "reason=" here despite the C8 pre-mint arm's identical detail string
+    // carrying it) -- pin both arms to the SAME format.
+    CHECK(ts.audit_details.back().find("reason=destructive_untargeted") != std::string::npos);
 }
 
 TEST_CASE("MCP #3685: Destructive + scope target (real scope or __all__) is refused identically, "
@@ -9716,11 +9754,11 @@ TEST_CASE("MCP #3685: an untargeted Destructive supervised call is refused pre-m
     CHECK(appr.pending_count() == 0);
     CHECK_FALSE(dispatched);
     // Gate 8 round 3 (residual B, coordinator follow-up): this is the C8
-    // pre-mint RefuseUntargeted arm specifically — the audit-detail test at
-    // line ~7111 above exercises the OPERATOR-tier main-handler backstop's
-    // RefuseUntargeted arm instead, so it cannot see this arm's "reason="
-    // prefix (added in the prior commit for parity with the adjacent
-    // ClassifyMiss arm). Assert it here so the prefix ships with coverage.
+    // pre-mint RefuseUntargeted arm specifically. The OPERATOR-tier
+    // main-handler backstop's own RefuseUntargeted arm (test above, role
+    // "operator") used to omit this "reason=" prefix despite an adjacent
+    // comment there claiming parity with this arm -- governance Gate 4
+    // consistency-auditor caught the drift; both arms now agree.
     REQUIRE_FALSE(ts.audit_log.empty());
     CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
     CHECK(ts.audit_details.back().find("reason=destructive_untargeted") != std::string::npos);
@@ -9993,6 +10031,169 @@ TEST_CASE("MCP #3685: a Targeted Destructive call is NOT refused and still reach
     CHECK(dispatched);
     REQUIRE(seen.has_value());
     CHECK(*seen == std::unordered_set<std::string>{"dev-1", "dev-2"});
+}
+
+// ── 36c. Wave 7 PR7.2: Forensics single-target rule on MCP execute_instruction
+//
+// The Destructive cases above prove evaluate_destructive_targeting's
+// non-empty-agent_ids branch through execute_instruction; app_usage.last_used
+// is a REAL `Forensics`-securable row (ReadOnly, not Destructive) whose rule
+// is STRICTER — exactly one explicit agent_id, not merely a non-empty set —
+// and nothing previously drove it through this handler at all. Operator tier
+// exercises the BACKSTOP gate site (mcp_server.cpp, ~8524); the tier is
+// deliberately "operator" throughout except the approval-flow case, which
+// exercises the C8 pre-mint site (~4683) the same way the sibling Destructive
+// test above does.
+
+namespace {
+[[nodiscard]] std::expected<yuzu::server::CommandCapability, yuzu::server::ClassificationError>
+forensics_classify_stub(std::string_view plugin, std::string_view action) {
+    static constexpr yuzu::server::CommandCapability kForensicsRow{
+        .plugin = "app_usage",
+        .action = "last_used",
+        .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+        .mutability = yuzu::server::Mutability::None,
+        .securable = "Forensics",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = yuzu::server::ExecuteGate::AdminOrApproval,
+    };
+    if (plugin == kForensicsRow.plugin && action == kForensicsRow.action)
+        return kForensicsRow;
+    return std::unexpected(yuzu::server::ClassificationError::Unclassified);
+}
+} // namespace
+
+TEST_CASE("MCP Wave7 PR7.2: Forensics + ZERO targets is refused with the forensic-specific "
+          "envelope, dispatch_fn NOT invoked",
+          "[mcp][integration][execute][forensics]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = forensics_classify_stub;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"app_usage","action":"last_used"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() ==
+          std::string(yuzu::server::kForensicUntargetedMessage));
+    CHECK_FALSE(dispatched);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find(std::string(yuzu::server::kReasonForensicUntargeted)) !=
+          std::string::npos);
+    // #3937 follow-up: a Forensics refusal must NOT claim the action "is
+    // classified Destructive" -- it's a distinct, read-only classification
+    // with its own single-target rule (dispatch_destructive_gate.hpp's
+    // remediation_for_refusal_reason).
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("classified Destructive") == std::string::npos);
+    CHECK(remediation.find("single-target forensic read") != std::string::npos);
+}
+
+TEST_CASE("MCP Wave7 PR7.2: Forensics + TWO explicit agent_ids is refused — exactly-one, not "
+          "merely non-empty — dispatch_fn NOT invoked",
+          "[mcp][integration][execute][forensics]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = forensics_classify_stub;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"app_usage","action":"last_used","agent_ids":["dev-1","dev-2"]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() ==
+          std::string(yuzu::server::kForensicUntargetedMessage));
+    CHECK_FALSE(dispatched);
+}
+
+TEST_CASE("MCP Wave7 PR7.2: Forensics + explicit single agent_id dispatches normally",
+          "[mcp][integration][execute][forensics]") {
+    McpTestServer ts;
+    ts.classify_fn_for_test = forensics_classify_stub;
+    bool dispatched = false;
+    std::vector<std::string> seen_ids;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>& agent_ids, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        seen_ids = agent_ids;
+        return {.sent = 1, .command_id = "cmd"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"app_usage","action":"last_used","agent_ids":["dev-1"]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK_FALSE(body.contains("error"));
+    CHECK(dispatched);
+    CHECK(seen_ids == std::vector<std::string>{"dev-1"});
+}
+
+TEST_CASE("MCP Wave7 PR7.2: an untargeted Forensics supervised call is refused pre-mint — NO "
+          "approval ticket created",
+          "[mcp][pg][integration][execute][forensics][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.classify_fn_for_test = forensics_classify_stub;
+    ts.approval_manager_for_test = &appr;
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd"};
+    };
+    ts.start_with_dispatch(dispatch, "supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"execute_instruction","arguments":{"plugin":"app_usage","action":"last_used"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>() ==
+          std::string(yuzu::server::kForensicUntargetedMessage));
+    CHECK(appr.pending_count() == 0);
+    CHECK_FALSE(dispatched);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "mcp.execute_instruction|denied");
+    CHECK(ts.audit_details.back().find(std::string("reason=") +
+                                       std::string(yuzu::server::kReasonForensicUntargeted)) !=
+          std::string::npos);
+    // #3937 follow-up: same C8 pre-mint site -- remediation text must not
+    // claim "classified Destructive" for a Forensics refusal either.
+    const auto remediation = body["error"]["data"]["remediation"].get<std::string>();
+    CHECK(remediation.find("classified Destructive") == std::string::npos);
+    CHECK(remediation.find("single-target forensic read") != std::string::npos);
 }
 
 // ── 35c. #3687: pre-dispatch authorization dry run — discriminated denials ──

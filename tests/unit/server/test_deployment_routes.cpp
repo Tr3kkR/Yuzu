@@ -441,6 +441,14 @@ TEST_CASE("deployment routes: GET /api/v1/deployments/preview 503s (not 404) "
     REQUIRE(res);
     CHECK(res->status == 503);
     CHECK(res->body.find(run_id) == std::string::npos);
+    // #2146 Batch A retry-hint audit: this genuine store-fault (not the
+    // unwired-pointer case in the sibling TEST_CASE below) must carry a
+    // retry hint matching the MCP twin's own kMcpStoreFaultShortRetryMs
+    // (2000ms) — see mcp_server.cpp's get_deployment_preview handler and
+    // mcp_retry.hpp.
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["error"].contains("retry_after_ms"));
+    CHECK(body["error"]["retry_after_ms"].get<int>() == 2000);
 }
 
 TEST_CASE("deployment routes: GET /api/v1/deployments/preview 503s when the "

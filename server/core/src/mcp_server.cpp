@@ -778,7 +778,7 @@ static const ToolDef kTools[] = {
      "fleet-wide read gated by a bare GuaranteedState:Read plus a service-scoped-token deny "
      "(the SAME posture the REST route has today — issue #3238 tracks giving this fleet-wide "
      "branch real per-caller confinement; this tool does not fix or paper over that gap).",
-     R"({"type":"object","properties":{"rule_id":{"type":"string"},"agent_id":{"type":"string","maxLength":256},"severity":{"type":"string"},"limit":{"type":"integer","minimum":0,"maximum":1000},"offset":{"type":"integer","minimum":0}}})",
+     R"({"type":"object","properties":{"rule_id":{"type":"string","maxLength":256},"agent_id":{"type":"string","maxLength":256},"severity":{"type":"string","maxLength":256},"limit":{"type":"integer","minimum":0,"maximum":1000},"offset":{"type":"integer","minimum":0}}})",
      R"j({"type":"object","properties":{"events":{"type":"array","items":{"type":"object","properties":{"event_id":{"type":"string"},"rule_id":{"type":"string"},"agent_id":{"type":"string"},"event_type":{"type":"string"},"severity":{"type":"string"},"guard_type":{"type":"string"},"guard_category":{"type":"string"},"detected_value":{"type":"string"},"expected_value":{"type":"string"},"detail_json":{"type":"string"},"remediation_action":{"type":"string"},"remediation_success":{"type":"boolean"},"detection_latency_us":{"type":"integer"},"remediation_latency_us":{"type":"integer"},"timestamp":{"type":"string"}},"required":["event_id","rule_id","event_type","severity","timestamp"]}},"total":{"type":"integer"},"offset":{"type":"integer"}},"required":["events","total","offset"]})j"},
 
     {"get_guardian_rule_status",
@@ -1260,7 +1260,10 @@ static const ToolDef kTools[] = {
      "WARNING: If neither scope nor agent_ids is provided, the command targets ALL connected "
      "agents. EXCEPTION (#3685): a Destructive-classified plugin.action pair requires explicit, "
      "non-empty agent_ids - broadcast and scope fan-out (including __all__) are refused before a "
-     "ticket is minted or consumed, matching REST POST /api/command. "
+     "ticket is minted or consumed, matching REST POST /api/command. A SECOND, STRICTER "
+     "EXCEPTION (Wave 7 PR7.2b): a Forensics-classified plugin.action pair requires EXACTLY ONE "
+     "explicit, in-scope agent_id - not merely non-empty agent_ids, and scope is refused outright "
+     "even when it would resolve to one device - a forensic read is per-device by nature. "
      "DENIAL DISCRIMINATION (#3687): a dispatch-authorization denial is a JSON-RPC error whose "
      "error.data.reason is one of the six machine-readable values \"unclassified\", "
      "\"ambiguous\", \"anonymous_operator\", \"forbidden\", \"approval_required\", "
@@ -2749,7 +2752,13 @@ constexpr std::string_view kRbacSecurables[] = {
     // Enrollment (auto-approve rules + pending-agent visibility), OidcConfig
     // (OIDC SSO config read — deliberately NOT "Directory", see the naming
     // trap called out in the issue and in discovery_routes.cpp).
-    "Directory", "Enrollment", "OidcConfig"};
+    "Directory", "Enrollment", "OidcConfig",
+    "Forensics",
+    // Decommission has NO MCP consumer by design — the erasure verb is
+    // REST-only (ADR-1005 twin-existence exception #2102). It is listed so
+    // the seeded-catalogues binding test in test_rbac_store.cpp keeps the
+    // two mirrors equal.
+    "Decommission"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.
@@ -4548,9 +4557,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // tier_allows-then-perm_fn order. This resources/read branch, like every other
             // branch in this method, emits no audit row on tier denial (unlike tools/call's
             // mcp_audit("denied", ...)) — the whole resources/read surface predates
-            // per-call audit, tracked by the same #2713 follow-up. Deliberately NOT
-            // unauthenticated like /api/v1/openapi.json — that posture is a tracked
-            // pre-existing gap (#2057), not a precedent to follow.
+            // per-call audit, tracked by the same #2713 follow-up. #2057 (REST
+            // GET /api/v1/openapi.json was unauthenticated) is now closed — that
+            // route gates Infrastructure:Read too, so the two surfaces share the
+            // same posture rather than this one being the odd one out.
             //
             // Shared tier-denial remediation text for these two branches only — NOT the
             // same scope as tools/call's kTierRemediation (declared later, inside that
@@ -5346,7 +5356,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             const auto gate = yuzu::server::evaluate_destructive_targeting(
                                 classify_fn_(p, a),
                                 /*valid_nonempty_agent_ids=*/args.contains("agent_ids"),
-                                /*scope_key_present=*/args.contains("scope"));
+                                /*scope_key_present=*/args.contains("scope"),
+                                /*agent_id_count=*/
+                                (args.contains("agent_ids") && args["agent_ids"].is_array())
+                                    ? args["agent_ids"].size()
+                                    : 0);
                             // #3685 governance round: exhaustive switch, no
                             // `default:` arm — matches REST's `/api/command`
                             // switch over the SAME enum (server.cpp) and the
@@ -5462,9 +5476,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                         metrics
                                             ->counter("yuzu_server_dispatch_target_rejected_total",
                                                       {{"route", "mcp"},
-                                                       {"reason",
-                                                        std::string(yuzu::server::
-                                                                        kReasonDestructiveUntargeted)}})
+                                                       {"reason", std::string(gate.refusal_reason)}})
                                             .increment();
                                     } catch (...) { // NOLINT(bugprone-empty-catch)
                                     }
@@ -5485,19 +5497,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                 // correlation_id=<cid>`) — genuine parity, not just a
                                 // shared mechanism, so audit-log tooling can rely on
                                 // one convention across both arms of this switch.
+                                // Wave 7 PR7.2: this arm now also covers a Forensics
+                                // single-target refusal (reason=forensic_untargeted).
                                 const bool audit_ok = mcp_audit(
                                     "denied",
-                                    std::string("reason=destructive_untargeted ") +
-                                        yuzu::server::detail::sanitize_detail_value(p) + ":" +
-                                        yuzu::server::detail::sanitize_detail_value(a) +
+                                    std::string("reason=") + std::string(gate.refusal_reason) +
+                                        " " + yuzu::server::detail::sanitize_detail_value(p) +
+                                        ":" + yuzu::server::detail::sanitize_detail_value(a) +
                                         " correlation_id=" + cid);
+                                // #3937 follow-up: branch the remediation text by
+                                // refusal reason — a Forensics single-target refusal
+                                // is a distinct, read-only classification and must
+                                // not claim the action "is classified Destructive"
+                                // (dispatch_destructive_gate.hpp's
+                                // remediation_for_refusal_reason).
                                 res.set_content(
-                                    a4_error(kInvalidParams,
-                                             yuzu::server::kDestructiveUntargetedMessage,
-                                             "this plugin.action is classified Destructive: "
-                                             "name explicit agent_ids (no scope, no broadcast) "
-                                             "and re-call; no approval ticket was created or "
-                                             "consumed",
+                                    a4_error(kInvalidParams, gate.refusal_message,
+                                             std::string(yuzu::server::remediation_for_refusal_reason(
+                                                 gate.refusal_reason)) +
+                                                 "; no approval ticket was created or consumed",
                                              -1, cid, audit_ok),
                                     "application/json");
                                 return;
@@ -6459,7 +6477,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto defs_result = instruction_store->query_definitions(iq);
                 if (!defs_result) {
                     res.set_content(
-                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        a4_error(kInternalError, "instruction store read failed", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -6506,7 +6525,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto def_result = instruction_store->get_definition(def_id);
                 if (!def_result) {
                     res.set_content(
-                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        a4_error(kInternalError, "instruction store read failed", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -6552,7 +6572,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto def_result = instruction_store->get_definition(def_id);
                 if (!def_result) {
                     res.set_content(
-                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        a4_error(kInternalError, "instruction store read failed", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -6603,10 +6624,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 q.limit = static_cast<int>(*limit_opt);
                 auto packs_result = product_pack_store->list(q);
                 if (!packs_result) {
+                    // product_pack_error_status classifies a genuine DB/lease
+                    // fault (503, transient) apart from a validation/business-
+                    // rule error (400, never retryable) -- only the former gets
+                    // a retry hint, matching REST's own classification.
+                    const bool transient = product_pack_error_status(packs_result.error()) == 503;
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       product_pack_client_message("list_product_packs",
-                                                                   packs_result.error())),
+                        a4_error(kInternalError,
+                                product_pack_client_message("list_product_packs",
+                                                            packs_result.error()),
+                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -6645,10 +6672,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto pack_id = param_str(args, "id");
                 auto pack_result = product_pack_store->get(pack_id);
                 if (!pack_result) {
+                    const bool transient = product_pack_error_status(pack_result.error()) == 503;
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       product_pack_client_message("get_product_pack",
-                                                                   pack_result.error())),
+                        a4_error(kInternalError,
+                                product_pack_client_message("get_product_pack",
+                                                            pack_result.error()),
+                                {}, transient ? mcp::kMcpStoreFaultRetryMs : -1),
                         "application/json");
                     return;
                 }
@@ -8312,9 +8341,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto schedules_result = schedule_engine->query_schedules_checked(sq);
                 if (!schedules_result) {
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       yuzu::server::genericize_db_error(
-                                           "list_schedules", schedules_result.error())),
+                        a4_error(kInternalError,
+                                yuzu::server::genericize_db_error("list_schedules",
+                                                                  schedules_result.error()),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8367,9 +8397,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto workflows_result = workflow_engine->list_workflows(wq);
                 if (!workflows_result) {
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       yuzu::server::genericize_db_error("list_workflows",
-                                                                         workflows_result.error())),
+                        a4_error(kInternalError,
+                                yuzu::server::genericize_db_error("list_workflows",
+                                                                  workflows_result.error()),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8404,9 +8435,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto workflow_result = workflow_engine->get_workflow(workflow_id);
                 if (!workflow_result) {
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       yuzu::server::genericize_db_error("get_workflow",
-                                                                         workflow_result.error())),
+                        a4_error(kInternalError,
+                                yuzu::server::genericize_db_error("get_workflow",
+                                                                  workflow_result.error()),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8450,9 +8482,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto exec_result = workflow_engine->get_execution(exec_id);
                 if (!exec_result) {
                     res.set_content(
-                        error_response(id, kInternalError,
-                                       yuzu::server::genericize_db_error("get_execution",
-                                                                         exec_result.error())),
+                        a4_error(kInternalError,
+                                yuzu::server::genericize_db_error("get_execution",
+                                                                  exec_result.error()),
+                                {}, /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8789,7 +8822,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto rollup = guardian_status_rollup(*guaranteed_state_store, gate.scope);
                 if (!rollup) {
                     res.set_content(
-                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -8836,7 +8870,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto rows = guaranteed_state_store->list_rules();
                 if (!rows) {
                     res.set_content(
-                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9013,7 +9048,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto row = guaranteed_state_store->get_rule(rule_id);
                 if (!row) {
                     res.set_content(
-                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9036,7 +9072,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto rows = guardian_rule_agent_status_rows(*guaranteed_state_store, rule_id);
                 if (!rows) {
                     res.set_content(
-                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9108,7 +9145,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     agent_id, "per-device all-guards view via MCP");
                 if (!rows) {
                     res.set_content(
-                        error_response(id, kInternalError, "guaranteed-state store degraded"),
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -10900,7 +10938,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     const auto gate = yuzu::server::evaluate_destructive_targeting(
                         classify_fn_(plugin, action),
                         /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
-                        /*scope_key_present=*/!scope.empty());
+                        /*scope_key_present=*/!scope.empty(),
+                        /*agent_id_count=*/agent_ids.size());
                     // #3685 governance round: exhaustive switch, no `default:`
                     // arm — matches REST's `/api/command` switch over the SAME
                     // enum (server.cpp), the C8 pre-mint site above, and the
@@ -10934,9 +10973,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                 metrics
                                     ->counter("yuzu_server_dispatch_target_rejected_total",
                                               {{"route", "mcp"},
-                                               {"reason",
-                                                std::string(yuzu::server::
-                                                                kReasonDestructiveUntargeted)}})
+                                               {"reason", std::string(gate.refusal_reason)}})
                                     .increment();
                             } catch (...) { // NOLINT(bugprone-empty-catch)
                             }
@@ -10946,16 +10983,26 @@ McpServer::HandlerFn McpServer::build_handler(
                         // denial-audit row — same convention as the C8 pre-mint
                         // site above (audit_persisted doc comment ~3763, the
                         // denied_ok = mcp_audit(...) working example ~5424).
+                        // Wave 7 PR7.2: this arm now also covers a Forensics
+                        // single-target refusal (reason=forensic_untargeted).
                         const bool audit_ok = mcp_audit(
                             "denied",
-                            std::string("destructive_untargeted ") +
+                            // "reason=" prefix -- matches the C8 pre-mint site
+                            // above; governance Gate 4 consistency-auditor
+                            // finding: this site previously omitted it despite
+                            // the adjacent comment claiming parity, so a
+                            // `reason=(\S+)` audit-log parser silently lost
+                            // the reason on every refusal routed through here.
+                            std::string("reason=") + std::string(gate.refusal_reason) + " " +
                                 yuzu::server::detail::sanitize_detail_value(plugin) + ":" +
                                 yuzu::server::detail::sanitize_detail_value(action) +
                                 " correlation_id=" + cid);
+                        // #3937 follow-up: branch the remediation text by refusal
+                        // reason — see the C8 pre-mint site above.
                         res.set_content(
-                            a4_error(kInvalidParams, yuzu::server::kDestructiveUntargetedMessage,
-                                     "this plugin.action is classified Destructive: name "
-                                     "explicit agent_ids (no scope, no broadcast) and re-call",
+                            a4_error(kInvalidParams, gate.refusal_message,
+                                     yuzu::server::remediation_for_refusal_reason(
+                                         gate.refusal_reason),
                                      -1, cid, audit_ok),
                             "application/json");
                         return;
@@ -14584,9 +14631,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
                 if (!preflight_run_store_) {
-                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
-                                             "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                    // No retry_after_ms: preflight_run_store_ is wired exactly
+                    // once at server construction, no runtime setter — a null
+                    // value here is a permanent deployment-config condition,
+                    // not one a client can retry past. Matches the REST twin
+                    // (preflight_routes.cpp's unwired-pointer branch).
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable"),
                                     "application/json");
                     return;
                 }
@@ -14635,9 +14685,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
                     return;
                 if (!preflight_run_store_) {
-                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable",
-                                             "retry once the server reports ready",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                    // No retry_after_ms: preflight_run_store_ is wired exactly
+                    // once at server construction, no runtime setter — a null
+                    // value here is a permanent deployment-config condition,
+                    // not one a client can retry past. Matches the REST twin
+                    // (deployment_routes.cpp's unwired-pointer branch).
+                    res.set_content(a4_error(kInternalError, "pre-flight run store unavailable"),
                                     "application/json");
                     return;
                 }
@@ -16738,7 +16791,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // (no server-wide set_exception_handler is installed on
                     // web_server_ — see rest_api_v1.cpp's identical note).
                     res.set_content(
-                        error_response(id, kInternalError, "Instruction store unavailable"),
+                        a4_error(kInternalError, "instruction store read failed", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }

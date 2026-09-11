@@ -165,7 +165,7 @@
 #include "guardian_ingest.hpp" // kGuardianEventStoreDurationMetric + warm_create_guardian_event_store_metric
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
-#include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
+#include "network_api_local.hpp" // ADR-0031 WS-A4: core-only /network seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "inventory_ci_join.hpp"
@@ -1358,22 +1358,36 @@ public:
                               {"reason", std::string(yuzu::server::kReasonBodyType)}});
         }
         // #3685: Destructive-class targeting refusal. Seeded on `command`
-        // (REST `/api/command`) and `mcp` (MCP `execute_instruction`, both
+        // (REST `/api/command`), `mcp` (MCP `execute_instruction`, both
         // the C8 pre-mint gate and the main-handler backstop share this one
-        // label — mutually exclusive per request, so no double-count) —
-        // deliberately NOT `instruction_execute`: that route has no
-        // Destructive gate yet (tracked as a residual parity follow-up), and
-        // seeding it here would publish a series claiming a reachability
-        // that does not exist, which is exactly what the per-route seeding
-        // above exists to avoid.
+        // label — mutually exclusive per request, so no double-count),
+        // `dashboard`, and — since Wave 7 PR7.2's BR-001 fix wired
+        // `evaluate_destructive_targeting` into `/api/instructions/{id}/execute`
+        // (workflow_routes.cpp) — `instruction_execute` too (the exclusion
+        // this comment used to state, "that route has no Destructive gate
+        // yet", is stale: it does now). `workflow`: the SAME
+        // evaluate_destructive_targeting call, now run as a whole-request
+        // preflight over every step of `/api/workflows/{id}/execute` before
+        // WorkflowEngine::execute() is invoked at all — a genuinely NEW
+        // emission point, not a relabeling of the per-step dispatch_fn refusal
+        // (that refusal has no metrics/audit_fn/req access and stays a silent
+        // failed-step result by construction).
         // "dashboard" seeded alongside the other two (PR6.0b): a series created
         // only on first use reads as ABSENT until the first refusal, which is
         // exactly the absent()-alerting break the single-array discipline exists
         // to prevent -- and three docs tell operators to alert on this series.
-        for (const char* route : {"command", "mcp", "dashboard"})
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // Wave 7 PR7.2: the Forensics single-target refusal — same routes as
+        // its Destructive sibling above, since `evaluate_destructive_targeting`
+        // is called generically for any classified capability on all of them
+        // (a Forensics row is never Destructive, but reaches the same gate).
+        for (const char* route : {"command", "mcp", "dashboard", "instruction_execute", "workflow"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonForensicUntargeted)}});
         // #2557: `destructive_no_visible_target` is emitted ONLY by
         // `/api/command`'s confine-to-visible-agents 404 arm today — unlike
         // its `destructive_untargeted` sibling above, MCP's execute_instruction
@@ -8746,13 +8760,13 @@ public:
     /// skipped.
     ///
     /// PRODUCTION TRIGGER — LIVE: the operator decommission surface that calls this
-    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on a SCOPED
-    /// CONJUNCTION over every securable the cascade erases through —
-    /// `SoftwareLicensing:Delete` AND `Inventory:Delete` AND `GuaranteedState:Delete`
-    /// (app_perf_daily is DEX behavioural PII) — plus audit-before-erase fail-closed
-    /// (Decision 11). ADDING A STORE BELOW? Add its governing securable's Delete to
-    /// that conjunction too; the drift guard in test_agent_decommission.cpp fails
-    /// until you do.
+    /// is `DELETE /api/v1/sle/agents/{id}` (sle_routes.cpp), gated on ONE scoped
+    /// securable, `Decommission:Delete` (ADR-0024 Decision 9, amended Wave 7
+    /// PR7.2) — a device-level erasure grant covering the cascade's whole blast
+    /// radius — plus audit-before-erase fail-closed (Decision 11). ADDING A STORE
+    /// BELOW? Add it to `AgentDecommissionStores`, `agent_decommission.cpp`'s
+    /// registration list, and `kCascadeStoreCount` — the securable no longer
+    /// changes.
     /// Today's OTHER agent-removal paths (registry session teardown, enrollment
     /// deny/remove, cert revocation) are non-durable-data by design and deliberately
     /// do NOT auto-erase (a revoked-for-compromise agent's forensic rows must
@@ -15212,7 +15226,8 @@ private:
             // registration time, so the ordering is fine.
             [this](const std::string& scope, bool full_sync) -> int {
                 return guardian_push_fn_ ? guardian_push_fn_(scope, full_sync) : -2;
-            });
+            },
+            &metrics_); // #4252 — platform-support-matrix-stale counter
 
         // F2a: the fleet perf snapshot provider — joins AgentHealthStore heartbeat
         // perf tags (validated through the SAME dex_perf_rules the Prometheus
@@ -16301,6 +16316,14 @@ private:
         wf_deps.execution_event_bus = execution_event_bus_.get();
         wf_deps.stream_budget = stream_budget_.get(); // ADR-0034: one budget, every surface
         wf_deps.metrics = &metrics_;                  // #2500 targeting-refusal counter
+        // BR-001 — the SAME capability_registry_ classifier /api/command, MCP
+        // execute_instruction and the exec console consult, so a fourth
+        // operator-facing dispatch surface cannot disagree with them about
+        // whether a plugin.action is Destructive or Forensics. Wired
+        // UNCONDITIONALLY, exactly like set_capability_classify_fn on
+        // DashboardRoutes/McpServer above: capability_registry_ is a plain
+        // ServerImpl member, never conditional on another store's presence.
+        wf_deps.capability_registry = &capability_registry_;
         workflow_routes_->register_routes(*web_server_, std::move(wf_deps));
 
         // NotificationRoutes — /api/notifications/*

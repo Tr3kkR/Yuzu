@@ -69,7 +69,12 @@ using yuzu::server::evaluate_destructive_targeting;
 using yuzu::server::ExecuteGate;
 using yuzu::server::kDestructiveNoVisibleAgentMessage;
 using yuzu::server::kDestructiveUntargetedMessage;
+using yuzu::server::kForensicsSecurable;
+using yuzu::server::kForensicUntargetedMessage;
+using yuzu::server::kReasonDestructiveUntargeted;
+using yuzu::server::kReasonForensicUntargeted;
 using yuzu::server::Mutability;
+using yuzu::server::requires_explicit_targets;
 
 namespace {
 
@@ -127,6 +132,36 @@ inline constexpr std::array<CommandCapability, 1> kCollidingFragment{{
         .securable = "Infrastructure",
         .operation = yuzu::server::authz::Operation::Delete,
         .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+}};
+
+// Wave 7 PR7.2 — a local Forensics fixture: `ReadOnly`/`None`, never
+// `Destructive`, but still subject to the single-target rule via
+// `requires_explicit_targets`'s securable-name branch. Also a plain
+// Inventory `ReadOnly` row (no relation to Forensics) proving the rule does
+// NOT leak onto every ReadOnly securable.
+inline constexpr std::array<CommandCapability, 2> kForensicsFixture{{
+    {
+        .plugin = "execution_artifacts",
+        .action = "shimcache",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Forensics",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::High,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "inventory",
+        .action = "list",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = yuzu::server::authz::Operation::Read,
+        .risk_tier = yuzu::server::authz::RiskTier::Low,
         .system_reserved = false,
         .execute_gate = ExecuteGate::None,
     },
@@ -263,6 +298,105 @@ TEST_CASE("ReadOnly and Mutating rows: NotDestructive regardless of targeting sh
     CHECK(gate2.verdict == DestructiveTargetingVerdict::NotDestructive);
     REQUIRE(gate2.capability.has_value());
     CHECK(gate2.capability->plugin == "tags");
+}
+
+// ──────────────────────────── Wave 7 PR7.2: Forensics single-target rule ──
+
+TEST_CASE("Forensics ReadOnly row, exactly one explicit agent_id, no scope: Targeted",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kForensicsFixture)};
+    auto classified = registry.classify("execution_artifacts", "shimcache");
+    REQUIRE(classified.has_value());
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/true,
+                                                      /*scope_key_present=*/false,
+                                                      /*agent_id_count=*/1);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::Targeted);
+    REQUIRE(gate.capability.has_value());
+    CHECK(gate.capability->securable == kForensicsSecurable);
+}
+
+TEST_CASE("Forensics ReadOnly row: RefuseUntargeted for 0 ids, 2 ids, ids+scope, and an "
+          "omitted count (fail-closed default)",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kForensicsFixture)};
+    auto classified = registry.classify("execution_artifacts", "shimcache");
+    REQUIRE(classified.has_value());
+
+    // 0 ids.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/false,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/0);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+    // 2 ids (fan-out — not a broadcast, but still more than the one target
+    // the single-target rule permits).
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/2);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+    // Exactly one id, but scope ALSO present.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/true,
+                                                          /*agent_id_count=*/1);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+    // The count parameter OMITTED entirely — defaults to 0, so a caller that
+    // has not been updated to count ids FAILS CLOSED rather than admitting a
+    // forensic broadcast by silent omission.
+    {
+        const auto gate = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false);
+        CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+        CHECK(gate.refusal_reason == kReasonForensicUntargeted);
+        CHECK(gate.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
+TEST_CASE("Inventory ReadOnly row stays NotDestructive — the single-target rule does not leak "
+          "onto every ReadOnly securable",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kForensicsFixture)};
+    auto classified = registry.classify("inventory", "list");
+    REQUIRE(classified.has_value());
+    CHECK_FALSE(requires_explicit_targets(*classified));
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/false,
+                                                      /*scope_key_present=*/false,
+                                                      /*agent_id_count=*/0);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::NotDestructive);
+}
+
+TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/message, not the "
+          "Forensics pair",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{std::span<const CommandCapability>(kFixture)};
+    auto classified = registry.classify("tar", "purge_source");
+    REQUIRE(classified.has_value());
+
+    const auto gate = evaluate_destructive_targeting(classified,
+                                                      /*valid_nonempty_agent_ids=*/false,
+                                                      /*scope_key_present=*/false);
+    CHECK(gate.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+    CHECK(gate.refusal_reason == kReasonDestructiveUntargeted);
+    CHECK(gate.refusal_message == kDestructiveUntargetedMessage);
 }
 
 // ──────────────────────────────────────────────── confine_destructive_targets ──
