@@ -156,6 +156,56 @@ TEST_CASE("TAR retention: re-enabling a source resumes retention", "[tar][retent
     CHECK(after_resume < 48);
 }
 
+// ── Wave 7 PR7.2b: usage_daily_user's independent retention target ─────────
+
+TEST_CASE("TAR retention: usage_daily_user prunes independently of usage_daily's own state",
+          "[tar][retention][usage]") {
+    // Round 2 finding #4 (PR #4177): usage_daily_user used to run only INSIDE
+    // usage_daily's own per-pass iteration, sharing that parent's guard
+    // verdict — so a tick where usage_daily's own guard declines-to-delete
+    // (nothing of ITS OWN past cutoff) meant usage_daily_user's genuinely
+    // expired rows were never even considered. This pins the fix: usage_daily
+    // has nothing to do this pass, usage_daily_user still prunes its own
+    // expired row on its own facts.
+    yuzu::tar::RetentionGuardState guard;
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-usage-retention-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    constexpr int64_t kUsageDailyWindow = 2678400; // 31 days -- matches the registry
+    const int64_t t_now = 1'735'689'600 + kUsageDailyWindow;
+    REQUIRE(db.set_config("retention_guard_last_pass", std::to_string(t_now))); // skip bootstrap decline
+
+    // usage_daily itself: ONE recent row, well inside the window -- nothing
+    // for ITS OWN guard to do.
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES ({}, 'a.exe', 1, 10, "
+        "{}, {}, 1, 0, 0)",
+        t_now, t_now, t_now)));
+
+    // usage_daily_user: an OLD row past the SAME 31-day window, plus a recent
+    // survivor -- proves this table reaches its OWN independent verdict.
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES ({}, 'old.exe', 'alice')",
+        t_now - kUsageDailyWindow - 86400)));
+    REQUIRE(db.execute_sql(std::format(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES ({}, 'a.exe', 'bob')",
+        t_now)));
+
+    run_retention(db, t_now, guard);
+
+    auto count = [&](const std::string& table) {
+        auto r = db.execute_query("SELECT COUNT(*) FROM " + table);
+        REQUIRE(r.has_value());
+        return std::stoi(r->rows[0][0]);
+    };
+    CHECK(count("usage_daily") == 1);      // usage_daily's own row: nothing expired, untouched
+    CHECK(count("usage_daily_user") == 1); // the OLD row pruned; the recent survivor remains
+}
+
 // ── PR-A (#547): apply_source_enabled_transition + paused_at semantics ─────
 
 TEST_CASE("TAR paused_at: enabled→disabled writes the timestamp", "[tar][paused_at][pr-a]") {
@@ -512,7 +562,7 @@ TEST_CASE("TAR #538: every registered capture source is classified by diff_state
     // performed out here.
     const std::set<std::string_view> non_diff_sources = {"perf",     "procperf", "netqual",
                                                           "module",   "netconn",  "power",
-                                                          "removable"};
+                                                          "removable", "usage"};
 
     for (const auto& src : capture_sources()) {
         const bool is_diff = diff_sources.contains(src.name);

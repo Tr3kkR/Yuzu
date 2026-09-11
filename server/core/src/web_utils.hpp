@@ -733,7 +733,14 @@ template <typename Req>
 inline bool is_login_exempt_path(std::string_view path) {
     return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
            path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
-           path == "/auth/callback" || path == "/api/v1/openapi.json" ||
+           path == "/auth/callback" ||
+           // #2057: /api/v1/openapi.json used to be listed here as
+           // unauthenticated-by-design. It no longer is — the route now
+           // gates `Infrastructure:Read` (rest_api_v1.cpp), matching its
+           // MCP twin `yuzu://openapi`. Removed so the pre-routing
+           // chokepoint resolves a session for it like every other
+           // /api/v1/* route; the route's own perm_fn is the authority,
+           // not this exemption list.
            path == "/auth/saml/start" || path == "/saml/acs" ||
            // PKI PR4: the CA root cert + CRL are public by design — clients
            // and browsers need them to establish trust / check revocation

@@ -371,7 +371,8 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             const auto gate = yuzu::server::evaluate_destructive_targeting(
                 deps.capability_registry->classify(plugin, action),
                 /*valid_nonempty_agent_ids=*/!agent_ids.empty(),
-                /*scope_key_present=*/!extract_json_string(body, "scope").empty());
+                /*scope_key_present=*/!extract_json_string(body, "scope").empty(),
+                /*agent_id_count=*/agent_ids.size());
             switch (gate.verdict) {
             case yuzu::server::DestructiveTargetingVerdict::NotDestructive:
                 break;
@@ -401,8 +402,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                         deps.metrics
                             ->counter("yuzu_server_dispatch_target_rejected_total",
                                      {{"route", "command"},
-                                      {"reason",
-                                       std::string(yuzu::server::kReasonDestructiveUntargeted)}})
+                                      {"reason", std::string(gate.refusal_reason)}})
                             .increment();
                     } catch (const std::exception& e) {
                         // Governance round 1 (UP-4b): every empty catch in
@@ -410,29 +410,29 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                         // DestructiveNoVisibleTarget sibling below already
                         // logs — this one silently swallowed.
                         spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
-                                     "(reason=destructive_untargeted): {}",
-                                     plugin, action, e.what());
+                                     "(reason={}): {}",
+                                     plugin, action, gate.refusal_reason, e.what());
                     } catch (...) {
                         spdlog::error("dispatch_target_rejected_total counter threw for {}:{} "
-                                     "(reason=destructive_untargeted)",
-                                     plugin, action);
+                                     "(reason={})",
+                                     plugin, action, gate.refusal_reason);
                     }
                     // #3685 fix round (adversarial review F2): audited like
                     // the check_targeting_shape refusal above in this same
                     // function — an incident review of a near-miss
                     // broadcast-Destructive attempt must find a row here,
-                    // not just a counter increment.
+                    // not just a counter increment. Wave 7 PR7.2: the same
+                    // audit shape now also covers a broadcast/fan-out
+                    // Forensics refusal (reason=forensic_untargeted).
                     const bool audit_ok = yuzu::server::detail::emit_behavioral_audit(
                         audit_fn, req, res, "command.dispatch", "denied", "command", "",
-                        std::string("reason=") +
-                            std::string(yuzu::server::kReasonDestructiveUntargeted) + " " +
+                        std::string("reason=") + std::string(gate.refusal_reason) + " " +
                             onbehalf::sanitize_for_log(plugin, 128) + ":" +
                             onbehalf::sanitize_for_log(action, 128));
                     res.status = 400;
                     nlohmann::json err{
                         {"error",
-                         {{"code", 400},
-                          {"message", std::string(yuzu::server::kDestructiveUntargetedMessage)}}},
+                         {{"code", 400}, {"message", std::string(gate.refusal_message)}}},
                         {"meta", {{"api_version", "v1"}}}};
                     if (deps.audit_store_configured_fn())
                         err["audit_emitted"] = audit_ok;
