@@ -12,6 +12,7 @@ tar_sources = files(
   'src/tar_diff.cpp',
   'src/tar_schema_registry.cpp',
   'src/tar_aggregator.cpp',
+  'src/tar_usage.cpp',
   'src/tar_sql_executor.cpp',
   'src/tar_network_collector.cpp',
   'src/tar_netqual_boot.cpp',

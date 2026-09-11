@@ -90,7 +90,8 @@ namespace yuzu::agent {
 #  define YUZU_WORKER_MUTEX_GUARD 1
 #endif
 
-/// True iff taking GuardianEngine::mtx_ on a thread stop() joins aborts the process.
+/// True iff taking GuardianEngine::mtx_ on a thread stop() joins, or on a detached
+/// GuardianIoExecutor worker (rung 9c R5.1), aborts the process.
 [[nodiscard]] constexpr bool worker_mutex_guard_enabled() noexcept {
 #ifdef YUZU_WORKER_MUTEX_GUARD
     return true;
@@ -417,6 +418,32 @@ public:
     /// production caller.
     [[nodiscard]] std::string last_rearm_degrade_message_for_test() const;
 
+    /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
+    /// attempt ended up with — empty if never armed as file-hash-equals, the
+    /// authored value if `expected_hash` was set, or a SEEDED persisted baseline
+    /// if one existed for this rule_id/target. This is what
+    /// start_guard_for_rule_locked built INTO `FileGuard::Config` before calling
+    /// `start()` — set regardless of whether `start()` itself actually arms
+    /// (FileGuard is Windows-only for the MVP; off Windows this is the only
+    /// observable proof the seed-lookup ran and produced the right value, since no
+    /// FileGuard object survives to observe otherwise). Locked, returned by value
+    /// — same rationale as last_rearm_degrade_message_for_test above. No
+    /// production caller.
+    [[nodiscard]] std::string last_file_expected_hash_for_test() const;
+
+    /// Gate 3 quality-engineer follow-up (#4021): `last_file_expected_hash_for_test`
+    /// only proves the SEED lookup ran — it says nothing about whether the
+    /// CAPTURE callback (`FileGuard::Config::on_baseline`) was actually attached,
+    /// since a seeded (non-empty `expected_hash`) rule never re-enters the
+    /// capture branch at all. Set unconditionally, right after the assignment,
+    /// on every file-hash-equals arm attempt — true regardless of seeding, so a
+    /// test can assert the wiring itself happened (deleting the assignment
+    /// would otherwise leave every Linux test green, since no real FileGuard
+    /// runs off Windows to observe the callback firing). Locked, returned by
+    /// value — same rationale as the sibling accessors above. No production
+    /// caller.
+    [[nodiscard]] bool last_file_on_baseline_wired_for_test() const;
+
     /// Live bounded-I/O worker count on the spark reader (0 if never wired) -
     /// the F3 orphan-exit obligation's plumbing (rung 7.6 is the enforcement).
     [[nodiscard]] std::size_t active_io_workers() const;
@@ -437,13 +464,20 @@ private:
     /// BasicLockable, so every `std::lock_guard lock(mtx_)` site is unchanged by CTAD.
     ///
     /// Holds NO reference to the worker: it asks a thread-local role marker
-    /// (on_guardian_drain_worker_thread()) instead. A pointer to the worker would have to
+    /// (on_guardian_joined_thread()) instead. A pointer to the worker would have to
     /// be read here BEFORE mu_ is held - an unsynchronised cross-thread read - and wiring
     /// rollback can destroy the worker while another thread holds that pointer, which made
     /// the safety device itself a use-after-free (#2298 Sol review).
     ///
     /// Aborts rather than asserts: `assert` is a no-op under NDEBUG, so a release build
     /// with sanitizers would have logged the violation and then walked into the deadlock.
+    ///
+    /// Second role, rung 9c R5.1 (guardian_detached_worker_role.hpp): a DETACHED
+    /// GuardianIoExecutor worker - either dispatch form, including the consumer-injected
+    /// on_abandoned/on_complete callback it runs after the backend call - is a different
+    /// hazard class (lock-vs-lifetime, not lock-vs-join: it can never be joined and may
+    /// outlive stop() or the F3 orphan grace) with the same remedy. The tripwire consults
+    /// both markers and names the role that fired.
     class WorkerHostileMutex {
     public:
         void lock() {
@@ -579,6 +613,12 @@ private:
     std::function<void(const std::string&)> rearm_fault_hook_for_test_;
     /// TEST-ONLY (see last_rearm_degrade_message_for_test); empty = no degrade this run.
     std::string last_rearm_degrade_message_for_test_;
+    /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
+    /// arm attempt has run yet.
+    std::string last_file_expected_hash_for_test_;
+    /// TEST-ONLY (see last_file_on_baseline_wired_for_test); false = no
+    /// file-hash-equals arm attempt has run yet.
+    bool last_file_on_baseline_wired_for_test_{false};
     std::unordered_map<std::string, std::unique_ptr<IGuard>> guards_;
 
     /// rule_id -> SparkType for every rule CURRENTLY classified RulePlacement::Unsupported
@@ -664,5 +704,20 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 /// by the #1307 regression test to assert the event_id embeds the agent_id.
 YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
                                               const GuardDrift& drift);
+
+/// Test-support helpers (#4021 adversarial-review K1/C2-1 regression net): reach
+/// the persist-side overwrite guard and the seed-side lookup directly, since the
+/// real call site (`FileGuard::Config::on_baseline`) fires only from a running
+/// Windows-only guard worker thread — not exercisable end-to-end on this
+/// platform's tests. Both are thin forwarders into guardian_engine.cpp's
+/// anonymous-namespace `guardian_persist_baseline`/`guardian_seed_baseline`
+/// (internal linkage) — not friends, no GuardianEngine state involved. No
+/// production caller.
+YUZU_EXPORT void guardian_persist_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                                    const std::string& fingerprint,
+                                                    const std::string& hash);
+YUZU_EXPORT std::optional<std::string>
+guardian_seed_baseline_for_test(KvStore& kv, const std::string& rule_id,
+                                const std::string& fingerprint);
 
 } // namespace yuzu::agent

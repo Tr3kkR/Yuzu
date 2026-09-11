@@ -1,8 +1,8 @@
 ---
-status: proposed
+status: accepted
 date: 2026-07-06
 owner: Dave Rae
-deciders: pending — acceptance requires at least one recorded independent review and a linked tracking issue (SOC 2 Workstream F change-management evidence; cf. ADR-0006's decision record)
+deciders: Nathan Dornbrook (project owner), 2026-09-07; independent review of record: enterprise-architect adjudication 2026-09-07 + the approving review on the ADR-reconciliation PR (docs/agents/domain.md ADR Acceptance Convention); tracking issue #4099
 scope: platform — consumer model, principal classes, UI/API boundary, use-case engine direction
 ---
 
@@ -106,6 +106,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      applies in full to that feature. Recorded class-level so each future
      gauge-family PR cites this entry instead of relitigating (governance
      Gate-3 architect, spark rung-1 re-land).
+
+   - **2026-09-07 — class-level entry: a compiled-in specification surfaced as
+     REST route + MCP resource, with no MCP tool, satisfies the twin.** The
+     plugin documentation manifests (`GET /api/v1/discover/plugin-docs` and
+     `yuzu://plugin-docs`, byte-identical, `docs/plugin-readme-standard.md`
+     rule 10) follow the 2g PR4 specs-as-resources shape: the resource is
+     enumerable through `resources/list`, gated tier-then-permission like
+     its REST twin, and the tool-level entry point is the `docs` summary
+     `discover_plugins` already carries. Decision 4 asks for REST and MCP;
+     a resource IS the MCP surface for static content. Recorded class-level
+     so the next compiled-in catalog cites this entry (governance Gate-3
+     architect + Gate-4 consistency-auditor, PR D.1 of the plugin docs
+     programme).
 
    - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
      no MCP twin, and absent from route discovery (A2/A3) — a "no" on
@@ -264,6 +277,212 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        (#3789)"; wire reference: `docs/user-manual/rest-api.md`'s
        "Executions" section.
 
+   - **2026-09-07 — 8 Settings read-twins (`GET /api/v1/settings/{tls,https,
+     gateway,server-config,mcp,data-retention,analytics}` +
+     `GET /api/v2/agent/plugin-policy` — its predecessor `/api/v1/agent/
+     plugin-policy` deprecated by #4144 per `docs/api-versioning-policy.md`,
+     not covered by this exception, #4028).** REST-only, no MCP twin — a
+     "no" on Decision 1's both-surfaces requirement. Recorded rather than
+     fixed pre-merge because:
+     - **The gap is a deliberate, pre-existing security boundary, not a
+       build-order gap.** #520 (this issue's own scoping note, echoed in
+       `docs/mcp-server.md`'s MCP-tier reference) holds that MCP tokens are
+       for fleet management and must not be used to administer the server
+       itself — settings, users, TLS, OIDC. `mcp_policy.hpp`'s `tier_allows()`
+       hard-denies the four securables gating these eight routes
+       (`TlsConfig`/`PluginSigning`/`ServerConfig`/`AnalyticsConfig`) at
+       EVERY MCP tier, including `readonly` — an admin-owned MCP token
+       cannot read this data either. This PR's job was hardening the eight
+       sub-areas onto REST v1 + dedicated RBAC securables (previously an
+       undifferentiated `admin_fn_`-only gate on the dashboard fragment
+       route alone); it did not — and, per #520, should not casually — add
+       an MCP surface alongside that hardening.
+     - **This entry corrects a same-PR ledger error, not a fresh
+       classification call.** An earlier round of this PR flipped these 8
+       rows straight to `status: "twinned"` in
+       `scripts/ci/api-parity/settings.json` despite `mcp_twin: null`,
+       understating the untwinned ratchet by 8
+       (`scripts/ci/check-api-parity.py`'s `BASELINE_UNTWINNED` moved
+       265 → 257) and recording the #520 decision nowhere this ADR's own
+       exception-ledger mechanism could see it — an adversarial two-model
+       review (`/home/dgr/advrev-4028`) caught the mislabel independently of
+       the credential-leak finding on the same branch. The rows are now
+       `status: "exception:#520"`, `BASELINE_UNTWINNED` is restored to 265,
+       and this entry is the exception-ledger record ADR-1005's own
+       Decision 1 requires for it.
+     - **Not a tracked follow-up — revisit only if #520 itself is amended.**
+       Unlike the SCIM entry above, there is no scoped MCP-surface work
+       item to point at: adding an MCP twin here means amending #520's
+       fleet-management/server-administration boundary, which
+       `docs/mcp-server.md:21` already states explicitly requires "its own
+       security-guardian-reviewed amendment... not a side effect of a
+       routine REST-twin PR." This stands as a standing exception until
+       that amendment happens, not a numbered issue with a revisit date.
+     - **The exception relaxes no control.** Every route requires its
+       dedicated RBAC securable (`Read`) and is floored in
+       `authz_topology_floor.hpp` so an RBAC-off deployment stays
+       admin-gated rather than silently widening to any authenticated user.
+       Four of the eight (TLS, HTTPS, plugin-signing, analytics — the
+       higher-sensitivity sub-areas) are additionally audited fail-closed
+       (`settings.*.read` / `plugin_signing.*`, `settings_routes.hpp`'s
+       dedicated `AuditFn`); the other four (gateway, server-config,
+       data-retention, MCP) are deliberately unaudited, matching their
+       pre-existing dashboard-fragment posture and #4028's own Evidence
+       classification of that data as non-sensitive (each REST handler's
+       comment states this explicitly). The MCP deny-list changes nothing
+       about REST-side access control either way.
+     - Design record: `server/core/src/mcp_policy.hpp`'s `#4028/#520`
+       comment; `docs/auth-architecture.md`'s "Settings read-twins" section;
+       wire reference: `docs/user-manual/rest-api.md`'s Settings routes,
+       `docs/mcp-server.md`'s MCP-tier reference.
+
+   - **2026-09 — the legacy unversioned `/api/*` admin plane, class-level
+     entry (107 routes).** Enumerated by grepping every `sink.Get/Post/Put/
+     Delete(...)` registration in `server/core/src` for an `/api/*` path
+     that is NOT `/api/v1/*` (the `/api/executions*` family above and the
+     four health-probe paths in the first ledger entry are separate,
+     already-recorded exceptions and are excluded from the count). These
+     routes predate ADR-1005 by construction — grandfathered under this
+     ADR's prospective-only binding (see "Binding status" above), same
+     "maintenance, not a violation" posture as the other entries in this
+     ledger — but had never been individually inventoried, so a reviewer
+     had no citable list distinguishing "known legacy debt" from "a new
+     UI-only capability slipped in disguised as a settings route." This
+     entry is that inventory, not a re-classification: nothing below
+     changes behavior or authorization posture.
+     - Only **2 of the 107** already have a genuine `/api/v1` twin (`GET
+       /api/audit` → `GET /api/v1/audit`; `GET /api/me` → `GET
+       /api/v1/me`) — both pre-existing, unrelated to this ledgering pass.
+       Everything else is `/api/settings/*` admin/config surface (user
+       management, OIDC/SAML/TLS/cert-upload config, enrollment tokens,
+       pending-agent approve/deny, MFA admin, plugin signing, agent-update
+       upload/rollout, MCP settings, DEX-alert routing, management-group
+       create, CA import-chain/revoke) or a handful of sibling
+       non-`/settings` admin routes (`/api/command`, `/api/policies*`,
+       `/api/policy-fragments*`, `/api/webhooks*`, `/api/workflows*`,
+       `/api/product-packs*`, `/api/notifications*`, `/api/nvd/*`,
+       `/api/patches*`, `/api/deployment-jobs*`, `/api/discovery/*`,
+       `/api/directory/*`, `/api/dashboard/*`, `/api/scope/*`,
+       `/api/help*`, `/api/analytics/*`, `/api/instructions/*/execute`,
+       `/api/compliance*`) — marked **settings-plane exception** with a
+       **2027-Q1** proposed re-home target (PO-adjustable; no committed
+       date until an owning module is scoped). `/fragments/*` surfaces
+       (e.g. `/fragments/auto/*`, `/fragments/tar/*`,
+       `/fragments/device/live/*`, `/fragments/executions`) remain under
+       item 1 above; they carry no migration date — tracked separately.
+
+     | Method | Path | Owning file | Replacement `/api/v1` path | Target quarter |
+     |---|---|---|---|---|
+     | POST | `/api/settings/ca/import-chain` | `ca_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/ca/revoke` | `ca_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/command` | `command_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/compliance` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/compliance/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/policies` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/policies/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/policies/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/disable` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/enable` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/evaluate` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/invalidate` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/([^/]+)/remediate` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policies/invalidate-all` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/policy-fragments` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/policy-fragments` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/policy-fragments/([^/]+)` | `compliance_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/agents` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/analytics/recent` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/analytics/status` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/audit` | `dashboard_api_routes.cpp` | `GET /api/v1/audit` | 2026-Q4 |
+     | POST | `/api/export/json-to-csv` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/me` | `dashboard_api_routes.cpp` | `GET /api/v1/me` | 2026-Q4 |
+     | POST | `/api/scope/validate` | `dashboard_api_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/group-from-results` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/dashboard/tar-execute` | `dashboard_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/deployment-jobs` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/deployment-jobs/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | PUT | `/api/directory/group-mappings` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/directory/status` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/directory/sync` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/directory/users` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/discovery/results` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/discovery/scan` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/patches` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/patches/deploy` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/patches/deployments` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/patches/deployments/([a-f0-9]+)` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/patches/deployments/([a-f0-9]+)/cancel` | `discovery_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/notifications` | `notification_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/notifications/(\d+)/dismiss` | `notification_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/notifications/(\d+)/read` | `notification_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/nvd/match` | `nvd_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/nvd/status` | `nvd_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/nvd/sync` | `nvd_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help/autocomplete` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help/html` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/help/palette` | `page_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/api-tokens` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/api-tokens/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/auto-approve` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/auto-approve/(\d+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/auto-approve/(\d+)/toggle` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/auto-approve/mode` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/cert-paste` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/cert-upload` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/dex-alerts/blast` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/dex-alerts/cohort-export` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/dex-alerts/routing` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/enrollment-tokens` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/enrollment-tokens/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/enrollment-tokens/batch` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/management-groups` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/management-groups/([a-f0-9]+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mcp` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/disable` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/init` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/recovery-codes` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/mfa/verify` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/oidc` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/oidc/test` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/pending-agents/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/(.+)/approve` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/(.+)/deny` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/bulk-approve` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/pending-agents/bulk-deny` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/plugin-signing/clear` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/plugin-signing/require` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/plugin-signing/upload` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/tls` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/updates/([^/]+)/([^/]+)/([^/]+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/updates/([^/]+)/([^/]+)/([^/]+)/rollout` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/updates/upload` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/users` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/settings/users/(.+)` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/settings/users/(.+)/role` | `settings_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/webhooks` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/webhooks` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/webhooks/(\d+)` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/webhooks/(\d+)/deliveries` | `webhook_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/instructions/([^/]+)/execute` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/product-packs` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/product-packs` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/product-packs/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/product-packs/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/scope/estimate` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/workflow-executions/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/workflows` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/workflows` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | DELETE | `/api/workflows/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | GET | `/api/workflows/([^/]+)` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+     | POST | `/api/workflows/([^/]+)/execute` | `workflow_routes.cpp` | settings-plane exception | 2027-Q1 |
+
+     `/fragments/*` surfaces remain under item 1; they carry no migration date — tracked separately.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.
@@ -292,3 +511,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 - **Ship shape (eventual):** headless `yuzu-server` (with thin admin console) as a supported standalone deploy; first-party engine as a separate artifact customers may take, replace, or omit. The first-party engine declares a min/max supported server API version and refuses to start outside it.
 - **Data-processor status:** an engine holding a synced copy of fleet or behavioral data is a data processor in its own right; retention/deletion/DPA obligations for that copy fall to the engine operator and are not discharged by this ADR — SOC 2 Workstream E tracks this.
 - **Works-council / SOC 2 posture is designed to improve** — one audit chokepoint recording every server-mediated actor (human, agent daemon, engine, engine-for-operator) — **contingent on** the delegation follow-up shipping server-verifiable delegation and the Decision 5 audit-row fields. It is not a completed control, and engine-internal redistribution of synced data remains outside this chokepoint (see Decision 5's perimeter caveat). Engine-principal credential lifecycle lands in SOC 2 Workstream B.
+
+## Acceptance note (2026-09-07)
+
+Accepted (tracking issue #4099). Shipped in-server: `on_behalf_guard.hpp`, `grpc_on_behalf_interceptor.hpp` (registered via `SetInterceptorCreators`, `server.cpp:7157-7166`), `principal_class.hpp`, `engine_principal_store.{hpp,cpp}`, `principal_quota_gate.hpp`, and the `StreamBudget` admission cap give Decisions 1–4 a live substrate to bind against. Accepted children ADR-0031 (`engine_principal_store`, builds-on), ADR-0031 (`presentation-core-engine-decomposition`, amends Decision 6), ADR-0032 and ADR-0033 (both depends-on) already rest on this ADR; acceptance closes that inversion.
+
+Phase 7 (the vuln-management strangler re-home into a use-case engine under `engines/`, `docs/adr-1005-execution-plan.md`) has NOT started — no `engines/` directory exists. Grandfathered surface #2 is unchanged by this acceptance: it covers only the shipped NVD sync/matching and the absorbed ADR-0023 and ADR-4001 designed scopes, placement-only, outside-by-default beyond them (rider (b): ADR-4002 not absorbed). The remaining vuln ADRs (0001/0002/0005/0029/4002/4003/4004) are deferred into that future engine, not withdrawn, and are NOT grandfathered — each faces Decision 2 fresh at implementation. ADR-0028 (component inventory) is agent-side collection mechanism: deferred, but it stays core under Decision 2 and is not engine scope.
+
+Interim rules at acceptance: rule 1's "no engine principal class" clause is discharged by ADR-0031 (`engine_principal_store`) while its on-behalf-of ban remains live (`on_behalf_guard.hpp`, unamended by ADR-0032); rule 2 is discharged by `principal_quota_gate.hpp`; rule 3 is discharged by the published `docs/api-versioning-policy.md`; rule 4 (unverified-delegation audit marking) remains live and conditional on the delegation follow-up. Decisions 1–4 bind prospectively from 2026-09-07.

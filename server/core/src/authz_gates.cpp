@@ -2,9 +2,12 @@
 
 #include "auth_routes.hpp"
 #include "authz_model.hpp"
+#include "authz_topology_floor.hpp" // #4031: topology_floor_applies — see this gate's floor-check block
 #include "mcp_policy.hpp" // mcp::tier_allows — #3290 Phase 2 caller-class parity with require_permission/require_list_read
 #include "rest_a4_envelope_http.hpp"
 #include "service_scope_policy.hpp" // authz::kServiceTagKey — #3289 single confinement-key definition
+
+#include <yuzu/metrics.hpp> // MetricsRegistry — #4031 topology-floor-denied counter
 
 #include <unordered_set>
 
@@ -161,6 +164,52 @@ AuthRoutes::require_fleet_read(const httplib::Request& req, httplib::Response& r
         res.set_content(detail::a4_denial(res, 403,
                                           "service-scoped tokens require RBAC to be enabled"),
                         "application/json");
+        return std::unexpected(authz::GateFailure::Forbidden);
+    }
+
+    // #4031 topology floor (authz_topology_floor.hpp): RbacStore::authorize_
+    // list_read's own legacy-open branch (rbac_store.cpp) returns AdmitAll
+    // UNCONDITIONALLY once RBAC enforcement is off, with no floor check of
+    // its own — RbacStore is a data-layer primitive and must not depend on
+    // Session, so it cannot apply a role-based floor itself (see
+    // require_list_read's doc comment, auth_routes.hpp, which names this
+    // exact gap and warns that a FUTURE floored securable routed through
+    // that sibling gate "must re-apply the floor explicitly — do not assume
+    // this wrapper inherits it for free"). This gate had the identical gap,
+    // latent until now: every prior caller (Inventory/Execution/Response/
+    // Schedule:Read) is unfloored, so nothing exercised it. #4031's
+    // Enrollment:Read migration (docs/auth-architecture.md's "Fifth
+    // migration") is the first floored securable ever routed through
+    // require_fleet_read — without this check, a disabled-RBAC deployment
+    // (the default) would silently widen GET /api/v1/enrollment/pending-agents
+    // from admin-only back to any authenticated session, undoing exactly the
+    // widening authz_topology_floor.hpp's (Enrollment, Read) entry (84cdfcc06)
+    // was added to prevent. Mirrors require_permission's own legacy-branch
+    // floor check (auth_routes.cpp) — same predicate, same audit-reason
+    // prefix, same counter — but does not share code with it: the two
+    // functions' surrounding control flow differs enough (this gate already
+    // branched on `rbac_enforcement_in_effect` above for the service-scope
+    // case) that a shared helper was judged higher-risk than a second,
+    // narrowly-scoped copy of a five-line predicate. Placed after the
+    // service-scope hard-403 above (a service-scoped session under RBAC-off
+    // is already denied there, floored or not) and before the management-
+    // group axis below, so it runs exactly once per request and only for the
+    // ordinary (non-elevated, non-engine, tier-allowed, non-service) case a
+    // floored securable can actually reach.
+    if (!rbac_enforcement_in_effect(rbac_store_) && topology_floor_applies(securable_type, operation) &&
+        auth::effective_role(*session) != auth::Role::admin) {
+        const std::string reason = "topology floor: non-admin role denied " + perm +
+                                   (session->mcp_tier.empty()
+                                        ? ""
+                                        : " (mcp_tier=" + session->mcp_tier + ")");
+        audit_log(req, "auth.fleet_read_required", "denied", "", "", reason);
+        if (auto* m = auth_mgr_.metrics_registry()) {
+            m->counter("yuzu_auth_topology_floor_denied_total", {{"permission", perm}}).increment();
+        }
+        res.status = 403;
+        res.set_content(
+            detail::a4_denial(res, 403, "admin role required", detail::A4ErrorOpts{.permission = perm}),
+            "application/json");
         return std::unexpected(authz::GateFailure::Forbidden);
     }
 

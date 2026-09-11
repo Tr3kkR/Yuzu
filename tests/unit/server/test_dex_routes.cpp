@@ -1861,13 +1861,19 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         REQUIRE(done);
         CHECK(done->body.find("<svg") != std::string::npos);
         CHECK(done->body.find("hx-trigger") == std::string::npos); // polling stopped
+        // #4035: the poll route is where the parsed data actually reaches the
+        // operator, so it must carry its own audit row (the dispatch's
+        // "success" audit above is a SEPARATE row for the request, not the read).
+        CHECK(audited == "dex.device.perf.query|rendered|WS-1");
 
+        audited.clear();
         fake_rows = {{"WS-1", 0, "error|<b>no such table</b>", ""}};
         auto err =
             sink.Get("/fragments/dex/device/perf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
         REQUIRE(err);
         CHECK(err->body.find("reported an error") != std::string::npos);
         CHECK(err->body.find("<b>no such table</b>") == std::string::npos); // escaped, not raw
+        CHECK(audited.empty()); // an agent-reported error is not an audited data access
     }
 
     SECTION("result poll: a valid-but-empty result renders 'no history', stops polling (gov S3)") {
@@ -1988,6 +1994,28 @@ TEST_CASE("DEX perf routes: dispatch, poll, degrade, and authz posture",
         CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
         CHECK(dispatched == 1);
         CHECK(audited.find("dex.device.procperf.query") != std::string::npos);
+    }
+    // #4035: both /result poll routes previously had NO audit call at all — only
+    // the dispatch half was audited. The poll is where the parsed data actually
+    // reaches the operator, so it needs its own row (fires only when data is
+    // actually rendered, never on a still-pending re-poll).
+    SECTION("procperf result poll: rendered data is audited under its own verb") {
+        fake_rows = {{"WS-1", 0,
+                      "__schema__|name|samples|instances_max|cpu_avg|cpu_max|ws_avg|ws_max|hours\n"
+                      "chrome.exe|10|3|25.5|40.0|1000000|2000000|5\n",
+                      ""}};
+        auto r = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(audited == "dex.device.procperf.query|rendered|WS-1");
+    }
+    SECTION("procperf result poll: still pending is NOT audited (no per-attempt spam)") {
+        auto r = sink.Get(
+            "/fragments/dex/device/procperf/result?command_id=tar-deadbeef&agent_id=WS-1&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("hx-trigger") != std::string::npos); // re-polling
+        CHECK(audited.empty());
     }
     SECTION("perf clean path sets NO Sec-Audit-Failed header") {
         auto r = sink.Get("/fragments/dex/device/perf?agent_id=WS-1");

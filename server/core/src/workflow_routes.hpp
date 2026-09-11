@@ -32,6 +32,8 @@
 
 namespace yuzu::server {
 
+class CommandCapabilityRegistry;
+
 /// Workflow, product-pack, execution fragment, and scope-estimate routes.
 /// Extracted from ServerImpl::start_web_server() for god-object decomposition.
 class WorkflowRoutes {
@@ -176,6 +178,20 @@ public:
         /// route refuses it. nullptr = no metric (test harnesses that do not
         /// assert on it); the REFUSAL itself never depends on this being wired.
         yuzu::MetricsRegistry* metrics{nullptr};
+        /// BR-001 (branch review) — the SAME `CommandCapabilityRegistry` the
+        /// other three operator-facing dispatch surfaces (`/api/command`,
+        /// MCP `execute_instruction`, the exec console) consult via
+        /// `evaluate_destructive_targeting`/`requires_explicit_targets`
+        /// (`dispatch_destructive_gate.hpp`) to refuse an untargeted
+        /// Destructive dispatch or a non-single-target Forensics read.
+        /// `POST /api/instructions/:id/execute` is a FOURTH real
+        /// plugin.action dispatch producer that this gate had missed. A
+        /// plain, never-conditional `ServerImpl` member in production
+        /// (mirrors `command_routes::Deps::capability_registry`) — always
+        /// wired there, exactly like that sibling field; a test harness
+        /// that leaves this nullptr is asserting an unwired-classifier
+        /// configuration never reached in production.
+        const yuzu::server::CommandCapabilityRegistry* capability_registry{nullptr};
     };
 
     /// Production overload — wraps `httplib::Server&` in an HttplibRouteSink

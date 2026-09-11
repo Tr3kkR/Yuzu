@@ -35,6 +35,17 @@ Failure-mode runbook: `docs/ci-troubleshooting.md`.
   `nightly-broken` issue. **Discipline norm: no merge to main while a
   `nightly-broken` issue is open.**
 
+  **Scheduled nightlies always run the DEFAULT branch's copy of the workflow**
+  (currently `main`) — `dev` gets zero nightly ASan/TSan/coverage coverage
+  outside a manual `workflow_dispatch` (#4018). `workflow_dispatch.inputs.jobs`
+  (choice `all`/`windows-asan`, default `all`) exists so a `windows-asan`-only
+  recurrence check can be dispatched against `dev` without paying for the full
+  Big Tam matrix each time: it skips `sanitize-asan`/`sanitize-tsan`/`coverage`
+  and — so a diagnostic dev-branch dispatch never touches the shared
+  `nightly-broken` discipline gate — also skips `alert`/`close-on-green`. A
+  plain `jobs=all` dispatch (or the omitted-input schedule trigger) is
+  unaffected and runs exactly as before.
+
   The TSan leg preloads `$RUNNER_TEMP/libgai_sync_shim.so` to replace glibc's
   `getaddrinfo_a()` async DNS path with synchronous `getaddrinfo()` on the
   calling thread. Required because cpp-httplib enables
@@ -134,6 +145,26 @@ required check; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
+
+### Plugin README gates (`docs` suite + `docs-lint.yml`, `docs/plugin-readme-standard.md`)
+
+Two gates keep each plugin's `agents/plugins/<name>/README.md` honest. The
+meson `docs` suite runs `tests/test_plugin_readmes.py` on every leg: the
+README-existence ratchet (the count of plugin directories without a README
+may only fall), the section contract, and a byte-diff of every generated
+artefact — the README fences, the user-manual plugin index,
+`site/src/nav.plugins.mjs` and the `content/plugin-docs/*.json` manifests —
+against what `tools/plugin-doc-gen` produces from the committed sources
+(the same contract `check-capability-matrix.sh` enforces for the
+capability matrix, and it needs no build). A stale sample leg-hash fails
+it too; regenerate with `python3 tools/plugin-doc-gen/plugin_doc_gen.py
+--all`. The `plugin-readme-touch-rule` job in `docs-lint.yml` (pull
+requests only, not a required check today) runs
+`scripts/ci/check-plugin-readme-touch.sh`: a change under
+`agents/plugins/<name>/src/**` must also touch that README, or the PR body
+must carry a visible `docs-unchanged: <section> — <reason>` line, which
+the job prints. Both scripts carry a fixture self-test that the `docs`
+suite also runs.
 
 ### ClusterFuzzLite (`cflite-pr.yml` + `cflite-batch.yml`)
 
@@ -427,6 +458,13 @@ leaks a slot) that caps concurrent heavy test phases to **2 per box** (the
 **build** phase stays 4-wide). `Test (non-pg suites)` passes `--num-processes 4`
 (one consolidated invocation now covers what used to be five separate
 suites plus the four non-pg server shards).
+
+`nightly.yml`'s `windows-asan` job now joins this same `with-test-slot.sh 2`
+gate and carries `--timeout-multiplier 2` (#4018) — previously it ran
+ungated, with no multiplier, on the shared 4-runner Wee Tam box. It shares
+the script's default slot namespace with `ci.yml`'s Windows legs above (no
+`YUZU_TEST_SLOT_NAME` override on either side), so a nightly run and a
+concurrent PR/push genuinely compete for the same 2 slots.
 
 **Staged widening — the decision rule (stated once here; each push's
 paragraph below references it, doesn't restate it).** The pg-shards step

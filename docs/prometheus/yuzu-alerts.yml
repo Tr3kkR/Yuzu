@@ -869,6 +869,32 @@ groups:
             the whole 60s budget. The delay exists so a self-resolving blip
             clears before anyone is woken, not so it is ignored.
 
+      # WS-3 3.4 (review B3): a remediation-owned status write that matched zero
+      # rows on its claim-generation fence because a sibling replica had already
+      # reclaimed the (policy,agent) claim. This counter is the ONLY signal for
+      # a mis-threaded claim_gen, which would make every remediation write
+      # silently no-op — so it must not ship un-alerted (sre governance, HIGH).
+      - alert: YuzuPolicyRemediationFenceSkip
+        expr: |
+          increase(yuzu_server_policy_remediation_fence_skip_total[1h]) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy remediation status writes are being fenced out ({{ $value }} in 1h)"
+          description: >-
+            yuzu_server_policy_remediation_fence_skip_total incremented: a
+            remediation-owned update_agent_status matched zero rows on its
+            claim-generation fence. On a single replica this should stay 0. A
+            few transient increments on a genuine active-active pair are benign
+            (a real claim was reclaimed past the stale window). A SUSTAINED rate
+            is the failure the fence's tests exist to prevent leaking: a
+            mis-threaded claim_gen makes every mark-fixing / verify / error
+            write no-op while remediate() still reports success, so remediations
+            silently do nothing. Cross-check that policy_status rows actually
+            reach 'fixing' after an operator remediate, and review any recent
+            change to claim_remediation or the collect_ready gen threading.
+
       - alert: YuzuQuarantineGateServingStaleState
         expr: |
           sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0

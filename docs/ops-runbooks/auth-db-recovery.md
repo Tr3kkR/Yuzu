@@ -383,10 +383,10 @@ this is the SOC 2 CC6.6 break-glass evidence chain for this path.
 <!-- yuzu:claim id=break-glass-arm status=shipped evidence=server/core/src/main.cpp#--break-glass-arm -->
 ## Break-glass arm (IdP outage under `--auth-mode=sso-only`)
 
-Under `--auth-mode=sso-only` only OIDC mints a session. If the IdP is down,
-the `--break-glass-user` account is the way back in — but it is exempt
-**only while armed**, and arming is an out-of-band host CLI operation so it
-works when the IdP does not.
+Under `--auth-mode=sso-only` only an SSO provider (OIDC or SAML) mints a session. If the IdP is down, the
+`--break-glass-user` account is the way back in — but it is exempt **only while
+armed**, and arming is an out-of-band host CLI operation so it works when the
+IdP does not.
 
 ```bash
 sudo -u _yuzu yuzu-server \

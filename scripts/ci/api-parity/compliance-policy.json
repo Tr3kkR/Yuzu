@@ -3,25 +3,34 @@
     "method": "GET",
     "path": "/api/compliance",
     "capability_id": "get.api-compliance",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/compliance"
+    },
+    "mcp_twin": "get_fleet_compliance",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/compliance/{param}",
     "capability_id": "get.api-compliance-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/compliance/{param}"
+    },
+    "mcp_twin": "get_policy_agent_statuses",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/policies",
     "capability_id": "get.api-policies",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/policies"
+    },
+    "mcp_twin": "list_policies",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -51,9 +60,12 @@
     "method": "GET",
     "path": "/api/policies/{param}",
     "capability_id": "get.api-policies-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/policies/{param}"
+    },
+    "mcp_twin": "get_policy",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -99,9 +111,12 @@
     "method": "GET",
     "path": "/api/policy-fragments",
     "capability_id": "get.api-policy-fragments",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/policy-fragments"
+    },
+    "mcp_twin": "list_policy_fragments",
+    "status": "twinned"
   },
   {
     "method": "POST",
@@ -125,7 +140,7 @@
     "capability_id": "get.fragments-compliance-summary",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-compliance"
   },
   {
     "method": "GET",
@@ -133,7 +148,7 @@
     "capability_id": "get.fragments-compliance-param",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "composed-of:get.api-compliance-param"
   },
   {
     "method": "GET",
@@ -141,7 +156,7 @@
     "capability_id": "get.fragments-settings-nvd",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "exception:<ADR-1005 grandfathered surface #2 — NVD sync/CVE matching, re-homed by the vuln-module strangler, not twinned>"
   },
   {
     "method": "GET",

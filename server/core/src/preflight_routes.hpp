@@ -43,6 +43,7 @@
 #include "preflight_parse.hpp" // Verdict, Bucket, PreflightCheckResponses, PreflightDeviceResult
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <optional>
@@ -89,6 +90,15 @@ std::string render_auto_note(const std::string& message);
 class PreflightRunStore; // server/core/src/preflight_run_store.hpp
 struct PreflightRunRow;  //   "
 class HttpRouteSink;     // server/core/src/http_route_sink.hpp
+
+/// PURE: one saved run as a JSON object — the REST (`GET
+/// /api/v1/preflight/runs`) + MCP (`list_preflight_runs`) twin of the
+/// saved-runs-rail data. Structured fields, not `render_auto_rail`'s
+/// flattened display label — an API caller wants `go`/`warn`/`nogo`/
+/// `incomplete` as counts, not a pre-formatted string. No httplib.h; both
+/// surfaces call this SAME function so the JSON shape cannot drift between
+/// them (api-twin-recipe.md Rule 1).
+nlohmann::json preflight_run_row_json(const PreflightRunRow& r);
 
 /// `/auto` routes — page shell + config/rail fragment + run creation + result
 /// poll. Runs persist (PreflightRunStore); a running run renders live, a complete

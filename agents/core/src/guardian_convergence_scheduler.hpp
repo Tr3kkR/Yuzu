@@ -90,6 +90,11 @@ public:
     /// synchronously on the caller's thread.
     void sweep_lane(SparkType type);
     void sweep_pending_initial();
+    /// #2818 poll backstop: pass-through to GuardianSparkRuntime::revalidate_
+    /// subscriptions() (also what priority_loop's own tick calls). Public and
+    /// synchronous for the same reason as the two above - a test drives one pass
+    /// deterministically rather than waiting on the ~5s priority lane's own cadence.
+    void revalidate_subscriptions();
     /// Deterministic test seam (also lane_loop's own wait-duration source, #3531):
     /// apply cfg_'s jitter_pct to base_ms using the given RNG. Single-sourced with
     /// guardian_spark_bridge.hpp's debounce-default computation via

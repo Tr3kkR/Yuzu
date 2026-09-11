@@ -121,6 +121,11 @@ void ConvergenceScheduler::priority_loop() {
             seen = sig_->priority_gen;
         }
         firewalled_sweep([this] { sweep_pending_initial(); });
+        // #2818 poll backstop, folded into this already-running ~5s lane rather than a
+        // new thread: catches a Dead subscription whose Lost notification was silently
+        // dropped by a full Queued consumer channel. Independent firewalled_sweep so a
+        // throw in one does not skip the other.
+        firewalled_sweep([this] { rt_.revalidate_subscriptions(); });
     }
 }
 
@@ -133,5 +138,7 @@ void ConvergenceScheduler::sweep_pending_initial() {
     for (const std::string& key : rt_.keys_with_pending_initial())
         rt_.evaluate_key(key, EvalReason::Convergence);
 }
+
+void ConvergenceScheduler::revalidate_subscriptions() { rt_.revalidate_subscriptions(); }
 
 } // namespace yuzu::agent

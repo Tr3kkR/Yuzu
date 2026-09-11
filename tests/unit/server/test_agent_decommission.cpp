@@ -412,7 +412,7 @@ TEST_CASE("AgentDecommission erases an agent from every real store; a bystander 
     CHECK(result.ok());
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
-    CHECK(sl->outcome == DecommissionOutcome::Deleted); // the new SLE store IS included
+    CHECK(sl->outcome == DecommissionOutcome::Deleted); // the SLE store IS included
 
     // agent-del is gone from EVERY store.
     auto inv_del = inventory.get_agent_inventory("agent-del");
@@ -496,27 +496,26 @@ TEST_CASE("AgentDecommission over real stores skips an unconfigured store, still
 
 // ─────────────────────────── DRIFT GUARD (the root cause) ───────────────────────
 //
-// The erasure route's authorization gate is a CONJUNCTION over the securables the
-// cascade erases THROUGH — today SoftwareLicensing + Inventory + GuaranteedState
-// (sle_routes.cpp). That gate is hand-maintained, and NOTHING structurally ties it
-// to this store list: the first cut of the conjunction shipped covering four of the
-// five stores because `app_perf_daily` (GuaranteedState, DEX behavioural PII) was
-// silently unaccounted for, while the docs asserted "full blast radius".
+// The erasure route's authorization gate is now the single, fixed securable
+// `Decommission:Delete` (ADR-0024 Decision 9, amended Wave 7 PR7.2) — it no longer
+// changes as stores are added, which is the whole point of the promotion. But the
+// securable being fixed does NOT mean the blast radius is: adding a
+// store still widens what ONE Decommission:Delete grant destroys, so this test
+// ties the store list to the documented radius instead of to a conjunction.
 //
 // This test is the tie. It fails the moment a store joins AgentDecommissionStores,
-// forcing whoever adds it to answer: WHICH SECURABLE GOVERNS THE NEW STORE'S DATA,
-// and is that securable's Delete in the DELETE route's conjunction?
+// forcing whoever adds it to answer: is the new store's governing securable's READ
+// listed in the blast-radius docs (sle_routes.hpp/.cpp, rest_api_v1.cpp's delete
+// block, ADR-0024 Decisions 9/11, rest-api.md)?
 //
 // If you are here because this test failed:
-//   1. Add the new store's governing securable to the conjunction in sle_routes.cpp
-//      (unless an existing conjunct already governs it — say which, in a comment).
-//   2. Update kCascadeStoreCount below, and the enumerations in sle_routes.hpp,
+//   1. Update kCascadeStoreCount below.
+//   2. Add the store to the blast-radius lists in sle_routes.hpp/.cpp,
 //      agent_decommission.hpp, the OpenAPI `delete` block in rest_api_v1.cpp, and
-//      ADR-0024 Decisions 9/11.
-//   3. If the conjunction reaches a FOURTH securable, stop and promote it to the
-//      device-level `Decommission` securable ADR-0024 Decision 9 records as the
-//      rejected-for-now option — at that width the conjunction is the wrong shape.
-TEST_CASE("decommission cascade: store list is pinned to the DELETE route's authz gate",
+//      ADR-0024 Decisions 9/11 — naming the securable that governs its READ.
+//   3. The gate itself (`Decommission:Delete`) does NOT change — that is the
+//      reversal this promotion delivered.
+TEST_CASE("decommission cascade: store list is pinned to the DELETE route's documented radius",
           "[decommission][authz]") {
     // Every store null → all registered targets report Skipped, so target_count()
     // is the cascade's registered-store count without needing a live store.

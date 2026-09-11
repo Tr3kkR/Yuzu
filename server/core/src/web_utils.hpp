@@ -165,6 +165,29 @@ inline std::string html_escape(const std::string& s) {
     return out;
 }
 
+/// Sanitize an operator-supplied value (definition id, approval id) before it
+/// goes into a server log line: control characters — CR/LF especially —
+/// would otherwise let a caller forge additional log lines (Gate 8 LOW).
+/// Truncates for good measure; callers already substr to bound length.
+/// Promoted from `ServerImpl::log_safe` (#2542 PR-7, `instruction_routes.cpp`
+/// needs it alongside the pre-existing `/api/approvals/:id/{approve,reject}`
+/// call sites, which PR-9 later extracted into `approval_routes.cpp` —
+/// reconciled at merge time onto this same promotion rather than PR-9's own
+/// independently-promoted `log_safe.hpp`) — mirrors the #2557
+/// `json_extract.hpp` precedent: a pure, `this`-free static helper with
+/// call sites both inside and outside an about-to-be-extracted route
+/// cluster is promoted to a shared free function, never duplicated, so the
+/// two calling sites can't silently diverge.
+[[nodiscard]] inline std::string log_safe(const std::string& s, std::size_t max = 64) {
+    std::string out;
+    out.reserve(std::min(s.size(), max));
+    for (std::size_t i = 0; i < s.size() && i < max; ++i) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        out += (c < 0x20 || c == 0x7f) ? '?' : s[i];
+    }
+    return out;
+}
+
 /// Neutralise a value for safe interpolation into a STRUCTURED `k=v k=v` audit
 /// detail string (#1290 Hermes MEDIUM). Audit details are assembled by string
 /// concatenation, so a value carrying a space, `=`, `,`, or a control byte (CRLF)
@@ -710,7 +733,14 @@ template <typename Req>
 inline bool is_login_exempt_path(std::string_view path) {
     return path == "/login" || path == "/login/mfa" || path == "/login/mfa/enroll" ||
            path == "/health" || path == "/api/health" || path == "/auth/oidc/start" ||
-           path == "/auth/callback" || path == "/api/v1/openapi.json" ||
+           path == "/auth/callback" ||
+           // #2057: /api/v1/openapi.json used to be listed here as
+           // unauthenticated-by-design. It no longer is — the route now
+           // gates `Infrastructure:Read` (rest_api_v1.cpp), matching its
+           // MCP twin `yuzu://openapi`. Removed so the pre-routing
+           // chokepoint resolves a session for it like every other
+           // /api/v1/* route; the route's own perm_fn is the authority,
+           // not this exemption list.
            path == "/auth/saml/start" || path == "/saml/acs" ||
            // PKI PR4: the CA root cert + CRL are public by design — clients
            // and browsers need them to establish trust / check revocation

@@ -243,13 +243,57 @@ struct ServiceSparkData {
 /// doc comment for why.
 using SparkData = std::variant<std::monostate, DiskSparkData, ServiceSparkData>;
 
-/// What a consumer receives when an armed spark fires.
+/// #2818: what kind of notification a SparkEvent carries. `Fired` is a real detection
+/// fire (every pre-existing call site — unaffected default). The other three ride the
+/// SAME Inline/Queued dispatch channel a fire uses, so any consumer already registered
+/// gets them via whatever handler it wired for `Fired` — no new registration surface.
+enum class SparkEventKind : std::uint8_t {
+    Fired,     ///< a real detection fire — `data` is meaningful, `subscription_id`/`detail` are not.
+    Lost,      ///< the key's armed_ entry was torn down entirely (an in-flight watch arm
+               ///< that could not be completed). PERMANENT for the subscription named by
+               ///< `subscription_id`: no further event of any kind will ever arrive for it.
+               ///< A fresh arm() is required — there is nothing to re-check.
+    Faulted,   ///< the watch reported itself unhealthy AFTER a successful arm (B1). The
+               ///< key is STILL armed (unlike Lost) — this may self-heal; watch for a
+               ///< paired Recovered for the same key.
+    Recovered, ///< a prior Faulted on this key has cleared.
+};
+
+/// What a consumer receives when an armed spark fires — or, since #2818, when a
+/// subscription's underlying watch dies or changes health. A CONSUMER MUST SWITCH
+/// ON `kind`: a handler that treats every SparkEvent as a fire (ignoring `kind`)
+/// will silently misread a Lost/Faulted/Recovered notification as a real detection
+/// fire with empty `data` (governance Gate 2 finding, PR-2d).
 struct SparkEvent {
     std::string key;                          ///< spark_key() of the armed spec
     SparkType type{SparkType::Interval};
     std::uint64_t seq{0};                     ///< per-armed-spark, monotonically increasing
     std::chrono::system_clock::time_point at; ///< wall-clock fire time
     SparkData data{};
+    SparkEventKind kind{SparkEventKind::Fired};
+    /// Meaningful only for kind != Fired. One key-level condition is fanned out to
+    /// potentially several differently-subscribed consumers, so a single shared
+    /// SparkEvent object cannot itself name "the" subscription — deliver() stamps this
+    /// per-recipient from Subscriber::id. 0 for Fired (a fire is key-scoped, never
+    /// subscription-scoped).
+    std::uint64_t subscription_id{0};
+    /// Meaningful only for kind != Fired: the mechanism's watch-failure text (Lost) or
+    /// the fault/recovery reason (Faulted/Recovered). Empty for Fired.
+    std::string detail;
+};
+
+/// #2818: the liveness of a subscription id, as of the moment of the call. `Dead` means
+/// no further event of any kind will ever arrive for it (a Lost notification either
+/// already was, or — if this raced the drop — is about to be, delivered). Built on the
+/// fact that SubscriptionIds are monotonic and never reused (SparkEngine's own
+/// teardown_arm_race comment), so "is this id still live" is a complete, always-correct
+/// existence check — no incarnation counter or graveyard bookkeeping needed. Lives here,
+/// not in spark_engine.hpp, so GuardianSparkRuntime's ISparkBackend seam (deliberately
+/// decoupled from spark_engine.hpp) can use it too.
+enum class SubscriptionHealth {
+    Dead,     ///< the id is no longer tracked — its key was torn down (or never armed).
+    Faulted,  ///< the id's key is armed but reported unhealthy (B1).
+    Healthy,  ///< armed, not faulted.
 };
 
 // ── Subscription tiers ────────────────────────────────────────────────────────

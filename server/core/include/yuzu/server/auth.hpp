@@ -1,9 +1,11 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
@@ -88,6 +90,58 @@ struct UserEntry {
     /// SSO identity auto-provisioned by `AuthDB::upsert_sso_identity`. Not
     /// populated by every list/read path — see the call site's doc comment.
     std::string identity_source{"local"};
+    /// Gate 5 chaos-injector CH-1 (#4020 follow-up): a stamp from
+    /// `AuthManager::next_role_version_()`'s single PROCESS-WIDE monotonic
+    /// counter, taken every time ANY entry (any username) is created or has
+    /// `.role` mutated in place - NOT a per-username counter starting at 0.
+    ///
+    /// #4107 (row-locking rewrite) REMOVED the only code that ever COMPARED
+    /// this stamp - `recheck_role_after_credential_check` now serializes via
+    /// a real Postgres row lock instead (see that function's header doc),
+    /// and no longer reads `pre_check_version` at all. This field is
+    /// retained purely as a write-ordering stamp: every writer still bumps
+    /// it in lockstep with `.role` (an invariant several reviewers have
+    /// checked for and relied on), which is useful for future consumers and
+    /// for reasoning about write ordering, but nothing compares it for
+    /// correctness today. The history below (why it's process-wide, not
+    /// per-username) explains the counter's DESIGN and remains accurate;
+    /// just read every "the compare-guard" reference below as "the retired
+    /// compare-guard, historical context for why this field is shaped the
+    /// way it is."
+    ///
+    /// Comparing this stamp instead of `.role` itself in the (retired)
+    /// recheck compare-guard closed an ABA hole a role-VALUE compare cannot:
+    /// a promote-then-demote back to the same role value inside one PBKDF2
+    /// window would satisfy a value-equality guard and let a stale read win
+    /// over the demote that already landed. A cpp-safety re-review of the
+    /// first version of that fix (which used a per-username counter
+    /// carried forward across `upsert_user`/reactivate) found that a
+    /// PER-USERNAME scheme reopens the identical class through a different
+    /// door: `remove_user()` erases the cache entry outright, and
+    /// `reactivate_user()`/a fresh cold hydrate then reinstalls a NEW entry
+    /// whose counter restarts at a low value (typically 0) - a stale
+    /// in-flight call's captured pre-check version could coincidentally
+    /// match that reset value. A single process-wide source stamped at
+    /// EVERY write (including first creation, not just later mutation) made
+    /// any two equal stamps observed by this process mean the exact same
+    /// write event, full stop - erase/reinsert included. Only a u64
+    /// wraparound (~2^64 writes across every username combined, over one
+    /// process's lifetime) could theoretically repeat a stamp, which was
+    /// never a realistic concern.
+    ///
+    /// One creation path is a carve-out, not covered by "every entry is
+    /// stamped": `load_config()`'s cfg-file bulk load builds entries directly
+    /// and never calls `next_role_version_()`, so a cfg-seeded entry keeps
+    /// this field's struct-default `0`. Safe ONLY because
+    /// `role_version_epoch_` starts at 1 and can never (re)issue 0 - see that
+    /// field's own doc - and because `load_config()` runs boot-only,
+    /// single-threaded, strictly before `set_auth_db()` is ever called on the
+    /// same `AuthManager` (`main.cpp`), so no in-flight recheck call can exist
+    /// yet to capture a stale `pre_check_version` against one of these
+    /// entries. A future config-reload feature reusing `load_config()` at
+    /// runtime would need to stamp these entries too, or it would reopen
+    /// this exact ABA class for cfg-file-seeded accounts.
+    std::uint64_t role_version{0};
 };
 
 struct Session {
@@ -408,6 +462,17 @@ public:
     /// `auth_source="local"`. If `mfa_verified` is true, stamps
     /// `mfa_verified_at = system_clock::now()` so the step-up window
     /// covers immediate high-risk actions taken right after login.
+    ///
+    /// Requires the account to already have an AuthDB `users` row when
+    /// `auth_db_` is configured: post_mint_role_recheck (see its own doc)
+    /// re-reads AuthDB immediately after minting and fails closed - empty
+    /// string returned, no session - on ANY read failure, including a
+    /// plain UserNotFound (never provisioned, or removed). Every real
+    /// production caller (auth_routes.cpp's 3 call sites) is only reached
+    /// after a local-auth verify_password() call that already guarantees
+    /// the row exists; calling this directly for an account with no row
+    /// (e.g. a test synthesizing a session for an OIDC/SCIM-only
+    /// principal) will always be denied (#4107 CI finding, 38cc33b88).
     std::string create_local_session(const std::string& username, Role role, bool mfa_verified);
 
     /// Stamp `mfa_verified_at = system_clock::now()` on the named session.
@@ -482,6 +547,76 @@ public:
     /// NOT call this — no caller in `server/core/src/**` references it. A
     /// no-op if `token` is not a live session.
     void expire_session_for_test(const std::string& token, std::chrono::seconds offset);
+
+    /// TEST-ONLY: installs a callback fired inside
+    /// `recheck_role_after_credential_check`, BEFORE it starts its row-locked
+    /// AuthDB re-check (`AuthDB::recheck_role_locked`). Originally fired
+    /// between an unlocked DB read and a plain `mu_` acquire (Gate 5
+    /// chaos-injector's CH-1 window); #4107's row-locking rewrite moved the
+    /// firing point earlier, because a hook that synchronously called
+    /// `update_role()` at the OLD point would now self-deadlock (this
+    /// thread would go on to hold the row lock its own hook is blocked
+    /// trying to acquire). A hook that needs to simulate a GENUINE
+    /// concurrent write racing the row lock must spawn a separate
+    /// `std::thread` to do it (join it before the test ends) - see
+    /// `tests/unit/server/test_auth.cpp` for the pattern. Production code
+    /// MUST NOT call this - no caller in `server/core/src/**` references it.
+    /// A no-op (nullptr) by default.
+    void set_role_recheck_race_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired INSIDE
+    /// `recheck_role_after_credential_check`'s `AuthDB::recheck_role_locked`
+    /// callback - i.e. while AuthDB genuinely holds the row lock, immediately
+    /// before the in-process cache write. Lets a test spawn a writer thread
+    /// here and confirm its `update_role()` call genuinely blocks (proving
+    /// the row lock is real, not just documented) before letting this hook
+    /// return, which lets the enclosing transaction commit and the writer
+    /// unblock. Must NOT synchronously call anything that itself needs this
+    /// row's lock (self-deadlock - same reason
+    /// `set_role_recheck_race_hook_for_test` moved its own firing point) -
+    /// spawn a thread and join it AFTER `recheck_role_after_credential_check`
+    /// returns, never inside this callback. Production code MUST NOT call
+    /// this - no caller in `server/core/src/**` references it. A no-op
+    /// (nullptr) by default.
+    void set_role_recheck_inside_lock_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired in `authenticate()` (cpp-safety
+    /// Gate 8 catch: NOT in `create_local_session()` - that function has no
+    /// pre-mint recheck of its own to race against, since its `role`
+    /// parameter comes from an EARLIER caller-side check; see the doc on
+    /// `test_auth.cpp`'s parameter-based stale-role test for that path's
+    /// coverage instead), AFTER the row lock has already been released
+    /// (`recheck_role_after_credential_check` has returned) but BEFORE
+    /// `persist_new_session` mints the session - i.e. squarely inside the
+    /// #4107 check-then-mint window `post_mint_role_recheck` exists to
+    /// close. Unlike the two hooks
+    /// above, there is no lock held at this firing point, so a hook MAY
+    /// safely call `update_role()` (or spawn+join a thread that does)
+    /// synchronously and wait for it to fully complete before returning -
+    /// this lets a test force a demote to land, fully committed, strictly
+    /// inside the gap, with no race/timing dependence at all (deterministic
+    /// red/green, unlike the row-lock-blocking test's genuinely-racy
+    /// coverage of this same window). Production code MUST NOT call this -
+    /// no caller in `server/core/src/**` references it. A no-op (nullptr) by
+    /// default.
+    void set_post_mint_race_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: raw `users_` cache peek, bypassing AuthDB entirely (unlike
+    /// `get_user_role()`, which is DB-authoritative and so cannot observe
+    /// cache staleness at all). Lets a test confirm the version-guard in
+    /// `recheck_role_after_credential_check` actually left the cache alone
+    /// rather than clobbering it with a stale read (Gate 5 CH-1 regression).
+    /// Returns nullopt if the username isn't cached (cold or evicted).
+    /// Production code MUST NOT call this - no caller in `server/core/src/**`
+    /// references it.
+    [[nodiscard]] std::optional<Role> cached_role_for_test(const std::string& username) const;
+
+    /// TEST-ONLY: raw `users_` cache peek of `role_version` - the version-side
+    /// twin of `cached_role_for_test`. Returns nullopt if the username isn't
+    /// cached. Production code MUST NOT call this - no caller in
+    /// `server/core/src/**` references it.
+    [[nodiscard]] std::optional<std::uint64_t>
+    cached_role_version_for_test(const std::string& username) const;
 
     /// Derive a cache `Session`'s adjudication deadlines from the DB-authored
     /// timestamps and the AUTHORITY clock `now_ms` (Postgres `now()` for a durable
@@ -575,7 +710,16 @@ public:
     /// Returns false if user not found.
     bool update_role(const std::string& username, Role new_role);
 
-    /// Look up a user's legacy role. Returns nullopt if user not found.
+    /// Look up a user's legacy role. Returns nullopt if user not found (or,
+    /// in AuthDB-backed mode, if the store could not answer - never falls
+    /// back to a cached value on a store error). AuthDB-authoritative on
+    /// EVERY call when configured (no cache, no cache fallback) - see the
+    /// .cpp definition's doc for why (Gate 3 governance BLOCKING finding,
+    /// #4020: this is the call auth_routes.cpp's legacy API-token session
+    /// synthesis makes on every request, so a stale cached role here was a
+    /// live stale-privilege gap after a demotion, independent of
+    /// authenticate()/verify_password() entirely). Config-file mode (no
+    /// AuthDB) remains cache-only, unchanged.
     std::optional<Role> get_user_role(const std::string& username) const;
 
     /// Check whether any users are configured.
@@ -859,6 +1003,194 @@ public:
 
 private:
     static std::string generate_session_token();
+
+    /// Why a `users_` credential lookup produced no entry (#4020): "no such
+    /// active row" vs "AuthDB could not answer". Kept distinct so a DB outage
+    /// is never logged or counted as a bad username.
+    enum class UserLookupMiss { NotFound, DbError };
+
+    /// Look a user up for a credential check, hydrating `users_` from AuthDB on
+    /// a cache miss (#4020). `users_` is warmed only by load_config() and by THIS
+    /// process's own per-username writes, so a row created anywhere else (a
+    /// dashboard `POST /api/settings/users` before a restart, SCIM, another
+    /// replica) is invisible to a cache-only lookup - authenticate() and
+    /// verify_password() reported "unknown user" for a genuinely active account
+    /// until the next cfg-file boot. The AuthDB row is authoritative and the map
+    /// is a read-optimisation layered on top (the remove_user / update_role /
+    /// reactivate_user contract). PG I/O runs OUTSIDE `mu_`; the insert never
+    /// overwrites an entry an in-process write installed while that read was in
+    /// flight. Returns a COPY so callers run PBKDF2 without holding `mu_`.
+    /// Caller must NOT hold `mu_`.
+    [[nodiscard]] std::expected<UserEntry, UserLookupMiss>
+    find_user_or_hydrate(const std::string& username);
+
+    /// A fresh, process-wide-unique stamp for `UserEntry::role_version` - see
+    /// that field's doc comment. Cheap (single atomic increment), callable
+    /// with or without `mu_` held (the counter is independent of it).
+    [[nodiscard]] std::uint64_t next_role_version_();
+
+    /// Shared by authenticate()/verify_password(): the post-password-check
+    /// re-read of AuthDB (already firing to catch a soft-deleted user) made
+    /// authoritative for role too (#4020 Gate 2 adversarial-review/governance
+    /// follow-up). Went through several hardening rounds against increasingly
+    /// subtle same-process races (compare-by-role-value -> compare-by-version
+    /// -> return-value-follows-the-guard -> re-verify-on-divergence -> this
+    /// one) - see `git log -p` on this function for the blow-by-blow if the
+    /// history matters; this comment describes only the CURRENT mechanism.
+    ///
+    /// #4107: re-verifies via `AuthDB::recheck_role_locked`, which takes a
+    /// `SELECT ... FOR UPDATE` row lock and holds it across the callback
+    /// below (where the in-process cache write happens) before committing.
+    /// This SERIALIZES against any concurrent `update_role()` write to this
+    /// user's row, and against `reactivate_user()` too WHEN the row is
+    /// active at read time (authdb Gate 8: `reactivate_user`'s UPDATE has no
+    /// `is_active` filter, so it contends for the same lock; but if the row's
+    /// last-COMMITTED state is already inactive, its own `is_active = TRUE`
+    /// filter excludes it under READ COMMITTED's own snapshot rules,
+    /// regardless of whether a `reactivate_user()` happens to be
+    /// concurrently uncommitted at that instant - correct fail-closed
+    /// denial, not a missed serialization - see `recheck_role_locked`'s own
+    /// doc in `auth_db.hpp` for the full asymmetry). This is by construction, not by
+    /// detecting a race after the fact - closing the whole class of
+    /// same-process divergence residuals every EARLIER version of this
+    /// function's version-counter guard could only narrow, never eliminate
+    /// (a version counter can tell you something changed since you looked;
+    /// it cannot make your look happen atomically with the change). No more
+    /// case-2/case-3 split, no more `pre_check_version` comparison - a role
+    /// this call observes under the row lock is provably not stale relative
+    /// to any OTHER writer's commit, full stop. `pre_check_version` stays in
+    /// the signature (now used only by the cfg-file-mode early return above,
+    /// which doesn't touch it either) rather than reworking both call sites
+    /// in the same round as this rewrite - signature cleanup is a follow-up.
+    ///
+    /// What this does NOT close: the gap between THIS function returning and
+    /// the caller (`authenticate()`/`verify_password()`) actually minting a
+    /// session via `persist_new_session` - a separate, later step that is not
+    /// itself inside the row lock. A demote committing in that specific
+    /// window still mints a stale session, surviving that demote's own sweep
+    /// (`update_role`'s `std::erase_if(sessions_, ...)`, which already ran
+    /// before the new session existed). External adversarial review
+    /// (fjarvis, PR #4076, "C1") named this the "inherent check-then-mint gap
+    /// no non-serialized recheck can close" - true of every version of this
+    /// function including this one; only serializing all the way through
+    /// session creation would close it, which is a materially bigger change
+    /// (would need `persist_new_session`, and its own DB write in HA mode, to
+    /// run inside the same transaction/lock). This is NOT a same-process-only
+    /// gap: Postgres row locks serialize at the DATABASE-ENGINE level, not
+    /// per-process or per-connection, so a racing writer from a DIFFERENT
+    /// replica sharing the same Postgres primary is serialized against this
+    /// function's own row-locked read exactly like a same-process writer
+    /// (security-guardian Gate 8 re-review verified this empirically against
+    /// a live instance, in both directions - a corrected earlier draft of
+    /// this doc wrongly described a separate "cross-replica" residual here;
+    /// there isn't one - the check-then-mint window is the one remaining gap,
+    /// same mechanism regardless of which process the racing writer runs in).
+    /// This is the CURRENT scope of issue #4107 (re-scoped from its original
+    /// case-2/case-3 framing, which this commit closes) - `validate_session`
+    /// still performs no per-request AuthDB re-verification, so a session
+    /// minted via this gap still carries a stale role for its full lifetime,
+    /// not one request.
+    ///
+    /// Returns the current role on success (cfg-file mode, no `auth_db_`,
+    /// trivially returns `pre_check_role` unchanged - there's no DB to
+    /// re-check against). Returns nullopt if AuthDB reports the user no
+    /// longer active (soft-deleted/removed) - in which case the stale cache
+    /// entry is ALSO evicted, mirroring remove_user()'s own eviction: a
+    /// removal made through a DIFFERENT AuthManager never touches this
+    /// process's map, so without this a removed principal stays "active,
+    /// role R" forever in any consumer of that stale `users_` entry -
+    /// reachable via a still-valid API token, since remove_user() only wipes
+    /// sessions, never tokens. (get_user_role() itself is no longer such a
+    /// consumer - a later fix made it AuthDB-authoritative on every call,
+    /// independent of this eviction entirely.)
+    ///
+    /// CALLER-SIDE NOTE: every `nullopt` this function returns (store error,
+    /// or a genuine `UserNotFound`) is indistinguishable from a genuine bad
+    /// password to `verify_password`'s REST caller (`auth_routes.cpp`), which
+    /// counts ANY `nullopt` toward the account lockout threshold
+    /// (`AuthDB::record_failed_login`). Pre-existing (present since the
+    /// original C1 fix), not this round's concern; no new capability for an
+    /// attacker (only affects legitimate concurrent operations on the SAME
+    /// already-authenticating principal), so LOW availability impact,
+    /// disclose-don't-fix is proportionate. Distinguishing "denied by a
+    /// detected race, retry" from "wrong password" would need a richer
+    /// return type than `std::optional<Role>` threaded through both callers.
+    ///
+    /// `context` is the log-message prefix ("Auth failed" / "verify_password
+    /// failed") so both callers keep their existing distinct wording. Caller
+    /// must NOT hold `mu_`.
+    [[nodiscard]] std::optional<Role>
+    recheck_role_after_credential_check(const std::string& username, Role pre_check_role,
+                                        std::uint64_t pre_check_version,
+                                        std::string_view context);
+
+    /// Closes the #4107 check-then-mint gap: `recheck_role_after_credential_
+    /// check`'s row-locked read (or, for `create_local_session`'s callers, an
+    /// even earlier `verify_password()` call) can be stale by the time a
+    /// session actually finishes minting - `persist_new_session` is a
+    /// separate, later step, not itself inside any row lock. Call this
+    /// immediately after a successful `persist_new_session`, passing the
+    /// role the just-minted session was stamped with; on divergence (or a
+    /// store error) it revokes that session via `invalidate_user_sessions`
+    /// and returns `false` - the caller must then treat the mint as denied
+    /// (return `nullopt`/`{}` per its own contract), never hand out a token
+    /// past this point.
+    ///
+    /// This is the SAME pattern (mint, then post-mint re-check, then revoke-
+    /// and-deny on divergence) `docs/auth-architecture.md` already documents
+    /// for the structurally identical OIDC/SAML deprovision-race - chosen
+    /// over serializing the mint inside AuthDB's row lock, which that doc's
+    /// §3 explicitly rejects for this race class ("never hold one store's
+    /// pool lease while calling another" - `SessionStore`'s shared write-
+    /// generation row is exactly the cross-store lock that discipline
+    /// exists to avoid). See this method's own `.cpp` doc for the ordering
+    /// proof that this closes the race rather than merely narrowing it.
+    ///
+    /// Returns `true` unconditionally in cfg-file mode (`!auth_db_`) - no
+    /// separate authority exists to diverge from. Caller must NOT hold `mu_`.
+    [[nodiscard]] bool post_mint_role_recheck(const std::string& username, Role minted_role,
+                                              std::string_view context);
+
+    /// Backing field for `set_role_recheck_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside
+    /// `recheck_role_after_credential_check`.
+    std::function<void()> role_recheck_race_hook_for_test_;
+
+    /// Backing field for `set_role_recheck_inside_lock_hook_for_test` - see
+    /// that method's doc. Invoked (if set) from inside
+    /// `recheck_role_after_credential_check`'s `AuthDB::recheck_role_locked`
+    /// callback, i.e. while the row lock is held. Same shape/lifetime/
+    /// production-reachability as `role_recheck_race_hook_for_test_` above -
+    /// see that field's Resource Ledger entry, which covers this one too.
+    std::function<void()> role_recheck_inside_lock_hook_for_test_;
+
+    /// Backing field for `set_post_mint_race_hook_for_test` - see that
+    /// method's doc. Invoked (if set) from inside `authenticate()` only
+    /// (NOT `create_local_session()` - see the setter's doc), after the row
+    /// lock releases but before `persist_new_session`. Same shape/lifetime/
+    /// production-reachability
+    /// as `role_recheck_race_hook_for_test_` above - see that field's
+    /// Resource Ledger entry, which covers this one too.
+    std::function<void()> post_mint_race_hook_for_test_;
+
+    /// Backing counter for `next_role_version_()` - see `UserEntry::role_version`'s
+    /// doc for why this is process-wide, not per-username. `std::atomic` since
+    /// it's drawn from both under `mu_` (most call sites) and without it
+    /// (`find_user_or_hydrate`/`reactivate_user` stamp a LOCAL copy before ever
+    /// taking `mu_`) - safe either way, since uniqueness comes from `fetch_add`'s
+    /// atomicity alone (no two RMWs on one atomic ever observe the same prior
+    /// value, independent of memory order) and cross-thread visibility of the
+    /// stamped value, once published into `users_`, comes from `mu_` itself, not
+    /// from this counter's ordering. Starts at 1, not 0: `load_config()`
+    /// (cfg-file bulk load, boot-only, always before `set_auth_db()` - see that
+    /// call's doc) seeds entries at the struct default `role_version{0}`
+    /// without drawing a stamp at all, and 0 must stay a value this counter can
+    /// never (re)issue - historically (pre-#4107) so such an entry's version
+    /// could never coincidentally match a stale in-flight caller's
+    /// `pre_check_version` in the now-retired recheck compare-guard; kept
+    /// unconditionally true today even though nothing compares this value
+    /// anymore (see `UserEntry::role_version`'s doc).
+    std::atomic<std::uint64_t> role_version_epoch_{1};
 
     // ── Durable session store integration (HA WS-1/1a) ─────────────────────────
     // These are all no-ops / pure-in-memory when `session_store_ == nullptr`.

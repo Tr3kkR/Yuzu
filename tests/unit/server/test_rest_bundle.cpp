@@ -148,7 +148,7 @@ struct BundleHarness {
                             /*guaranteed_state_store=*/nullptr, &metrics, /*session_revoke_fn=*/{},
                             /*execution_event_bus=*/nullptr, /*result_set_store=*/nullptr,
                             dispatch_fn, /*step_up_fn=*/{}, /*guardian_push_fn=*/{},
-                            /*dex_perf_fn=*/{}, /*net_perf_fn=*/{}, /*lockout_clear_fn=*/{},
+                            /*dex_perf_fn=*/{}, /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, /*scoped_perm_fn=*/scoped_perm_fn,
                             /*software_inventory_store=*/nullptr,
                             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},

@@ -41,6 +41,7 @@
 #include "dex_routes.hpp"            // DexRoutes::AuditFn
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <functional>
 #include <optional>
@@ -60,6 +61,14 @@ class HttpRouteSink;
 /// empty results container. `cohort` = the count of go+warn devices the run cleared.
 std::string render_deploy_config(const std::string& run_id, const std::string& run_name,
                                  int go_count, int warn_count);
+
+/// PURE: the deploy-config go/warn preview as a JSON object — the REST (`GET
+/// /api/v1/deployments/preview`) + MCP (`get_deployment_preview`) twin of
+/// `render_deploy_config`'s underlying data. No httplib.h; both surfaces call
+/// this SAME function so the JSON shape cannot drift (api-twin-recipe.md
+/// Rule 1).
+nlohmann::json deploy_preview_json(const std::string& run_id, const std::string& run_name,
+                                   int go_count, int warn_count);
 
 /// The deployment progress, AGGREGATE-FIRST: a KPI strip (targeted / succeeded /
 /// executing / in-flight / failed / skipped) + a progress bar, then the device

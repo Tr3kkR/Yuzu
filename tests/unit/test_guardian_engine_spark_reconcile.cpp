@@ -13,6 +13,7 @@
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
 #include "guardian_joined_thread_role.hpp" // GuardianJoinedThreadRole (death test below)
+#include "guardian_io_executor.hpp" // GuardianIoExecutor::submit() (rung 9c R5.1 death test)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (aggregate inertness)
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
@@ -43,6 +44,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <thread>
+#include <version> // __cpp_lib_jthread
 #include <vector>
 
 #ifndef _WIN32
@@ -353,20 +355,18 @@ struct SparkReconcileFixture {
 
 } // namespace
 
-TEST_CASE("#2818 PIN — Guardian's subscription is erased by a sibling's failed watch and "
-          "Guardian keeps reporting the rule armed",
+TEST_CASE("#2818 — Guardian is notified when a sibling's failed watch kills their shared "
+          "key, and reports the rule errored instead of still-armed",
           "[spark][guardian][reconcile]") {
-    // The engine-level halves of this gap are pinned in test_spark_mechanism.cpp. THIS
-    // case is the one that says why it matters: it shows the silent kill landing on
-    // GUARDIAN, the real consumer, and shows what Guardian reports afterwards.
+    // The engine-level halves of this fix are pinned in test_spark_mechanism.cpp. THIS
+    // case is the one that says why it matters: it shows the notification landing on
+    // GUARDIAN, the real consumer, and shows what Guardian now reports afterwards.
     //
-    // Guardian cannot be its own sibling — GuardianSparkRuntime's arming_keys_ plus the
-    // executor's AlreadyRunning rejection make two concurrent Guardian arms of one key
-    // impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
+    // Guardian cannot be its own sibling - GuardianSparkRuntime's per-key claim FIFO
+    // (rung 9c R5.2: a second same-key attach queues behind the in-flight head and joins
+    // its subscription, never dispatching a second backend arm) makes two concurrent
+    // Guardian arms of one key impossible. So the sibling here is a RAW SparkEngine consumer, which is exactly the
     // situation Stage 2 creates the moment anything other than Guardian arms a spark.
-    //
-    // PIN, NOT A REGRESSION TEST: every assertion below states the CURRENT, DEFECTIVE
-    // behaviour. The fix (#2818, PR-2d) will flip the last two.
     SparkReconcileFixture f;
 
     // A raw consumer arms the SAME spec Guardian derives from make_service_rule("r1")
@@ -409,17 +409,29 @@ TEST_CASE("#2818 PIN — Guardian's subscription is erased by a sibling's failed
     armer.join();
     CHECK_FALSE(raw_sub.has_value()); // the raw consumer learns its arm failed
 
-    // THE DEFECT, at the layer that matters. Nothing is armed and nothing is watched…
+    // Nothing is armed and nothing is watched at the engine level…
     CHECK(f.spark_engine.stats().armed_sparks == 0);
     CHECK(f.spark_engine.stats().subscriptions == 0);
     CHECK(f.mechanism->watching_count() == 0);
-    // …and Guardian still reports the rule as armed, because nobody told it otherwise.
-    // Its PerKey subscription id now names nothing, no re-arm is attempted, and the rule
-    // will sit in this state until something unrelated causes a re-reconcile.
-    CHECK(f.engine->spark_armed_rule_count() == 1);
-    // The legacy path did NOT pick the rule up either — this is not a silent fallback to
-    // IGuard, it is a genuine detection hole.
+    // …and Guardian is now told, asynchronously (the Lost notification crosses its own
+    // "guardian-spark" consumer's dispatch thread), and detaches the rule as errored
+    // rather than continuing to report it armed.
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 0; }));
+    // No self-heal in this PR (Dave's call, 2026-09-06): the rule sits errored until the
+    // next server-issued PushRules or an agent restart re-attaches it.
+    // The legacy path does NOT pick the rule up either — this is not a silent fallback to
+    // IGuard, it stays a genuine, honestly-reported detection hole until re-attached.
     CHECK(f.engine->armed_guard_count() == 0);
+
+    // The lifecycle audit reflects WHY the rule stopped being enforced: "errored", not
+    // "disarmed" (guardian_outbox.hpp's documented vocabulary) — Guardian didn't
+    // withdraw the rule, its enforcement broke out from under it.
+    REQUIRE(yuzu::test::spin_until([&] {
+        std::lock_guard<std::mutex> lk{f.sent_mu};
+        return std::any_of(f.sent.begin(), f.sent.end(), [](const OutboxEntry& e) {
+            return e.rule_id == "r1" && e.lifecycle_kind == "errored";
+        });
+    }));
 }
 
 TEST_CASE("a supported type arms via spark, never in legacy guards_",
@@ -1447,9 +1459,13 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
         return;
     }
 
-    // fork() WITHOUT exec. Safe here because Catch2 runs test cases sequentially and this one
-    // starts no threads before forking, so no other thread can hold a libc lock at fork time.
+    // fork() WITHOUT exec. Catch2 runs test cases sequentially and this one starts no threads
+    // before forking - but an EARLIER case's detached executor worker can still be in its
+    // exit tail here (its active_worker_count()==0 is the last self-observable point, not
+    // OS-thread exit), and under TSan that makes the child die at its first thread start
+    // (die_after_fork; seen 2 of 6 runs on rung 9c PR-1). Wait for quiescence first, loudly.
     // The child is short-lived and aborts; it never returns to the harness.
+    REQUIRE(yuzu::test::wait_until_quiescent());
     const pid_t pid = ::fork();
     REQUIRE(pid >= 0);
 
@@ -1514,6 +1530,89 @@ TEST_CASE("a worker-thread mtx_ acquisition aborts the process (death test)",
     INFO("child exit code (if it exited normally): " << (WIFEXITED(status) ? WEXITSTATUS(status)
                                                                           : -1));
     REQUIRE(WIFSIGNALED(status));            // died by signal, not a clean exit
+    CHECK(WTERMSIG(status) == SIGABRT);      // and specifically via std::abort()
+}
+
+TEST_CASE("a GuardianIoExecutor::submit() completion callback taking mtx_ aborts the process "
+          "(death test, rung 9c R5.1)",
+          "[spark][guardian][reconcile][death]") {
+    // The SECOND WorkerHostileMutex role (guardian_detached_worker_role.hpp): a detached
+    // executor worker can never be joined and may outlive stop() or the F3 orphan grace,
+    // so an mtx_ acquisition from its body or its completion callback is a
+    // lock-vs-lifetime fault the tripwire must turn into a loud abort. Drives the hostile
+    // call through the REAL dispatch form (submit() + on_complete on the worker), not a
+    // hand-marked thread - the marker is applied by the executor's own worker lambda,
+    // which is exactly the wiring under test. Mutation: revert abort_if_worker_thread()'s
+    // predicate to the joined-thread role alone -> the child exits 94 (no abort).
+    if constexpr (!yuzu::agent::worker_mutex_guard_enabled()) {
+        SUCCEED("WorkerHostileMutex is compiled out in this build; nothing to prove");
+        return;
+    }
+
+    // fork() WITHOUT exec, same posture as the case above. NOTE the enlarged suite: an
+    // earlier case's detached executor worker can, in principle, still be alive at this
+    // fork (every such case spins for active_worker_count()==0 before returning, which
+    // bounds but does not prove it). Only the forking thread is duplicated, and the
+    // child does nothing but open a KvStore, start an engine, spawn ONE worker and touch
+    // mtx_, so a libc lock held by a stray thread at fork time is the residual risk;
+    // an isolated child executable would remove it and is noted as the follow-up. Until
+    // then, wait for thread quiescence (governance pass-3 qe-2/cp-1/cs-4) so the fork is
+    // never taken with a stray worker alive - TSan kills such a child at its first thread.
+    REQUIRE(yuzu::test::wait_until_quiescent());
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+
+    if (pid == 0) {
+        // ---- child ----
+        ::signal(SIGABRT, SIG_DFL);
+
+        auto opened = KvStore::open(unique_kv_path());
+        if (!opened)
+            ::_exit(90);
+        KvStore kv{std::move(*opened)};
+        GuardianEngine engine{&kv, "agent-death-submit", /*prefer_spark=*/true};
+        if (!engine.start_local())
+            ::_exit(92);
+
+        yuzu::agent::GuardianIoExecutor ex;
+        const auto adm = ex.submit(yuzu::agent::IoClass::File, "death", [] { return 1; },
+                                   [&engine](yuzu::agent::IoResult<int>&&) {
+                                       (void)engine.journal_stats(); // takes mtx_ on the
+                                                                     // detached worker -> abort
+                                   });
+        if (!adm)
+            ::_exit(91); // admission refused: setup failure, not a verdict
+
+        // If the guard works we never get here - the process aborts inside the worker.
+        // Give it a bounded window, then report "no abort" with a distinct code.
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        ::_exit(94);
+    }
+
+    // ---- parent ---- (poll, never block: a regressed guard leaves the child alive)
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t r = ::waitpid(pid, &status, WNOHANG);
+        if (r == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(r == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited: the submit() worker took mtx_ and neither aborted nor "
+             "returned - the lock-vs-lifetime wedge WorkerHostileMutex's second role exists "
+             "to prevent");
+    }
+
+    INFO("child exit code (if it exited normally): " << (WIFEXITED(status) ? WEXITSTATUS(status)
+                                                                          : -1));
+    REQUIRE(WIFSIGNALED(status));            // died by signal, not a clean exit (94 = no abort)
     CHECK(WTERMSIG(status) == SIGABRT);      // and specifically via std::abort()
 }
 
@@ -2457,6 +2556,15 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
           "[spark][guardian][reconcile][liveness]") {
     SparkReconcileFixture f;
     f.mechanism->hang_next_watch();
+    // Release the parked mechanism on EVERY exit path, declared after `f` so it runs
+    // BEFORE the fixture tears down SparkEngine/GuardianEngine: a failing REQUIRE
+    // below used to skip the end-of-body release and destroy spark_engine while the
+    // detached worker was still parked inside a mechanism it owns (governance cs-202).
+    struct ReleaseHangOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
+    };
+    ReleaseHangOnExit release_parked{f};
     REQUIRE(f.engine->policy_generation() == 0);
 
     gpb::GuaranteedStatePush p;
@@ -2473,8 +2581,77 @@ TEST_CASE("#2233 item 3: a timed-out arm holds policy_generation for retry, not 
     CHECK(f.engine->policy_generation() == 0); // held, NOT advanced to 5
     CHECK(f.engine->rule_count() == 1);        // persisted (put_rule_locked ran)
     CHECK(f.engine->spark_armed_rule_count() == 0);
-
-    // Cleanup: release the still-parked mechanism so the detached worker can
-    // finish before the fixture tears down SparkEngine/GuardianEngine.
-    f.mechanism->release_hang();
+    // (the parked mechanism is released by `release_parked` above on every exit path)
 }
+
+#ifndef _WIN32
+// The quiescence gate the fork()-without-exec death tests above rely on. Mutation: make
+// wait_until_quiescent return true unconditionally -> the "false while a thread lives"
+// branch fails; make it never return true -> the "true once it exits" branch times out.
+TEST_CASE("test helper: wait_until_quiescent returns false while another thread lives and true once "
+          "it has exited (fork death-test gate; governance pass-3 qe-2/cp-1/cs-4)",
+          "[spark][guardian][reconcile][helpers]") {
+#if !defined(__linux__)
+    SUCCEED("wait_until_quiescent is a no-op off Linux; nothing to prove");
+    return;
+#else
+    // Governance pass-4 cs-101: the second thread is joined on scope exit by construction,
+    // never by a trailing manual join a throw could skip. std::jthread where the library
+    // has it (loops on its own stop_token: a jthread destructor calls request_stop() and
+    // would never set a hand-rolled release flag, so looping on such a flag would hang the
+    // unwind path); a scope-exit join guard over std::thread on any toolchain that does not
+    // define __cpp_lib_jthread. Not a hypothetical fallback: Apple Clang's libc++ does NOT
+    // provide std::jthread (this project's own compiler floor, README.md:168 and
+    // docs/build-guide.md:17, includes "Apple Clang 15+"; that exact substitution already
+    // broke Apple Clang's libc++ once in this codebase on #2580 -
+    // docs/governance-skill-tuning-2026-07.md:86, .claude/skills/governance/SKILL.md:1422,
+    // and the same guard convention at tests/unit/server/test_secret_codec.cpp:1104 and
+    // tests/unit/server/test_license_store.cpp:459). No CI leg compiles this arm today (see
+    // the structural note below), so nothing here has been exercised against a real macOS
+    // toolchain by this PR - the guard exists because the fact is established elsewhere in
+    // this tree, not because this test proves it.
+    // NOTE (governance pass-6 xp-201/dw-304): no CI leg compiles the fallback arm today for a
+    // STRUCTURAL reason, not toolchain ubiquity - this whole test is `#ifndef _WIN32` (Windows
+    // excluded above) and returns via SUCCEED() before reaching this #if on any non-Linux
+    // platform (see the `#if !defined(__linux__)` branch just above), so only Linux ever
+    // reaches this selection, and every Linux CI leg builds against libstdc++, which does
+    // define __cpp_lib_jthread. Treat this fallback as review-only code (no CI leg compiles
+    // it today) and keep it trivially simple regardless.
+#if defined(__cpp_lib_jthread)
+    std::jthread t([](std::stop_token st) {
+        while (!st.stop_requested())
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    });
+    // A live second thread: the gate must NOT open (bounded: 150 ms, scaled).
+    CHECK_FALSE(yuzu::test::wait_until_quiescent(std::chrono::milliseconds(150)));
+    t.request_stop();
+    t.join(); // explicit here so the next CHECK observes the exited thread; the
+              // destructor's join is the exception-path guarantee, not the happy path
+#else
+    std::atomic<bool> release{false};
+    std::thread t([&] {
+        while (!release.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    });
+    struct JoinOnExit {
+        std::atomic<bool>& release;
+        std::thread& t;
+        JoinOnExit(std::atomic<bool>& r, std::thread& th) : release(r), t(th) {}
+        JoinOnExit(const JoinOnExit&) = delete;            // qe-204: one owner, one join
+        JoinOnExit& operator=(const JoinOnExit&) = delete;
+        ~JoinOnExit() {
+            release.store(true, std::memory_order_release);
+            if (t.joinable())
+                t.join();
+        }
+    } join_guard{release, t};
+    // A live second thread: the gate must NOT open (bounded: 150 ms, scaled).
+    CHECK_FALSE(yuzu::test::wait_until_quiescent(std::chrono::milliseconds(150)));
+    release.store(true, std::memory_order_release);
+    t.join(); // explicit for the next CHECK; the guard is the exception-path join
+#endif
+    // Exited -> quiescent (TSan's background thread is excluded by the helper's threshold).
+    CHECK(yuzu::test::wait_until_quiescent(std::chrono::seconds(5)));
+#endif
+}
+#endif
