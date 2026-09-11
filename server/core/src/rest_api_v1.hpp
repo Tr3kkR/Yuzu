@@ -17,6 +17,7 @@
 #include "dex_app_perf_model.hpp"
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
+#include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
 #include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -485,7 +486,14 @@ public:
         // Trailing optional dep; `{}` degrades GET /api/v1/dex/app and GET
         // /api/v1/dex/overview to "no confinement" (matching the fragment's own
         // unwired-`visible_set_fn_` posture), never a crash.
-        DexVisibleFn dex_visible_fn = {});
+        DexVisibleFn dex_visible_fn = {},
+        // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam (replaces
+        // the former AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort provider
+        // for GET /api/v1/dex/perf/compare) — the SAME instance the /auto VERIFY
+        // dashboard fragments and the MCP compare_app_perf_versions tool call,
+        // so REST/dashboard/MCP can never disagree. nullptr = the route answers
+        // 503 (provider unwired), same degrade as the retired cohort provider.
+        std::shared_ptr<const VerifyApi> verify_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -571,7 +579,10 @@ public:
         // #4035 hardening (governance): see the production overload's doc
         // comment above (DexVisibleFn); identical trailing-optional-dep,
         // degrade-to-no-confinement contract.
-        DexVisibleFn dex_visible_fn = {});
+        DexVisibleFn dex_visible_fn = {},
+        // ADR-0031 WS-A4 #4250: see the production overload's doc comment
+        // above; identical trailing-optional-dep, 503-when-unwired contract.
+        std::shared_ptr<const VerifyApi> verify_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

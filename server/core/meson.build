@@ -513,6 +513,7 @@ yuzu_server_core_lib = static_library(
     'src/preflight_runner.cpp',
     'src/verify_routes.cpp',
     'src/verify_ui.cpp',
+    'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
     'src/deployment_run_store.cpp',

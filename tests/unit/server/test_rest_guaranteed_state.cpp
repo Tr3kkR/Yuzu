@@ -33,6 +33,7 @@
 #include "rest_api_v1.hpp"
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
+#include "test_verify_api_double.hpp"
 
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
@@ -246,6 +247,12 @@ struct RestGsHarness {
     // default (so the audit/scope/render paths are reachable); left empty when
     // wire_app_perf is false so a test can prove the provider-absent → 503 branch.
     yuzu::server::AppPerfProviders app_perf_providers_;
+    // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing GET
+    // /api/v1/dex/perf/compare (replaces the retired AppPerfCohortFn-in-
+    // AppPerfProviders ad-hoc cohort provider). Left null when wire_app_perf is
+    // false — same "provider absent → 503" branch every other app-perf seam
+    // above exercises.
+    std::shared_ptr<const yuzu::server::VerifyApi> verify_api_;
     // Rows the wired fleet provider returns (default empty). A test sets this before
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
@@ -490,9 +497,15 @@ struct RestGsHarness {
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
             };
-            app_perf_providers_.cohort =
-                [this](std::string_view, std::string_view, std::string_view, std::string_view, int)
-                -> std::optional<yuzu::server::CohortRead> { return cohort_read_; };
+            // ADR-0031 WS-A4 #4250: the shared VerifyApi seam (replaces the
+            // retired AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort
+            // provider) — a FnVerifyApi wraps the SAME `cohort_read_` fixture
+            // so every existing test in this file keeps its meaning
+            // unchanged. Left null (see the member's doc comment) when
+            // wire_app_perf is false, same "provider absent → 503" branch.
+            verify_api_ = std::make_shared<yuzu::server::test::FnVerifyApi>(
+                [this](std::string_view, std::string_view, std::string_view, std::string_view,
+                      int) -> std::optional<yuzu::server::CohortRead> { return cohort_read_; });
         }
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
@@ -560,7 +573,11 @@ struct RestGsHarness {
                             // per-username resolution, only whether the
                             // caller's set is engaged).
                             RestApiV1::DexVisibleFn{
-                                [this](const std::string&) { return dex_visible_override_; }});
+                                [this](const std::string&) { return dex_visible_override_; }},
+                            // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing
+                            // GET /api/v1/dex/perf/compare (see verify_api_'s doc
+                            // comment above).
+                            verify_api_);
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
