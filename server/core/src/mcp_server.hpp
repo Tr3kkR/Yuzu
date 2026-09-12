@@ -108,6 +108,20 @@ class ProductPackStore;
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
 class DashboardRoutes;
+// B5 (api-parity programme #2146) — backs the offload-target / platform-
+// license / software-deployment MCP twins (list/create/get/delete_offload_
+// target, list_offload_target_deliveries, get/activate_platform_license,
+// list_license_alerts, list/create/rollback/cancel_software_deployment).
+// Forward-declared (pointer-only in build_handler/register_routes); the .cpp
+// includes each store's own header for the full definition. LicenseStore and
+// SoftwareDeploymentStore are DELIBERATELY DORMANT on `dev` (ADR-0048/0051 —
+// nothing in server.cpp constructs them, mirroring rest_api_v1_'s own
+// nullptr wiring for both) — their MCP twins answer "unavailable" in
+// production today, same posture as their REST siblings, until a future PR
+// re-wires construction (out of scope here).
+class OffloadTargetStore;
+class LicenseStore;
+class SoftwareDeploymentStore;
 }
 
 namespace yuzu::server::detail {
@@ -736,7 +750,32 @@ public:
                             // disagree. Trailing optional dep; nullptr leaves the tool
                             // answering an internal-error JSON-RPC response, same degrade
                             // as the retired cohort provider.
-                            std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                            std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                            // B5 (api-parity #2146) — backs the 5 offload-target MCP
+                            // twins. The SAME `offload_target_store_` instance
+                            // OffloadRoutes::register_routes wires (server.cpp) — a real,
+                            // non-dormant store. Trailing optional dep; nullptr leaves
+                            // every offload-target tool answering "unavailable".
+                            OffloadTargetStore* offload_target_store = nullptr,
+                            // B5 — backs get/activate_platform_license + list_license_alerts.
+                            // DELIBERATELY nullptr in production today (ADR-0048: LicenseStore
+                            // is dormant, matching RestApiV1's own `/*license_store=*/nullptr`
+                            // wiring) — see this header's forward-declaration comment above.
+                            LicenseStore* license_store = nullptr,
+                            // B5 — backs list/create/rollback/cancel_software_deployment.
+                            // DELIBERATELY nullptr in production today (ADR-0051:
+                            // SoftwareDeploymentStore is dormant, matching RestApiV1's own
+                            // `/*sw_deploy_store=*/nullptr` wiring).
+                            SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                            // B5 — backs export_ca_root_csr, the MCP twin of GET
+                            // /api/v1/ca/root-csr. Reuses `CaRoutes::ExportCsrFn` verbatim
+                            // (ca_routes.hpp, already included above for IssueCodeSigningFn)
+                            // rather than redeclaring it, so the REST route and this twin
+                            // call the identical ServerImpl seam (export_ca_csr()). Trailing
+                            // optional dep; unset leaves the tool answering "CA not
+                            // available", the same degradation ca_store == nullptr produces
+                            // for the other CA tools above.
+                            CaRoutes::ExportCsrFn export_csr_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -836,7 +875,13 @@ public:
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
                          IssueCodeSigningFn issue_code_signing_fn = {},
                          // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
-                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                         // B5 (api-parity #2146) — forwarded to build_handler; see its doc
+                         // comments above for each param's contract.
+                         OffloadTargetStore* offload_target_store = nullptr,
+                         LicenseStore* license_store = nullptr,
+                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                         CaRoutes::ExportCsrFn export_csr_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -885,7 +930,13 @@ public:
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
                          IssueCodeSigningFn issue_code_signing_fn = {},
                          // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
-                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                         // B5 (api-parity #2146) — forwarded to build_handler; see its doc
+                         // comments above for each param's contract.
+                         OffloadTargetStore* offload_target_store = nullptr,
+                         LicenseStore* license_store = nullptr,
+                         SoftwareDeploymentStore* sw_deploy_store = nullptr,
+                         CaRoutes::ExportCsrFn export_csr_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

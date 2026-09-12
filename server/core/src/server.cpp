@@ -17928,7 +17928,23 @@ private:
                 // and the REST GET /api/v1/dex/perf/compare twin use, so all
                 // three compare_app_perf_versions/compare siblings never
                 // disagree.
-                verify_api);
+                verify_api,
+                // B5 (api-parity #2146) — the SAME offload_target_store_ instance
+                // OffloadRoutes::register_routes wires above (a real, non-dormant
+                // store), so the REST route and these five MCP twins read/write
+                // identical state.
+                offload_target_store_.get(),
+                // license_store / sw_deploy_store: DELIBERATELY nullptr, matching
+                // RestApiV1's own `/*license_store=*/nullptr` /
+                // `/*sw_deploy_store=*/nullptr` wiring immediately above
+                // (ADR-0048/ADR-0051 — both stores are dormant on `dev`; nothing
+                // in this file constructs either). Re-wiring construction is out
+                // of scope for this PR, same as it was for RestApiV1's own wiring.
+                /*license_store=*/nullptr,
+                /*sw_deploy_store=*/nullptr,
+                // The SAME ServerImpl seam the CaRoutes registration above wires
+                // for GET /api/v1/ca/root-csr (export_ca_csr holds the CA key).
+                [this]() -> std::optional<std::string> { return export_ca_csr(); });
         }
 
         // -- Listen -----------------------------------------------------------

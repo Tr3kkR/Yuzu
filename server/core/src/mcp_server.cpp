@@ -71,6 +71,13 @@
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
 
+// B5 (api-parity #2146) — offload-target / platform-license / software-
+// deployment MCP twins. All three stores are forward-declared only in
+// mcp_server.hpp; the full definitions are needed here.
+#include "offload_target_store.hpp"
+#include "license_store.hpp"
+#include "software_deployment_store.hpp"
+
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
 #include <spdlog/spdlog.h>
@@ -251,6 +258,57 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
 
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
+}
+
+// B5 (api-parity #2146) — mirrors rest_api_v1.cpp's file-local
+// `sw_deploy_error_status`/`sw_deploy_client_message` (both `static` there, so
+// TU-invisible here — duplicated rather than shared, same constraint the
+// license helper below documents). Classification: `kSwDeployDbErrorPrefix`
+// (software_deployment_store.hpp's shared, machine-checkable idiom) is a
+// genuine DB/lease failure -> retryable; anything else is a caller-input
+// validation or not-found/wrong-state business error -> terminal. Never
+// echoes a genuine DB/lease failure's raw text (can embed PQerrorMessage()
+// fragments) to the MCP caller — logs it server-side and returns a generic
+// message instead, same posture as the REST twin.
+bool sw_deploy_is_db_error(const std::string& err) {
+    return err.starts_with(yuzu::server::kSwDeployDbErrorPrefix);
+}
+
+std::string sw_deploy_safe_message(const char* op, const std::string& err) {
+    if (sw_deploy_is_db_error(err)) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
+}
+
+// B5 — LicenseStore's `unexpected()` shape is three-way (mirrors
+// rest_api_v1.cpp's file-local `license_error_status`, TU-invisible here):
+// `"not_found: "` -> a genuine not-found business fact; `kLicenseDbErrorPrefix`
+// -> a genuine DB/lease failure; anything else -> a caller-input/business-rule
+// error, safe to echo verbatim (operator-authored feedback, e.g. "organization
+// cannot be empty"). UNLIKE the REST twin (which echoes `kLicenseDbErrorPrefix`
+// text — including embedded PQerrorMessage() fragments — verbatim, a pre-
+// existing REST posture this file does not otherwise replicate for any other
+// store), this MCP twin sanitises the db_error case the same way
+// `sw_deploy_safe_message` above does: never hand raw DB/lease internals to an
+// agentic caller, only log them server-side.
+enum class LicenseErrorClass { kNotFound, kDbError, kBusiness };
+
+LicenseErrorClass classify_license_error(const std::string& err) {
+    if (err.starts_with("not_found:"))
+        return LicenseErrorClass::kNotFound;
+    if (err.starts_with(yuzu::server::kLicenseDbErrorPrefix))
+        return LicenseErrorClass::kDbError;
+    return LicenseErrorClass::kBusiness;
+}
+
+std::string license_safe_message(const char* op, const std::string& err) {
+    if (classify_license_error(err) == LicenseErrorClass::kDbError) {
+        spdlog::error("{}: {}", op, err);
+        return "service unavailable";
+    }
+    return err;
 }
 
 // Server-side length cap for free-text agentic params (question, scenario) that
@@ -2232,6 +2290,176 @@ static const ToolDef kTools[] = {
      "distinct from deployment.create). Requires SoftwareDeployment:Read.",
      R"j({"type":"object","properties":{"run_id":{"type":"string","minLength":1,"description":"The source pre-flight run id"}},"required":["run_id"]})j",
      R"j({"type":"object","properties":{"run_id":{"type":"string"},"name":{"type":"string"},"go":{"type":"integer"},"warn":{"type":"integer"}},"required":["run_id","name","go","warn"]})j"},
+
+    // ── B5 (api-parity #2146) — offload-target MCP twins ──────────────────
+    // Mirrors offload_routes.cpp's /api/v1/offload-targets* surface exactly:
+    // same Infrastructure:Read/Write gate per route, same OffloadWriteError
+    // classification, same audit verbs (offload_target.create/.delete). The
+    // credential itself (auth_credential) is write-only and NEVER echoed back
+    // — only has_credential (a bool) is ever returned, matching the REST
+    // target_to_json() shape and ADR-0010's anti-downgrade rule.
+    {"list_offload_targets",
+     "List configured response-offload targets (event-forwarding webhooks that mirror fleet "
+     "events out to an external system). Mirrors GET /api/v1/offload-targets. Never returns "
+     "credential material — only has_credential (bool). Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"offload_targets":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"url":{"type":"string"},"auth_type":{"type":"string","enum":["none","bearer","basic","hmac"]},"has_credential":{"type":"boolean"},"event_types":{"type":"string"},"batch_size":{"type":"integer"},"enabled":{"type":"boolean"},"created_at":{"type":"integer"}},"required":["id","name","url","auth_type","has_credential","event_types","batch_size","enabled","created_at"]}}},"required":["offload_targets"]})j"},
+
+    {"create_offload_target",
+     "Register a new response-offload target: fleet events matching event_types are POSTed to "
+     "url (optionally batched, optionally authenticated). Mirrors POST "
+     "/api/v1/offload-targets. auth_credential (if given) is envelope-encrypted at rest and "
+     "never echoed back by any tool — only has_credential (bool) is ever readable afterward "
+     "(ADR-0010). url must be http:// or https://; batch_size 1 delivers each event "
+     "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
+     "target, overwrites nothing) but a duplicate name is rejected. Requires "
+     "Infrastructure:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"
+     R"j("url":{"type":"string","minLength":8,"maxLength":2048,"pattern":"^https?://","description":"Delivery endpoint; must be http:// or https://"},)j"
+     R"j("auth_type":{"type":"string","enum":["none","bearer","basic","hmac"],"default":"none"},)j"
+     R"j("auth_credential":{"type":"string","maxLength":8192,"description":"Write-only; bearer token, \"user:pass\" for basic, or the HMAC shared secret. Never echoed back by any tool"},)j"
+     R"j("event_types":{"type":"string","maxLength":512,"default":"*","description":"Comma-separated event types to forward, or \"*\" for all"},)j"
+     R"j("batch_size":{"type":"integer","minimum":1,"maximum":10000,"default":1},)j"
+     R"j("enabled":{"type":"boolean","default":true})j"
+     R"j(},"required":["name","url"]})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"status":{"const":"created"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["id","status"]})j"},
+
+    {"get_offload_target",
+     "Get one offload target's config (no credential material — only has_credential). Mirrors "
+     "GET /api/v1/offload-targets/{id}. Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"Target id from list_offload_targets"}},"required":["id"]})j",
+     R"j({"type":"object","properties":{"id":{"type":"integer"},"name":{"type":"string"},"url":{"type":"string"},"auth_type":{"type":"string","enum":["none","bearer","basic","hmac"]},"has_credential":{"type":"boolean"},"event_types":{"type":"string"},"batch_size":{"type":"integer"},"enabled":{"type":"boolean"},"created_at":{"type":"integer"}},"required":["id","name","url","auth_type","has_credential","event_types","batch_size","enabled","created_at"]})j"},
+
+    {"delete_offload_target",
+     "Delete an offload target (cascades its delivery history). Mirrors DELETE "
+     "/api/v1/offload-targets/{id}. Destructive but NOT approval-gated — matches the REST "
+     "route's own Infrastructure:Write gate exactly (not Infrastructure:Delete), so this stays "
+     "reachable at the supervised MCP tier without a maker-checker ticket, same as the REST "
+     "twin. A retry against an already-deleted id answers not_found, never a silent success.",
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"Target id from list_offload_targets"}},"required":["id"]})j",
+     R"j({"type":"object","properties":{"deleted":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["deleted"]})j"},
+
+    {"list_offload_target_deliveries",
+     "Recent delivery history for one offload target, newest first (status_code/error per "
+     "attempt — a forensic/troubleshooting view, not a decision surface). Mirrors GET "
+     "/api/v1/offload-targets/{id}/deliveries. A missing target answers not-found, matching "
+     "get_offload_target's own semantics. Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("id":{"type":"integer","minimum":1,"description":"Target id from list_offload_targets"},)j"
+     R"j("limit":{"type":"integer","minimum":1,"maximum":1000,"default":50})j"
+     R"j(},"required":["id"]})j",
+     R"j({"type":"object","properties":{"deliveries":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"target_id":{"type":"integer"},"event_type":{"type":"string"},"event_count":{"type":"integer"},"payload":{"type":"string"},"status_code":{"type":"integer"},"delivered_at":{"type":"integer"},"error":{"type":"string"}},"required":["id","target_id","event_type","event_count","payload","status_code","delivered_at","error"]}}},"required":["deliveries"]})j"},
+
+    // ── B5 — internal-CA root-CSR export twin (ca_routes.cpp, distinct route
+    // from the genuinely-public GET /api/v1/ca/root and /ca/crl — see this
+    // tool's description + ca_routes.hpp's file comment for why THIS route
+    // needs auth while those two don't). Read-only (no state change).
+    {"export_ca_root_csr",
+     "Export the install CA's own signing request (PKCS#10 PEM, over its EXISTING key) for an "
+     "enterprise root to countersign into a subordinate-CA intermediate (PR6 subordinate-CA "
+     "workflow). Mirrors GET /api/v1/ca/root-csr — NOT the same route as the public GET "
+     "/api/v1/ca/root (the CA's already-issued root certificate) or GET /api/v1/ca/crl, both of "
+     "which are genuinely unauthenticated by design (every TLS client needs them to trust the "
+     "install) and have no MCP twin. This CSR carries only the CA's already-public key + "
+     "subject — no secret ever leaves the server — but exporting it still requires the CA key "
+     "to sign the request, so unlike the two public routes this one is authenticated: Requires "
+     "Security:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"csr_pem":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["csr_pem"]})j"},
+
+    // ── B5 — platform license MCP twins (rest_api_v1.cpp) ──────────────────
+    // LicenseStore is DELIBERATELY DORMANT on `dev` (ADR-0048) — nothing in
+    // server.cpp constructs one, matching RestApiV1's own `/*license_store=*/
+    // nullptr` wiring, so these three answer "unavailable" in production
+    // today, same posture as their REST siblings.
+    {"get_platform_license",
+     "Get the current active platform license (organization, seats, edition, expiry, "
+     "days_remaining) or {\"status\":\"none\"} if none is activated. Mirrors GET "
+     "/api/v1/license. Requires License:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"status":{"type":"string"},"id":{"type":"string"},"organization":{"type":"string"},"seat_count":{"type":"integer"},"seats_used":{"type":"integer"},"issued_at":{"type":"integer"},"expires_at":{"type":"integer","description":"0 = perpetual"},"edition":{"type":"string"},"days_remaining":{"type":"integer"}},"required":["status"]})j"},
+
+    {"activate_platform_license",
+     "Activate a platform license. Mirrors POST /api/v1/license. license_key is hashed "
+     "(SHA-256) before storage — the raw key is never persisted or ever echoed back by any "
+     "tool. A duplicate license_key is rejected (\"license key already activated\"), never "
+     "silently re-activated. Additive: mints a new license row, overwrites nothing existing. "
+     "Requires License:Write.",
+     R"j({"type":"object","properties":{)j"
+     R"j("organization":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("license_key":{"type":"string","minLength":1,"maxLength":512,"description":"Write-only; hashed at rest, never echoed back"},)j"
+     R"j("seat_count":{"type":"integer","minimum":0,"default":0},)j"
+     R"j("edition":{"type":"string","maxLength":32,"default":"community"},)j"
+     R"j("expires_at":{"type":"integer","minimum":0,"default":0,"description":"Unix epoch seconds; 0 = perpetual"},)j"
+     R"j("features_json":{"type":"string","maxLength":8192,"default":"[]","description":"JSON array of feature flags"})j"
+     R"j(},"required":["organization","license_key"]})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["id"]})j"},
+
+    {"list_license_alerts",
+     "List license lifecycle alerts (expiry/seat-limit warnings and terminal "
+     "expired/exceeded notices), newest-triggered first. Mirrors GET /api/v1/license/alerts. "
+     "Requires License:Read.",
+     R"j({"type":"object","properties":{"unacknowledged_only":{"type":"boolean","default":false}}})j",
+     R"j({"type":"object","properties":{"alerts":{"type":"array","items":{"type":"object","properties":{"id":{"type":"integer"},"license_id":{"type":"string"},"alert_type":{"type":"string","enum":["expiry_warning","seat_limit_warning","expired","exceeded"]},"message":{"type":"string"},"triggered_at":{"type":"integer"},"acknowledged":{"type":"boolean"}},"required":["id","license_id","alert_type","message","triggered_at","acknowledged"]}}},"required":["alerts"]})j"},
+
+    // ── B5 — software-deployment MCP twins (rest_api_v1.cpp) ───────────────
+    // SoftwareDeploymentStore is DELIBERATELY DORMANT on `dev` (ADR-0051) —
+    // nothing in server.cpp constructs one, matching RestApiV1's own
+    // `/*sw_deploy_store=*/nullptr` wiring, so these four answer "unavailable"
+    // in production today, same posture as their REST siblings. State
+    // machine (store-enforced, single guarded UPDATE per transition — see
+    // software_deployment_store.hpp): staged -[start]-> deploying
+    // -[rollback]-> rolled_back; staged/deploying -[cancel]-> cancelled;
+    // deploying/verifying/completed -[rollback]-> rolled_back. cancel on a
+    // completed deployment and rollback on a staged (never-started)
+    // deployment are BOTH rejected as a wrong-state business error, never a
+    // silent no-op. There is no start_software_deployment MCP tool — the
+    // REST POST .../start route requires a fresh MFA step-up
+    // (docs/mcp-server.md: MCP tokens are non-interactive and cannot satisfy
+    // a step-up challenge), so it is deliberately not twinned here.
+    {"list_software_deployments",
+     "List software-package fleet deployments, optionally filtered by status (staged | "
+     "deploying | verifying | completed | cancelled | rolled_back | failed), newest first. "
+     "Mirrors GET /api/v1/software-deployments. Requires SoftwareDeployment:Read.",
+     R"j({"type":"object","properties":{"status":{"type":"string","maxLength":32,"description":"Exact status filter; omit for every status"}}})j",
+     R"j({"type":"object","properties":{"deployments":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"package_id":{"type":"string"},"status":{"type":"string"},"created_by":{"type":"string"},"created_at":{"type":"integer"},"started_at":{"type":"integer"},"completed_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"}},"required":["id","package_id","status","created_by","created_at","started_at","completed_at","agents_targeted","agents_success","agents_failure"]}}},"required":["deployments"]})j"},
+
+    {"create_software_deployment",
+     "Create a new software-package deployment against a scope expression, in the initial "
+     "'staged' state (a subsequent POST /api/v1/software-deployments/{id}/start — REST-only, "
+     "no MCP twin, see this family's own note — actually pushes it to endpoints). Mirrors POST "
+     "/api/v1/software-deployments. package_id must reference an existing software package "
+     "(a foreign-key violation is rejected); scope_expression is stored as-is and is NOT "
+     "validated against the live fleet at creation time — an expression matching zero devices "
+     "is accepted and simply targets nothing when started. Mints a new deployment row, "
+     "overwrites nothing existing — but is annotated Destructive (not Additive) because it "
+     "gates on SoftwareDeployment:Execute, and every Execute/Delete-gated tool on this surface "
+     "carries destructiveHint:true regardless of its own semantics. Requires "
+     "SoftwareDeployment:Execute.",
+     R"j({"type":"object","properties":{)j"
+     R"j("package_id":{"type":"string","minLength":1,"maxLength":64,"description":"Must reference an existing software package"},)j"
+     R"j("scope_expression":{"type":"string","maxLength":4096,"description":"Target scope DSL expression; not validated against the live fleet at creation time"})j"
+     R"j(},"required":["package_id"]})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["id"]})j"},
+
+    {"rollback_software_deployment",
+     "Roll back a deployment: only valid from deploying, verifying, or completed — a staged "
+     "(never-started) or already-terminal (cancelled/rolled_back/failed) deployment is "
+     "rejected with a wrong-state business error, never a silent no-op. Mirrors POST "
+     "/api/v1/software-deployments/{id}/rollback. Destructive, one-way (no un-rollback). "
+     "Requires SoftwareDeployment:Execute.",
+     R"j({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Deployment id from list_software_deployments"}},"required":["id"]})j",
+     R"j({"type":"object","properties":{"rolled_back":{"const":true},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["rolled_back"]})j"},
+
+    {"cancel_software_deployment",
+     "Cancel a deployment: only valid from staged or deploying — a completed, verifying, or "
+     "already-terminal (cancelled/rolled_back/failed) deployment is rejected with a wrong-state "
+     "business error (use rollback_software_deployment for a completed/verifying deployment "
+     "instead). Mirrors POST /api/v1/software-deployments/{id}/cancel. Destructive, one-way. "
+     "Requires SoftwareDeployment:Execute.",
+     R"j({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"Deployment id from list_software_deployments"}},"required":["id"]})j",
+     R"j({"type":"object","properties":{"cancelled":{"const":true},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["cancelled"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -2281,6 +2509,16 @@ static const char* const kWriteToolsRaw[] = {
     // gate; the tool performs no mutation, but the write set is keyed on the
     // RBAC operation, not on whether a handler mutates state.
     "preview_management_group_agent_count",
+    // B5 (api-parity #2146) — create/delete_offload_target mutate;
+    // list_offload_targets/get_offload_target/list_offload_target_deliveries
+    // are read-only and deliberately absent. activate_platform_license and
+    // create/rollback/cancel_software_deployment mutate; get_platform_license/
+    // list_license_alerts/list_software_deployments/export_ca_root_csr are
+    // read-only and deliberately absent (export_ca_root_csr generates no new
+    // state — it re-signs the SAME CSR from the CA's existing key every call).
+    "create_offload_target", "delete_offload_target", "activate_platform_license",
+    "create_software_deployment", "rollback_software_deployment",
+    "cancel_software_deployment",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -2603,6 +2841,39 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // would be a false claim per ServiceScopeClass's own doc comment.
     {"list_preflight_runs", {"Infrastructure", "Read"}},
     {"get_deployment_preview", {"SoftwareDeployment", "Read"}},
+    // B5 (api-parity #2146) — offload targets: parity with offload_routes.cpp's
+    // own perm_fn gates exactly. delete_offload_target is deliberately
+    // Infrastructure:Write (NOT Write+Delete) — matches the REST DELETE
+    // route's own gate, so it is NOT swept into requires_approval()'s blanket
+    // "operation == Delete" supervised-tier approval rule (mcp_policy.hpp);
+    // REST doesn't approval-gate it either, so MCP parity requires the same.
+    // 2-element (default `denied`) form throughout: none of the five reads
+    // are per-agent data with a real confinement mechanism to classify
+    // `confined` against (same reasoning as list_preflight_runs above).
+    {"list_offload_targets", {"Infrastructure", "Read"}},
+    {"create_offload_target", {"Infrastructure", "Write"}},
+    {"get_offload_target", {"Infrastructure", "Read"}},
+    {"delete_offload_target", {"Infrastructure", "Write"}},
+    {"list_offload_target_deliveries", {"Infrastructure", "Read"}},
+    // B5 — CA root-CSR export: parity with ca_routes.cpp's GET
+    // /api/v1/ca/root-csr gate exactly (Security:Read, same securable as
+    // list_issued_certs above).
+    {"export_ca_root_csr", {"Security", "Read"}},
+    // B5 — platform license: parity with rest_api_v1.cpp's License:Read/Write
+    // gates exactly.
+    {"get_platform_license", {"License", "Read"}},
+    {"activate_platform_license", {"License", "Write"}},
+    {"list_license_alerts", {"License", "Read"}},
+    // B5 — software deployments: parity with rest_api_v1.cpp's
+    // SoftwareDeployment:Read/Execute gates exactly — mutations map to
+    // Execute (matching the REST create/rollback/cancel routes' own perm_fn
+    // calls), not Write, so this table and mcp_policy.hpp's tier ladder never
+    // disagree with the REST twin (same invariant note as quarantine_device
+    // above).
+    {"list_software_deployments", {"SoftwareDeployment", "Read"}},
+    {"create_software_deployment", {"SoftwareDeployment", "Execute"}},
+    {"rollback_software_deployment", {"SoftwareDeployment", "Execute"}},
+    {"cancel_software_deployment", {"SoftwareDeployment", "Execute"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -3167,6 +3438,41 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // shape for unchanged server state.
     {"list_preflight_runs", {ToolEffect::ReadOnly, true, "List pre-flight runs"}},
     {"get_deployment_preview", {ToolEffect::ReadOnly, true, "Get deployment preview"}},
+
+    // ── B5 (api-parity #2146) — offload targets / CA root-CSR / platform
+    // license / software deployments ───────────────────────────────────────
+    {"list_offload_targets", {ToolEffect::ReadOnly, true, "List offload targets"}},
+    {"get_offload_target", {ToolEffect::ReadOnly, true, "Get offload target"}},
+    {"list_offload_target_deliveries",
+     {ToolEffect::ReadOnly, true, "List offload target deliveries"}},
+    {"export_ca_root_csr", {ToolEffect::ReadOnly, true, "Export CA root CSR"}},
+    {"get_platform_license", {ToolEffect::ReadOnly, true, "Get platform license"}},
+    {"list_license_alerts", {ToolEffect::ReadOnly, true, "List license alerts"}},
+    {"list_software_deployments", {ToolEffect::ReadOnly, true, "List software deployments"}},
+    // create_offload_target/activate_platform_license: pure INSERT of a NEW
+    // row, nothing existing overwritten -> Additive (same reasoning as
+    // mint_upload_grant above). A duplicate name/license_key is REJECTED,
+    // never silently reused -> each successful call mints a distinct id ->
+    // not idempotent.
+    {"create_offload_target", {ToolEffect::Additive, false, "Create offload target"}},
+    {"activate_platform_license", {ToolEffect::Additive, false, "Activate platform license"}},
+    // create_software_deployment is ALSO a pure INSERT (same shape as the two
+    // above), but its kToolSecurityRows operation is Execute (matching the
+    // REST route's own perm_fn gate exactly, not Write) — the 2g PR2
+    // safe-direction floor (test_mcp_server.cpp) mandates destructiveHint:true
+    // for every Delete/Execute-gated tool, so this is Destructive despite the
+    // Additive-shaped semantics, never Additive like its two siblings above.
+    {"create_software_deployment", {ToolEffect::Destructive, false, "Create software deployment"}},
+    // delete_offload_target/rollback_software_deployment/cancel_software_deployment:
+    // one-way state transitions; a retry against an already-deleted/wrong-state
+    // target answers not_found/wrong-state rather than a clean no-op success
+    // -> Destructive, not idempotent (same reasoning as revoke_upload_grant/
+    // revoke_certificate above).
+    {"delete_offload_target", {ToolEffect::Destructive, false, "Delete offload target"}},
+    {"rollback_software_deployment",
+     {ToolEffect::Destructive, false, "Roll back software deployment"}},
+    {"cancel_software_deployment",
+     {ToolEffect::Destructive, false, "Cancel software deployment"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -3791,7 +4097,9 @@ McpServer::HandlerFn McpServer::build_handler(
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, OffloadTargetStore* offload_target_store,
+    LicenseStore* license_store, SoftwareDeploymentStore* sw_deploy_store,
+    CaRoutes::ExportCsrFn export_csr_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -14727,6 +15035,736 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── B5 (api-parity #2146) — offload targets ─────────────────────
+            // Mirrors offload_routes.cpp's /api/v1/offload-targets* surface:
+            // same Infrastructure:Read/Write gate per route, same
+            // OffloadWriteError classification, same audit verbs. The
+            // credential is write-only and never echoed back by any tool —
+            // only has_credential (bool) round-trips (ADR-0010).
+            if (tool_name == "list_offload_targets") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!offload_target_store || !offload_target_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                // AUTHORITATIVE read (ADR-0012 §1): nullopt means the read
+                // degraded, never "no targets configured" — matches the REST
+                // twin's own 503 posture (offload_routes.cpp).
+                auto targets = offload_target_store->list();
+                if (!targets) {
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& t : *targets) {
+                    arr.push_back({{"id", t.id},
+                                   {"name", t.name},
+                                   {"url", t.url},
+                                   {"auth_type", offload_auth_type_to_string(t.auth_type)},
+                                   {"has_credential", t.has_credential},
+                                   {"event_types", t.event_types},
+                                   {"batch_size", t.batch_size},
+                                   {"enabled", t.enabled},
+                                   {"created_at", t.created_at}});
+                }
+                nlohmann::json payload = {{"offload_targets", arr}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_offload_target") {
+                if (!tier_allows(tier, "Infrastructure", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Write"))
+                    return;
+                if (!offload_target_store || !offload_target_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::string name = param_str(args, "name");
+                const std::string url = param_str(args, "url");
+                const std::string auth_type_str = param_str(args, "auth_type", "none");
+                const std::string auth_credential = param_str(args, "auth_credential");
+                const std::string event_types = param_str(args, "event_types", "*");
+                const int batch_size = param_int32(args, "batch_size", 1);
+                bool enabled = true;
+                if (args.contains("enabled") && args["enabled"].is_boolean())
+                    enabled = args["enabled"].get<bool>();
+                if (name.empty() || url.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "name and url are required"),
+                                    "application/json");
+                    return;
+                }
+                auto auth_type = offload_auth_type_from_string(auth_type_str);
+                if (offload_auth_type_to_string(auth_type) != auth_type_str) {
+                    // Mirrors offload_routes.cpp's own round-trip check: the
+                    // lenient from-string parser folds any unrecognized
+                    // string to None, which would silently turn a typo into
+                    // an unauthenticated target instead of rejecting it.
+                    audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                             "invalid_auth_type");
+                    res.set_content(a4_error(kInvalidParams, "unrecognized auth_type"),
+                                    "application/json");
+                    return;
+                }
+                auto result = offload_target_store->create_target(
+                    name, url, auth_type, auth_credential, event_types, batch_size, enabled);
+                if (!result.has_value()) {
+                    // #3097 classification, same as offload_routes.cpp:
+                    // invalid_input is the caller's mistake (kInvalidParams);
+                    // store_unavailable/db_error are store/infra degradation
+                    // (kInternalError + retry_after_ms) — distinct in the
+                    // audit record even where the outcome collapses.
+                    if (result.error() == OffloadWriteError::invalid_input) {
+                        audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                                 "validation_failed");
+                        res.set_content(
+                            a4_error(kInvalidParams, "target rejected: invalid url, name, "
+                                                     "batch_size, or duplicate name"),
+                            "application/json");
+                    } else {
+                        const char* detail =
+                            result.error() == OffloadWriteError::store_unavailable
+                                ? "store_unavailable"
+                                : "db_error";
+                        audit_fn(req, "offload_target.create", "denied", "offload_target", name,
+                                 detail);
+                        res.set_content(a4_error(kInternalError, "offload target store unavailable",
+                                                 "retry once the server reports ready",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                    }
+                    return;
+                }
+                const int64_t new_target_id = *result;
+                const bool audit_ok = audit_fn(req, "offload_target.create", "success",
+                                               "offload_target", std::to_string(new_target_id), name);
+                nlohmann::json payload_j = {{"id", new_target_id}, {"status", "created"}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_offload_target") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!offload_target_store || !offload_target_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const int64_t target_id = param_int(args, "id", -1);
+                if (target_id < 1) {
+                    res.set_content(a4_error(kInvalidParams, "id must be a positive integer"),
+                                    "application/json");
+                    return;
+                }
+                bool store_ok = true;
+                auto t = offload_target_store->get(target_id, &store_ok);
+                if (!t) {
+                    // Distinguish genuine not-found from a degraded read
+                    // (#3097 classification), matching offload_routes.cpp.
+                    if (store_ok) {
+                        res.set_content(a4_error(kInvalidParams, "offload target not found"),
+                                        "application/json");
+                    } else {
+                        res.set_content(a4_error(kInternalError, "offload target store unavailable",
+                                                 "retry once the server reports ready",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                    }
+                    return;
+                }
+                nlohmann::json payload = {{"id", t->id},
+                                          {"name", t->name},
+                                          {"url", t->url},
+                                          {"auth_type", offload_auth_type_to_string(t->auth_type)},
+                                          {"has_credential", t->has_credential},
+                                          {"event_types", t->event_types},
+                                          {"batch_size", t->batch_size},
+                                          {"enabled", t->enabled},
+                                          {"created_at", t->created_at}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "delete_offload_target") {
+                if (!tier_allows(tier, "Infrastructure", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Write"))
+                    return;
+                if (!offload_target_store || !offload_target_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const int64_t target_id = param_int(args, "id", -1);
+                if (target_id < 1) {
+                    res.set_content(a4_error(kInvalidParams, "id must be a positive integer"),
+                                    "application/json");
+                    return;
+                }
+                // Snapshot name/url BEFORE delete so the audit row captures
+                // it — mirrors offload_routes.cpp exactly: after delete the
+                // row is gone, and a brief compromise-and-cleanup attacker
+                // would otherwise erase the only record of which URL fleet
+                // data was exfiltrated to.
+                auto target_snapshot = offload_target_store->get(target_id);
+                std::string snapshot_detail;
+                if (target_snapshot)
+                    snapshot_detail = "name=" + target_snapshot->name + " url=" + target_snapshot->url;
+                auto result = offload_target_store->delete_target(target_id);
+                const std::string target_id_str = std::to_string(target_id);
+                if (!result.has_value()) {
+                    const char* write_err_detail =
+                        result.error() == OffloadWriteError::store_unavailable ? "store_unavailable"
+                                                                               : "db_error";
+                    audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                             target_id_str, write_err_detail);
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable",
+                                             "retry once the server reports ready",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                if (!*result) {
+                    audit_fn(req, "offload_target.delete", "denied", "offload_target",
+                             target_id_str, "not_found");
+                    res.set_content(a4_error(kInvalidParams, "offload target not found"),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "offload_target.delete", "success",
+                                               "offload_target", target_id_str, snapshot_detail);
+                nlohmann::json payload_j = {{"deleted", true}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_offload_target_deliveries") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!offload_target_store || !offload_target_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "offload target store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const int64_t target_id = param_int(args, "id", -1);
+                if (target_id < 1) {
+                    res.set_content(a4_error(kInvalidParams, "id must be a positive integer"),
+                                    "application/json");
+                    return;
+                }
+                // Match get_offload_target's own semantics (HP-2): a missing
+                // target answers not-found, mirroring offload_routes.cpp's
+                // sibling GET .../deliveries route exactly.
+                bool store_ok = true;
+                if (!offload_target_store->get(target_id, &store_ok)) {
+                    if (store_ok) {
+                        res.set_content(a4_error(kInvalidParams, "offload target not found"),
+                                        "application/json");
+                    } else {
+                        res.set_content(a4_error(kInternalError, "offload target store unavailable",
+                                                 "retry once the server reports ready",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                    }
+                    return;
+                }
+                int limit = param_int32(args, "limit", 50);
+                limit = std::clamp(limit, 1, 1000);
+                auto deliveries = offload_target_store->get_deliveries(target_id, limit);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& d : deliveries) {
+                    arr.push_back({{"id", d.id},
+                                   {"target_id", d.target_id},
+                                   {"event_type", d.event_type},
+                                   {"event_count", d.event_count},
+                                   {"payload", d.payload},
+                                   {"status_code", d.status_code},
+                                   {"delivered_at", d.delivered_at},
+                                   {"error", d.error}});
+                }
+                nlohmann::json payload = {{"deliveries", arr}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── B5 — CA root-CSR export (ca_routes.cpp) ─────────────────────
+            // Distinct from the genuinely-public GET /api/v1/ca/root and
+            // /ca/crl (see ca_routes.hpp's file comment + this tool's own
+            // description for why those two stay REST-only). Read-only.
+            if (tool_name == "export_ca_root_csr") {
+                if (!tier_allows(tier, "Security", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Read"))
+                    return;
+                if (!ca_store || !ca_store->is_open() || !export_csr_fn) {
+                    res.set_content(a4_error(kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                auto csr = export_csr_fn();
+                if (!csr) {
+                    (void)audit_fn(req, "ca.root_csr.exported", "failure", "CaRoot", "root", "");
+                    // retry-hint-exempt: mirrors "no CA to export from" (a
+                    // permanent CA-key-state condition, same as ca_store ==
+                    // nullptr above), not a transient store fault — matches
+                    // the REST twin's own no-retry posture (ca_routes.cpp).
+                    res.set_content(a4_error(kInternalError, "could not generate CA CSR"),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "ca.root_csr.exported", "success", "CaRoot", "root", "");
+                nlohmann::json payload_j = {{"csr_pem", *csr}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── B5 — platform license (rest_api_v1.cpp) ─────────────────────
+            // LicenseStore is DELIBERATELY DORMANT on `dev` (ADR-0048) — see
+            // this file's forward-declaration comment (mcp_server.hpp); these
+            // three answer "unavailable" in production today, same posture
+            // as their REST siblings.
+            if (tool_name == "get_platform_license") {
+                if (!tier_allows(tier, "License", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "License", "Read"))
+                    return;
+                if (!license_store || !license_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "license store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto lic = license_store->get_active_license();
+                if (!lic) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 license_safe_message("get_platform_license", lic.error()),
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!lic->has_value()) {
+                    nlohmann::json payload = {{"status", "none"}};
+                    mcp_audit("success");
+                    res.set_content(
+                        success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                        "application/json");
+                    return;
+                }
+                auto days = license_store->days_remaining();
+                if (!days) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 license_safe_message("get_platform_license", days.error()),
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                nlohmann::json payload = {{"id", (*lic)->id},
+                                          {"organization", (*lic)->organization},
+                                          {"seat_count", (*lic)->seat_count},
+                                          {"seats_used", (*lic)->seats_used},
+                                          {"issued_at", (*lic)->issued_at},
+                                          {"expires_at", (*lic)->expires_at},
+                                          {"edition", (*lic)->edition},
+                                          {"status", (*lic)->status},
+                                          {"days_remaining", *days}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "activate_platform_license") {
+                if (!tier_allows(tier, "License", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "License", "Write"))
+                    return;
+                if (!license_store || !license_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "license store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                License lic;
+                lic.organization = param_str(args, "organization");
+                lic.seat_count = param_int(args, "seat_count", 0);
+                lic.edition = param_str(args, "edition", "community");
+                lic.expires_at = param_int(args, "expires_at", 0);
+                lic.features_json = param_str(args, "features_json", "[]");
+                const std::string key = param_str(args, "license_key");
+                // Mirrors REST exactly: no route-level pre-check beyond what
+                // LicenseStore::activate_license itself validates (empty
+                // organization/license_key are its own business errors,
+                // classified below like every other non-db_error result).
+                auto result = license_store->activate_license(lic, key);
+                if (!result) {
+                    // REST audits ONLY success for this route (no audit_fn
+                    // call on any failure branch, rest_api_v1.cpp) — mirrored
+                    // here for exact parity, not "improved" unasked.
+                    if (classify_license_error(result.error()) == LicenseErrorClass::kDbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     license_safe_message("activate_platform_license",
+                                                          result.error()),
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, result.error()),
+                                        "application/json");
+                    }
+                    return;
+                }
+                const std::string& new_license_id = *result;
+                const bool audit_ok = audit_fn(req, "license.activate", "success", "License",
+                                               new_license_id, lic.organization);
+                nlohmann::json payload_j = {{"id", new_license_id}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "list_license_alerts") {
+                if (!tier_allows(tier, "License", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "License", "Read"))
+                    return;
+                if (!license_store || !license_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "license store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                bool unack = false;
+                if (args.contains("unacknowledged_only") && args["unacknowledged_only"].is_boolean())
+                    unack = args["unacknowledged_only"].get<bool>();
+                auto alerts = license_store->list_alerts(unack);
+                if (!alerts) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 license_safe_message("list_license_alerts", alerts.error()),
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& a : *alerts) {
+                    arr.push_back({{"id", a.id},
+                                   {"license_id", a.license_id},
+                                   {"alert_type", a.alert_type},
+                                   {"message", a.message},
+                                   {"triggered_at", a.triggered_at},
+                                   {"acknowledged", a.acknowledged}});
+                }
+                nlohmann::json payload = {{"alerts", arr}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── B5 — software deployments (rest_api_v1.cpp) ─────────────────
+            // SoftwareDeploymentStore is DELIBERATELY DORMANT on `dev`
+            // (ADR-0051) — see this file's forward-declaration comment
+            // (mcp_server.hpp); these four answer "unavailable" in
+            // production today, same posture as their REST siblings. No
+            // start_software_deployment tool: the REST POST .../start route
+            // requires a fresh MFA step-up, which an MCP token (non-
+            // interactive) cannot satisfy — deliberately not twinned.
+            if (tool_name == "list_software_deployments") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Read"))
+                    return;
+                if (!sw_deploy_store || !sw_deploy_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "software deployment store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::string status = param_str(args, "status");
+                auto deps = sw_deploy_store->list_deployments(status);
+                if (!deps) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 sw_deploy_safe_message("list_software_deployments", deps.error()),
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& d : *deps) {
+                    arr.push_back({{"id", d.id},
+                                   {"package_id", d.package_id},
+                                   {"status", d.status},
+                                   {"created_by", d.created_by},
+                                   {"created_at", d.created_at},
+                                   {"started_at", d.started_at},
+                                   {"completed_at", d.completed_at},
+                                   {"agents_targeted", d.agents_targeted},
+                                   {"agents_success", d.agents_success},
+                                   {"agents_failure", d.agents_failure}});
+                }
+                nlohmann::json payload = {{"deployments", arr}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_software_deployment") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Execute")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                if (!sw_deploy_store || !sw_deploy_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "software deployment store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                SoftwareDeployment dep;
+                dep.package_id = param_str(args, "package_id");
+                dep.scope_expression = param_str(args, "scope_expression");
+                dep.created_by = session->username;
+                // Mirrors REST exactly: no route-level pre-check beyond what
+                // SoftwareDeploymentStore::create_deployment itself validates
+                // (empty package_id, or a package_id that does not exist —
+                // an FK violation — are its own business errors, classified
+                // below like every other non-db_error result). scope_expression
+                // is stored as-is and is NOT validated against the live fleet
+                // here, matching the REST route exactly — an expression
+                // matching zero devices is accepted and simply targets
+                // nothing once started.
+                auto result = sw_deploy_store->create_deployment(dep);
+                if (!result) {
+                    // REST audits ONLY success for this route (no audit_fn
+                    // call on any failure branch) — mirrored here for exact
+                    // parity, not "improved" unasked.
+                    if (sw_deploy_is_db_error(result.error())) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     sw_deploy_safe_message("create_software_deployment",
+                                                            result.error()),
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, result.error()),
+                                        "application/json");
+                    }
+                    return;
+                }
+                const std::string& new_deployment_id = *result;
+                const bool audit_ok =
+                    audit_fn(req, "software_deployment.create", "success", "SoftwareDeployment",
+                             new_deployment_id, dep.package_id);
+                nlohmann::json payload_j = {{"id", new_deployment_id}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "rollback_software_deployment") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Execute")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                if (!sw_deploy_store || !sw_deploy_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "software deployment store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::string dep_id = param_str(args, "id");
+                if (dep_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "id is required"), "application/json");
+                    return;
+                }
+                // Guarded single-UPDATE transition (software_deployment_store.hpp):
+                // only valid from deploying/verifying/completed — a staged
+                // (never-started) or already-terminal deployment is rejected
+                // with "only deploying, verifying, or completed deployments
+                // can be rolled back", never a silent no-op.
+                auto result = sw_deploy_store->rollback_deployment(dep_id);
+                if (!result) {
+                    // REST audits ONLY success for this route — mirrored here.
+                    if (sw_deploy_is_db_error(result.error())) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     sw_deploy_safe_message("rollback_software_deployment",
+                                                            result.error()),
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, result.error()),
+                                        "application/json");
+                    }
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "software_deployment.rollback", "success",
+                                               "SoftwareDeployment", dep_id, "");
+                nlohmann::json payload_j = {{"rolled_back", true}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "cancel_software_deployment") {
+                if (!tier_allows(tier, "SoftwareDeployment", "Execute")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "SoftwareDeployment", "Execute"))
+                    return;
+                if (!sw_deploy_store || !sw_deploy_store->is_open()) {
+                    res.set_content(a4_error(kInternalError, "software deployment store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const std::string dep_id = param_str(args, "id");
+                if (dep_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "id is required"), "application/json");
+                    return;
+                }
+                // Guarded single-UPDATE transition: only valid from
+                // staged/deploying — a completed/verifying or already-terminal
+                // deployment is rejected with "only staged or deploying
+                // deployments can be cancelled" (use rollback for those),
+                // never a silent no-op.
+                auto result = sw_deploy_store->cancel_deployment(dep_id);
+                if (!result) {
+                    // REST audits ONLY success for this route — mirrored here.
+                    if (sw_deploy_is_db_error(result.error())) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     sw_deploy_safe_message("cancel_software_deployment",
+                                                            result.error()),
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, result.error()),
+                                        "application/json");
+                    }
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "software_deployment.cancel", "success",
+                                               "SoftwareDeployment", dep_id, "");
+                nlohmann::json payload_j = {{"cancelled", true}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             if (tool_name == "revoke_upload_grant") {
                 if (!tier_allows(tier, "UploadGrant", "Delete")) {
                     res.set_content(
@@ -17109,7 +18147,11 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
                                 IssueCodeSigningFn issue_code_signing_fn,
-                                std::shared_ptr<const VerifyApi> verify_api) {
+                                std::shared_ptr<const VerifyApi> verify_api,
+                                OffloadTargetStore* offload_target_store,
+                                LicenseStore* license_store,
+                                SoftwareDeploymentStore* sw_deploy_store,
+                                CaRoutes::ExportCsrFn export_csr_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -17125,7 +18167,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
                     std::move(caller_fn), product_pack_store, workflow_engine,
-                    std::move(issue_code_signing_fn), std::move(verify_api));
+                    std::move(issue_code_signing_fn), std::move(verify_api), offload_target_store,
+                    license_store, sw_deploy_store, std::move(export_csr_fn));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -17162,7 +18205,11 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
                                 IssueCodeSigningFn issue_code_signing_fn,
-                                std::shared_ptr<const VerifyApi> verify_api) {
+                                std::shared_ptr<const VerifyApi> verify_api,
+                                OffloadTargetStore* offload_target_store,
+                                LicenseStore* license_store,
+                                SoftwareDeploymentStore* sw_deploy_store,
+                                CaRoutes::ExportCsrFn export_csr_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -17194,7 +18241,9 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             // held-open worker, whichever verb pinned it.
                             stream_budget, std::move(revalidate_fn),
                             std::move(principal_audit_fn), product_pack_store, workflow_engine,
-                            std::move(issue_code_signing_fn), std::move(verify_api)));
+                            std::move(issue_code_signing_fn), std::move(verify_api),
+                            offload_target_store, license_store, sw_deploy_store,
+                            std::move(export_csr_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
