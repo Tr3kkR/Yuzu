@@ -2740,10 +2740,21 @@ TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule res
     CHECK(dr.exit_code == 0);
     CHECK(f.engine->policy_generation() == 0);
 
-    // Release the parked backend call: NOW the arm resolves and the generation may
-    // advance to reflect it.
+    // Release the parked backend call: NOW the arm resolves. R5.3/R5.4 make
+    // acknowledgment TICK-DRIVEN (the heartbeat-bounded drain), not automatic on
+    // resolution - and an executor completion callback may never take mtx_ (the
+    // routed-concern chokepoint this file's own fixture exercises), so nothing
+    // advances the generation between release and the next
+    // journal_maintenance_tick(). Drive that tick explicitly rather than spin on
+    // wall-clock alone, or a genuine cutover bug (generation never advances at all)
+    // is indistinguishable from "just hasn't ticked yet" - the fixture's
+    // prefer_spark=true means the tick's own !prefer_spark_ early return doesn't
+    // apply here.
     f.mechanism->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return f.engine->policy_generation() == 1; }));
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->journal_maintenance_tick();
+        return f.engine->policy_generation() == 1;
+    }));
     CHECK(f.engine->spark_armed_rule_count() == 1);
 
     pusher.join();
