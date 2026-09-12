@@ -9,16 +9,28 @@
   exactly, verified by reading the full handler rather than inferring from the route path or securable
   name: `list_management_group_roles` and `assign_management_group_role` both run the REST route's
   compound gate (a fleet-wide permission OR the caller already holding `ITServiceOwner` on the group
-  in question, the fallback skipped for a service-scoped token); `assign_management_group_role`
+  in question, the fallback skipped for a service-scoped token) on top of `list_management_group_roles`'s
+  own leading `ManagementGroup:Read` gate (#2376 - the caller must be allowed to see the group AND
+  allowed to see role assignments); `assign_management_group_role`
   additionally restricts `role_name` to `Operator`/`Viewer` only, matching REST, with the underlying
   store's `RbacStore::validate_assignment` dangerous-role-block chokepoint as defense in depth;
   `check_permission` mirrors `POST /api/v1/rbac/check`'s deliberate zero-RBAC-gate posture (a self-check
   of the caller's own authority, open to any authenticated caller); `create_api_token` mirrors the
   REST route's multi-store (`RbacStore` + `ManagementGroupStore`) authority check for a service-scoped
   token; `list_api_tokens` and `create_api_token` are unconditionally self-scoped to the calling
-  principal, matching REST exactly (there is no admin all-owner-token view on this route — that
+  principal, matching REST exactly (there is no admin all-owner-token view on this route - that
   capability exists only as an HTMX dashboard fragment with no REST v1 route yet, so no MCP twin).
   `list_management_group_roles`/`list_api_tokens`/`check_permission`/`get_management_group` are
-  read-only; the other seven are approval-gated at the supervised MCP tier like every other
-  privileged mutation. `McpServer::LockoutClearFn` (mirroring `RestApiV1::LockoutClearFn`) is a new
+  read-only; the other seven, including `create_api_token`, are approval-gated at the supervised MCP
+  tier like every other privileged mutation (`ApiToken:Write` is now in `mcp_policy.hpp`'s
+  supervised-tier `requires_approval()` list - closing a gap, shared with the identically-gated REST
+  route, where a supervised-tier caller could self-mint a fresh, untiered, non-expiring credential
+  with neither MFA step-up nor human approval; `ApiToken:Rotate` stays deliberately ungated per its
+  own documented rationale, which does not transfer to minting a brand-new credential).
+  `McpServer::LockoutClearFn` (mirroring `RestApiV1::LockoutClearFn`) is a new
   trailing `build_handler`/`register_routes` parameter backing `unlock_account`.
+  Known limitation, tracked separately (#4309, not introduced by this batch): MCP
+  tier/approval enforcement is architecture-wide inert for interactive cookie
+  sessions (`mcp_tier` is only ever set on an actual MCP token), so the
+  approval-gating described above applies to MCP-token callers specifically, not
+  to every caller of the underlying REST route.

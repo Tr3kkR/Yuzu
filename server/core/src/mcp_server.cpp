@@ -700,12 +700,12 @@ static const ToolDef kTools[] = {
     {"list_management_group_roles",
      "List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer "
      "on this group) — authorization TOPOLOGY, not group metadata. Mirrors GET "
-     "/api/v1/management-groups/{id}/roles. Gate is NOT ManagementGroup:Read: this REST route is "
-     "authorized by the fleet-wide UserManagement:Read permission OR by the caller holding "
-     "ITServiceOwner on THIS group (a group-scoped admin can read the role grants of a group it "
-     "administers even without the fleet-wide permission) — the SAME compound gate is mirrored "
-     "here exactly, including that the ITServiceOwner fallback is skipped for a service-scoped "
-     "MCP token.",
+     "/api/v1/management-groups/{id}/roles exactly: requires ManagementGroup:Read as a LEADING "
+     "gate (the caller must be allowed to see the group at all), then EITHER the fleet-wide "
+     "UserManagement:Read permission OR the caller holding ITServiceOwner on THIS group (a "
+     "group-scoped admin can read the role grants of a group it administers even without the "
+     "fleet-wide permission) - the ITServiceOwner fallback is skipped for a service-scoped MCP "
+     "token, matching REST.",
      R"j({"type":"object","properties":{)j"
      R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"})j"
      R"j(},"required":["group_id"]})j",
@@ -1739,9 +1739,10 @@ static const ToolDef kTools[] = {
      "'Service: <scope_service>' management group (or the fleet-wide ManagementGroup:Write "
      "permission) — the SAME multi-store check (rbac_store + mgmt_store) the REST route runs; "
      "RBAC must be enabled for a scope_service token at all. The raw token is returned exactly "
-     "once — store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write. Additive: "
-     "mints a new credential, overwrites nothing (not idempotent — each call mints a distinct "
-     "token).",
+     "once - store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write (approval-gated "
+     "at the supervised MCP tier - maker-checker for self-service credential minting). "
+     "Additive: mints a new credential, overwrites nothing (not idempotent - each call mints a "
+     "distinct token).",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","maxLength":256,"description":"Human-readable label"},)j"
      R"j("expires_at":{"type":"integer","description":"Unix seconds; required if mcp_tier or scope_service is set (90-day cap for mcp_tier); 0/omitted = never expires"},)j"
@@ -8596,6 +8597,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #2376 (gov security-guardian finding, B4 fix round): the REST
+                // twin (GET /api/v1/management-groups/{id}/roles) requires
+                // ManagementGroup:Read as a LEADING gate, on top of the compound
+                // UserManagement:Read-OR-ITServiceOwner check below -- "the
+                // caller must be allowed to see the group AND allowed to see
+                // role assignments." This tool was missing that first gate,
+                // letting a caller with group-scoped ITServiceOwner but no
+                // ManagementGroup:Read/UserManagement:Read read the role graph
+                // via MCP where REST would 403 them.
+                if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                    return;
                 if (!mgmt_store) {
                     res.set_content(a4_error(kInternalError, "Management group store unavailable",
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
@@ -16959,9 +16971,19 @@ McpServer::HandlerFn McpServer::build_handler(
             // MCP-tier TTL cap, the length caps, and the multi-store
             // (rbac_store + mgmt_store) ITServiceOwner-of-service-group check for
             // a scope_service token. Does NOT mirror the REST route's MFA
-            // step-up gate — no MCP tool in this file calls step_up_fn; the
-            // approval-gate substitutes for it at the supervised MCP tier (same
-            // established asymmetry as rotate_api_token/unlock_account).
+            // step-up gate -- no MCP tool in this file calls step_up_fn. Unlike
+            // that gap, this one IS closed by a compensating control: ApiToken:Write
+            // is approval-gated at the supervised MCP tier (mcp_policy.hpp's
+            // requires_approval(), gov security-guardian finding, B4 fix round) --
+            // a supervised token cannot self-mint a fresh credential without a
+            // human four-eyes approval, closing the self-mint-then-persist risk
+            // step-up exists to prevent. This is a DIFFERENT posture from
+            // rotate_api_token/unlock_account below: rotate_api_token stays
+            // deliberately ungated for the three structural reasons documented at
+            // mcp_policy.hpp's ApiToken:Rotate comment (self-service,
+            // authority-inheriting, lifetime-neutral -- none of which hold for a
+            // freshly-minted token), and unlock_account IS approval-gated via the
+            // generic UserManagement:Write rule, same mechanism as here.
             if (tool_name == "create_api_token") {
                 if (!tier_allows(tier, "ApiToken", "Write")) {
                     res.set_content(

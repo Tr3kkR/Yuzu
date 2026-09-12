@@ -65,9 +65,11 @@ constexpr std::string_view kCompliance[] = {
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
     "get_policy_agent_statuses"}; // #4034
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
-// B4 (#2146 API-parity) adds the remaining management-group CRUD/membership/
-// role tools to this family (create/get/update/add_member/list_roles/
+// B4 (#2146 API-parity) adds Create/Read/Update/membership/role management-
+// group tools to this family (create/get/update/add_member/list_roles/
 // assign_role) — same domain, same securable, no reason for a separate family.
+// Delete-class management-group operations (delete group, remove member,
+// unassign role) have no MCP twin yet.
 constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
                                             "preview_management_group_agent_count",
                                             "create_management_group",

@@ -15375,6 +15375,50 @@ TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallbac
     CHECK(payload["roles"][0]["role_name"] == "ITServiceOwner");
 }
 
+// gov security-guardian finding (B4 fix round): REST's leading ManagementGroup:Read
+// gate (#2376 -- "the caller must be allowed to see the group AND allowed to see role
+// assignments") was missing from this MCP twin. This test pins that even a caller
+// admitted by the compound gate's ITServiceOwner-of-group arm is still denied
+// outright when it lacks ManagementGroup:Read, matching REST exactly.
+TEST_CASE("MCP list_management_group_roles: ManagementGroup:Read leading gate denies "
+          "even a caller admitted by ITServiceOwner-of-group (gov security-guardian)",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Owned But Unseeable Group";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    yuzu::server::GroupRoleAssignment owner_grant;
+    owner_grant.group_id = *created;
+    owner_grant.principal_type = "user";
+    owner_grant.principal_id = "test-user";
+    owner_grant.role_name = "ITServiceOwner";
+    REQUIRE(store.assign_role(owner_grant).has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    // Deny BOTH ManagementGroup:Read (the new leading gate) and UserManagement:Read
+    // (the compound gate's fleet-wide arm) -- only the ITServiceOwner-of-group
+    // fallback would admit this call if the leading gate didn't exist.
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !((securable == "ManagementGroup" && op == "Read") ||
+                 (securable == "UserManagement" && op == "Read"));
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,)"
+        R"("params":{"name":"list_management_group_roles","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
 TEST_CASE("MCP list_management_group_roles: neither UserManagement:Read nor "
           "ITServiceOwner-of-group admits — 403 (compound gate, both arms denied)",
           "[mcp][pg][management_group]") {
@@ -17851,12 +17895,12 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"preview_management_group_agent_count",
          nlohmann::json::parse(R"({"command_id":"cmd-1","plugin":"procfetch"})")},
         // B4 (#2146 API-parity): the four ManagementGroup:Write mutations, plus
-        // ApiToken:Delete and UserManagement:Write, are all supervised-tier
-        // gated (requires_approval()'s general Delete rule for revoke_api_token;
-        // its explicit ManagementGroup:Write and UserManagement:Write rules for
-        // the rest). create_api_token (ApiToken:Write, not gated — see
-        // mcp_policy.hpp's tier_allows() operator-tier comment) and every
-        // read-only B4 tool are deliberately absent from this map.
+        // ApiToken:Delete, ApiToken:Write, and UserManagement:Write, are all
+        // supervised-tier gated (requires_approval()'s general Delete rule for
+        // revoke_api_token; its explicit ManagementGroup:Write,
+        // UserManagement:Write, and -- gov security-guardian fix round --
+        // ApiToken:Write rules for the rest). Every read-only B4 tool is
+        // deliberately absent from this map.
         {"create_management_group", nlohmann::json::parse(R"({"name":"g"})")},
         {"update_management_group", nlohmann::json::parse(R"({"group_id":"abc123"})")},
         {"add_management_group_member",
@@ -17864,6 +17908,7 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"assign_management_group_role",
          nlohmann::json::parse(
              R"({"group_id":"abc123","principal_id":"alice","role_name":"Operator"})")},
+        {"create_api_token", nlohmann::json::parse(R"({"name":"ci-key"})")},
         {"revoke_api_token", nlohmann::json::parse(R"({"token_id":"abc123"})")},
         {"unlock_account", nlohmann::json::parse(R"({"username":"alice"})")},
     };
