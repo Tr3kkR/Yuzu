@@ -1,7 +1,8 @@
 #pragma once
 
 /**
- * guardian_arm_ack.hpp - rung 9c PR-2 Unit 5 (ack bookkeeping preparation).
+ * guardian_arm_ack.hpp - rung 9c PR-2 ack bookkeeping (Unit 5: built and
+ * tested standalone; Unit 6: wired into the live apply_rules()/heartbeat path).
  * See docs/spark-stage2-guardian-consumer-design.md §R5.3.
  *
  * GuardianArmAckLedger tracks ONE outstanding "application" - the set of rules
@@ -15,14 +16,13 @@
  * triggers a full re-apply once something has actually failed, expired, or
  * the push's content has changed underneath it").
  *
- * PREPARATION ONLY (Unit 5): built and independently tested here, not yet
- * wired into apply_rules()/reconcile_rule_locked() - GuardianSparkRuntime::
- * attach_rule() still uses its blocking overload in production, so
- * ReconcileOutcome::Accepted is never actually produced yet (see that enum's
- * own doc comment in guardian_engine.hpp). Unit 6 connects this to the live
- * path: apply_rules() begins/feeds an application, the heartbeat drains it,
- * and its generation-hold gate reads can_advance() instead of assuming
- * pending_arms == 0.
+ * Built and independently tested here in Unit 5; wired into the live path by
+ * Unit 6 - reconcile_rule_locked() now calls GuardianSparkRuntime::attach_rule
+ * (NonWaiting{}, ...), so ReconcileOutcome::Accepted is genuinely produced in
+ * production (see that enum's own doc comment in guardian_engine.hpp).
+ * apply_rules() begins/feeds an application, journal_maintenance_tick() drains
+ * it every heartbeat, and the generation-hold gate reads can_advance() instead
+ * of assuming pending_arms == 0.
  *
  * Deliberately conservative and pre-K-bound (rung 9c PR-2's own scope only):
  * a receipt that resolves to anything other than Committed holds its
