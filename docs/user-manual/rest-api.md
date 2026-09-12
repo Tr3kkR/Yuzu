@@ -8888,8 +8888,11 @@ expression resolves from the persistent tag store **only** — unlike a real
 dispatch, which also falls back to a connected agent's own live self-report —
 see [Tag source precedence](asset-tagging-guide.md).
 
-**Permission:** `Infrastructure:Read` (this route discloses agent identities,
-unlike the syntax-only validate route above).
+**Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
+chokepoint (ADR-0017) — this route discloses agent identities, unlike the
+syntax-only validate route above, so a management-group-confined caller's
+`matched_agents`/`matched_count` are narrowed to their own visible devices
+before the preview builder runs, never the whole fleet.
 
 **Request body:** `{"expression": "..."}`
 

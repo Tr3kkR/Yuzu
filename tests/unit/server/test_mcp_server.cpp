@@ -20815,3 +20815,37 @@ TEST_CASE("MCP result-sets: service-scoped token is denied outright on owner-sco
     CHECK(body["error"]["code"] == -32003);
     CHECK(body["error"]["message"].get<std::string>().find("service-scoped") != std::string::npos);
 }
+
+// ── #2146 Batch B2 review fix: preview_scope_targets confinement ──────────
+//
+// The pre-fix handler gated on a bare `perm_fn(req, res, "Infrastructure",
+// "Read")` and evaluated the expression against the UNFILTERED agents_fn()
+// snapshot — a fan-out read of per-agent data (matched_agents) that must use
+// the admit-then-filter fleet-read chokepoint instead (routed-concerns.md's
+// authorize_list_read row), never a bare global permission. Fixed to use
+// fleet_read_fn_ + gate.scope, same pattern as list_tar_process_tree_devices.
+TEST_CASE("MCP preview_scope_targets: a management-group-confined caller sees only their own "
+          "visible agents, never the whole fleet",
+          "[mcp][integration][scope]") {
+    McpTestServer ts;
+    // The fixture's default agents_fn stub returns agent-001 (linux) and
+    // agent-002 (windows), both x64 — an unconfined caller previewing
+    // `arch == "x64"` would match both. Confine the caller to agent-001 only.
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{
+                          std::unordered_set<std::string>{"agent-001"}}};
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":60,"params":{"name":"preview_scope_targets","arguments":{"expression":"arch == \"x64\""}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto sc = body["result"]["structuredContent"];
+    CHECK(sc["matched_count"] == 1);
+    REQUIRE(sc["matched_agents"].is_array());
+    REQUIRE(sc["matched_agents"].size() == 1);
+    CHECK(sc["matched_agents"][0] == "agent-001");
+}

@@ -713,12 +713,15 @@ static const ToolDef kTools[] = {
      R"j(]})j"},
 
     {"preview_scope_targets",
-     "Show which agents match a scope expression. NOTE: tag:<key> atoms resolve from the "
-     "persistent tag store ONLY (unlike an actual dispatch, which also falls back to a "
-     "connected agent's own live self-reported value when the store has no row for that "
-     "agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
+     "Show which agents match a scope expression. Confined by management group (ADR-0017): a "
+     "caller admitted through a management-group grant sees matched_agents/matched_count "
+     "narrowed to only their own visible devices, never the whole fleet. NOTE: tag:<key> atoms "
+     "resolve from the persistent tag store ONLY (unlike an actual dispatch, which also falls "
+     "back to a connected agent's own live self-reported value when the store has no row for "
+     "that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
      "own live report may be previewed as excluded here but still be targeted by the real "
-     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\".",
+     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". REST v1 twin: POST "
+     "/api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
@@ -8834,20 +8837,51 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                // #4143-class fix (found during #2146 Batch B2 review): this
+                // tool discloses per-agent identities (matched_agents), so it
+                // is a fan-out READ of per-agent data and MUST use the
+                // admit-then-filter fleet-read chokepoint — never a bare
+                // `perm_fn` (routed-concerns.md's authorize_list_read row).
+                // The old bare `perm_fn(req, res, "Infrastructure", "Read")`
+                // let a management-group-confined caller (or a global
+                // Infrastructure:Read holder narrower than the whole fleet)
+                // see every connected agent, not just their own visible set.
+                // `fleet_read_fn_` REPLACES the permission check (it already
+                // performs the RBAC check internally) rather than being
+                // paired with it — same pattern as list_tar_process_tree_devices.
+                if (!fleet_read_fn_) {
+                    spdlog::error("preview_scope_targets: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
                 auto expression = param_str(args, "expression");
                 if (expression.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "expression is required"),
                                     "application/json");
                     return;
                 }
+                // Narrow the candidate set to the caller's admitted scope
+                // BEFORE the preview builder runs — the unfiltered snapshot
+                // (get_agents()) is the SAME source list_agents' own agents_fn
+                // and GET /api/v1/devices use; gate.scope is the sole filter,
+                // mirroring GET /api/v1/devices' own in_scope-filter-then-render.
+                const auto& all_agents = get_agents();
+                nlohmann::json visible_agents = nlohmann::json::array();
+                for (const auto& a : all_agents) {
+                    if (authz::in_scope(gate.scope, a.value("agent_id", "")))
+                        visible_agents.push_back(a);
+                }
                 // #2146 Batch B2: delegates to the shared preview_scope_targets()
                 // builder (scope_preview.hpp) so this tool and its new REST v1
                 // twin (POST /api/v1/scope/preview) cannot silently diverge in
                 // which agents match (api-twin-recipe.md Rule 1).
                 auto outcome =
-                    yuzu::server::preview_scope_targets(expression, get_agents(), tag_store);
+                    yuzu::server::preview_scope_targets(expression, visible_agents, tag_store);
                 switch (outcome.kind) {
                 case yuzu::server::ScopePreviewOutcome::Kind::kInvalidExpression:
                     res.set_content(error_response(id, kInvalidParams, outcome.detail),

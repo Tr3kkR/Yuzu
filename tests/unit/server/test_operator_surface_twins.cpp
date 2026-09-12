@@ -499,6 +499,35 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_guardian_events", "GuaranteedState", "Read", true},
     {"get_guardian_rule_status", "GuaranteedState", "Read", true},
     {"get_guardian_device_guards", "GuaranteedState", "Read", true},
+    // #2146 Batch B2 — result-set MCP twins, pinned against rest_api_v1.cpp's
+    // 12-operation REST v1 result-set API (docs/scope-walking-design.md).
+    // The three async dispatch producers + reevaluate share
+    // execute_instruction's own Execution:Execute pair; the rest are owner-
+    // scoped, no RBAC gate in the handler (Infrastructure:Read/Write/Delete
+    // drive MCP tier classification only, matching validate_scope's own
+    // precedent of a registered pair with no backing perm_fn call).
+    //
+    // create_result_set_from_inventory_query is DELIBERATELY NOT listed here:
+    // its real RBAC gate is a genuine perm_fn(Inventory, Read) call (matching
+    // the REST twin exactly — see that tool's own permission-denied test),
+    // but its kToolSecurityRows/kWriteTools registration is Inventory:WRITE,
+    // because the tool genuinely creates a new result set (a write) and
+    // readOnlyHint/kWriteTools classification must stay truthful regardless
+    // of which permission happens to gate the read half of the work. This
+    // array's contract ("REST and MCP gate on the SAME securable/operation")
+    // does not hold for this one tool by design, so pinning it here would
+    // assert something false in one direction or fail in the other.
+    {"list_result_sets", "Infrastructure", "Read", true},
+    {"create_result_set", "Infrastructure", "Write", false},
+    {"create_result_set_from_tar_query", "Execution", "Execute", false},
+    {"create_result_set_from_instruction_result", "Execution", "Execute", false},
+    {"reevaluate_result_set", "Execution", "Execute", false},
+    {"get_result_set", "Infrastructure", "Read", true},
+    {"get_result_set_members", "Infrastructure", "Read", true},
+    {"get_result_set_lineage", "Infrastructure", "Read", true},
+    {"pin_result_set", "Infrastructure", "Write", false},
+    {"unpin_result_set", "Infrastructure", "Write", false},
+    {"delete_result_set", "Infrastructure", "Delete", false},
 };
 
 } // namespace

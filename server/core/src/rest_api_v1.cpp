@@ -1458,7 +1458,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Validate a scope expression's syntax", "tags": ["Scope"], "description": "Versioned twin of the legacy POST /api/scope/validate and MCP validate_scope — all three call the SAME yuzu::scope::validate(). Auth-only, no RBAC gate (a syntax-only check with no data disclosure).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{valid: true, expression} or {valid: false, error}"}, "400": {"description": "expression missing or empty"}}}
     },
     "/scope/preview": {
-      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). Requires Infrastructure:Read. tag:<key> atoms resolve from the persistent tag store only (see docs/asset-tagging-guide.md \"Tag source precedence\").", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "503": {"description": "Tag store degraded while resolving a tag:<key> atom the expression references (Retry-After: 5)"}}}
+      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). Gated on the admit-then-filter fleet-read chokepoint (Infrastructure:Read; ADR-0017) — a management-group-confined caller's matched_agents/matched_count are narrowed to their own visible devices, never the whole fleet. tag:<key> atoms resolve from the persistent tag store only (see docs/asset-tagging-guide.md \"Tag source precedence\").", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "503": {"description": "Tag store degraded while resolving a tag:<key> atom the expression references (Retry-After: 5)"}}}
     },
     "/software-packages": {
       "get": {"summary": "List registered software packages", "tags": ["Software Deployment"], "description": "Only available when SoftwareDeploymentStore is wired — the server does not construct it today (capability 7.6 deliberately shelved, ADR-0051); documented for when a future change re-wires it. Requires SoftwareDeployment:Read.", "responses": {"200": {"description": "{data: [{id, name, version, platform, installer_type, content_hash, size_bytes, created_at, created_by}]}"}, "503": {"description": "A genuine database read failure"}}},
@@ -9767,17 +9767,28 @@ void RestApiV1::register_routes(
     // POST /api/v1/scope/preview — versioned twin of MCP preview_scope_targets.
     // No legacy unversioned twin exists — verified: `/api/scope/estimate`
     // (workflow_routes.cpp) is a DIFFERENT capability (matched/total counts
-    // only, for the workflow builder's confined scope_fn; this route returns
-    // the actual matched_agents list, unconfined, matching the MCP tool
-    // exactly). Requires Infrastructure:Read, matching the MCP twin's real
-    // perm_fn gate.
-    sink.Post("/api/v1/scope/preview", [auth_fn, perm_fn, tag_store, agents_fn](
+    // only, for the workflow builder's confined scope_fn).
+    //
+    // #4143-class fix (found during #2146 Batch B2 review): this route
+    // discloses per-agent identities (matched_agents), so it is a fan-out
+    // READ of per-agent data and MUST use the admit-then-filter fleet-read
+    // chokepoint — never a bare `perm_fn` (routed-concerns.md's
+    // authorize_list_read row / AuthRoutes::require_fleet_read doc comment).
+    // `fleet_read_fn` REPLACES the permission check (it already performs the
+    // RBAC check internally) rather than being paired with it — same pattern
+    // as GET /api/v1/devices above.
+    sink.Post("/api/v1/scope/preview", [fleet_read_fn, tag_store, agents_fn](
                                             const httplib::Request& req, httplib::Response& res) {
-        if (!perm_fn(req, res, "Infrastructure", "Read"))
+        if (!fleet_read_fn) {
+            spdlog::error("scope.preview: fleet_read_fn unwired — misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
-        auto session = auth_fn(req, res);
-        if (!session)
-            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the A4 error body + status
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         std::string expression = (!body.is_discarded() && body.is_object())
                                      ? body.value("expression", std::string())
@@ -9787,8 +9798,15 @@ void RestApiV1::register_routes(
             res.set_content(detail::a4_error(res, "expression is required"), "application/json");
             return;
         }
-        const auto agents = agents_fn ? agents_fn() : nlohmann::json::array();
-        auto outcome = preview_scope_targets(expression, agents, tag_store);
+        // Narrow to the caller's admitted scope BEFORE the preview builder
+        // runs — mirrors GET /api/v1/devices' own in_scope-filter-then-render.
+        nlohmann::json visible_agents = nlohmann::json::array();
+        if (agents_fn) {
+            for (const auto& a : agents_fn())
+                if (authz::in_scope(gate.scope, a.value("agent_id", "")))
+                    visible_agents.push_back(a);
+        }
+        auto outcome = preview_scope_targets(expression, visible_agents, tag_store);
         switch (outcome.kind) {
         case ScopePreviewOutcome::Kind::kInvalidExpression:
             res.status = 400;
