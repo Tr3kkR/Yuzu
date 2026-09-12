@@ -9,7 +9,7 @@
   drift from each other. `ApprovalManager::query()`/`pending_count()`
   previously collapsed a degraded store (not open, pool exhausted, or a
   failed query) into the same empty list / zero count a genuinely empty
-  approval queue returns — a silent false-negative on exactly the signal a
+  approval queue returns - a silent false-negative on exactly the signal a
   maker-checker workflow depends on. New checked twins `query_checked()`/
   `pending_count_checked()` distinguish the two, so both the REST and MCP
   surfaces now answer a genuine store failure with 503/a retryable error
