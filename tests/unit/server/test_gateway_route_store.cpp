@@ -1119,13 +1119,21 @@ TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a DIFFERENT
     CHECK(*declined_after2 == mix_anchor + ":backward"); // re-armed with the CURRENT direction
 }
 
-// A 4-pass strict direction alternation (forward, backward, forward,
-// backward — each fabricated at a fresh anchor, per the "same anchor cannot
-// naturally flip direction" constraint documented above) must never
-// accidentally recover: every pass declines and the live row survives
-// throughout.
-TEST_CASE("GatewayRouteStore[pg]: a 4-pass strict direction alternation never recovers — every "
-          "pass declines, the live row survives (PR #4299 round-2 external review)",
+// A 4-pass strict direction alternation must never accidentally recover:
+// every pass declines and the live row survives throughout. PR #4299 round-3
+// review caught the PRIOR revision as a FALSE GREEN — it only set the anchor
+// per pass (each a fresh, distinct value), so an anchor-value mismatch alone
+// always forced the decline and the DIRECTION check was never exercised:
+// reverting the direction comparison to anchor-only keying left this test
+// green. The fix, per the reviewer: on EVERY leg also seed the declined
+// marker AT THE SAME ANCHOR this pass reads, but with the OPPOSITE direction
+// to the one this pass will classify. Now the anchor MATCHES the marker on
+// every leg, so only the direction comparison can force the decline — revert
+// the direction check to anchor-only and each leg RECOVERS instead, flipping
+// `recovered` to true and failing the `CHECK_FALSE(out->recovered)` below.
+TEST_CASE("GatewayRouteStore[pg]: a 4-pass direction alternation never recovers — the marker's "
+          "anchor MATCHES each pass (only the direction check can decline), the live row survives "
+          "(PR #4299 round-2 external review; round-3 de-false-greened)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
     auto baseline = fx.store().reap_stale_routes();
@@ -1139,25 +1147,37 @@ TEST_CASE("GatewayRouteStore[pg]: a 4-pass strict direction alternation never re
                 .matched);
 
     const std::int64_t now0 = fx.raw_db_now_ms();
-    // Four passes, alternating forward/backward, each at a value distinct
-    // from every prior pass's anchor (so an anchor-value mismatch alone
-    // would already force a decline) AND presenting the opposite direction
-    // to whatever the immediately-preceding pass's marker recorded (so the
-    // direction check is also exercised, not just anchor equality).
-    const std::string anchors[4] = {
-        std::to_string(now0 - 2LL * 24 * 3600 * 1000),      // forward
-        std::to_string(now0 + 1LL * 3600 * 1000),           // backward
-        std::to_string(now0 - 3LL * 24 * 3600 * 1000),      // forward
-        std::to_string(now0 + 2LL * 3600 * 1000),           // backward
+    // Each leg: {anchor value, the direction THIS pass will classify for that
+    // anchor}. A value far behind now classifies forward; a value ahead of now
+    // classifies backward.
+    struct Leg {
+        std::string anchor;
+        std::string this_pass_direction;
     };
-    for (const auto& anchor : anchors) {
-        fx.raw_set_reap_anchor(anchor);
+    const Leg legs[4] = {
+        {std::to_string(now0 - 2LL * 24 * 3600 * 1000), "forward"},
+        {std::to_string(now0 + 1LL * 3600 * 1000), "backward"},
+        {std::to_string(now0 - 3LL * 24 * 3600 * 1000), "forward"},
+        {std::to_string(now0 + 2LL * 3600 * 1000), "backward"},
+    };
+    for (const auto& leg : legs) {
+        fx.raw_set_reap_anchor(leg.anchor);
+        // Seed the marker at the SAME anchor but the OPPOSITE direction, so the
+        // anchor equality holds and ONLY the direction mismatch can force the
+        // decline. (Anchor-only keying would recover here.)
+        const std::string opposite = leg.this_pass_direction == "forward" ? "backward" : "forward";
+        fx.raw_set_reap_declined_anchor(leg.anchor + ":" + opposite);
+
         auto out = fx.store().reap_stale_routes();
         REQUIRE(out.has_value());
         CHECK(out->clock_anomaly);
-        CHECK_FALSE(out->recovered);
+        CHECK_FALSE(out->recovered); // DISCRIMINATING: true under anchor-only keying
         CHECK(out->expired_leases_reaped == 0);
         CHECK(out->tombstones_reaped == 0);
+        // Re-armed with THIS pass's direction, at this anchor.
+        auto marker = fx.raw_get_reap_declined_anchor();
+        REQUIRE(marker.has_value());
+        CHECK(*marker == leg.anchor + ":" + leg.this_pass_direction);
     }
 
     auto live = fx.store().lookup_route("agent-alt-live");

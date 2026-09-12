@@ -252,6 +252,25 @@ per-predicate cap):
    vs. self-heal-and-re-anchor), and only the skew path is the "no permanent wedge either way"
    claim above.
 
+   **Marker-obligation rule (PR #4299 round-3 — decide/apply split).** The recovery mechanisms above
+   hinge on a single invariant that had THREE rounds of the same defect (one terminal/decline path
+   forgetting its marker decision): **every lock-holding pass that COMMITS writes
+   `reap_declined_anchor_ms` exactly once — ARM or CLEAR; LEAVE exists only for passes that never read
+   `now()` (the advisory-lock skip) or that roll back.** Any DISTINCT anomaly — a skew/direction
+   mismatch, a bad `now()` reading, OR a corrupt persisted anchor — CLEARs or re-ARMs the marker,
+   never LEAVES a stale recovery identity a later same-direction skew could free-ride on. The
+   bad-`now()` path specifically now CLEARs (the round-3 fix — it used to LEAVE the marker, so a
+   distinct bad-now anomaly followed by a matching-direction skew at the same anchor could recover on
+   what was really its first skew pass). The class is closed STRUCTURALLY, not by a fourth hand-patch:
+   the decision is computed by the pure `decide_reap` in `server/core/src/gateway_route_reap_rules.hpp`,
+   whose `ReapDecision::marker` is a `MarkerAction` with no default constructor — a reap branch that
+   omits the marker decision is a COMPILE error (the `ExecuteGate` discipline). The store's
+   `reap_stale_routes()` does I/O only: the lock, three reads, and ONE apply tail (the sole `return
+   true` after the lock). `decide_reap`'s five-decision set is unit-tested with no Postgres in
+   `tests/unit/server/test_gateway_route_reap_rules.cpp`; the `[pg]` tests in
+   `test_gateway_route_store.cpp` remain the integration layer asserting the apply tail wires onto the
+   right SQL.
+
 Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
 regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a
 batch of already-stale routes on the first pass is an acceptable worst case, never non-reproducible

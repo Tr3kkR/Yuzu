@@ -148,7 +148,20 @@ struct DeregisterResult {
 /// now_ms (never drained) so the next pass proceeds normally rather than
 /// wedging forever (PR #4299 round-3 review; see
 /// gateway_route_store.cpp's persisted-anchor guard and
-/// docs/clock-guarded-retention.md). `recovered` is true iff this
+/// docs/clock-guarded-retention.md).
+///
+/// MARKER OBLIGATION (PR #4299 round-3, the defect class the decide/apply
+/// split in gateway_route_reap_rules.hpp closes): every lock-holding pass that
+/// COMMITS writes `reap_declined_anchor_ms` exactly once — ARM or CLEAR.
+/// LEAVE exists ONLY for passes that never read `now()` (the advisory-lock
+/// skip) or that roll back. Any DISTINCT anomaly — a skew/direction mismatch,
+/// a bad `now()` reading, OR a corrupt persisted anchor — CLEARs or re-ARMs
+/// the marker; none of them LEAVES a stale recovery identity a later
+/// same-direction skew could free-ride on. The bad-`now()` path in particular
+/// CLEARs (it used to LEAVE — that was the round-3 defect). Because
+/// `ReapDecision::marker` has no default-constructible `MarkerAction`, a
+/// future reap branch that forgets this decision is a COMPILE error, not a
+/// silent fourth round of the same bug. `recovered` is true iff this
 /// pass was NOT declined but DID run via the decline-once/drain-on-repeat
 /// recovery branch (an anomaly persisted across a full decline pass — see
 /// the reap_stale_routes() header below and docs/clock-guarded-retention.md)
