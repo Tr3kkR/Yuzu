@@ -17668,6 +17668,17 @@ private:
             // cannot observe a different admit decision for the same caller
             // (same conversion, same underlying require_list_read call).
             mcp_server_->set_list_read_fn(list_read_fn);
+            // #2146 Batch B1 — the SAME guardian_push_fn_ closure wired into the
+            // REST registration's trailing guardian_push_fn param above (assigned
+            // during that same call, just above), so REST POST
+            // /guaranteed-state/push and MCP push_guardian_rules fan out through
+            // the IDENTICAL scope-to-agents dispatch — they cannot drift on what
+            // gets pushed or to whom.
+            mcp_server_->set_guardian_push_fn(guardian_push_fn_);
+            // #2146 Batch B1 — the SAME BaselineStore GET
+            // /guaranteed-state/device-compliance already reads, backing MCP
+            // get_guardian_device_compliance's identical baseline lookup.
+            mcp_server_->set_baseline_store(baseline_store_.get());
             // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
             // for these three tools is the fleet_read_fn_ already wired above
             // (the SAME instance query_installed_software uses).

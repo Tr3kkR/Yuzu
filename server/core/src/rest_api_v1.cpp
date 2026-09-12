@@ -13383,8 +13383,9 @@ void RestApiV1::register_routes(
     // a real MCP twin, get_guardian_status (mcp_server.cpp), which calls the SAME
     // guardian_status_rollup() model function via the SAME McpServer::list_read_fn_
     // (require_list_read) gate wired from the identical server.cpp lambda — see
-    // guardian_model.hpp. The per-agent /status/{agent_id} route just below remains
-    // untwinned (out of #4037's scope; not named by its acceptance criteria).
+    // guardian_model.hpp. The per-agent /status/{agent_id} route just below was
+    // out of #4037's scope (not named by its acceptance criteria); it is now
+    // twinned too, via get_guardian_agent_status (#2146 Batch B1), same pattern.
     sink.Get(
         "/api/v1/guaranteed-state/status",
         [list_read_fn, guaranteed_state_store](const httplib::Request& req,
@@ -13514,23 +13515,35 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+            // #2146 Batch B1: guardian_agent_status_rollup (guardian_model.hpp) is the
+            // SAME function the MCP get_guardian_agent_status twin calls — REST and MCP
+            // cannot drift on total_rules/errored_rules derivation by construction (same
+            // extraction precedent as guardian_status_rollup's #4037 header comment).
+            // Folds the former two-store-call sequence (agent_rule_statuses_for_agent +
+            // rule_names_for) into one; a degrade in EITHER underlying read now surfaces
+            // as a single `nullopt`.
+            auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
             // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647 kernel,
             // same HELPER as GET /guaranteed-state/device-compliance, but NOT identical
             // fault-handling: device-compliance has a separate PRE-audit baseline_store_ok
             // check that, on fault, emits no audit row at all ("no PII was looked up yet").
-            // This route has a single store call that IS the access attempt, so a degrade
-            // here is audited as result="failure" rather than left unaudited — over-audit
-            // rather than under-audit, consistent with the codebase-wide posture, but a
-            // SOC2/SIEM consumer correlating guardian.device.view rows across both routes
-            // should not assume identical fault-audit behavior from the "same shape" framing
-            // above. `result` otherwise records success/failure (this route has no "not
-            // found" branch of its own — an unrecognised agent_id simply has zero census
-            // rows, which is a legitimate empty result, not an error).
+            // This route's data comes from a single shared-builder call that IS the access
+            // attempt, so a degrade here is audited as result="failure" rather than left
+            // unaudited — over-audit rather than under-audit, consistent with the
+            // codebase-wide posture, but a SOC2/SIEM consumer correlating
+            // guardian.device.view rows across both routes should not assume identical
+            // fault-audit behavior from the "same shape" framing above. `result` otherwise
+            // records success/failure (this route has no "not found" branch of its own —
+            // an unrecognised agent_id simply has zero census rows, which is a legitimate
+            // empty result, not an error). #2146 Batch B1 note: pre-extraction, a degrade
+            // confined to the SECOND of the two store reads (rule_names_for) audited
+            // "success" here (only the first read's truthiness gated the audit) despite
+            // the request ultimately 503ing below — auditing on the single rollup's
+            // truthiness closes that gap; any degrade in either underlying read now
+            // audits "failure", never a "success" for a read that did not actually render.
             if (!detail::emit_behavioral_audit(
-                    audit_fn, req, res, "guardian.device.view",
-                    statuses_result ? "success" : "failure", "Agent", agent_id,
-                    "per-agent Guaranteed State status via REST")) {
+                    audit_fn, req, res, "guardian.device.view", rollup ? "success" : "failure",
+                    "Agent", agent_id, "per-agent Guaranteed State status via REST")) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
@@ -13542,7 +13555,7 @@ void RestApiV1::register_routes(
                              cid, agent_id);
                 return;
             }
-            if (!statuses_result) {
+            if (!rollup) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "guaranteed-state store degraded", cid,
@@ -13552,41 +13565,14 @@ void RestApiV1::register_routes(
                              "agent_id={}",
                              cid, agent_id);
                 return;
-            }
-            // Intersect against the live rule catalogue, bounded to just this agent's
-            // reported rule_ids (same shape as device-compliance's rule_names_for call).
-            std::vector<std::string> rule_ids;
-            rule_ids.reserve(statuses_result->size());
-            for (const auto& st : *statuses_result)
-                rule_ids.push_back(st.rule_id);
-            auto rule_names_result = guaranteed_state_store->rule_names_for(rule_ids);
-            if (!rule_names_result) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
-                                          {.retry_after_ms = 5000}),
-                    "application/json");
-                spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
-                             "agent_id={}",
-                             cid, agent_id);
-                return;
-            }
-            const auto& rule_names = *rule_names_result;
-            int64_t total_rules = 0, errored = 0;
-            for (const auto& st : *statuses_result) {
-                if (!rule_names.count(st.rule_id))
-                    continue; // orphan census row for a since-deleted rule
-                ++total_rules;
-                if (st.state == "errored")
-                    ++errored;
             }
             res.set_content(
                 ok_json(JObj()
                             .add("agent_id", agent_id)
-                            .add("total_rules", total_rules)
-                            .add("compliant_rules", 0)
-                            .add("drifted_rules", 0)
-                            .add("errored_rules", errored)
+                            .add("total_rules", rollup->total_rules)
+                            .add("compliant_rules", rollup->compliant_rules)
+                            .add("drifted_rules", rollup->drifted_rules)
+                            .add("errored_rules", rollup->errored_rules)
                             .add("note", "total_rules and errored_rules are both real (M1 "
                                         "census-derived, #2298 item 6d) and both intersected "
                                         "against the live rule catalogue; "

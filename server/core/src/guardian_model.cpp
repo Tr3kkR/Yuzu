@@ -22,6 +22,34 @@ guardian_status_rollup(GuaranteedStateStore& store,
     return out;
 }
 
+std::optional<GuardianAgentStatusRollup>
+guardian_agent_status_rollup(GuaranteedStateStore& store, const std::string& agent_id) {
+    // Mirrors the pre-existing inline logic in rest_api_v1.cpp's
+    // GET /guaranteed-state/status/{agent_id} handler verbatim (#2146 Batch B1
+    // extraction, same precedent as guardian_status_rollup's own #4037 header
+    // comment) — REST and MCP cannot drift on this derivation by construction.
+    auto statuses_result = store.agent_rule_statuses_for_agent(agent_id);
+    if (!statuses_result)
+        return std::nullopt;
+    std::vector<std::string> rule_ids;
+    rule_ids.reserve(statuses_result->size());
+    for (const auto& st : *statuses_result)
+        rule_ids.push_back(st.rule_id);
+    auto rule_names_result = store.rule_names_for(rule_ids);
+    if (!rule_names_result)
+        return std::nullopt;
+    const auto& rule_names = *rule_names_result;
+    GuardianAgentStatusRollup out;
+    for (const auto& st : *statuses_result) {
+        if (!rule_names.count(st.rule_id))
+            continue; // orphan census row for a since-deleted rule
+        ++out.total_rules;
+        if (st.state == "errored")
+            ++out.errored_rules;
+    }
+    return out;
+}
+
 std::optional<std::vector<GuardianRuleAgentStatusRow>>
 guardian_rule_agent_status_rows(GuaranteedStateStore& store, const std::string& rule_id) {
     auto statuses = store.agent_rule_statuses(rule_id);

@@ -59,6 +59,30 @@ std::optional<GuardianStatusRollup>
 guardian_status_rollup(GuaranteedStateStore& store,
                        const std::optional<std::vector<std::string>>& agent_scope);
 
+/// Per-agent Guaranteed State status rollup — shared by
+/// `GET /api/v1/guaranteed-state/status/{agent_id}` and MCP
+/// `get_guardian_agent_status` (#2146 Batch B1). A DIFFERENT algorithm from
+/// `guardian_status_rollup` above, not a scoped call to it: `total_rules`
+/// here is "rules with ANY census entry for THIS agent, intersected against
+/// the live rule catalogue" (derived from `agent_rule_statuses_for_agent` +
+/// `rule_names_for`), never the global catalogue size the fleet rollup uses.
+/// `compliant_rules`/`drifted_rules` stay 0 for the same reason as the fleet
+/// rollup — full status ingest lands in a later rung.
+struct GuardianAgentStatusRollup {
+    std::int64_t total_rules{0};
+    std::int64_t compliant_rules{0};
+    std::int64_t drifted_rules{0};
+    std::int64_t errored_rules{0};
+};
+
+/// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
+/// `rule_names_for()` read (ADR-0038 catastrophic-read set) — caller MUST
+/// refuse to render (503 on REST), never render a silent 0 that would
+/// misreport this device as compliant. An agent_id with no census rows is a
+/// legitimate empty result (all-zero rollup), not an error.
+std::optional<GuardianAgentStatusRollup>
+guardian_agent_status_rollup(GuaranteedStateStore& store, const std::string& agent_id);
+
 /// Per-guard fleet-wide agent-status drilldown row — one row per agent that
 /// has reported THIS rule's state — shared by the new
 /// `GET /api/v1/guaranteed-state/rules/{rule_id}/status` and MCP

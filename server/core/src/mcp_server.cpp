@@ -29,7 +29,10 @@
 #include "engine_principal_store.hpp"   // EnginePrincipalStore (fwd-declared only in mcp_server.hpp)
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
+#include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
+#include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
@@ -799,6 +802,134 @@ static const ToolDef kTools[] = {
      "gate the device-compliance / per-agent status routes already use.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"state":{"type":"string"},"updated_at":{"type":"string"}},"required":["rule_id","name","state","updated_at"]}},"total_guards":{"type":"integer"}},"required":["agent_id","guards","total_guards"]})j"},
+
+    // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
+    // Closes the remaining MCP gap on the Guaranteed State surface: the 6
+    // #4037 tools above are read-only; these 7 twin the mutating rule
+    // lifecycle (create/get/update/delete), the push fan-out, and the two
+    // per-agent reads #4037 deliberately deferred (per-agent status,
+    // baseline-scoped device-compliance). Fleet-wide rule CRUD/push mirror
+    // list_guardian_rules' deny_fleet_wide_service_scoped posture exactly (a
+    // Guard has no single owning device/service); the two per-agent reads use
+    // the SAME scoped_perm_fn gate get_guardian_device_guards already uses.
+    {"create_guardian_rule",
+     "Author a new Guaranteed State Guard (rule). Mirrors POST "
+     "/api/v1/guaranteed-state/rules exactly — same derive_rule_spec validation, same "
+     "create_rule store write. A structured Guard needs both 'spark' and 'assertion' blocks "
+     "(each with a 'type'); 'remediation' defaults to alert-only when omitted. Omit all three "
+     "structured blocks and supply 'yaml_source' instead for a legacy, non-agent-enforceable "
+     "Guard. Use get_guardian_schemas to discover the spark/assertion/remediation type "
+     "catalogue before authoring. Fleet-wide (a Guard has no single owning device/service); "
+     "requires GuaranteedState:Write, denied outright to a service-scoped API token.",
+     R"j({"type":"object","properties":{)j"
+     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"description":"Unique Guard identifier"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
+     R"j("version":{"type":"integer","minimum":1,"default":1},)j"
+     R"j("enabled":{"type":"boolean","default":true},)j"
+     R"j("enforcement_mode":{"type":"string","enum":["enforce","audit"],"default":"enforce"},)j"
+     R"j("severity":{"type":"string","enum":["critical","high","medium","low"],"default":"medium"},)j"
+     R"j("os_target":{"type":"string","enum":["windows","linux","macos",""],"default":"","description":"Empty = all OSes"},)j"
+     R"j("scope_expr":{"type":"string","maxLength":2048,"description":"Scope DSL expression narrowing which agents this Guard applies to"},)j"
+     R"j("spark":{"type":"object","description":"Detector block {type, params}; see get_guardian_schemas"},)j"
+     R"j("assertion":{"type":"object","description":"Assertion block {type, params}; required alongside spark for a structured Guard; see get_guardian_schemas"},)j"
+     R"j("remediation":{"type":"object","description":"Remediation block {type, params}; defaults to alert-only"},)j"
+     R"j("yaml_source":{"type":"string","maxLength":65536,"description":"Legacy unstructured Guard body; used only when spark/assertion are both omitted"})j"
+     R"j(},"required":["rule_id","name"]})j",
+     R"j({"type":"object","properties":{"created":{"const":true},"rule_id":{"type":"string"}},"required":["created","rule_id"]})j"},
+
+    {"get_guardian_rule",
+     "Get one Guaranteed State Guard by rule_id — full rule body (yaml_source/spec_json) plus "
+     "metadata. Mirrors GET /api/v1/guaranteed-state/rules/{rule_id} exactly, same store read. "
+     "Fleet-wide (a Guard has no single owning device/service); a service-scoped API token is "
+     "refused outright.",
+     R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
+     R"j({"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"yaml_source":{"type":"string"},"spec_json":{"type":"string"},"version":{"type":"integer"},"enabled":{"type":"boolean"},"enforcement_mode":{"type":"string"},"severity":{"type":"string"},"os_target":{"type":"string"},"scope_expr":{"type":"string"},"created_at":{"type":"string"},"updated_at":{"type":"string"},"created_by":{"type":"string"},"updated_by":{"type":"string"}},"required":["rule_id","name","version","enabled","enforcement_mode"]})j"},
+
+    {"update_guardian_rule",
+     "Update an existing Guaranteed State Guard. Mirrors PUT "
+     "/api/v1/guaranteed-state/rules/{rule_id} exactly, same derive_rule_spec re-validation "
+     "and update_rule store write. enforcement_mode is IMMUTABLE after creation — supplying a "
+     "different value than the Guard's current mode is rejected; create a new Guard for a "
+     "different Watch/Enforce posture instead. Omitting all of spark/assertion/remediation "
+     "keeps the existing structured spec and applies only the supplied metadata fields "
+     "(name/enabled/severity/os_target/scope_expr/yaml_source). version is bumped by the "
+     "store on every successful update — not caller-supplied. Fleet-wide; requires "
+     "GuaranteedState:Write, denied outright to a service-scoped API token.",
+     R"j({"type":"object","properties":{)j"
+     R"j("rule_id":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("enabled":{"type":"boolean"},)j"
+     R"j("enforcement_mode":{"type":"string","enum":["enforce","audit"],"description":"Must equal the Guard's current mode; a different value is rejected (see description above)"},)j"
+     R"j("severity":{"type":"string","enum":["critical","high","medium","low"]},)j"
+     R"j("os_target":{"type":"string","enum":["windows","linux","macos",""]},)j"
+     R"j("scope_expr":{"type":"string","maxLength":2048},)j"
+     R"j("spark":{"type":"object","description":"Detector block {type, params}; see get_guardian_schemas"},)j"
+     R"j("assertion":{"type":"object","description":"Assertion block {type, params}; required alongside spark to re-author the structured spec"},)j"
+     R"j("remediation":{"type":"object","description":"Remediation block {type, params}"},)j"
+     R"j("yaml_source":{"type":"string","maxLength":65536})j"
+     R"j(},"required":["rule_id"]})j",
+     R"j({"type":"object","properties":{"updated":{"const":true},"rule_id":{"type":"string"},"version":{"type":"integer"}},"required":["updated","rule_id","version"]})j"},
+
+    {"delete_guardian_rule",
+     "Delete a Guaranteed State Guard by rule_id. Mirrors DELETE "
+     "/api/v1/guaranteed-state/rules/{rule_id} exactly, same delete_rule store write. "
+     "Destructive (GuaranteedState:Delete): approval-gated at the supervised MCP tier — the "
+     "first call returns an approval ticket (kApprovalRequired), re-call with the returned "
+     "approval_id to consume it. Fleet-wide; denied outright to a service-scoped API token.",
+     R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
+     R"j({"type":"object","properties":{"deleted":{"const":true},"rule_id":{"type":"string"}},"required":["deleted","rule_id"]})j"},
+
+    {"push_guardian_rules",
+     "Push the current enabled Guard set to in-scope agents. Mirrors POST "
+     "/api/v1/guaranteed-state/push exactly — same scope-to-agents fan-out, same "
+     "GuaranteedState:Push gate. NOT idempotent: each call re-derives and re-dispatches "
+     "against the current rule set and policy generation, and full_sync forces a full "
+     "re-sync rather than an incremental diff, so two calls in quick succession both "
+     "dispatch (this is by design — a push is an action, not a state to converge on; a "
+     "concurrent/replayed push simply re-delivers the same-or-newer generation, which "
+     "agents accept idempotently on THEIR side, but the tool call itself is not safe to "
+     "retry blindly assuming no-op). Fleet-wide; requires the distinct GuaranteedState:Push "
+     "verb (not Write), denied outright to a service-scoped API token.",
+     R"j({"type":"object","properties":{)j"
+     R"j("scope":{"type":"string","maxLength":2048,"default":"","description":"Scope DSL expression selecting target agents; empty = fleet-wide"},)j"
+     R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents rather than an incremental push"})j"
+     R"j(}})j",
+     R"j({"type":"object","properties":{"queued":{"const":true},"rules":{"type":"integer"},"agents":{"type":"integer"},"scope":{"type":"string"},"full_sync":{"type":"boolean"}},"required":["queued","rules","agents","scope","full_sync"]})j"},
+
+    {"get_guardian_agent_status",
+     "Per-agent Guaranteed State status rollup: total_rules/errored_rules real and "
+     "intersected against the live rule catalogue (compliant_rules/drifted_rules still 0 — "
+     "full status ingest lands in a later rung). Mirrors GET "
+     "/api/v1/guaranteed-state/status/{agent_id} exactly, same shared builder "
+     "(guardian_agent_status_rollup). Per-device behavioral read — every call is "
+     "audit-logged (guardian.device.view). Per-device scoped (management-group aware) via "
+     "the SAME gate get_guardian_device_guards uses; a service-scoped API token is confined "
+     "to its own service's agents rather than denied outright.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"total_rules":{"type":"integer"},"compliant_rules":{"type":"integer"},"drifted_rules":{"type":"integer"},"errored_rules":{"type":"integer"},"note":{"type":"string"},"audit_persisted":{"type":"boolean"}},"required":["agent_id","total_rules","compliant_rules","drifted_rules","errored_rules"]})j"},
+
+    {"get_guardian_device_compliance",
+     "Is this device compliant with ONE named Baseline: the Guards actually applicable to "
+     "this device (deployed-snapshot intersected with what it has reported), each with its "
+     "last reported verdict. Mirrors GET /api/v1/guaranteed-state/device-compliance exactly, "
+     "same baseline + guaranteed-state store reads. assessable is false when there is no "
+     "compliance signal to act on (draft Baseline, or nothing reported yet) — do not compute "
+     "a percentage when false. Per-device behavioral read — every call is audit-logged "
+     "(guardian.device.view). Per-device scoped (management-group aware) via the SAME gate "
+     "get_guardian_agent_status uses.",
+     R"j({"type":"object","properties":{)j"
+     R"j("baseline":{"type":"string","minLength":1,"maxLength":256,"description":"Baseline name (stable across reseeds, unlike baseline_id)"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256})j"
+     R"j(},"required":["baseline","agent_id"]})j",
+     R"j({"type":"object","properties":{)j"
+     R"j("baseline":{"type":"object","properties":{"baseline_id":{"type":"string"},"name":{"type":"string"},"lifecycle":{"type":"string"}},"required":["baseline_id","name","lifecycle"]},)j"
+     R"j("deployed":{"type":"boolean"},"assessable":{"type":"boolean"},"agent_id":{"type":"string"},)j"
+     R"j("total_guards":{"type":"integer"},"snapshot_total":{"type":"integer"},"compliant":{"type":"integer"},)j"
+     R"j("drifted":{"type":"integer"},"errored":{"type":"integer"},"pending":{"type":"integer"},)j"
+     R"j("last_updated":{"type":["string","null"]},)j"
+     R"j("guards":{"type":"array","items":{"type":"object","properties":{"rule_id":{"type":"string"},"name":{"type":"string"},"status":{"type":"string"},"updated_at":{"type":["string","null"]}},"required":["rule_id","name","status"]}},)j"
+     R"j("audit_persisted":{"type":"boolean"})j"
+     R"j(},"required":["baseline","deployed","assessable","agent_id","total_guards","snapshot_total","compliant","drifted","errored","pending","guards"]})j"},
 
     // ── DEX (Digital Employee Experience) read tools — parity with /api/v1/dex/* ──
     {"list_dex_signals",
@@ -2281,6 +2412,11 @@ static const char* const kWriteToolsRaw[] = {
     // gate; the tool performs no mutation, but the write set is keyed on the
     // RBAC operation, not on whether a handler mutates state.
     "preview_management_group_agent_count",
+    // #2146 Batch B1 — Guardian rule CRUD + push. create/update: Write;
+    // delete: Delete; push: Push. get_guardian_rule/get_guardian_agent_status/
+    // get_guardian_device_compliance are Read and deliberately absent.
+    "create_guardian_rule", "update_guardian_rule", "delete_guardian_rule",
+    "push_guardian_rules",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -2455,6 +2591,21 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // which DOES apply a service-scoped token's own service-tag confinement per
     // target — a real mechanism, same classification as get_dex_signal_detail below.
     {"get_guardian_device_guards", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    // #2146 Batch B1 — fleet-wide rule CRUD/push mirror list_guardian_rules'
+    // `denied` posture exactly (a Guard has no single owning device/service);
+    // the mutating verbs match each REST route's own perm_fn gate exactly
+    // (create/update: Write; delete: Delete; push: the distinct Push verb).
+    {"create_guardian_rule", {"GuaranteedState", "Write"}},
+    {"get_guardian_rule", {"GuaranteedState", "Read"}},
+    {"update_guardian_rule", {"GuaranteedState", "Write"}},
+    {"delete_guardian_rule", {"GuaranteedState", "Delete"}},
+    {"push_guardian_rules", {"GuaranteedState", "Push"}},
+    // get_guardian_agent_status / get_guardian_device_compliance use
+    // scoped_perm_fn_ (require_scoped_permission), the SAME real per-device
+    // confinement mechanism get_guardian_device_guards uses above — `confined`,
+    // matching REST's own scoped_perm_fn gate on both sibling routes.
+    {"get_guardian_agent_status", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    {"get_guardian_device_compliance", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"list_dex_signals", {"GuaranteedState", "Read"}},
     {"get_dex_signal_scope", {"GuaranteedState", "Read"}},
     {"get_dex_signal_detail", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
@@ -3018,6 +3169,26 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_guardian_events", {ToolEffect::ReadOnly, true, "List Guardian events"}},
     {"get_guardian_rule_status", {ToolEffect::ReadOnly, true, "Get per-guard agent status"}},
     {"get_guardian_device_guards", {ToolEffect::ReadOnly, true, "Get per-device all-guards view"}},
+    // #2146 Batch B1 — create is Additive (fresh resource, nothing existing
+    // overwritten), matching create_engine_principal's pairing above; not
+    // idempotent (retrying a successful create hits the SAME rule_id/name
+    // UNIQUE conflict, so a blind retry is not safe). update/delete overwrite
+    // or remove EXISTING rule state (the effect table's own destructiveness
+    // test), matching set_tag/delete_tag's pairing; both are idempotent
+    // (re-applying the same update converges on the same fields — only the
+    // store-bumped version counter differs — and re-deleting an
+    // already-deleted rule is a safe no-op 404, never a second deletion).
+    // push is Destructive (re-arms/replaces what agents enforce) and
+    // explicitly NOT idempotent per its own kTools[] description — each call
+    // re-dispatches, so a retry is not a safe no-op.
+    {"create_guardian_rule", {ToolEffect::Additive, false, "Create Guardian rule"}},
+    {"get_guardian_rule", {ToolEffect::ReadOnly, true, "Get Guardian rule"}},
+    {"update_guardian_rule", {ToolEffect::Destructive, true, "Update Guardian rule"}},
+    {"delete_guardian_rule", {ToolEffect::Destructive, true, "Delete Guardian rule"}},
+    {"push_guardian_rules", {ToolEffect::Destructive, false, "Push Guardian rules"}},
+    {"get_guardian_agent_status", {ToolEffect::ReadOnly, true, "Get per-agent Guardian status"}},
+    {"get_guardian_device_compliance",
+     {ToolEffect::ReadOnly, true, "Get per-device Baseline compliance"}},
     {"list_dex_signals", {ToolEffect::ReadOnly, true, "List DEX signals"}},
     {"get_dex_signal_scope", {ToolEffect::ReadOnly, true, "Get DEX signal scope"}},
     {"get_dex_signal_detail", {ToolEffect::ReadOnly, true, "Get DEX signal detail"}},
@@ -9163,6 +9334,693 @@ McpServer::HandlerFn McpServer::build_handler(
                 payload.add("agent_id", agent_id)
                     .raw("guards", arr.str())
                     .add("total_guards", static_cast<int64_t>(rows->size()));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── Guardian rule CRUD + push + per-agent read twins (#2146 Batch B1) ──
+            if (tool_name == "create_guardian_rule") {
+                if (!tier_allows(tier, "GuaranteedState", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // Fleet-wide rule authoring: no per-target shape to scope a
+                // service-scoped token's own service against (a Guard isn't owned
+                // by any one IT service) — same rationale as REST POST
+                // /guaranteed-state/rules's deny_fleet_wide_service_scoped.
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.rule.create", "GuaranteedState",
+                        "Guaranteed State rule create denied to a service-scoped token (MCP "
+                        "create_guardian_rule)",
+                        "service-scoped tokens may not create Guaranteed State rules"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Write"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                GuaranteedStateRuleRow row;
+                row.rule_id = param_str(args, "rule_id");
+                row.name = param_str(args, "name");
+                row.version = param_int(args, "version", 1);
+                row.enabled = args.value("enabled", true);
+                row.enforcement_mode = param_str(args, "enforcement_mode", "enforce");
+                row.severity = param_str(args, "severity", "medium");
+                row.os_target = param_str(args, "os_target", "");
+                row.scope_expr = param_str(args, "scope_expr", "");
+
+                // enforcement_mode decides whether the agent WRITES to the endpoint —
+                // reject anything but enforce|audit, mirroring REST's create handler.
+                if (row.enforcement_mode != "enforce" && row.enforcement_mode != "audit") {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id, "invalid enforcement_mode");
+                    // retry-hint-exempt: validation failure, not a store fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "enforcement_mode must be 'enforce' or 'audit'"),
+                        "application/json");
+                    return;
+                }
+
+                // Structured Guard authoring (contract §8) — same shared validator
+                // REST's create handler calls; `args` carries the SAME
+                // spark/assertion/remediation/yaml_source shape as REST's JSON body.
+                auto spec = ::yuzu::server::guardian::derive_rule_spec(
+                    args, row.name, row.version, row.enabled, row.enforcement_mode);
+                if (spec.error) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id, spec.error->message);
+                    // retry-hint-exempt: authoring validation failure, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, spec.error->message),
+                                    "application/json");
+                    return;
+                }
+                if (spec.structured) {
+                    row.spec_json = std::move(spec.spec_json);
+                    row.yaml_source = std::move(spec.yaml_source);
+                } else {
+                    row.yaml_source = param_str(args, "yaml_source");
+                }
+
+                if (row.rule_id.empty() || row.name.empty() ||
+                    (!spec.structured && row.yaml_source.empty())) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "rule_id and name are required, plus either a "
+                                       "structured spark+assertion or a yaml_source"),
+                        "application/json");
+                    return;
+                }
+                row.created_by = session->username;
+                row.updated_by = session->username;
+                row.created_at = utc_now_iso();
+                row.updated_at = row.created_at;
+
+                auto result = guaranteed_state_store->create_rule(row);
+                if (!result) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.create", "denied",
+                        "GuaranteedState", row.rule_id, result.error());
+                    // retry-hint-exempt: a UNIQUE conflict (duplicate rule_id/name) or a
+                    // store-side validation error — a client-input error, not a transient
+                    // store fault; mirrors REST's own 409/400 (never 503) for this branch.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       is_conflict_error(result.error())
+                                           ? std::string(strip_conflict_prefix(result.error()))
+                                           : result.error()),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guaranteed_state.rule.create", "success", "GuaranteedState",
+                    row.rule_id, row.name);
+                JObj payload;
+                payload.add("created", true).add("rule_id", row.rule_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_rule") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string rule_id = param_str(args, "rule_id");
+                if (rule_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "rule_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Same fleet-wide-catalogue confinement gap as list_guardian_rules —
+                // a single rule isn't owned by any one IT service either, so this is
+                // a blanket deny, not a per-target scope check.
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.rule.read", "GuaranteedState",
+                        "Guaranteed State rule read denied to a service-scoped token (MCP "
+                        "get_guardian_rule)",
+                        "service-scoped tokens may not read Guaranteed State rules", rule_id))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                // get_rule is three-state (ADR-0038): found / genuinely absent /
+                // degraded — a degrade must error, never collapse into "not found".
+                auto row = guaranteed_state_store->get_rule(rule_id);
+                if (!row) {
+                    res.set_content(
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*row) {
+                    // retry-hint-exempt: genuine not-found, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, "rule not found"),
+                                    "application/json");
+                    return;
+                }
+                const auto& r = **row;
+                JObj payload;
+                payload.add("rule_id", r.rule_id)
+                    .add("name", r.name)
+                    .add("yaml_source", r.yaml_source)
+                    .add("spec_json", r.spec_json)
+                    .add("version", static_cast<int64_t>(r.version))
+                    .add("enabled", r.enabled)
+                    .add("enforcement_mode", r.enforcement_mode)
+                    .add("severity", r.severity)
+                    .add("os_target", r.os_target)
+                    .add("scope_expr", r.scope_expr)
+                    .add("created_at", r.created_at)
+                    .add("updated_at", r.updated_at)
+                    .add("created_by", r.created_by)
+                    .add("updated_by", r.updated_by);
+                mcp_audit("success", rule_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "update_guardian_rule") {
+                if (!tier_allows(tier, "GuaranteedState", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string rule_id = param_str(args, "rule_id");
+                if (rule_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "rule_id is required"),
+                                    "application/json");
+                    return;
+                }
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.rule.update", "GuaranteedState",
+                        "Guaranteed State rule update denied to a service-scoped token (MCP "
+                        "update_guardian_rule)",
+                        "service-scoped tokens may not update Guaranteed State rules", rule_id))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Write"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto existing = guaranteed_state_store->get_rule(rule_id);
+                if (!existing) {
+                    res.set_content(
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*existing) {
+                    // retry-hint-exempt: genuine not-found, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, "rule not found"),
+                                    "application/json");
+                    return;
+                }
+                const GuaranteedStateRuleRow& existing_rule = **existing;
+                auto updated = existing_rule;
+                updated.name = param_str(args, "name", existing_rule.name.c_str());
+                updated.enabled = args.value("enabled", existing_rule.enabled);
+                // Mode (Watch/Enforce) is IMMUTABLE after creation — a different
+                // posture is a different Guard. Mirrors REST's PUT handler exactly.
+                if (args.contains("enforcement_mode") && args["enforcement_mode"].is_string() &&
+                    args["enforcement_mode"].get<std::string>() != existing_rule.enforcement_mode) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.update", "denied",
+                        "GuaranteedState", rule_id, "attempt to change immutable enforcement_mode");
+                    // retry-hint-exempt: immutable-field validation, not a store fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "enforcement_mode is immutable — create a new Guard "
+                                       "for a different posture (Watch vs Enforce)"),
+                        "application/json");
+                    return;
+                }
+                updated.enforcement_mode = existing_rule.enforcement_mode;  // unchanged
+                updated.severity = param_str(args, "severity", existing_rule.severity.c_str());
+                updated.os_target = param_str(args, "os_target", existing_rule.os_target.c_str());
+                updated.scope_expr =
+                    param_str(args, "scope_expr", existing_rule.scope_expr.c_str());
+                updated.version = existing_rule.version + 1;
+
+                auto spec = ::yuzu::server::guardian::derive_rule_spec(
+                    args, updated.name, updated.version, updated.enabled,
+                    updated.enforcement_mode);
+                if (spec.error) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.update", "denied",
+                        "GuaranteedState", rule_id, spec.error->message);
+                    // retry-hint-exempt: authoring validation failure, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, spec.error->message),
+                                    "application/json");
+                    return;
+                }
+                if (spec.structured) {
+                    updated.spec_json = std::move(spec.spec_json);
+                    updated.yaml_source = std::move(spec.yaml_source);
+                } else {
+                    updated.yaml_source =
+                        param_str(args, "yaml_source", updated.yaml_source.c_str());
+                    // A metadata-only update keeps the existing spec_json, so
+                    // derive_rule_spec's assertion validator did NOT run. If this
+                    // update flips the rule into enforce mode, re-check the STORED
+                    // assertion against the dangerous-key denylist (contract §6).
+                    if (updated.enforcement_mode == "enforce") {
+                        if (std::string why = ::yuzu::server::guardian::dangerous_enforce_in_spec(
+                                updated.spec_json);
+                            !why.empty()) {
+                            (void)yuzu::server::detail::try_persist_audit(
+                                audit_fn, req, "guaranteed_state.rule.update", "denied",
+                                "GuaranteedState", rule_id, "enforce on denylisted target");
+                            // retry-hint-exempt: policy-denylist validation, not a store fault.
+                            res.set_content(
+                                error_response(
+                                    id, kInvalidParams,
+                                    "enforce mode not permitted: this guard targets " + why),
+                                "application/json");
+                            return;
+                        }
+                    }
+                }
+
+                updated.updated_at = utc_now_iso();
+                updated.updated_by = session->username;
+
+                auto result = guaranteed_state_store->update_rule(updated);
+                if (!result) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.update", "denied",
+                        "GuaranteedState", rule_id, result.error());
+                    // retry-hint-exempt: a UNIQUE conflict (duplicate name) or a
+                    // store-side validation error — a client-input error, not a
+                    // transient store fault; mirrors REST's own 409/400.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       is_conflict_error(result.error())
+                                           ? std::string(strip_conflict_prefix(result.error()))
+                                           : result.error()),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guaranteed_state.rule.update", "success", "GuaranteedState",
+                    rule_id, updated.name);
+                JObj payload;
+                payload.add("updated", true)
+                    .add("rule_id", rule_id)
+                    .add("version", static_cast<int64_t>(updated.version));
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "delete_guardian_rule") {
+                if (!tier_allows(tier, "GuaranteedState", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string rule_id = param_str(args, "rule_id");
+                if (rule_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "rule_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // PR2 Gate 4 consistency-B1 (rest_api_v1.cpp): Guardian rule DELETE
+                // is equally destructive to UPDATE — gating both the same way keeps
+                // a hijacked session from removing auto-remediation policy.
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.rule.delete", "GuaranteedState",
+                        "Guaranteed State rule delete denied to a service-scoped token (MCP "
+                        "delete_guardian_rule)",
+                        "service-scoped tokens may not delete Guaranteed State rules", rule_id))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Delete"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto result = guaranteed_state_store->delete_rule(rule_id);
+                if (!result) {
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "guaranteed_state.rule.delete", "denied",
+                        "GuaranteedState", rule_id, result.error());
+                    // retry-hint-exempt: mirrors REST's own posture — delete_rule
+                    // conflates not-found with a genuine failure into one error
+                    // string, so this is not distinguishably a transient store fault.
+                    res.set_content(error_response(id, kInvalidParams, result.error()),
+                                    "application/json");
+                    return;
+                }
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guaranteed_state.rule.delete", "success", "GuaranteedState",
+                    rule_id, "");
+                JObj payload;
+                payload.add("deleted", true).add("rule_id", rule_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "push_guardian_rules") {
+                if (!tier_allows(tier, "GuaranteedState", "Push")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // BLOCKING finding from external review (PR #3156, mirrored here):
+                // a service-scoped token must not push the fleet-wide rule set to
+                // agents outside its own service. Same posture as REST's push route.
+                if (deny_fleet_wide_service_scoped(
+                        "guaranteed_state.push", "GuaranteedState",
+                        "Guaranteed State push denied to a service-scoped token (MCP "
+                        "push_guardian_rules)",
+                        "service-scoped tokens may not push the fleet-wide Guaranteed "
+                        "State rule set"))
+                    return;
+                if (!perm_fn(req, res, "GuaranteedState", "Push"))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                const std::string scope = param_str(args, "scope");
+                const bool full_sync = args.value("full_sync", false);
+                const auto rule_count = guaranteed_state_store->rule_count();
+                // Same log-injection defence as REST's push handler: strip control
+                // bytes and backslash-escape quotes before embedding in the audit
+                // detail string (SIEM parser integrity, SOC 2 audit-trail).
+                auto sanitize_audit_string = [](const std::string& s) {
+                    std::string out;
+                    out.reserve(s.size());
+                    for (char c : s) {
+                        if (c == '"' || c == '\\') {
+                            out += '\\';
+                            out += c;
+                        } else if (static_cast<unsigned char>(c) < 0x20 ||
+                                   static_cast<unsigned char>(c) == 0x7F) {
+                            // dropped
+                        } else {
+                            out += c;
+                        }
+                    }
+                    return out;
+                };
+                int pushed = 0;
+                if (guardian_push_fn_) {
+                    pushed = guardian_push_fn_(scope, full_sync);
+                    // -2 is the ADR-0038 degraded-store sentinel (distinct from -1's
+                    // "unparseable scope") — a guaranteed-state read degrade must
+                    // render an internal/retryable error, never the misleading
+                    // "invalid scope expression".
+                    if (pushed == -2) {
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, "guaranteed_state.push", "denied", "GuaranteedState",
+                            "", "store degraded scope=\"" + sanitize_audit_string(scope) + "\"");
+                        res.set_content(
+                            a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (pushed < 0) {
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, "guaranteed_state.push", "denied", "GuaranteedState",
+                            "", "invalid scope=\"" + sanitize_audit_string(scope) + "\"");
+                        // retry-hint-exempt: an unparseable scope expression is a
+                        // client-input error, not a store fault.
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid scope expression"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guaranteed_state.push", "success", "GuaranteedState", "",
+                    "rules=" + std::to_string(rule_count) +
+                        " full_sync=" + (full_sync ? "true" : "false") + " scope=\"" +
+                        sanitize_audit_string(scope) + "\" agents=" + std::to_string(pushed));
+                JObj payload;
+                payload.add("queued", true)
+                    .add("rules", static_cast<int64_t>(rule_count))
+                    .add("agents", static_cast<int64_t>(pushed))
+                    .add("scope", scope)
+                    .add("full_sync", full_sync);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_agent_status") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                if (agent_id.size() > auth::kMaxAgentIdLength) {
+                    res.set_content(error_response(id, kInvalidParams, "agent_id is too long"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return;
+                if (!guaranteed_state_store) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
+                // Behavioral-PII access audit — same verb/target as REST GET
+                // /guaranteed-state/status/{agent_id}. MCP set-and-proceed posture
+                // (audit_persisted:false on a dropped row, never fail closed — MCP
+                // has no Sec-Audit-Failed header, docs/api-twin-recipe.md §4).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guardian.device.view", rollup ? "success" : "failure",
+                    "Agent", agent_id, "per-agent Guaranteed State status via MCP");
+                if (!rollup) {
+                    res.set_content(
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                JObj payload;
+                payload.add("agent_id", agent_id)
+                    .add("total_rules", rollup->total_rules)
+                    .add("compliant_rules", rollup->compliant_rules)
+                    .add("drifted_rules", rollup->drifted_rules)
+                    .add("errored_rules", rollup->errored_rules)
+                    .add("note", "total_rules and errored_rules are both real (M1 "
+                                "census-derived, #2298 item 6d) and both intersected "
+                                "against the live rule catalogue; compliant_rules/"
+                                "drifted_rules land with full status ingest in a later rung");
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_guardian_device_compliance") {
+                if (!tier_allows(tier, "GuaranteedState", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const std::string baseline_name = param_str(args, "baseline");
+                const std::string agent_id = param_str(args, "agent_id");
+                if (baseline_name.empty() || agent_id.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "baseline and agent_id are both required"),
+                        "application/json");
+                    return;
+                }
+                if (baseline_name.size() > auth::kMaxAgentIdLength ||
+                    agent_id.size() > auth::kMaxAgentIdLength) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "baseline or agent_id is too long"),
+                        "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn) {
+                    res.set_content(error_response(id, kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
+                    return;
+                if (!guaranteed_state_store || !baseline_store_) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Guaranteed State store unavailable"),
+                        "application/json");
+                    return;
+                }
+                bool baseline_store_ok = true;
+                const auto baseline =
+                    baseline_store_->get_baseline_by_name(baseline_name, &baseline_store_ok);
+                if (!baseline_store_ok) {
+                    res.set_content(
+                        a4_error(kInternalError, "baseline store unavailable",
+                                "retry the request",
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Behavioral-PII access audit — same verb/target as REST GET
+                // /guaranteed-state/device-compliance. MCP set-and-proceed posture
+                // (never fail closed — MCP has no Sec-Audit-Failed header, a dropped
+                // row surfaces as audit_persisted:false instead, docs/api-twin-recipe.md
+                // §4), UNLIKE REST's own fail-closed contract for this identical verb.
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "guardian.device.view", baseline ? "success" : "not_found",
+                    "Agent", agent_id,
+                    "baseline '" + baseline_name + "' per-device guard status via MCP");
+                if (!baseline) {
+                    // retry-hint-exempt: genuine not-found, not a store fault.
+                    res.set_content(error_response(id, kInvalidParams, "baseline not found"),
+                                    "application/json");
+                    return;
+                }
+                const bool deployed = (baseline->lifecycle == kBaselineDeployed);
+                auto guard_ids_result =
+                    baseline_store_->deployed_member_rule_ids(baseline->baseline_id);
+                if (!guard_ids_result) {
+                    res.set_content(
+                        a4_error(kInternalError, "baseline store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& guard_ids = *guard_ids_result;
+                auto rule_names_result = guaranteed_state_store->rule_names_for(guard_ids);
+                auto statuses_result =
+                    guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+                if (!rule_names_result || !statuses_result) {
+                    res.set_content(
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& rule_names = *rule_names_result;
+                std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
+                for (auto& st : *statuses_result)
+                    dev[st.rule_id] = std::move(st);
+
+                int64_t compliant = 0, drifted = 0, errored = 0;
+                std::string last_updated;
+                JArr guards;
+                int64_t total_guards = 0;
+                for (const auto& rid : guard_ids) {
+                    const auto it = dev.find(rid);
+                    if (it == dev.end())
+                        continue;  // not applicable to this device
+                    ++total_guards;
+                    std::string status = "pending";
+                    const std::string& s = it->second.state;
+                    if (s == "compliant") { status = s; ++compliant; }
+                    else if (s == "drifted") { status = s; ++drifted; }
+                    else if (s == "errored") { status = s; ++errored; }
+                    const std::string& updated_at = it->second.updated_at;
+                    if (!updated_at.empty() && updated_at > last_updated)
+                        last_updated = updated_at;
+                    const auto nit = rule_names.find(rid);
+                    JObj g;
+                    g.add("rule_id", rid)
+                        .add("name", (nit != rule_names.end() && !nit->second.empty())
+                                        ? nit->second
+                                        : rid)
+                        .add("status", status);
+                    if (updated_at.empty())
+                        g.raw("updated_at", "null");
+                    else
+                        g.add("updated_at", updated_at);
+                    guards.add(std::move(g));
+                }
+                const int64_t pending = total_guards - (compliant + drifted + errored);
+
+                JObj b;
+                b.add("baseline_id", baseline->baseline_id)
+                    .add("name", baseline->name)
+                    .add("lifecycle", baseline->lifecycle);
+
+                JObj payload;
+                payload.raw("baseline", b.str())
+                    .add("deployed", deployed)
+                    .add("assessable", deployed && total_guards > 0)
+                    .add("agent_id", agent_id)
+                    .add("total_guards", total_guards)
+                    .add("snapshot_total", static_cast<int64_t>(guard_ids.size()))
+                    .add("compliant", compliant)
+                    .add("drifted", drifted)
+                    .add("errored", errored)
+                    .add("pending", pending);
+                if (last_updated.empty())
+                    payload.raw("last_updated", "null");
+                else
+                    payload.add("last_updated", last_updated);
+                payload.raw("guards", guards.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 res.set_content(

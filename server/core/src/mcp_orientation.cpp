@@ -131,9 +131,19 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // views; list_guardian_events is the __observation__/enforcement event feed
 // (confined, not denied — see its kToolSecurityRows comment);
 // get_guardian_device_guards is the per-device all-guards census.
-constexpr std::string_view kGuardian[] = {"get_guardian_status", "list_guardian_rules",
-                                          "get_guardian_rule_status", "list_guardian_events",
-                                          "get_guardian_device_guards"};
+// #2146 Batch B1 extends this family with the rule CRUD/push mutations
+// (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
+// per-agent reads #4037 deliberately deferred (get_guardian_agent_status,
+// get_guardian_device_compliance) — same live-enforcement-state family, not
+// a new one; the schema-catalog/live-state distinction this family's
+// description draws still holds.
+constexpr std::string_view kGuardian[] = {
+    "get_guardian_status",         "list_guardian_rules",
+    "get_guardian_rule_status",    "list_guardian_events",
+    "get_guardian_device_guards",  "create_guardian_rule",
+    "get_guardian_rule",           "update_guardian_rule",
+    "delete_guardian_rule",        "push_guardian_rules",
+    "get_guardian_agent_status",   "get_guardian_device_compliance"};
 // #4036 (api-parity Batch A) — the /auto pre-flight ASSESS + deploy ACT
 // stages' read twins. Own family, distinct from Fleet & agents / Live
 // execution: these are owner-scoped readiness/preview reads over the
