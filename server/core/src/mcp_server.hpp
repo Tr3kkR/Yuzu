@@ -599,6 +599,17 @@ public:
         std::function<std::optional<std::set<std::string>>(const std::string& username)>;
     void set_dex_visible_fn(DexVisibleFn fn) { dex_visible_fn_ = std::move(fn); }
 
+    /// B4 (#2146 API-parity): mirrors `RestApiV1::LockoutClearFn` (rest_api_v1.hpp)
+    /// so the MCP `unlock_account` tool clears an account's lockout counter
+    /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
+    /// without pulling in rest_api_v1.hpp for one nested type (same mirror-not-
+    /// reuse discipline as `PublishCrlFn` below, which mirrors `CaRoutes::
+    /// PublishCrlFn`). Wraps `AuthDB::clear_failed_logins`. Returns true when
+    /// the underlying auth store write succeeded. Empty/unset callback = the
+    /// tool answers "lockout subsystem unavailable" (503-equivalent), matching
+    /// the REST route's degrade when `lockout_clear_fn` is unwired.
+    using LockoutClearFn = std::function<bool(const std::string& username)>;
+
     /// Republish-CRL callback (PR4 B-2): mirrors `CaRoutes::PublishCrlFn` so the
     /// MCP `revoke_certificate` tool republishes the CRL after a revoke exactly as
     /// the REST `/api/v1/ca/revoke` handler does. Returns the new CRL DER, or
@@ -736,7 +747,13 @@ public:
                             // disagree. Trailing optional dep; nullptr leaves the tool
                             // answering an internal-error JSON-RPC response, same degrade
                             // as the retired cohort provider.
-                            std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                            std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                            // B4 (#2146 API-parity): backs the `unlock_account` tool
+                            // (MCP twin of POST /api/v1/users/{name}/unlock). Trailing
+                            // optional dep; unset leaves the tool answering "lockout
+                            // subsystem unavailable", the same degrade the REST route
+                            // takes when its own lockout_clear_fn is unwired.
+                            LockoutClearFn lockout_clear_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -836,7 +853,10 @@ public:
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
                          IssueCodeSigningFn issue_code_signing_fn = {},
                          // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
-                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                         // B4 (#2146 API-parity): see build_handler's doc comment above —
+                         // forwarded to it for the `unlock_account` tool.
+                         LockoutClearFn lockout_clear_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -885,7 +905,10 @@ public:
                          // gap-matrix #10 (ADR-1005 A5 parity) — forwarded to build_handler.
                          IssueCodeSigningFn issue_code_signing_fn = {},
                          // ADR-0031 WS-A4 #4250: see build_handler's doc comment above.
-                         std::shared_ptr<const VerifyApi> verify_api = nullptr);
+                         std::shared_ptr<const VerifyApi> verify_api = nullptr,
+                         // B4 (#2146 API-parity): see build_handler's doc comment above —
+                         // forwarded to it for the `unlock_account` tool.
+                         LockoutClearFn lockout_clear_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

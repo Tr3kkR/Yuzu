@@ -65,8 +65,17 @@ constexpr std::string_view kCompliance[] = {
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
     "get_policy_agent_statuses"}; // #4034
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
+// B4 (#2146 API-parity) adds the remaining management-group CRUD/membership/
+// role tools to this family (create/get/update/add_member/list_roles/
+// assign_role) — same domain, same securable, no reason for a separate family.
 constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
-                                            "preview_management_group_agent_count"};
+                                            "preview_management_group_agent_count",
+                                            "create_management_group",
+                                            "get_management_group",
+                                            "update_management_group",
+                                            "add_management_group_member",
+                                            "list_management_group_roles",
+                                            "assign_management_group_role"};
 constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
                                            "reject_request"};
 constexpr std::string_view kDexSignals[] = {
@@ -115,9 +124,16 @@ constexpr std::string_view kEnginePrincipals[] = {
 constexpr std::string_view kAccessReviews[] = {"export_access_review", "open_access_review",
                                                "record_attestation", "get_access_review",
                                                "list_access_reviews", "close_access_review"};
-// Human API-token rotation (P2 #11, SOC 2 CC6.3) — self-service, own family
-// distinct from Engine principals: no admin/approval gate, owner-only.
-constexpr std::string_view kApiTokens[] = {"rotate_api_token", "confirm_api_token_rotation"};
+// Human API-token lifecycle (P2 #11, SOC 2 CC6.3 rotation; B4 #2146 API-parity
+// adds list/create/revoke) — own family distinct from Engine principals. List/
+// create/rotate/confirm are self-service ONLY (mint/list/rotate always act on
+// the calling principal's own tokens, never an admin-for-another-user path);
+// revoke ADDITIONALLY allows an elevated/admin session to act on another
+// user's token (the one asymmetry in this family — see revoke_api_token's own
+// tool description for the exact posture).
+constexpr std::string_view kApiTokens[] = {"rotate_api_token", "confirm_api_token_rotation",
+                                           "list_api_tokens", "create_api_token",
+                                           "revoke_api_token"};
 constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
                                                 "classify_operational_question",
                                                 "get_incident_playbook", "summarize_working_set"};
@@ -158,8 +174,17 @@ constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
 // Fleet & agents (directory users are IdP-sourced identity records, not
 // managed endpoints) or Engine principals (unrelated identity axis).
 constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
+// B4 (#2146 API-parity) — no existing family covers a self-check "can I do X"
+// RBAC read; own family, distinct from Discovery's discover_permissions (the
+// whole catalog + role grid) and from Engine principals' assign/unassign/
+// list_engine_roles (grant AUTHORING, not a self-check).
+constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// B4 — no existing family covers local-account lockout lifecycle; own family,
+// distinct from Directory & identity (AD/Entra sync, a different identity
+// axis) and from Engine principals (a different principal class entirely).
+constexpr std::string_view kAccountLockout[] = {"unlock_account"};
 
-constexpr std::array<ToolFamily, 30> kFamilies{{
+constexpr std::array<ToolFamily, 32> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -174,7 +199,10 @@ constexpr std::array<ToolFamily, 30> kFamilies{{
     {"Policy & compliance", "policies, per-device and fleet compliance, Guardian schemas",
      kCompliance},
     {"Scope targeting", "validate a scope expression and preview the devices it selects", kScope},
-    {"Management groups", "the hierarchical device grouping used for access scoping", kMgmtGroups},
+    {"Management groups",
+     "the hierarchical device grouping used for access scoping — list/create/get/update groups, "
+     "manage static membership, and delegate group-scoped Operator/Viewer roles",
+     kMgmtGroups},
     {"Approvals", "list pending approvals and approve/reject maker-checker tickets", kApprovals},
     {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
      kDexSignals},
@@ -200,8 +228,9 @@ constexpr std::array<ToolFamily, 30> kFamilies{{
      kEnginePrincipals},
     {"Access reviews", "open, attest, close, and export SOC 2 access-certification reviews",
      kAccessReviews},
-    {"API tokens", "self-service overlap-pair rotation of your own API tokens (owner-only, "
-                   "no admin/approval gate)",
+    {"API tokens", "list/create/revoke/rotate your own API tokens (self-service; revoke "
+                   "additionally allows an elevated admin session to act on another user's "
+                   "token)",
      kApiTokens},
     {"Agentic helpers", "high-level workflow helpers: fast posture, classification, playbooks",
      kAgenticHelpers},
@@ -221,6 +250,11 @@ constexpr std::array<ToolFamily, 30> kFamilies{{
      kTar},
     {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
      kDirectory},
+    {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
+                        "permission",
+     kRbacCheck},
+    {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
+     kAccountLockout},
 }};
 
 }  // namespace

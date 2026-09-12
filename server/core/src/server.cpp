@@ -17928,7 +17928,17 @@ private:
                 // and the REST GET /api/v1/dex/perf/compare twin use, so all
                 // three compare_app_perf_versions/compare siblings never
                 // disagree.
-                verify_api);
+                verify_api,
+                // B4 (#2146 API-parity) — backs the unlock_account MCP tool
+                // (twin of POST /api/v1/users/{name}/unlock). Same wiring as the
+                // REST route's lockout_clear_fn above: wraps
+                // AuthDB::clear_failed_logins so McpServer stays decoupled from
+                // AuthDB. SOC 2 CC6.3. Empty/null auth_db => false => the tool
+                // reports "lockout subsystem unavailable".
+                [this](const std::string& username) -> bool {
+                    auto* db = auth_mgr_.auth_db_ptr();
+                    return db && db->clear_failed_logins(username).has_value();
+                });
         }
 
         // -- Listen -----------------------------------------------------------

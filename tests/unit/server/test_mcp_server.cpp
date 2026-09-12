@@ -1109,6 +1109,18 @@ struct McpTestServer {
     /// and discover_scope_kinds need none of these (compiled-in / self-contained).
     yuzu::server::RbacStore* rbac_store_for_test{nullptr};
     yuzu::server::InstructionStore* instruction_store_for_test{nullptr};
+    /// B4 (#2146 API-parity): optionally wire a real ManagementGroupStore so the
+    /// six new management-group MCP twins (create/get/update/add_member/
+    /// list_roles/assign_role) can be exercised end-to-end. Default nullptr
+    /// keeps every pre-existing test (including list_management_groups /
+    /// preview_management_group_agent_count, which were already hardcoded to
+    /// nullptr before this PR) on the "store unavailable" path.
+    yuzu::server::ManagementGroupStore* mgmt_store_for_test{nullptr};
+    /// B4: optionally wire a lockout-clear callback so unlock_account can be
+    /// exercised end-to-end. Default unset (empty std::function) keeps every
+    /// pre-existing test on the "lockout subsystem unavailable" path, mirroring
+    /// production's auth_db==nullptr degrade.
+    yuzu::server::mcp::McpServer::LockoutClearFn lockout_clear_fn_for_test{};
     yuzu::server::detail::AgentRegistry* agent_registry_for_test{nullptr};
     /// #4029: optionally wire a real ProductPackStore so list_product_packs /
     /// get_product_pack can be exercised end-to-end. Default nullptr keeps
@@ -1407,7 +1419,7 @@ private:
             /*tag_store=*/tag_store_for_test,
             /*inventory_store=*/nullptr,
             /*policy_store=*/nullptr,
-            /*mgmt_store=*/nullptr,
+            /*mgmt_store=*/mgmt_store_for_test,
             /*approval_manager=*/approval_manager_for_test,
             /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn),
             /*ca_store=*/ca_store_for_test,
@@ -1453,7 +1465,8 @@ private:
             /*product_pack_store=*/product_pack_store_for_test,
             /*workflow_engine=*/workflow_engine_for_test,
             /*issue_code_signing_fn=*/issue_code_signing_fn_for_test,
-            /*verify_api=*/verify_api_for_test);
+            /*verify_api=*/verify_api_for_test,
+            /*lockout_clear_fn=*/lockout_clear_fn_for_test);
     }
 };
 
@@ -2742,6 +2755,253 @@ TEST_CASE("MCP rotate_api_token: readonly tier is denied before RBAC (tier-befor
     REQUIRE(str_body.contains("error"));
     CHECK(str_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
     CHECK(store.get_token(token_id).value()->rotation_group.empty());
+}
+
+// ── B4 (#2146 API-parity) — list/create/revoke API token twins ─────────────
+
+TEST_CASE("MCP list_api_tokens: unconditionally self-scoped to the caller, never another "
+          "principal's tokens",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("mine", "test-user").has_value());
+    REQUIRE(store.create_token("someone-elses", "other-user").has_value());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1000,)"
+                       R"("params":{"name":"list_api_tokens","arguments":{}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    // tool_result_split: content[0].text is the bare array, structuredContent
+    // carries the {"tokens":[...]} wrapper — see list_management_group_roles'
+    // test above for the same established pattern.
+    auto payload = body["result"]["structuredContent"];
+    REQUIRE(payload["tokens"].is_array());
+    REQUIRE(payload["tokens"].size() == 1);
+    CHECK(payload["tokens"][0]["name"] == "mine");
+    CHECK(payload["tokens"][0]["principal_id"] == "test-user");
+}
+
+TEST_CASE("MCP list_api_tokens: RBAC denial (ApiToken:Read) blocks the call", "[mcp][token]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ApiToken" && op == "Read");
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1001,)"
+                       R"("params":{"name":"list_api_tokens","arguments":{}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP create_api_token: happy path mints a token owned by the caller",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1002,)"
+                       R"("params":{"name":"create_api_token","arguments":{"name":"ci-key"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["name"] == "ci-key");
+    REQUIRE_FALSE(payload["token"].get<std::string>().empty());
+    auto listing = store.list_tokens("test-user");
+    REQUIRE(listing.has_value());
+    REQUIRE(listing->size() == 1);
+    CHECK(listing->front().name == "ci-key");
+    CHECK(listing->front().principal_id == "test-user"); // always self-issued
+}
+
+TEST_CASE("MCP create_api_token: RBAC denial (ApiToken:Write) blocks the call", "[mcp][token]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ApiToken" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1003,)"
+        R"("params":{"name":"create_api_token","arguments":{"name":"x"}}})");
+    REQUIRE(res->status == 403);
+}
+
+namespace {
+// Combined template for create_api_token's scope_service multi-store
+// authority check: ApiTokenStore + ManagementGroupStore + RbacStore all
+// migrated onto one database (different schemas, no collision) — mirrors
+// the "mcp_rbac_tpl" (SoftwareLicensingStore + RbacStore) precedent above.
+yuzu::test::PgTestTemplate mcp_token_scope_service_tpl{
+    "mcptokensvcscope", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::ApiTokenStore tokens{pool};
+        yuzu::server::ManagementGroupStore mgmt{pool};
+        yuzu::server::RbacStore rbac{pool};
+        if (!tokens.is_open() || !mgmt.is_open() || !rbac.is_open())
+            throw std::runtime_error("mcptokensvcscope template: a store failed to migrate");
+    }};
+} // namespace
+
+TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner authority "
+          "on the 'Service: <name>' management group (multi-store check)",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_token_scope_service_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore tokens{pool};
+    yuzu::server::ManagementGroupStore mgmt{pool};
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(tokens.is_open());
+    REQUIRE(mgmt.is_open());
+    REQUIRE(rbac.is_open());
+    rbac.set_rbac_enabled(true);
+
+    const int64_t now = static_cast<int64_t>(std::time(nullptr));
+    const std::string expires_at_arg = std::to_string(now + 3600);
+
+    McpTestServer ts_denied;
+    ts_denied.engine_credential_store_for_test = &tokens;
+    ts_denied.mgmt_store_for_test = &mgmt;
+    ts_denied.rbac_store_for_test = &rbac;
+    // No ITServiceOwner grant yet, and the mock perm_fn's default-allow would
+    // mask the multi-store check entirely — deny the fleet-wide
+    // ManagementGroup:Write arm so only the ITServiceOwner-of-service-group
+    // fallback could admit this call.
+    ts_denied.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts_denied.start();
+    auto denied = ts_denied.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1004,)"
+        R"("params":{"name":"create_api_token",)"
+        R"("arguments":{"name":"svc-key","scope_service":"billing","expires_at":)" +
+        expires_at_arg + R"(}}})");
+    REQUIRE(denied->status == 200);
+    auto denied_body = nlohmann::json::parse(denied->body);
+    REQUIRE(denied_body.contains("error"));
+    CHECK(denied_body["error"]["message"].get<std::string>().find("ITServiceOwner authority") !=
+          std::string::npos);
+    CHECK_FALSE(tokens.list_tokens("test-user")->size() > 0);
+
+    // Grant test-user ITServiceOwner on "Service: billing" — the fallback
+    // arm should now admit the same call.
+    yuzu::server::ManagementGroup svc_group;
+    svc_group.name = "Service: billing";
+    svc_group.membership_type = "static";
+    svc_group.created_by = "admin";
+    auto svc_group_id = mgmt.create_group(svc_group);
+    REQUIRE(svc_group_id.has_value());
+    yuzu::server::GroupRoleAssignment grant;
+    grant.group_id = *svc_group_id;
+    grant.principal_type = "user";
+    grant.principal_id = "test-user";
+    grant.role_name = "ITServiceOwner";
+    REQUIRE(mgmt.assign_role(grant).has_value());
+
+    McpTestServer ts_allowed;
+    ts_allowed.engine_credential_store_for_test = &tokens;
+    ts_allowed.mgmt_store_for_test = &mgmt;
+    ts_allowed.rbac_store_for_test = &rbac;
+    ts_allowed.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts_allowed.start();
+    auto allowed = ts_allowed.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1005,)"
+        R"("params":{"name":"create_api_token",)"
+        R"("arguments":{"name":"svc-key","scope_service":"billing","expires_at":)" +
+        expires_at_arg + R"(}}})");
+    REQUIRE(allowed->status == 200);
+    auto allowed_body = nlohmann::json::parse(allowed->body);
+    REQUIRE(allowed_body.contains("result"));
+    auto listing = tokens.list_tokens("test-user");
+    REQUIRE(listing.has_value());
+    REQUIRE(listing->size() == 1);
+    CHECK(listing->front().scope_service == "billing");
+}
+
+TEST_CASE("MCP revoke_api_token: happy path revokes the caller's own token",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("to-revoke", "test-user").has_value());
+    const auto token_id = store.list_tokens("test-user").value().front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto tok = store.get_token(token_id);
+    REQUIRE(tok.has_value());
+    REQUIRE(tok->has_value());
+    CHECK((*tok)->revoked);
+}
+
+TEST_CASE("MCP revoke_api_token: another user's token is 'not found', not an enumeration "
+          "oracle",
+          "[mcp][pg][token]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.create_token("not-mine", "other-user").has_value());
+    const auto token_id = store.list_tokens("other-user").value().front().token_id;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    // mock_username defaults to "test-user", not the owner; mock_role
+    // defaults to admin, which the store's own JIT-elevation allowance would
+    // let bypass the ownership check entirely (matching REST's own admin
+    // override) — force a non-admin role so this test actually exercises the
+    // owner-vs-nonexistent belt, not the elevated-session bypass.
+    ts.mock_role = yuzu::server::auth::Role::user;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1007,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "token not found");
+    auto tok = store.get_token(token_id);
+    REQUIRE(tok.has_value());
+    REQUIRE(tok->has_value());
+    CHECK_FALSE((*tok)->revoked); // untouched
+}
+
+TEST_CASE("MCP revoke_api_token: RBAC denial (ApiToken:Delete) blocks the call",
+          "[mcp][token]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ApiToken" && op == "Delete");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1008,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":"x"}}})");
+    REQUIRE(res->status == 403);
 }
 
 TEST_CASE("MCP confirm_engine_rotation: a pre-consume precondition denies a drifted "
@@ -4178,6 +4438,171 @@ TEST_CASE("MCP Integration: discover_permissions wired vs unwired",
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     CHECK(body2.contains("error"));
+}
+
+// ── B4 (#2146 API-parity) — check_permission ────────────────────────────────
+// Self-check "can I do X" tool. Mirrors POST /api/v1/rbac/check EXACTLY: that
+// REST handler has NO perm_fn call at all (auth_fn only) — the tool answers a
+// question about the CALLING PRINCIPAL's own authority, so its own call is
+// never itself RBAC-gated.
+
+TEST_CASE("MCP check_permission: answers true for a permission the caller's role grants",
+          "[mcp][pg][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::PrincipalRole pr;
+    pr.principal_type = "user";
+    pr.principal_id = "test-user";
+    pr.role_name = "Administrator";
+    REQUIRE(rbac.assign_role(pr).has_value());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2000,)"
+        R"("params":{"name":"check_permission",)"
+        R"("arguments":{"securable_type":"ManagementGroup","operation":"Write"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["allowed"] == true);
+}
+
+TEST_CASE("MCP check_permission: answers false for a permission the caller lacks — the tool "
+          "call itself still succeeds (200), it is not a denial",
+          "[mcp][pg][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    yuzu::server::PrincipalRole pr;
+    pr.principal_type = "user";
+    pr.principal_id = "test-user";
+    pr.role_name = "Viewer"; // a narrow, non-admin role
+    REQUIRE(rbac.assign_role(pr).has_value());
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2001,)"
+        R"("params":{"name":"check_permission",)"
+        R"("arguments":{"securable_type":"ManagementGroup","operation":"Write"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["allowed"] == false);
+}
+
+TEST_CASE("MCP check_permission: reachable even when the caller holds NO RBAC permissions "
+          "at all — this tool has no perm_fn gate of its own, matching POST "
+          "/api/v1/rbac/check exactly",
+          "[mcp][pg][rbac]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+    // No role assigned to test-user at all.
+
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    // Deny EVERY permission via the mock — if check_permission called perm_fn
+    // for itself, this would 403 it. It must not.
+    ts.perm_override_for_test = [](const std::string&, const std::string&) { return false; };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2002,)"
+        R"("params":{"name":"check_permission",)"
+        R"("arguments":{"securable_type":"ManagementGroup","operation":"Write"}}})");
+    REQUIRE(res->status == 200); // NOT 403 — no perm_fn gate on this tool itself
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["allowed"] == false); // the ANSWER is false; the CALL still succeeded
+}
+
+// ── B4 (#2146 API-parity) — unlock_account ──────────────────────────────────
+
+TEST_CASE("MCP unlock_account: happy path clears the lockout and audits "
+          "auth.lockout.cleared",
+          "[mcp][account]") {
+    McpTestServer ts;
+    ts.lockout_clear_fn_for_test = [](const std::string&) { return true; };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2100,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"alice"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["username"] == "alice");
+    CHECK(payload["unlocked"] == true);
+    CHECK(payload["audit_emitted"] == true);
+    bool saw_audit = false;
+    for (size_t i = 0; i < ts.audit_log.size(); ++i) {
+        if (ts.audit_log[i] == "auth.lockout.cleared|ok") {
+            saw_audit = true;
+            CHECK(ts.audit_target_ids[i] == "alice");
+        }
+    }
+    CHECK(saw_audit);
+}
+
+TEST_CASE("MCP unlock_account: RBAC denial (UserManagement:Write) blocks the call",
+          "[mcp][account]") {
+    McpTestServer ts;
+    ts.lockout_clear_fn_for_test = [](const std::string&) { return true; };
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "UserManagement" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2101,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"alice"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP unlock_account: unwired lockout_clear_fn reports subsystem unavailable, "
+          "matching the REST route's degrade when its own callback is unwired",
+          "[mcp][account]") {
+    McpTestServer ts; // lockout_clear_fn_for_test left unset (default)
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2102,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"alice"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "lockout subsystem unavailable");
+}
+
+TEST_CASE("MCP unlock_account: invalid username format is rejected before the store is "
+          "ever reached",
+          "[mcp][account]") {
+    McpTestServer ts;
+    bool called = false;
+    ts.lockout_clear_fn_for_test = [&called](const std::string&) {
+        called = true;
+        return true;
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2103,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"bad user!"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "invalid username format");
+    CHECK_FALSE(called);
 }
 
 TEST_CASE("MCP Integration: discover_instructions wired vs unwired",
@@ -14696,6 +15121,403 @@ TEST_CASE("MCP preview_management_group_agent_count: securable/operation registr
     CHECK(it->operation == "Write");
 }
 
+// ── B4 (#2146 API-parity) — management-group CRUD/membership/role twins ────
+
+namespace {
+// Shares the SAME template name ("mgmtgroupstore") + setup body as
+// test_management_group_store.cpp's own `mgmt_tpl` — PgTestTemplate's registry
+// is keyed by name, so a byte-identical setup here is built once and reused
+// across TUs rather than migrated twice (see PgTestTemplate's own doc comment
+// on sharing a name across files needing the exact same store set).
+yuzu::test::PgTestTemplate mcp_mgmt_tpl{"mgmtgroupstore", [](const std::string& dsn) {
+    yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+    yuzu::server::ManagementGroupStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("mgmtgroupstore template: store failed to migrate");
+}};
+} // namespace
+
+TEST_CASE("MCP create_management_group: happy path persists a new group",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"create_management_group",)"
+        R"("arguments":{"name":"Prod Servers","description":"all prod boxes"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    const auto id = payload["id"].get<std::string>();
+    REQUIRE_FALSE(id.empty());
+    auto g = store.get_group(id);
+    REQUIRE(g.has_value());
+    CHECK(g->name == "Prod Servers");
+    CHECK(g->description == "all prod boxes");
+    CHECK(g->created_by == "test-user"); // session->username, never caller-supplied
+}
+
+TEST_CASE("MCP create_management_group: RBAC denial (ManagementGroup:Write) blocks the call",
+          "[mcp][management_group]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"create_management_group","arguments":{"name":"x"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP get_management_group: happy path returns metadata + members",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Db Tier";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    REQUIRE(store.add_member(*created, "agent-77").has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["name"] == "Db Tier");
+    REQUIRE(payload["members"].is_array());
+    REQUIRE(payload["members"].size() == 1);
+    CHECK(payload["members"][0]["agent_id"] == "agent-77");
+}
+
+TEST_CASE("MCP get_management_group: nonexistent id reports not-found, no crash",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":"deadbeef0000"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "group not found");
+}
+
+TEST_CASE("MCP get_management_group: RBAC denial (ManagementGroup:Read) blocks the call",
+          "[mcp][management_group]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Read");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":"x"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP update_management_group: happy path renames a group",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Old Name";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,)"
+        R"("params":{"name":"update_management_group","arguments":{"group_id":")" +
+        *created + R"(","name":"New Name"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto updated = store.get_group(*created);
+    REQUIRE(updated.has_value());
+    CHECK(updated->name == "New Name");
+}
+
+TEST_CASE("MCP update_management_group: RBAC denial (ManagementGroup:Write) blocks the call",
+          "[mcp][management_group]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,)"
+        R"("params":{"name":"update_management_group","arguments":{"group_id":"x","name":"y"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP add_management_group_member: happy path adds a static member, idempotent",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Web Tier";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    const std::string call_body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,)"
+        R"("params":{"name":"add_management_group_member","arguments":{"group_id":")" +
+        *created + R"(","agent_id":"agent-1"}}})";
+    auto res = ts.call(call_body);
+    REQUIRE(res->status == 200);
+    auto res2 = ts.call(call_body); // idempotent re-add
+    REQUIRE(res2->status == 200);
+    auto members = store.get_members(*created);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0].agent_id == "agent-1");
+}
+
+TEST_CASE("MCP add_management_group_member: RBAC denial (ManagementGroup:Write) blocks the call",
+          "[mcp][management_group]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,)"
+        R"("params":{"name":"add_management_group_member",)"
+        R"("arguments":{"group_id":"x","agent_id":"agent-1"}}})");
+    REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP list_management_group_roles: ITServiceOwner-of-this-group fallback admits "
+          "without UserManagement:Read (compound gate)",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Owned Group";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    yuzu::server::GroupRoleAssignment owner_grant;
+    owner_grant.group_id = *created;
+    owner_grant.principal_type = "user";
+    owner_grant.principal_id = "test-user"; // matches McpTestServer's default mock_username
+    owner_grant.role_name = "ITServiceOwner";
+    REQUIRE(store.assign_role(owner_grant).has_value());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    // The fleet-wide UserManagement:Read arm is denied — only the
+    // ITServiceOwner-of-this-group fallback can admit this call.
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "UserManagement" && op == "Read");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,)"
+        R"("params":{"name":"list_management_group_roles","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    // tool_result_split puts the bare array in content[0].text (byte-identical
+    // to the pre-split wire shape) and the {"roles":[...]} wrapper in
+    // structuredContent — read the latter, matching the established pattern
+    // for every other tool built on tool_result_split in this file.
+    auto payload = body["result"]["structuredContent"];
+    REQUIRE(payload["roles"].is_array());
+    REQUIRE(payload["roles"].size() == 1);
+    CHECK(payload["roles"][0]["role_name"] == "ITServiceOwner");
+}
+
+TEST_CASE("MCP list_management_group_roles: neither UserManagement:Read nor "
+          "ITServiceOwner-of-group admits — 403 (compound gate, both arms denied)",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Unowned Group";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    // No ITServiceOwner grant for "test-user" on this group.
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "UserManagement" && op == "Read");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":11,)"
+        R"("params":{"name":"list_management_group_roles","arguments":{"group_id":")" +
+        *created + R"("}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "forbidden");
+}
+
+TEST_CASE("MCP assign_management_group_role: happy path grants Operator, idempotent",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Target";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    // assign_management_group_role's gate requires rbac_store non-null (mirrors
+    // the REST route's own `!mgmt_store || !rbac_store` 503 guard) but never
+    // dereferences it in this code path — a closed, non-null store is
+    // sufficient and avoids a second live Postgres connection.
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start(); // perm_override unset -> ManagementGroup:Write allowed
+    const std::string call_body =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,)"
+        R"("params":{"name":"assign_management_group_role",)"
+        R"("arguments":{"group_id":")" +
+        *created + R"(","principal_id":"alice","role_name":"Operator"}}})";
+    auto res = ts.call(call_body);
+    REQUIRE(res->status == 200);
+    auto res2 = ts.call(call_body); // idempotent re-assign
+    REQUIRE(res2->status == 200);
+    auto roles = store.get_group_roles(*created);
+    REQUIRE(roles.size() == 1);
+    CHECK(roles[0].principal_id == "alice");
+    CHECK(roles[0].role_name == "Operator");
+}
+
+TEST_CASE("MCP assign_management_group_role: role_name outside {Operator,Viewer} is "
+          "rejected before the store is ever reached",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Target 2";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,)"
+        R"("params":{"name":"assign_management_group_role",)"
+        R"("arguments":{"group_id":")" +
+        *created + R"(","principal_id":"alice","role_name":"ITServiceOwner"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "only Operator and Viewer roles can be delegated");
+    CHECK(store.get_group_roles(*created).empty());
+}
+
+TEST_CASE("MCP assign_management_group_role: RBAC denial (ManagementGroup:Write, no "
+          "ITServiceOwner fallback) blocks the call",
+          "[mcp][pg][management_group]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+    yuzu::server::ManagementGroup g;
+    g.name = "Role Target 3";
+    g.membership_type = "static";
+    g.created_by = "admin";
+    auto created = store.create_group(g);
+    REQUIRE(created.has_value());
+    yuzu::server::pg::PgPool bad_pool{
+        {.conninfo = "host=127.0.0.1 port=1 dbname=nope user=nope connect_timeout=1", .size = 1}};
+    yuzu::server::RbacStore closed_rbac{bad_pool};
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.rbac_store_for_test = &closed_rbac;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,)"
+        R"("params":{"name":"assign_management_group_role",)"
+        R"("arguments":{"group_id":")" +
+        *created + R"(","principal_id":"alice","role_name":"Operator"}}})");
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"] == "forbidden");
+    CHECK(store.get_group_roles(*created).empty());
+}
+
 // ── query_software_licenses (ADR-0024 SLE discovery — the MCP twin of the ──────
 //    GET /api/v1/sle/agents/{id} drill). Same per-device SCOPED SoftwareLicensing:
 //    Read gate (ADR-0017 confinement) as the REST drill, the same #1717 fail-closed
@@ -17028,6 +17850,22 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // fragment's own gate exactly (see its kTools[] entry's comment).
         {"preview_management_group_agent_count",
          nlohmann::json::parse(R"({"command_id":"cmd-1","plugin":"procfetch"})")},
+        // B4 (#2146 API-parity): the four ManagementGroup:Write mutations, plus
+        // ApiToken:Delete and UserManagement:Write, are all supervised-tier
+        // gated (requires_approval()'s general Delete rule for revoke_api_token;
+        // its explicit ManagementGroup:Write and UserManagement:Write rules for
+        // the rest). create_api_token (ApiToken:Write, not gated — see
+        // mcp_policy.hpp's tier_allows() operator-tier comment) and every
+        // read-only B4 tool are deliberately absent from this map.
+        {"create_management_group", nlohmann::json::parse(R"({"name":"g"})")},
+        {"update_management_group", nlohmann::json::parse(R"({"group_id":"abc123"})")},
+        {"add_management_group_member",
+         nlohmann::json::parse(R"({"group_id":"abc123","agent_id":"a"})")},
+        {"assign_management_group_role",
+         nlohmann::json::parse(
+             R"({"group_id":"abc123","principal_id":"alice","role_name":"Operator"})")},
+        {"revoke_api_token", nlohmann::json::parse(R"({"token_id":"abc123"})")},
+        {"unlock_account", nlohmann::json::parse(R"({"username":"alice"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
