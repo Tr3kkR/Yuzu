@@ -341,7 +341,7 @@ cluster unit; intra-zone scale is more nodes.
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
 
-**Status (WS-4): 4.1 done.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
+**Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done — see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
 `gateway_route_store.{hpp,cpp}`, Postgres schema `gateway_route_store`) and is written on the
 gateway-upstream connect/disconnect/heartbeat paths, but it is **INERT** — no dispatch surface reads it
 yet, so this slice changes no runtime routing behaviour. The epoch in "delayed replay from an older
@@ -355,58 +355,90 @@ epoch settles who WINS a fresh registration race, `session_id` settles who may t
 afterward. The wire gained only `StreamStatusNotification.cluster_id`. Posture is fail-open on a
 runtime write failure today (the directory isn't dispatch-authoritative yet); **4.2 (northbound
 dispatch rewire) must flip that to fail-closed** before a command's undeliverable-because-route-unknown
-case can be trusted. 4.3 (net-new distributed intra-cluster routing) and 4.4 (`gateway_node`
+case can be trusted — slice **4.2a** below hardens the writer path itself (tombstone semantics, a
+stale-route reaper, a fresh-epoch-clobber fix, guard-rejection visibility) but deliberately defers that
+flip to **4.2b**. 4.3 (net-new distributed intra-cluster routing) and 4.4 (`gateway_node`
 convergence reconcile) remain outstanding.
 
 **4.2 design obligations surfaced by the 4.1 governance review (all INERT today — latent because
 nothing reads the directory — but load-bearing the moment 4.2 makes it dispatch-authoritative; the
 "cannot overwrite a newer re-home" guarantee above is precise only for *overwrite*, and only
-intra-replica with a live session):**
-- **Epoch orders by server PROCESSING time, not connection recency.** The `nextval` is minted when a
-  ProxyRegister is *handled*. A zombie/delayed replay whose original session has already left the
-  in-memory `gateway_sessions_` map (post-DISCONNECTED, a replica restart, or a cross-replica fan-out)
-  falls into the FRESH branch, mints a *higher* epoch, and WINS the CAS — so the fence does not stop a
-  stale replay that has lost its session membership. 4.2 must gate the fresh-branch clobber (e.g. refuse
-  a fresh register while a live higher-epoch lease is unexpired) or treat session-eviction as the
-  explicit supersede signal.
+intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) closed items #2, #4, #5,
+#7, #8's counter half, and #9** — the writer-path hardening only, still short of dispatch-authoritative
+4.2 itself:**
+- **Epoch orders by server PROCESSING time, not connection recency** (#4246 #2 — **CLOSED, 4.2a**). The
+  `nextval` is minted when a ProxyRegister is *handled*. A zombie/delayed replay whose original session
+  has already left the in-memory `gateway_sessions_` map (post-DISCONNECTED, a replica restart, or a
+  cross-replica fan-out) previously fell into the FRESH branch, minted a *higher* epoch, and WON the
+  CAS. **4.2a closes this**: `ProxyRegister`'s mechanism (c) branch — a presented session unknown to
+  this replica's `gateway_sessions_` — now renews the PRESENTED session in the directory instead of
+  calling `register_fresh`, so it never mints a fresh epoch or reaches the clobbering branch. The
+  session-id-minting/`gateway_sessions_`-population half of the gap (the S′-vs-S response desync) is
+  unchanged — see the next-but-one bullet.
 - **The re-announce REUSES the session id, so a late DISCONNECTED for that same id deletes the live
-  re-homed route** — the session guard cannot distinguish original-home teardown from re-home.
-- **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`); under
+  re-homed route** (#4246 #4 — **CLOSED, 4.2a**) — the session guard could not distinguish original-home
+  teardown from re-home. **4.2a closes this**: `deregister` now TOMBSTONES the row (`session_id`/
+  `lease_until`/`cluster_id`/`gateway_node` → NULL, `connection_epoch` retained) instead of deleting it,
+  so a late CONNECTED for the same now-gone session no-ops against the tombstone instead of resurrecting
+  a dead route — see the `announce_connected` fallback-INSERT bullet below, closed by the same change.
+- **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) (#4246 #3 —
+  **DEFERRED**, re-homed to its own slice under WS-5 shared agent presence, ADR §7a); under
   active-active a replay routed to a non-owning replica always takes the fresh branch. A durable
   cross-replica session lookup is required before the guarantee holds on more than one replica.
 - **Re-announce refreshes LIVENESS (lease), not PLACEMENT** — `cluster_id`/`gateway_node` are not
   re-read on the replay branch, and a fresh re-register COALESCE-preserves the OLD cluster/node until a
   CONNECTED `announce_connected` lands; a 4.2 reader must not trust placement from a replay/fail-open
-  window.
-- **A stale-lease reaper is required** before 4.2 — a missed DISCONNECT leaves an orphan lease (growth
-  is PK-bounded, so not a capacity risk, but a dead route reads live). The reaper MUST also sweep
-  **lease-less rows** (`lease_until IS NULL`) by `updated_at` age: a won `register_fresh` resets the
-  lease to NULL (a new connection does not inherit the superseded one's lease — landed in 4.1), and a
-  NULL lease never reads `is_stale`, so a row whose stream never establishes (no CONNECTED, no
-  DISCONNECTED) would otherwise live forever.
+  window. Unaffected by 4.2a.
+- **A stale-lease reaper is required** before 4.2 (#4246 #7 — **CLOSED, 4.2a**) — a missed DISCONNECT
+  leaves an orphan lease (growth is PK-bounded, so not a capacity risk, but a dead route reads live).
+  **4.2a closes this**: `GatewayRouteStore::reap_stale_routes()`, a clock-guarded background pass
+  (`docs/clock-guarded-retention.md`'s adoption register has the full record) on a ~5-minute cadence,
+  sweeps (a) leases expired past a 180s grace window (2× the 90s TTL) — tombstoned, not deleted — and
+  (b) NULL-lease rows (tombstones, or a `register_fresh` that never got an `announce_connected`) past a
+  300s purge age — hard-deleted.
 - **`announce_connected`'s fallback INSERT can RESURRECT a row after `deregister`** when CONNECTED and
-  DISCONNECTED race (the gateway spawns one sender process per notification, no arrival-order
-  guarantee): a late CONNECTED for a just-deregistered session re-inserts `(epoch 0, session S, fresh
-  lease)` for a dead stream — neither the epoch fence (fallback hardcodes epoch 0) nor the session guard
-  (same session) stops it. 4.2 fix: tombstone on `deregister`, or epoch-guard the fallback insert.
+  DISCONNECTED race (#4246 #5 — **CLOSED, 4.2a**) — the gateway spawns one sender process per
+  notification, no arrival-order guarantee: a late CONNECTED for a just-deregistered session used to
+  re-insert `(epoch 0, session S, fresh lease)` for a dead stream. **4.2a closes this** via the same
+  `deregister` tombstone change above: the fallback INSERT is `ON CONFLICT (agent_id) DO NOTHING`, and
+  against an EXISTING tombstoned row it now no-ops instead of reviving a dead route.
 - **The gateway discards the replay `ProxyRegister` response, so a server-minted fresh session desyncs
-  silently.** When the presented session is unknown (core restart / replica failover / post-DISCONNECT
-  eviction) the server mints a NEW session and returns it, but the gateway's replay path ignores the
-  response and keeps stamping the OLD session id on every notify/heartbeat → `renew`/`announce`/
-  `deregister` all miss, the route is stale and wrong-sessioned until the agent reconnects or the 4.4
-  reconcile runs. 4.2/4.4 fix: write the replay response's `session_id` back into the gateway registry,
-  or reconcile. (ADR §7 already assigns core-restart convergence to 4.4; the point here is the 4.1
-  replay protocol itself manufactures the desync.)
-- **Guard-rejection no-ops are unobserved.** The 4.1 fail-open counter covers only Postgres WRITE
-  FAILURES; a systemic guard-rejection desync (e.g. every `renew` matching 0 rows, every `announce`
-  no-opping after the replay desync above) moves neither a log nor a metric. 4.2 must add a
-  no-op/mismatch counter (`announce matched=false` / `deregister removed=false` / `renew
-  renewed<requested`) so the desync is visible before a reader trusts the directory.
-- **Optionally correlate `agent_id` on `renew_leases`** — today renew matches `session_id` alone
-  (defense-in-depth gap against a compromised gateway renewing a foreign session; see the trust-rationale
-  comment at the BatchHeartbeat site). Pair `agent_id` per renewed session if the directory becomes
-  authoritative.
-- **Ship the write-failure alert rule + metrics-doc entry with the fail-closed flip.**
+  silently** (#4246 #6 — **DEFERRED to 4.4**). When the presented session is unknown (core restart /
+  replica failover / post-DISCONNECT eviction) the server mints a NEW session and returns it, but the
+  gateway's replay path ignores the response and keeps stamping the OLD session id on every
+  notify/heartbeat → `renew`/`announce`/`deregister` all miss, the route is stale and wrong-sessioned
+  until the agent reconnects or the 4.4 reconcile runs. 4.2a's mechanism (c) (see above) renews the
+  *presented* session server-side rather than clobbering it, which narrows the blast radius, but the
+  gateway-side session-id writeback itself remains 4.4's fix.
+- **Guard-rejection no-ops are unobserved** (#4246 #8 — **counter half CLOSED, 4.2a; alert-rule half
+  DEFERRED to 4.2b**). The 4.1 fail-open counter covers only Postgres WRITE FAILURES; a systemic
+  guard-rejection desync (e.g. every `renew` matching 0 rows, every `announce` no-opping) moved neither
+  a log nor a metric. **4.2a closes the counter half**: `yuzu_server_gateway_route_desync_total{op,
+  outcome}` (`op` ∈ `renew_leases`\|`announce_connected`\|`deregister`\|`notify_stream_status`,
+  `outcome` ∈ `shortfall`\|`session_mismatch`\|`unknown_session`) — see
+  `docs/observability-conventions.md` and `docs/user-manual/metrics.md`. The alert rule ships with the
+  4.2b fail-closed flip (next bullet, #4246 #1).
+- **Optionally correlate `agent_id` on `renew_leases`** (#4246 #10 — **DEFERRED to 4.4**) — today renew
+  matches `session_id` alone (defense-in-depth gap against a compromised gateway renewing a foreign
+  session; see the trust-rationale comment at the BatchHeartbeat site). Pair `agent_id` per renewed
+  session if the directory becomes authoritative.
+- **Ship the write-failure alert rule + metrics-doc entry with the fail-closed flip** (#4246 #1 —
+  **DEFERRED to 4.2b**, alongside #8's alert-rule half above). The metrics-doc entries for BOTH counter
+  families already exist (`docs/observability-conventions.md`, `docs/user-manual/metrics.md`); what
+  remains is the fail-closed posture flip itself and the alert rule(s) that depend on the directory
+  being dispatch-authoritative.
+
+**Status (4.2a, 2026-09-11): writer-path hardening DONE (PR pending, branch
+`feat/ha-ws4-42a-directory-hardening`)** — `deregister` tombstone semantics, `reap_stale_routes`
+(scheduled `ReplicaSafe` in `background_jobs.hpp`, WS-10 classification), the mechanism-(c)
+unknown-presented-session fix, the `yuzu_server_gateway_route_desync_total` counter, and the
+hot-path/reaper write-timeout split (500ms/2000ms) (#4246 #9 — **CLOSED, 4.2a**) all land in this slice. **The directory is STILL
+INERT** — nothing dispatches through it — and **4.2 (northbound dispatch rewire, making the directory
+dispatch-authoritative) is NOT done**; the fail-closed posture flip and its alert rule are explicitly
+deferred to 4.2b. Remaining WS-4 sub-work after 4.2a: 4.2b (fail-closed flip + alert rule), the durable
+cross-replica session lookup (re-homed to its own slice under WS-5), 4.3 (net-new distributed
+intra-cluster agent→node routing), 4.4 (`gateway_node` convergence reconcile, replay-response
+writeback, `agent_id`-on-renew correlation).
 
 ### 7a. Shared agent presence / health / scope population (new, per review)
 `AgentRegistry` is **more than a stream router** — it is also the authoritative **live-agent set,

@@ -156,6 +156,143 @@ These two carve-outs are recorded here per part (6)'s "record which way you went
 the full 7. SINGLE-WRITER today (the one server); becomes PG-shared-state under the ADR-0012
 advisory lock when a 2nd replica lands.
 
+### `GatewayRouteStore::reap_stale_routes` (HA WS-4 slice 4.2a, hardened PR #4299)
+
+JOINS this guarded set on the `SessionStore::reap_expired` shape (`pg_try_advisory_xact_lock`
+own-statement `gateway_route_store:reap` — all but the holder skip, PR #4299 round-2 external
+review — in-SQL DB `now()` read once for both cutoffs + anchor-compare + anchor-update,
+persisted+sanitised `route_meta` anchor, forward/backward-anomaly decline, unconditional
+per-predicate cap):
+
+1. **NO would-wipe probe** (DELIBERATE carve-out, the `api_token_store`/`SessionStore` precedent) —
+   the `agent_routes` table legitimately drains toward "every lease expired" as ROUTINE behaviour (a
+   fleet going offline overnight expires every lease), so a would-wipe verdict cannot separate a true
+   from a false positive here.
+4. **Fact-set anomaly dedup is ADOPTED** (PR #4299 review; an earlier revision carved this out too,
+   the way `SessionStore` does — that was the defect this fix closes), in a form simplified for this
+   store's small state: **decline-once / drain-on-repeat, keyed on the PAIR (declined `reap_anchor_ms`
+   value, anomaly DIRECTION)** (round-2 external review; the initial round-2 fix keyed on the anchor
+   value alone — see "Direction-keyed, not anchor-value-alone" below for the defect that closed)
+   rather than the full multi-field `Facts` struct `audit_store.cpp` uses. A forward- or backward-skew
+   anomaly persists `route_meta.reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>"` and declines;
+   an IDENTICAL repeat (the anchor still unmoved, because a decline never advances it, AND the same
+   direction) RECOVERS — runs both sweeps under the cap, advances `reap_anchor_ms` to `now_ms`
+   UNCONDITIONALLY (never `max(anchor, now_ms)`, which would leave a forward-skew-poisoned anchor
+   stuck forever), and clears the declined-anchor marker. A DIFFERENT-direction anomaly at the SAME
+   frozen anchor (e.g. a backward-skew decline followed by an unrelated forward-skew reading) does
+   NOT match — it re-declines and re-arms against the new direction instead of recovering. A normal
+   (non-anomalous) accepted pass also clears the marker, so a later transient glitch is judged fresh
+   against the new anchor rather than free-riding on a stale recovery. **Why this mattered**: the
+   carved-out version wedged PERMANENTLY after any routine >24h
+   gap (weekend shutdown, DR failover, extended maintenance) — `now - anchor` only grows while
+   declined, so every subsequent pass declined forever with no recovery path. **Corrected (round-2
+   review, then re-corrected to add direction below): there is no permanent wedge either way for a
+   clock that keeps drifting the SAME direction.** A skew that persists into the next pass at the
+   SAME direction presents the SAME frozen (anchor, direction) pair, which is exactly the match, so
+   it RECOVERS on that pass — it does not "correctly never recover on its own." A continuously-drifting
+   clock instead OSCILLATES (decline, recover, decline, recover, ...) roughly every other pass, since
+   a recovered pass re-anchors to that pass's `now_ms` unconditionally, and the next pass judges
+   itself fresh against the new anchor. The **operator re-anchor** (reset `route_meta.reap_anchor_ms`
+   and, for cleanliness, `route_meta.reap_declined_anchor_ms` to the corrected current epoch-ms once
+   the underlying clock is fixed) is an OPTIONAL escape hatch to stop that oscillation, not a
+   requirement to un-wedge anything — see the code comment at `gateway_route_store.cpp`'s
+   anomaly-detection site. Every
+   decline is `spdlog::warn`'d AND counted:
+   `yuzu_server_gateway_route_reap_total{outcome="declined"}` (incremented at the reap call site in
+   `server.cpp`, pre-seeded across `ok`/`recovered`/`declined`/`skipped`/`error` since PR #4299
+   round-2, `skipped` added round-2 external review). This
+   is a DEDICATED reap-outcome counter, distinct from
+   `yuzu_server_gateway_route_desync_total`/`_write_failed_total`, which cover the WRITE path
+   (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not a reap pass's own outcome.
+   A reap pass that fails outright (pool/query degradation, distinct from a clock-anomaly decline) is
+   counted the same way under `outcome="error"`; a clean, ORDINARY accepted pass is `outcome="ok"`; a
+   pass that ran via the recovery branch above is its own `outcome="recovered"` (PR #4299 round-2
+   review, `ReapRoutesResult::recovered`) — a recovery can drain a large backlog in one go, so it is
+   metric-distinguishable from a routine `ok` tick rather than reading identically to one.
+
+   **Direction-keyed, not anchor-value-alone (PR #4299 round-2 EXTERNAL review — corrects the
+   round-2 review's own "cross-type recovery is safe" conclusion above, which this fix replaces).**
+   The initial round-2 fix keyed recovery on `declined_anchor == anchor` alone, blind to whether THIS
+   pass's own anomaly is forward- or backward-classified, or whether it matches the classification of
+   the pass that froze `declined_anchor` in the first place — so a BACKWARD-skew decline (pass 1)
+   followed by a DIFFERENT, unrelated FORWARD-skew reading (pass 2) at that SAME anchor satisfied the
+   match and recovered, running the sweeps against pass 2's own forward-skewed (implausibly-huge)
+   `now_ms` — mass-tombstoning live leased routes and letting sweep (b) hard-delete pre-existing
+   NULL-lease (in-handshake `register_fresh`'d) rows. That "only a forward-classified recovery can
+   mass-reap, so keying just needs to gate the forward direction" reasoning was the defect: it treated
+   the CURRENT pass's own classification as sufficient, but never checked that the CURRENT anomaly is
+   the SAME anomaly as the one that froze the anchor. A single fresh forward anomaly that should
+   decline-once instead drained because an unrelated prior backward decline happened to freeze the
+   same anchor value. The fix compares the FULL fact set — (anchor, direction) — never a value-only
+   latch: recovery requires the declined marker's direction to match THIS pass's own direction, so a
+   direction change at the same anchor re-declines (and re-arms against the new direction) instead of
+   recovering. Anomaly-type keying is therefore load-bearing, not unnecessary complexity — see the
+   corrected "Fact-set anomaly dedup is ADOPTED" bullet above and `gateway_route_store.hpp`'s
+   `reap_stale_routes` doc comment for the marker format (`"<anchor>:<direction>"`) and its
+   mixed-version-safe parse (an unparseable value, including a legacy bare-integer marker or this
+   store's own new-format value read by an older binary, is treated as absent and re-declines).
+
+   **The decline-once/drain-on-repeat recovery above is the SKEW path only — a corrupt PERSISTED
+   anchor uses a DIFFERENT mechanism (PR #4299 round-3 review).** An unparseable or negative
+   `route_meta.reap_anchor_ms` reading never reaches the skew logic at all — it is a separate guard,
+   checked first, because it is a durably PERSISTED value rather than a fresh-every-pass `now()`
+   reading: this method is the anchor's sole writer and always writes a sanitised non-negative i64,
+   so an invalid stored value can only be external tampering/corruption. Declining it without
+   repair (the pre-round-3 behaviour) wedged EVERY future pass permanently, since the skew
+   recovery's (anchor, direction) match is never reached from this branch. The fix is
+   SELF-HEAL, not drain-on-repeat: on a corrupt persisted anchor, re-anchor `reap_anchor_ms` to
+   this pass's own already-sanitised `now_ms` (never the anchor's old value), clear
+   `reap_declined_anchor_ms` (a stale skew marker must not be judged against the freshly
+   re-anchored value), and decline only THIS one pass. The next pass then reads back a valid,
+   now()-derived anchor and proceeds as an ordinary accepted pass. Drain-on-repeat is deliberately
+   NOT used here: a corrupt/garbage anchor is not evidence of genuine elapsed downtime the way a
+   persisting skew is, and auto-draining on evidence of tampering risks a mass-reap against
+   garbage data. Net effect: neither anomaly class — skew or corrupt-anchor — leaves the reaper
+   permanently wedged, but they recover via two distinct mechanisms (decline-once/drain-on-repeat
+   vs. self-heal-and-re-anchor), and only the skew path is the "no permanent wedge either way"
+   claim above.
+
+   **Marker-obligation rule (PR #4299 round-3 — decide/apply split).** The recovery mechanisms above
+   hinge on a single invariant that had THREE rounds of the same defect (one terminal/decline path
+   forgetting its marker decision): **every lock-holding pass that COMMITS writes
+   `reap_declined_anchor_ms` exactly once — ARM or CLEAR; LEAVE exists only for passes that never read
+   `now()` (the advisory-lock skip) or that roll back.** Any DISTINCT anomaly — a skew/direction
+   mismatch, a bad `now()` reading, OR a corrupt persisted anchor — CLEARs or re-ARMs the marker,
+   never LEAVES a stale recovery identity a later same-direction skew could free-ride on. The
+   bad-`now()` path specifically now CLEARs (the round-3 fix — it used to LEAVE the marker, so a
+   distinct bad-now anomaly followed by a matching-direction skew at the same anchor could recover on
+   what was really its first skew pass). The class is closed STRUCTURALLY, not by a fourth hand-patch:
+   the decision is computed by the pure `decide_reap` in `server/core/src/gateway_route_reap_rules.hpp`,
+   whose `ReapDecision::marker` is a `MarkerAction` with no default constructor — a reap branch that
+   omits the marker decision is a COMPILE error (the `ExecuteGate` discipline). The store's
+   `reap_stale_routes()` does I/O only: the lock, three reads, and ONE apply tail (the sole `return
+   true` after the lock). `decide_reap`'s five-decision set is unit-tested with no Postgres in
+   `tests/unit/server/test_gateway_route_reap_rules.cpp`; the `[pg]` tests in
+   `test_gateway_route_store.cpp` remain the integration layer asserting the apply tail wires onto the
+   right SQL.
+
+Part (6)'s missing-anchor decision is **PROCEED** (`ResultSetStore`'s answer): a route is
+regenerable by the agent's next heartbeat/`ProxyRegister`, so a from-boot skewed clock reaping a
+batch of already-stale routes on the first pass is an acceptable worst case, never non-reproducible
+evidence loss.
+
+Two predicates sweep in the same pass, both capped independently (`kReapCap = 5000`, matching
+`SessionStore`'s shape — never its number): (a) `lease_until` past a grace window of `2x` the 90s
+lease TTL (`kStaleLeaseGraceSecs = 180`) — TOMBSTONES the row (same shape as `deregister`, retaining
+`connection_epoch`) rather than deleting it, because the associated session may still be alive and
+merely stopped renewing; (b) a NULL-lease row (a real tombstone, or a row stuck since
+`register_fresh` that never got an `announce_connected`) whose `updated_at` is past a SHORT purge age
+(`kTombstonePurgeAgeSecs = 300`) — hard-DELETEs it, since by that age a late CONNECTED/DISCONNECTED
+resurrecting it is not a realistic risk and a genuine later `register_fresh` works identically
+whether the row exists or not. The implausible-forward-skew bound (part 1) is this store's own,
+NEVER copied from a sibling: `kMaxPlausibleSkewMs = 1 day`, sized against this store's own
+sub-ten-minute liveness horizon (grace + purge-age ≈ 480s), not `SessionStore`'s 366-day bound (sized
+to a human session's plausible lifetime).
+
+SINGLE-WRITER today (one dedicated advisory-lock key, `gateway_route_store:reap`); becomes
+PG-shared-state under the same ADR-0012 lock when a 2nd replica lands, matching every sibling in this
+register. See `gateway_route_store.hpp`'s `reap_stale_routes` doc comment for the full record.
+
 ### `ExecutionTracker::reap_command_execution_mappings` (HA WS-1(1b))
 
 JOINS this guarded set on the identical shape (advisory-lock own-statement, in-SQL DB `now()` read

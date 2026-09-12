@@ -115,15 +115,20 @@ steadily.
 routing directory written on the gateway-upstream connect/disconnect/heartbeat
 paths (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`). See
 `docs/postgres-migration-ladder.md`'s `GatewayRouteStore` row for the full
-epoch-fence design.
+epoch-fence design. The desync counter below was added in slice 4.2a; the
+reap-outcome counter was added alongside it in the same slice's governance
+fold.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_gateway_route_write_failed_total` | counter | A `GatewayRouteStore` directory write that degraded instead of succeeding, labeled `op` (`register_fresh`\|`announce_connected`\|`deregister`\|`renew_leases`) and `reason` (`store_unavailable`\|`db_error`). **Fail-OPEN this slice** — the write is logged and the RPC proceeds regardless, since the directory is not yet dispatch-authoritative (4.1) — so this counter is the only signal a systemic Postgres write problem would otherwise leave invisible. |
+| `yuzu_server_gateway_route_desync_total` | counter | A directory session-guard that correctly REJECTED a write/lookup because the presented session doesn't own the row (`op` ∈ `renew_leases`\|`announce_connected`\|`deregister`\|`notify_stream_status`, `outcome` ∈ `shortfall`\|`session_mismatch`\|`unknown_session`). Distinct from the write-failed counter above — the call succeeded, the guard just refused to touch a row it doesn't own. A low background rate is expected (stale/superseded-session notifications); a sustained rise means the in-memory `gateway_sessions_` map and the durable directory have gone out of sync (HA WS-4 4.2a, `#4246` item #8). Deliberately excludes a benign `register_fresh` epoch-race loss. **Two benign contributors an SRE must not page on:** (a) a post-restart/failover baseline rise — a replica that just lost its in-memory `gateway_sessions_` emits `unknown_session`/`shortfall` until agents re-announce/reap; this is the dominant post-restart symptom, not an incident by itself; (b) a redelivered/duplicate `DISCONNECTED` notification, which counts as a `deregister`/`session_mismatch` the second time it arrives. |
+| `yuzu_server_gateway_route_reap_total{outcome}` | counter | `reap_stale_routes()` background-tick outcomes (HA WS-4 4.2a governance fold), `outcome` ∈ `ok`\|`recovered`\|`declined`\|`skipped`\|`error`. `declined` means the pass was skipped by the clock-guarded-retention anomaly guard (an implausible or unparseable `now()`/persisted-anchor reading, or an anomaly whose direction differs from the anchor's prior decline) and reaped nothing; `recovered` (PR #4299 round-2 review) means a clock anomaly PERSISTED across a full decline pass at the SAME (anchor, direction) and this pass drained the resulting backlog under the usual caps, per the decline-once/drain-on-repeat guard — a sustained non-zero `recovered` rate is worth an operator look (a clock anomaly or a real gap), even though nothing failed; `skipped` (PR #4299 round-2 external review) means another replica already held the `gateway_route_store:reap` advisory lock this tick (`pg_try_advisory_xact_lock`, not blocking) — routine on a multi-replica deployment, never a failure; `error` means the store call itself failed (pool/query degradation). This is the compensating observable signal for the clock-guarded-retention part-1 carve-out and the decline-once/drain-on-repeat part-4 guard documented in `gateway_route_store.hpp`'s `reap_stale_routes` header — see `docs/clock-guarded-retention.md`'s `GatewayRouteStore` entry. |
 
-There is deliberately no success/rate counter and no alert rule for this
-family yet — both land with the WS-4 4.2 fail-closed flip, once a reader
-depends on the directory being fresh.
+There is deliberately no success/rate counter and no alert rule for the
+write-failed/desync pair yet — both land with the WS-4 4.2b fail-closed flip,
+once a reader depends on the directory being fresh (`#4246` item #1 and the
+alert-rule half of item #8).
 
 ## SSO login metrics
 
