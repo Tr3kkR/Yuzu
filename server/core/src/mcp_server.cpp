@@ -16981,6 +16981,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto name = param_str(args, "name");
                 const auto expires_at_opt = param_int_strict(args, "expires_at", 0);
                 if (!expires_at_opt) {
+                    // retry-hint-exempt: a present-but-wrong-JSON-type input (a float or
+                    // string where an integer is required) is a client-side input-parse
+                    // failure, not a store/query fault — same terminal, non-retryable
+                    // class as rotate_api_token's overlap_days type check above.
                     res.set_content(a4_error(kInvalidParams, "expires_at must be a JSON integer (unix seconds)"),
                                     "application/json");
                     return;
