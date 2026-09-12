@@ -1315,19 +1315,31 @@ TEST_CASE("prefer_spark=true: the maintenance tick retries a persist a write fai
     SparkReconcileFixture f;
     f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
     // rung 9c PR-2 Unit 6: apply_rules() no longer stages "armed" synchronously - the
-    // arm is Accepted and resolves later on a detached worker - so its own exit flush
-    // is now a guaranteed no-op regardless of the injected failure (nothing pending
-    // to persist yet). Use dispatch_raw(), not apply() (which settles via its own
-    // tick and would consume the injected failure itself), and wait for the arm to
-    // actually commit before checking the journal - THAT'S the first real persist
-    // attempt this test is about, and the one the injected failure must land on.
+    // arm is Accepted and resolves later on a detached worker, asynchronously and with
+    // NO ordering guarantee relative to apply_rules() itself finishing its own exit
+    // flush. A FAST backend (this fixture's fake mechanism has no artificial latency)
+    // can commit and stage the record BEFORE dispatch_raw() even returns - a race an
+    // earlier version of this test got backwards under TSan + full-suite load (it
+    // assumed the exit flush ALWAYS predates staging, so the explicit tick below was
+    // "the first real attempt" - false when the worker wins the race, which makes the
+    // EXIT FLUSH the first attempt instead, consuming the injected failure earlier than
+    // expected and leaving the explicit tick below to observe the record as durable
+    // already). Force the ordering with a hang gate instead of assuming it: the watch()
+    // stays parked across dispatch_raw()'s ENTIRE execution (including its exit flush),
+    // so that flush is GUARANTEED to see nothing staged yet.
+    f.mechanism->hang_next_watch();
     REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    // dispatch_raw() has ALREADY returned here - its own exit flush already ran, and
+    // the arm cannot possibly have committed yet (the worker has not even returned
+    // from watch(), confirmed next) - so that flush provably saw nothing pending,
+    // regardless of how it's scheduled relative to the worker.
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(5)));
+    f.mechanism->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
 
-    // This tick is the FIRST real persist attempt (post-cutover, apply_rules()'s own
-    // exit flush is a no-op - nothing was staged yet at that point) - the injected
-    // failure lands HERE, not on the "retry" tick below (pre-cutover, apply_rules()'s
-    // synchronous commit meant its own exit flush was that first attempt instead).
+    // NOW pending_journal_ genuinely has something staged for the first time - this
+    // tick is the FIRST real persist attempt, and the injected failure lands HERE, not
+    // on the "retry" tick below.
     f.engine->journal_maintenance_tick();
 
     auto before = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
@@ -1353,11 +1365,13 @@ TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left 
           "[spark][guardian][reconcile][journal]") {
     SparkReconcileFixture f;
     f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
-    // Use dispatch_raw() + an explicit single tick, not apply() (which settles via its
-    // own tick loop and would consume the injected failure at an unpredictable point
-    // in that loop instead of here) - see the sibling "maintenance tick retries" test
-    // just above for the same reasoning.
+    // Hang the watch so apply_rules()'s own exit flush is guaranteed to run before
+    // anything is staged - see the sibling "maintenance tick retries" test just above
+    // for why this determinism can't be assumed from timing alone.
+    f.mechanism->hang_next_watch();
     REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(5)));
+    f.mechanism->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
     f.engine->journal_maintenance_tick(); // first real persist attempt - fails, stays pending
     CHECK(f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
@@ -2111,9 +2125,9 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     KvStore kv{std::move(*opened)};
 
     SparkEngine spark_engine;
-    REQUIRE(spark_engine.register_mechanism(SparkType::Service,
-                                            std::make_unique<FakeServiceMechanism>())
-                .has_value());
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    FakeServiceMechanism* mechanism = mech.get(); // borrowed; owned by spark_engine
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
     spark_engine.start();
 
     std::mutex send_mu;
@@ -2148,18 +2162,17 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     } release_parked_worker{send_mu, send_cv, release};
 
     // rung 9c PR-2 Unit 6: no injected write failure needed any more (this test
-    // pre-dates the cutover, where one was required - see below). apply_rules()
-    // no longer stages "armed" synchronously: it returns as soon as the arm is
-    // Accepted, well before the detached worker's commit stages anything into the
-    // journal, so its own exit-time flush is now a guaranteed no-op regardless of
-    // any injected failure - the record is genuinely PENDING (not yet even
-    // staged) at that point, for a timing reason rather than a fault-injected
-    // one. Nothing else persists it until stop()'s own pre-join flush below, so
-    // that flush is naturally the first (and only) attempt, and the same
-    // durable-during-the-join property this test is about follows without
-    // needing to force anything to fail first. (Injecting one here now would
-    // make THAT pre-join attempt the one that fails instead, since nothing
-    // upstream of it consumes the fault any more - defeating the proof.)
+    // pre-dates the cutover, where one was required - see below). apply_rules() no
+    // longer stages "armed" synchronously: it returns as soon as the arm is
+    // Accepted - but the detached worker's commit can still land BEFORE apply_
+    // rules()'s own exit flush runs (a FAST fake backend can outrace the calling
+    // thread; earlier revisions of this test assumed otherwise and were flaky
+    // under TSan + full-suite load, sometimes finding the record already durable
+    // right after dispatch). Hang the watch to force the ordering instead of
+    // assuming it: apply_rules() returns immediately regardless (Unit 6's whole
+    // point), so the exit flush runs and is provably a no-op while the worker is
+    // still parked, well before it can commit or stage anything.
+    mechanism->hang_next_watch();
     gpb::GuaranteedStatePush push;
     push.set_full_sync(true);
     *push.add_rules() = make_service_rule("r1");
@@ -2167,7 +2180,9 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
     // apply() helper above for the Windows EXE/DLL abseil hash-seed boundary.
     REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, push.SerializeAsString())
                 .exit_code == 0);
+    REQUIRE(mechanism->wait_entered_hang(std::chrono::seconds(5)));
     REQUIRE(kv.list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
+    mechanism->release_hang();
 
     {   // Park the worker inside a send, so the join below cannot complete.
         // Generous deadline: on a saturated Windows CI runner the drain worker can
