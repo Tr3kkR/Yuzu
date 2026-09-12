@@ -17718,6 +17718,13 @@ private:
             // DeploymentRoutes already hold (constructed well before this
             // point, server.cpp:4041) — no new construction needed.
             mcp_server_->set_preflight_run_store(preflight_run_store_.get());
+            // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
+            // store/kill-switch/offline-store instances the REST VizRoutes
+            // registration below wires (viz_routes_->register_routes(...)), so
+            // the two surfaces cannot disagree about cache state, the
+            // yuzu_viz_disabled kill switch, or which hosts render stale.
+            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_endpoint_store_.get(),
+                                      &viz_disabled_);
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the

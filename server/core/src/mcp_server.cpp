@@ -56,6 +56,7 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
@@ -2232,6 +2233,95 @@ static const ToolDef kTools[] = {
      "distinct from deployment.create). Requires SoftwareDeployment:Read.",
      R"j({"type":"object","properties":{"run_id":{"type":"string","minLength":1,"description":"The source pre-flight run id"}},"required":["run_id"]})j",
      R"j({"type":"object","properties":{"run_id":{"type":"string"},"name":{"type":"string"},"go":{"type":"integer"},"warn":{"type":"integer"}},"required":["run_id","name","go","warn"]})j"},
+
+    // ── #2146 Batch B3 (api-parity programme): fleet visualization + execution/
+    // fleet statistics REST+MCP twins. All 6 are confirmed pure reads with no
+    // dispatch -- both stats tools call the SAME ExecutionTracker aggregate
+    // queries their REST twins call (via the shared execution_statistics_model.hpp
+    // builders, Rule 1); the viz tools mirror VizRoutes::handle_topology /
+    // handle_host_topology's own gate/param/cap pipeline exactly (kill switch,
+    // then Response:Read, then the M-1 machines_max DoS cap) via the
+    // set_viz_deps() setter below, and share merge_offline_topology()
+    // (fleet_topology_store.hpp) with the REST handler for the offline-host
+    // merge rule.
+    {"get_execution_statistics",
+     "Fleet-wide execution success/failure rollup across every dispatched instruction "
+     "(capability 1.9): total executions, how many ran today, how many distinct agents have "
+     "executed anything, overall success rate (%), and average duration (seconds). Mirrors GET "
+     "/api/v1/execution-statistics. Use for a quick fleet execution health pulse; use "
+     "get_execution_statistics_by_agent or get_execution_statistics_by_definition for the same "
+     "rollup broken down by agent or instruction definition, or get_fleet_statistics for the "
+     "same data reshaped for a dashboard tile. All-zero values are the honest empty state for a "
+     "fleet with no completed executions yet, not an error. Requires Execution:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"total_executions":{"type":"integer"},"executions_today":{"type":"integer"},"active_agents":{"type":"integer"},"overall_success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["total_executions","executions_today","active_agents","overall_success_rate","avg_duration_seconds"]})j"},
+
+    {"get_execution_statistics_by_agent",
+     "Per-agent execution success/failure rollup, optionally filtered by agent_id and/or a "
+     "since timestamp, sorted by total executions descending, capped at 1000 rows. Mirrors GET "
+     "/api/v1/execution-statistics/agents. Use to find which agents are failing "
+     "disproportionately, or to see one agent's execution history at a glance (pass agent_id). "
+     "An empty data array means no agent has any completed execution matching the filter, not a "
+     "fault. NOT confined by the caller's own management-group scope -- like its REST twin, this "
+     "fleet-wide rollup returns rows for every agent regardless of the caller's visible-agent "
+     "set. Requires Execution:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","maxLength":256,"description":"Filter to one agent; omit for every agent"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"total_executions":{"type":"integer"},"success_count":{"type":"integer"},"failure_count":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"},"last_execution_at":{"type":"integer"}},"required":["agent_id","total_executions","success_count","failure_count","success_rate","avg_duration_seconds","last_execution_at"]}}},"required":["data"]})j"},
+
+    {"get_execution_statistics_by_definition",
+     "Per-instruction-definition execution success/failure rollup, optionally filtered by "
+     "definition_id and/or a since timestamp, sorted by total executions descending, capped at "
+     "1000 rows. Mirrors GET /api/v1/execution-statistics/definitions. Use to find which "
+     "instruction definitions fail disproportionately across the fleet, or to see one "
+     "definition's execution history at a glance (pass definition_id). An empty data array "
+     "means no definition has any completed execution matching the filter, not a fault. NOT "
+     "confined by the caller's own management-group scope -- like its REST twin, this "
+     "fleet-wide rollup returns rows regardless of the caller's visible-agent set. Requires "
+     "Execution:Read.",
+     R"j({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to one instruction definition; omit for every definition"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"definition_id":{"type":"string"},"total_executions":{"type":"integer"},"total_agents":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["definition_id","total_executions","total_agents","success_rate","avg_duration_seconds"]}}},"required":["data"]})j"},
+
+    {"get_fleet_statistics",
+     "Top-level fleet dashboard rollup: execution totals/today/success-rate/avg-duration nested "
+     "under executions, plus active_agents at the top level. Mirrors GET /api/v1/statistics. "
+     "Same underlying ExecutionTracker fleet summary as get_execution_statistics, reshaped for "
+     "a dashboard tile -- prefer get_execution_statistics if the flat shape is more convenient. "
+     "All-zero values are the honest empty state for a fleet with no completed executions yet, "
+     "not an error. Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"executions":{"type":"object","properties":{"total":{"type":"integer"},"today":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["total","today","success_rate","avg_duration_seconds"]},"active_agents":{"type":"integer"}},"required":["executions","active_agents"]})j"},
+
+    {"get_fleet_topology",
+     "Fleet-wide 3D-visualization topology snapshot: every connected agent as a machine node "
+     "with its processes, open connections, and listening sockets. Mirrors GET "
+     "/api/v1/viz/fleet/topology. Use for a point-in-time inventory of what's running/"
+     "listening/talking across the fleet, or before drilling into one host via "
+     "get_host_topology. Cached up to 60s server-side; pass fresh=true to force a live "
+     "re-fetch (this invalidates the shared cache for every caller, not only this one -- use "
+     "sparingly). A host that aged out of the live cache but was seen within the last 7 days "
+     "still appears, flagged stale=true with empty processes/connections/listeners and ts=0 -- "
+     "treat that shape as 'last known identity, no current detail', never as an error. "
+     "machines_max bounds the response size (DoS protection, default 5000, ceiling 100000): a "
+     "fleet larger than the cap is refused outright, never silently truncated, so a caller "
+     "never mistakes a partial view for the whole fleet -- raise machines_max or use "
+     "get_host_topology per agent instead. Answers kInternalError when an operator has "
+     "disabled the visualization feature (yuzu_viz_disabled / --viz-disable). Requires "
+     "Response:Read.",
+     R"j({"type":"object","properties":{"include_vuln":{"type":"boolean","default":false,"description":"Join known-CVE severity onto each process by name (best-effort; often inert if the fleet has no version-bearing inventory match)"},"fresh":{"type":"boolean","default":false,"description":"Force a live re-fetch, invalidating the shared 60s cache for every caller"},"machines_max":{"type":"integer","minimum":1,"maximum":100000,"default":5000,"description":"Refuse (do not truncate) a snapshot with more machines than this"}}})j",
+     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"include_vuln":{"type":"boolean"},"machines":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["schema","schema_minor","generated_at","include_vuln","machines"]})j"},
+
+    {"get_host_topology",
+     "Per-host slice of the fleet topology -- one machine's processes, open connections, and "
+     "listening sockets, keyed by agent_id. Mirrors GET /api/v1/viz/host/{id}/topology. Use "
+     "after get_fleet_topology or list_agents to drill into a single host without paying for "
+     "the whole fleet's payload. Answers kInvalidParams 'host not found' when agent_id has no "
+     "entry in the CURRENT live topology snapshot -- unlike get_fleet_topology, this tool does "
+     "NOT fall back to a durable stale placeholder for a host that aged out of the cache, so "
+     "not-found here means 'not in the live snapshot right now', not 'never existed'. Answers "
+     "kInternalError when an operator has disabled the visualization feature "
+     "(yuzu_viz_disabled / --viz-disable). Requires Response:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The agent to slice out of the current fleet topology snapshot"}},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"stale":{"type":"boolean"},"machine":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["schema","schema_minor","generated_at","stale","machine"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -2603,6 +2693,19 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // would be a false claim per ServiceScopeClass's own doc comment.
     {"list_preflight_runs", {"Infrastructure", "Read"}},
     {"get_deployment_preview", {"SoftwareDeployment", "Read"}},
+
+    // #2146 Batch B3 — fleet visualization + execution/fleet statistics read
+    // twins. Default (2-element) form: none of these routes reason about
+    // service-scoped tokens on the REST side either (no
+    // deny_fleet_wide_service_scoped call, no per-agent confinement) — a
+    // service-scoped MCP token is structurally denied at the generic C8
+    // chokepoint here, matching the REST twins' own posture exactly.
+    {"get_execution_statistics", {"Execution", "Read"}},
+    {"get_execution_statistics_by_agent", {"Execution", "Read"}},
+    {"get_execution_statistics_by_definition", {"Execution", "Read"}},
+    {"get_fleet_statistics", {"Infrastructure", "Read"}},
+    {"get_fleet_topology", {"Response", "Read"}},
+    {"get_host_topology", {"Response", "Read"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -3167,6 +3270,18 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // shape for unchanged server state.
     {"list_preflight_runs", {ToolEffect::ReadOnly, true, "List pre-flight runs"}},
     {"get_deployment_preview", {ToolEffect::ReadOnly, true, "Get deployment preview"}},
+    // #2146 Batch B3 — plain reads, repeat calls return the same shape for
+    // unchanged server state (get_fleet_topology's fresh=true param busts a
+    // shared cache but is still safe/repeatable -- it never mutates
+    // persisted state).
+    {"get_execution_statistics", {ToolEffect::ReadOnly, true, "Get execution statistics"}},
+    {"get_execution_statistics_by_agent",
+     {ToolEffect::ReadOnly, true, "Get execution statistics by agent"}},
+    {"get_execution_statistics_by_definition",
+     {ToolEffect::ReadOnly, true, "Get execution statistics by definition"}},
+    {"get_fleet_statistics", {ToolEffect::ReadOnly, true, "Get fleet statistics"}},
+    {"get_fleet_topology", {ToolEffect::ReadOnly, true, "Get fleet topology"}},
+    {"get_host_topology", {ToolEffect::ReadOnly, true, "Get host topology"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -14724,6 +14839,423 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── #2146 Batch B3: execution/fleet statistics read twins ───────────
+            // Shared builders (execution_statistics_model.hpp) -- the REST twins
+            // (rest_api_v1.cpp) call the SAME functions, so the JSON shape cannot
+            // drift (api-twin-recipe.md Rule 1). ExecutionTracker's aggregate
+            // queries here (get_fleet_summary/get_agent_statistics/
+            // get_definition_statistics) return plain values, never
+            // std::optional/std::expected -- a pool/query fault degrades
+            // SILENTLY to zero/empty (matching every existing caller of these
+            // three methods, REST included -- see execution_tracker.cpp), so the
+            // only guardable failure mode here is the pointer itself being
+            // unwired. Unaudited on REST (no audit_fn call at either route); the
+            // generic mcp_audit("success") is still emitted, matching the
+            // dominant convention nearly every sibling read tool in this file
+            // uses regardless of the REST twin's own audit posture (see
+            // list_preflight_runs/get_deployment_preview's identical rationale
+            // above).
+            if (tool_name == "get_execution_statistics") {
+                if (!tier_allows(tier, "Execution", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Execution", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    // No retry_after_ms: execution_tracker is wired exactly once
+                    // at server construction, no runtime setter -- a null value
+                    // here is a permanent deployment-config condition, not one a
+                    // client can retry past.
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto summary = execution_tracker->get_fleet_summary();
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(fleet_execution_summary_json(summary),
+                                                                  kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_execution_statistics_by_agent") {
+                if (!tier_allows(tier, "Execution", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Execution", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                ExecutionStatsQuery q;
+                q.agent_id = param_str(args, "agent_id");
+                q.since = param_int(args, "since", 0);
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                q.limit = static_cast<int>(*limit_opt);
+                if (q.limit > 1000)
+                    q.limit = 1000;
+                auto stats = execution_tracker->get_agent_statistics(q);
+                JArr arr;
+                for (const auto& s : stats)
+                    arr.add_raw(agent_execution_stats_row_json(s));
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().raw("data", arr.str()).str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_execution_statistics_by_definition") {
+                if (!tier_allows(tier, "Execution", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Execution", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                ExecutionStatsQuery q;
+                q.definition_id = param_str(args, "definition_id");
+                q.since = param_int(args, "since", 0);
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                q.limit = static_cast<int>(*limit_opt);
+                if (q.limit > 1000)
+                    q.limit = 1000;
+                auto stats = execution_tracker->get_definition_statistics(q);
+                JArr arr;
+                for (const auto& s : stats)
+                    arr.add_raw(definition_execution_stats_row_json(s));
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().raw("data", arr.str()).str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_fleet_statistics") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto fleet = execution_tracker->get_fleet_summary();
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(fleet_statistics_json(fleet), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── #2146 Batch B3: fleet visualization read twins ───────────────────
+            // Mirrors VizRoutes::handle_topology's / handle_host_topology's own
+            // pipeline exactly: kill switch -> store availability ->
+            // Response:Read -> params -> fetch -> merge_offline_topology
+            // (SHARED with the REST handler, fleet_topology_store.hpp,
+            // api-twin-recipe.md Rule 1) -> the M-1 machines_max DoS cap ->
+            // serialize via the SAME nlohmann to_json ADL functions
+            // (fleet_topology_types.hpp) REST uses, so the wire shape cannot
+            // drift. tier_allows() runs first per every MCP tool's universal
+            // ordering; the viz kill switch is then consulted BEFORE perm_fn,
+            // matching REST's DEP-1 tier-before-permission posture
+            // (docs/fleet-viz-invariants.md). Audit reuses REST's own domain
+            // verbs (viz.fleet_topology / viz.fleet_topology.invalidate /
+            // viz.host_topology) rather than the generic mcp.<tool_name>
+            // (api-twin-recipe.md §4) so the audit trail reads the same
+            // regardless of transport.
+            if (tool_name == "get_fleet_topology") {
+                const auto viz_t_start = std::chrono::steady_clock::now();
+                if (!tier_allows(tier, "Response", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (viz_kill_switch_ && viz_kill_switch_->load(std::memory_order_acquire)) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                        "kill_switch via MCP");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "viz endpoint disabled by operator (yuzu_viz_disabled)", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Response", "Read"))
+                    return;
+                if (!fleet_topology_store_) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "failure", "FleetTopology", "",
+                        "store_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "fleet topology store not available", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                bool include_vuln = false;
+                if (args.contains("include_vuln") && args["include_vuln"].is_boolean())
+                    include_vuln = args["include_vuln"].get<bool>();
+                bool fresh = false;
+                if (args.contains("fresh") && args["fresh"].is_boolean())
+                    fresh = args["fresh"].get<bool>();
+
+                const auto machines_max_opt = param_int_strict(
+                    args, "machines_max",
+                    static_cast<int64_t>(yuzu::server::VizRoutes::kDefaultMachinesMax));
+                if (!machines_max_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "machines_max must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*machines_max_opt < 1 ||
+                    *machines_max_opt > yuzu::server::VizRoutes::kMachinesMaxCeiling) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                        "bad_machines_max via MCP");
+                    res.set_content(
+                        a4_error(kInvalidParams, "machines_max must be in [1, 100000]", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+                const int machines_max = static_cast<int>(*machines_max_opt);
+
+                if (fresh) {
+                    fleet_topology_store_->invalidate();
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology.invalidate", "success", "FleetTopology",
+                        "", "via MCP get_fleet_topology");
+                }
+
+                const auto viz_pre_hits = fleet_topology_store_->cache_hits();
+                const auto viz_pre_misses = fleet_topology_store_->cache_misses();
+                std::shared_ptr<const yuzu::server::TopologySnapshot> snap;
+                try {
+                    snap = fleet_topology_store_->get(include_vuln);
+                } catch (const std::exception& ex) {
+                    spdlog::error("MCP get_fleet_topology: store->get threw: {}", ex.what());
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "failure", "FleetTopology", "",
+                        "fetch_threw via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch failed", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!snap) {
+                    // Defensive belt only -- FleetTopologyStore::get() is
+                    // documented never to return null (PR 2 invariant UP-9);
+                    // mirrors the REST twin's identical belt (viz_routes.cpp).
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "failure", "FleetTopology", "",
+                        "snap_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch returned null", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                if (metrics) {
+                    if (fleet_topology_store_->cache_hits() > viz_pre_hits)
+                        metrics->counter("yuzu_viz_cache_hit_total").increment();
+                    if (fleet_topology_store_->cache_misses() > viz_pre_misses)
+                        metrics->counter("yuzu_viz_cache_miss_total").increment();
+                }
+
+                if (offline_endpoint_store_) {
+                    auto persisted = offline_endpoint_store_->query_stale_within(
+                        std::chrono::seconds(yuzu::server::VizRoutes::kOfflineStaleWindowSecs));
+                    const auto viz_before = snap->machines.size();
+                    snap = yuzu::server::merge_offline_topology(std::move(snap), persisted);
+                    const auto viz_merged_count = snap->machines.size() - viz_before;
+                    if (viz_merged_count > 0 && metrics)
+                        metrics->counter("yuzu_viz_offline_hosts_total")
+                            .increment(static_cast<double>(viz_merged_count));
+                }
+
+                if (static_cast<int>(snap->machines.size()) > machines_max) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                        "oversize machines=" + std::to_string(snap->machines.size()) +
+                            " cap=" + std::to_string(machines_max) + " via MCP");
+                    if (metrics)
+                        metrics->counter("yuzu_viz_oversize_response_total").increment();
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "fleet topology exceeds machines_max -- raise the cap or scope down",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                nlohmann::json j = *snap;
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "viz.fleet_topology", "success", "FleetTopology", "",
+                    "machines=" + std::to_string(snap->machines.size()) +
+                        " include_vuln=" + (include_vuln ? "1" : "0") + " via MCP");
+                if (!audit_ok)
+                    j["audit_persisted"] = false;
+                if (metrics) {
+                    const auto viz_elapsed = std::chrono::steady_clock::now() - viz_t_start;
+                    metrics->histogram("yuzu_viz_topology_request_seconds")
+                        .observe(std::chrono::duration<double>(viz_elapsed).count());
+                }
+                res.set_content(success_response(id, tool_result(j.dump(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_host_topology") {
+                const auto viz_host_t_start = std::chrono::steady_clock::now();
+                if (!tier_allows(tier, "Response", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                if (viz_kill_switch_ && viz_kill_switch_->load(std::memory_order_acquire)) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "denied", "HostTopology", agent_id,
+                        "kill_switch via MCP");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "viz endpoint disabled by operator (yuzu_viz_disabled)", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Response", "Read"))
+                    return;
+                if (!fleet_topology_store_) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                        "store_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "fleet topology store not available", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                const auto viz_host_pre_hits = fleet_topology_store_->cache_hits();
+                const auto viz_host_pre_misses = fleet_topology_store_->cache_misses();
+                std::shared_ptr<const yuzu::server::TopologySnapshot> snap;
+                try {
+                    snap = fleet_topology_store_->get(/*include_vuln=*/false);
+                } catch (const std::exception& ex) {
+                    spdlog::error("MCP get_host_topology: store->get threw: {}", ex.what());
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                        "fetch_threw via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch failed", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!snap) {
+                    // Defensive belt only -- see get_fleet_topology's identical
+                    // comment above.
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                        "snap_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch returned null", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                if (metrics) {
+                    if (fleet_topology_store_->cache_hits() > viz_host_pre_hits)
+                        metrics->counter("yuzu_viz_cache_hit_total").increment();
+                    if (fleet_topology_store_->cache_misses() > viz_host_pre_misses)
+                        metrics->counter("yuzu_viz_cache_miss_total").increment();
+                }
+
+                for (const auto& m : snap->machines) {
+                    if (m.agent_id != agent_id)
+                        continue;
+                    yuzu::server::HostTopologySnapshot wrapper{snap->generated_at, m.stale, m};
+                    nlohmann::json j = wrapper;
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "success", "HostTopology", agent_id,
+                        "via MCP");
+                    if (!audit_ok)
+                        j["audit_persisted"] = false;
+                    if (metrics) {
+                        const auto viz_host_elapsed =
+                            std::chrono::steady_clock::now() - viz_host_t_start;
+                        metrics->histogram("yuzu_viz_topology_request_seconds")
+                            .observe(std::chrono::duration<double>(viz_host_elapsed).count());
+                    }
+                    res.set_content(success_response(id, tool_result(j.dump(), kObjectOutputSchema)),
+                                    "application/json");
+                    return;
+                }
+                // Not found -- unlike get_fleet_topology, this tool does not fall
+                // back to a durable stale placeholder (matches
+                // VizRoutes::handle_host_topology, which never consults
+                // offline_store_ at all).
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                    "not_found via MCP");
+                res.set_content(a4_error(kInvalidParams, "host not found"), "application/json");
                 return;
             }
 

@@ -158,8 +158,21 @@ constexpr std::string_view kTar[] = {"list_tar_process_tree_devices",
 // Fleet & agents (directory users are IdP-sourced identity records, not
 // managed endpoints) or Engine principals (unrelated identity axis).
 constexpr std::string_view kDirectory[] = {"list_directory_users", "get_directory_status"};
+// #2146 Batch B3 (api-parity programme) — fleet execution/dashboard rollups,
+// distinct from "Executions & audit" (single-execution records/status) and
+// "DEX performance" (per-device/app reliability signals): these are
+// ExecutionTracker-wide success/failure aggregates, not per-execution detail.
+constexpr std::string_view kExecutionStatistics[] = {"get_execution_statistics",
+                                                     "get_execution_statistics_by_agent",
+                                                     "get_execution_statistics_by_definition",
+                                                     "get_fleet_statistics"};
+// #2146 Batch B3 — the 3D fleet visualizer's REST surface had zero MCP
+// presence before this read-twin pair; its own family, distinct from "Fleet &
+// agents" (a machine/process/socket topology snapshot is a different data
+// model from an agent roster row).
+constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_host_topology"};
 
-constexpr std::array<ToolFamily, 30> kFamilies{{
+constexpr std::array<ToolFamily, 32> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -221,6 +234,12 @@ constexpr std::array<ToolFamily, 30> kFamilies{{
      kTar},
     {"Directory & identity", "AD/Entra directory-synced users and directory-sync status",
      kDirectory},
+    {"Execution statistics", "fleet-wide, per-agent, and per-definition execution "
+                             "success/failure rollups",
+     kExecutionStatistics},
+    {"Fleet visualization", "3D fleet topology snapshot -- per-machine processes, "
+                            "connections, and listening sockets, fleet-wide or per-host",
+     kFleetVisualization},
 }};
 
 }  // namespace

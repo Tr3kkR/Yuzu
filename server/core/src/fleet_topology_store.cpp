@@ -11,6 +11,7 @@
 
 #include "audit_store.hpp"
 #include "nvd_db.hpp"
+#include "offline_endpoint_store.hpp" // OfflineEndpoint -- merge_offline_topology() below
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -1029,6 +1030,34 @@ TopologySnapshot FleetTopologyStore::build_snapshot(std::vector<RawAgentSnapshot
     }
 
     return out;
+}
+
+std::shared_ptr<const TopologySnapshot>
+merge_offline_topology(std::shared_ptr<const TopologySnapshot> snap,
+                       const std::vector<OfflineEndpoint>& persisted) {
+    if (persisted.empty())
+        return snap;
+    std::unordered_set<std::string> online;
+    online.reserve(snap->machines.size());
+    for (const auto& m : snap->machines)
+        online.insert(m.agent_id);
+    std::vector<MachineNode> stale_nodes;
+    for (const auto& ep : persisted) {
+        if (online.count(ep.agent_id) != 0U)
+            continue; // currently online -- already in the live snapshot
+        MachineNode n;
+        n.agent_id = ep.agent_id;
+        n.hostname = ep.hostname;
+        n.os = ep.os;
+        n.stale = true; // dimmed "offline" cube; ts stays 0
+        stale_nodes.push_back(std::move(n));
+    }
+    if (stale_nodes.empty())
+        return snap;
+    auto merged = std::make_shared<TopologySnapshot>(*snap);
+    for (auto& n : stale_nodes)
+        merged->machines.push_back(std::move(n));
+    return merged;
 }
 
 } // namespace yuzu::server

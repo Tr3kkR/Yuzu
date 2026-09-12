@@ -22,6 +22,7 @@
 #include "execution_event_scope.hpp"
 #include "guardian_model.hpp" // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
 #include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
                                      // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
@@ -7688,14 +7689,10 @@ void RestApiV1::register_routes(
                  if (!perm_fn(req, res, "Execution", "Read"))
                      return;
                  auto summary = execution_tracker->get_fleet_summary();
-                 auto data = JObj()
-                                 .add("total_executions", summary.total_executions)
-                                 .add("executions_today", summary.executions_today)
-                                 .add("active_agents", summary.active_agents)
-                                 .add("overall_success_rate", summary.overall_success_rate)
-                                 .add("avg_duration_seconds", summary.avg_duration_seconds)
-                                 .str();
-                 res.set_content(ok_json(data), "application/json");
+                 // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
+                 // the MCP twin get_execution_statistics calls the SAME function.
+                 res.set_content(ok_json(fleet_execution_summary_json(summary)),
+                                 "application/json");
              });
 
     sink.Get("/api/v1/execution-statistics/agents",
@@ -7717,16 +7714,10 @@ void RestApiV1::register_routes(
                      q.limit = 1000;
                  auto stats = execution_tracker->get_agent_statistics(q);
                  JArr arr;
-                 for (const auto& s : stats) {
-                     arr.add(JObj()
-                                 .add("agent_id", s.agent_id)
-                                 .add("total_executions", s.total_executions)
-                                 .add("success_count", s.success_count)
-                                 .add("failure_count", s.failure_count)
-                                 .add("success_rate", s.success_rate)
-                                 .add("avg_duration_seconds", s.avg_duration_seconds)
-                                 .add("last_execution_at", s.last_execution_at));
-                 }
+                 // #2146 Batch B3: shared builder -- the MCP twin
+                 // get_execution_statistics_by_agent calls the SAME function.
+                 for (const auto& s : stats)
+                     arr.add_raw(agent_execution_stats_row_json(s));
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
                                  "application/json");
              });
@@ -7750,14 +7741,10 @@ void RestApiV1::register_routes(
                      q.limit = 1000;
                  auto stats = execution_tracker->get_definition_statistics(q);
                  JArr arr;
-                 for (const auto& s : stats) {
-                     arr.add(JObj()
-                                 .add("definition_id", s.definition_id)
-                                 .add("total_executions", s.total_executions)
-                                 .add("total_agents", s.total_agents)
-                                 .add("success_rate", s.success_rate)
-                                 .add("avg_duration_seconds", s.avg_duration_seconds));
-                 }
+                 // #2146 Batch B3: shared builder -- the MCP twin
+                 // get_execution_statistics_by_definition calls the SAME function.
+                 for (const auto& s : stats)
+                     arr.add_raw(definition_execution_stats_row_json(s));
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
                                  "application/json");
              });
@@ -10445,17 +10432,9 @@ void RestApiV1::register_routes(
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
                  auto fleet = execution_tracker->get_fleet_summary();
-                 auto data = JObj()
-                                 .raw("executions",
-                                      JObj()
-                                          .add("total", fleet.total_executions)
-                                          .add("today", fleet.executions_today)
-                                          .add("success_rate", fleet.overall_success_rate)
-                                          .add("avg_duration_seconds", fleet.avg_duration_seconds)
-                                          .str())
-                                 .add("active_agents", fleet.active_agents)
-                                 .str();
-                 res.set_content(ok_json(data), "application/json");
+                 // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
+                 // the MCP twin get_fleet_statistics calls the SAME function.
+                 res.set_content(ok_json(fleet_statistics_json(fleet)), "application/json");
              });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
