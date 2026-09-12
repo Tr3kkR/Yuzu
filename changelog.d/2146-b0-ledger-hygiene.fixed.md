@@ -14,11 +14,11 @@
   (`get.fragments-auto-verify`, gated `Infrastructure:Read`) and the instructions list and
   editor fragments (`get.fragments-instructions`, gated bare-auth-only; `get.fragments-
   instructions-editor`, gated `InstructionDefinition:Write`) were reverted to
-  `planned:#2146` rather than flipped to `composed-of` — their cited targets
+  `planned:#2146` rather than flipped to `composed-of` - their cited targets
   (`ManagementGroup:Read` and `InstructionDefinition:Read` respectively) are gated by a
   *stricter or independent* securable than the fragment itself, so a role holding the
   fragment's narrower grant could be denied by the "twin" the ledger would otherwise claim
-  covers it. Composing the same *data* is not sufficient for a `composed-of` claim — the
+  covers it. Composing the same *data* is not sufficient for a `composed-of` claim - the
   target's authorization gate must be no stricter than the original fragment's, or the
   claim silently forecloses the work of building a properly-gated twin for a real gap in
   reachability.
