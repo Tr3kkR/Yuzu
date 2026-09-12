@@ -888,6 +888,45 @@ private:
         std::deque<std::shared_ptr<KeyClaim>> fifo; ///< front() = the current claim
     };
 
+    /// rung 9c PR-2, Unit 1 (shared attach core): attach_rule()'s outcome BEFORE any
+    /// wait. Armed/Failed mean already resolved - the caller need not wait further.
+    /// Pending means the claim returned alongside it is this call's own live claim,
+    /// already enqueued in claims_ and (if selected) already dispatched off-lock; the
+    /// public, blocking attach_rule() waits on it via wait_for_claim(). Vocabulary
+    /// matches docs/spark-stage2-guardian-consumer-design.md §R5.3 (Armed / Accepted
+    /// / Failed) - Pending, not a fourth outcome word, names the same "not yet
+    /// resolved" concept from the runtime's own side, where a future non-waiting
+    /// entry point (not yet added) would report it as Accepted.
+    enum class AttachCoreState { Armed, Pending, Failed };
+    struct AttachCoreResult {
+        AttachCoreState state{AttachCoreState::Failed};
+        std::uint64_t generation{0};      ///< valid iff state == Armed
+        std::string error;                ///< valid iff state == Failed
+        /// valid iff state == Pending. An OBSERVATION handle only (rung 9c PR-2,
+        /// Astra opine review 2026-09-12): destroying it must never withdraw the
+        /// rule or abandon its operation - ownership of cancellation stays in
+        /// claims_ and the callback's own capture, exactly as it does today for
+        /// attach_rule's local `arm_claim`.
+        std::shared_ptr<KeyClaim> claim;
+    };
+
+    /// The shared body of attach_rule(), before any wait: derive the claim/inline/
+    /// shared-watcher decision, retire any prior generation, and (claim path only)
+    /// dispatch off-lock. `key` is precomputed by the caller (spark_key(spec)) since
+    /// the caller's own claim_rollback guard captures it before this call, and before
+    /// `spec` is moved in here. `arm_claim` is a REFERENCE to the caller's own local:
+    /// this function writes it (a noexcept pointer write, exactly at the point the
+    /// claim is enqueued) rather than returning the claim only inside the result, so
+    /// that a throw AFTER the enqueue but before this function returns still leaves
+    /// the caller's own claim_rollback (armed over that same local, per #3831) able
+    /// to find and abandon it - returning the claim solely via AttachCoreResult would
+    /// leave the caller's rollback guard looking at a still-null slot on exactly that
+    /// throw path, recreating #3831 one level up. The caller (attach_rule()) alone
+    /// owns claim_rollback's scope and commit point.
+    AttachCoreResult attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
+                                 RuleAssertion assertion, bool emit_compliant_edge,
+                                 std::shared_ptr<KeyClaim>& arm_claim);
+
     // Helpers (all assume the documented lock discipline; see the .cpp).
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
     /// rule's key ->0 edge) for the CALLER to submit off-lock once it unlocks - see

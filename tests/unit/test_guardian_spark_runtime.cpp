@@ -2381,39 +2381,48 @@ TEST_CASE("source tripwire: claim_rollback's .fn is assigned before the arm clai
     // cannot coexist with normal test infrastructure (see that file's own "WHY THIS IS
     // A SEPARATE EXECUTABLE" doc comment). Absent that, this pins the textual property
     // the fix actually depends on: .fn is assigned before the mutation it protects, so
-    // a throw during the assignment has nothing left to roll back. Mutation-verified:
-    // swapping the two lines' relative order makes this fail.
+    // a throw during the assignment has nothing left to roll back.
+    //
+    // RE-ANCHORED (rung 9c PR-2, Unit 1, Astra opine review 2026-09-12): attach_rule()'s
+    // body that does the actual claim enqueue was extracted into a shared
+    // attach_core() (attach_rule() alone still owns claim_rollback's declaration and
+    // commit point - see attach_core()'s own doc comment for why). The property is
+    // now a stronger, two-part one: (a) claim_rollback.fn is assigned in attach_rule()
+    // BEFORE it calls attach_core() at all - a hard function-call boundary, not merely
+    // an in-function line order, so this half cannot be silently reintroduced by
+    // reordering two lines the way the original #3831 defect was; (b) attach_core()'s
+    // own locked block still takes registry_mu_ before the enqueue, preserving the
+    // original ordering WITHIN the function that now does the mutation. Both anchors
+    // below search from the START of the file (not from an attach_rule/attach_core
+    // anchor) since each searched string is unique in this file (verified: a repeat of
+    // this search after any edit that adds a second match anywhere is exactly what
+    // would make this test start checking the wrong occurrence, the same fragility the
+    // original version's own comment warned about for an unanchored search - if a
+    // future edit needs two occurrences of any of these strings, re-anchor explicitly
+    // rather than relaxing this check). Mutation-verified: swapping the two lines'
+    // relative order within either function makes this fail.
     std::ifstream input(std::filesystem::path(YUZU_AGENT_SRC_DIR) / "guardian_spark_runtime.cpp");
     REQUIRE(input.is_open());
     const std::string source((std::istreambuf_iterator<char>(input)),
                              std::istreambuf_iterator<char>());
 
-    // Anchor every search on attach_rule's DEFINITION: since rung 9c R5.2 several
-    // functions defined ABOVE it in this file (wait_for_claim, on_arm_complete) open
-    // their own std::unique_lock<std::mutex> lk{registry_mu_}, so an unanchored
-    // find() would match one of those and invert the scope check below.
-    const auto attach_pos = source.find("GuardianSparkRuntime::attach_rule(");
-    REQUIRE(attach_pos != std::string::npos);
-
-    const auto fn_assign_pos = source.find("claim_rollback.fn =", attach_pos);
+    const auto fn_assign_pos = source.find("claim_rollback.fn =");
     REQUIRE(fn_assign_pos != std::string::npos);
-    // The real enqueue, not a mention in prose: the push of the freshly built claim
-    // into its key entry is the mutation the guard protects (the old shape's
-    // arming_keys_.emplace(key, InFlightArm ...)). "entry.fifo.push_back(c);" is the
-    // call's own text and appears in no comment.
-    const auto enqueue_pos = source.find("entry.fifo.push_back(c);", attach_pos);
-    REQUIRE(enqueue_pos != std::string::npos);
-    CHECK(fn_assign_pos < enqueue_pos);
+    const auto core_call_pos = source.find("attach_core(key, std::move(rule_id)", fn_assign_pos);
+    REQUIRE(core_call_pos != std::string::npos);
+    CHECK(fn_assign_pos < core_call_pos);
 
-    // Ordering alone isn't the whole property: a future edit could move this guard's
-    // declaration back INSIDE the locked block (reintroducing the pre-#3831 lock-order
-    // hazard the block-scope comment above it warns against) while keeping .fn= textually
-    // before the enqueue - still "passing" the check above. Pin scope too: .fn= must
-    // precede the FIRST std::unique_lock<std::mutex> lk{registry_mu_} AFTER the
-    // attach_rule anchor (the one its locked block opens with).
-    const auto lock_pos = source.find("std::unique_lock<std::mutex> lk{registry_mu_}", attach_pos);
+    // Within attach_core() (defined after this call site): the lock still precedes the
+    // real enqueue, not a mention in prose - the push of the freshly built claim into
+    // its key entry is the mutation the guard (now armed before attach_core() is even
+    // entered) protects. "entry.fifo.push_back(c);" is the call's own text and appears
+    // in no comment.
+    const auto lock_pos =
+        source.find("std::unique_lock<std::mutex> lk{registry_mu_}", core_call_pos);
     REQUIRE(lock_pos != std::string::npos);
-    CHECK(fn_assign_pos < lock_pos);
+    const auto enqueue_pos = source.find("entry.fifo.push_back(c);", core_call_pos);
+    REQUIRE(enqueue_pos != std::string::npos);
+    CHECK(lock_pos < enqueue_pos);
 }
 
 // ── PR #3821 review (fjarvis): prior_disarm dropped on an early exit ───────────

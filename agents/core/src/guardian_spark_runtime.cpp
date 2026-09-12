@@ -917,56 +917,31 @@ std::expected<std::uint64_t, std::string>
 GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAssertion assertion,
                                   bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
-    // #2233 item 3: File/Registry/Service arm off registry_mu_; every other type
-    // stays inline (see io_class_for_spark_type's doc).
-    const std::optional<IoClass> io_class = io_class_for_spark_type(spec.type);
-    std::function<void()> waker;
-    std::function<void()> outbox_waker;
-    std::uint64_t new_gen = 0;
-    std::shared_ptr<KeyClaim> prior_disarm;
-    // Snapshot BEFORE taking registry_mu_ (same outside-lock pattern evaluate_key uses
-    // for its own now-snapshot): this is PendingState::first_seen, the M1 item (b)
-    // elapsed-time demotion clock. A fresh attach always starts un-demoted regardless
-    // of how long a PRIOR generation on this rule_id sat pending (detach_rule_locked
-    // below drops that generation's PendingState entirely). It comes from the
-    // INJECTED clock_() and is never used as the real wait deadline below.
-    const auto attach_now = clock_();
+    std::shared_ptr<KeyClaim> arm_claim; // written by attach_core() iff it returns Pending
 
-    // Built once, reused by both the fast (reuse-existing-watcher / inline-type) path
-    // and the claim (bounded off-lock arm) path's commit.
-    const std::string rule_name = assertion.rule_name;
-    const char* guard_type = guard_type_for(assertion.kind);
-    auto rg = std::make_shared<RuleGeneration>();
-    rg->active = true;
-    rg->emit_compliant_edge = emit_compliant_edge;
-    rg->assertion = std::move(assertion);
-    rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
-
-    std::uint64_t gen = 0;
-    std::shared_ptr<KeyClaim> arm_claim;    // this call's own claim, once queued
-    std::shared_ptr<KeyClaim> to_dispatch;  // set iff this call must dispatch it
-    std::shared_ptr<KeyClaim> head_to_drive; // a retained disarm at the head to redrive first
-
-    // #3831 (rung 9c R5.2 shape): this guard protects the claim enqueue inside the
-    // locked block just below, but the work it must ALSO wrap - the off-lock dispatch
-    // and the bounded wait, much further down - runs OFF both locks in a separate
-    // region after that block has already closed. Function-scoped, one object spanning
-    // both regions, .fn assigned HERE before registry_mu_ is even locked, so a throw
-    // during the assignment (a multi-capture closure exceeding libstdc++'s
-    // std::function SBO heap-allocates) has nothing to roll back yet - the original
-    // defect was a guard whose .fn was assigned AFTER the mutation it protected, which
-    // left the key's marker orphaned forever on a bad_alloc. arm_claim starts null and
-    // is set (a noexcept pointer write) immediately after the enqueue succeeds, so fn
-    // no-ops until then. Matched on POINTER identity: a same-rule_id retry that has
-    // since queued a FRESH claim is a different object, so this guard can never touch
-    // it (stronger than the (rule_id, generation) match the InFlightArm shape needed).
+    // #3831 (rung 9c R5.2 shape): this guard protects the claim enqueue inside
+    // attach_core()'s locked block, but the work it must ALSO wrap - the off-lock
+    // dispatch and the bounded wait below, both still owned by THIS function - runs
+    // OFF both locks, in a region after attach_core() has already returned. Function-
+    // scoped, one object spanning both regions, .fn assigned HERE before
+    // registry_mu_ is even locked, so a throw during the assignment (a multi-capture
+    // closure exceeding libstdc++'s std::function SBO heap-allocates) has nothing to
+    // roll back yet - the original defect was a guard whose .fn was assigned AFTER
+    // the mutation it protected, which left the key's marker orphaned forever on a
+    // bad_alloc. arm_claim starts null and is set (a noexcept pointer write, inside
+    // attach_core()) immediately after the enqueue succeeds, so fn no-ops until then.
+    // Matched on POINTER identity: a same-rule_id retry that has since queued a FRESH
+    // claim is a different object, so this guard can never touch it (stronger than
+    // the (rule_id, generation) match the InFlightArm shape needed).
     //
     // Lock order: fn takes registry_mu_, yet it is declared while the caller has NOT
-    // locked it, and it can fire while the locked block below still holds it. Safe only
-    // because that block's own std::unique_lock is a NARROWER scope than this
-    // function-scope guard - C++ unwind destructs the narrower scope's locals
-    // (releasing registry_mu_) before continuing to unwind this one. Moving this
-    // declaration back inside that block would deadlock on exactly that unwind path.
+    // locked it, and it can fire while attach_core()'s own locked block still holds
+    // it. Safe only because that block's own std::unique_lock is a NARROWER scope
+    // than this function-scope guard - C++ unwind destructs the narrower scope's
+    // locals (releasing registry_mu_) before continuing to unwind this one. Moving
+    // this declaration into attach_core() would deadlock on exactly that unwind path
+    // (rung 9c PR-2, Unit 1: kept in THIS function for exactly this reason - see
+    // attach_core()'s own doc comment).
     GuardianRollback claim_rollback;
     claim_rollback.fn = [this, key, &arm_claim] {
         if (!arm_claim)
@@ -989,10 +964,82 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         claim_cv_.notify_all();
     };
 
+    AttachCoreResult core = attach_core(key, std::move(rule_id), std::move(spec),
+                                       std::move(assertion), emit_compliant_edge, arm_claim);
+    switch (core.state) {
+    case AttachCoreState::Armed:
+        return core.generation;
+    case AttachCoreState::Failed:
+        return std::unexpected(std::move(core.error));
+    case AttachCoreState::Pending:
+        break; // fall through to the bounded wait below
+    }
+
+    // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
+    // caller - GuardianEngine::apply_rules/start_local, still holding mtx_ for its
+    // whole body - waits at most cfg_.backend_op_deadline for this rule's arm to
+    // resolve, PLUS, if this rule_id had a prior generation on a bounded key, up to
+    // another deadline for that generation's disarm, since the two are sequential,
+    // not concurrent - a same-key redeploy is therefore up to 2x this deadline, not
+    // 1x, and a rule moving onto a key that holds a RETAINED disarm (Gate 4 hp-1) up
+    // to 3x: prior-key disarm, target-key disarm, own arm; a non-waiting entry point
+    // removes this wait entirely). The deadline is real steady_clock time captured
+    // HERE - after attach_core()'s own prior-disarm wait, which runs inside it - never
+    // the injected clock_() snapshot attach_core() uses for its own bookkeeping
+    // (tests inject fake clocks) and never counted from entry. Every OTHER rule's
+    // attach/detach and every evaluate_key proceed freely throughout, since
+    // registry_mu_ is not held here at all. The commit itself - keys_/rules_/
+    // pending_initial/"armed" audit - runs in on_arm_complete on the executor
+    // worker; the wait only collects its recorded outcome (or rethrows its commit
+    // exception on this thread). On a deadline or stop the waiter abandons the claim
+    // under registry_mu_ (a queued claim is erased, a dispatched one is left for the
+    // callback to finish and disarm - #3816's late-success handling, now decided on
+    // the runtime's side with the same one-mutex shape). The wakers for a claim
+    // commit are fired by the callback, not here.
+    const auto deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
+    auto outcome = wait_for_claim(key, arm_claim, deadline);
+    claim_rollback.committed = true;
+    return outcome;
+}
+
+GuardianSparkRuntime::AttachCoreResult
+GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
+                                  RuleAssertion assertion, bool emit_compliant_edge,
+                                  std::shared_ptr<KeyClaim>& arm_claim) {
+    // #2233 item 3: File/Registry/Service arm off registry_mu_; every other type
+    // stays inline (see io_class_for_spark_type's doc).
+    const std::optional<IoClass> io_class = io_class_for_spark_type(spec.type);
+    std::function<void()> waker;
+    std::function<void()> outbox_waker;
+    std::uint64_t new_gen = 0;
+    std::shared_ptr<KeyClaim> prior_disarm;
+    // Snapshot BEFORE taking registry_mu_ (same outside-lock pattern evaluate_key uses
+    // for its own now-snapshot): this is PendingState::first_seen, the M1 item (b)
+    // elapsed-time demotion clock. A fresh attach always starts un-demoted regardless
+    // of how long a PRIOR generation on this rule_id sat pending (detach_rule_locked
+    // below drops that generation's PendingState entirely). It comes from the
+    // INJECTED clock_() and is never used as the real wait deadline in attach_rule().
+    const auto attach_now = clock_();
+
+    // Built once, reused by both the fast (reuse-existing-watcher / inline-type) path
+    // and the claim (bounded off-lock arm) path's commit.
+    const std::string rule_name = assertion.rule_name;
+    const char* guard_type = guard_type_for(assertion.kind);
+    auto rg = std::make_shared<RuleGeneration>();
+    rg->active = true;
+    rg->emit_compliant_edge = emit_compliant_edge;
+    rg->assertion = std::move(assertion);
+    rg->assertion.rule_id = rule_id; // keep the assertion's own rule_id authoritative
+
+    std::uint64_t gen = 0;
+    std::shared_ptr<KeyClaim> to_dispatch;  // set iff this call must dispatch it
+    std::shared_ptr<KeyClaim> head_to_drive; // a retained disarm at the head to redrive first
+
     {
         std::unique_lock<std::mutex> lk{registry_mu_};
         if (stopping_)
-            return std::unexpected(std::string{"stopping"});
+            return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
+                                    .error = "stopping", .claim = nullptr};
 
         // PR #3821 review (fjarvis, cpp-safety re-review): armed BEFORE
         // prior_disarm is even populated below, not after - fn is a std::function
@@ -1129,7 +1176,9 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
             };
             auto armed = backend_->arm(spec); // may THROW -> rollback + index_add_rollback undo it
             if (!armed)
-                return std::unexpected(armed.error()); // rollback + index_add_rollback undo it
+                // rollback + index_add_rollback undo it
+                return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
+                                        .error = armed.error(), .claim = nullptr};
             sub = *armed;
             armed_here = true;
             pk = std::make_shared<PerKey>();
@@ -1183,37 +1232,26 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         dispatch_arm_off_lock(key, to_dispatch);
 
     if (!arm_claim) {
+        // Resolved synchronously (inline type, or an existing committed shared
+        // watcher was reused) - nothing pending, so fire the wakers here rather than
+        // deferring them to a caller that has nothing further to wait for.
         if (waker)
             waker();
         if (outbox_waker)
             outbox_waker();
-        return new_gen;
+        return AttachCoreResult{.state = AttachCoreState::Armed, .generation = new_gen,
+                                .error = {}, .claim = nullptr};
     }
 
-    // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
-    // caller - GuardianEngine::apply_rules/start_local, still holding mtx_ for its
-    // whole body - waits at most cfg_.backend_op_deadline for this rule's arm to
-    // resolve, PLUS, if this rule_id had a prior generation on a bounded key, up to
-    // another deadline for that generation's disarm above, since the two are
-    // sequential, not concurrent - a same-key redeploy is therefore up to 2x this
-    // deadline, not 1x, and a rule moving onto a key that holds a RETAINED disarm
-    // (Gate 4 hp-1) up to 3x: prior-key disarm, target-key disarm, own arm; PR-2
-    // removes the wait). The deadline is real steady_clock
-    // time captured HERE, after the prior-disarm wait, never the injected clock_()
-    // snapshot above (tests inject fake clocks) and never counted from entry. Every
-    // OTHER rule's attach/detach and every evaluate_key proceed freely throughout,
-    // since registry_mu_ is not held here at all. The commit itself - keys_/rules_/
-    // pending_initial/"armed" audit - runs in on_arm_complete on the executor
-    // worker; the wait only collects its recorded outcome (or rethrows its commit
-    // exception on this thread). On a deadline or stop the waiter abandons the claim
-    // under registry_mu_ (a queued claim is erased, a dispatched one is left for the
-    // callback to finish and disarm - #3816's late-success handling, now decided on
-    // the runtime's side with the same one-mutex shape). The wakers for a claim
-    // commit are fired by the callback, not here.
-    const auto deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
-    auto outcome = wait_for_claim(key, arm_claim, deadline);
-    claim_rollback.committed = true;
-    return outcome;
+    // Still pending: `arm_claim` (the caller's own local, written above) is this
+    // call's own live claim, already enqueued and (if selected) already dispatched
+    // off-lock. The wakers for a claim's eventual commit are fired by
+    // on_arm_complete's own callback, not here - unlike the resolved branch above,
+    // there is nothing to fire yet. attach_rule() waits on this claim via
+    // wait_for_claim(); a future non-waiting entry point would return it as
+    // Accepted(claim) instead, without waiting.
+    return AttachCoreResult{.state = AttachCoreState::Pending, .generation = 0,
+                            .error = {}, .claim = arm_claim};
 }
 
 void GuardianSparkRuntime::detach_rule(const std::string& rule_id) {
