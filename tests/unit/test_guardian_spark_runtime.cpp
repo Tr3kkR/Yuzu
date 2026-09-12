@@ -2393,29 +2393,39 @@ TEST_CASE("source tripwire: claim_rollback's .fn is assigned before the arm clai
     // those two lines can't reintroduce the defect the way it did pre-extraction; (b)
     // attach_core()'s own locked block still takes registry_mu_ before the enqueue,
     // preserving the original ordering WITHIN the function that now does the mutation.
-    // Both anchors below search from the START of the file (not from an
-    // attach_rule/attach_core anchor) because each searched string is CURRENTLY unique
-    // in this file - that is a fact about today's source, not a property the search
-    // itself enforces: an unscoped source.find() has no notion of "inside
-    // attach_rule()" and will silently grab whichever occurrence comes first in file
-    // order. Astra's rung 9c PR-2 Unit 2 plan adds a second, textually-identical
-    // "claim_rollback.fn = [this, key, &arm_claim]" and a second
-    // "attach_core(key, std::move(rule_id)" call in a new non-waiting overload -
-    // exactly the second-occurrence case this note warns about. THIS TEST MUST BE
-    // RE-ANCHORED (e.g. bounded to the byte range of attach_rule()'s own definition)
-    // in the same commit that adds that overload, not left to keep passing by
-    // incidentally matching whichever copy sorts first. Mutation-verified: swapping the
-    // two lines' relative order within either function makes this fail, as of today's
-    // single-occurrence source.
+    //
+    // RE-ANCHORED AGAIN (rung 9c PR-2, Unit 2): Unit 2 added exactly the second
+    // occurrence this comment previously warned about - attach_rule(NonWaiting, ...)
+    // has its own, textually-identical "claim_rollback.fn = [this, key, &arm_claim]"
+    // and its own "attach_core(key, std::move(rule_id)" call, sharing attach_core()
+    // with the blocking overload by design. An unscoped source.find() would now
+    // silently grab whichever copy sorts first in the file - which happens to still
+    // be the blocking overload's own (it is declared first), so this test was
+    // passing for the right reason purely by file-layout accident. Fixed by bounding
+    // the search to the blocking attach_rule(std::string rule_id, ...)'s own
+    // definition range: from its own signature up to (but not including) the next
+    // attach_rule(...) overload's definition. If a THIRD attach_rule overload or a
+    // reordering of these two ever changes that range's content, re-anchor again
+    // rather than relaxing this bound.
     std::ifstream input(std::filesystem::path(YUZU_AGENT_SRC_DIR) / "guardian_spark_runtime.cpp");
     REQUIRE(input.is_open());
     const std::string source((std::istreambuf_iterator<char>(input)),
                              std::istreambuf_iterator<char>());
 
-    const auto fn_assign_pos = source.find("claim_rollback.fn =");
+    const auto attach_rule_def_pos =
+        source.find("GuardianSparkRuntime::attach_rule(std::string rule_id");
+    REQUIRE(attach_rule_def_pos != std::string::npos);
+    const auto next_overload_pos =
+        source.find("GuardianSparkRuntime::attach_rule(NonWaiting", attach_rule_def_pos);
+    REQUIRE(next_overload_pos != std::string::npos);
+    REQUIRE(attach_rule_def_pos < next_overload_pos);
+
+    const auto fn_assign_pos = source.find("claim_rollback.fn =", attach_rule_def_pos);
     REQUIRE(fn_assign_pos != std::string::npos);
+    REQUIRE(fn_assign_pos < next_overload_pos); // still inside the blocking overload
     const auto core_call_pos = source.find("attach_core(key, std::move(rule_id)", fn_assign_pos);
     REQUIRE(core_call_pos != std::string::npos);
+    REQUIRE(core_call_pos < next_overload_pos); // ditto
     CHECK(fn_assign_pos < core_call_pos);
 
     // Within attach_core() (defined after this call site): the lock still precedes the
