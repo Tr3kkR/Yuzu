@@ -156,11 +156,18 @@ struct DeregisterResult {
 /// large backlog in one go and is worth its own metric outcome
 /// (`yuzu_server_gateway_route_reap_total{outcome="recovered"}`, PR #4299
 /// round-2 review). `clock_anomaly` and `recovered` are mutually exclusive.
+/// `skipped` (PR #4299 round-2 external review) is true iff another replica
+/// already holds the `gateway_route_store:reap` advisory lock this tick — the
+/// ReplicaSafe contract (background_jobs.hpp) is "all but the holder skip",
+/// matching every sibling single-sweeper store's `pg_try_advisory_xact_lock`
+/// idiom; `skipped` implies every other field stays at its default (the
+/// lambda returns before reading now()/the anchor).
 struct ReapRoutesResult {
     int expired_leases_reaped{0}; ///< predicate (a): lease_until past the grace window
     int tombstones_reaped{0};     ///< predicate (b): NULL-lease rows past the purge age
     bool clock_anomaly{false};
     bool recovered{false};
+    bool skipped{false};
 };
 
 /// A durable agent→cluster route, as read by `lookup_route`. Timestamps are
@@ -251,16 +258,24 @@ public:
     ///    would-wipe verdict cannot separate a true positive from that
     ///    routine case.
     ///  - Part 4 (fact-set anomaly dedup) is ADOPTED, in a simplified form
-    ///    keyed on the declined `route_meta.reap_anchor_ms` value rather than
-    ///    the full multi-field `Facts` struct (PR #4299 review, BLOCKER 1) —
-    ///    a forward- or backward-skew anomaly declines ONCE (persisting
-    ///    `reap_declined_anchor_ms = reap_anchor_ms`) and an IDENTICAL
-    ///    repeat (the anchor still unmoved) RECOVERS and drains, capped,
-    ///    treating the persisted gap as genuine elapsed downtime rather than
-    ///    a transient glitch. Without this, a routine >24h gap (weekend
-    ///    shutdown, DR failover, extended maintenance) wedged the guard
-    ///    PERMANENTLY — `now - anchor` only grows while declined, so every
-    ///    later pass declined forever with no recovery path. An OPERATOR can
+    ///    keyed on the PAIR (declined `route_meta.reap_anchor_ms` value,
+    ///    anomaly DIRECTION) rather than the full multi-field `Facts` struct
+    ///    (PR #4299 review, BLOCKER 1; direction-keyed since round-2 external
+    ///    review) — a forward- or backward-skew anomaly declines ONCE
+    ///    (persisting `reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>"`)
+    ///    and an IDENTICAL repeat (the anchor still unmoved AND the same
+    ///    direction) RECOVERS and drains, capped, treating the persisted gap
+    ///    as genuine elapsed downtime rather than a transient glitch. A
+    ///    DIFFERENT-direction anomaly at the SAME frozen anchor (e.g. a
+    ///    backward decline followed by an unrelated forward reading) is NOT
+    ///    the same anomaly repeating — it re-declines and re-arms against the
+    ///    new direction rather than recovering, since recovering it would run
+    ///    the sweeps against a forward-classified `now_ms`, itself the
+    ///    corrupted/huge reading. Without the decline-once/drain-on-repeat
+    ///    mechanism at all, a routine >24h gap (weekend shutdown, DR failover,
+    ///    extended maintenance) wedged the guard PERMANENTLY — `now - anchor`
+    ///    only grows while declined, so every later pass declined forever
+    ///    with no recovery path. An OPERATOR can
     ///    force recovery early by resetting `route_meta.reap_anchor_ms` (see
     ///    the operator re-anchor comment at the anomaly-detection site in
     ///    `gateway_route_store.cpp`). Every decline (first or, before this

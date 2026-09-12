@@ -158,10 +158,11 @@ advisory lock when a 2nd replica lands.
 
 ### `GatewayRouteStore::reap_stale_routes` (HA WS-4 slice 4.2a, hardened PR #4299)
 
-JOINS this guarded set on the `SessionStore::reap_expired` shape (advisory-lock own-statement
-`gateway_route_store:reap`, in-SQL DB `now()` read once for both cutoffs + anchor-compare +
-anchor-update, persisted+sanitised `route_meta` anchor, forward/backward-anomaly decline,
-unconditional per-predicate cap):
+JOINS this guarded set on the `SessionStore::reap_expired` shape (`pg_try_advisory_xact_lock`
+own-statement `gateway_route_store:reap` — all but the holder skip, PR #4299 round-2 external
+review — in-SQL DB `now()` read once for both cutoffs + anchor-compare + anchor-update,
+persisted+sanitised `route_meta` anchor, forward/backward-anomaly decline, unconditional
+per-predicate cap):
 
 1. **NO would-wipe probe** (DELIBERATE carve-out, the `api_token_store`/`SessionStore` precedent) —
    the `agent_routes` table legitimately drains toward "every lease expired" as ROUTINE behaviour (a
@@ -169,20 +170,26 @@ unconditional per-predicate cap):
    from a false positive here.
 4. **Fact-set anomaly dedup is ADOPTED** (PR #4299 review; an earlier revision carved this out too,
    the way `SessionStore` does — that was the defect this fix closes), in a form simplified for this
-   store's small state: **decline-once / drain-on-repeat, keyed on the declined `reap_anchor_ms`
-   value** rather than the full multi-field `Facts` struct `audit_store.cpp` uses. A forward- or
-   backward-skew anomaly persists `route_meta.reap_declined_anchor_ms = reap_anchor_ms` and declines;
-   an IDENTICAL repeat (the anchor still unmoved, because a decline never advances it) RECOVERS —
-   runs both sweeps under the cap, advances `reap_anchor_ms` to `now_ms` UNCONDITIONALLY (never
-   `max(anchor, now_ms)`, which would leave a forward-skew-poisoned anchor stuck forever), and clears
-   the declined-anchor marker. A normal (non-anomalous) accepted pass also clears the marker, so a
-   later transient glitch is judged fresh against the new anchor rather than free-riding on a stale
-   recovery. **Why this mattered**: the carved-out version wedged PERMANENTLY after any routine >24h
+   store's small state: **decline-once / drain-on-repeat, keyed on the PAIR (declined `reap_anchor_ms`
+   value, anomaly DIRECTION)** (round-2 external review; the initial round-2 fix keyed on the anchor
+   value alone — see "Direction-keyed, not anchor-value-alone" below for the defect that closed)
+   rather than the full multi-field `Facts` struct `audit_store.cpp` uses. A forward- or backward-skew
+   anomaly persists `route_meta.reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>"` and declines;
+   an IDENTICAL repeat (the anchor still unmoved, because a decline never advances it, AND the same
+   direction) RECOVERS — runs both sweeps under the cap, advances `reap_anchor_ms` to `now_ms`
+   UNCONDITIONALLY (never `max(anchor, now_ms)`, which would leave a forward-skew-poisoned anchor
+   stuck forever), and clears the declined-anchor marker. A DIFFERENT-direction anomaly at the SAME
+   frozen anchor (e.g. a backward-skew decline followed by an unrelated forward-skew reading) does
+   NOT match — it re-declines and re-arms against the new direction instead of recovering. A normal
+   (non-anomalous) accepted pass also clears the marker, so a later transient glitch is judged fresh
+   against the new anchor rather than free-riding on a stale recovery. **Why this mattered**: the
+   carved-out version wedged PERMANENTLY after any routine >24h
    gap (weekend shutdown, DR failover, extended maintenance) — `now - anchor` only grows while
    declined, so every subsequent pass declined forever with no recovery path. **Corrected (round-2
-   review): there is no permanent wedge either way.** A skew that persists into the next pass
-   presents the SAME frozen anchor, which is exactly the `declined_anchor == anchor` match, so it
-   RECOVERS on that pass — it does not "correctly never recover on its own." A continuously-drifting
+   review, then re-corrected to add direction below): there is no permanent wedge either way for a
+   clock that keeps drifting the SAME direction.** A skew that persists into the next pass at the
+   SAME direction presents the SAME frozen (anchor, direction) pair, which is exactly the match, so
+   it RECOVERS on that pass — it does not "correctly never recover on its own." A continuously-drifting
    clock instead OSCILLATES (decline, recover, decline, recover, ...) roughly every other pass, since
    a recovered pass re-anchors to that pass's `now_ms` unconditionally, and the next pass judges
    itself fresh against the new anchor. The **operator re-anchor** (reset `route_meta.reap_anchor_ms`
@@ -192,7 +199,8 @@ unconditional per-predicate cap):
    anomaly-detection site. Every
    decline is `spdlog::warn`'d AND counted:
    `yuzu_server_gateway_route_reap_total{outcome="declined"}` (incremented at the reap call site in
-   `server.cpp`, pre-seeded across `ok`/`recovered`/`declined`/`error` since PR #4299 round-2). This
+   `server.cpp`, pre-seeded across `ok`/`recovered`/`declined`/`skipped`/`error` since PR #4299
+   round-2, `skipped` added round-2 external review). This
    is a DEDICATED reap-outcome counter, distinct from
    `yuzu_server_gateway_route_desync_total`/`_write_failed_total`, which cover the WRITE path
    (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not a reap pass's own outcome.
@@ -202,17 +210,27 @@ unconditional per-predicate cap):
    review, `ReapRoutesResult::recovered`) — a recovery can drain a large backlog in one go, so it is
    metric-distinguishable from a routine `ok` tick rather than reading identically to one.
 
-   **Cross-type recovery is anchor-value-keyed, not direction-keyed (PR #4299 round-2 review).** The
-   `declined_anchor == anchor` match above is blind to whether THIS pass's own anomaly is forward- or
-   backward-classified, or whether it matches the classification of the pass that froze
-   `declined_anchor` in the first place — so a forward-skew decline followed by a BACKWARD-skew repeat
-   at that SAME anchor also satisfies the match and recovers. This is deliberate and safe: the
-   recovery branch always computes its reap cutoffs from THIS pass's own `now_ms` (the real, current
-   DB clock read that pass), never from the anchor. A forward-skewed `now_ms` is itself the
-   corrupted/huge reading, so only a forward-classified recovery can mass-reap; a backward-classified
-   pass has a normal (or genuinely small) `now_ms`, so it can only UNDER-reap relative to an ordinary
-   pass — a live row with a future lease is never brought into range by a smaller `now_ms`. Adding
-   anomaly-type keying on top of the anchor-value key is therefore unnecessary.
+   **Direction-keyed, not anchor-value-alone (PR #4299 round-2 EXTERNAL review — corrects the
+   round-2 review's own "cross-type recovery is safe" conclusion above, which this fix replaces).**
+   The initial round-2 fix keyed recovery on `declined_anchor == anchor` alone, blind to whether THIS
+   pass's own anomaly is forward- or backward-classified, or whether it matches the classification of
+   the pass that froze `declined_anchor` in the first place — so a BACKWARD-skew decline (pass 1)
+   followed by a DIFFERENT, unrelated FORWARD-skew reading (pass 2) at that SAME anchor satisfied the
+   match and recovered, running the sweeps against pass 2's own forward-skewed (implausibly-huge)
+   `now_ms` — mass-tombstoning live leased routes and letting sweep (b) hard-delete pre-existing
+   NULL-lease (in-handshake `register_fresh`'d) rows. That "only a forward-classified recovery can
+   mass-reap, so keying just needs to gate the forward direction" reasoning was the defect: it treated
+   the CURRENT pass's own classification as sufficient, but never checked that the CURRENT anomaly is
+   the SAME anomaly as the one that froze the anchor. A single fresh forward anomaly that should
+   decline-once instead drained because an unrelated prior backward decline happened to freeze the
+   same anchor value. The fix compares the FULL fact set — (anchor, direction) — never a value-only
+   latch: recovery requires the declined marker's direction to match THIS pass's own direction, so a
+   direction change at the same anchor re-declines (and re-arms against the new direction) instead of
+   recovering. Anomaly-type keying is therefore load-bearing, not unnecessary complexity — see the
+   corrected "Fact-set anomaly dedup is ADOPTED" bullet above and `gateway_route_store.hpp`'s
+   `reap_stale_routes` doc comment for the marker format (`"<anchor>:<direction>"`) and its
+   mixed-version-safe parse (an unparseable value, including a legacy bare-integer marker or this
+   store's own new-format value read by an older binary, is treated as absent and re-declines).
 
    **The decline-once/drain-on-repeat recovery above is the SKEW path only — a corrupt PERSISTED
    anchor uses a DIFFERENT mechanism (PR #4299 round-3 review).** An unparseable or negative
@@ -221,7 +239,7 @@ unconditional per-predicate cap):
    reading: this method is the anchor's sole writer and always writes a sanitised non-negative i64,
    so an invalid stored value can only be external tampering/corruption. Declining it without
    repair (the pre-round-3 behaviour) wedged EVERY future pass permanently, since the skew
-   recovery's `declined_anchor == anchor` match is never reached from this branch. The fix is
+   recovery's (anchor, direction) match is never reached from this branch. The fix is
    SELF-HEAL, not drain-on-repeat: on a corrupt persisted anchor, re-anchor `reap_anchor_ms` to
    this pass's own already-sanitised `now_ms` (never the anchor's old value), clear
    `reap_declined_anchor_ms` (a stale skew marker must not be judged against the freshly

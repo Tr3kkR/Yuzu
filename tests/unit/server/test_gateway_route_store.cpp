@@ -921,34 +921,34 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is AHEAD of the 
     CHECK(*(*stale)->session_id == "s-stale");
 }
 
-// PR #4299 round-2 review, FIX C: recovery is keyed on the ANCHOR VALUE only
-// (`declined_anchor == anchor`), never on which direction (forward vs.
-// backward) triggered either this pass's own anomaly or the anomaly that
-// froze `declined_anchor` in the first place. This test proves the
-// cross-type case: pass 1 is a genuine, real FORWARD-skew decline (anchor
-// implausibly BEHIND the DB clock; identical mechanism to the "declines a
-// forward-skew anomaly ONCE" test above), demonstrating the decline
-// mechanism persists `reap_declined_anchor_ms` exactly as documented. A real
-// anchor scalar cannot then naturally flip to presenting as BACKWARD-skewed
-// (anchor AHEAD of the clock) on a very-shortly-after pass 2, since real
-// wall-clock time only advances between passes — so pass 2's precondition
-// (current anchor == persisted declined_anchor, with the CURRENT anchor
-// positioned ahead of "now") is constructed directly via
-// raw_set_reap_anchor + raw_set_reap_declined_anchor, both set to the SAME
-// new value. This is the same test technique every other decline/recover
-// case in this file already uses (a raw-seeded anchor standing in for
-// "whatever a prior pass would have left behind") — here applied to BOTH
-// meta keys so pass 2 is unambiguously classified as a BACKWARD-skew
-// recovery against a declined_anchor that (by construction) could only
-// really have been frozen by a backward decline, while pass 1 above
-// independently proves the freezing mechanism works for the FORWARD
-// direction too. Together they demonstrate the match is anchor-value-keyed,
-// not direction-keyed: recovery does not care, and must not care, which
-// direction produced either side of the comparison.
-TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a backward-skew repeat "
-          "at the SAME (re-seeded) declined anchor RECOVERS, UNDER-reaps (the live row "
-          "survives), and reports recovered=true, not just clock_anomaly=false (PR #4299 "
-          "round-2 review, FIX C cross-type recovery)",
+// PR #4299 round-2 EXTERNAL review, BLOCKER: recovery MUST be keyed on the
+// PAIR (declined anchor value, anomaly DIRECTION), never the anchor value
+// alone. The round-2 review's own "FIX C cross-type recovery" test (this
+// comment block used to describe it, and used to assert the OPPOSITE of
+// what the tests below assert) proved the exact defect this fix closes: a
+// backward-skew decline (pass 1) followed by a DIFFERENT, unrelated
+// forward-skew reading (pass 2) at the SAME frozen anchor satisfied a
+// value-only match and RECOVERED — running the sweeps against pass 2's own
+// forward-skewed (implausibly-huge) now_ms, which mass-tombstones live
+// leased routes and lets sweep (b) hard-delete pre-existing NULL-lease
+// (in-handshake register_fresh'd) rows. A single fresh forward anomaly that
+// should decline-once instead drained because an unrelated backward decline
+// happened to precede it at the same anchor.
+//
+// Marker format since this fix: `reap_declined_anchor_ms` stores
+// `"<anchor>:<direction>"` (direction in {forward, backward}) — see
+// gateway_route_store.cpp's `parse_declined_marker`. Real forward/backward
+// declines are driven exactly like the standalone single-decline tests
+// above; a real anchor scalar cannot naturally flip which direction it
+// presents on a shortly-after pass (real wall-clock time only advances
+// between passes), so a SAME-anchor-DIFFERENT-direction precondition is
+// constructed directly via raw_set_reap_anchor + raw_set_reap_declined_anchor
+// — the same technique every decline/recover case in this file already uses
+// for "whatever a prior pass would have left behind".
+TEST_CASE("GatewayRouteStore[pg]: a backward-skew decline followed by a DIFFERENT forward-skew "
+          "reading at the SAME anchor RE-DECLINES (never recovers), and a subsequent identical "
+          "forward-skew repeat at that anchor then RECOVERS (PR #4299 round-2 external review, "
+          "direction-keyed decline-once/drain-on-repeat)",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
     auto baseline = fx.store().reap_stale_routes(); // establishes a real anchor
@@ -956,24 +956,25 @@ TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a backward-
     CHECK_FALSE(baseline->clock_anomaly);
     CHECK_FALSE(baseline->recovered);
 
-    REQUIRE(fx.store().register_fresh("agent-mix-live", "s-live").value().won);
+    REQUIRE(fx.store().register_fresh("agent-dir-live", "s-live").value().won);
     REQUIRE(fx.store()
-                .announce_connected("agent-mix-live", "s-live", "c1", "n1", 3600)
+                .announce_connected("agent-dir-live", "s-live", "c1", "n1", 3600)
                 .value()
                 .matched);
-    REQUIRE(fx.store().register_fresh("agent-mix-expired", "s-expired").value().won);
+    REQUIRE(fx.store().register_fresh("agent-dir-expired", "s-expired").value().won);
     REQUIRE(fx.store()
-                .announce_connected("agent-mix-expired", "s-expired", "c1", "n1", 30)
+                .announce_connected("agent-dir-expired", "s-expired", "c1", "n1", 30)
                 .value()
                 .matched);
-    fx.raw_set_lease_until_ago("agent-mix-expired", 200); // past the 180s grace
+    fx.raw_set_lease_until_ago("agent-dir-expired", 200); // past the 180s grace
 
-    // Pass 1 (REAL forward-skew decline): anchor implausibly BEHIND the DB
-    // clock. Identical to the standalone forward-decline test above — this
-    // is not manufactured, it is the store's genuine decline behaviour.
-    const std::string forward_poisoned =
-        std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
-    fx.raw_set_reap_anchor(forward_poisoned);
+    // Pass 1 (REAL backward-skew decline): anchor implausibly AHEAD of the
+    // DB clock. Identical mechanism to the standalone backward-decline test
+    // above — not manufactured, the store's genuine decline behaviour.
+    // Proves the marker is written as "<anchor>:backward".
+    const std::string backward_poisoned =
+        std::to_string(fx.raw_db_now_ms() + 3600LL * 1000);
+    fx.raw_set_reap_anchor(backward_poisoned);
 
     auto out1 = fx.store().reap_stale_routes();
     REQUIRE(out1.has_value());
@@ -981,57 +982,328 @@ TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a backward-
     CHECK_FALSE(out1->recovered);
     CHECK(out1->expired_leases_reaped == 0);
     CHECK(out1->tombstones_reaped == 0);
-    // The real decline persisted declined_anchor == forward_poisoned, and
-    // left reap_anchor_ms unchanged at forward_poisoned too.
     auto declined_after1 = fx.raw_get_reap_declined_anchor();
     REQUIRE(declined_after1.has_value());
-    CHECK(*declined_after1 == forward_poisoned);
+    CHECK(*declined_after1 == backward_poisoned + ":backward");
     auto anchor_after1 = fx.raw_get_reap_anchor();
     REQUIRE(anchor_after1.has_value());
-    CHECK(*anchor_after1 == forward_poisoned);
+    CHECK(*anchor_after1 == backward_poisoned);
 
     // Construct pass 2's precondition directly: re-seed BOTH meta keys to
-    // the SAME new value, positioned AHEAD of the current DB clock, so this
-    // pass classifies as BACKWARD-skew (now_ms < anchor) against a
-    // declined_anchor that matches the current anchor exactly ->
-    // declined_anchor == anchor -> RECOVERS, via the opposite direction from
-    // pass 1's own decline.
-    const std::string backward_anchor =
-        std::to_string(fx.raw_db_now_ms() + 2LL * 24 * 3600 * 1000);
-    fx.raw_set_reap_anchor(backward_anchor);
-    fx.raw_set_reap_declined_anchor(backward_anchor);
+    // the SAME new anchor value, positioned FAR BEHIND the current DB clock
+    // (forward-skew) — a DIFFERENT anomaly at that anchor than the one the
+    // marker (fabricated here to stand in for "whatever pass 1 really
+    // froze") records as "backward". Anchor matches; direction does not ->
+    // MUST re-decline, never recover.
+    const std::string mix_anchor = std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
+    fx.raw_set_reap_anchor(mix_anchor);
+    fx.raw_set_reap_declined_anchor(mix_anchor + ":backward");
 
     auto out2 = fx.store().reap_stale_routes();
     REQUIRE(out2.has_value());
-    CHECK_FALSE(out2->clock_anomaly); // recovered, not declined again
-    CHECK(out2->recovered);           // distinct signal from an ordinary "ok" pass
-    // UNDER-reaps: the recovery branch computes its cutoffs from THIS pass's
-    // own (real, current, correct) now_ms -- never from the artificially
-    // future anchor -- so it reaps exactly what a normal pass would: the
-    // genuinely-expired row, and nothing more.
-    CHECK(out2->expired_leases_reaped == 1);
+    CHECK(out2->clock_anomaly);     // RE-DECLINES
+    CHECK_FALSE(out2->recovered);   // never recovers on a direction mismatch
+    CHECK(out2->expired_leases_reaped == 0);
     CHECK(out2->tombstones_reaped == 0);
 
-    auto live = fx.store().lookup_route("agent-mix-live");
+    // The live row SURVIVES — a wrong recovery here would have run the
+    // sweeps against the forward-skewed (implausibly huge) now_ms and
+    // mass-tombstoned it.
+    auto live_after2 = fx.store().lookup_route("agent-dir-live");
+    REQUIRE(live_after2.has_value());
+    REQUIRE(live_after2->has_value());
+    REQUIRE((*live_after2)->session_id.has_value());
+    CHECK(*(*live_after2)->session_id == "s-live");
+    // The already-expired row is untouched too — a declined pass reaps
+    // nothing, recovered or not.
+    auto expired_after2 = fx.store().lookup_route("agent-dir-expired");
+    REQUIRE(expired_after2.has_value());
+    REQUIRE(expired_after2->has_value());
+    REQUIRE((*expired_after2)->session_id.has_value());
+    CHECK(*(*expired_after2)->session_id == "s-expired");
+
+    // The marker is RE-ARMED against the new (mix_anchor, forward) pair —
+    // never left at the stale "backward" claim.
+    auto declined_after2 = fx.raw_get_reap_declined_anchor();
+    REQUIRE(declined_after2.has_value());
+    CHECK(*declined_after2 == mix_anchor + ":forward");
+    auto anchor_after2 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after2.has_value());
+    CHECK(*anchor_after2 == mix_anchor); // anchor itself never moves on a decline
+
+    // Pass 3 (REAL, no more fabrication): the anchor is still mix_anchor
+    // (a decline never advances it), and only a few ms of real time have
+    // passed, so this pass reads the IDENTICAL forward-skew direction again
+    // against the IDENTICAL anchor -> matches the marker pass 2 just wrote
+    // -> RECOVERS this time.
+    auto out3 = fx.store().reap_stale_routes();
+    REQUIRE(out3.has_value());
+    CHECK_FALSE(out3->clock_anomaly);
+    CHECK(out3->recovered);
+    // UNDER-reaps nothing extra: the recovery branch computes its cutoffs
+    // from THIS pass's own (real, current, correct) now_ms, so it reaps
+    // exactly what a normal pass would — the genuinely-expired row.
+    CHECK(out3->expired_leases_reaped == 1);
+    CHECK(out3->tombstones_reaped == 0);
+
+    auto live3 = fx.store().lookup_route("agent-dir-live");
+    REQUIRE(live3.has_value());
+    REQUIRE(live3->has_value());
+    REQUIRE((*live3)->session_id.has_value());
+    CHECK(*(*live3)->session_id == "s-live"); // SURVIVES
+
+    auto expired3 = fx.store().lookup_route("agent-dir-expired");
+    REQUIRE(expired3.has_value());
+    REQUIRE(expired3->has_value());
+    CHECK_FALSE((*expired3)->session_id.has_value()); // tombstoned by the recovered pass
+
+    // Recovery re-anchors UNCONDITIONALLY to this pass's real now_ms, moving
+    // decisively off the artificially-past mix_anchor, and clears the
+    // declined marker.
+    auto anchor_after3 = fx.raw_get_reap_anchor();
+    REQUIRE(anchor_after3.has_value());
+    const std::int64_t anchor3 = std::strtoll(anchor_after3->c_str(), nullptr, 10);
+    const std::int64_t mix_anchor_val = std::strtoll(mix_anchor.c_str(), nullptr, 10);
+    CHECK(anchor3 > mix_anchor_val); // NOT max(anchor, now_ms) -- moved decisively off it
+    CHECK_FALSE(fx.raw_get_reap_declined_anchor().has_value());
+}
+
+// Symmetry check for the fix above: a forward-skew decline followed by a
+// DIFFERENT backward-skew reading at the same anchor must ALSO re-decline —
+// the direction check is not one-sided.
+TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a DIFFERENT backward-skew "
+          "reading at the SAME anchor RE-DECLINES (symmetry, PR #4299 round-2 external review)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-sym-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-sym-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+
+    // Pass 1 (REAL forward-skew decline).
+    const std::string forward_poisoned =
+        std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
+    fx.raw_set_reap_anchor(forward_poisoned);
+    auto out1 = fx.store().reap_stale_routes();
+    REQUIRE(out1.has_value());
+    CHECK(out1->clock_anomaly);
+    CHECK_FALSE(out1->recovered);
+    auto declined_after1 = fx.raw_get_reap_declined_anchor();
+    REQUIRE(declined_after1.has_value());
+    CHECK(*declined_after1 == forward_poisoned + ":forward");
+
+    // Fabricate pass 2: SAME (re-seeded) anchor, now presented as
+    // backward-skew, marker still claiming "forward" -> mismatch.
+    const std::string mix_anchor = std::to_string(fx.raw_db_now_ms() + 3600LL * 1000);
+    fx.raw_set_reap_anchor(mix_anchor);
+    fx.raw_set_reap_declined_anchor(mix_anchor + ":forward");
+
+    auto out2 = fx.store().reap_stale_routes();
+    REQUIRE(out2.has_value());
+    CHECK(out2->clock_anomaly);
+    CHECK_FALSE(out2->recovered);
+
+    auto live_after2 = fx.store().lookup_route("agent-sym-live");
+    REQUIRE(live_after2.has_value());
+    REQUIRE(live_after2->has_value());
+    REQUIRE((*live_after2)->session_id.has_value());
+    CHECK(*(*live_after2)->session_id == "s-live");
+
+    auto declined_after2 = fx.raw_get_reap_declined_anchor();
+    REQUIRE(declined_after2.has_value());
+    CHECK(*declined_after2 == mix_anchor + ":backward"); // re-armed with the CURRENT direction
+}
+
+// A 4-pass strict direction alternation (forward, backward, forward,
+// backward — each fabricated at a fresh anchor, per the "same anchor cannot
+// naturally flip direction" constraint documented above) must never
+// accidentally recover: every pass declines and the live row survives
+// throughout.
+TEST_CASE("GatewayRouteStore[pg]: a 4-pass strict direction alternation never recovers — every "
+          "pass declines, the live row survives (PR #4299 round-2 external review)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-alt-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-alt-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+
+    const std::int64_t now0 = fx.raw_db_now_ms();
+    // Four passes, alternating forward/backward, each at a value distinct
+    // from every prior pass's anchor (so an anchor-value mismatch alone
+    // would already force a decline) AND presenting the opposite direction
+    // to whatever the immediately-preceding pass's marker recorded (so the
+    // direction check is also exercised, not just anchor equality).
+    const std::string anchors[4] = {
+        std::to_string(now0 - 2LL * 24 * 3600 * 1000),      // forward
+        std::to_string(now0 + 1LL * 3600 * 1000),           // backward
+        std::to_string(now0 - 3LL * 24 * 3600 * 1000),      // forward
+        std::to_string(now0 + 2LL * 3600 * 1000),           // backward
+    };
+    for (const auto& anchor : anchors) {
+        fx.raw_set_reap_anchor(anchor);
+        auto out = fx.store().reap_stale_routes();
+        REQUIRE(out.has_value());
+        CHECK(out->clock_anomaly);
+        CHECK_FALSE(out->recovered);
+        CHECK(out->expired_leases_reaped == 0);
+        CHECK(out->tombstones_reaped == 0);
+    }
+
+    auto live = fx.store().lookup_route("agent-alt-live");
     REQUIRE(live.has_value());
     REQUIRE(live->has_value());
     REQUIRE((*live)->session_id.has_value());
-    CHECK(*(*live)->session_id == "s-live"); // SURVIVES: backward under-reaps, never mass-reaps
+    CHECK(*(*live)->session_id == "s-live");
+}
 
-    auto expired = fx.store().lookup_route("agent-mix-expired");
-    REQUIRE(expired.has_value());
-    REQUIRE(expired->has_value());
-    CHECK_FALSE((*expired)->session_id.has_value()); // tombstoned by the recovered pass
+// Mixed-version / self-heal safety: a LEGACY bare-integer marker (as written
+// by a pre-fix binary, or by `raw_set_reap_declined_anchor` directly) is
+// unparseable by `parse_declined_marker` (no `:direction` suffix) and MUST
+// be treated as absent — re-arming in the new format and declining once
+// more, never granting a recovery on anchor-value coincidence alone.
+TEST_CASE("GatewayRouteStore[pg]: a legacy bare-integer declined-anchor marker is treated as "
+          "absent — declines and re-arms in the new <anchor>:<direction> format",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
 
-    // Recovery re-anchors UNCONDITIONALLY to this pass's real now_ms, moving
-    // decisively off the artificially-future backward_anchor, and clears the
-    // declined marker.
-    auto anchor_after2 = fx.raw_get_reap_anchor();
-    REQUIRE(anchor_after2.has_value());
-    const std::int64_t anchor2 = std::strtoll(anchor_after2->c_str(), nullptr, 10);
-    const std::int64_t backward_anchor_val = std::strtoll(backward_anchor.c_str(), nullptr, 10);
-    CHECK(anchor2 < backward_anchor_val); // NOT max(anchor, now_ms) -- moved decisively off it
+    REQUIRE(fx.store().register_fresh("agent-legacy-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-legacy-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+
+    // Anchor far behind the clock (forward-skew) with a LEGACY marker whose
+    // anchor half matches EXACTLY — under the old anchor-only keying this
+    // would have recovered; under the fix it must not, since the legacy
+    // value carries no direction and is treated as absent.
+    const std::string anchor = std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
+    fx.raw_set_reap_anchor(anchor);
+    fx.raw_set_reap_declined_anchor(anchor); // bare integer, no ":direction" suffix
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->clock_anomaly);
+    CHECK_FALSE(out->recovered);
+
+    auto live = fx.store().lookup_route("agent-legacy-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live");
+
+    // Re-armed in the NEW format.
+    auto declined_after = fx.raw_get_reap_declined_anchor();
+    REQUIRE(declined_after.has_value());
+    CHECK(*declined_after == anchor + ":forward");
+}
+
+// The self-heal path (corrupt/unparseable PERSISTED anchor) clears
+// `reap_declined_anchor_ms` unconditionally, regardless of marker format —
+// a pre-existing NEW-format (direction-suffixed) marker must not survive a
+// self-heal any more than a legacy bare-integer one did before this fix.
+TEST_CASE("GatewayRouteStore[pg]: self-heal on a corrupt persisted anchor clears a pre-existing "
+          "direction-suffixed declined-anchor marker",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    auto baseline = fx.store().reap_stale_routes();
+    REQUIRE(baseline.has_value());
+    CHECK_FALSE(baseline->clock_anomaly);
+
+    REQUIRE(fx.store().register_fresh("agent-selfheal-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-selfheal-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+
+    // A stale NEW-format marker recorded against an anchor value that is
+    // about to be discarded as corrupt.
+    fx.raw_set_reap_declined_anchor("123456789:backward");
+    fx.raw_set_reap_anchor("not-a-number");
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->clock_anomaly);
+    CHECK_FALSE(out->recovered);
+
+    // Self-heal must clear the combined (anchor, direction) marker exactly
+    // as it cleared the legacy bare-anchor one — the freshly re-anchored
+    // value must not be judged against a marker recorded against the
+    // now-discarded corrupt anchor.
     CHECK_FALSE(fx.raw_get_reap_declined_anchor().has_value());
+
+    auto live = fx.store().lookup_route("agent-selfheal-live");
+    REQUIRE(live.has_value());
+    REQUIRE(live->has_value());
+    REQUIRE((*live)->session_id.has_value());
+    CHECK(*(*live)->session_id == "s-live");
+}
+
+// PR #4299 round-2 external review (SHOULD): the advisory lock switched from
+// blocking `pg_advisory_xact_lock` to `pg_try_advisory_xact_lock`, matching
+// the ReplicaSafe contract (background_jobs.hpp: "all but the holder skip")
+// and every sibling single-sweeper store's idiom (response_store.cpp's
+// equivalent test is the template for this one). A sibling replica already
+// holding the fleet-wide advisory lock must make this pass skip quietly —
+// never touching now()/the anchor/the sweeps — and report it via
+// `ReapRoutesResult::skipped`, not `clock_anomaly`.
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes skips quietly when a sibling holds the "
+          "advisory lock",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+
+    REQUIRE(fx.store().register_fresh("agent-lockskip-stale", "s-stale").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-lockskip-stale", "s-stale", "c1", "n1", 30)
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-lockskip-stale", 200); // past the 180s grace
+
+    yuzu::server::pg::PgConn locker{PQconnectdb(fx.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult begin{PQexec(locker.get(), "BEGIN")};
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        yuzu::server::pg::PgResult lock{PQexec(
+            locker.get(),
+            "SELECT pg_advisory_xact_lock(hashtext('gateway_route_store:reap'))")};
+        REQUIRE(lock.status() == PGRES_TUPLES_OK);
+    }
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->skipped);
+    CHECK_FALSE(out->clock_anomaly);
+    CHECK_FALSE(out->recovered);
+    CHECK(out->expired_leases_reaped == 0);
+    CHECK(out->tombstones_reaped == 0);
+
+    // Nothing was touched — the sibling held the lock before this pass could
+    // even read now()/the anchor.
+    CHECK(fx.raw_row_exists("agent-lockskip-stale"));
+    CHECK_FALSE(fx.raw_get_reap_anchor().has_value());
+
+    yuzu::server::pg::PgResult rollback{PQexec(locker.get(), "ROLLBACK")};
+    REQUIRE(rollback.status() == PGRES_COMMAND_OK);
+
+    // With the lock released, a normal pass now runs and reaps the stale row.
+    auto out2 = fx.store().reap_stale_routes();
+    REQUIRE(out2.has_value());
+    CHECK_FALSE(out2->skipped);
+    CHECK(out2->expired_leases_reaped == 1);
 }
 
 // PR #4299 round-3 review (Codex + Kimi panel, both confirmed): a prior

@@ -125,9 +125,10 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     {"execution_tracker.poll_event_outbox_once", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "MUST run per-replica — cross-replica SSE delivery (ADR-2002 §5); NEVER leader-gate"},
     {"gateway_route_store.reap_stale_routes", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
-     "clock-guarded (SessionStore shape, clock-guard parts 1 & 4 carved out) + advisory-lock "
-     "own-statement; DB-clock-authored leases — every replica may tick it, all but the "
-     "advisory-lock holder skip; matches the other reaper classifications (WS-4 4.2a)"},
+     "clock-guarded (SessionStore shape, clock-guard part 1 carved out, part 4 adopted "
+     "direction-keyed decline-once/drain-on-repeat) + pg_try_advisory_xact_lock own-statement; "
+     "DB-clock-authored leases — every replica may tick it, all but the advisory-lock holder "
+     "skip (PR #4299 round-2 external review); matches the other reaper classifications (WS-4 4.2a)"},
     {"result_set_store.counts", "result_set_maint_thread_", BackgroundJobClass::ReplicaSafe,
      "read-only gauge refresh"},
 

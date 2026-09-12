@@ -15,6 +15,7 @@
 #include <cstdlib> // std::strtoll — parse_reap_i64
 #include <string>
 #include <string_view>
+#include <utility> // std::pair — parse_declined_marker's (anchor, direction) result
 #include <vector>
 
 namespace yuzu::server {
@@ -120,6 +121,10 @@ std::optional<std::string> col_opt(PGresult* r, int row, int col) {
     return std::string(PQgetvalue(r, row, col));
 }
 
+// Mirrors response_store.cpp/audit_store.cpp's local helper of the same name:
+// Postgres boolean text output is 't'/'f'.
+bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
 // Checked parse for the two clock-guard-critical readings in
 // reap_stale_routes (the DB now() column and the persisted route_meta
 // anchor) — mirrors session_store.cpp's parse_reap_i64 (#3785): unparseable,
@@ -133,6 +138,37 @@ std::optional<std::int64_t> parse_reap_i64(const std::string& val) {
     if (val.empty() || errno != 0 || end == val.c_str() || *end != '\0')
         return std::nullopt;
     return static_cast<std::int64_t>(v);
+}
+
+// Parses the `reap_declined_anchor_ms` marker, format `"<anchor>:<direction>"`
+// (direction ∈ {"forward","backward"}) since PR #4299 round-2 external
+// review — the decline/recovery pair must be judged on the fact set (frozen
+// anchor, anomaly direction), never the anchor alone (docs/
+// clock-guarded-retention.md part 4). NEVER sign-encode direction: a negative
+// anchor is the tamper signal parse_reap_i64 already rejects, so it stays a
+// suffix, not an arithmetic trick.
+//
+// Absent on any of: no `:` (a LEGACY bare-integer marker from before this
+// fix, or a garbled value), an unrecognised direction token, or an unparseable/
+// negative anchor half. Absent is always safe here — every call site treats it
+// identically to "no prior decline", which re-arms in the new format and
+// declines once more rather than granting an unearned recovery. This is also
+// what makes a MIXED-VERSION rollout safe in both directions: an OLDER binary
+// reading this store's new `"<int>:<dir>"` value hands the whole string to its
+// own bare `parse_reap_i64`, which stops at the `:` and rejects the trailing
+// text (`*end != '\0'`) — so it treats the marker as absent and declines too.
+std::optional<std::pair<std::int64_t, std::string>>
+parse_declined_marker(const std::string& val) {
+    const auto colon = val.find(':');
+    if (colon == std::string::npos)
+        return std::nullopt;
+    const std::string direction = val.substr(colon + 1);
+    if (direction != "forward" && direction != "backward")
+        return std::nullopt;
+    auto anchor = parse_reap_i64(val.substr(0, colon));
+    if (!anchor || *anchor < 0)
+        return std::nullopt;
+    return std::make_pair(*anchor, direction);
 }
 
 } // namespace
@@ -483,6 +519,15 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     // (server.cpp) needs it to emit a distinct `outcome="recovered"` metric,
     // separate from an ordinary `outcome="ok"` pass.
     bool recovered_from_prior_decline = false;
+    // PR #4299 round-2 external review (SHOULD): the ReplicaSafe contract for
+    // this job (background_jobs.hpp) is "all but the advisory-lock holder
+    // skip", matching every sibling single-sweeper store's
+    // pg_try_advisory_xact_lock idiom (audit_store.cpp/response_store.cpp/
+    // result_set_store.cpp/policy_store.cpp/guaranteed_state_store.cpp) — a
+    // BLOCKING pg_advisory_xact_lock here instead pins a second replica's
+    // maintenance-thread tick until the holder's transaction commits, which
+    // the documented contract already claimed was not happening.
+    bool skipped_lock = false;
     std::string err;
     const bool ok = pool_.with_txn_for(kReapWriteTimeout, [&](PGconn* c) -> bool {
         // Fixed key, deliberately NOT salted per-instance/per-test: Postgres advisory
@@ -492,11 +537,16 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // the single-writer rendezvous every replica's reap tick must serialize
         // against (SINGLE-WRITER-today note above; becomes the PG-shared-state lock
         // when a 2nd replica lands).
-        if (pg::exec_params(c, "SELECT pg_advisory_xact_lock(hashtext('gateway_route_store:reap'))",
-                            std::vector<std::string>{})
-                .status() != PGRES_TUPLES_OK) {
-            err = "reap advisory lock failed";
+        pg::PgResult lk = pg::exec_params(
+            c, "SELECT pg_try_advisory_xact_lock(hashtext('gateway_route_store:reap'))",
+            std::vector<std::string>{});
+        if (lk.status() != PGRES_TUPLES_OK) {
+            err = "reap advisory lock probe failed";
             return false;
+        }
+        if (!to_bool(PQgetvalue(lk.get(), 0, 0))) {
+            skipped_lock = true;
+            return true; // another replica is sweeping this tick; not a failure
         }
         std::int64_t now_ms = 0;
         {
@@ -607,37 +657,49 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // pass poisoned the anchor.
         const bool backward_skew = has_anchor && now_ms < anchor;
 
-        // DECLINE-ONCE / DRAIN-ON-REPEAT (PR #4299 review, BLOCKER 1).
-        // Mirrors audit_retention_rules.hpp::classify + AuditStore::
-        // cleanup_once's "decline ONCE on the fact set, then DRAIN an
-        // identical repeat, capped" shape (docs/clock-guarded-retention.md
-        // part 4) — a bare "always decline on skew" (the pre-fix behaviour)
-        // wedges PERMANENTLY after any routine >24h gap (weekend shutdown, DR
-        // failover, extended maintenance): now-anchor only grows while
-        // declined, so every later pass declines forever with no recovery.
+        // DECLINE-ONCE / DRAIN-ON-REPEAT (PR #4299 review, BLOCKER 1;
+        // direction-keyed since round-2 external review — "compare the full
+        // fact set, never a latch"). Mirrors audit_retention_rules.hpp::
+        // classify + AuditStore::cleanup_once's "decline ONCE on the fact
+        // set, then DRAIN an identical repeat, capped" shape (docs/
+        // clock-guarded-retention.md part 4) — a bare "always decline on
+        // skew" (the pre-fix behaviour) wedges PERMANENTLY after any routine
+        // >24h gap (weekend shutdown, DR failover, extended maintenance):
+        // now-anchor only grows while declined, so every later pass declines
+        // forever with no recovery.
         //
-        // Keyed on the DECLINED anchor value, not on the anomaly's direction:
-        // `reap_anchor_ms` does not move while a decline is outstanding, so a
-        // genuine multi-day gap presents the IDENTICAL anchor to pass 2 — the
-        // signal that distinguishes "real elapsed downtime, decline once then
-        // recover" from a single glitched reading (whose corrected successor
-        // reads normally against the unmoved anchor and is an ordinary
-        // accepted pass, not a recovery).
+        // Keyed on the PAIR (frozen `reap_anchor_ms`, anomaly DIRECTION).
+        // `forward_skew`/`backward_skew` above are mutually exclusive, so
+        // "direction" is a lossless raw fact carried straight from that
+        // computation, not a derived/classified enum. `reap_anchor_ms` does
+        // not move while a decline is outstanding, so a genuine multi-day gap
+        // presents the IDENTICAL anchor AND the same direction to pass 2 —
+        // the signal that distinguishes "real elapsed downtime, decline once
+        // then recover" from a DIFFERENT anomaly arriving at the same frozen
+        // anchor (e.g. a backward-skew decline followed by an unrelated
+        // forward-skew reading, or vice versa). That second case is NOT the
+        // same anomaly repeating — recovering it would run the sweeps against
+        // THIS pass's own now_ms, which for a forward-classified pass is
+        // itself the corrupted/huge reading, mass-tombstoning live leased
+        // routes. Keying on the anchor alone (the pre-fix behaviour) could
+        // not tell the two apart; keying on (anchor, direction) can.
         //
-        // ACTUAL RECOVERY BEHAVIOUR (corrected — a prior revision of this
-        // comment claimed the opposite): a decline never advances
-        // `reap_anchor_ms`, so a skew that PERSISTS into the next pass
-        // presents the IDENTICAL frozen anchor again — and that is exactly
-        // the "declined_anchor == anchor" match below, which RECOVERS. There
-        // is no permanent wedge: a genuinely-stuck (still-wrong) clock does
-        // not keep "reporting against an ever-different anchor" — the anchor
-        // cannot move while declined, so pass 2 against the same anchor
-        // recovers-and-drains rather than declining forever. A
-        // CONTINUOUSLY-DRIFTING clock instead OSCILLATES: pass 1 declines
-        // (freezing the anchor), pass 2 recovers (advancing the anchor to
-        // that pass's now_ms UNCONDITIONALLY), and if the clock is still
-        // skewed relative to the NEW anchor, the next pass declines again —
-        // roughly one decline every other pass, never a lasting wedge.
+        // RECOVERY BEHAVIOUR: a decline never advances `reap_anchor_ms`, so a
+        // skew that PERSISTS into the next pass with the SAME direction
+        // presents the IDENTICAL frozen (anchor, direction) pair again — that
+        // match RECOVERS: runs both sweeps under the cap and advances the
+        // anchor to THIS pass's own now_ms UNCONDITIONALLY. A skew that
+        // changes DIRECTION at the same anchor (forward-then-backward or
+        // backward-then-forward) does NOT match and RE-DECLINES instead,
+        // re-arming the marker against the new direction — this symmetry is
+        // the fix (see docs/clock-guarded-retention.md's GatewayRouteStore
+        // entry for the defect this closes). A CONTINUOUSLY-DRIFTING clock
+        // that keeps the SAME direction still OSCILLATES: pass 1 declines
+        // (freezing anchor+direction), pass 2 recovers (advancing the anchor
+        // to that pass's now_ms UNCONDITIONALLY), and if the clock is still
+        // skewed the same way relative to the NEW anchor, the next pass
+        // declines again — roughly one decline every other pass, never a
+        // lasting wedge.
         //
         // OPERATOR RE-ANCHOR PROCEDURE: this is therefore an OPTIONAL escape
         // hatch to STOP that decline/recover oscillation under a
@@ -650,23 +712,16 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // the oscillation. See docs/clock-guarded-retention.md's
         // GatewayRouteStore entry for the full record.
         //
-        // CROSS-TYPE RECOVERY IS SAFE (FIX C, PR #4299 round-2 review):
-        // recovery below is keyed on the ANCHOR VALUE only
-        // (`declined_anchor == anchor`), never on which of forward_skew /
-        // backward_skew fired THIS pass vs. which one fired the pass that
-        // froze `declined_anchor`. So a forward-skew decline followed by a
-        // BACKWARD-skew repeat at that SAME anchor also recovers — this is
-        // deliberate and safe: the recovery branch always computes its reap
-        // cutoffs from THIS pass's own now_ms (the real, current DB clock),
-        // never from the anchor. A forward-skewed now_ms is itself the
-        // corrupted/huge reading, so a forward recovery can mass-reap. A
-        // backward-classified pass has a normal (or genuinely small) now_ms,
-        // so it can only UNDER-reap relative to a normal pass — a live row
-        // with a future lease is never brought into range by a SMALLER
-        // now_ms. Only the forward direction can mass-reap, and that is the
-        // direction this guard exists to gate; adding anomaly-type keying on
-        // top would be unnecessary complexity.
+        // MARKER FORMAT: `reap_declined_anchor_ms` stores `"<anchor>:<direction>"`
+        // (see parse_declined_marker above), not a bare integer. Mixed-version
+        // and tamper safety: an unparseable value — a LEGACY bare-integer
+        // marker from before this fix, external corruption, or this store's
+        // OWN new-format value read back by an OLDER binary expecting a bare
+        // integer — is treated as ABSENT, never as a false match. Absent
+        // always re-arms in the new format and declines once more, never
+        // granting a recovery this pass never earned.
         if (forward_skew || backward_skew) {
+            const char* current_direction = forward_skew ? "forward" : "backward";
             pg::PgResult dr = pg::exec_params(
                 c,
                 "SELECT value FROM gateway_route_store.route_meta WHERE "
@@ -676,38 +731,45 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 err = "reap declined-anchor read failed";
                 return false;
             }
-            std::optional<std::int64_t> declined_anchor;
+            std::optional<std::pair<std::int64_t, std::string>> declined;
             if (PQntuples(dr.get()) > 0) {
                 const std::string raw = PQgetvalue(dr.get(), 0, 0);
-                auto parsed = parse_reap_i64(raw);
                 // This method is the sole writer of this marker, so an
-                // unparseable value can only be external tampering. Treat it
-                // as absent rather than erroring the whole pass — the safe
-                // direction is to decline again below (re-arming the marker
-                // with a clean value), never to grant a recovery this pass
-                // never actually earned.
-                if (parsed && *parsed >= 0)
-                    declined_anchor = *parsed;
+                // unparseable value can only be external tampering, a legacy
+                // pre-fix bare-integer marker, or a mixed-version rollout.
+                // Treat it as absent rather than erroring the whole pass —
+                // the safe direction is to decline again below (re-arming the
+                // marker with a clean value), never to grant a recovery this
+                // pass never actually earned.
+                declined = parse_declined_marker(raw);
             }
-            if (declined_anchor.has_value() && *declined_anchor == anchor) {
+            if (declined.has_value() && declined->first == anchor &&
+                declined->second == current_direction) {
                 recovered_from_prior_decline = true;
                 spdlog::warn(
-                    "GatewayRouteStore::reap_stale_routes recovering: the clock anomaly at "
+                    "GatewayRouteStore::reap_stale_routes recovering: the {} clock anomaly at "
                     "anchor {} persisted across a full decline pass (now_ms {}) — treating as "
                     "genuine elapsed downtime and running the sweeps now",
-                    anchor, now_ms);
+                    current_direction, anchor, now_ms);
             } else {
-                spdlog::warn(
-                    "GatewayRouteStore::reap_stale_routes declined: now_ms {} vs anchor {} "
-                    "({}) — declining this pass; an identical repeat (same anchor) recovers "
-                    "and drains, capped",
-                    now_ms, anchor, forward_skew ? "implausibly ahead" : "behind");
+                if (declined.has_value() && declined->first == anchor)
+                    spdlog::warn(
+                        "GatewayRouteStore::reap_stale_routes declined: now_ms {} vs anchor {} "
+                        "is a {} anomaly, but the prior decline at this anchor was {} — a "
+                        "DIFFERENT anomaly, not a repeat; declining and re-arming",
+                        now_ms, anchor, current_direction, declined->second);
+                else
+                    spdlog::warn(
+                        "GatewayRouteStore::reap_stale_routes declined: now_ms {} vs anchor {} "
+                        "({}) — declining this pass; an identical repeat (same anchor, same "
+                        "direction) recovers and drains, capped",
+                        now_ms, anchor, forward_skew ? "implausibly ahead" : "behind");
                 pg::PgResult set_declined = pg::exec_params(
                     c,
                     "INSERT INTO gateway_route_store.route_meta (key, value) VALUES "
                     "('reap_declined_anchor_ms', $1) ON CONFLICT (key) DO UPDATE SET "
                     "value=EXCLUDED.value",
-                    std::vector<std::string>{std::to_string(anchor)});
+                    std::vector<std::string>{std::to_string(anchor) + ":" + current_direction});
                 if (set_declined.status() != PGRES_COMMAND_OK) {
                     err = "reap declined-anchor persist failed";
                     return false;
@@ -866,7 +928,8 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     return ReapRoutesResult{.expired_leases_reaped = expired_leases_reaped,
                             .tombstones_reaped = tombstones_reaped,
                             .clock_anomaly = clock_anomaly,
-                            .recovered = recovered_from_prior_decline};
+                            .recovered = recovered_from_prior_decline,
+                            .skipped = skipped_lock};
 }
 
 } // namespace yuzu::server

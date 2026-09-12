@@ -823,6 +823,22 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
                 // but was still counted here on every SUBSEQUENT heartbeat.
                 // Dedupe, then drop known race-losers, BEFORE comparing
                 // against rows_updated.
+                //
+                // PR #4299 round-2 external review (LOW, disputed between the two
+                // reviewers — VERIFIED against the code): a lost-race session's
+                // agent_routes row is claimed to be "renewed by heartbeats but
+                // excluded from this eligible set", undercounting the shortfall by
+                // one. Not reachable: a lost-race session's CONNECTED handler
+                // (this file, NotifyStreamStatus) checks `lost_race_sessions_` and
+                // skips the `announce_connected` call ENTIRELY for that session_id
+                // — including its fallback `ON CONFLICT DO NOTHING` insert — so no
+                // agent_routes row is ever created under a lost-race session_id.
+                // renew_leases() (gateway_route_store.cpp) matches by session_id,
+                // so it can never touch a row that doesn't exist under that id
+                // either. There is therefore nothing for a subsequent heartbeat to
+                // "renew" for a lost-race session in the first place; excluding it
+                // from `eligible` here removes a permanent false shortfall, not a
+                // real row from the count.
                 std::vector<std::string> distinct_ids(session_ids.begin(), session_ids.end());
                 std::sort(distinct_ids.begin(), distinct_ids.end());
                 distinct_ids.erase(std::unique(distinct_ids.begin(), distinct_ids.end()),
