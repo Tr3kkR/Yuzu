@@ -11,5 +11,9 @@
   like `scope_expression` already was) plus `completed_at`/`parent_id`/`rerun_of`, which stay
   truthful for every caller - closing a field-parity gap against the REST v1 detail route
   (`GET /api/v1/executions/{id}`), which already returned all four. `GET /api/v1/schedules` and
-  MCP `list_schedules` gain optional `definition_id`/`enabled_only` filters, threaded into the
-  same `ScheduleQuery` the legacy `GET /api/schedules` route already populates.
+  MCP `list_schedules` gain optional `definition_id`/`enabled_only` filters. `enabled_only` is a
+  real boolean on both (gov docs-writer/cpp-expert fix round: the initial parse reproduced the
+  legacy `GET /api/schedules` route's presence-only quirk, where any presence of the param -
+  regardless of value - is treated as true; fixed to follow the #4034 precedent already set on
+  `GET /api/v1/policies` before this PR shipped, matching MCP `list_schedules`'s own value-respecting
+  parse, which was correct from the start).

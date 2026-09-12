@@ -2296,17 +2296,34 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "application/json");
                     return;
                 }
-                // #2146 A2-R1: definition_id/enabled_only query params,
-                // matching the legacy GET /api/schedules route's exact
-                // parsing (schedule_routes.cpp) -- ANY presence of
-                // enabled_only (regardless of value) sets it true, a
-                // pre-existing quirk reproduced here for parity rather than
-                // "fixed" into a stricter parse.
+                // #2146 A2-R1 (gov docs-writer/cpp-expert fix round): definition_id/
+                // enabled_only query params. The legacy GET /api/schedules route
+                // treats ANY presence of enabled_only as true, regardless of value
+                // -- this v1 twin does NOT reproduce that quirk. It follows the
+                // #4034 precedent already set on this same REST v1 surface
+                // (compliance_routes.cpp's PolicyQuery enabled_only fix) and
+                // matches the MCP twin list_schedules, which already honors the
+                // boolean value: presence alone must not decide it, or
+                // enabled_only=false would silently behave like enabled_only=true
+                // (the caller asked to see disabled/all schedules and got the
+                // opposite). An unrecognized value 400s.
                 ScheduleQuery q;
                 if (req.has_param("definition_id"))
                     q.definition_id = req.get_param_value("definition_id");
-                if (req.has_param("enabled_only"))
-                    q.enabled_only = true;
+                if (req.has_param("enabled_only")) {
+                    auto v = req.get_param_value("enabled_only");
+                    if (v == "true" || v == "1") {
+                        q.enabled_only = true;
+                    } else if (v == "false" || v == "0") {
+                        q.enabled_only = false;
+                    } else {
+                        res.status = 400;
+                        res.set_content(
+                            detail::a4_error(res, "invalid boolean query parameter: enabled_only"),
+                            "application/json");
+                        return;
+                    }
+                }
                 // #4030 review finding (blocking): was the unchecked
                 // query_schedules(), which collapsed a pool-exhaustion or
                 // query failure into the same empty vector a genuinely

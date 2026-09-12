@@ -5446,10 +5446,12 @@ the legacy route's own posture); a confined denial is audited as `execution.read
 denied the fleet-wide list outright (schedules carry no per-agent axis for `fleet_read_fn` to
 confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
 `list_schedules` (widened by this PR to include `execution_count`). Accepts `definition_id` and
-`enabled_only` query parameters (#2146 A2-R1), matching the legacy unversioned `GET /api/schedules`
-route's exact parsing - **not** the same capability, though: this route remains a distinct,
-separately-ledgered twin of `GET /fragments/schedules`, not of `GET /api/schedules` documented
-above.
+`enabled_only` query parameters (#2146 A2-R1). `enabled_only` is a real boolean here (`true`/`1` or
+`false`/`0`; any other value 400s), matching the #4034 precedent already set on `GET
+/api/v1/policies` and MCP `list_schedules` - **not** the legacy unversioned `GET /api/schedules`
+route's parsing, where any presence of `enabled_only` is treated as true regardless of value. This
+route remains a distinct, separately-ledgered twin of `GET /fragments/schedules`, not of `GET
+/api/schedules` documented above.
 
 ---
 

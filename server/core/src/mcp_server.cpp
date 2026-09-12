@@ -694,8 +694,10 @@ static const ToolDef kTools[] = {
      "carry execution_count, matching the dashboard fragment's field set. The query is "
      "hard-capped at 100 rows with no limit/cursor parameter; a result hitting that cap "
      "sets result_truncated_by_cap:true rather than presenting a partial list as complete. "
-     "#2146 A2-R1: optional definition_id/enabled_only filters, matching the legacy "
-     "GET /api/schedules route and the REST v1 twin GET /api/v1/schedules.",
+     "#2146 A2-R1: optional definition_id/enabled_only filters, matching the REST v1 twin "
+     "GET /api/v1/schedules exactly (enabled_only is a real boolean on both -- unlike the "
+     "legacy unversioned GET /api/schedules route, where ANY presence of enabled_only, "
+     "regardless of value, is treated as true).",
      R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to schedules for this instruction definition"},"enabled_only":{"type":"boolean","description":"Only return enabled schedules"}}})",
      R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"},"execution_count":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at","execution_count"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["schedules"]})j"},
 
@@ -8290,6 +8292,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     for (const auto& c : *children_opt)
                         arr.add_raw(execution_child_row_json(c).dump());
                 }
+                // gov security-guardian fix round (#2146 A2-R1): success-audit
+                // this Execution-domain read, matching get_execution_status/
+                // list_executions/list_schedules' own convention on this same
+                // MCP surface (the REST-only "denial-only" posture this tool
+                // otherwise mirrors doesn't transfer to MCP's established
+                // per-tool audit convention).
+                mcp_audit("success", exec_id);
                 res.set_content(
                     success_response(id, tool_result(JObj().raw("children", arr.str()).str(),
                                                      kObjectOutputSchema)),

@@ -3609,3 +3609,69 @@ TEST_CASE("GET /api/v1/schedules: enabled_only narrows the result set",
     CHECK(found_enabled);
     CHECK_FALSE(found_disabled);
 }
+
+// gov docs-writer/cpp-expert fix round: enabled_only=false must NOT behave
+// like enabled_only=true (the #4034-class presence-only defect). No prior
+// test exercised this value on either surface, so the initial parse's
+// `if (req.has_param("enabled_only")) q.enabled_only = true;` bug (any
+// presence, regardless of value, filtered to enabled-only) would have shipped
+// silently.
+TEST_CASE("GET /api/v1/schedules: enabled_only=false does NOT filter to enabled-only "
+          "(presence-only defect regression)",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled-2";
+    enabled_sched.definition_id = "def-2146-enabled-2";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = h.schedule_engine->create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled-2";
+    disabled_sched.definition_id = "def-2146-disabled-2";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = h.schedule_engine->create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/schedules?enabled_only=false");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    bool found_enabled = false, found_disabled = false;
+    for (const auto& row : body["data"]) {
+        if (row["id"] == *enabled_id)
+            found_enabled = true;
+        if (row["id"] == *disabled_id)
+            found_disabled = true;
+    }
+    CHECK(found_enabled);
+    CHECK(found_disabled); // must NOT be filtered out by enabled_only=false
+}
+
+TEST_CASE("GET /api/v1/schedules: an unrecognized enabled_only value answers 400",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    auto res = h.sink.Get("/api/v1/schedules?enabled_only=maybe");
+    REQUIRE(res);
+    CHECK(res->status == 400);
+}
