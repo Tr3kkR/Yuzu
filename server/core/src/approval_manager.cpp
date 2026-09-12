@@ -519,6 +519,15 @@ std::vector<Approval> ApprovalManager::query(const ApprovalQuery& q) const {
 // own established checked-read convention) so REST v1 `GET /api/v1/approvals`
 // and MCP `list_pending_approvals` can emit an honest 503/retry_after_ms
 // rather than serializing a false empty-list response.
+//
+// Resource Ledger (gov cpp-safety, #2146 A2-R4 fix round): this function and
+// pending_count_checked() below each acquire one pg::PgPool::Lease (owner
+// move-only/non-copyable, `pool_.try_acquire_for`) and one pg::PgResult
+// (owner RAII, PQclear on scope exit, via pg::exec_params). Both are
+// stack-local and released by destructor on every path, including every
+// early std::unexpected return -- no manual cleanup, no borrow escapes past
+// either object's scope (row_to_approval copies every column into owned
+// std::string/int64_t fields before the PgResult goes out of scope).
 std::expected<ApprovalListResult, StoreReadError>
 ApprovalManager::query_checked(const ApprovalQuery& q) const {
     if (!open_) {

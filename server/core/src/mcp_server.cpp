@@ -8699,6 +8699,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // immediately above.
                 auto list_result = approval_manager->query_checked(aq);
                 if (!list_result) {
+                    mcp_audit("failure", "store degraded; list_pending_approvals");
                     res.set_content(
                         a4_error(kInternalError, "approval store degraded", {},
                                  /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),

@@ -8799,7 +8799,7 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 #### `GET /api/v1/approvals`
 
-REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool — all three share one JSON-row builder so they cannot drift. Requires `Approval:Read`. Accepts `status` and `submitted_by` query parameters, same as the legacy route. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
+REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool. This route, the single-fetch `GET /api/v1/approvals/{id}` route, and MCP `list_pending_approvals` share one JSON-row builder (`approval_row_json`) so those three cannot drift from each other; the legacy route below is a separate, unmigrated implementation that emits the same field set today by convention, not by construction. Requires `Approval:Read`. Accepts `status` and `submitted_by` query parameters, same as the legacy route. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
 
 **Response (200):**
 

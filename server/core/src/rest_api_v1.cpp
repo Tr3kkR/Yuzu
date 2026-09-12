@@ -8382,7 +8382,7 @@ void RestApiV1::register_routes(
     // /api/v1/schedules).
     sink.Get(
         "/api/v1/approvals",
-        [perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, audit_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Approval", "Read"))
                 return;
             const auto cid = detail::ensure_correlation_id(res);
@@ -8418,6 +8418,13 @@ void RestApiV1::register_routes(
             JArr arr;
             for (const auto& a : list_result->approvals)
                 arr.add_raw(approval_row_json(a).dump());
+            // Audit the read (gov security-guardian, #2146 A2-R4 fix round):
+            // this is the fleet-wide approval-review queue, a broader
+            // disclosure than the single-fetch route above, which already
+            // audits. Best-effort (success path only), matching that route's
+            // posture.
+            (void)audit_fn(req, "approval.read", "success", "Approval", "",
+                           "surface=list count=" + std::to_string(arr.size()));
             JObj pagination;
             pagination.add("total", arr.size()).add("start", int64_t{0}).add("page_size", int64_t{50});
             if (list_result->truncated)
@@ -8441,7 +8448,7 @@ void RestApiV1::register_routes(
     // exactly the ambiguity a maker-checker backlog monitor cannot tolerate.
     sink.Get(
         "/api/v1/approvals/pending/count",
-        [perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+        [perm_fn, audit_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
             if (!perm_fn(req, res, "Approval", "Read"))
                 return;
             const auto cid = detail::ensure_correlation_id(res);
@@ -8468,6 +8475,10 @@ void RestApiV1::register_routes(
                 return;
             }
 
+            // Audit the read (gov security-guardian, #2146 A2-R4 fix round) --
+            // same posture as the list route above.
+            (void)audit_fn(req, "approval.read", "success", "Approval", "",
+                           "surface=count count=" + std::to_string(*count_result));
             res.set_content(
                 ok_json(JObj().add("count", *count_result).str()),
                 "application/json");
