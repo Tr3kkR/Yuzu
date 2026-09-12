@@ -343,28 +343,42 @@ further, consistent with the small excluded-arm counts elsewhere in this doc).
 **65285us**.
 
 **This is the headline finding, stated plainly: end-to-end establishment is
-~65ms, roughly 1000x the ~83-190us the S2/S3 per-call sums would suggest, and
-SCM load makes essentially no difference (E1 and E2 are within run-to-run
-noise of each other).** The raw OS calls are not the bottleneck - the
-mechanism's own `kServicePollCadence` (`spark_service.cpp:967`, 50ms) is: the
-mechanism thread only notices a completed probe on its next poll tick (capped
-at 50ms whenever any probe is Pending, `spark_service.cpp:1657`), so every
-sample pays close to one full poll interval regardless of how fast the
+~65ms, roughly 340-790x the ~83-190us the S2/S3 per-call sums would suggest
+(65285/190 ≈ 344x at SCM-load per-call cost, 65285/83 ≈ 787x at idle per-call
+cost - not "roughly 1000x", corrected 2026-09-12 per adversarial-review
+finding R2-C03/K-R2-2, an arithmetic overstatement in the original wording),
+and SCM load makes essentially no difference (E1 and E2 are within
+run-to-run noise of each other).** The raw OS calls are not the bottleneck -
+the mechanism's own `kServicePollCadence` (`spark_service.cpp:967`, 50ms) is:
+the mechanism thread only notices a completed probe on its next poll tick
+(capped at 50ms whenever any probe is Pending, `spark_service.cpp:1657`), so
+every sample pays close to one full poll interval regardless of how fast the
 underlying `OpenServiceW`/`NotifyServiceStatusChangeW` pair actually
 completes. The remarkably tight clustering (p50 and p99 within ~1ms of each
 other, every run) is the signature of a fixed-cadence poll dominating a
 much-smaller, much-more-variable OS call cost, not measurement noise.
 
-**Do not read this as a PR-B3 regression or defect** - this cadence existed
-identically before PR-B3 (it governs how the mechanism thread notices ANY
-Pending probe's completion, a concern that exists regardless of whether the
-probe itself runs synchronously or on a detached lane) - PR-B3's own scope was
-isolating `OpenServiceW` from blocking sibling watches, not reducing this
-poll-driven notice latency. It is, however, new and load-bearing information
-this doc did not previously contain: anyone consuming Service Spark events
-expecting sub-millisecond delivery (matching the raw OS call cost) should
-instead expect ~50-65ms from arm to first observed state, engine-wide, as a
-structural property of the current design - see forward action item 5.
+**CORRECTED 2026-09-12 (adversarial-review finding R2-C03/K-R2-2): this IS a
+real behavior change PR-B3 introduces, not something inherited unchanged -**
+an earlier version of this paragraph claimed the opposite ("this cadence
+existed identically before PR-B3"), which is false: `kServicePollCadence`
+does not exist before this branch (`git show 78bfb9513:agents/core/src/
+spark_service.cpp | grep kServicePollCadence` → no matches), and the
+pre-PR-B3 `arm_watch()` ran `OpenServiceW`/`NotifyServiceStatusChangeW`
+synchronously with the notification delivered by an **immediate** APC - no
+poll-tick delay at all. Pre-PR-B3 arm-to-first-state latency would have
+tracked close to the raw OS call cost (low hundreds of microseconds, per
+S2/S3), not 50-65ms. **PR-B3's async restructure is what trades that
+synchronous-but-head-of-line-blocking behavior for this asynchronous-but-
+poll-delayed one** - a deliberate, accepted trade (removes the risk of one
+hung service blocking every sibling watch, at the cost of adding a
+poll-cadence delay to the ordinary happy path), not a free isolation with no
+downside. Anyone consuming Service Spark events expecting sub-millisecond
+delivery (matching the raw OS call cost, or matching pre-PR-B3 behavior)
+should expect ~50-65ms from arm to first observed state instead, engine-wide,
+as a structural property of the current design - see forward action item 5,
+which exists specifically because this is PR-B3's own tradeoff to amortize
+later, not an inherited constant to leave alone.
 
 **Post-fix-cost, Service after-figure (same case as Results above, re-run
 2026-09-11 once PR-B3 landed, closing forward action item 2 for Service):**
