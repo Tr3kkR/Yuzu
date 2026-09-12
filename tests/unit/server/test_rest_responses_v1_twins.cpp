@@ -65,8 +65,8 @@ struct RespV1Harness {
         response_store = std::make_unique<ResponseStore>(pool, /*retention_days=*/0);
         REQUIRE(response_store->is_open());
 
-        auto auth_fn = [this](const httplib::Request&,
-                              httplib::Response&) -> std::optional<auth::Session> {
+        auto auth_fn = [](const httplib::Request&,
+                          httplib::Response&) -> std::optional<auth::Session> {
             auth::Session s;
             s.username = "tester";
             s.role = auth::Role::admin;

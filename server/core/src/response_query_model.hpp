@@ -36,6 +36,7 @@
 #include <nlohmann/json.hpp>
 
 #include <string>
+#include <string_view>
 
 namespace yuzu::server {
 

@@ -5441,7 +5441,9 @@ and MCP `aggregate_responses` share another (`response_aggregate_row_json`).
 **Two deliberate corrections vs. the legacy routes**, both scoped to the new v1/MCP surfaces only
 (the legacy routes are unmodified and keep their pre-existing behavior):
 
-- `limit` is clamped on **both** bounds everywhere below. The legacy export route
+- `limit` is clamped on **both** bounds on the two routes below that accept it — `GET
+  /api/v1/responses/{id}` (`[1,1000]`) and `GET /api/v1/responses/{id}/export` (`[1,10000]`);
+  `GET /api/v1/responses/{id}/aggregate` has no `limit` parameter. The legacy export route
   (`GET /api/responses/{id}/export`) only floors its own *default* at 10000 — a caller-supplied
   `?limit=` there has no ceiling at all and can attempt an unbounded fetch. Not fixed on the legacy
   route (out of scope for this PR); not propagated to `GET /api/v1/responses/{id}/export`.
