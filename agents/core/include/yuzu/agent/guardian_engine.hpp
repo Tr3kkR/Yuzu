@@ -536,7 +536,16 @@ private:
 
     bool put_rule_locked(const yuzu::guardian::v1::GuaranteedStateRule& rule);
     void refresh_count_locked();
-    void persist_generation_locked();
+    /// Persists `gen` to the policy-generation KV key. Returns kv_->set()'s own
+    /// success bool (false if kv_ is null) - callers publish policy_generation_
+    /// ONLY after a true return, never before, so a failed (or throwing - kv_->set()
+    /// is not noexcept) write leaves policy_generation_ at its prior value and the
+    /// caller's own advance condition (gen > policy_generation_) is still true next
+    /// time it is checked, retrying naturally with no separate bookkeeping needed
+    /// (coordinator finding, rung 9c PR-2 Unit 6 gate: the old void-returning form
+    /// let a failed or throwing persist strand policy_generation_ already advanced
+    /// with nothing durable behind it - a silent, permanent stop to server re-push).
+    [[nodiscard]] bool persist_generation_locked(std::uint64_t gen);
     /// Flush the runtime's staged lifecycle records to the durable journal (item 7
     /// PR-Ag). mtx_ held; snapshot → persist → erase-persisted-prefix, circuit-broken
     /// on the first write failure. prefer_spark_-gated (inert when spark is not the

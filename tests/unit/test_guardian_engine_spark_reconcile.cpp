@@ -48,6 +48,9 @@
 #include <version> // __cpp_lib_jthread
 #include <vector>
 
+#include <sqlite3.h> // real KV-write-failure seam (test_kv_store.cpp's own "drop the table
+                     // through a second connection" pattern) - no fault-injection stand-in
+
 #ifndef _WIN32
 #  include <sys/wait.h>
 #  include <unistd.h>
@@ -78,6 +81,43 @@ using yuzu::agent::SparkSpec; // #2818 pin
 using yuzu::agent::SparkType;
 
 namespace {
+
+/// Real KV-write-failure seam (rung 9c PR-2 Unit 6 gate, coordinator finding): opens a
+/// SECOND connection to the SAME on-disk KvStore file and drops/recreates the
+/// `kv_store` table, so `KvStore::set()` genuinely fails (a real SQLite "no such
+/// table" error) or genuinely succeeds again on the SAME already-open KvStore object -
+/// no fault-injection stand-in. Mirrors test_kv_store.cpp's own "dropping the table
+/// through a second connection makes prepare_v2 fail for real" pattern. The schema
+/// matches kv_store.cpp's own CREATE TABLE exactly (governance would flag drift here
+/// as a truth mismatch against the real store).
+void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
+    if (err)
+        sqlite3_free(err);
+    sqlite3_close(raw);
+    REQUIRE(rc == SQLITE_OK);
+}
+void recreate_kv_store_table_for_test(const std::filesystem::path& db_path) {
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(raw,
+                                "CREATE TABLE IF NOT EXISTS kv_store ("
+                                "    plugin     TEXT NOT NULL,"
+                                "    key        TEXT NOT NULL,"
+                                "    value      TEXT,"
+                                "    updated_at INTEGER,"
+                                "    PRIMARY KEY(plugin, key)"
+                                ")",
+                                nullptr, nullptr, &err);
+    if (err)
+        sqlite3_free(err);
+    sqlite3_close(raw);
+    REQUIRE(rc == SQLITE_OK);
+}
 
 std::string uid_suffix() {
 #ifdef _WIN32
@@ -3028,4 +3068,48 @@ TEST_CASE("rung 9c PR-2 Unit 6: a full_sync teardown throw holds the generation 
     for (int i = 0; i < 5; ++i)
         f.engine->journal_maintenance_tick();
     CHECK(f.engine->policy_generation() == 0);
+}
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-2 Unit 6 gate (coordinator finding) - persist_generation_locked()'s
+// publish-before-persist ordering
+// ---------------------------------------------------------------------------
+
+TEST_CASE("rung 9c PR-2 Unit 6 gate: journal_maintenance_tick() does not advance "
+          "policy_generation() when persisting it fails, and retries cleanly once "
+          "the KV write succeeds",
+          "[spark][guardian][reconcile]") {
+    // Was RED before the fix: persist_generation_locked() published policy_generation_
+    // to the candidate value BEFORE attempting (and discarding the result of) the KV
+    // write - a failed write left policy_generation_ already advanced with nothing
+    // durable behind it, and the tick's own gen > policy_generation_ recheck was
+    // therefore false on every later tick, permanently (the server's heartbeat
+    // reconcile only re-pushes while the agent reports a generation BEHIND its own -
+    // this would silently and permanently stop that retry).
+    SparkReconcileFixture f;
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(1);
+    *p.add_rules() = make_service_rule("r1");
+    REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p.SerializeAsString())
+                .exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE(f.engine->policy_generation() == 0); // not yet acknowledged - no tick has run
+
+    // A real KV-write failure (not a fault-injection stand-in): drop the table through
+    // a second connection to the SAME on-disk file, so persist_generation_locked()'s
+    // kv_->set() call genuinely fails ("no such table") on THIS tick.
+    drop_kv_store_table_for_test(f.db_.path);
+    f.engine->journal_maintenance_tick();
+    // TARGET: the failed persist must NOT have published policy_generation_. Before the
+    // fix, this was already 1 here - the exact bug the coordinator's gate caught.
+    CHECK(f.engine->policy_generation() == 0);
+
+    // KV healthy again: the SAME condition (gen > policy_generation_) that failed to
+    // persist above is still true, so the very next tick retries it with no separate
+    // retry bookkeeping - and this time it durably succeeds.
+    recreate_kv_store_table_for_test(f.db_.path);
+    f.engine->journal_maintenance_tick();
+    CHECK(f.engine->policy_generation() == 1);
 }

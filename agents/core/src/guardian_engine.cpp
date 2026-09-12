@@ -777,10 +777,16 @@ void GuardianEngine::journal_maintenance_tick() {
         ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick);
         if (ack_ledger_->can_advance()) {
             const auto gen = ack_ledger_->pending_generation();
-            if (gen > policy_generation_) {
+            // Persist BEFORE publishing, and check the result: a false return or a
+            // throw (kv_->set() is not noexcept) must leave policy_generation_
+            // unchanged, so this same `gen > policy_generation_` condition is still
+            // true on the NEXT tick and retries the write with no separate retry
+            // bookkeeping - publishing first and discarding the result (the old
+            // shape) could strand policy_generation_ already advanced with nothing
+            // durable behind it, silently and permanently halting the server's
+            // re-push (coordinator finding, rung 9c PR-2 Unit 6 gate).
+            if (gen > policy_generation_ && persist_generation_locked(gen))
                 policy_generation_ = gen;
-                persist_generation_locked();
-            }
         }
     } catch (...) {
         ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
@@ -1071,7 +1077,14 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         }
         // Re-persist the policy generation marker (rewritten unconditionally here,
         // same as before this change — harmless whether or not the key survived).
-        persist_generation_locked();
+        // Deliberately NOT given the publish-after-persist treatment the other two
+        // call sites got (rung 9c PR-2 Unit 6 gate, coordinator finding): this site
+        // does not GATE an advance decision - policy_generation_ is already whatever
+        // it was, unchanged by this call either way - it only re-affirms the CURRENT
+        // value defensively after a full_sync KV clear. A failed write here just
+        // means the durable marker can lag the in-memory value for one more cycle,
+        // never a wrong "caught up" signal to the server; out of scope for this fix.
+        (void)persist_generation_locked(policy_generation_);
         // Full sync replaces the active set - tear down BOTH backends before
         // re-arming (rung 7: a spark-attached rule the new push omits must be
         // withdrawn too, not left dangling - Sol's rev-2 review). FIREWALLED like the
@@ -1207,10 +1220,15 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // has ... armed ... never on acceptance alone"). If something IS still pending,
     // this call does not advance the generation at all - journal_maintenance_tick()'s
     // own drain does, once it resolves.
+    // Persist BEFORE publishing (coordinator finding, rung 9c PR-2 Unit 6 gate - this
+    // call site has the identical shape as journal_maintenance_tick()'s own, fixed
+    // alongside it): a failed or throwing persist leaves policy_generation_ at its
+    // prior value, so the same condition is still true on a later tick or a repeat
+    // push, retrying naturally.
     if (reconcile_failures == 0 && ack_ledger_->can_advance() &&
-        push.policy_generation() > policy_generation_) {
+        push.policy_generation() > policy_generation_ &&
+        persist_generation_locked(push.policy_generation())) {
         policy_generation_ = push.policy_generation();
-        persist_generation_locked();
     }
 
     refresh_count_locked();
@@ -1376,9 +1394,9 @@ void GuardianEngine::refresh_count_locked() {
     rule_count_ = kv_->list(kKvNamespace, kRulePrefix).size();
 }
 
-void GuardianEngine::persist_generation_locked() {
-    if (!kv_) return;
-    kv_->set(kKvNamespace, kKeyGen, std::to_string(policy_generation_));
+bool GuardianEngine::persist_generation_locked(std::uint64_t gen) {
+    if (!kv_) return false;
+    return kv_->set(kKvNamespace, kKeyGen, std::to_string(gen));
 }
 
 void GuardianEngine::set_event_sink(EventSink sink) {
