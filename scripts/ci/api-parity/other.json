@@ -525,7 +525,7 @@
     "capability_id": "get.fragments-instructions",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-instructions"
+    "status": "planned:#2146"
   },
   {
     "method": "GET",
@@ -533,7 +533,7 @@
     "capability_id": "get.fragments-instructions-editor",
     "rest_v1_twin": null,
     "mcp_twin": null,
-    "status": "composed-of:get.api-instructions-param"
+    "status": "planned:#2146"
   },
   {
     "method": "POST",
