@@ -20,4 +20,8 @@
   /api/responses/{id}/export` route only floors its own *default* at 10000; an explicit
   `?limit=` there has no ceiling at all and can attempt an unbounded fetch. That pre-existing
   legacy-route bug is deliberately NOT fixed by this PR (the legacy handlers are frozen reference
-  code here) and is not propagated to the new v1/MCP surfaces; tracked separately as #4310.
+  code here) and is not propagated to the new v1/MCP surfaces; tracked separately as #4310 (broadened
+  to also cover the plain legacy query route, which shares the same unbounded-limit shape).
+- The new export route's CSV output reuses the existing `data_export::csv_escape` helper unchanged
+  (no new escaping logic written) - inherits, but does not worsen, that helper's pre-existing lack
+  of CSV-formula-injection neutralization on agent-controlled fields; tracked as #4311.

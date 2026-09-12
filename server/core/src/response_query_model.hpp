@@ -31,12 +31,12 @@
 ///
 /// No httplib.h, no MCP-specific include -- pure, I/O-free.
 
-#include "response_store.hpp"
+#include <string>
+#include <string_view>
 
 #include <nlohmann/json.hpp>
 
-#include <string>
-#include <string_view>
+#include "response_store.hpp"
 
 namespace yuzu::server {
 

@@ -5514,7 +5514,23 @@ clamped to `[1,10000]` on both bounds (see the correction above). Unlike the leg
 narrower 7-column CSV, both formats here carry the same field set as `GET /api/v1/responses/{id}`
 (`id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin,
 received_at_ms`) — this is a brand-new endpoint with no positional-column consumer to keep
-compatible. Both formats set `Content-Disposition: attachment`.
+compatible. Both formats set `Content-Disposition: attachment`. The JSON format's envelope is the
+standard v1 `{data, pagination, meta}` shape (same as `GET /api/v1/responses/{id}` above) -
+distinct from the legacy export's bespoke `{instruction_id, count, responses}` body.
+
+**Response** (`format=json`):
+
+```json
+{
+  "data": [
+    { "id": 42, "instruction_id": "instr-1", "agent_id": "agent-A", "execution_id": "exec-1",
+      "status": 0, "output": "ok", "error_detail": "", "timestamp": 1735689600,
+      "plugin": "shellexec", "received_at_ms": 1735689600123 }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
 
 ---
 
