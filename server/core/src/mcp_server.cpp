@@ -2594,12 +2594,18 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"list_result_sets", {"Infrastructure", "Read"}},
     {"create_result_set", {"Infrastructure", "Write"}},
     // from-inventory-query is a SYNCHRONOUS read (queries InventoryStore, no
-    // dispatch) gated on a REAL perm_fn(Inventory, Read) call, matching its
-    // REST twin exactly -- not `confined` (the REST twin applies no per-
-    // device/service-tag scoping either, per its own governance-flagged
-    // comment; matching REST bug-for-bug here would be a false `confined`
-    // claim, so this stays the default `denied`). The kToolSecurity
-    // OPERATION here is deliberately "Write", NOT "Read", even though the
+    // dispatch), gated via fleet_read_fn_/fleet_read_fn on both transports
+    // (Gate 2 BLOCKING fix, #2146 Batch B2 review) -- a REAL per-agent
+    // confinement mechanism (authz::in_scope narrows candidate inventory
+    // records before evaluation), matching its REST twin exactly. Still the
+    // default `denied` ServiceScopeClass, NOT `confined`: fleet_read_fn's
+    // own service-scope branch admits-and-confines a service-scoped caller
+    // rather than hard-denying it the way this tool's 8 non-dispatch
+    // siblings' deny_fleet_wide_service_scoped call does -- since the
+    // created result set is still owner-scoped to the minting token, that
+    // asymmetry is a real cross-service-reach gap, tracked in #4307, not
+    // resolved by this classification. The kToolSecurity OPERATION here is
+    // deliberately "Write", NOT "Read", even though the
     // real RBAC gate the handler calls is Inventory:Read -- these are two
     // independent things (kToolSecurity's operation feeds tier_allows/
     // requires_approval/readOnlyHint-coherence; the handler's own perm_fn
@@ -5186,6 +5192,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::optional<ResultSet>& row = *row_result;
                 if (!row || row->owner_principal != session->username) {
                     mcp_audit("denied", "id=" + rs_id + " reason=not found or not owned");
+                    // #2146 Batch B2 review fix: also emit the structured
+                    // result_set.access audit REST's own load_owned twin uses
+                    // (target_type=ResultSet, target_id=rs_id) - the generic
+                    // mcp_audit call above records this under target_type=
+                    // mcp_tool with the id only in free text, so an auditor
+                    // filtering by ResultSet target/id previously missed every
+                    // MCP-sourced ownership-probe denial across all 12 tools
+                    // that share this helper.
+                    (void)audit_fn(req, "result_set.access", "denied", "ResultSet", rs_id,
+                                   "not found or not owned");
                     // retry-hint-exempt: not found/not owned, a permanent
                     // outcome — existence-oracle-safe (matches REST's 404).
                     res.set_content(
