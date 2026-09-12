@@ -34,6 +34,7 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
+class BaselineStore;
 
 /// Fleet Guardian status rollup — shared by `GET /api/v1/guaranteed-state/status`
 /// and MCP `get_guardian_status`. Re-derives EXACTLY the fields the REST route
@@ -147,5 +148,53 @@ struct GuardianDeviceGuardRow {
 /// never render an empty list as "this device has no guards".
 std::optional<std::vector<GuardianDeviceGuardRow>>
 guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id);
+
+/// Per-baseline device-compliance rollup — shared by
+/// `GET /api/v1/guaranteed-state/device-compliance` and MCP
+/// `get_guardian_device_compliance` (#2146 Batch B1, extracted post-review).
+/// Both twins previously ran this same four-read sequence (baseline lookup,
+/// deployed_member_rule_ids, rule_names_for, agent_rule_statuses_for_agent)
+/// inline, and both audited "success"/"not_found" right after the FIRST read
+/// only — a degrade in any of the other three then produced a 503 the audit
+/// row had already called "success". Aggregating all four reads here, behind
+/// one nullopt/`store_degraded` contract, means a caller can only audit once
+/// every read has actually completed.
+struct GuardianDeviceComplianceGuardRow {
+    std::string rule_id;
+    std::string name;       // resolved rule name; falls back to rule_id if the
+                             // rule has since been deleted from the catalogue
+    std::string status;     // "compliant" | "drifted" | "errored" | "pending"
+    std::string updated_at; // ISO-8601 of the last reported verdict; empty if none
+};
+
+struct GuardianDeviceComplianceRollup {
+    std::string baseline_id;
+    std::string baseline_name;
+    std::string baseline_lifecycle;
+    bool deployed{false};
+    std::int64_t snapshot_total{0}; // deployed_member_rule_ids().size()
+    std::int64_t total_guards{0};   // snapshot members this device has reported ANY verdict for
+    std::int64_t compliant{0};
+    std::int64_t drifted{0};
+    std::int64_t errored{0};
+    std::int64_t pending{0};
+    std::string last_updated; // max reported updated_at across guards; empty if none
+    std::vector<GuardianDeviceComplianceGuardRow> guards;
+};
+
+/// `store_degraded` is a REQUIRED out-param, same contract as
+/// `BaselineStore::get_baseline_by_name`'s own `store_ok`: set true the
+/// moment ANY of the four underlying reads degrades, at which point the
+/// return is always `nullopt` and the caller MUST refuse to render (503),
+/// never treat it as "baseline not found". `nullopt` with `*store_degraded
+/// == false` means the named baseline genuinely does not exist (400/404) -
+/// a real miss, not a fault. A degraded read must never render as a silent
+/// 0/compliant result (ADR-0038/ADR-0055 catastrophic-read set) - this
+/// function's whole job is making that the only way to call these four
+/// reads.
+std::optional<GuardianDeviceComplianceRollup>
+guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
+                                  const std::string& baseline_name, const std::string& agent_id,
+                                  bool* store_degraded);
 
 } // namespace yuzu::server

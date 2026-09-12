@@ -9892,7 +9892,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (baseline_name.empty() || agent_id.empty()) {
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "baseline and agent_id are both required"),
+                                       "baseline and agent_id are required"),
                         "application/json");
                     return;
                 }
@@ -9916,13 +9916,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                bool baseline_store_ok = true;
-                const auto baseline =
-                    baseline_store_->get_baseline_by_name(baseline_name, &baseline_store_ok);
-                if (!baseline_store_ok) {
+                // #2146 Batch B1 review fix: all four underlying reads (baseline
+                // lookup, deployed_member_rule_ids, rule_names_for,
+                // agent_rule_statuses_for_agent) now complete BEFORE the audit
+                // fires below - the prior inline version audited "success" right
+                // after the first read, so a degrade in any of the other three
+                // still surfaced a 500 the audit had already called successful.
+                bool store_degraded = false;
+                auto rollup = guardian_device_compliance_rollup(
+                    *baseline_store_, *guaranteed_state_store, baseline_name, agent_id,
+                    &store_degraded);
+                if (store_degraded) {
                     res.set_content(
-                        a4_error(kInternalError, "baseline store unavailable",
-                                "retry the request",
+                        a4_error(kInternalError, "guaranteed-state store degraded", {},
                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
@@ -9932,94 +9938,51 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (never fail closed — MCP has no Sec-Audit-Failed header, a dropped
                 // row surfaces as audit_persisted:false instead, docs/api-twin-recipe.md
                 // §4), UNLIKE REST's own fail-closed contract for this identical verb.
+                // Fires only once EVERY read above has genuinely succeeded or the
+                // baseline is genuinely absent - never before a read that could still
+                // fail.
                 const bool audit_ok = yuzu::server::detail::try_persist_audit(
-                    audit_fn, req, "guardian.device.view", baseline ? "success" : "not_found",
+                    audit_fn, req, "guardian.device.view", rollup ? "success" : "not_found",
                     "Agent", agent_id,
                     "baseline '" + baseline_name + "' per-device guard status via MCP");
-                if (!baseline) {
+                if (!rollup) {
                     // retry-hint-exempt: genuine not-found, not a store fault.
                     res.set_content(error_response(id, kInvalidParams, "baseline not found"),
                                     "application/json");
                     return;
                 }
-                const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-                auto guard_ids_result =
-                    baseline_store_->deployed_member_rule_ids(baseline->baseline_id);
-                if (!guard_ids_result) {
-                    res.set_content(
-                        a4_error(kInternalError, "baseline store degraded", {},
-                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
-                    return;
-                }
-                const auto& guard_ids = *guard_ids_result;
-                auto rule_names_result = guaranteed_state_store->rule_names_for(guard_ids);
-                auto statuses_result =
-                    guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
-                if (!rule_names_result || !statuses_result) {
-                    res.set_content(
-                        a4_error(kInternalError, "guaranteed-state store degraded", {},
-                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
-                    return;
-                }
-                const auto& rule_names = *rule_names_result;
-                std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
-                for (auto& st : *statuses_result)
-                    dev[st.rule_id] = std::move(st);
 
-                int64_t compliant = 0, drifted = 0, errored = 0;
-                std::string last_updated;
                 JArr guards;
-                int64_t total_guards = 0;
-                for (const auto& rid : guard_ids) {
-                    const auto it = dev.find(rid);
-                    if (it == dev.end())
-                        continue;  // not applicable to this device
-                    ++total_guards;
-                    std::string status = "pending";
-                    const std::string& s = it->second.state;
-                    if (s == "compliant") { status = s; ++compliant; }
-                    else if (s == "drifted") { status = s; ++drifted; }
-                    else if (s == "errored") { status = s; ++errored; }
-                    const std::string& updated_at = it->second.updated_at;
-                    if (!updated_at.empty() && updated_at > last_updated)
-                        last_updated = updated_at;
-                    const auto nit = rule_names.find(rid);
-                    JObj g;
-                    g.add("rule_id", rid)
-                        .add("name", (nit != rule_names.end() && !nit->second.empty())
-                                        ? nit->second
-                                        : rid)
-                        .add("status", status);
-                    if (updated_at.empty())
-                        g.raw("updated_at", "null");
+                for (const auto& g : rollup->guards) {
+                    JObj gj;
+                    gj.add("rule_id", g.rule_id).add("name", g.name).add("status", g.status);
+                    if (g.updated_at.empty())
+                        gj.raw("updated_at", "null");
                     else
-                        g.add("updated_at", updated_at);
-                    guards.add(std::move(g));
+                        gj.add("updated_at", g.updated_at);
+                    guards.add(std::move(gj));
                 }
-                const int64_t pending = total_guards - (compliant + drifted + errored);
 
                 JObj b;
-                b.add("baseline_id", baseline->baseline_id)
-                    .add("name", baseline->name)
-                    .add("lifecycle", baseline->lifecycle);
+                b.add("baseline_id", rollup->baseline_id)
+                    .add("name", rollup->baseline_name)
+                    .add("lifecycle", rollup->baseline_lifecycle);
 
                 JObj payload;
                 payload.raw("baseline", b.str())
-                    .add("deployed", deployed)
-                    .add("assessable", deployed && total_guards > 0)
+                    .add("deployed", rollup->deployed)
+                    .add("assessable", rollup->deployed && rollup->total_guards > 0)
                     .add("agent_id", agent_id)
-                    .add("total_guards", total_guards)
-                    .add("snapshot_total", static_cast<int64_t>(guard_ids.size()))
-                    .add("compliant", compliant)
-                    .add("drifted", drifted)
-                    .add("errored", errored)
-                    .add("pending", pending);
-                if (last_updated.empty())
+                    .add("total_guards", rollup->total_guards)
+                    .add("snapshot_total", rollup->snapshot_total)
+                    .add("compliant", rollup->compliant)
+                    .add("drifted", rollup->drifted)
+                    .add("errored", rollup->errored)
+                    .add("pending", rollup->pending);
+                if (rollup->last_updated.empty())
                     payload.raw("last_updated", "null");
                 else
-                    payload.add("last_updated", last_updated);
+                    payload.add("last_updated", rollup->last_updated);
                 payload.raw("guards", guards.str());
                 if (!audit_ok)
                     payload.add("audit_persisted", false);

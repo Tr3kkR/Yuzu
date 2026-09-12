@@ -13794,21 +13794,28 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            bool baseline_store_ok = true;
-            const auto baseline =
-                baseline_store->get_baseline_by_name(baseline_name, &baseline_store_ok);
-            if (!baseline_store_ok) {
-                // Store FAULT (DB locked/corrupt), NOT a genuine miss — return a
-                // retryable 503, not the 404 a CMDB would read as "no such baseline →
-                // delete this CI" on a transient fault (UP-13/sre-2). Pre-audit, like
-                // the store-null/unwired 503s above: no PII was looked up, and a
+            // #2146 Batch B1 review fix: all four underlying reads (baseline
+            // lookup, deployed_member_rule_ids, rule_names_for,
+            // agent_rule_statuses_for_agent) now complete BEFORE the audit fires
+            // below - the prior inline version audited "success" right after the
+            // first read, so a degrade in any of the other three still surfaced a
+            // 503 the audit had already called successful.
+            bool store_degraded = false;
+            auto rollup = guardian_device_compliance_rollup(*baseline_store, *guaranteed_state_store,
+                                                             baseline_name, agent_id,
+                                                             &store_degraded);
+            if (store_degraded) {
+                // Store FAULT (DB locked/corrupt) in one of the four reads, NOT a
+                // genuine miss — return a retryable 503, not the 404 a CMDB would
+                // read as "no such baseline → delete this CI" on a transient fault
+                // (UP-13/sre-2). Pre-audit: no PII was looked up, and a
                 // name-independent fault leaks no baseline existence (no enumeration).
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "baseline store unavailable", cid, 5000,
-                                                      "retry the request"),
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                                      {.retry_after_ms = 5000}),
                                 "application/json");
-                spdlog::warn("guardian.device.view baseline store fault (503) cid={} agent_id={}",
-                             cid, agent_id);
+                spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
+                             agent_id);
                 return;
             }
 
@@ -13819,7 +13826,9 @@ void RestApiV1::register_routes(
             // catch-arm log can never drift between surfaces again — the drift #1647
             // closed). Serving audited per-device compliance while the
             // guardian.device.view row is known-lost is exactly what audit-on-open
-            // exists to prevent (SOC 2 CC7.2 / works-council).
+            // exists to prevent (SOC 2 CC7.2 / works-council). Fires only once EVERY
+            // read above has genuinely succeeded or the baseline is genuinely absent
+            // - never before a read that could still fail.
             //
             // `result` keeps the found/not_found distinction (enumeration trail, same
             // verb the dashboard lens and the /events sibling emit). A persist failure
@@ -13831,7 +13840,7 @@ void RestApiV1::register_routes(
             // contract. The pre-auth rejections above (400, 503 unwired/store-null)
             // carry no authorized access and are intentionally not audited here.
             if (!detail::emit_behavioral_audit(
-                    audit_fn, req, res, "guardian.device.view", baseline ? "success" : "not_found",
+                    audit_fn, req, res, "guardian.device.view", rollup ? "success" : "not_found",
                     "Agent", agent_id,
                     "baseline '" + baseline_name + "' per-device guard status via REST")) {
                 res.status = 503;
@@ -13845,120 +13854,28 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            if (!baseline) {
+            if (!rollup) {
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "baseline not found", cid),
                                 "application/json");
                 return;
             }
 
-            const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-            // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
-            // read must 503, never render an empty guard_ids that would flow
-            // through rule_names_for/the compliance tally below as a false-clean
-            // "0 guards, fully compliant" report for this baseline.
-            auto guard_ids_result = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
-            if (!guard_ids_result) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "baseline store degraded", cid,
-                                          {.retry_after_ms = 5000}),
-                    "application/json");
-                spdlog::warn("guardian.device.view baseline store degraded (503) cid={} "
-                             "agent_id={}",
-                             cid, agent_id);
-                return;
-            }
-            const auto& guard_ids = *guard_ids_result;
-
-            // rule_id -> Guard name, resolved ONLY for this baseline's deployed
-            // members (name-only read; never materializes the rule body blobs).
-            // Bounded WHERE rule_id IN (guard_ids) rather than the full authored
-            // catalogue — this is per-request on the fleet-polled device-compliance
-            // path. Falls back to the rule_id when a snapshot member Guard has since
-            // been deleted (absent from the map).
-            // rule_names_for / agent_rule_statuses_for_agent are now type-distinguishable
-            // (ADR-0038 catastrophic-read set — this route's compliance counts are an
-            // enforce-gate/census consumer): a degrade must render 503, never a silent
-            // "0 guards reported" that would misreport the device as compliant.
-            auto rule_names_result = guaranteed_state_store->rule_names_for(guard_ids);
-            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
-            if (!rule_names_result || !statuses_result) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
-                                          {.retry_after_ms = 5000}),
-                    "application/json");
-                spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
-                             agent_id);
-                return;
-            }
-            const auto& rule_names = *rule_names_result;
-
-            // rule_id -> last reported verdict for THIS device.
-            std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
-            for (auto& st : *statuses_result)
-                dev[st.rule_id] = std::move(st);
-
-            int64_t compliant = 0, drifted = 0, errored = 0;
-            // max reported updated_at; ISO-8601 sorts lexically (all stamps are UTC
-            // 'Z', written by the store's format_iso_utc, so the byte compare is correct).
-            std::string last_updated;
-            // Report-driven device-applicable subset: emit ONLY the deployed-snapshot
-            // members this device has actually reported a verdict for. A member that
-            // is out of scope for this device (its scope_expr excludes it → the push
-            // never armed it → it never reported) is correctly ABSENT, so each machine
-            // shows only its applicable Guards even though they share one Baseline.
-            // (Honest in-scope-but-unreported "pending" needs scope-engine evaluation
-            // per device — deferred; see the route header.) guard_ids is the snapshot
-            // order, so the emitted subset keeps a stable order.
             JArr guards;
-            int64_t total_guards = 0;
-            for (const auto& rid : guard_ids) {
-                const auto it = dev.find(rid);
-                if (it == dev.end())
-                    continue;  // not applicable to this device
-                ++total_guards;
-                std::string status = "pending";
-                const std::string& s = it->second.state;
-                if (s == "compliant") { status = s; ++compliant; }
-                else if (s == "drifted") { status = s; ++drifted; }
-                else if (s == "errored") { status = s; ++errored; }
-                // any unexpected stored state falls through to "pending" — the
-                // forward-compat path: a future verdict token this build doesn't
-                // recognize stays counted in total_guards as pending, never silently
-                // dropped from the denominator.
-                //
-                // The report row EXISTS here (we are past dev.find != end), so it
-                // carries a real timestamp regardless of whether the token is
-                // recognized. Capture updated_at for staleness INDEPENDENT of the
-                // status LABEL (hp-1): an unrecognized-token "pending" guard (e.g. a
-                // newer agent talking to an older server) DID report recently —
-                // suppressing its updated_at would conflate "reported, unknown token"
-                // with "never reported", and a consumer watching last_updated could
-                // not tell them apart.
-                const std::string& updated_at = it->second.updated_at;
-                if (!updated_at.empty() && updated_at > last_updated)
-                    last_updated = updated_at;
-                const auto nit = rule_names.find(rid);
-                JObj g;
-                g.add("rule_id", rid)
-                    .add("name",
-                         (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid)
-                    .add("status", status);
-                if (updated_at.empty())
-                    g.raw("updated_at", "null");
+            for (const auto& g : rollup->guards) {
+                JObj gj;
+                gj.add("rule_id", g.rule_id).add("name", g.name).add("status", g.status);
+                if (g.updated_at.empty())
+                    gj.raw("updated_at", "null");
                 else
-                    g.add("updated_at", updated_at);
-                guards.add(std::move(g));
+                    gj.add("updated_at", g.updated_at);
+                guards.add(std::move(gj));
             }
-
-            const int64_t pending = total_guards - (compliant + drifted + errored);
 
             JObj b;
-            b.add("baseline_id", baseline->baseline_id)
-                .add("name", baseline->name)
-                .add("lifecycle", baseline->lifecycle);
+            b.add("baseline_id", rollup->baseline_id)
+                .add("name", rollup->baseline_name)
+                .add("lifecycle", rollup->baseline_lifecycle);
 
             // assessable: a machine-readable go/no-go for a CMDB consumer (UP-2 /
             // comp-1 / er-1). FALSE when the response carries no compliance signal to
@@ -13974,19 +13891,19 @@ void RestApiV1::register_routes(
             // compliant/total_guards.
             JObj data;
             data.raw("baseline", b.str())
-                .add("deployed", deployed)
-                .add("assessable", deployed && total_guards > 0)
+                .add("deployed", rollup->deployed)
+                .add("assessable", rollup->deployed && rollup->total_guards > 0)
                 .add("agent_id", agent_id)
-                .add("total_guards", total_guards)
-                .add("snapshot_total", static_cast<int64_t>(guard_ids.size()))
-                .add("compliant", compliant)
-                .add("drifted", drifted)
-                .add("errored", errored)
-                .add("pending", pending);
-            if (last_updated.empty())
+                .add("total_guards", rollup->total_guards)
+                .add("snapshot_total", rollup->snapshot_total)
+                .add("compliant", rollup->compliant)
+                .add("drifted", rollup->drifted)
+                .add("errored", rollup->errored)
+                .add("pending", rollup->pending);
+            if (rollup->last_updated.empty())
                 data.raw("last_updated", "null");
             else
-                data.add("last_updated", last_updated);
+                data.add("last_updated", rollup->last_updated);
             data.raw("guards", guards.str());
 
             res.set_content(ok_json(data.str()), "application/json");

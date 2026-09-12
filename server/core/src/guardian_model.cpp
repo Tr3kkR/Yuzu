@@ -1,6 +1,9 @@
 #include "guardian_model.hpp"
 
+#include "baseline_store.hpp"
 #include "guaranteed_state_store.hpp"
+
+#include <unordered_map>
 
 namespace yuzu::server {
 
@@ -90,6 +93,80 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
         row.updated_at = s.updated_at;
         out.push_back(std::move(row));
     }
+    return out;
+}
+
+std::optional<GuardianDeviceComplianceRollup>
+guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
+                                  const std::string& baseline_name, const std::string& agent_id,
+                                  bool* store_degraded) {
+    *store_degraded = false;
+    bool baseline_store_ok = true;
+    const auto baseline = baseline_store.get_baseline_by_name(baseline_name, &baseline_store_ok);
+    if (!baseline_store_ok) {
+        *store_degraded = true;
+        return std::nullopt;
+    }
+    if (!baseline)
+        return std::nullopt; // genuinely no such baseline, not a fault
+
+    // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
+    // read must never render as an empty guard_ids that flows through as a
+    // false-clean "0 guards, fully compliant" report for this baseline.
+    auto guard_ids_result = baseline_store.deployed_member_rule_ids(baseline->baseline_id);
+    if (!guard_ids_result) {
+        *store_degraded = true;
+        return std::nullopt;
+    }
+    const auto& guard_ids = *guard_ids_result;
+
+    // ADR-0038 catastrophic-read set: this route's compliance counts are an
+    // enforce-gate/census consumer - a degrade must never render as a silent
+    // "0 guards reported" that would misreport the device as compliant.
+    auto rule_names_result = store.rule_names_for(guard_ids);
+    auto statuses_result = store.agent_rule_statuses_for_agent(agent_id);
+    if (!rule_names_result || !statuses_result) {
+        *store_degraded = true;
+        return std::nullopt;
+    }
+    const auto& rule_names = *rule_names_result;
+
+    std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
+    for (auto& st : *statuses_result)
+        dev[st.rule_id] = std::move(st);
+
+    GuardianDeviceComplianceRollup out;
+    out.baseline_id = baseline->baseline_id;
+    out.baseline_name = baseline->name;
+    out.baseline_lifecycle = baseline->lifecycle;
+    out.deployed = (baseline->lifecycle == kBaselineDeployed);
+    out.snapshot_total = static_cast<std::int64_t>(guard_ids.size());
+
+    // Report-driven device-applicable subset: emit ONLY the deployed-snapshot
+    // members this device has actually reported a verdict for (guard_ids
+    // order, so the emitted subset keeps a stable order).
+    for (const auto& rid : guard_ids) {
+        const auto it = dev.find(rid);
+        if (it == dev.end())
+            continue; // not applicable to this device
+        ++out.total_guards;
+        std::string status = "pending";
+        const std::string& s = it->second.state;
+        if (s == "compliant") { status = s; ++out.compliant; }
+        else if (s == "drifted") { status = s; ++out.drifted; }
+        else if (s == "errored") { status = s; ++out.errored; }
+        const std::string& updated_at = it->second.updated_at;
+        if (!updated_at.empty() && updated_at > out.last_updated)
+            out.last_updated = updated_at;
+        const auto nit = rule_names.find(rid);
+        GuardianDeviceComplianceGuardRow row;
+        row.rule_id = rid;
+        row.name = (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid;
+        row.status = status;
+        row.updated_at = updated_at;
+        out.guards.push_back(std::move(row));
+    }
+    out.pending = out.total_guards - (out.compliant + out.drifted + out.errored);
     return out;
 }
 
