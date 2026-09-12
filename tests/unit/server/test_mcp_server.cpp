@@ -970,6 +970,13 @@ struct McpTestServer {
     yuzu::server::CaRoutes::ExportCsrFn export_csr_fn_for_test{};
     bool export_csr_succeeds_{true};
 
+    /// B5 (api-parity #2146 scope correction): optionally wire a stub
+    /// ImportChainFn so import_ca_chain can be exercised end-to-end, mirroring
+    /// export_csr_fn_for_test immediately above. Default unset (empty
+    /// std::function) keeps every existing test on the "CA not available"
+    /// path - matches production's import_chain_fn == unset degradation.
+    yuzu::server::CaRoutes::ImportChainFn import_chain_fn_for_test{};
+
     /// B5 — optionally wire a real (Postgres-backed) OffloadTargetStore /
     /// LicenseStore / SoftwareDeploymentStore so the offload-target /
     /// platform-license / software-deployment MCP tools can be exercised
@@ -1483,7 +1490,8 @@ private:
             /*offload_target_store=*/offload_target_store_for_test,
             /*license_store=*/license_store_for_test,
             /*sw_deploy_store=*/sw_deploy_store_for_test,
-            /*export_csr_fn=*/export_csr_fn_for_test);
+            /*export_csr_fn=*/export_csr_fn_for_test,
+            /*import_chain_fn=*/import_chain_fn_for_test);
     }
 };
 
@@ -17023,6 +17031,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"revoke_certificate", nlohmann::json::parse(R"({"serial_hex":"AB12"})")},
         {"issue_code_signing_cert",
          nlohmann::json::parse(R"({"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----","label":"my-signer"})")},
+        // B5 scope correction (#2146): Security:Write, approval-gated like
+        // issue_code_signing_cert above.
+        {"import_ca_chain",
+         nlohmann::json::parse(R"({"intermediate_pem":"x","chain_pem":"y"})")},
         {"create_engine_principal",
          nlohmann::json::parse(
              R"({"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"internal"})")},
@@ -20798,6 +20810,221 @@ TEST_CASE("MCP B5: export_ca_root_csr respects perm_fn denial on Security:Read",
         R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"export_ca_root_csr",)"
         R"("arguments":{}}})");
     REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── CA subordinate-chain import (scope correction: gap-matrix #2146 B5) ──────
+// Mirrors POST /api/v1/ca/import-chain (ca_routes.cpp:799) exactly, same
+// import_chain_fn seam and publish_crl_fn CRL-republish follow-up. Security:Write
+// on the supervised tier is approval-gated (mcp_policy.hpp::requires_approval),
+// so these tests follow the revoke_certificate/issue_code_signing_cert
+// ticket-mint-then-recall pattern rather than export_ca_root_csr's direct-call one.
+
+TEST_CASE("MCP B5: import_ca_chain is tier-denied below supervised (Security:Write)",
+          "[mcp][integration][pki][security][b5]") {
+    int calls = 0;
+    McpTestServer ts;
+    ts.import_chain_fn_for_test = [&](const std::string&, const std::string&) {
+        ++calls;
+        return yuzu::server::CaRoutes::ImportOutcome::Ok;
+    };
+    ts.start("operator"); // operator cannot do Security:Write
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // tier denied — the generic gate fired
+    CHECK(calls == 0);
+    CHECK(ts.crl_publish_calls_ == 0);
+}
+
+TEST_CASE("MCP B5: import_ca_chain supervised + approval manager mints a ticket",
+          "[mcp][integration][pki][security][approval][b5]") {
+    int calls = 0;
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [&](const std::string&, const std::string&) {
+        ++calls;
+        return yuzu::server::CaRoutes::ImportOutcome::Ok;
+    };
+    ts.start("supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK(body["error"]["data"].contains("approval_id"));
+    // Ticket minted only — the CA must not have been switched yet.
+    CHECK(calls == 0);
+    CHECK(ts.crl_publish_calls_ == 0);
+    CHECK(appr.pending_count() == 1);
+}
+
+TEST_CASE("MCP B5: import_ca_chain full approval-ticket round-trip reaches imported:true "
+          "and republishes the CRL",
+          "[mcp][integration][pki][security][approval][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    int calls = 0;
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [&](const std::string& intermediate,
+                                       const std::string& chain) {
+        ++calls;
+        CHECK(intermediate == "-----BEGIN CERTIFICATE-----int-----END CERTIFICATE-----");
+        CHECK(chain == "-----BEGIN CERTIFICATE-----parent-----END CERTIFICATE-----");
+        return yuzu::server::CaRoutes::ImportOutcome::Ok;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"-----BEGIN CERTIFICATE-----int-----END CERTIFICATE-----",)"
+        R"("chain_pem":"-----BEGIN CERTIFICATE-----parent-----END CERTIFICATE-----"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    CHECK(calls == 0); // not yet consumed
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"-----BEGIN CERTIFICATE-----int-----END CERTIFICATE-----",)"
+        R"("chain_pem":"-----BEGIN CERTIFICATE-----parent-----END CERTIFICATE-----","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // SUCCESS
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["imported"] == true);
+    CHECK(payload["mode"] == "subordinate");
+    CHECK(payload["crl_republished"] == true);
+    CHECK(calls == 1);
+    CHECK(ts.crl_publish_calls_ == 1);
+    CHECK(ts.audit_log.back() == "mcp.import_ca_chain|success");
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("ca.subordinate.imported|success")) != ts.audit_log.end());
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == payload);
+}
+
+TEST_CASE("MCP B5: import_ca_chain maps a BadIntermediate refusal to kInvalidParams, audits "
+          "denied, and never republishes the CRL (reject-without-state-change)",
+          "[mcp][integration][pki][security][approval][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [](const std::string&, const std::string&) {
+        return yuzu::server::CaRoutes::ImportOutcome::BadIntermediate;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"not-a-cert","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"not-a-cert","chain_pem":"y","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("not a valid certificate") !=
+          std::string::npos);
+    CHECK(ts.crl_publish_calls_ == 0);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("ca.subordinate.imported|denied")) != ts.audit_log.end());
+}
+
+TEST_CASE("MCP B5: import_ca_chain without a CA store answers unavailable, not a crash",
+          "[mcp][integration][pki][security][approval][b5]") {
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts; // ca_store_for_test / import_chain_fn_for_test stay unset
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" + approval_id +
+        R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP B5: import_ca_chain denies without Security:Write, even after an approved "
+          "ticket (RBAC)",
+          "[mcp][integration][pki][security][approval][b5]") {
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+        return !(securable == "Security" && operation == "Write");
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" + approval_id +
+        R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    // perm_fn's own mock 403 — the RBAC denial fires inside the handler, after
+    // the ticket is consumed — not a JSON-RPC "result" envelope.
     CHECK(res->status == 403);
 }
 

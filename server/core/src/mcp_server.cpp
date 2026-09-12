@@ -2368,6 +2368,19 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{},"additionalProperties":false})j",
      R"j({"type":"object","properties":{"csr_pem":{"type":"string"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["csr_pem"]})j"},
 
+    {"import_ca_chain",
+     "Switch the install CA to subordinate mode by importing a countersigned intermediate "
+     "certificate plus its chain to a trusted parent (PR6 subordinate-CA workflow). Mirrors "
+     "POST /api/v1/ca/import-chain exactly, same import_chain_fn validation (intermediate must "
+     "be a valid CA:TRUE certificate carrying THIS server's public key, verifying to the "
+     "supplied parent chain) and the same CRL republish afterward so the served CRL is signed "
+     "under the new issuing identity. Destructive and NOT idempotent-safe to blind-retry: a "
+     "successful import changes which key signs every future cert/CRL this server issues. "
+     "Requires Security:Write. A validation failure (bad/mismatched/non-chaining intermediate) "
+     "is a REJECTION, not a fault - the caller's material was refused, no state changed.",
+     R"j({"type":"object","properties":{"intermediate_pem":{"type":"string","minLength":1,"maxLength":16384,"description":"PEM-encoded intermediate CA certificate"},"chain_pem":{"type":"string","minLength":1,"maxLength":32768,"description":"PEM-encoded parent chain the intermediate verifies against"}},"required":["intermediate_pem","chain_pem"]})j",
+     R"j({"type":"object","properties":{"imported":{"const":true},"mode":{"const":"subordinate"},"crl_republished":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["imported","mode","crl_republished"]})j"},
+
     // ── B5 — platform license MCP twins (rest_api_v1.cpp) ──────────────────
     // LicenseStore is DELIBERATELY DORMANT on `dev` (ADR-0048) — nothing in
     // server.cpp constructs one, matching RestApiV1's own `/*license_store=*/
@@ -2479,7 +2492,7 @@ static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
 static const char* const kWriteToolsRaw[] = {
     "set_tag",         "delete_tag",     "execute_instruction",
     "approve_request", "reject_request", "quarantine_device",
-    "revoke_certificate", "execute_bundle", "issue_code_signing_cert",
+    "revoke_certificate", "execute_bundle", "issue_code_signing_cert", "import_ca_chain",
     // Engine-principal lifecycle tools (ADR-1005 item 2b, plan PR 4.3).
     "create_engine_principal", "revoke_engine_principal",
     "mint_engine_credential",  "rotate_engine_credential",
@@ -2859,6 +2872,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // /api/v1/ca/root-csr gate exactly (Security:Read, same securable as
     // list_issued_certs above).
     {"export_ca_root_csr", {"Security", "Read"}},
+    {"import_ca_chain", {"Security", "Write"}},
     // B5 — platform license: parity with rest_api_v1.cpp's License:Read/Write
     // gates exactly.
     {"get_platform_license", {"License", "Read"}},
@@ -3446,6 +3460,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_offload_target_deliveries",
      {ToolEffect::ReadOnly, true, "List offload target deliveries"}},
     {"export_ca_root_csr", {ToolEffect::ReadOnly, true, "Export CA root CSR"}},
+    {"import_ca_chain", {ToolEffect::Destructive, false, "Import CA subordinate chain"}},
     {"get_platform_license", {ToolEffect::ReadOnly, true, "Get platform license"}},
     {"list_license_alerts", {ToolEffect::ReadOnly, true, "List license alerts"}},
     {"list_software_deployments", {ToolEffect::ReadOnly, true, "List software deployments"}},
@@ -4099,7 +4114,7 @@ McpServer::HandlerFn McpServer::build_handler(
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
     std::shared_ptr<const VerifyApi> verify_api, OffloadTargetStore* offload_target_store,
     LicenseStore* license_store, SoftwareDeploymentStore* sw_deploy_store,
-    CaRoutes::ExportCsrFn export_csr_fn) {
+    CaRoutes::ExportCsrFn export_csr_fn, CaRoutes::ImportChainFn import_chain_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -15381,6 +15396,107 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── B5 — CA chain import (ca_routes.cpp) ────────────────────────
+            // Mirrors POST /api/v1/ca/import-chain exactly: same import_chain_fn
+            // seam (switches the CA to subordinate mode), same publish_crl_fn
+            // CRL republish afterward (the EXISTING McpServer publish_crl_fn
+            // param above — identical signature to CaRoutes::PublishCrlFn, no
+            // second one added). Destructive: a privileged trust-root switch.
+            if (tool_name == "import_ca_chain") {
+                if (!tier_allows(tier, "Security", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Security", "Write"))
+                    return;
+                if (!ca_store || !ca_store->is_open() || !import_chain_fn) {
+                    res.set_content(a4_error(kInternalError, "CA not available"),
+                                    "application/json");
+                    return;
+                }
+                const std::string intermediate_pem = param_str(args, "intermediate_pem");
+                const std::string chain_pem = param_str(args, "chain_pem");
+                if (intermediate_pem.empty() || chain_pem.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "intermediate_pem and chain_pem are required"),
+                        "application/json");
+                    return;
+                }
+                CaRoutes::ImportOutcome outcome;
+                try {
+                    outcome = import_chain_fn(intermediate_pem, chain_pem);
+                } catch (const std::exception& e) {
+                    (void)audit_fn(req, "ca.subordinate.imported", "failure", "CaRoot", "root",
+                                   std::string("reason=exception detail=") + e.what());
+                    res.set_content(a4_error(kInternalError, "import failed"), "application/json");
+                    return;
+                } catch (...) {
+                    (void)audit_fn(req, "ca.subordinate.imported", "failure", "CaRoot", "root",
+                                   "reason=exception");
+                    res.set_content(a4_error(kInternalError, "import failed"), "application/json");
+                    return;
+                }
+                // Audit vocab matches REST exactly (#1240): success = applied;
+                // denied = caller's material rejected (reject-without-state-
+                // change); failure = authorized but the server errored.
+                std::string result = "denied";
+                std::string msg;
+                std::string detail = "mode=subordinate";
+                bool ok = false;
+                switch (outcome) {
+                case CaRoutes::ImportOutcome::Ok:
+                    ok = true;
+                    result = "success";
+                    break;
+                case CaRoutes::ImportOutcome::NoRoot:
+                    msg = "no CA root to subordinate (generate default certs first)";
+                    detail = "reason=no_root";
+                    break;
+                case CaRoutes::ImportOutcome::BadIntermediate:
+                    msg = "intermediate_pem is not a valid certificate";
+                    detail = "reason=bad_intermediate";
+                    break;
+                case CaRoutes::ImportOutcome::NotCa:
+                    msg = "intermediate is not a CA certificate (basicConstraints CA:TRUE required)";
+                    detail = "reason=not_ca";
+                    break;
+                case CaRoutes::ImportOutcome::KeyMismatch:
+                    msg = "intermediate does not carry this CA's public key";
+                    detail = "reason=key_mismatch";
+                    break;
+                case CaRoutes::ImportOutcome::ChainInvalid:
+                    msg = "intermediate does not verify to the provided parent chain";
+                    detail = "reason=chain_invalid";
+                    break;
+                case CaRoutes::ImportOutcome::StoreError:
+                    msg = "failed to persist the imported chain";
+                    detail = "reason=store_error";
+                    result = "failure";
+                    break;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
+                if (!ok) {
+                    res.set_content(error_response(id, kInvalidParams, msg), "application/json");
+                    return;
+                }
+                // Re-publish the CRL so it's signed under the new issuing cert's
+                // identity - same follow-up REST performs after a successful import.
+                const bool crl_ok = publish_crl_fn && publish_crl_fn().has_value();
+                nlohmann::json payload_j = {
+                    {"imported", true}, {"mode", "subordinate"}, {"crl_republished", crl_ok}};
+                if (!audit_ok)
+                    payload_j["audit_persisted"] = false;
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload_j.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
             // ── B5 — platform license (rest_api_v1.cpp) ─────────────────────
             // LicenseStore is DELIBERATELY DORMANT on `dev` (ADR-0048) — see
             // this file's forward-declaration comment (mcp_server.hpp); these
@@ -18151,7 +18267,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 OffloadTargetStore* offload_target_store,
                                 LicenseStore* license_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
-                                CaRoutes::ExportCsrFn export_csr_fn) {
+                                CaRoutes::ExportCsrFn export_csr_fn,
+                                CaRoutes::ImportChainFn import_chain_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -18168,7 +18285,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
                     std::move(caller_fn), product_pack_store, workflow_engine,
                     std::move(issue_code_signing_fn), std::move(verify_api), offload_target_store,
-                    license_store, sw_deploy_store, std::move(export_csr_fn));
+                    license_store, sw_deploy_store, std::move(export_csr_fn),
+                    std::move(import_chain_fn));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -18209,7 +18327,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 OffloadTargetStore* offload_target_store,
                                 LicenseStore* license_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
-                                CaRoutes::ExportCsrFn export_csr_fn) {
+                                CaRoutes::ExportCsrFn export_csr_fn,
+                                CaRoutes::ImportChainFn import_chain_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -18243,7 +18362,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(principal_audit_fn), product_pack_store, workflow_engine,
                             std::move(issue_code_signing_fn), std::move(verify_api),
                             offload_target_store, license_store, sw_deploy_store,
-                            std::move(export_csr_fn)));
+                            std::move(export_csr_fn), std::move(import_chain_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

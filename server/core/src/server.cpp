@@ -17944,7 +17944,13 @@ private:
                 /*sw_deploy_store=*/nullptr,
                 // The SAME ServerImpl seam the CaRoutes registration above wires
                 // for GET /api/v1/ca/root-csr (export_ca_csr holds the CA key).
-                [this]() -> std::optional<std::string> { return export_ca_csr(); });
+                [this]() -> std::optional<std::string> { return export_ca_csr(); },
+                // The SAME ServerImpl seam the CaRoutes registration above wires
+                // for POST /api/v1/ca/import-chain (import_subordinate_chain).
+                [this](const std::string& intermediate_pem,
+                       const std::string& parent_chain_pem) -> CaRoutes::ImportOutcome {
+                    return import_subordinate_chain(intermediate_pem, parent_chain_pem);
+                });
         }
 
         // -- Listen -----------------------------------------------------------

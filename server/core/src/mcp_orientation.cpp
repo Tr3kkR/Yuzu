@@ -89,7 +89,8 @@ constexpr std::string_view kRemediation[] = {"quarantine_device"};
 // same Security securable, distinct from the "Offload targets" family below
 // despite both being new in this same PR.
 constexpr std::string_view kCerts[] = {"list_issued_certs", "revoke_certificate",
-                                       "issue_code_signing_cert", "export_ca_root_csr"};
+                                       "issue_code_signing_cert", "export_ca_root_csr",
+                                       "import_ca_chain"};
 // KEK rotation (#2395 track C) is its own family, distinct from Certificates:
 // a KEK is the server's own secrets-at-rest encryption key, not a PKI
 // certificate, and it gates on a different lifecycle (rotate/rewrap/status,

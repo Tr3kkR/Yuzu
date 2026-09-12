@@ -775,7 +775,16 @@ public:
                             // optional dep; unset leaves the tool answering "CA not
                             // available", the same degradation ca_store == nullptr produces
                             // for the other CA tools above.
-                            CaRoutes::ExportCsrFn export_csr_fn = {});
+                            CaRoutes::ExportCsrFn export_csr_fn = {},
+                            // B5 — backs import_ca_chain, the MCP twin of POST
+                            // /api/v1/ca/import-chain. Reuses `CaRoutes::ImportChainFn`
+                            // verbatim; the CRL-republish half reuses the EXISTING
+                            // `publish_crl_fn` param above (identical signature to
+                            // `CaRoutes::PublishCrlFn`, already wired for
+                            // revoke_certificate) rather than adding a second one.
+                            // Trailing optional dep; unset leaves the tool answering
+                            // "CA not available".
+                            CaRoutes::ImportChainFn import_chain_fn = {});
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -881,7 +890,8 @@ public:
                          OffloadTargetStore* offload_target_store = nullptr,
                          LicenseStore* license_store = nullptr,
                          SoftwareDeploymentStore* sw_deploy_store = nullptr,
-                         CaRoutes::ExportCsrFn export_csr_fn = {});
+                         CaRoutes::ExportCsrFn export_csr_fn = {},
+                         CaRoutes::ImportChainFn import_chain_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -936,7 +946,8 @@ public:
                          OffloadTargetStore* offload_target_store = nullptr,
                          LicenseStore* license_store = nullptr,
                          SoftwareDeploymentStore* sw_deploy_store = nullptr,
-                         CaRoutes::ExportCsrFn export_csr_fn = {});
+                         CaRoutes::ExportCsrFn export_csr_fn = {},
+                         CaRoutes::ImportChainFn import_chain_fn = {});
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──
