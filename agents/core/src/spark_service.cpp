@@ -993,18 +993,24 @@ ServiceRunState map_terminal(DWORD s) {
 struct PendingEmit {
     std::string key;
     ServiceRunState state;
-    /// The staging watch's `probe_gen` at push time (#2012/#3840 PR-B3
-    /// review) — `drop_stale()` compares this against the CURRENT watch
-    /// mapped to `key` right before dispatch, so a same-tick remove+re-add
-    /// of `key` (staged under the OLD watch, delivered after the drain
-    /// re-maps it to a NEW one) is discarded rather than misattributed.
-    std::uint64_t gen{0};
+    /// `key`'s subscription epoch (`key_epoch_[key]`) at push time
+    /// (#2012/#3840 PR-B3 review, round 2: `probe_gen` was the wrong
+    /// identity here — it tracks PROBE launches, not subscription
+    /// lifetime, so a same-watch re-arm-failure retry after a state was
+    /// already staged could drop a real, already-true transition, and a
+    /// fold_ci-coalesced same-object Remove+Add could fail to drop an
+    /// actually-stale one). `drop_stale()` compares this against `key`'s
+    /// CURRENT epoch right before dispatch, so a same-tick remove+re-add
+    /// of `key` (staged under the OLD subscription) is discarded, while a
+    /// same-watch probe relaunch that does NOT touch `key`'s own
+    /// subscription lifetime never invalidates already-staged data.
+    std::uint64_t key_epoch{0};
 };
 struct PendingFault {
     std::string key;
     bool faulted;
     std::string reason;
-    std::uint64_t gen{0}; ///< see PendingEmit::gen
+    std::uint64_t key_epoch{0}; ///< see PendingEmit::key_epoch
 };
 
 /// Pending-operation state of one watch's establishment — INDEPENDENT of its
@@ -1123,14 +1129,6 @@ struct SvcWatch {
 
     // ── PR-B3 (#2012/#3840): async establishment state ─────────────────────
     ProbeState probe{ProbeState::Idle};
-    /// Mechanism-global, bumped at every probe reservation. Staged into every
-    /// PendingEmit/PendingFault at push time and checked against the CURRENT
-    /// watch's value by drop_stale() right before dispatch — the guard the
-    /// governance review found write-only is now genuinely relied upon: it
-    /// is what discards a same-tick stale-generation delivery (a probe
-    /// result staged for this watch, then superseded by a Remove+Add of its
-    /// key before dispatch runs). See drop_stale()'s own doc comment.
-    std::uint64_t probe_gen{0};
     /// Engaged from an admitted launch until resolve_probe() consumes it.
     std::optional<DetachedCall<ServiceProbeResult>> call;
     /// When the CURRENT obligation was accepted — set ONLY on a fresh
@@ -1379,7 +1377,6 @@ private:
             w.accepted_at = Clock::now();
             w.grace_counted = false;
         }
-        w.probe_gen = ++gen_;
 
         if (launched) {
             w.probe = ProbeState::Pending;
@@ -1454,7 +1451,7 @@ private:
             if (!w.faulted) {
                 w.faulted = true;
                 for (const auto& k : w.keys)
-                    faults.push_back({k, true, "OpenService probe failed", w.probe_gen});
+                    faults.push_back({k, true, "OpenService probe failed", key_epoch_.at(k)});
             }
             // ProbeState::Deferred (not Idle) — a due next_retry with probe
             // still Idle would never be picked up by run()'s retry scan,
@@ -1479,7 +1476,7 @@ private:
                 if (w.faulted) {
                     w.faulted = false;
                     for (const auto& k : w.keys)
-                        faults.push_back({k, false, "recovered", w.probe_gen});
+                        faults.push_back({k, false, "recovered", key_epoch_.at(k)});
                 }
             } else {
                 spdlog::warn("spark_service: OpenService failed for a watched service (err={})",
@@ -1487,7 +1484,7 @@ private:
                 if (!w.faulted) {
                     w.faulted = true;
                     for (const auto& k : w.keys)
-                        faults.push_back({k, true, "OpenService failed", w.probe_gen});
+                        faults.push_back({k, true, "OpenService failed", key_epoch_.at(k)});
                 }
             }
             // Deferred, not Idle — an absent service needs its periodic
@@ -1514,7 +1511,7 @@ private:
             if (!w.faulted) {
                 w.faulted = true;
                 for (const auto& k : w.keys)
-                    faults.push_back({k, true, "NotifyServiceStatusChange failed", w.probe_gen});
+                    faults.push_back({k, true, "NotifyServiceStatusChange failed", key_epoch_.at(k)});
             }
             // Deferred, not Idle — see the comment on the two branches above.
             w.probe = ProbeState::Deferred;
@@ -1534,7 +1531,7 @@ private:
         if (w.faulted) {
             w.faulted = false;
             for (const auto& k : w.keys)
-                faults.push_back({k, false, "recovered", w.probe_gen});
+                faults.push_back({k, false, "recovered", key_epoch_.at(k)});
         }
         w.next_retry = {}; // event-driven now; no polling backstop needed while armed
     }
@@ -1559,7 +1556,7 @@ private:
             health_edges_.fetch_add(1, std::memory_order_relaxed);
             for (const auto& k : w.keys)
                 faults.push_back(
-                    {k, true, "service watch establishment pending past grace", w.probe_gen});
+                    {k, true, "service watch establishment pending past grace", key_epoch_.at(k)});
         }
     }
 
@@ -1568,37 +1565,48 @@ private:
             return;
         w.last = mapped;
         for (const auto& k : w.keys)
-            out.push_back({k, mapped, w.probe_gen});
+            out.push_back({k, mapped, key_epoch_.at(k)});
     }
 
-    // Drops any staged emit/fault whose `gen` no longer matches the CURRENT
-    // watch mapped to its `key` (#2012/#3840 PR-B3 review) — closes the
-    // same-tick window where a probe/grace/fired-scan result is staged
+    // Drops any staged emit/fault whose `key_epoch` no longer matches `key`'s
+    // CURRENT subscription epoch (#2012/#3840 PR-B3 review, round 2) — closes
+    // the same-tick window where a probe/grace/fired-scan result is staged
     // BEFORE the command drain processes a Remove+Add of that same key: the
     // stale entry would otherwise be delivered to the REPLACEMENT
     // subscription instead of being discarded (the kickoff doc's own
     // required stale-generation guard, ~/.claude/plans/spark-2012-3840-prb3-
-    // service-KICKOFF.md:254-255). gen_ is mechanism-wide monotonic
-    // (bumped on every begin_probe()), so an exact match against the watch
-    // CURRENTLY owning `key` is a sufficient test either way a staged entry
-    // can go stale: the key was removed entirely (no longer in key_svc_),
-    // remapped to a brand-new SvcWatch (a different, higher gen_), or the
-    // SAME watch has since started a newer probe (also a different, higher
-    // gen_ — and in that case the newer probe's own result supersedes this
-    // one regardless, so discarding it is correct, not just safe). Only
-    // called right before the ONE dispatch() that follows a command drain
-    // in the same iteration (other dispatch() call sites have no drain in
-    // between, so nothing to filter).
+    // service-KICKOFF.md:254-255).
+    //
+    // DELIBERATELY keyed on the per-KEY subscription epoch (`key_epoch_`),
+    // NOT `SvcWatch::probe_gen` — an earlier version of this check used
+    // probe_gen and was wrong in both directions, found in this same
+    // adversarial-review round: (1) probe_gen is bumped by ANY begin_probe()
+    // call on a watch, including a re-arm-failure retry that has nothing to
+    // do with `key`'s own subscription lifetime — staging a real, already-
+    // true state transition and then launching such a retry in the SAME
+    // iteration (fired-scan: set_terminal() then begin_probe() when re-arm
+    // fails) would have dropped that already-observed, never-to-recur
+    // transition. (2) case-insensitive name coalescing means two DIFFERENT
+    // keys can share one SvcWatch (and therefore one probe_gen); a same-tick
+    // Remove+Add of ONE of those keys leaves the shared watch's probe_gen
+    // completely unchanged, so the old check would have let a genuinely
+    // stale entry straight through — the exact leak this function exists to
+    // close. `key_epoch_` tracks neither of those unrelated events: it
+    // bumps ONLY when `key_svc_` actually gains a fresh entry for `key`
+    // (see the Add-drain branch below), which is precisely "is this still
+    // the subscription this entry was produced for." Only called right
+    // before the ONE dispatch() that follows a command drain in the same
+    // iteration (other dispatch() call sites have no drain in between, so
+    // nothing to filter).
     template <typename T>
     void drop_stale(std::vector<T>& v) {
         v.erase(std::remove_if(v.begin(), v.end(),
                                [this](const T& e) {
-                                   auto kit = key_svc_.find(e.key);
-                                   if (kit == key_svc_.end())
+                                   if (!key_svc_.contains(e.key))
                                        return true; // no longer watched at all
-                                   auto sit = svcs_.find(kit->second);
-                                   return sit == svcs_.end() ||
-                                          sit->second->probe_gen != e.gen;
+                                   auto kit = key_epoch_.find(e.key);
+                                   return kit == key_epoch_.end() ||
+                                          kit->second != e.key_epoch;
                                }),
                 v.end());
     }
@@ -1775,15 +1783,23 @@ private:
                     }
                     w->keys.insert(cmd.key);
                     key_svc_.emplace(cmd.key, folded);
+                    // A fresh subscription epoch for `cmd.key` specifically —
+                    // NOT `w->probe_gen` (#2012/#3840 PR-B3 review, round 2):
+                    // this is the identity drop_stale() checks, and it must
+                    // track THIS key's own Add/Remove lifecycle, independent
+                    // of the shared watch's probe activity or of any other
+                    // key coalesced onto the same watch.
+                    const std::uint64_t this_key_epoch = ++gen_;
+                    key_epoch_[cmd.key] = this_key_epoch;
                     if (is_new) {
                         begin_probe(*w);
                     } else if (w->last) {
                         // Same UP-2 fix as the Linux mechanism: hand a
                         // newly-coalescing key the fault status too, not just
                         // the cached state.
-                        emits.push_back({cmd.key, *w->last, w->probe_gen});
+                        emits.push_back({cmd.key, *w->last, this_key_epoch});
                         if (w->faulted)
-                            faults.push_back({cmd.key, true, "OpenService failed", w->probe_gen});
+                            faults.push_back({cmd.key, true, "OpenService failed", this_key_epoch});
                     }
                 } else { // Cmd::Remove
                     auto kit = key_svc_.find(cmd.key);
@@ -1791,6 +1807,7 @@ private:
                         continue;
                     const std::wstring folded = kit->second;
                     key_svc_.erase(kit);
+                    key_epoch_.erase(cmd.key);
                     auto sit = svcs_.find(folded);
                     if (sit == svcs_.end())
                         continue;
@@ -1960,16 +1977,29 @@ private:
     // stop() after the thread has joined.
     std::unordered_map<std::wstring, std::unique_ptr<SvcWatch>> svcs_; ///< keyed by folded name
     std::unordered_map<std::string, std::wstring> key_svc_;           ///< spark key -> folded name
+    /// spark key -> subscription epoch, bumped in `++gen_` whenever `key_svc_`
+    /// actually gains an entry for that key (a genuinely new or freshly
+    /// re-added subscription — never on the idempotent-Add no-op branch).
+    /// This is the identity `drop_stale()` checks — deliberately NOT
+    /// `SvcWatch::probe_gen`, which tracks probe LAUNCHES and is bumped by
+    /// events (a same-watch re-arm-failure retry) that have nothing to do
+    /// with whether `key`'s own subscription is still the one a staged
+    /// emit/fault was produced for (#2012/#3840 PR-B3 review, round 2).
+    std::unordered_map<std::string, std::uint64_t> key_epoch_;
     /// Removed watches awaiting quiescence before real free — see the
     /// Cmd::Remove handling and the reap loop in run() for why a watch isn't
     /// freed synchronously on removal.
     std::vector<std::unique_ptr<SvcWatch>> retiring_;
 
     // ── PR-B3 (#2012/#3840): probe-only establishment lane ──────────────────
-    /// Mechanism-global, bumped at every probe reservation (begin_probe()) —
-    /// see SvcWatch::probe_gen's own doc comment for why this is
-    /// defense-in-depth here rather than load-bearing the way it is for
-    /// Registry.
+    /// Mechanism-global monotonic source, consumed by `key_epoch_` (see its
+    /// own doc comment) each time a key's subscription is freshly
+    /// (re-)established. An earlier version of this counter also stamped a
+    /// per-watch `SvcWatch::probe_gen` field bumped on every probe launch;
+    /// that field was removed (#2012/#3840 PR-B3 review, round 2) once
+    /// `drop_stale()` moved off it — it had no other reader once its one
+    /// use turned out to be the wrong identity (probe-launch, not
+    /// subscription-lifetime) for that check.
     std::uint64_t gen_{0};
     std::shared_ptr<const ServiceProbeHook> probe_hook_; ///< test seam
     SparkDetachedLane probe_lane_;
