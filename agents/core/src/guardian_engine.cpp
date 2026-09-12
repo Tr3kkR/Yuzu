@@ -1053,13 +1053,15 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             continue; // not counted as applied - reconcile_rule_locked already logged why
         }
         // rung 9c PR-2 (structural step, R5.3): Accepted is not a failure - the rule
-        // was eligible and its arm was dispatched - so it is counted as applied
-        // exactly like Armed/Inert, never added to reconcile_failures/arm_failures_.
-        // But it is also not yet resolved, so it must independently hold the
-        // generation below (never on acceptance alone). NOT YET REACHABLE: no path
-        // produces ReconcileOutcome::Accepted today (see its own doc) - this branch
-        // and pending_arms below are structural preparation for when attach_rule's
-        // wait is removed, not a behavior change (pending_arms is always 0 here).
+        // was eligible and its arm attempt was accepted (dispatched, or queued
+        // behind an in-flight/retained claim on the same key, R5.2) - so it is
+        // counted as applied exactly like Armed/Inert, never added to
+        // reconcile_failures/arm_failures_. But it is also not yet resolved, so it
+        // must independently hold the generation below (never on acceptance alone).
+        // No path produces ReconcileOutcome::Accepted today (see its own doc) -
+        // GuardianSparkRuntime::attach_rule() still waits for its own claim before
+        // returning - so this branch and pending_arms below are exercised only once
+        // that wait is removed (pending_arms is always 0 as of this comment).
         if (outcome == ReconcileOutcome::Accepted)
             ++pending_arms;
         ++applied;
@@ -1682,8 +1684,9 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             // rung 9c PR-2 (structural step): attach_rule() still WAITS (bounded) for
             // its own claim's outcome, so `gen` is always already resolved here - this
             // always maps to Armed, never (yet) to ReconcileOutcome::Accepted. Once
-            // attach_rule's wait is removed (this PR's remaining, not-yet-attempted
-            // step), a successful-but-unresolved `gen` maps to Accepted instead.
+            // attach_rule gains a non-waiting entry point (staged as its own reviewed
+            // sequence of units), a successful-but-unresolved result maps to Accepted
+            // instead.
             auto gen = spark_runtime_->attach_rule(rule.rule_id(), std::move(*spec),
                                                    std::move(*assertion),
                                                    /*emit_compliant_edge=*/true);

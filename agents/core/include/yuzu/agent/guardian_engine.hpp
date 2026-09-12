@@ -567,21 +567,26 @@ private:
     /// silently treated as fully applied and the server never retries it) without
     /// also holding generation on routine/expected inert outcomes (#2233 item 3).
     ///
-    /// Accepted (rung 9c PR-2, structural step): the rule was eligible, a spark arm
-    /// ATTEMPT was dispatched and accepted, but has not yet resolved — as opposed to
-    /// Armed (resolved, successfully). Named after
+    /// Accepted (rung 9c PR-2): the rule was eligible and a spark arm attempt was
+    /// ACCEPTED — dispatched to the backend, OR queued behind an in-flight/retained
+    /// claim already occupying its key (R5.2's per-key claim/queue model: a queued
+    /// sibling is accepted without triggering its own backend submission) — but has
+    /// not yet resolved, as opposed to Armed (resolved, successfully). Named after
     /// docs/spark-stage2-guardian-consumer-design.md §R5.3's own vocabulary
     /// ("'Accepted' means reconcile_rule_locked() returned Accepted specifically —
-    /// the async-arm outcome, as opposed to Armed"). NOT YET PRODUCED by any code
-    /// path today: GuardianSparkRuntime::attach_rule() still waits (bounded) for its
-    /// own claim's outcome before returning, so every call here still resolves to
-    /// Armed or Failed before reconcile_rule_locked can return at all. This value
-    /// exists ahead of the behavior change that will produce it (attach_rule's own
-    /// non-waiting cutover, rung 9c PR-2's remaining, not-yet-attempted step) so
-    /// apply_rules' generation-hold gate already has the right shape to add it to
-    /// once it becomes reachable — apply_rules treats it exactly like an
-    /// unresolved episode (holds the generation), never like Failed (it is not a
-    /// failure) or like Armed (it is not yet resolved).
+    /// the async-arm outcome, as opposed to Armed").
+    ///
+    /// Production status as of this comment: NOT YET PRODUCED by any code path —
+    /// GuardianSparkRuntime::attach_rule() still waits (bounded) for its own claim's
+    /// outcome before returning, so every call here still resolves to Armed or
+    /// Failed before reconcile_rule_locked can return at all. Removing that wait is
+    /// staged as its own reviewed sequence of units (attach_rule gains a non-waiting
+    /// entry point alongside the existing blocking one; the two share dispatch,
+    /// commit, and cleanup) — this value was added FIRST, ahead of that behavior
+    /// change, so apply_rules' generation-hold gate already has the right shape to
+    /// receive it once a caller can actually produce it: apply_rules treats it
+    /// exactly like an unresolved episode (holds the generation), never like Failed
+    /// (it is not a failure) or like Armed (it is not yet resolved).
     enum class ReconcileOutcome { Armed, Accepted, Failed, Inert };
 
     /// THE reconcile op (rung 7): the SOLE per-rule arm/disarm decision point,

@@ -2675,24 +2675,35 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
 //
 // Tagged `[!shouldfail]` - Catch2's own mechanism for a checked-in, deliberately-red
 // assertion of not-yet-built behaviour (not this repo's prior practice; there is no
-// earlier precedent for this tag here, noted for reviewers). This is NOT a broken test
-// and NOT a false-green: Catch2 reports `[!shouldfail]` GREEN precisely because the body
-// fails (today, for the right reason - the REQUIRE below actually observes the parked
-// wait), and would report it RED the instant someone loosened the assertion back to
-// today's blocking contract without implementing the cutover, or once the cutover lands
-// and the body's REQUIREs all genuinely pass (Catch2 flags an unexpectedly-passing
-// `[!shouldfail]` case as a failure) - either way this is a live tripwire, not inert
-// documentation. Whoever implements the cutover should watch this test flip from
-// pass-via-failure to a real, unexpected pass, and then remove the tag, turning this into
-// an ordinary enforced regression test.
+// earlier precedent for this tag here, noted for reviewers). This is NOT a broken test:
+// Catch2 reports `[!shouldfail]` GREEN when the body fails (today, for the right reason -
+// see the deadline-margin note below) and RED when the body unexpectedly passes in full,
+// which is what makes it a live tripwire rather than inert documentation - NOT a stronger
+// guarantee than that. `[!shouldfail]` reports which TEST CASE failed, not which assertion
+// within it did or whether it failed for the intended reason (Astra opine review,
+// 2026-09-12) - a maintenance edit that broke this test for an unrelated reason would
+// also read as "failed as expected" here. Treat a green run of this case as "still red for
+// SOME reason", and re-run it with the tag stripped (or step through it) before trusting
+// that reason is the intended one. Whoever implements the cutover should watch this test
+// flip from pass-via-failure to a real, unexpected pass, and then remove the tag, turning
+// this into an ordinary enforced regression test.
 TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule resolves, "
           "and holds the policy generation until it does",
           "[spark][guardian][reconcile][!shouldfail]") {
-    // Shrink backend_op_deadline (production 5s) so a parked backend call costs this
-    // test tens of milliseconds instead of a real multi-second wait either way - whether
-    // today's blocking wait runs to completion, or the future cutover returns instantly.
+    // Shrink backend_op_deadline (production 5s), but keep a WIDE margin over the poll
+    // window below even after sanitizer scaling (Astra opine review, 2026-09-12: the
+    // original 300ms deadline / 60ms poll window was scheduling-sensitive, not
+    // deterministic - test_helpers.hpp's spin_until scales ITS OWN timeout by
+    // kSpinScale, 6x under TSan/ASan, but never scales this deadline, which is real
+    // wall-clock time enforced inside production code. A 60ms request becomes an
+    // effective 360ms wait under a sanitizer build - LARGER than the original 300ms
+    // deadline - so on those legs alone, today's genuinely-blocking code could complete
+    // and return within the scaled window purely from that scale factor, flipping this
+    // `[!shouldfail]` case to an unexpected, environment-dependent pass having proven
+    // nothing). 2000ms deadline / 100ms request (600ms scaled) keeps over 3x headroom
+    // either way.
     SparkReconcileFixture f{/*periodic_bound_ms=*/0,
-                            /*backend_op_deadline=*/std::chrono::milliseconds{300}};
+                            /*backend_op_deadline=*/std::chrono::milliseconds{2000}};
 
     gpb::GuaranteedStatePush p;
     p.set_full_sync(true);
@@ -2712,7 +2723,13 @@ TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule res
     });
     // cpp-safety Gate 3 shape (matching the #2818 test above): release the hang and join
     // on ANY exit path, so a failed REQUIRE between spawn and join can never unwind past
-    // a still-joinable std::thread.
+    // a still-joinable std::thread. A non-waiting `pusher.join()` below only proves the
+    // dispatch call itself returned, NOT that every detached runtime callback has
+    // finished (Astra opine review) - this test additionally spins on
+    // spark_armed_rule_count() before the fixture tears down, so by the time
+    // SparkReconcileFixture's destructor runs (engine.reset() then spark_engine.stop()),
+    // the one callback this test drives has already committed; it does not generalise to
+    // a test that returns without observing that.
     struct PusherGuard {
         FakeServiceMechanism* mech;
         std::thread* t;
@@ -2728,34 +2745,48 @@ TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule res
     // TARGET (rung 9c PR-2): apply_rules() must already have returned here, while the
     // backend call is still parked - it must not still be blocked inside attach_rule's
     // bounded wait. spin_until is liveness-only (never a bare sleep-based timing
-    // assertion, per its own doc) - the short 60ms bound (a fifth of the shrunk 300ms
-    // deadline) is what makes this fail TODAY (apply_rules is still blocked, having not
-    // yet reached anywhere near its own deadline) and pass once the wait is actually
-    // removed.
+    // assertion, per its own doc); the margin between this 100ms request (600ms worst-
+    // case scaled) and the 2000ms deadline above is what makes this fail TODAY for the
+    // intended reason (apply_rules is still blocked, having not reached anywhere near
+    // its own deadline) rather than by scheduling accident, and pass once the wait is
+    // actually removed.
     REQUIRE(yuzu::test::spin_until([&] { return dispatch_returned.load(std::memory_order_acquire); },
-                                   std::chrono::milliseconds{60}));
+                                   std::chrono::milliseconds{100}));
 
     // TARGET: the push was accepted (dispatch succeeded) but the rule's arm has not yet
     // resolved - the generation must NOT have advanced while it's still parked.
     CHECK(dr.exit_code == 0);
     CHECK(f.engine->policy_generation() == 0);
 
-    // Release the parked backend call: NOW the arm resolves. R5.3/R5.4 make
-    // acknowledgment TICK-DRIVEN (the heartbeat-bounded drain), not automatic on
-    // resolution - and an executor completion callback may never take mtx_ (the
-    // routed-concern chokepoint this file's own fixture exercises), so nothing
-    // advances the generation between release and the next
-    // journal_maintenance_tick(). Drive that tick explicitly rather than spin on
-    // wall-clock alone, or a genuine cutover bug (generation never advances at all)
-    // is indistinguishable from "just hasn't ticked yet" - the fixture's
-    // prefer_spark=true means the tick's own !prefer_spark_ early return doesn't
-    // apply here.
+    // Release the parked backend call: NOW the arm resolves.
     f.mechanism->release_hang();
+
+    // Prove the runtime's OWN commit is observable before asserting anything about the
+    // generation (Astra opine review, 2026-09-12) - spark_armed_rule_count() reflects
+    // commit_new_generation_locked()'s write, independent of any acknowledgment
+    // bookkeeping, so this synchronizes on "the arm actually resolved" without racing
+    // whatever advances (or wrongly fails to advance) the generation.
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+
+    // TARGET (R5.3/R5.4): acknowledgment is TICK-DRIVEN (the heartbeat-bounded drain),
+    // never automatic on resolution - and an executor completion callback may never
+    // take mtx_ (the routed-concern chokepoint this file's own fixture exercises), so
+    // the generation must still be UNCHANGED here, strictly BEFORE any tick runs.
+    // Without this assertion, an implementation that (wrongly) advances the generation
+    // directly from the completion callback - skipping the tick-driven drain R5.3/R5.4
+    // require - would also satisfy the tick-driven check below, since nothing yet
+    // distinguishes "advanced by the tick" from "already advanced before it".
+    CHECK(f.engine->policy_generation() == 0);
+
+    // NOW drive the tick explicitly (rather than spinning on wall-clock alone, which
+    // could not distinguish "hasn't ticked yet" from a genuine cutover bug where the
+    // generation never advances at all) and observe the acknowledgment it produces.
+    // The fixture's prefer_spark=true means the tick's own !prefer_spark_ early return
+    // doesn't apply here.
     REQUIRE(yuzu::test::spin_until([&] {
         f.engine->journal_maintenance_tick();
         return f.engine->policy_generation() == 1;
     }));
-    CHECK(f.engine->spark_armed_rule_count() == 1);
 
     pusher.join();
 }
