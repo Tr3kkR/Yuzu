@@ -485,6 +485,32 @@ contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
 the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. PR-B3 (Service) is in review as of 2026-09-11, closing this series - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
 
+**R5.2 as implemented (rung 9c PR-2 Unit 2/6).** `GuardianSparkRuntime` exposes the
+non-waiting counterpart directly: `attach_rule(NonWaiting{}, rule_id, spec, assertion,
+emit_compliant_edge)` returns `ArmOutcome{kind, generation, receipt}` -
+`kind == Armed` for exactly the synchronous outcomes the blocking overload already
+produced (an inline type, an already-committed shared watcher, or a claim observed
+already-terminal before this call returns), `kind == Accepted` for everything the
+blocking overload used to wait on via `wait_for_claim()`. Both overloads share
+`attach_core()`; the non-waiting one simply never calls `wait_for_claim()`. The
+deadline this section's "dispatched-operation timeout" bullet (3) describes is
+therefore no longer discovered by a blocked waiter's own timeout - nothing is
+blocked to notice it - but by `expire_overdue_claims()`, a registry-locked
+transition callable directly: it does exactly what `wait_for_claim()`'s timeout
+branch always did (`abandon_claim_locked()` every live Arm claim whose deadline has
+passed), just relocated out of a waiter, never removed. `GuardianEngine::
+reconcile_rule_locked()` is the production caller of the non-waiting overload as of
+Unit 6; `GuardianArmAckLedger::drain_locked()` (R5.3) is the production caller of
+`expire_overdue_claims()`, from `journal_maintenance_tick()`'s own heartbeat cadence.
+
+**Structural consequence, found during Unit 6's own regression-test design:**
+`attach_core()`'s only synchronous `Failed` return is the `stopping_` guard, and
+`GuardianEngine::stop()` holds `mtx_` across `spark_runtime_->begin_stop()` -
+`apply_rules()` can never observe it. Post-cutover, a genuine per-rule synchronous
+`ReconcileOutcome::Failed` for a File/Registry/Service rule is therefore
+unreachable outside engine shutdown; every real backend arm failure now surfaces
+only asynchronously, through the ledger's drain (R5.3 below).
+
 **R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
 stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
 "flag ≠ revoke" precedent for a similarly-named-but-distinct signal** (Periodic Access
@@ -559,6 +585,35 @@ per tick, matching the existing lifecycle-journal's 4-batch/1024-record shape, s
 large outstanding batch drains over several heartbeat ticks rather than risking a
 heartbeat-thread stall.
 
+**R5.3 as implemented (rung 9c PR-2 Unit 5/6).** `GuardianArmAckLedger` is the
+concrete per-application tracker this section's "apply_rules() tracks, per accepted
+rule, whether its arm has resolved" describes. `begin_application(generation,
+content_id, full_sync, applied)` opens ONE current application, never a history -
+a receipt from a superseded application resolving later is simply no longer in any
+ledger's pending set, safe by construction since an `ArmReceipt` is an OBSERVATION
+handle, never an owning one. `add_pending()` registers each `Accepted` rule's
+receipt. `drain_locked()` - called every `journal_maintenance_tick()`, bounded
+(`kAckDrainMaxPerTick`) - sweeps `expire_overdue_claims()` (R5.2) first, then
+resolves as many still-pending receipts as its bound allows via
+`GuardianSparkRuntime::receipt_status()`. `can_advance()` is what the
+generation-hold gate reads: true only with a current application, nothing pending,
+and nothing resolved to anything but Committed - and, deliberately, ALSO true for a
+current application with an empty pending set because every one of its rules
+resolved synchronously (Armed/Inert, nothing Accepted) - matching this document's
+own "an `Inert` outcome... satisfies the predicate immediately" language above,
+never the "zero-accepted push" vacuous-advance case this section separately warns
+against (that case is refused AT ADMISSION and never reaches the ledger as a
+receipt at all). `decide_retry(generation, content_id, full_sync, runtime)` is this
+section's own same-generation-retry suppression (the paragraph above, "is a no-op
+while every outstanding episode... is still genuinely pending"): it consults the
+runtime directly, not just its own resolved-failure count, since `drain_locked()`'s
+per-tick bound means a receipt past one call's cap can already be resolved without
+yet being retired from `pending`. `apply_rules()` calls `decide_retry()` before
+anything else, including its own full_sync teardown - REQUIRED, not an
+optimization: without it, every same-generation `full_sync` heartbeat retry while
+an episode is still genuinely pending would re-run the whole teardown+re-arm, and
+an arm slower than the 25 s retry interval would never converge.
+
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
 PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
@@ -606,6 +661,29 @@ failure is unchanged - but a SUBSEQUENT late success on a still-wanted rule does
 its "armed" record when it commits under ruling 14(b): expiry silences the failure, not
 the eventual success.
 
+**R5.4 as implemented (rung 9c PR-2 Unit 6).** `journal_maintenance_tick()` is the
+one heartbeat-cadence caller for BOTH (2) and (3) above - EXTENDED, not a second
+method, since both were already "periodic maintenance under `mtx_`,
+`prefer_spark_`-gated, firewalled." It runs its own persist step (3) BEFORE the
+ledger's drain step (2) - an arbitrary, harmless ordering as far as either step's
+OWN result is concerned (neither reads the other's) - but it has one consequence
+for durability timing that this section's "three timings, not one" principle
+already permits and should not be mistaken for a bug: staging (1) lands on the
+detached worker's own schedule, independent of the tick loop, including possibly
+exactly between one tick's persist (3) and its drain (2) - so the very tick whose
+drain step FIRST observes a receipt as Committed may already have run ITS OWN
+persist attempt against a `pending_journal_` that still predated the staging.
+Durable persistence of that record is therefore not guaranteed within the SAME
+tick that resolves the ack - only within the next one, on the engine's existing
+cadence, exactly as this section already promises. No data is ever lost (each
+tick's persist re-snapshots `pending_journal_` fresh, and `persist()` erases only
+what it durably wrote), only delayed by up to one additional tick beyond
+ack-observation - a delay this section's own multi-tick tolerance for a large
+outstanding batch already covers, and one the test suite accounts for directly
+(`SparkReconcileFixture::apply()`'s settle loop runs one extra
+`journal_maintenance_tick()` after observing ack settlement, specifically for this
+reason).
+
 **R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
 in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
 backend call can no longer delay agent shutdown the way it can today. In-flight workers
@@ -621,7 +699,16 @@ destroyed in the trampoline (the latest self-observable point before OS-thread e
 uncounted tail after it and why no grace covers it are stated in R5.1), never the
 early-releasing quota count, so a worker that has returned from `fn()` and is still
 inside its completion callback holds the process open exactly as a worker still inside
-the OS call does.
+the OS call does. `GuardianEngine::stop()` also retires the ack ledger (Unit 6,
+`GuardianArmAckLedger::retire()`) - belt-and-suspenders, since `journal_maintenance_
+tick()` already no-ops after `stopped_`, but it also stops watching receipts whose
+claims `begin_stop()` is tearing down; `start_local()` opens a defensive application
+at the already-loaded `policy_generation_` before its own boot re-arm walk, so a
+receipt accepted during that walk is tracked too - not exercised by
+`SparkReconcileFixture` (`test_guardian_engine_spark_reconcile.cpp`), which wires
+`start_local()` BEFORE `wire_spark_engine()` (the reverse of production's
+`agent.cpp` order), so `spark_availability_` is still `Unwired` during its boot
+walk and the walk never reaches the spark path at all in that fixture.
 
 **R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,

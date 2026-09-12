@@ -979,7 +979,8 @@ public:
     /// return Armed"). On an unresolved claim it hands ownership to claims_/the
     /// completion callback - never marking it waiter_abandoned, since Accepted means
     /// the operation is still wanted, not abandoned - and returns Accepted(receipt)
-    /// immediately, without waiting. Nothing in production calls this yet (Unit 6).
+    /// immediately, without waiting. GuardianEngine::reconcile_rule_locked() is the
+    /// production caller as of Unit 6.
     std::expected<ArmOutcome, std::string> attach_rule(NonWaiting, std::string rule_id,
                                                        SparkSpec spec, RuleAssertion assertion,
                                                        bool emit_compliant_edge);
@@ -995,9 +996,10 @@ public:
     /// disarms through submit() too, which has no deadline concept at all - see
     /// redrive_retained_disarms() for the disarm-side maintenance pass instead.
     /// Idempotent: a claim already terminal or already waiter_abandoned is
-    /// skipped. A future heartbeat tick (Unit 5) is its production caller; exposed
-    /// standalone here so a test can drive it directly. Returns the number of
-    /// claims this call expired.
+    /// skipped. GuardianArmAckLedger::drain_locked() (Unit 5/6) is the production
+    /// caller, from GuardianEngine::journal_maintenance_tick()'s own heartbeat
+    /// cadence; exposed standalone here so a test can drive it directly. Returns
+    /// the number of claims this call expired.
     std::size_t expire_overdue_claims();
 
     /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
