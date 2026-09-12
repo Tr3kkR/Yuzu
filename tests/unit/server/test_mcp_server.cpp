@@ -20536,6 +20536,33 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         REQUIRE(res);
         CHECK(res->status == 403);
     }
+
+    SECTION("create_result_set_from_inventory_query: a non-object condition element is refused "
+            "with kInvalidParams, never an uncaught nlohmann::json::type_error (#2146 Batch B2 "
+            "review Gate 3 fix - .value(key, default) throws on a type mismatch, it does not "
+            "coerce, and MCP input-schema validation is approval-gated only)") {
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":["not-an-object"]}}})");
+        REQUIRE(res);
+        CHECK(res->status == 200); // JSON-RPC error is still a 200 transport response
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+
+    SECTION("create_result_set_from_inventory_query: a condition field with the wrong JSON type "
+            "(e.g. a number instead of a string) is treated as absent, never an uncaught "
+            "nlohmann::json::type_error") {
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":123}]}}})");
+        REQUIRE(res);
+        // Reaches the store-unavailable branch in this fixture (no InventoryStore wired) rather
+        // than crashing - proves the type-mismatched "value" field was safely defaulted, not
+        // thrown on, before the store call.
+        CHECK(res->status != 500);
+    }
 }
 
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "

@@ -9254,8 +9254,28 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "create_result_set_from_inventory_query") {
-                if (!perm_fn(req, res, "Inventory", "Read"))
+                // Gate 2 BLOCKING fix (#2146 Batch B2 review): this tool evaluates
+                // an expression over EVERY agent's inventory records and
+                // materializes matching agent_ids into a result set the caller
+                // owns and can read back — a fan-out read of per-agent data that
+                // MUST use the admit-then-filter fleet-read chokepoint, never a
+                // bare `perm_fn` (routed-concerns.md's authorize_list_read row).
+                // The old bare `perm_fn(req, res, "Inventory", "Read")` let a
+                // management-group-confined caller (real but narrower
+                // Inventory:Read grant) enumerate fleet-wide device-identity +
+                // inventory-attribute correlation. Same fix shape as
+                // preview_scope_targets above; REST's twin needs the identical
+                // fix (tracked together, not two separate defects).
+                if (!fleet_read_fn_) {
+                    spdlog::error("create_result_set_from_inventory_query: fleet_read_fn_ "
+                                  "unwired — misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
                 if (!result_set_store_) {
                     res.set_content(a4_error(kInternalError, "result-set store unavailable"),
                                     "application/json");
@@ -9272,12 +9292,30 @@ McpServer::HandlerFn McpServer::build_handler(
                 yuzu::server::InventoryEvalRequest eval_req;
                 eval_req.combine = param_str(args, "combine", "all");
                 if (args.contains("conditions") && args["conditions"].is_array()) {
+                    // Gate 3 BLOCKING fix (#2146 Batch B2 review): `.value(key, default)`
+                    // throws nlohmann::json::type_error on a type mismatch - it does not
+                    // coerce. MCP input-schema validation is approval-gated only, so a
+                    // non-object element or a non-string field reaches this loop directly
+                    // from any caller and previously fell through to an uncaught exception
+                    // (bare empty-body 500, no A4/JSON-RPC envelope). Validate explicitly.
                     for (const auto& c : args["conditions"]) {
+                        if (!c.is_object()) {
+                            res.set_content(
+                                error_response(id, kInvalidParams,
+                                               "each condition must be a JSON object"),
+                                "application/json");
+                            return;
+                        }
+                        auto field_str = [&c](const char* key) -> std::string {
+                            return (c.contains(key) && c[key].is_string())
+                                       ? c[key].get<std::string>()
+                                       : "";
+                        };
                         yuzu::server::InventoryCondition cond;
-                        cond.plugin = c.value("plugin", "");
-                        cond.field = c.value("field", "");
-                        cond.op = c.value("op", "");
-                        cond.value = c.value("value", "");
+                        cond.plugin = field_str("plugin");
+                        cond.field = field_str("field");
+                        cond.op = field_str("op");
+                        cond.value = field_str("value");
                         eval_req.conditions.push_back(std::move(cond));
                     }
                 }
@@ -9360,10 +9398,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Narrow to the caller's admitted scope BEFORE evaluation - gate.scope
+                // is the sole filter, mirroring preview_scope_targets' own fix above.
                 std::vector<std::pair<std::string, std::string>> records;
                 records.reserve(records_raw->size());
-                for (const auto& r : *records_raw)
+                for (const auto& r : *records_raw) {
+                    if (!authz::in_scope(gate.scope, r.agent_id))
+                        continue;
                     records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                }
                 auto results = yuzu::server::evaluate_inventory(eval_req, records);
                 std::unordered_set<std::string> seen;
                 std::vector<std::string> members;

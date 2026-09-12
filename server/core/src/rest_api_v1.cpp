@@ -9147,27 +9147,27 @@ void RestApiV1::register_routes(
         // agent that matched. When parent_id is given, the candidate set is
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
-                  [auth_fn, perm_fn, audit_fn, result_set_store, inventory_store,
+                  [auth_fn, fleet_read_fn, audit_fn, result_set_store, inventory_store,
                    metrics_registry, rs_to_json, rs_err,
                    load_owned](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
                       // SECURITY (CWE-862, missing authorization) — guardian-
-                      // confinement-2298 PR3 §3e residual sweep finding. This
-                      // producer is a SYNCHRONOUS READ (queries inventory_store
-                      // directly, no command dispatch), not one of the three
-                      // DISPATCH producers the e7b47ca3/#2500 fix already gated
-                      // just below (from-tar-query, from-instruction-result,
-                      // re-eval) — it was never covered by that fix and has been
-                      // reachable by ANY authenticated session (service-scoped or
-                      // not) with no authorization check at all: up to 5000
-                      // fleet-wide inventory records queried and evaluated with
-                      // zero scoping. Gated on Inventory:Read (the same
-                      // securable/operation GET /api/v1/inventory/software uses
-                      // for the identical data class), not Execution:Execute —
-                      // there is no dispatch here to authorize.
-                      if (!perm_fn(req, res, "Inventory", "Read"))
+                      // confinement-2298 PR3 §3e residual sweep finding, upgraded
+                      // (#2146 Batch B2 review): the prior fix gated this synchronous
+                      // fan-out READ on a bare `perm_fn(Inventory, Read)`, closing the
+                      // "reachable with no check at all" gap but leaving a
+                      // management-group-confined caller (or any Inventory:Read
+                      // holder narrower than the whole fleet) able to enumerate
+                      // fleet-wide device-identity + inventory-attribute correlation.
+                      // `fleet_read_fn` REPLACES the permission check (it already
+                      // performs the RBAC check internally) and narrows the candidate
+                      // records to `gate.scope` below — same pattern as
+                      // GET /api/v1/inventory/software and this PR's own
+                      // preview_scope_targets/scope-preview fix.
+                      auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+                      if (!gate.admitted)
                           return;
                       const auto audit_failure = [&](std::string_view reason) {
                           bool ok = true;
@@ -9191,12 +9191,25 @@ void RestApiV1::register_routes(
                       InventoryEvalRequest eval_req;
                       eval_req.combine = body.value("combine", "all");
                       if (body.contains("conditions") && body["conditions"].is_array()) {
+                          // Gate 3 BLOCKING fix (#2146 Batch B2 review): `.value(key, default)`
+                          // throws nlohmann::json::type_error on a type mismatch - it does not
+                          // coerce. A non-object element or a non-string field previously fell
+                          // through to an uncaught exception. Validate explicitly.
                           for (const auto& c : body["conditions"]) {
+                              if (!c.is_object()) {
+                                  rs_err(res, 400, "each condition must be a JSON object");
+                                  return;
+                              }
+                              auto field_str = [&c](const char* key) -> std::string {
+                                  return (c.contains(key) && c[key].is_string())
+                                             ? c[key].get<std::string>()
+                                             : "";
+                              };
                               InventoryCondition cond;
-                              cond.plugin = c.value("plugin", "");
-                              cond.field = c.value("field", "");
-                              cond.op = c.value("op", "");
-                              cond.value = c.value("value", "");
+                              cond.plugin = field_str("plugin");
+                              cond.field = field_str("field");
+                              cond.op = field_str("op");
+                              cond.value = field_str("value");
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -9289,10 +9302,15 @@ void RestApiV1::register_routes(
                                  "materialise a partial result set");
                           return;
                       }
+                      // Narrow to the caller's admitted scope BEFORE evaluation -
+                      // gate.scope is the sole filter (see the SECURITY comment above).
                       std::vector<std::pair<std::string, std::string>> records;
                       records.reserve(records_raw->size());
-                      for (const auto& r : *records_raw)
+                      for (const auto& r : *records_raw) {
+                          if (!authz::in_scope(gate.scope, r.agent_id))
+                              continue;
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                      }
 
                       auto results = evaluate_inventory(eval_req, records);
                       std::unordered_set<std::string> seen;
