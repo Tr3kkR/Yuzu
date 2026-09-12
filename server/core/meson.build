@@ -404,6 +404,7 @@ yuzu_server_core_lib = static_library(
     'src/tag_store.cpp',
     'src/tag_routes.cpp',
     'src/scope_engine.cpp',
+    'src/scope_preview.cpp', # #2146 Batch B2: shared REST v1 + MCP scope-preview builder
     'src/yaml_scan.cpp',
     'src/scope_yaml.cpp',
     'src/analytics_event_store.cpp',
@@ -462,6 +463,7 @@ yuzu_server_core_lib = static_library(
     'src/result_set_store.cpp',
     'src/result_set_routes.cpp',
     'src/result_set_matcher.cpp',
+    'src/result_set_model.cpp', # #2146 Batch B2: shared REST v1 + MCP builder
     'src/policy_store.cpp',
     'src/policy_evaluator.cpp',
     'src/guaranteed_state_store.cpp',

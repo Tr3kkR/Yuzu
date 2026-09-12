@@ -49,6 +49,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -108,6 +109,11 @@ class ProductPackStore;
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
 class DashboardRoutes;
+// #2146 Batch B2 — backs the 12 result-set MCP twins (scope-walking,
+// docs/scope-walking-design.md). Forward-declared (pointer-only in
+// build_handler/register_routes); the .cpp includes result_set_store.hpp for
+// the full definition.
+class ResultSetStore;
 }
 
 namespace yuzu::server::detail {
@@ -481,6 +487,18 @@ public:
     /// `set_plugin_config_store` above. Unset (`nullptr`, the default) ⇒
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
+
+    /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
+    /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
+    /// Same setter idiom as `set_preflight_run_store` above. Unset
+    /// (`nullptr`, the default) ⇒ every result-set tool answers
+    /// "unavailable" rather than crashing. Owner-scoped, not RBAC-gated
+    /// (matches the REST twins' `deny_fleet_wide_service_scoped`-only
+    /// posture — `ResultSet` is not a seeded RBAC securable, see
+    /// `rest_api_v1.cpp`'s result-set routes doc comment) — the three
+    /// dispatch-producer tools are the exception, gated on
+    /// `Execution:Execute` exactly like their REST twins.
+    void set_result_set_store(ResultSetStore* store) { result_set_store_ = store; }
 
     /// #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
@@ -923,6 +941,8 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    // #2146 Batch B2 — see set_result_set_store above.
+    ResultSetStore* result_set_store_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};

@@ -17,7 +17,9 @@
 #include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
+#include "scope_preview.hpp" // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
+#include "inventory_eval.hpp" // #2146 Batch B2: InventoryEvalRequest/evaluate_inventory (create_result_set_from_inventory_query)
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
@@ -30,6 +32,7 @@
 #include "openapi_spec_access.hpp"      // openapi_spec_json() (discover_routes tool)
 #include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
@@ -718,6 +721,140 @@ static const ToolDef kTools[] = {
      "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\".",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
+
+    // ── Result Sets (#2146 Batch B2) — scope-walking primitive: a named,
+    // TTL-bounded, lineage-tracked set of device ids produced by a query,
+    // action result, or manual curation (docs/scope-walking-design.md). REST
+    // v1 had a full 12-operation API with zero MCP tools before this batch.
+    // Every tool below shares the SAME `ResultSet` row shape (id/name/
+    // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
+    // source_kind/status/source_execution_id/device_count) as its REST v1
+    // twin — both surfaces call the SAME result_set_json() builder
+    // (result_set_model.hpp), so the shape cannot drift.
+
+    {"list_result_sets",
+     "List the caller's own result sets (scope-walking artifacts). Owner-scoped: only sets "
+     "owned by the calling principal are returned. REST v1 twin: GET /api/v1/result-sets. "
+     "Service-scoped API tokens are denied outright — owner-scoping keys on the minting "
+     "principal's username, which a sibling service token of the same minter would otherwise "
+     "share.",
+     R"j({"type":"object","properties":{"cursor":{"type":"string","description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
+     R"j({"type":"object","properties":{"result_sets":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
+
+    {"create_result_set",
+     "Create a result set directly from pre-computed device ids. Synchronous — lands "
+     "materialized immediately (e.g. \"I have a CSV of device ids\"), unlike the "
+     "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
+     "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
+     "Service-scoped API tokens are denied outright.",
+     R"j({"type":"object","properties":{"name":{"type":"string"},"source_kind":{"type":"string","default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string"},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"create_result_set_from_inventory_query",
+     "Create an owner-scoped result set from a SYNCHRONOUS inventory query — evaluates "
+     "conditions against every agent's stored inventory server-side; membership is every "
+     "match, optionally narrowed to an owned parent set's CURRENT members. Requires "
+     "Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same "
+     "securable as query_installed_software). REST v1 twin: POST "
+     "/api/v1/result-sets/from-inventory-query.",
+     R"j({"type":"object","properties":{"name":{"type":"string"},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"field":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}}}},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"create_result_set_from_tar_query",
+     "Create a result set by DISPATCHING a read-only TAR SQL query to the fleet. ASYNC: "
+     "returns immediately with status=\"pending\" — poll get_result_set by the returned id, "
+     "or subscribe to /api/v1/events on source_execution_id, until status flips to "
+     "\"materialized\" (or \"failed\"). Requires Execution:Execute, confined to the caller's "
+     "derived visible device set — the ONLY per-device authorization on this dispatch "
+     "surface (not defense-in-depth). SQL is sandboxed AGENT-side by a read-only authorizer; "
+     "the server only length-checks (max 100000 bytes). Membership is every agent that "
+     "returned >=1 row (include_empty=true widens to every responder). Dispatches to "
+     "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
+     "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
+     "nothing is refused (400), never silently widened. REST v1 twin: POST "
+     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or error — it "
+     "dispatches a real command to the fleet; poll instead.",
+     R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string"}},"required":["sql"]})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"create_result_set_from_instruction_result",
+     "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
+     "ASYNC — same pending->materialize contract as create_result_set_from_tar_query: poll "
+     "get_result_set by id, or subscribe to /api/v1/events on source_execution_id. Requires "
+     "Execution:Execute, confined to the caller's derived visible device set — the ONLY "
+     "per-device authorization on this dispatch surface. Membership is the responders whose "
+     "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
+     "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
+     "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
+     "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
+     "or discover_instructions — do not guess. REST v1 twin: POST "
+     "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
+     "error — it dispatches a real command to the fleet; poll instead.",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1},"params":{"type":"object","additionalProperties":{"type":"string"},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string"},"name":{"type":"string"}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"reevaluate_result_set",
+     "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
+     "parent_id as the original, NOT a child of it) — a fresh snapshot of a tar_query or "
+     "instruction_result set's original question against today's fleet. Requires "
+     "Execution:Execute (re-dispatches to the fleet, ASYNC, same pending->materialize "
+     "contract as the create_result_set_from_* producers) — confined to the caller's derived "
+     "visible device set. A manual_curate or inventory_query source set returns an error "
+     "(re-eval of those source kinds is not yet supported; sync sources are a tracked "
+     "follow-up). REST v1 twin: POST /api/v1/result-sets/{id}/re-eval. NEVER re-send this "
+     "call on a timeout or error.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"The result set to re-evaluate"}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"get_result_set",
+     "Get one result set's metadata by id. Owner-scoped — a non-owner gets the same "
+     "not-found error as a nonexistent id (existence-oracle-safe). REST v1 twin: GET "
+     "/api/v1/result-sets/{id}.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"get_result_set_members",
+     "List a result set's member device ids. Owner-scoped. REST v1 twin: GET "
+     "/api/v1/result-sets/{id}/members.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["id"]})",
+     R"j({"type":"object","properties":{"device_ids":{"type":"array","items":{"type":"string"}},"next_cursor":{"type":"string"}},"required":["device_ids","next_cursor"]})j"},
+
+    {"get_result_set_lineage",
+     "Walk a result set's parent chain, root to self — reconstructs the narrowing steps "
+     "(query -> refine -> refine) that produced it. Owner-scoped; the walk stops at the "
+     "first ancestor not owned by the caller, so a child parented onto another operator's "
+     "set cannot leak that set's metadata. REST v1 twin: GET /api/v1/result-sets/{id}/lineage.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{"chain":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"source_kind":{"type":"string"},"device_count":{"type":"integer"}},"required":["id","name","source_kind","device_count"]}}},"required":["chain"]})j"},
+
+    {"pin_result_set",
+     "Pin a result set, exempting it from TTL expiry. Idempotent — pinning an already-pinned "
+     "set is a no-op success, same end state. Owner-scoped; capped at 50 pinned sets per "
+     "owner. REST v1 twin: POST /api/v1/result-sets/{id}/pin.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"unpin_result_set",
+     "Unpin a result set, restoring its normal TTL. Idempotent — unpinning an already-unpinned "
+     "set is a no-op success. Owner-scoped. REST v1 twin: POST /api/v1/result-sets/{id}/unpin.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"delete_result_set",
+     "Delete a result set. Owner-scoped. A pinned set must be unpinned first. REST v1 twin: "
+     "DELETE /api/v1/result-sets/{id}.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{"deleted":{"type":"boolean"}},"required":["deleted"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
@@ -2281,6 +2418,18 @@ static const char* const kWriteToolsRaw[] = {
     // gate; the tool performs no mutation, but the write set is keyed on the
     // RBAC operation, not on whether a handler mutates state.
     "preview_management_group_agent_count",
+    // #2146 Batch B2 — result-set mutations/dispatches (non-Read operation):
+    // create_result_set (Write), create_result_set_from_inventory_query
+    // (Write — see its kToolSecurity row comment for why this is "Write"
+    // despite the handler's real RBAC gate being Inventory:Read), the three
+    // dispatch producers (Execute), pin/unpin (Write), delete (Delete).
+    // list_result_sets/get_result_set*'s exclusion above is because THEIR
+    // operation is "Read"; operation is the ONLY thing that decides
+    // membership here, not whether a handler mutates state.
+    "create_result_set", "create_result_set_from_inventory_query",
+    "create_result_set_from_tar_query",
+    "create_result_set_from_instruction_result", "reevaluate_result_set",
+    "pin_result_set", "unpin_result_set", "delete_result_set",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -2427,6 +2576,55 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_workflow_execution", {"Workflow", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
+    // #2146 Batch B2 -- result-set tools. `ResultSet` is NOT a seeded RBAC
+    // securable (rest_api_v1.cpp's result-set routes doc comment): every
+    // REST twin except the 3 dispatch producers + from-inventory-query gates
+    // on auth-only + ownership, no perm_fn call at all. These 8 use the
+    // generic-only "Infrastructure" Read/Write/Delete pair SOLELY to drive
+    // the C8 tier gate (block mutation at readonly tier) -- no perm_fn call
+    // backs them either, matching the REST twins exactly (see each tool's
+    // handler). `denied` (the default 2-element form, NOT confined):
+    // owner-scoping by session->username is not a service-scope confinement
+    // mechanism (same reasoning as list_preflight_runs above) -- a service-
+    // scoped token is refused outright by the generic C8 gate, matching the
+    // REST twins' own deny_fleet_wide_service_scoped call.
+    {"list_result_sets", {"Infrastructure", "Read"}},
+    {"create_result_set", {"Infrastructure", "Write"}},
+    // from-inventory-query is a SYNCHRONOUS read (queries InventoryStore, no
+    // dispatch) gated on a REAL perm_fn(Inventory, Read) call, matching its
+    // REST twin exactly -- not `confined` (the REST twin applies no per-
+    // device/service-tag scoping either, per its own governance-flagged
+    // comment; matching REST bug-for-bug here would be a false `confined`
+    // claim, so this stays the default `denied`). The kToolSecurity
+    // OPERATION here is deliberately "Write", NOT "Read", even though the
+    // real RBAC gate the handler calls is Inventory:Read -- these are two
+    // independent things (kToolSecurity's operation feeds tier_allows/
+    // requires_approval/readOnlyHint-coherence; the handler's own perm_fn
+    // call is the actual RBAC enforcement, matching REST exactly regardless
+    // of this row). The tool CREATES a persisted result-set row -- a real
+    // side effect -- so `operation:"Read"` would force readOnlyHint:true via
+    // the 2g PR2 mechanical coherence test (test_mcp_server.cpp), which is
+    // exactly the false safe-direction hint A5 blocks on. "Write" also
+    // correctly excludes readonly-tier MCP tokens from this tool via
+    // tier_allows, which "Read" would not have.
+    {"create_result_set_from_inventory_query", {"Inventory", "Write"}},
+    // The three dispatch producers: `confined` -- a REAL per-device mechanism
+    // (the caller's derived exec_visible, threaded into dispatch_fn exactly
+    // like execute_instruction), matching their REST twins' perm_fn(
+    // Execution, Execute) gate + exec_visible_fn confinement exactly. This
+    // is the #1788/ADR-0017 confinement class -- get it right: the derived
+    // VisibleSet is the ONLY per-device authorization on this surface, not
+    // defense-in-depth.
+    {"create_result_set_from_tar_query", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"create_result_set_from_instruction_result",
+     {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"reevaluate_result_set", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"get_result_set", {"Infrastructure", "Read"}},
+    {"get_result_set_members", {"Infrastructure", "Read"}},
+    {"get_result_set_lineage", {"Infrastructure", "Read"}},
+    {"pin_result_set", {"Infrastructure", "Write"}},
+    {"unpin_result_set", {"Infrastructure", "Write"}},
+    {"delete_result_set", {"Infrastructure", "Delete"}},
     {"list_pending_approvals", {"Approval", "Read"}},
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
@@ -3009,6 +3207,38 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_workflow_execution", {ToolEffect::ReadOnly, true, "Get workflow execution"}},
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
+    // #2146 Batch B2 -- result-set tools. The mechanical rule (readOnlyHint
+    // == operation=="Read") makes list/get/members/lineage ReadOnly. The
+    // three dispatch producers + reevaluate are Destructive, same posture as
+    // execute_instruction/execute_bundle/quarantine_device above -- an
+    // arbitrary dispatched plugin.action (or an existing InstructionDefinition
+    // resolved at call time) cannot be proven non-destructive statically, so
+    // this table's own "when in doubt, the stronger hint" rule applies; NOT
+    // idempotent (each call creates a genuinely new pending set + dispatches
+    // a real command -- re-sending is explicitly warned against in each
+    // tool's own description). create_result_set/create_result_set_from_
+    // inventory_query create a new distinct resource each call (Additive,
+    // not idempotent). pin/unpin are Additive + idempotent (the store
+    // documents pin as an explicit no-op on an already-pinned row; unpin's
+    // unconditional UPDATE is equally idempotent). delete_result_set is
+    // Destructive + NOT idempotent (matches revoke_upload_grant's identical
+    // shape above -- a second call 404s rather than repeating the same
+    // success).
+    {"list_result_sets", {ToolEffect::ReadOnly, true, "List result sets"}},
+    {"create_result_set", {ToolEffect::Additive, false, "Create result set"}},
+    {"create_result_set_from_inventory_query",
+     {ToolEffect::Additive, false, "Create result set from inventory query"}},
+    {"create_result_set_from_tar_query",
+     {ToolEffect::Destructive, false, "Create result set from TAR query"}},
+    {"create_result_set_from_instruction_result",
+     {ToolEffect::Destructive, false, "Create result set from instruction result"}},
+    {"reevaluate_result_set", {ToolEffect::Destructive, false, "Re-evaluate result set"}},
+    {"get_result_set", {ToolEffect::ReadOnly, true, "Get result set"}},
+    {"get_result_set_members", {ToolEffect::ReadOnly, true, "Get result set members"}},
+    {"get_result_set_lineage", {ToolEffect::ReadOnly, true, "Get result set lineage"}},
+    {"pin_result_set", {ToolEffect::Additive, true, "Pin result set"}},
+    {"unpin_result_set", {ToolEffect::Additive, true, "Unpin result set"}},
+    {"delete_result_set", {ToolEffect::Destructive, false, "Delete result set"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
@@ -4920,6 +5150,48 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, action, "denied", target_type, target_id, audit_detail);
                 res.set_content(a4_error(kPermissionDenied, message), "application/json");
                 return true;
+            };
+
+            // #2146 Batch B2 — shared across the 12 result-set MCP tools.
+            //
+            // `rs_load_owned`: owner-scoped result-set fetch, matching
+            // rest_api_v1.cpp's `load_owned` exactly — a DbError on this
+            // ownership-check read is TYPE-DISTINGUISHABLE from a genuine
+            // not-found/not-owned row (ADR-0036 fail-closed contract): the
+            // former retries as a store fault, the latter is a permanent
+            // "not found" (existence-oracle-safe — a non-owner gets the
+            // identical response as a nonexistent id). Writes the response
+            // and returns nullopt on either failure; the caller just checks
+            // `if (!row) return;`.
+            auto rs_load_owned = [&](const std::string& rs_id) -> std::optional<ResultSet> {
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                auto row_result = result_set_store_->get(rs_id);
+                if (!row_result) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_STORE_UNAVAILABLE: could not verify result-set "
+                                 "ownership",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return std::nullopt;
+                }
+                const std::optional<ResultSet>& row = *row_result;
+                if (!row || row->owner_principal != session->username) {
+                    mcp_audit("denied", "id=" + rs_id + " reason=not found or not owned");
+                    // retry-hint-exempt: not found/not owned, a permanent
+                    // outcome — existence-oracle-safe (matches REST's 404).
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_NOT_FOUND: result set not found"),
+                        "application/json");
+                    return std::nullopt;
+                }
+                return row;
             };
 
             // #3289 — MCP twin of the REST/legacy tag-mutation TOCTOU guard.
@@ -8570,87 +8842,897 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Validate first
-                auto valid = yuzu::scope::validate(expression);
-                if (!valid) {
+                // #2146 Batch B2: delegates to the shared preview_scope_targets()
+                // builder (scope_preview.hpp) so this tool and its new REST v1
+                // twin (POST /api/v1/scope/preview) cannot silently diverge in
+                // which agents match (api-twin-recipe.md Rule 1).
+                auto outcome =
+                    yuzu::server::preview_scope_targets(expression, get_agents(), tag_store);
+                switch (outcome.kind) {
+                case yuzu::server::ScopePreviewOutcome::Kind::kInvalidExpression:
+                    res.set_content(error_response(id, kInvalidParams, outcome.detail),
+                                    "application/json");
+                    return;
+                case yuzu::server::ScopePreviewOutcome::Kind::kTagStoreDegraded:
+                    // Target = the expression being previewed — every sibling
+                    // failure audit here carries a target (governance cons-F2).
+                    mcp_audit("failure", expression);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
+                case yuzu::server::ScopePreviewOutcome::Kind::kOk:
+                    mcp_audit("success", expression);
                     res.set_content(
-                        error_response(id, kInvalidParams, "Invalid scope: " + valid.error()),
+                        success_response(
+                            id, tool_result(outcome.payload.dump(), kObjectOutputSchema)),
                         "application/json");
                     return;
                 }
-                // Parse the expression into an AST
-                auto parsed_expr = yuzu::scope::parse(expression);
-                if (!parsed_expr) {
+                return;
+            }
+
+            // ── Result Sets (#2146 Batch B2) ──────────────────────────────
+            //
+            // Shared local helpers, used by the tool blocks below.
+            //
+            // `rs_resolve_owned_parent`: MCP twin of rest_api_v1.cpp's
+            // `resolve_owned_parent` — used ONLY by the 3 async dispatch
+            // producers (matching REST exactly: the synchronous creators
+            // below use `rs_load_owned` directly on a canonical id, no alias
+            // resolution). Resolves a per-operator alias OR a canonical
+            // "rs_"-prefixed id to a canonical id this session owns.
+            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<std::string> {
+                std::string rs_id = raw;
+                if (!raw.starts_with("rs_")) {
+                    auto canon = result_set_store_->resolve_alias(session->username, raw);
+                    if (!canon) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: could not resolve alias",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return std::nullopt;
+                    }
+                    if (*canon)
+                        rs_id = **canon;
+                    // else: rs_id stays = raw; rs_load_owned() below 404s on the miss.
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return std::nullopt;
+                return rs_id;
+            };
+
+            // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
+            // shared dispatch engine for the 3 async result-set producers
+            // (create_result_set_from_tar_query, create_result_set_from_
+            // instruction_result, reevaluate_result_set). `args_for_parent` is
+            // read ONLY for `parent_id` (everything else is passed explicitly
+            // so reevaluate_result_set can synthesise it) — mirrors REST's
+            // `run_async(..., body, name)` shape exactly, including the
+            // #2500-class parent_id type/emptiness guard. `perm_fn(Execution,
+            // Execute)` is the CALLER's job (checked before this runs); this
+            // closure's exec_visible derivation is the ONLY per-device
+            // authorization here — #1788, the primary gate, not
+            // defense-in-depth.
+            auto rs_run_async = [&](const std::string& plugin, const std::string& action,
+                                    const std::unordered_map<std::string, std::string>& params,
+                                    std::string_view src_kind, const std::string& source_payload,
+                                    const std::string& matcher,
+                                    const nlohmann::json& args_for_parent,
+                                    const std::string& name) {
+                if (!result_set_store_ || !execution_tracker) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "Parse error: " + parsed_expr.error()),
+                        a4_error(kInternalError,
+                                 "RESULT_SET_DISPATCH_UNAVAILABLE: result-set store or execution "
+                                 "tracker not wired"),
                         "application/json");
                     return;
                 }
-                // Preload every tag:<key> the expression references in ONE
-                // bulk query before the agent loop (ADR-0050 — the
-                // pre-migration version called get_tag_map per agent, N
-                // network round-trips per preview against the Postgres
-                // substrate). Degrade fails the whole tool call: this tool
-                // PREVIEWS dispatch targeting, and a silently-tagless
-                // preview under/over-states the cohort exactly like a
-                // collapsed scope read (#2500 family).
-                std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
-                    preview_tags;
-                {
-                    std::vector<std::string> tag_keys;
-                    yuzu::scope::collect_attribute_suffixes(*parsed_expr, "tag:", tag_keys);
-                    if (!tag_keys.empty() && tag_store) {
-                        auto preload = tag_store->get_values_for_keys(tag_keys);
-                        if (!preload) {
-                            // Target = the expression being previewed — every
-                            // sibling failure audit here carries a target
-                            // (governance cons-F2).
-                            mcp_audit("failure", expression);
+                if (!dispatch_fn) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                auto caller = caller_fn
+                                  ? caller_fn(*session)
+                                  : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                caller.approval_provenance = approval_ticket_just_consumed
+                                                 ? yuzu::server::ApprovalProvenance::Ticket
+                                                 : yuzu::server::ApprovalProvenance::None;
+
+                // Same rule as REST's run_async: OMIT parent_id to broadcast
+                // deliberately. A SUPPLIED parent_id must name a parent —
+                // including an explicit non-string/empty value, which is
+                // refused rather than read as "absent" (#2500 family).
+                if (args_for_parent.contains("parent_id") &&
+                    (!args_for_parent["parent_id"].is_string() ||
+                     args_for_parent["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason = args_for_parent["parent_id"].is_string()
+                                                        ? kReasonParentIdEmpty
+                                                        : kReasonParentIdType;
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
+                            .increment();
+                    }
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason) +
+                                       " source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to dispatch to all agents"),
+                        "application/json");
+                    return;
+                }
+                std::optional<std::string> parent_id;
+                std::string scope_expr;
+                if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
+                    !args_for_parent["parent_id"].get<std::string>().empty()) {
+                    auto canon = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
+                    if (!canon)
+                        return; // rs_resolve_owned_parent already wrote the error
+                    parent_id = *canon;
+                    scope_expr = "from_result_set:" + *canon;
+                }
+
+                // Create-before-dispatch (UP2-4): the execution_id must be
+                // registered before any RPC so a fast loopback agent can't
+                // reply ahead of the mapping.
+                Execution exec;
+                exec.definition_id = std::string(src_kind);
+                exec.status = "running";
+                exec.scope_expression = scope_expr;
+                exec.parameter_values =
+                    nlohmann::json(redact_sensitive_instruction_params(params)).dump();
+                exec.dispatched_by = session->username;
+                std::string exec_id;
+                if (auto created = execution_tracker->create_execution(exec); created.has_value())
+                    exec_id = *created;
+                if (exec_id.empty()) {
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_INTERNAL: failed to create execution row"),
+                        "application/json");
+                    return;
+                }
+
+                if (result_set_store_->count_for_owner(session->username) >=
+                    ResultSetStore::kMaxPerOwner) {
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // retry-hint-exempt: owner is genuinely at the per-owner
+                    // quota, not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(to_string(ResultSetError::QuotaExceeded)) +
+                                           " execution_id=" + exec_id),
+                        "application/json");
+                    return;
+                }
+
+                std::string command_id;
+                int sent = 0;
+                const std::string dispatch_scope =
+                    scope_expr.empty() ? std::string(yuzu::server::kBroadcastScope) : scope_expr;
+                try {
+                    // #1788: `exec_visible` narrows whichever arm dispatch_scope
+                    // selects, inside dispatch_confined_arms — nothing is
+                    // pre-filtered here, matching REST's run_async exactly.
+                    const auto dispatch_outcome =
+                        dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id, caller);
+                    command_id = dispatch_outcome.command_id;
+                    sent = dispatch_outcome.sent;
+                } catch (const std::exception& e) {
+                    spdlog::error("result-set MCP async producer dispatch failed: {}", e.what());
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled also failed for execution_id={}",
+                                     exec_id);
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_DISPATCH_FAILED: dispatch raised",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (sent == 0) {
+                    // Matches REST's run_async: a confinement drop (VisibleSet
+                    // admits none of the resolved targets) is answered
+                    // identically to a scope that genuinely matched nobody —
+                    // deliberate, so a distinct status never discloses devices
+                    // the caller cannot see.
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_NO_AGENTS: no agents reached in the target scope — "
+                                 "targets may be unreachable, quarantined, or withheld because "
+                                 "containment state could not be read",
+                                 "retry once devices reconnect",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!execution_tracker->set_agents_targeted(exec_id, sent))
+                    spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
+
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = name;
+                cr.parent_id = parent_id;
+                cr.source_kind = std::string(src_kind);
+                cr.source_payload = source_payload;
+                cr.matcher = matcher;
+                auto created = result_set_store_->create_pending(cr, exec_id);
+                if (!created) {
+                    if (metrics && created.error() == ResultSetError::QuotaExceeded)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    if (created.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    // retry-hint-exempt: business-rule outcome (quota), not a
+                    // transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(to_string(created.error())) +
+                                           " execution_id=" + exec_id),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_result_sets_total",
+                                  {{"source_kind", std::string(src_kind)}, {"result", "pending"}})
+                        .increment();
+                const bool audit_ok = audit_fn(
+                    req, "result_set.create", "success", "ResultSet", created->id,
+                    std::string(src_kind) + " execution_id=" + exec_id +
+                        " agents=" + std::to_string(sent));
+                nlohmann::json payload = result_set_json(*created);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", created->id);
+                // 202-equivalent (JSON-RPC has no status code): membership is
+                // not known yet; the client polls get_result_set by id, or
+                // subscribes to /api/v1/events on source_execution_id.
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+            };
+
+            if (tool_name == "list_result_sets") {
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                std::string cursor = param_str(args, "cursor");
+                int64_t limit = param_int(args, "limit", 50);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > 500)
+                    limit = 500;
+                std::string next;
+                auto sets = result_set_store_->list_by_owner(session->username, cursor,
+                                                              static_cast<int>(limit), next);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& s : sets)
+                    arr.push_back(result_set_json(s));
+                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", next}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_result_set") {
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = param_str(args, "name");
+                cr.source_kind = param_str(args, "source_kind", "manual_curate");
+                cr.source_payload =
+                    args.contains("source_payload") ? args["source_payload"].dump() : std::string("{}");
+                if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                    !args["parent_id"].get_ref<const std::string&>().empty()) {
+                    auto pid = args["parent_id"].get<std::string>();
+                    // Owner-check the parent before persisting the lineage
+                    // edge, else an operator could parent onto a victim's id
+                    // and read its metadata back via get_result_set_lineage.
+                    auto parent = rs_load_owned(pid);
+                    if (!parent)
+                        return; // rs_load_owned already wrote the error
+                    cr.parent_id = pid;
+                }
+                std::vector<std::string> members;
+                if (args.contains("device_ids") && args["device_ids"].is_array()) {
+                    for (const auto& d : args["device_ids"])
+                        if (d.is_string())
+                            members.push_back(d.get<std::string>());
+                }
+                if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    // retry-hint-exempt: the per-set member cap, a client
+                    // error, not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(to_string(ResultSetError::TooManyMembers))),
+                        "application/json");
+                    return;
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    if (created.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (created.error() == ResultSetError::QuotaExceeded && metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    // retry-hint-exempt: business-rule outcome (quota), not a
+                    // transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(created.error()))),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_result_sets_total",
+                                  {{"source_kind", cr.source_kind}, {"result", "created"}})
+                        .increment();
+                const bool audit_ok =
+                    audit_fn(req, "result_set.create", "success", "ResultSet", created->id, cr.source_kind);
+                nlohmann::json payload = result_set_json(*created);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", created->id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_result_set_from_inventory_query") {
+                if (!perm_fn(req, res, "Inventory", "Read"))
+                    return;
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!inventory_store || !inventory_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "inventory store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                yuzu::server::InventoryEvalRequest eval_req;
+                eval_req.combine = param_str(args, "combine", "all");
+                if (args.contains("conditions") && args["conditions"].is_array()) {
+                    for (const auto& c : args["conditions"]) {
+                        yuzu::server::InventoryCondition cond;
+                        cond.plugin = c.value("plugin", "");
+                        cond.field = c.value("field", "");
+                        cond.op = c.value("op", "");
+                        cond.value = c.value("value", "");
+                        eval_req.conditions.push_back(std::move(cond));
+                    }
+                }
+                // #2500-class guard, same shape as rs_run_async's own — a
+                // supplied parent_id must name a parent, never silently
+                // treated as absent.
+                if (args.contains("parent_id") &&
+                    (!args["parent_id"].is_string() ||
+                     args["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason =
+                        args["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
+                            .increment();
+                    }
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason) +
+                                       " source_kind=inventory_query");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to search all devices"),
+                        "application/json");
+                    return;
+                }
+                std::optional<std::unordered_set<std::string>> parent_members;
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = param_str(args, "name");
+                cr.source_kind = std::string(source_kind::kInventoryQuery);
+                cr.source_payload = args.dump();
+                if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                    !args["parent_id"].get_ref<const std::string&>().empty()) {
+                    auto pid = args["parent_id"].get<std::string>();
+                    auto parent = rs_load_owned(pid);
+                    if (!parent)
+                        return;
+                    cr.parent_id = pid;
+                    std::unordered_set<std::string> ms;
+                    std::string cur;
+                    while (true) {
+                        std::string next;
+                        auto page = result_set_store_->members(pid, cur, 5000, next);
+                        ms.insert(page.begin(), page.end());
+                        if (next.empty())
+                            break;
+                        cur = std::move(next);
+                    }
+                    parent_members = std::move(ms);
+                }
+                InventoryQuery iq;
+                iq.limit = 5000;
+                bool inv_truncated = false;
+                auto records_raw = inventory_store->query(iq, &inv_truncated);
+                if (!records_raw) {
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=store_degraded source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError, "inventory store degraded",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (inv_truncated) {
+                    // Governance M1: a capped read must NEVER be materialised
+                    // as a targeting set — the missing tail silently changes
+                    // who gets acted on (#2500/#2492 dispatch-targeting
+                    // invariant class).
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=query_truncated source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "inventory query truncated at the row or byte cap — refusing to "
+                                 "materialise a partial result set",
+                                 "narrow the query, or wait for the row/byte cap to be raised",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                std::vector<std::pair<std::string, std::string>> records;
+                records.reserve(records_raw->size());
+                for (const auto& r : *records_raw)
+                    records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                auto results = yuzu::server::evaluate_inventory(eval_req, records);
+                std::unordered_set<std::string> seen;
+                std::vector<std::string> members;
+                for (const auto& r : results) {
+                    if (!r.match)
+                        continue;
+                    if (parent_members && !parent_members->count(r.agent_id))
+                        continue;
+                    if (seen.insert(r.agent_id).second)
+                        members.push_back(r.agent_id);
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    if (created.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (created.error() == ResultSetError::QuotaExceeded && metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    // retry-hint-exempt: business-rule outcome (quota), not a
+                    // transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(created.error()))),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_result_sets_total",
+                                  {{"source_kind", cr.source_kind}, {"result", "created"}})
+                        .increment();
+                const bool audit_ok =
+                    audit_fn(req, "result_set.create", "success", "ResultSet", created->id, cr.source_kind);
+                nlohmann::json payload = result_set_json(*created);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", created->id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_result_set_from_tar_query") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                std::string sql = param_str(args, "sql");
+                if (sql.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        "application/json");
+                    return;
+                }
+                if (sql.size() > 100000) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                        "application/json");
+                    return;
+                }
+                const bool include_empty = args.value("include_empty", false);
+                nlohmann::json matcher = include_empty
+                                             ? nlohmann::json{{"kind", "any_response"}}
+                                             : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
+                // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                nlohmann::json payload;
+                payload["sql"] = sql;
+                payload["include_empty"] = include_empty;
+                if (args.contains("parent_id") && args["parent_id"].is_string())
+                    payload["scope_input_id"] = args["parent_id"];
+                std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                rs_run_async("tar", "sql", params, source_kind::kTarQuery, payload.dump(),
+                            matcher.dump(), args, param_str(args, "name"));
+                return;
+            }
+
+            if (tool_name == "create_result_set_from_instruction_result") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "instruction store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                std::string instruction_id = param_str(args, "instruction_id");
+                if (instruction_id.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_REQUEST: 'instruction_id' is required"),
+                        "application/json");
+                    return;
+                }
+                auto def_result = instruction_store->get_definition(instruction_id);
+                if (!def_result) {
+                    res.set_content(
+                        a4_error(kInternalError, "instruction store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*def_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "INSTRUCTION_NOT_FOUND: unknown instruction_id"),
+                        "application/json");
+                    return;
+                }
+                const auto& def = **def_result;
+                std::unordered_map<std::string, std::string> params;
+                if (args.contains("params") && args["params"].is_object())
+                    for (auto& [k, v] : args["params"].items())
+                        params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                std::string matcher = (args.contains("matcher") && args["matcher"].is_object())
+                                          ? args["matcher"].dump()
+                                          : std::string();
+                // source_payload — design §3.2 instruction_result shape.
+                nlohmann::json payload;
+                payload["instruction_id"] = instruction_id;
+                payload["params"] = args.contains("params") ? args["params"] : nlohmann::json::object();
+                if (args.contains("matcher"))
+                    payload["matcher"] = args["matcher"];
+                if (args.contains("parent_id") && args["parent_id"].is_string())
+                    payload["scope_input_id"] = args["parent_id"];
+                rs_run_async(def.plugin, def.action, params, source_kind::kInstructionResult,
+                            payload.dump(), matcher, args, param_str(args, "name"));
+                return;
+            }
+
+            if (tool_name == "reevaluate_result_set") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto orig = rs_load_owned(rs_id);
+                if (!orig)
+                    return;
+                auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                // Synthesise the parent so the sibling shares the original's
+                // parent (re-eval re-asks the same question against today's
+                // estate).
+                nlohmann::json synth = nlohmann::json::object();
+                if (orig->parent_id && !orig->parent_id->empty())
+                    synth["parent_id"] = *orig->parent_id;
+                // Skip the suffix if it's already there, else repeated
+                // re-evals of a sibling grow "foo (re-eval) (re-eval) ..."
+                // unboundedly.
+                const std::string reeval_name =
+                    orig->name.empty()                  ? std::string()
+                    : orig->name.ends_with(" (re-eval)") ? orig->name
+                                                         : (orig->name + " (re-eval)");
+                if (orig->source_kind == source_kind::kTarQuery) {
+                    std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                    if (sql.empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                            "application/json");
+                        return;
+                    }
+                    std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                    rs_run_async("tar", "sql", params, source_kind::kTarQuery, orig->source_payload,
+                                orig->matcher, synth, reeval_name);
+                } else if (orig->source_kind == source_kind::kInstructionResult) {
+                    std::string instruction_id = sp.is_object() ? sp.value("instruction_id", "") : "";
+                    std::optional<InstructionDefinition> def;
+                    if (instruction_store && instruction_store->is_open()) {
+                        auto def_result = instruction_store->get_definition(instruction_id);
+                        if (!def_result) {
                             res.set_content(
-                                error_response(id, kInternalError, "Tag store unavailable"),
+                                a4_error(kInternalError, "instruction store not available",
+                                         "retry once the server reports ready",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                 "application/json");
                             return;
                         }
-                        preview_tags = std::move(*preload);
+                        def = *def_result;
                     }
-                }
-                // Evaluate against all agents
-                const auto& agents = get_agents();
-                JArr matching;
-                for (const auto& a : agents) {
-                    auto agent_id = a.value("agent_id", "");
-                    std::unordered_map<std::string, std::string> attrs;
-                    attrs["os"] = a.value("os", "");
-                    attrs["arch"] = a.value("arch", "");
-                    attrs["hostname"] = a.value("hostname", "");
-                    attrs["agent_version"] = a.value("agent_version", "");
-                    if (auto it = preview_tags.find(agent_id); it != preview_tags.end()) {
-                        for (const auto& [k, v] : it->second)
-                            attrs["tag:" + k] = v;
+                    if (instruction_id.empty() || !def) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: original instruction unavailable"),
+                            "application/json");
+                        return;
                     }
-                    auto resolver = [&](std::string_view attr) -> std::string {
-                        auto it = attrs.find(std::string(attr));
-                        return it != attrs.end() ? it->second : "";
-                    };
-                    if (yuzu::scope::evaluate(*parsed_expr, resolver))
-                        matching.add(agent_id);
+                    std::unordered_map<std::string, std::string> params;
+                    if (sp.contains("params") && sp["params"].is_object())
+                        for (auto& [k, v] : sp["params"].items())
+                            params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                    rs_run_async(def->plugin, def->action, params, source_kind::kInstructionResult,
+                                orig->source_payload, orig->matcher, synth, reeval_name);
+                } else {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                       "is not yet supported"),
+                        "application/json");
                 }
-                // Blast-radius guard: warn when scope matches many agents (G4-UHP-MCP-011)
-                constexpr size_t kMcpScopeWarnThreshold = 50;
-                bool scope_warning = matching.size() > kMcpScopeWarnThreshold;
+                return;
+            }
 
-                auto obj = JObj()
-                               .add("expression", expression)
-                               .add("matched_count", static_cast<int64_t>(matching.size()))
-                               .raw("matched_agents", matching.str());
-                if (scope_warning)
-                    obj.add("warning", "scope matches " + std::to_string(matching.size()) +
-                                           " agents (>" + std::to_string(kMcpScopeWarnThreshold) +
-                                           "). Phase 2 write operations targeting this scope will "
-                                           "require approval.");
-                mcp_audit("success", expression);
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
-                                "application/json");
+            if (tool_name == "get_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(result_set_json(*row).dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_result_set_members") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                std::string cursor = param_str(args, "cursor");
+                int64_t limit = param_int(args, "limit", 1000);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > 10000)
+                    limit = 10000;
+                std::string next;
+                auto devs =
+                    result_set_store_->members(rs_id, cursor, static_cast<int>(limit), next);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& d : devs)
+                    arr.push_back(d);
+                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", next}};
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_result_set_lineage") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto chain = result_set_store_->lineage(rs_id, session->username);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& n : chain)
+                    arr.push_back({{"id", n.id},
+                                   {"name", n.name},
+                                   {"source_kind", n.source_kind},
+                                   {"device_count", n.device_count}});
+                nlohmann::json payload = {{"chain", arr}};
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "pin_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto pinned = result_set_store_->pin(rs_id);
+                if (!pinned) {
+                    if (pinned.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    mcp_audit(pinned.error() == ResultSetError::PinLimit ? "denied" : "failure", rs_id);
+                    // retry-hint-exempt: business-rule outcome (not found/
+                    // pin-limit), not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(pinned.error()))),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "result_set.pin", "success", "ResultSet", rs_id, "");
+                nlohmann::json payload = result_set_json(*pinned);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "unpin_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto unpinned = result_set_store_->unpin(rs_id);
+                if (!unpinned) {
+                    if (unpinned.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    mcp_audit("failure", rs_id);
+                    // retry-hint-exempt: business-rule outcome (not found),
+                    // not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(unpinned.error()))),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "result_set.unpin", "success", "ResultSet", rs_id, "");
+                nlohmann::json payload = result_set_json(*unpinned);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "delete_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto del = result_set_store_->delete_set(rs_id);
+                if (!del) {
+                    if (del.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    // retry-hint-exempt: business-rule outcome (not found/
+                    // pinned), not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(del.error()))),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "result_set.delete", "success", "ResultSet", rs_id, "");
+                nlohmann::json payload = {{"deleted", true}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 

@@ -120,7 +120,13 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # guardian-guard-form, get.fragments-guardian-guard-param-page, get.fragments-
 # guardian-guards, get.fragments-guardian-status) on top of origin/dev's 219 --
 # reconciled post-merge against the actual measured count, not hand-added.
-BASELINE_UNTWINNED = 213
+#
+# #2146 Batch B2: seven rows flip to "twinned" -- post.api-scope-validate
+# (mcp_twin: validate_scope) and six result-set fragment rows (mcp_twin:
+# list_result_sets/create_result_set/get_result_set/delete_result_set/
+# pin_result_set/unpin_result_set) -- on top of the prior 213, measured after
+# the flip, not hand-added.
+BASELINE_UNTWINNED = 206
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

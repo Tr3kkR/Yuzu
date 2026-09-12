@@ -33,6 +33,9 @@
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
+#include "result_set_model.hpp" // #2146 Batch B2: shared REST v1 + MCP result-set JSON builder
+#include "scope_engine.hpp"     // yuzu::scope::validate — POST /api/v1/scope/validate
+#include "scope_preview.hpp"    // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
@@ -1450,6 +1453,12 @@ const std::string& openapi_spec() {
     },
     "/result-sets/{id}/unpin": {
       "post": {"summary": "Unpin a result set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with pinned=false"}, "403": {"description": "Result-set unpin denied to a service-scoped token"}, "404": {"description": "Not found or not owned by the caller, OR the unpin write itself failed after ownership was confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership (read stage only)"}}}
+    },
+    "/scope/validate": {
+      "post": {"summary": "Validate a scope expression's syntax", "tags": ["Scope"], "description": "Versioned twin of the legacy POST /api/scope/validate and MCP validate_scope — all three call the SAME yuzu::scope::validate(). Auth-only, no RBAC gate (a syntax-only check with no data disclosure).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{valid: true, expression} or {valid: false, error}"}, "400": {"description": "expression missing or empty"}}}
+    },
+    "/scope/preview": {
+      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). Requires Infrastructure:Read. tag:<key> atoms resolve from the persistent tag store only (see docs/asset-tagging-guide.md \"Tag source precedence\").", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "503": {"description": "Tag store degraded while resolving a tag:<key> atom the expression references (Retry-After: 5)"}}}
     },
     "/software-packages": {
       "get": {"summary": "List registered software packages", "tags": ["Software Deployment"], "description": "Only available when SoftwareDeploymentStore is wired — the server does not construct it today (capability 7.6 deliberately shelved, ADR-0051); documented for when a future change re-wires it. Requires SoftwareDeployment:Read.", "responses": {"200": {"description": "{data: [{id, name, version, platform, installer_type, content_hash, size_bytes, created_at, created_by}]}"}, "503": {"description": "A genuine database read failure"}}},
@@ -8686,22 +8695,10 @@ void RestApiV1::register_routes(
     // command-dispatch callback + ExecutionTracker; without them they 503.
     if (result_set_store) {
         // Serialise a ResultSet row to a JSON object string.
-        auto rs_to_json = [](const ResultSet& r) {
-            JObj o;
-            o.add("id", r.id);
-            o.add("name", r.name);
-            o.add("owner_principal", r.owner_principal);
-            o.add("created_at", r.created_at);
-            o.add("ttl_at", r.ttl_at);
-            o.add("last_used_at", r.last_used_at);
-            o.add("pinned", r.pinned);
-            o.add("parent_id", r.parent_id.value_or(""));
-            o.add("source_kind", r.source_kind);
-            o.add("status", to_string(r.status));
-            o.add("source_execution_id", r.source_execution_id);
-            o.add("device_count", r.device_count);
-            return o.str();
-        };
+        // #2146 Batch B2: delegates to the shared result_set_json() builder
+        // (result_set_model.hpp) so this REST shape and the MCP result-set
+        // tools' shape cannot drift (api-twin-recipe.md Rule 1).
+        auto rs_to_json = [](const ResultSet& r) { return result_set_json(r).dump(); };
 
         // Emit an A4 error with a fresh correlation id.
         auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
@@ -9729,6 +9726,87 @@ void RestApiV1::register_routes(
                                         "application/json");
                     });
     }
+
+    // ── Scope validate/preview (#2146 Batch B2) ───────────────────────────
+    // Versioned REST v1 twins of MCP's validate_scope/preview_scope_targets.
+    // Both wrap the SAME underlying pure logic those tools use
+    // (yuzu::scope::validate / scope_preview.hpp's preview_scope_targets), so
+    // this route and its MCP twin cannot silently diverge in what they accept
+    // or match.
+
+    // POST /api/v1/scope/validate — versioned twin of the legacy POST
+    // /api/scope/validate (dashboard_api_routes.cpp) and MCP validate_scope.
+    // Auth-only, no RBAC gate — matches both existing siblings exactly (a
+    // syntax-only check with no data disclosure).
+    sink.Post("/api/v1/scope/validate", [auth_fn](const httplib::Request& req,
+                                                  httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        std::string expression = (!body.is_discarded() && body.is_object())
+                                     ? body.value("expression", std::string())
+                                     : std::string();
+        if (expression.empty()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "expression is required"), "application/json");
+            return;
+        }
+        auto valid = yuzu::scope::validate(expression);
+        if (valid) {
+            res.set_content(
+                ok_json(nlohmann::json({{"valid", true}, {"expression", expression}}).dump()),
+                "application/json");
+        } else {
+            res.set_content(
+                ok_json(nlohmann::json({{"valid", false}, {"error", valid.error()}}).dump()),
+                "application/json");
+        }
+    });
+
+    // POST /api/v1/scope/preview — versioned twin of MCP preview_scope_targets.
+    // No legacy unversioned twin exists — verified: `/api/scope/estimate`
+    // (workflow_routes.cpp) is a DIFFERENT capability (matched/total counts
+    // only, for the workflow builder's confined scope_fn; this route returns
+    // the actual matched_agents list, unconfined, matching the MCP tool
+    // exactly). Requires Infrastructure:Read, matching the MCP twin's real
+    // perm_fn gate.
+    sink.Post("/api/v1/scope/preview", [auth_fn, perm_fn, tag_store, agents_fn](
+                                            const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn(req, res, "Infrastructure", "Read"))
+            return;
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        std::string expression = (!body.is_discarded() && body.is_object())
+                                     ? body.value("expression", std::string())
+                                     : std::string();
+        if (expression.empty()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "expression is required"), "application/json");
+            return;
+        }
+        const auto agents = agents_fn ? agents_fn() : nlohmann::json::array();
+        auto outcome = preview_scope_targets(expression, agents, tag_store);
+        switch (outcome.kind) {
+        case ScopePreviewOutcome::Kind::kInvalidExpression:
+            res.status = 400;
+            res.set_content(detail::a4_error(res, outcome.detail), "application/json");
+            return;
+        case ScopePreviewOutcome::Kind::kTagStoreDegraded:
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "tag store unavailable",
+                                             {.retry_after_ms = 5000,
+                                              .remediation = "retry once the server reports "
+                                                             "ready"}),
+                            "application/json");
+            return;
+        case ScopePreviewOutcome::Kind::kOk:
+            res.set_content(ok_json(outcome.payload.dump()), "application/json");
+            return;
+        }
+    });
 
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
 

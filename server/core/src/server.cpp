@@ -17718,6 +17718,11 @@ private:
             // DeploymentRoutes already hold (constructed well before this
             // point, server.cpp:4041) — no new construction needed.
             mcp_server_->set_preflight_run_store(preflight_run_store_.get());
+            // #2146 Batch B2 — backs the 12 result-set MCP tools. Same store
+            // ResultSetRoutes/rest_api_v1's result-set routes already hold
+            // (constructed well before this point) — no new construction
+            // needed.
+            mcp_server_->set_result_set_store(result_set_store_.get());
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the

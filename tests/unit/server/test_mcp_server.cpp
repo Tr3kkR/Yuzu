@@ -31,6 +31,7 @@
 #include "test_approval_manager_pg_helper.hpp" // ApprovalManagerPg — ADR-0065 PG port
 #include "test_directory_sync_pg_helper.hpp" // DirectorySyncPg — #4031 list_directory_users/get_directory_status
 #include "test_execution_tracker_pg_helper.hpp" // ExecutionTrackerPg — ADR-0065 PG port
+#include "test_result_set_store_pg_helper.hpp" // ResultSetStorePg — #2146 Batch B2
 #include "test_response_execution_authz_pg_helper.hpp"
 #include "test_tag_store_pg_helper.hpp"  // TagStorePg — ADR-0050 PG port
 #include "approval_manager.hpp"
@@ -67,6 +68,7 @@
 #include "pg/secret_codec.hpp"
 #include "plugin_config_store.hpp"
 #include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
+#include "result_set_store.hpp" // #2146 Batch B2: ResultSetStore for the 12 result-set MCP tools
 
 #include <yuzu/metrics.hpp>
 
@@ -991,6 +993,13 @@ struct McpTestServer {
     /// pre-existing test on the "store unavailable" path.
     yuzu::server::PreflightRunStore* preflight_run_store_for_test{nullptr};
 
+    /// #2146 Batch B2 — optionally wire a real ResultSetStore so the 12
+    /// result-set MCP tools can be exercised end-to-end against live
+    /// Postgres state, same setter-idiom pattern as
+    /// preflight_run_store_for_test above. Default nullptr keeps every
+    /// pre-existing test on the "result-set store unavailable" path.
+    yuzu::server::ResultSetStore* result_set_store_for_test{nullptr};
+
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
     /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
     /// exercised. Default nullptr keeps every existing test on the no-store path
@@ -1369,6 +1378,11 @@ private:
         // the two above — wire before the handlers are built.
         if (preflight_run_store_for_test)
             mcp.set_preflight_run_store(preflight_run_store_for_test);
+        // #2146 Batch B2: result_set_store ALSO rides a setter, same pattern
+        // as preflight_run_store immediately above — wire before the
+        // handlers are built.
+        if (result_set_store_for_test)
+            mcp.set_result_set_store(result_set_store_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -17028,6 +17042,16 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         // fragment's own gate exactly (see its kTools[] entry's comment).
         {"preview_management_group_agent_count",
          nlohmann::json::parse(R"({"command_id":"cmd-1","plugin":"procfetch"})")},
+        // #2146 Batch B2: the 3 result-set dispatch producers (Execution:
+        // Execute, like execute_instruction above) and delete_result_set
+        // (Infrastructure:Delete, like delete_plugin_config/delete_plugin_secret
+        // above) inherit the supervised-tier approval gate as a consequence of
+        // their (securable, operation) pair, not a bespoke decision.
+        {"create_result_set_from_tar_query", nlohmann::json::parse(R"({"sql":"SELECT 1"})")},
+        {"create_result_set_from_instruction_result",
+         nlohmann::json::parse(R"({"instruction_id":"os_info.version"})")},
+        {"reevaluate_result_set", nlohmann::json::parse(R"({"id":"rs_test"})")},
+        {"delete_result_set", nlohmann::json::parse(R"({"id":"rs_test"})")},
     };
 
     // Tether: the gated set derived from security rows + requires_approval()
@@ -20441,4 +20465,353 @@ TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain
         CHECK(quota.in_flight("engine:ch6") == 0);
         tls_quota_slot().reset();
     }
+}
+
+// ── #2146 Batch B2: result-set MCP twins ───────────────────────────────────
+//
+// REST's own test suite (test_rest_result_sets_async.cpp, test_result_set_
+// store.cpp) already exercises the business rules (quota, pin-limit, matcher
+// semantics, re-eval sibling rule, etc.) exhaustively — these tests verify
+// the MCP-SPECIFIC wiring instead: the tier/perm gates match each REST twin
+// exactly, the JSON-RPC envelope shape is correct, and — per the #2146 B2
+// risk register ("twin uses a looser confinement provider than the fragment
+// it twins") — the three async dispatch producers reuse the EXACT #1788
+// confined chokepoint (dispatch_fn + caller_fn) execute_instruction uses,
+// with the same empty/malformed-parent_id and confinement-drop behaviour.
+
+TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
+          "[mcp][integration][result-sets]") {
+    McpTestServer ts;
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+
+    SECTION("create_result_set_from_tar_query denies without Execution:Execute") {
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Execution" && op == "Execute");
+        };
+        ts.start("operator");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+
+    SECTION("create_result_set_from_instruction_result denies without Execution:Execute") {
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Execution" && op == "Execute");
+        };
+        ts.start("operator");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"os_info.version"}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+
+    SECTION("reevaluate_result_set denies without Execution:Execute") {
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Execution" && op == "Execute");
+        };
+        ts.start("operator");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"reevaluate_result_set","arguments":{"id":"rs_doesnotmatter"}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+
+    SECTION("create_result_set_from_inventory_query denies without Inventory:Read (the REAL "
+            "gate — matches REST's perm_fn(Inventory, Read) call exactly, independent of this "
+            "tool's kToolSecurity operation being classified \"Write\" for readOnlyHint "
+            "truthfulness). Empty tier (not an MCP token) so tier_allows defers entirely to "
+            "RBAC and this test exercises ONLY the handler's own perm_fn gate — \"operator\" "
+            "tier would itself 403 first on Inventory:Write (the kToolSecurity classification), "
+            "which is a DIFFERENT gate than the one under test here.") {
+        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
+            return !(sec == "Inventory" && op == "Read");
+        };
+        ts.start();
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}]}}})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+}
+
+TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "
+          "family), never silently treated as absent",
+          "[mcp][integration][result-sets][scope]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    auto dispatch = [](const std::string&, const std::string&,
+                       const std::vector<std::string>&, const std::string&,
+                       const std::unordered_map<std::string, std::string>&, const std::string&,
+                       const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        FAIL("dispatch_fn must not be reached — the malformed parent_id check must refuse first");
+        return {.sent = 0, .command_id = ""};
+    };
+
+    SECTION("empty-string parent_id") {
+        McpTestServer ts;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.start_with_dispatch(dispatch, "operator");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1","parent_id":""}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+    }
+
+    SECTION("non-string parent_id") {
+        McpTestServer ts;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.start_with_dispatch(dispatch, "operator");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":11,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1","parent_id":123}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_BAD_PARENT") !=
+              std::string::npos);
+    }
+
+    SECTION("omitted parent_id is NOT an error — it means broadcast, deliberately") {
+        McpTestServer ts;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        auto broadcast_dispatch =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+               const std::string& scope, const std::unordered_map<std::string, std::string>&,
+               const std::string&,
+               const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            CHECK(scope == "__all__");
+            return {.sent = 1, .command_id = "cmd-broadcast"};
+        };
+        ts.start_with_dispatch(broadcast_dispatch, "operator");
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+    }
+}
+
+TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "
+          "and thread it into dispatch_fn — the #1788 chokepoint, not a looser provider",
+          "[mcp][integration][result-sets][scope]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // A confined caller who can see only agent-A — mirrors execute_instruction's
+    // own CDX-R5-02 confinement-handoff test.
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s}};
+    };
+    yuzu::server::authz::VisibleSet captured_visible;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller& caller)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        captured_visible = caller.exec_visible;
+        // Confinement drop: the production dispatch_confined seam would filter
+        // every target out for a caller who can't see any of them. Model that
+        // here as sent=0 — the handler's zero-agents branch must then be
+        // indistinguishable from a scope that genuinely matched nobody.
+        return {.sent = 0, .command_id = "cmd-confined"};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+    REQUIRE(res);
+    REQUIRE(captured_visible.has_value()); // confined, NOT unfiltered (nullopt)
+    CHECK(captured_visible->count("agent-A") == 1);
+    CHECK(captured_visible->count("agent-B") == 0);
+    // sent=0 is answered as a retryable internal error (RESULT_SET_NO_AGENTS),
+    // deliberately the SAME shape a genuinely-empty scope gets — no distinct
+    // status would disclose devices the caller cannot see.
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NO_AGENTS") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP result-sets: happy-path lifecycle (create, get, members, lineage, pin, unpin, "
+          "delete) against a real ResultSetStore",
+          "[pg][mcp][integration][result-sets]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.mock_username = "alice";
+    // Empty tier (not an MCP token, e.g. an interactive session): these tools
+    // are owner-scoped with no perm_fn gate, and "operator" tier itself
+    // tier-denies Infrastructure:Write/Delete (create/pin/unpin/delete) —
+    // see mcp_policy.hpp's tier_allows(). This test exercises the STORE/
+    // OWNERSHIP logic, not MCP tier policy, which is out of scope here.
+    ts.start();
+
+    // list_result_sets — empty to start.
+    auto list_empty = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,"params":{"name":"list_result_sets","arguments":{}}})");
+    REQUIRE(list_empty);
+    CHECK(list_empty->status == 200);
+    {
+        auto body = nlohmann::json::parse(list_empty->body);
+        auto sc = body["result"]["structuredContent"];
+        CHECK(sc["result_sets"].empty());
+    }
+
+    // create_result_set — manual curate, two members.
+    auto created = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,"params":{"name":"create_result_set","arguments":{"name":"my-set","device_ids":["dev-1","dev-2"]}}})");
+    REQUIRE(created);
+    REQUIRE(created->status == 200);
+    std::string rs_id;
+    {
+        auto body = nlohmann::json::parse(created->body);
+        auto sc = body["result"]["structuredContent"];
+        CHECK(sc["owner_principal"] == "alice");
+        CHECK(sc["device_count"] == 2);
+        CHECK(sc["status"] == "materialized");
+        rs_id = sc["id"].get<std::string>();
+        REQUIRE(rs_id.starts_with("rs_"));
+    }
+
+    // get_result_set.
+    auto got = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":32,)") +
+                       R"("params":{"name":"get_result_set","arguments":{"id":")" + rs_id +
+                       R"("}}})");
+    REQUIRE(got);
+    CHECK(got->status == 200);
+
+    // get_result_set_members.
+    auto members = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":33,)") +
+                           R"("params":{"name":"get_result_set_members","arguments":{"id":")" +
+                           rs_id + R"("}}})");
+    REQUIRE(members);
+    {
+        auto body = nlohmann::json::parse(members->body);
+        auto ids = body["result"]["structuredContent"]["device_ids"];
+        CHECK(ids.size() == 2);
+    }
+
+    // get_result_set_lineage — a ground set, so an empty chain.
+    auto lineage = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":34,)") +
+                           R"("params":{"name":"get_result_set_lineage","arguments":{"id":")" +
+                           rs_id + R"("}}})");
+    REQUIRE(lineage);
+    CHECK(lineage->status == 200);
+
+    // pin_result_set.
+    auto pinned = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":35,)") +
+                          R"("params":{"name":"pin_result_set","arguments":{"id":")" + rs_id +
+                          R"("}}})");
+    REQUIRE(pinned);
+    {
+        auto body = nlohmann::json::parse(pinned->body);
+        CHECK(body["result"]["structuredContent"]["pinned"] == true);
+    }
+
+    // delete_result_set while pinned -> refused (PIN_LIMIT-class business
+    // error, not a store fault — matches REST's 409).
+    auto del_while_pinned =
+        ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":36,)") +
+               R"("params":{"name":"delete_result_set","arguments":{"id":")" + rs_id +
+               R"("}}})");
+    REQUIRE(del_while_pinned);
+    {
+        auto body = nlohmann::json::parse(del_while_pinned->body);
+        REQUIRE(body.contains("error"));
+    }
+
+    // unpin_result_set.
+    auto unpinned = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":37,)") +
+                            R"("params":{"name":"unpin_result_set","arguments":{"id":")" +
+                            rs_id + R"("}}})");
+    REQUIRE(unpinned);
+    {
+        auto body = nlohmann::json::parse(unpinned->body);
+        CHECK(body["result"]["structuredContent"]["pinned"] == false);
+    }
+
+    // delete_result_set — now succeeds.
+    auto deleted = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":38,)") +
+                           R"("params":{"name":"delete_result_set","arguments":{"id":")" +
+                           rs_id + R"("}}})");
+    REQUIRE(deleted);
+    {
+        auto body = nlohmann::json::parse(deleted->body);
+        CHECK(body["result"]["structuredContent"]["deleted"] == true);
+    }
+
+    // get_result_set on the now-deleted id -> not found, existence-oracle-safe.
+    auto gone = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":39,)") +
+                        R"("params":{"name":"get_result_set","arguments":{"id":")" + rs_id +
+                        R"("}}})");
+    REQUIRE(gone);
+    {
+        auto body = nlohmann::json::parse(gone->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
+              std::string::npos);
+    }
+}
+
+TEST_CASE("MCP result-sets: a non-owner sees the same not-found as a nonexistent id "
+          "(existence-oracle-safe)",
+          "[pg][mcp][integration][result-sets]") {
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    McpTestServer ts_owner;
+    ts_owner.result_set_store_for_test = rs_bundle.get();
+    ts_owner.mock_username = "alice";
+    ts_owner.start(); // empty tier — see the lifecycle test above for why
+    auto created = ts_owner.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":40,"params":{"name":"create_result_set","arguments":{"device_ids":["dev-1"]}}})");
+    REQUIRE(created);
+    const std::string rs_id =
+        nlohmann::json::parse(created->body)["result"]["structuredContent"]["id"]
+            .get<std::string>();
+
+    McpTestServer ts_other;
+    ts_other.result_set_store_for_test = rs_bundle.get();
+    ts_other.mock_username = "mallory";
+    ts_other.start(); // get_result_set is Read — reachable at any tier anyway
+    auto res = ts_other.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":41,)") +
+                             R"("params":{"name":"get_result_set","arguments":{"id":")" + rs_id +
+                             R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_NOT_FOUND") !=
+          std::string::npos);
+}
+
+TEST_CASE("MCP result-sets: service-scoped token is denied outright on owner-scoped tools "
+          "(ServiceScopeClass::denied — matches REST's deny_fleet_wide_service_scoped)",
+          "[mcp][integration][result-sets]") {
+    McpTestServer ts;
+    ts.mock_token_scope_service = "svc-a";
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":50,"params":{"name":"list_result_sets","arguments":{}}})");
+    REQUIRE(res);
+    // The generic C8 service-scope default-deny gate answers a JSON-RPC error
+    // (kPermissionDenied, -32003) WITHOUT setting an HTTP status (unlike the
+    // mock perm_fn, which sets 403) — assert on the JSON-RPC error body, not
+    // res->status, matching how this gate actually answers.
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == -32003);
+    CHECK(body["error"]["message"].get<std::string>().find("service-scoped") != std::string::npos);
 }
