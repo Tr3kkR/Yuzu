@@ -55,7 +55,7 @@ constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition
 // securable (ProductPack), own family.
 constexpr std::string_view kProductPacks[] = {"list_product_packs", "get_product_pack"};
 constexpr std::string_view kResponses[] = {"query_responses", "aggregate_responses"};
-// #2146 A2-R1: get_execution_children joins the family — same securable
+// #2146 A2-R1: get_execution_children joins the family - same securable
 // (Execution:Read), same domain as get_execution_status/list_executions.
 constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "get_execution_children",
                                                  "list_executions", "query_audit_log"};

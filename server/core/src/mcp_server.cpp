@@ -662,7 +662,7 @@ static const ToolDef kTools[] = {
      "#2146 A2-R1: the result also carries parameter_values (redacted to "
      "\"(redacted - confined view)\" for a confined caller, exactly like "
      "scope_expression), plus completed_at/parent_id/rerun_of, which stay "
-     "truthful for every caller — the REST v1 twin GET /api/v1/executions/{id} "
+     "truthful for every caller - the REST v1 twin GET /api/v1/executions/{id} "
      "already returned all four; this closes the MCP field-parity gap.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
      R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
@@ -671,7 +671,7 @@ static const ToolDef kTools[] = {
      "List an execution's child executions (spawned reruns, workflow-step "
      "fan-out, or other lineage). Confined by management group: an invisible "
      "or nonexistent parent execution_id returns the same not-found error, "
-     "and — per #3789 — a visible parent does NOT by itself disclose a "
+     "and - per #3789 - a visible parent does NOT by itself disclose a "
      "child dispatched by, or targeting, someone else: each child "
      "independently passes the same visible-agent-or-owner test the parent "
      "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
@@ -2433,7 +2433,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // fleet_read_fn_ alongside the response tools above; same reclassification
     // rationale.
     {"get_execution_status", {"Execution", "Read", ServiceScopeClass::confined}},
-    // #2146 A2-R1 — same fleet_read_fn_-gated confinement mechanism as
+    // #2146 A2-R1 - same fleet_read_fn_-gated confinement mechanism as
     // get_execution_status/list_executions above.
     {"get_execution_children", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},

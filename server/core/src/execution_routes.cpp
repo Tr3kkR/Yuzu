@@ -814,7 +814,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
                 if (!execution_visible(c, c_statuses, gate.scope, username))
                     continue;
-                // #2146 A2-R1: shared builder (execution_model.hpp) — REST v1's
+                // #2146 A2-R1: shared builder (execution_model.hpp) - REST v1's
                 // new GET /api/v1/executions/{id}/children and MCP's new
                 // get_execution_children call the SAME function, so this row
                 // shape cannot drift from theirs (docs/api-twin-recipe.md Rule 1).

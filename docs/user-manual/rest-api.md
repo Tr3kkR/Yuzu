@@ -5418,12 +5418,12 @@ exactly: the caller's visible agent set is resolved and pushed into the store qu
 
 #### `GET /api/v1/executions/{id}/children` (#2146 A2-R1)
 
-**Permission:** `Execution:Read`, gated on the fleet-read chokepoint — same gate, same confinement
+**Permission:** `Execution:Read`, gated on the fleet-read chokepoint - same gate, same confinement
 rules, and the same `execution_child_row_json` shared builder as the legacy
 `GET /api/executions/{id}/children` route documented above (`docs/api-twin-recipe.md` Rule 1). MCP
 twin: `get_execution_children`. An invisible or nonexistent parent returns `404` with no existence
 oracle; under a confined grant, each child is checked against the caller's visibility
-**independently** of the parent's own visibility — a visible parent does not by itself disclose a
+**independently** of the parent's own visibility - a visible parent does not by itself disclose a
 child dispatched by, or targeting, someone else (#3789). Not audited on a successful read (matches
 the legacy route's own posture); a confined denial is audited as `execution.read`.
 
@@ -5447,7 +5447,7 @@ denied the fleet-wide list outright (schedules carry no per-agent axis for `flee
 confine against), then `Schedule:Read`. The v1 twin of `GET /fragments/schedules`, MCP twin
 `list_schedules` (widened by this PR to include `execution_count`). Accepts `definition_id` and
 `enabled_only` query parameters (#2146 A2-R1), matching the legacy unversioned `GET /api/schedules`
-route's exact parsing — **not** the same capability, though: this route remains a distinct,
+route's exact parsing - **not** the same capability, though: this route remains a distinct,
 separately-ledgered twin of `GET /fragments/schedules`, not of `GET /api/schedules` documented
 above.
 

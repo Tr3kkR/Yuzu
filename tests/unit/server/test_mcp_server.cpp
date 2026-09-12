@@ -57,7 +57,7 @@
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
 #include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
-#include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg — #2146 A2-R1
+#include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg - #2146 A2-R1
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
 // the store's live-state assertions below need the full definition + its
