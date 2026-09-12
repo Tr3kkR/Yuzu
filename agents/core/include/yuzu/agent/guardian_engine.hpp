@@ -566,7 +566,23 @@ private:
     /// count a genuine per-push arm failure (else a timed-out rule's push is
     /// silently treated as fully applied and the server never retries it) without
     /// also holding generation on routine/expected inert outcomes (#2233 item 3).
-    enum class ReconcileOutcome { Armed, Failed, Inert };
+    ///
+    /// Accepted (rung 9c PR-2, structural step): the rule was eligible, a spark arm
+    /// ATTEMPT was dispatched and accepted, but has not yet resolved — as opposed to
+    /// Armed (resolved, successfully). Named after
+    /// docs/spark-stage2-guardian-consumer-design.md §R5.3's own vocabulary
+    /// ("'Accepted' means reconcile_rule_locked() returned Accepted specifically —
+    /// the async-arm outcome, as opposed to Armed"). NOT YET PRODUCED by any code
+    /// path today: GuardianSparkRuntime::attach_rule() still waits (bounded) for its
+    /// own claim's outcome before returning, so every call here still resolves to
+    /// Armed or Failed before reconcile_rule_locked can return at all. This value
+    /// exists ahead of the behavior change that will produce it (attach_rule's own
+    /// non-waiting cutover, rung 9c PR-2's remaining, not-yet-attempted step) so
+    /// apply_rules' generation-hold gate already has the right shape to add it to
+    /// once it becomes reachable — apply_rules treats it exactly like an
+    /// unresolved episode (holds the generation), never like Failed (it is not a
+    /// failure) or like Armed (it is not yet resolved).
+    enum class ReconcileOutcome { Armed, Accepted, Failed, Inert };
 
     /// THE reconcile op (rung 7): the SOLE per-rule arm/disarm decision point,
     /// replacing the direct start_guard_for_rule_locked call apply_rules and

@@ -903,6 +903,11 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
 
     std::size_t applied = 0;
     std::size_t reconcile_failures = 0;
+    // rung 9c PR-2 (structural step, R5.3): rules ACCEPTED this push whose arm has
+    // not yet resolved - always 0 today (see ReconcileOutcome::Accepted's own doc);
+    // holds the generation exactly like a failure would, without being counted as
+    // one (arm_failures_/reconcile_failures stay a genuine-failure signal only).
+    std::size_t pending_arms = 0;
     // F7: rule_ids seen in a full_sync push, for the unsupported_rules_ sweep below.
     // guards_/spark_runtime_ don't need this - they're unconditionally torn down and
     // rebuilt fresh by stop_all_guards_locked()/detach_all() + the loop below.
@@ -1047,6 +1052,16 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             arm_failures_.fetch_add(1, std::memory_order_relaxed);
             continue; // not counted as applied - reconcile_rule_locked already logged why
         }
+        // rung 9c PR-2 (structural step, R5.3): Accepted is not a failure - the rule
+        // was eligible and its arm was dispatched - so it is counted as applied
+        // exactly like Armed/Inert, never added to reconcile_failures/arm_failures_.
+        // But it is also not yet resolved, so it must independently hold the
+        // generation below (never on acceptance alone). NOT YET REACHABLE: no path
+        // produces ReconcileOutcome::Accepted today (see its own doc) - this branch
+        // and pending_arms below are structural preparation for when attach_rule's
+        // wait is removed, not a behavior change (pending_arms is always 0 here).
+        if (outcome == ReconcileOutcome::Accepted)
+            ++pending_arms;
         ++applied;
     }
 
@@ -1077,15 +1092,21 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // live so a transient OOM/thread-exhaustion self-heals. (Sol B1 / Fable.) A later
     // successful push can still advance past a persistently-failing rule; arm_failures_
     // (surfaced via the heartbeat, item 9) is the durable fleet-visible signal for that.
-    if (reconcile_failures == 0 && push.policy_generation() > policy_generation_) {
+    // rung 9c PR-2 (structural step): an accepted-but-unresolved arm holds the
+    // generation exactly like a failure would (R5.3: "the policy generation
+    // advances ... only once every rule accepted under it has either armed or
+    // been quarantined ... never on acceptance alone") - pending_arms is always 0
+    // today, so this does not yet change which pushes advance.
+    if (reconcile_failures == 0 && pending_arms == 0 && push.policy_generation() > policy_generation_) {
         policy_generation_ = push.policy_generation();
         persist_generation_locked();
     }
 
     refresh_count_locked();
     spdlog::info(
-        "Guardian: apply_rules ok (applied={}, failed={}, full_sync={}, generation={}, total={})",
-        applied, reconcile_failures, push.full_sync(), policy_generation_, rule_count_);
+        "Guardian: apply_rules ok (applied={}, failed={}, pending={}, full_sync={}, generation={}, "
+        "total={})",
+        applied, reconcile_failures, pending_arms, push.full_sync(), policy_generation_, rule_count_);
     return applied;
 }
 
@@ -1658,6 +1679,11 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         if (placement == RulePlacement::Arm) {
             withdraw_legacy_guard_locked(rule.rule_id());
             unsupported_rules_.erase(rule.rule_id()); // F7: about to arm (or fail arming) - not Unsupported either way
+            // rung 9c PR-2 (structural step): attach_rule() still WAITS (bounded) for
+            // its own claim's outcome, so `gen` is always already resolved here - this
+            // always maps to Armed, never (yet) to ReconcileOutcome::Accepted. Once
+            // attach_rule's wait is removed (this PR's remaining, not-yet-attempted
+            // step), a successful-but-unresolved `gen` maps to Accepted instead.
             auto gen = spark_runtime_->attach_rule(rule.rule_id(), std::move(*spec),
                                                    std::move(*assertion),
                                                    /*emit_compliant_edge=*/true);
