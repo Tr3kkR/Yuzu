@@ -5508,11 +5508,13 @@ mapped to a `503` (a client typo must not read as store degradation).
 
 **Permission:** `Response:Read`, same resolve-then-scope confinement as the routes above. The v1
 twin of `GET /api/responses/{id}/export` above (no MCP twin — export is a REST-only shape). `format`
-is `json` (default) or `csv`; `limit` is clamped to `[1,10000]` on both bounds (see the correction
-above). Unlike the legacy export's narrower 7-column CSV, both formats here carry the same field set
-as `GET /api/v1/responses/{id}` (`id, instruction_id, agent_id, execution_id, status, output,
-error_detail, timestamp, plugin, received_at_ms`) — this is a brand-new endpoint with no
-positional-column consumer to keep compatible. Both formats set `Content-Disposition: attachment`.
+is `json` (default) or `csv` — an unrecognised value falls through to `json`, matching the legacy
+route's own behavior exactly (neither route rejects an unknown `format` with `400`); `limit` is
+clamped to `[1,10000]` on both bounds (see the correction above). Unlike the legacy export's
+narrower 7-column CSV, both formats here carry the same field set as `GET /api/v1/responses/{id}`
+(`id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin,
+received_at_ms`) — this is a brand-new endpoint with no positional-column consumer to keep
+compatible. Both formats set `Content-Disposition: attachment`.
 
 ---
 
