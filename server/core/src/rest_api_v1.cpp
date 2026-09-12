@@ -1123,6 +1123,9 @@ const std::string& openapi_spec() {
     },
     "/executions/{id}/responses": {
       "get": {"summary": "Responses for one execution (#4030)", "tags": ["Events"], "description": "REST v1 twin of MCP query_responses' execution_id-scoped filter (no new MCP tool: query_responses already covers this shape). A DISTINCT route from GET /executions/{id}, not a query param on it — response bodies are gated on Response:Read, a different securable than the detail route's Execution:Read. Scope pushdown mirrors query_responses exactly: distinct_agent_ids_by_execution -> in_scope filter -> pushed into the store query BEFORE limit (ADR-0017 INV-3). No offset parameter, matching query_responses exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is non-terminal, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400, not silently ignored (#4030 Gate 8 fix). Audited as execution.detail.fetch, REST fail-closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows for this execution", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/executions/{id}/children": {
+      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}]})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
         // Executions/Workflows/Schedules read-twin routes (#4030) grew this
@@ -8298,6 +8301,158 @@ void RestApiV1::register_routes(
                 }
             }
             res.set_content(ok_json(data_obj.str()), "application/json");
+        });
+
+    // ── GET /api/v1/executions/{id}/children (#2146 A2-R1) ──────────────
+    //
+    // REST v1 twin of the legacy GET /api/executions/{id}/children
+    // (execution_routes.cpp) -- same gate (fleet_read_fn, Execution:Read),
+    // same confinement rules (execution_scope_rules.hpp's execution_visible,
+    // applied to the parent AND independently to each child -- a visible
+    // parent does not by itself disclose a child dispatched by, or
+    // targeting, someone else, #3789), and the SAME execution_child_row_json
+    // shared builder (execution_model.hpp) the legacy route now also calls
+    // (docs/api-twin-recipe.md Rule 1). Batched per-child status lookup
+    // under confinement (get_agent_statuses_for_executions_checked), never
+    // N+1 (ADR-0017 INV-10).
+    //
+    // Auth: Execution:Read via fleet_read_fn. Audit: mirrors the legacy
+    // route's own posture exactly -- "execution.read"/"denied" ONLY under an
+    // engaged scope when the parent is invisible/nonexistent; no audit call
+    // on a successful read (metadata about executions, not itself the
+    // per-agent behavioural PII the detail route's `?include=agents`
+    // expansion carries) and no audit call for an unconfined caller's
+    // genuinely-nonexistent id (ordinary 404, not a confinement decision).
+    sink.Get(
+        R"(/api/v1/executions/([A-Za-z0-9_-]{1,128})/children)",
+        [fleet_read_fn, auth_fn, audit_fn, execution_tracker](const httplib::Request& req,
+                                                              httplib::Response& res) {
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/executions/{{id}}/children: fleet_read_fn unwired; "
+                              "cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Execution", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!execution_tracker) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "execution tracker unavailable",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+
+            auto exec_id = req.matches[1].str();
+            std::string username;
+            if (gate.scope) {
+                auto session = auth_fn(req, res);
+                if (!session)
+                    return;
+                username = session->username;
+                // #3789: an empty username under an engaged scope means
+                // session resolution failed after the fleet gate already
+                // admitted the request -- fail closed rather than silently
+                // fall through to agent-only visibility (matches the bare
+                // detail/list routes' identical guard).
+                if (username.empty()) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::a4_error(res,
+                                         "unable to resolve caller identity for a confined read",
+                                         {.retry_after_ms = 5000}),
+                        "application/json");
+                    return;
+                }
+            }
+
+            auto exec_r = execution_tracker->get_execution_checked(exec_id);
+            if (!exec_r) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& exec_opt = *exec_r;
+
+            std::vector<AgentExecStatus> parent_statuses;
+            if (gate.scope) {
+                auto statuses_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                if (!statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                parent_statuses = std::move(*statuses_opt);
+            }
+
+            const bool parent_visible =
+                exec_opt.has_value() &&
+                execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+            if (!exec_opt || !parent_visible) {
+                // #3789: audit ONLY under an engaged scope -- matches the
+                // legacy route's identical rationale (compliance-officer F2).
+                if (gate.scope) {
+                    (void)audit_fn(req, "execution.read", "denied", "Execution", exec_id,
+                                   "not found or outside caller's fleet-read scope "
+                                   "surface=children cid=" +
+                                       cid);
+                }
+                res.status = 404;
+                res.set_content(detail::error_json_a4(404, "execution not found", cid),
+                                "application/json");
+                return;
+            }
+
+            auto children_opt = execution_tracker->get_children_checked(exec_id);
+            if (!children_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "execution tracker degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+
+            JArr arr;
+            if (gate.scope) {
+                // #3789 (Sol/gpt-5.6-sol adversarial review, mirrored from
+                // the legacy route): parent visibility does NOT authorize
+                // enumerating every child -- each independently passes
+                // execution_visible. One batched statuses call, not N+1.
+                std::vector<std::string> child_ids;
+                child_ids.reserve(children_opt->size());
+                for (const auto& c : *children_opt)
+                    child_ids.push_back(c.id);
+                auto child_statuses_opt =
+                    execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
+                if (!child_statuses_opt) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "execution tracker degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                static const std::vector<AgentExecStatus> kEmptyStatuses;
+                for (const auto& c : *children_opt) {
+                    auto it = child_statuses_opt->find(c.id);
+                    const auto& c_statuses =
+                        it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                    if (!execution_visible(c, c_statuses, gate.scope, username))
+                        continue;
+                    arr.add_raw(execution_child_row_json(c).dump());
+                }
+            } else {
+                for (const auto& c : *children_opt)
+                    arr.add_raw(execution_child_row_json(c).dump());
+            }
+            res.set_content(ok_json(JObj().raw("children", arr.str()).str()), "application/json");
         });
 
     // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──

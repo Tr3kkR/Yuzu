@@ -1,5 +1,6 @@
 #include "execution_routes.hpp"
 
+#include "execution_model.hpp" // #2146 A2-R1: shared execution_child_row_json builder
 #include "execution_scope_rules.hpp"
 #include "execution_tracker.hpp"
 #include "http_route_sink.hpp"
@@ -813,13 +814,15 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
                 if (!execution_visible(c, c_statuses, gate.scope, username))
                     continue;
-                arr.push_back(
-                    {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                // #2146 A2-R1: shared builder (execution_model.hpp) — REST v1's
+                // new GET /api/v1/executions/{id}/children and MCP's new
+                // get_execution_children call the SAME function, so this row
+                // shape cannot drift from theirs (docs/api-twin-recipe.md Rule 1).
+                arr.push_back(execution_child_row_json(c));
             }
         } else {
             for (const auto& c : *children_opt) {
-                arr.push_back(
-                    {{"id", c.id}, {"status", c.status}, {"dispatched_at", c.dispatched_at}});
+                arr.push_back(execution_child_row_json(c));
             }
         }
         res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");

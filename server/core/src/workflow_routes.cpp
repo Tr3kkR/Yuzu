@@ -2296,12 +2296,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                     "application/json");
                     return;
                 }
+                // #2146 A2-R1: definition_id/enabled_only query params,
+                // matching the legacy GET /api/schedules route's exact
+                // parsing (schedule_routes.cpp) -- ANY presence of
+                // enabled_only (regardless of value) sets it true, a
+                // pre-existing quirk reproduced here for parity rather than
+                // "fixed" into a stricter parse.
+                ScheduleQuery q;
+                if (req.has_param("definition_id"))
+                    q.definition_id = req.get_param_value("definition_id");
+                if (req.has_param("enabled_only"))
+                    q.enabled_only = true;
                 // #4030 review finding (blocking): was the unchecked
                 // query_schedules(), which collapsed a pool-exhaustion or
                 // query failure into the same empty vector a genuinely
                 // empty table returns -- matches GET /api/v1/workflows
                 // above, which already has this checked/503 shape.
-                auto scheds_result = schedule_engine->query_schedules_checked();
+                auto scheds_result = schedule_engine->query_schedules_checked(q);
                 if (!scheds_result) {
                     res.status = 503;
                     res.set_content(detail::a4_error(res,

@@ -134,6 +134,10 @@ struct ExecHarness {
     /// file leaves it nullptr, and a fourth SQLite file per harness would be
     /// unpaid cost on ~60 constructions (CLAUDE.md test-efficiency discipline).
     std::unique_ptr<WorkflowEngine> workflows;
+    /// #2146 A2-R1: opt-in real ScheduleEngine, same rationale as `workflows`
+    /// above -- unpaid cost on every other test in this file, which is
+    /// content with the pre-existing schedule_engine==nullptr path.
+    std::unique_ptr<ScheduleEngine> schedule_engine;
     /// Opt-in `ProductPackStore` so `/api/product-packs*` (install/uninstall fan-out into
     /// InstructionStore/PolicyStore/WorkflowEngine, ADR-0064) is reachable. Opt-in for the same
     /// reason as `workflows` above — unpaid cost on every other test in this file.
@@ -259,7 +263,15 @@ struct ExecHarness {
                          bool wire_fleet_read_fn_arg = true,
                          bool with_product_pack_store = false,
                          WorkflowRoutes::AuthFn auth_override = {},
-                         WorkflowRoutes::FleetReadFn fleet_read_override = {})
+                         WorkflowRoutes::FleetReadFn fleet_read_override = {},
+                         // #2146 A2-R1: opt-in real ScheduleEngine so
+                         // GET /api/v1/schedules' definition_id/enabled_only
+                         // filters can be exercised end-to-end. Opt-in for
+                         // the same reason as with_workflow_engine above --
+                         // unpaid cost on every other test in this file,
+                         // which is content with the pre-existing
+                         // schedule_engine==nullptr "Not available" path.
+                         bool with_schedule_engine = false)
         : stream_budget(budget),
           instr_db(uniq("wf-routes-inst")),
           wf_db(uniq("wf-routes-wf")) {
@@ -303,6 +315,14 @@ struct ExecHarness {
             product_pack_store = std::make_unique<ProductPackStore>(pool);
             REQUIRE(product_pack_store->is_open());
             product_pack_store->set_require_signed_packs(false); // unsigned test bundles
+        }
+
+        // #2146 A2-R1: ScheduleEngine is Postgres-backed (ADR-0065) -- shares
+        // this harness's `pool` (schema-per-store, ADR-0008), same as
+        // WorkflowEngine/InstructionStore/ResponseStore above.
+        if (with_schedule_engine) {
+            schedule_engine = std::make_unique<ScheduleEngine>(pool);
+            REQUIRE(schedule_engine->is_open());
         }
 
         WorkflowRoutes::AuthFn auth_fn =
@@ -413,6 +433,7 @@ struct ExecHarness {
         // path for every pre-existing test.
         wf_deps.workflow_engine = workflows.get();
         wf_deps.product_pack_store = product_pack_store.get();
+        wf_deps.schedule_engine = schedule_engine.get(); // #2146 A2-R1
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
         // nullptr but is still registered, which is the qe-S1 path.
@@ -3496,4 +3517,95 @@ TEST_CASE("GET /api/v1/schedules: a service-scoped token is denied the fleet-wid
     auto res = h.sink.Get("/api/v1/schedules");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// #2146 A2-R1: definition_id/enabled_only query params, threaded into the
+// same ScheduleQuery the legacy GET /api/schedules route already populates.
+// Real ScheduleEngine (with_schedule_engine=true) so the filters are proven
+// to actually narrow the result set, not just be accepted and ignored.
+
+TEST_CASE("GET /api/v1/schedules: definition_id narrows the result set",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    InstructionSchedule matching;
+    matching.name = "sched-match";
+    matching.definition_id = "def-2146-a2r1";
+    matching.frequency_type = "once";
+    matching.created_by = "admin";
+    auto matching_id = h.schedule_engine->create_schedule(matching);
+    REQUIRE(matching_id.has_value());
+
+    InstructionSchedule other;
+    other.name = "sched-other";
+    other.definition_id = "def-2146-other";
+    other.frequency_type = "once";
+    other.created_by = "admin";
+    auto other_id = h.schedule_engine->create_schedule(other);
+    REQUIRE(other_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/schedules?definition_id=def-2146-a2r1");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    bool found_matching = false, found_other = false;
+    for (const auto& row : body["data"]) {
+        if (row["id"] == *matching_id)
+            found_matching = true;
+        if (row["id"] == *other_id)
+            found_other = true;
+    }
+    CHECK(found_matching);
+    CHECK_FALSE(found_other);
+}
+
+TEST_CASE("GET /api/v1/schedules: enabled_only narrows the result set",
+          "[pg][workflow][v1][twins][schedules]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool, /*with_bus=*/true, /*budget=*/nullptr, /*wire_exec_visible=*/true,
+                  /*with_workflow_engine=*/false, /*wire_fleet_read_fn_arg=*/true,
+                  /*with_product_pack_store=*/false, /*auth_override=*/{},
+                  /*fleet_read_override=*/{}, /*with_schedule_engine=*/true);
+    h.perm_grant = true;
+
+    InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled";
+    enabled_sched.definition_id = "def-2146-enabled";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = h.schedule_engine->create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled";
+    disabled_sched.definition_id = "def-2146-disabled";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = h.schedule_engine->create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/schedules?enabled_only=true");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].is_array());
+    bool found_enabled = false, found_disabled = false;
+    for (const auto& row : body["data"]) {
+        if (row["id"] == *enabled_id)
+            found_enabled = true;
+        if (row["id"] == *disabled_id)
+            found_disabled = true;
+    }
+    CHECK(found_enabled);
+    CHECK_FALSE(found_disabled);
 }

@@ -55,6 +55,7 @@
 #include "dispatch_destructive_gate.hpp" // #3685: evaluate_destructive_targeting — shared with /api/command
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_scope_rules.hpp" // #2146 A2-R1: execution_visible, shared with rest_api_v1.cpp/execution_routes.cpp
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
@@ -657,9 +658,27 @@ static const ToolDef kTools[] = {
      "the SAME redacted counts/scope_expression as any other confined caller. "
      "#4030: include:[\"agents\"] adds a confined per-agent status/duration array "
      "plus a kpi summary (total/succeeded/failed/p50_ms/p95_ms) — audited "
-     "separately from the bare call because it discloses raw agent identities.",
+     "separately from the bare call because it discloses raw agent identities. "
+     "#2146 A2-R1: the result also carries parameter_values (redacted to "
+     "\"(redacted - confined view)\" for a confined caller, exactly like "
+     "scope_expression), plus completed_at/parent_id/rerun_of, which stay "
+     "truthful for every caller — the REST v1 twin GET /api/v1/executions/{id} "
+     "already returned all four; this closes the MCP field-parity gap.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","description":"Execution ID"},"include":{"type":"array","items":{"type":"string","enum":["agents"]},"description":"Optional; \"agents\" adds a confined per-agent array + kpi summary"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct"]})j"},
+     R"j({"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"scope_expression":{"type":"string"},"parameter_values":{"type":"string","description":"Redacted to \"(redacted - confined view)\" for a confined caller"},"dispatched_by":{"type":"string"},"dispatched_at":{"type":"integer"},"agents_targeted":{"type":"integer"},"agents_responded":{"type":"integer"},"agents_success":{"type":"integer"},"agents_failure":{"type":"integer"},"progress_pct":{"type":"integer"},"completed_at":{"type":"integer"},"parent_id":{"type":"string"},"rerun_of":{"type":"string"},"retry_after_ms":{"type":"integer","description":"Present only while status is non-terminal — minimum ms before polling again"},"agents":{"type":"array","description":"Present only when include contains \"agents\"","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"},"first_response_at":{"type":"integer"},"completed_at":{"type":"integer"},"exit_code":{"type":"integer"},"error_detail":{"type":"string"}}}},"kpi":{"type":"object","description":"Present only when include contains \"agents\"","properties":{"total":{"type":"integer"},"succeeded":{"type":"integer"},"failed":{"type":"integer"},"p50_ms":{"type":["number","null"]},"p95_ms":{"type":["number","null"]}}},"audit_persisted":{"type":"boolean","description":"Present and false only when the per-agent expansion's audit row failed to persist"}},"required":["id","definition_id","status","scope_expression","parameter_values","dispatched_by","dispatched_at","agents_targeted","agents_responded","agents_success","agents_failure","progress_pct","completed_at","parent_id","rerun_of"]})j"},
+
+    {"get_execution_children",
+     "List an execution's child executions (spawned reruns, workflow-step "
+     "fan-out, or other lineage). Confined by management group: an invisible "
+     "or nonexistent parent execution_id returns the same not-found error, "
+     "and — per #3789 — a visible parent does NOT by itself disclose a "
+     "child dispatched by, or targeting, someone else: each child "
+     "independently passes the same visible-agent-or-owner test the parent "
+     "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
+     "GET /api/executions/{id}/children (same shared row builder, "
+     "docs/api-twin-recipe.md Rule 1).",
+     R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"description":"Parent execution ID"}},"required":["execution_id"]})",
+     R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}}},"required":["children"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
@@ -674,8 +693,10 @@ static const ToolDef kTools[] = {
     {"list_schedules", "List scheduled (recurring) instructions. #4030: rows now also "
      "carry execution_count, matching the dashboard fragment's field set. The query is "
      "hard-capped at 100 rows with no limit/cursor parameter; a result hitting that cap "
-     "sets result_truncated_by_cap:true rather than presenting a partial list as complete.",
-     R"({"type":"object","properties":{}})",
+     "sets result_truncated_by_cap:true rather than presenting a partial list as complete. "
+     "#2146 A2-R1: optional definition_id/enabled_only filters, matching the legacy "
+     "GET /api/schedules route and the REST v1 twin GET /api/v1/schedules.",
+     R"({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to schedules for this instruction definition"},"enabled_only":{"type":"boolean","description":"Only return enabled schedules"}}})",
      R"j({"type":"object","properties":{"schedules":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"definition_id":{"type":"string"},"frequency_type":{"type":"string"},"enabled":{"type":"boolean"},"next_execution_at":{"type":"integer"},"execution_count":{"type":"integer"}},"required":["id","name","definition_id","frequency_type","enabled","next_execution_at","execution_count"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["schedules"]})j"},
 
     {"list_workflows", "List multi-step workflows (WorkflowEngine — a different data model "
@@ -2412,6 +2433,9 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // fleet_read_fn_ alongside the response tools above; same reclassification
     // rationale.
     {"get_execution_status", {"Execution", "Read", ServiceScopeClass::confined}},
+    // #2146 A2-R1 — same fleet_read_fn_-gated confinement mechanism as
+    // get_execution_status/list_executions above.
+    {"get_execution_children", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_executions", {"Execution", "Read", ServiceScopeClass::confined}},
     {"list_schedules", {"Schedule", "Read", ServiceScopeClass::confined}},
     // #4030: Workflow (multi-step orchestration) — RBAC seeding prerequisite
@@ -3002,6 +3026,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"preview_management_group_agent_count",
      {ToolEffect::Additive, true, "Preview management group agent count"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
+    {"get_execution_children", {ToolEffect::ReadOnly, true, "List execution children"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
     {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
     {"list_workflows", {ToolEffect::ReadOnly, true, "List workflows"}},
@@ -8045,6 +8070,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 int64_t progress_pct =
                     execution_tracker->get_summary(exec_id).progress_pct;
                 std::string scope_expression = exec->scope_expression;
+                // #2146 A2-R1: parameter_values follows the EXACT SAME
+                // redaction rule as scope_expression -- security-relevant,
+                // do not weaken. The REST v1 twin (rest_api_v1.cpp) and the
+                // legacy detail route (execution_routes.cpp) both replace
+                // parameter_values with this same literal for a confined
+                // caller; never serialize the raw value here.
+                std::string parameter_values = exec->parameter_values;
                 if (gate.scope) {
                     // #1634 residual: see REST GET /api/v1/executions/{id} — agent status
                     // rows are response-arrival seeded, not dispatch-time target seeded,
@@ -8073,19 +8105,28 @@ McpServer::HandlerFn McpServer::build_handler(
                                        ? (agents_responded * 100 / agents_targeted)
                                        : 0;
                     scope_expression = "(redacted - confined view)";
+                    parameter_values = "(redacted - confined view)";
                 }
+                // Deliberately keep status, completion time, dispatcher, and
+                // lineage truthful for this narrower slice; none directly
+                // names another agent (matches the REST v1 detail route's
+                // identical posture, rest_api_v1.cpp).
                 auto obj = JObj()
                                .add("id", exec->id)
                                .add("definition_id", exec->definition_id)
                                .add("status", exec->status)
                                .add("scope_expression", scope_expression)
+                               .add("parameter_values", parameter_values)
                                .add("dispatched_by", exec->dispatched_by)
                                .add("dispatched_at", exec->dispatched_at)
                                .add("agents_targeted", agents_targeted)
                                .add("agents_responded", agents_responded)
                                .add("agents_success", agents_success)
                                .add("agents_failure", agents_failure)
-                               .add("progress_pct", progress_pct);
+                               .add("progress_pct", progress_pct)
+                               .add("completed_at", exec->completed_at)
+                               .add("parent_id", exec->parent_id)
+                               .add("rerun_of", exec->rerun_of);
                 // #3344: retry_after_ms is emitted ONLY while non-terminal, via
                 // the shared mcp::is_execution_terminal() predicate (Gate 8
                 // fold: this and query_responses' poll-hint independently
@@ -8125,6 +8166,134 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // ── get_execution_children (#2146 A2-R1) ──────────────────────
+            // REST v1 twin: GET /api/v1/executions/{id}/children
+            // (rest_api_v1.cpp); legacy twin: GET /api/executions/{id}/children
+            // (execution_routes.cpp). All three call execution_model.hpp's
+            // execution_child_row_json and share execution_scope_rules.hpp's
+            // execution_visible confinement predicate (docs/api-twin-recipe.md
+            // Rule 1) -- not re-derived here.
+            if (tool_name == "get_execution_children") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("get_execution_children: fleet_read_fn_ unwired; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Execution", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the response.
+                if (!execution_tracker) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Execution tracker unavailable"),
+                        "application/json");
+                    return;
+                }
+                auto exec_id = param_str(args, "execution_id");
+                std::string username;
+                if (gate.scope) {
+                    // #1634/#3789 precedent (list_executions below): an empty
+                    // username under an engaged scope must never silently
+                    // widen to "no owner filter" -- fail closed instead.
+                    username = session->username;
+                    if (username.empty()) {
+                        spdlog::error("get_execution_children: confined session has empty "
+                                      "username; failing closed rather than risk an unfiltered "
+                                      "read");
+                        res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                        "application/json");
+                        return;
+                    }
+                }
+
+                auto exec_r = execution_tracker->get_execution_checked(exec_id);
+                if (!exec_r) {
+                    res.set_content(
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                const auto& exec_opt = *exec_r;
+
+                std::vector<AgentExecStatus> parent_statuses;
+                if (gate.scope) {
+                    auto statuses_opt = execution_tracker->get_agent_statuses_checked(exec_id);
+                    if (!statuses_opt) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    parent_statuses = std::move(*statuses_opt);
+                }
+
+                const bool parent_visible =
+                    exec_opt.has_value() &&
+                    execution_visible(*exec_opt, parent_statuses, gate.scope, username);
+                if (!exec_opt || !parent_visible) {
+                    // #3789: audit ONLY under an engaged scope -- mirrors the
+                    // REST twins' identical rationale (compliance-officer F2).
+                    if (gate.scope) {
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, "execution.read", "denied", "Execution", exec_id,
+                            "MCP children query: not found or outside caller's fleet-read scope");
+                    }
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Execution not found: " + exec_id),
+                        "application/json");
+                    return;
+                }
+
+                auto children_opt = execution_tracker->get_children_checked(exec_id);
+                if (!children_opt) {
+                    res.set_content(
+                        a4_error(kInternalError, "execution tracker degraded", {},
+                                /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+
+                JArr arr;
+                if (gate.scope) {
+                    // #3789: parent visibility does NOT authorize enumerating
+                    // every child -- each independently passes
+                    // execution_visible. One batched statuses call, not N+1
+                    // (ADR-0017 INV-10).
+                    std::vector<std::string> child_ids;
+                    child_ids.reserve(children_opt->size());
+                    for (const auto& c : *children_opt)
+                        child_ids.push_back(c.id);
+                    auto child_statuses_opt =
+                        execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
+                    if (!child_statuses_opt) {
+                        res.set_content(
+                            a4_error(kInternalError, "execution tracker degraded", {},
+                                    /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    static const std::vector<AgentExecStatus> kEmptyStatuses;
+                    for (const auto& c : *children_opt) {
+                        auto it = child_statuses_opt->find(c.id);
+                        const auto& c_statuses =
+                            it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
+                        if (!execution_visible(c, c_statuses, gate.scope, username))
+                            continue;
+                        arr.add_raw(execution_child_row_json(c).dump());
+                    }
+                } else {
+                    for (const auto& c : *children_opt)
+                        arr.add_raw(execution_child_row_json(c).dump());
+                }
+                res.set_content(
+                    success_response(id, tool_result(JObj().raw("children", arr.str()).str(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -8338,7 +8507,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // from a genuinely empty table -- mirrors the same-PR
                 // list_workflows MCP tool's checked/error_response shape
                 // immediately below.
+                // #2146 A2-R1: definition_id/enabled_only filters, threaded
+                // into the same ScheduleQuery the REST v1 twin (GET
+                // /api/v1/schedules, workflow_routes.cpp) and the legacy
+                // GET /api/schedules route already populate.
                 ScheduleQuery sq;
+                sq.definition_id = param_str(args, "definition_id");
+                if (args.contains("enabled_only") && args["enabled_only"].is_boolean())
+                    sq.enabled_only = args["enabled_only"].get<bool>();
                 auto schedules_result = schedule_engine->query_schedules_checked(sq);
                 if (!schedules_result) {
                     res.set_content(

@@ -433,6 +433,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_workflows", "Workflow", "Read", true},
     {"get_workflow", "Workflow", "Read", true},
     {"get_workflow_execution", "Workflow", "Read", true},
+    // #2146 A2-R1 — pinned against the new GET /api/v1/executions/{id}/children
+    // (rest_api_v1.cpp) and legacy GET /api/executions/{id}/children
+    // (execution_routes.cpp) handlers' shared (securable, operation) gate.
+    {"get_execution_children", "Execution", "Read", true},
     // #4029 (api-parity Batch A content/catalog half): instruction-definition
     // read twins, pinned against instruction_definition_model.hpp / the new
     // GET /api/v1/instructions* routes (rest_api_v1.cpp).

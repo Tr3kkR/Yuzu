@@ -56,6 +56,8 @@
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
+#include "schedule_engine.hpp" // #2146 A2-R1: list_schedules definition_id/enabled_only filter tests
+#include "test_schedule_engine_pg_helper.hpp" // ScheduleEnginePg — #2146 A2-R1
 // M5 remediation (ADR-0031 operator-surface functional coverage): mcp_server.hpp
 // only forward-declares PluginConfigStore (its .cpp includes the real header) —
 // the store's live-state assertions below need the full definition + its
@@ -927,6 +929,12 @@ struct McpTestServer {
     /// behaviour for tests that don't opt in.
     yuzu::server::WorkflowEngine* workflow_engine_for_test{nullptr};
 
+    /// #2146 A2-R1: optionally wire a real ScheduleEngine so list_schedules'
+    /// definition_id/enabled_only filters can be exercised end-to-end.
+    /// Default nullptr preserves the pre-existing "Schedule engine
+    /// unavailable" path for every test that doesn't opt in.
+    yuzu::server::ScheduleEngine* schedule_engine_for_test{nullptr};
+
     /// Slice 1 (agentic fan-out scale-hardening): optionally wire a real
     /// ResponseStore so query_responses can be exercised end-to-end, including
     /// the new execution_id exact-correlation collect path. Default nullptr
@@ -1409,7 +1417,8 @@ private:
             /*policy_store=*/nullptr,
             /*mgmt_store=*/nullptr,
             /*approval_manager=*/approval_manager_for_test,
-            /*schedule_engine=*/nullptr, read_only_mode_, mcp_disabled_, std::move(dispatch_fn),
+            /*schedule_engine=*/schedule_engine_for_test, read_only_mode_, mcp_disabled_,
+            std::move(dispatch_fn),
             /*ca_store=*/ca_store_for_test,
             /*publish_crl_fn=*/
             [this]() -> std::optional<std::vector<std::uint8_t>> {
@@ -5732,6 +5741,97 @@ TEST_CASE("MCP: list_schedules denies a service-scoped token, denial audited",
     CHECK(saw_denied);
 }
 
+// #2146 A2-R1: definition_id/enabled_only filters, threaded into the same
+// ScheduleQuery the REST v1 twin (GET /api/v1/schedules) and the legacy
+// GET /api/schedules route already populate. Real ScheduleEngine so the
+// filters are proven to actually narrow the result set.
+
+TEST_CASE("MCP list_schedules: definition_id narrows the result set (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule matching;
+    matching.name = "sched-match-mcp";
+    matching.definition_id = "def-2146-mcp-a2r1";
+    matching.frequency_type = "once";
+    matching.created_by = "admin";
+    auto matching_id = engine.create_schedule(matching);
+    REQUIRE(matching_id.has_value());
+
+    yuzu::server::InstructionSchedule other;
+    other.name = "sched-other-mcp";
+    other.definition_id = "def-2146-mcp-other";
+    other.frequency_type = "once";
+    other.created_by = "admin";
+    auto other_id = engine.create_schedule(other);
+    REQUIRE(other_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":770,"params":{"name":"list_schedules",)"
+        R"("arguments":{"definition_id":"def-2146-mcp-a2r1"}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["schedules"].is_array());
+    bool found_matching = false, found_other = false;
+    for (const auto& row : sc["schedules"]) {
+        if (row["id"] == *matching_id)
+            found_matching = true;
+        if (row["id"] == *other_id)
+            found_other = true;
+    }
+    CHECK(found_matching);
+    CHECK_FALSE(found_other);
+}
+
+TEST_CASE("MCP list_schedules: enabled_only narrows the result set (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled-mcp";
+    enabled_sched.definition_id = "def-2146-mcp-enabled";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = engine.create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    yuzu::server::InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled-mcp";
+    disabled_sched.definition_id = "def-2146-mcp-disabled";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = engine.create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":771,"params":{"name":"list_schedules",)"
+        R"("arguments":{"enabled_only":true}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["schedules"].is_array());
+    bool found_enabled = false, found_disabled = false;
+    for (const auto& row : sc["schedules"]) {
+        if (row["id"] == *enabled_id)
+            found_enabled = true;
+        if (row["id"] == *disabled_id)
+            found_disabled = true;
+    }
+    CHECK(found_enabled);
+    CHECK_FALSE(found_disabled);
+}
+
 // #3290 Phase 2: query_installed_software's per-tool blanket
 // deny_fleet_wide_service_scoped call (the guardian-confinement-2298 Gate
 // 2/4/6 finding this test used to pin) is RETIRED — confinement is now
@@ -7427,6 +7527,263 @@ TEST_CASE("MCP get_execution_status: invisible execution collapses to the same "
     // the (different) requested execution_id verbatim on both branches — the
     // no-oracle property is the shared PREFIX/code, not byte-identical text,
     // matching the "Execution not found: <id>" format on both paths.
+    auto invisible_json = nlohmann::json::parse(invisible->body);
+    auto missing_json = nlohmann::json::parse(missing->body);
+    REQUIRE(invisible_json.contains("error"));
+    REQUIRE(missing_json.contains("error"));
+    CHECK(invisible_json["error"]["code"] == missing_json["error"]["code"]);
+    CHECK(invisible_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+    CHECK(missing_json["error"]["message"].get<std::string>().starts_with("Execution not found:"));
+}
+
+// #2146 A2-R1: get_execution_status's output gains parameter_values (redacted
+// like scope_expression for a confined caller) plus completed_at/parent_id/
+// rerun_of (truthful for every caller, matching the REST v1 twin).
+
+TEST_CASE("MCP get_execution_status: unconfined caller sees real parameter_values plus "
+          "completed_at/parent_id/rerun_of (#2146 A2-R1)",
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-fields-2146";
+    exec.parameter_values = R"({"path":"C:\\Windows"})";
+    exec.dispatched_by = "operator";
+    exec.status = "completed";
+    exec.completed_at = 1735689999;
+    exec.parent_id = "exec-parent-1";
+    exec.rerun_of = "exec-rerun-1";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":760,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+        exec_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["parameter_values"] == exec.parameter_values);
+    CHECK(sc["completed_at"] == 1735689999);
+    CHECK(sc["parent_id"] == "exec-parent-1");
+    CHECK(sc["rerun_of"] == "exec-rerun-1");
+}
+
+TEST_CASE("MCP get_execution_status: confined caller gets parameter_values redacted, never "
+          "the raw value -- completed_at/parent_id/rerun_of stay truthful (#2146 A2-R1)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-scope-params-2146";
+    exec.parameter_values = R"({"secret":"do-not-leak"})";
+    exec.scope_expression = "agent:secret-target";
+    exec.dispatched_by = "alice";
+    exec.status = "completed";
+    exec.completed_at = 1735699999;
+    exec.parent_id = "exec-parent-2";
+    exec.rerun_of = "exec-rerun-2";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::server::AgentExecStatus bob_status;
+    bob_status.agent_id = "bob-agent";
+    bob_status.status = "success";
+    tracker.update_agent_status(exec_id, bob_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":761,)"
+                    R"("params":{"name":"get_execution_status","arguments":{"execution_id":")") +
+            exec_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    // (a)/(b): confined caller never sees the raw value, byte-checked against
+    // the whole response body, not just the field a builder might rename.
+    CHECK(res->body.find("do-not-leak") == std::string::npos);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    CHECK(sc["parameter_values"] == "(redacted - confined view)");
+    // (c): completed_at/parent_id/rerun_of stay truthful even confined.
+    CHECK(sc["completed_at"] == 1735699999);
+    CHECK(sc["parent_id"] == "exec-parent-2");
+    CHECK(sc["rerun_of"] == "exec-rerun-2");
+}
+
+// #2146 A2-R1: get_execution_children -- REST v1/legacy twin is
+// GET /api/v1/executions/{id}/children / GET /api/executions/{id}/children.
+
+TEST_CASE("MCP get_execution_children: lists children via the shared builder (unconfined)",
+          "[pg][mcp][integration][execution]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution parent;
+    parent.definition_id = "def-children-basic";
+    parent.dispatched_by = "operator";
+    parent.status = "completed";
+    auto parent_created = tracker.create_execution(parent);
+    REQUIRE(parent_created.has_value());
+    const std::string parent_id = *parent_created;
+
+    yuzu::server::Execution child;
+    child.definition_id = "def-children-basic";
+    child.dispatched_by = "operator";
+    child.status = "completed";
+    child.dispatched_at = 1735690000;
+    child.parent_id = parent_id;
+    auto child_created = tracker.create_execution(child);
+    REQUIRE(child_created.has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start("operator");
+
+    auto res = ts.call(
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":762,)"
+                    R"("params":{"name":"get_execution_children","arguments":{"execution_id":")") +
+        parent_id + R"("}}})");
+    REQUIRE(res);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["children"].is_array());
+    bool found = false;
+    for (const auto& c : sc["children"]) {
+        if (c["id"] == *child_created) {
+            found = true;
+            CHECK(c["status"] == "completed");
+            CHECK(c["dispatched_at"] == 1735690000);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("MCP get_execution_children: confines each child independently of the parent's own "
+          "visibility (#3789, #2146 A2-R1)",
+          "[pg][mcp][integration][execution][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+
+    yuzu::server::Execution parent;
+    parent.definition_id = "def-children-scope";
+    parent.dispatched_by = "alice";
+    parent.status = "completed";
+    auto parent_created = tracker.create_execution(parent);
+    REQUIRE(parent_created.has_value());
+    const std::string parent_id = *parent_created;
+
+    yuzu::server::AgentExecStatus bob_status;
+    bob_status.agent_id = "bob-agent";
+    bob_status.status = "success";
+    tracker.update_agent_status(parent_id, bob_status);
+
+    yuzu::server::Execution visible_child;
+    visible_child.definition_id = "def-children-scope";
+    visible_child.dispatched_by = "alice";
+    visible_child.status = "completed";
+    visible_child.parent_id = parent_id;
+    auto visible_child_id = tracker.create_execution(visible_child);
+    REQUIRE(visible_child_id.has_value());
+    tracker.update_agent_status(*visible_child_id, bob_status);
+
+    yuzu::server::Execution invisible_child;
+    invisible_child.definition_id = "def-children-scope";
+    invisible_child.dispatched_by = "alice";
+    invisible_child.status = "completed";
+    invisible_child.parent_id = parent_id;
+    auto invisible_child_id = tracker.create_execution(invisible_child);
+    REQUIRE(invisible_child_id.has_value());
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "success";
+    tracker.update_agent_status(*invisible_child_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto res = ts.call_raw(
+        "POST",
+        std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":763,)"
+                    R"("params":{"name":"get_execution_children","arguments":{"execution_id":")") +
+            parent_id + R"("}}})",
+        {{"Authorization", "Bearer " + token}});
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto sc = nlohmann::json::parse(res->body)["result"]["structuredContent"];
+    REQUIRE(sc["children"].is_array());
+    bool found_visible = false, found_invisible = false;
+    for (const auto& c : sc["children"]) {
+        if (c["id"] == *visible_child_id)
+            found_visible = true;
+        if (c["id"] == *invisible_child_id)
+            found_invisible = true;
+    }
+    CHECK(found_visible);
+    CHECK_FALSE(found_invisible);
+}
+
+TEST_CASE("MCP get_execution_children: invisible parent collapses to the same not-found "
+          "error as a nonexistent one (#2146 A2-R1)",
+          "[pg][mcp][integration][execution][scope][notfound]") {
+    YUZU_REQUIRE_PG_DB_TPL(authz_db, yuzu::test::response_execution_authz_tpl);
+    yuzu::test::ResponseExecutionAuthzPgRig authz{authz_db.dsn()};
+
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::server::ExecutionTracker& tracker = *tracker_bundle;
+    yuzu::server::Execution exec;
+    exec.definition_id = "def-children-invisible";
+    exec.dispatched_by = "alice";
+    exec.status = "running";
+    auto created = tracker.create_execution(exec);
+    REQUIRE(created.has_value());
+    const std::string exec_id = *created;
+
+    yuzu::server::AgentExecStatus alice_status;
+    alice_status.agent_id = "alice-agent";
+    alice_status.status = "success";
+    tracker.update_agent_status(exec_id, alice_status);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.fleet_read_fn_for_test = authz.fleet_read_fn();
+    ts.mock_username = "bob";
+    ts.start("operator");
+
+    const auto token = authz.mint_bob();
+    auto call = [&](const std::string& target_id) {
+        return ts.call_raw(
+            "POST",
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":764,)"
+                        R"("params":{"name":"get_execution_children","arguments":{"execution_id":")") +
+                target_id + R"("}}})",
+            {{"Authorization", "Bearer " + token}});
+    };
+    auto invisible = call(exec_id);
+    auto missing = call("exec-does-not-exist-at-all");
+    REQUIRE(invisible);
+    REQUIRE(missing);
     auto invisible_json = nlohmann::json::parse(invisible->body);
     auto missing_json = nlohmann::json::parse(missing->body);
     REQUIRE(invisible_json.contains("error"));

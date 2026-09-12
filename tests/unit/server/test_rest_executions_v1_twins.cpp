@@ -348,3 +348,118 @@ TEST_CASE("GET /api/v1/executions/:id/responses: fleet_read_fn gates on Response
     REQUIRE(res);
     CHECK(res->status == 403);
 }
+
+// #2146 A2-R1: GET /api/v1/executions/{id}/children -- REST v1 twin of the
+// legacy GET /api/executions/{id}/children (execution_routes.cpp), same
+// gate/confinement rules, same execution_child_row_json shared builder
+// (docs/api-twin-recipe.md Rule 1).
+
+TEST_CASE("GET /api/v1/executions/:id/children: lists children via the shared builder",
+          "[pg][rest][executions][v1][children]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto parent_id = h.make_exec_with_agents("def-children-parent");
+
+    Execution child;
+    child.definition_id = "def-children-parent";
+    child.dispatched_by = "tester";
+    child.status = "completed";
+    child.dispatched_at = 1735689700;
+    child.parent_id = parent_id;
+    auto child_id = h.execution_tracker->create_execution(child);
+    REQUIRE(child_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/executions/" + parent_id + "/children");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"].contains("children"));
+    REQUIRE(body["data"]["children"].is_array());
+    bool found = false;
+    for (const auto& c : body["data"]["children"]) {
+        if (c["id"] == *child_id) {
+            found = true;
+            CHECK(c["status"] == "completed");
+            CHECK(c["dispatched_at"] == 1735689700);
+        }
+    }
+    CHECK(found);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/children: unknown parent id is 404",
+          "[pg][rest][executions][v1][children]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+
+    auto res = h.sink.Get("/api/v1/executions/does-not-exist/children");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/children: each child is confined independently of the "
+          "parent's own visibility (#3789)",
+          "[pg][rest][executions][v1][children][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    // Parent has agent-A(success)/agent-B(failure) -- visible to a caller
+    // confined to agent-A.
+    auto parent_id = h.make_exec_with_agents("def-children-conf");
+
+    Execution visible_child;
+    visible_child.definition_id = "def-children-conf";
+    visible_child.dispatched_by = "someone-else";
+    visible_child.status = "completed";
+    visible_child.dispatched_at = 1735689710;
+    visible_child.parent_id = parent_id;
+    auto visible_child_id = h.execution_tracker->create_execution(visible_child);
+    REQUIRE(visible_child_id.has_value());
+    AgentExecStatus visible_status;
+    visible_status.agent_id = "agent-A";
+    visible_status.status = "success";
+    h.execution_tracker->update_agent_status(*visible_child_id, visible_status);
+
+    Execution invisible_child;
+    invisible_child.definition_id = "def-children-conf";
+    invisible_child.dispatched_by = "someone-else";
+    invisible_child.status = "completed";
+    invisible_child.dispatched_at = 1735689720;
+    invisible_child.parent_id = parent_id;
+    auto invisible_child_id = h.execution_tracker->create_execution(invisible_child);
+    REQUIRE(invisible_child_id.has_value());
+    AgentExecStatus invisible_status;
+    invisible_status.agent_id = "agent-C";
+    invisible_status.status = "success";
+    h.execution_tracker->update_agent_status(*invisible_child_id, invisible_status);
+
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    auto res = h.sink.Get("/api/v1/executions/" + parent_id + "/children");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"]["children"].is_array());
+    bool found_visible = false, found_invisible = false;
+    for (const auto& c : body["data"]["children"]) {
+        if (c["id"] == *visible_child_id)
+            found_visible = true;
+        if (c["id"] == *invisible_child_id)
+            found_invisible = true;
+    }
+    CHECK(found_visible);
+    CHECK_FALSE(found_invisible);
+}
+
+TEST_CASE("GET /api/v1/executions/:id/children: fleet_read_fn denial -> 403",
+          "[pg][rest][executions][v1][children][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    h.perm_grant = false;
+
+    auto res = h.sink.Get("/api/v1/executions/anything/children");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
