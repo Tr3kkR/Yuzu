@@ -59,6 +59,14 @@ class GuaranteedStatePush;
 
 namespace yuzu::agent {
 
+/// Per-heartbeat-tick bound for GuardianArmAckLedger::drain_locked() (rung 9c PR-2
+/// Unit 6), matching guardian_journal_format.hpp's kJournalPersistMaxRecordsPerTick
+/// in spirit (bound the one heartbeat-thread caller, never the one-shot callers -
+/// there are none for this ledger yet, but the same principle applies if one is
+/// ever added). Generous relative to a realistic push size since each entry costs
+/// one brief, allocation-free registry_mu_ check, not KV I/O.
+inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
+
 /// Content identity for a push: a rule_id, its enabled flag, enforcement_mode,
 /// version, and its spark/assertion/remediation GuardianSpecBlocks (type +
 /// params, each params map canonicalized by sorted key - proto's own
@@ -155,9 +163,31 @@ public:
     /// checked above, independent of whether pending is empty.
     bool can_advance() const;
 
-    /// The `applied` count stashed at begin_application() time. Valid only
-    /// when there is a current application; 0 otherwise.
+    /// The `applied` count stashed at begin_application() time (or updated by
+    /// set_applied(), below). Valid only when there is a current application;
+    /// 0 otherwise.
     std::size_t applied_count() const;
+
+    /// TEST-ONLY: the current application's still-pending receipt count (0 if there
+    /// is no current application). Lets a test settle on "every accepted arm from
+    /// the last push has resolved" without a production accessor of its own -
+    /// GuardianEngine::ack_pending_count_for_test() forwards to this. No production
+    /// caller.
+    std::size_t pending_count_for_test() const;
+
+    /// rung 9c PR-2 Unit 6: apply_rules() calls begin_application() BEFORE its
+    /// per-rule loop (so reconcile_rule_locked's add_pending() calls during
+    /// that loop land in the right application) but does not know the real
+    /// applied count until the loop finishes - this updates it afterward, so
+    /// a later same-generation Suppress decision hands back the true count
+    /// rather than begin_application()'s placeholder. A no-op if there is no
+    /// current application.
+    void set_applied(std::size_t applied);
+
+    /// The generation the current application is FOR (0 if there is none) -
+    /// what journal_maintenance_tick() compares against policy_generation_
+    /// before advancing it once can_advance() is true.
+    std::uint64_t pending_generation() const;
 
     enum class RetryDecision { Suppress, Reapply };
 

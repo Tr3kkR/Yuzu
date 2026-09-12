@@ -63,6 +63,7 @@ class CommandRequest;
 namespace yuzu::agent {
 class SparkEngine;
 class GuardianSparkRuntime;
+class GuardianArmAckLedger;
 class ConvergenceScheduler;
 class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
@@ -330,6 +331,22 @@ public:
         return lifecycle_journal_.get();
     }
 
+    /// TEST-ONLY: the spark runtime, for fault injection (e.g.
+    /// GuardianSparkRuntime::set_detach_fault_for_test - rung 9c PR-2 Unit 6's own
+    /// "full_sync teardown throws" regression net). Null until wire_spark_engine
+    /// runs. No production caller.
+    [[nodiscard]] GuardianSparkRuntime* spark_runtime_for_test() {
+        return spark_runtime_.get();
+    }
+
+    /// TEST-ONLY: the current application's still-pending accepted-arm count (see
+    /// GuardianArmAckLedger::pending_count_for_test) - lets a test settle on "every
+    /// arm the last apply_rules() push accepted has resolved" without reaching into
+    /// the ledger directly. Defined out-of-line (guardian_engine.cpp): GuardianArmAckLedger
+    /// is only forward-declared here. Takes mtx_ (matches every other _for_test
+    /// accessor that reads engine-owned state). No production caller.
+    [[nodiscard]] std::size_t ack_pending_count_for_test() const;
+
     /// TEST-ONLY: the spark drain worker / convergence scheduler, for started-state
     /// introspection (#2238, fixes BLOCKING-2b). wire_spark_engine() constructs both
     /// unconditionally but starts them only under prefer_spark_ — journal_age_stats()
@@ -576,17 +593,16 @@ private:
     /// ("'Accepted' means reconcile_rule_locked() returned Accepted specifically —
     /// the async-arm outcome, as opposed to Armed").
     ///
-    /// Production status as of this comment: NOT YET PRODUCED by any code path —
-    /// GuardianSparkRuntime::attach_rule() still waits (bounded) for its own claim's
-    /// outcome before returning, so every call here still resolves to Armed or
-    /// Failed before reconcile_rule_locked can return at all. Removing that wait is
-    /// staged as its own reviewed sequence of units (attach_rule gains a non-waiting
-    /// entry point alongside the existing blocking one; the two share dispatch,
-    /// commit, and cleanup) — this value was added FIRST, ahead of that behavior
-    /// change, so apply_rules' generation-hold gate already has the right shape to
-    /// receive it once a caller can actually produce it: apply_rules treats it
-    /// exactly like an unresolved episode (holds the generation), never like Failed
-    /// (it is not a failure) or like Armed (it is not yet resolved).
+    /// Production status as of this comment (rung 9c PR-2 Unit 6): PRODUCED -
+    /// reconcile_rule_locked() calls GuardianSparkRuntime::attach_rule(NonWaiting{},
+    /// ...), so a rule whose arm is genuinely still in flight resolves to Accepted
+    /// here instead of waiting (bounded) for it. apply_rules' generation-hold gate
+    /// (ack_ledger_->can_advance()) treats it exactly like an unresolved episode
+    /// (holds the generation), never like Failed (it is not a failure) or like
+    /// Armed (it is not yet resolved) - the receipt itself is registered with
+    /// ack_ledger_ (guardian_arm_ack.hpp), which the heartbeat's
+    /// journal_maintenance_tick() drains and, once every accepted episode this
+    /// generation resolves, advances policy_generation_ from.
     enum class ReconcileOutcome { Armed, Accepted, Failed, Inert };
 
     /// THE reconcile op (rung 7): the SOLE per-rule arm/disarm decision point,
@@ -679,6 +695,16 @@ private:
     std::shared_ptr<GuardianStateReader> spark_reader_;
     std::shared_ptr<GuardianSparkEngineBackend> spark_backend_;
     std::shared_ptr<GuardianSparkRuntime> spark_runtime_;
+    /// rung 9c PR-2 Unit 5/6 (§R5.3 ack bookkeeping): the current push's accepted-
+    /// but-unresolved arm episodes. Constructed unconditionally in the constructor
+    /// (no backend dependency, unlike spark_runtime_) - engine-owned, never null.
+    /// apply_rules() begins/feeds it; journal_maintenance_tick() drains it and
+    /// advances policy_generation_ once it can_advance(); stop() retires it.
+    std::unique_ptr<GuardianArmAckLedger> ack_ledger_;
+    /// rung 9c PR-2 Unit 6: a throw from ack_ledger_->drain_locked() or the
+    /// generation-advance it gates, caught on the bare heartbeat thread exactly
+    /// like journal_maint_exceptions_ below (same B4a firewall posture).
+    std::atomic<std::uint64_t> ack_maint_exceptions_{0};
     /// Durable lifecycle-audit journal (item 7 PR-Ag). Engine-owned (NOT the runtime: the runtime
     /// must borrow no KvStore); borrows kv_ (the agent owns it and destroys it AFTER the engine).
     /// Constructed in wire_spark_engine; persist calls are prefer_spark_-gated.

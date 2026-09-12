@@ -123,10 +123,22 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             ++it;
             continue;
         }
-        if (status == GuardianSparkRuntime::ReceiptStatus::Committed)
+        if (status == GuardianSparkRuntime::ReceiptStatus::Committed) {
             ++current_->resolved_armed;
-        else
+        } else {
             ++current_->resolved_failed;
+            // rung 9c PR-2 Unit 6: the only place this can be logged - reconcile_rule_locked's
+            // own "spark arm failed" warn fires only for a SYNCHRONOUS refusal now; an
+            // Accepted rule that later resolves to anything but Committed would otherwise be
+            // silent on a Guaranteed State product. Heartbeat thread: contained, like every
+            // other log call on this path.
+            try {
+                spdlog::warn("Guardian: spark arm failed for rule '{}' (accepted, resolved "
+                             "asynchronously)",
+                             it->first);
+            } catch (...) {
+            }
+        }
         it = current_->pending.erase(it);
         ++resolved;
     }
@@ -142,6 +154,19 @@ bool GuardianArmAckLedger::can_advance() const {
 
 std::size_t GuardianArmAckLedger::applied_count() const {
     return current_ ? current_->applied : 0;
+}
+
+std::size_t GuardianArmAckLedger::pending_count_for_test() const {
+    return current_ ? current_->pending.size() : 0;
+}
+
+void GuardianArmAckLedger::set_applied(std::size_t applied) {
+    if (current_)
+        current_->applied = applied;
+}
+
+std::uint64_t GuardianArmAckLedger::pending_generation() const {
+    return current_ ? current_->generation : 0;
 }
 
 GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(

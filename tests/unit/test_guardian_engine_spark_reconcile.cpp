@@ -18,6 +18,7 @@
 #include "guardian_lifecycle_journal.hpp" // GuardianLifecycleJournal (for the _for_test fault seam)
 #include "guardian_outbox.hpp" // OutboxEntry, SendResult - full definitions for the test's send_fn
 #include "guardian_outbox_drain_worker.hpp" // GuardianOutboxDrainWorker (started_for_test, #2238)
+#include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::set_detach_fault_for_test (rung 9c PR-2 Unit 6 test (b))
 #include "shutdown_deadline_guard.hpp" // #2233 item 3 ("S+") wedge-pattern test
 #include "spark_engine.hpp"
 #include "spark_mechanism.hpp"
@@ -102,6 +103,11 @@ class FakeServiceMechanism final : public ISparkMechanism {
 public:
     void start(SparkEmitFn, SparkFaultFn) override {}
     std::expected<void, std::string> watch(const std::string& key, const SparkParams&) override {
+        // rung 9c PR-2 Unit 6 test (a): counts every real invocation, unconditionally -
+        // unlike watching_count() (reflects watched_, populated only past the hang
+        // gate/failure checks below), this proves a SUPPRESSED retry never reaches the
+        // mechanism at all, not merely that it hasn't (yet) committed.
+        watch_calls_.fetch_add(1, std::memory_order_relaxed);
         bool hang = false;
         bool do_throw = false;
         {
@@ -204,8 +210,10 @@ public:
         std::lock_guard<std::mutex> lk{mu_};
         return watched_;
     }
+    int watch_call_count() const { return watch_calls_.load(std::memory_order_relaxed); }
 
 private:
+    std::atomic<int> watch_calls_{0};
     std::mutex mu_;
     std::set<std::string> watched_;
     bool fail_next_watch_{false};
@@ -337,26 +345,67 @@ struct SparkReconcileFixture {
         spark_engine.stop();
     }
 
-    void apply(const gpb::GuaranteedStateRule& rule, bool full_sync = true) {
+    // Serialize-then-dispatch, NOT engine->apply_rules(p) directly: every rule
+    // here carries an assertion params Map (service_name/hive/key/path), and on
+    // Windows MSVC debug, populating that Map in the TEST EXE and then reading it
+    // DLL-side hits the #501 cross-image abseil hash-seed split - .find() silently
+    // misses ~50% of the time, producing an empty string exactly as if the field
+    // were never set (confirmed on DGRHP: every service-type test here failed
+    // spark validation with "spec derivation failed", i.e. guardian_assertion_
+    // param("service_name") read back empty). guardian_dispatch_push_
+    // bytes_for_test deserializes the bytes INSIDE the DLL, so the Map is
+    // populated using the DLL's own seed - see guardian_engine.hpp's doc comment
+    // on the helper for the full mechanism. Linux is blind to this class of bug
+    // (single shared object, no split seed), which is why this went uncaught
+    // until the first real Windows compile.
+    //
+    // rung 9c PR-2 Unit 6: does NOT settle - returns as soon as apply_rules()
+    // does, which may be before an Accepted rule's arm has resolved. Most callers
+    // want apply() below instead; use this raw form only when a test's own
+    // premise is about that pre-settlement window (a persist-retry/durability
+    // race against a specific injected fault - see the two journal tests that use
+    // it directly instead of apply()).
+    yuzu::agent::GuardianDispatchResult dispatch_raw(const gpb::GuaranteedStateRule& rule,
+                                                     bool full_sync = true) {
         gpb::GuaranteedStatePush p;
         p.set_full_sync(full_sync);
         *p.add_rules() = rule;
-        // Serialize-then-dispatch, NOT engine->apply_rules(p) directly: every
-        // rule here carries an assertion params Map (service_name/hive/key/
-        // path), and on Windows MSVC debug, populating that Map in the TEST
-        // EXE and then reading it DLL-side hits the #501 cross-image abseil
-        // hash-seed split - .find() silently misses ~50% of the time,
-        // producing an empty string exactly as if the field were never set
-        // (confirmed on DGRHP: every service-type test here failed spark
-        // validation with "spec derivation failed", i.e. guardian_assertion_
-        // param("service_name") read back empty). guardian_dispatch_push_
-        // bytes_for_test deserializes the bytes INSIDE the DLL, so the Map is
-        // populated using the DLL's own seed - see guardian_engine.hpp's
-        // doc comment on the helper for the full mechanism. Linux is blind to
-        // this class of bug (single shared object, no split seed), which is
-        // why this went uncaught until the first real Windows compile.
-        auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*engine, p.SerializeAsString());
+        return yuzu::agent::guardian_dispatch_push_bytes_for_test(*engine, p.SerializeAsString());
+    }
+
+    void apply(const gpb::GuaranteedStateRule& rule, bool full_sync = true) {
+        auto dr = dispatch_raw(rule, full_sync);
         REQUIRE(dr.exit_code == 0);
+        // rung 9c PR-2 Unit 6: apply_rules() no longer waits for an accepted arm to
+        // resolve (§R5.1/R5.3) - settle here so every pre-existing caller of this
+        // helper keeps observing "the push is fully reconciled" the way every one
+        // of them assumed pre-cutover, rather than each test re-deriving its own
+        // poll. The tick both drains resolved receipts (ack_pending_count_for_test
+        // -> 0) and retries any pending journal persist, so one loop covers both
+        // "is it armed yet" and "is it journaled yet" callers; an all-Unsupported/
+        // Inert push never add_pending()s anything, so this returns at once.
+        //
+        // ack_pending_count_for_test() alone only covers ACCEPTED ARMS - a disable/
+        // replace push's DISARM (Unit 3's own non-waiting cutover, unconditional
+        // regardless of prefer_spark_) is never added to the ledger at all, so it
+        // needs its own settle signal: active_io_workers() is the runtime's real
+        // "any backend arm/disarm call still physically running" count (also used
+        // for the F3 hard_exit orphan-worker contract), zero only once every
+        // dispatched backend call - arm OR disarm - has actually finished.
+        REQUIRE(yuzu::test::spin_until([&] {
+            engine->journal_maintenance_tick();
+            return engine->ack_pending_count_for_test() == 0 && engine->active_io_workers() == 0;
+        }));
+        // journal_maintenance_tick() persists BEFORE it drains the ack ledger (its own
+        // doc comment: "neither reads the other's result"), so the very tick call
+        // whose drain step FIRST observes ack_pending_count_for_test() drop to 0 may
+        // have already run ITS OWN persist step against a pending_journal_ that still
+        // predates the commit - the worker can stage the "armed" record in the gap
+        // between this call's persist and drain steps. One more tick, now that the
+        // settle loop above has already proven the commit (and therefore the staging
+        // that happens-before it under the same lock) has happened, is guaranteed to
+        // see it.
+        engine->journal_maintenance_tick();
     }
 };
 
@@ -682,7 +731,9 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
         *p.add_rules() = make_service_rule("r3", true, "SvcC");
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
                     .exit_code == 0);
-        REQUIRE(engine.spark_armed_rule_count() == 3);
+        // rung 9c PR-2 Unit 6: the arms are Accepted, not yet resolved, when dispatch
+        // returns - settle before asserting the seeded state a later phase depends on.
+        REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 3; }));
         engine.stop();
         spark_engine.stop();
     }
@@ -711,6 +762,10 @@ TEST_CASE("start_local degrades per-rule when a re-arm throws: the other cached 
     });
 
     REQUIRE(engine.start_local().has_value()); // degrade contract: success despite one poisoned rule
+
+    // rung 9c PR-2 Unit 6: r1/r3's boot re-arms are Accepted, not yet resolved, when
+    // start_local() returns - settle before asserting the degrade outcome.
+    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 2; }));
 
     // Assert BEFORE stop() - stop() unwinds spark watch state.
     CHECK(engine.rule_count() == 3);           // cache intact, including the poisoned rule
@@ -1259,11 +1314,25 @@ TEST_CASE("prefer_spark=true: the maintenance tick retries a persist a write fai
           "[spark][guardian][reconcile][journal]") {
     SparkReconcileFixture f;
     f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
-    f.apply(make_service_rule("r1")); // the apply_rules flush persist FAILS → record stays pending
+    // rung 9c PR-2 Unit 6: apply_rules() no longer stages "armed" synchronously - the
+    // arm is Accepted and resolves later on a detached worker - so its own exit flush
+    // is now a guaranteed no-op regardless of the injected failure (nothing pending
+    // to persist yet). Use dispatch_raw(), not apply() (which settles via its own
+    // tick and would consume the injected failure itself), and wait for the arm to
+    // actually commit before checking the journal - THAT'S the first real persist
+    // attempt this test is about, and the one the injected failure must land on.
+    REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+
+    // This tick is the FIRST real persist attempt (post-cutover, apply_rules()'s own
+    // exit flush is a no-op - nothing was staged yet at that point) - the injected
+    // failure lands HERE, not on the "retry" tick below (pre-cutover, apply_rules()'s
+    // synchronous commit meant its own exit flush was that first attempt instead).
+    f.engine->journal_maintenance_tick();
 
     auto before = f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix);
     REQUIRE(before.has_value());
-    CHECK(before->empty()); // nothing durable yet - the write failed
+    CHECK(before->empty()); // nothing durable yet - that first attempt failed
 
     f.engine->journal_maintenance_tick(); // NO new push/reconnect - the tick alone retries
 
@@ -1284,7 +1353,13 @@ TEST_CASE("prefer_spark=true: stop() final-flushes records a write failure left 
           "[spark][guardian][reconcile][journal]") {
     SparkReconcileFixture f;
     f.engine->lifecycle_journal_for_test()->inject_write_failures_for_test(1);
-    f.apply(make_service_rule("r1")); // persist fails → pending
+    // Use dispatch_raw() + an explicit single tick, not apply() (which settles via its
+    // own tick loop and would consume the injected failure at an unpredictable point
+    // in that loop instead of here) - see the sibling "maintenance tick retries" test
+    // just above for the same reasoning.
+    REQUIRE(f.dispatch_raw(make_service_rule("r1")).exit_code == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    f.engine->journal_maintenance_tick(); // first real persist attempt - fails, stays pending
     CHECK(f.kv->list_entries(yuzu::agent::kJournalNamespace, yuzu::agent::kBatchKeyPrefix)->empty());
 
     f.engine->stop(); // the final flush persists the leftover pending record
@@ -1664,8 +1739,19 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
                                                "Svc" + std::to_string(i));
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
                     .exit_code == 0);
-        REQUIRE(engine.spark_armed_rule_count() == 5); // armed via spark BEFORE the restart
-        engine.journal_maintenance_tick(); // force the pending records durable
+        // rung 9c PR-2 Unit 6: the arms are Accepted, not yet resolved, when dispatch
+        // returns - settle (each tick also retries any pending journal persist, so
+        // this doubles as "force the pending records durable" once armed). Generous
+        // bound: 5 rules each dispatch to a detached worker thread, and under the FULL
+        // agent suite's accumulated thread/scheduling load (thousands of prior test
+        // cases) the default 5s spin_until bound was observed to be too tight for this
+        // one - not a logic race (isolated and [spark][guardian]-only runs never miss).
+        REQUIRE(yuzu::test::spin_until(
+            [&] {
+                engine.journal_maintenance_tick();
+                return engine.spark_armed_rule_count() == 5; // armed via spark BEFORE the restart
+            },
+            std::chrono::seconds(30)));
         engine.stop();
         spark_engine.stop();
     }
@@ -1735,6 +1821,12 @@ TEST_CASE("PRODUCTION boot order: wire_spark_engine before start_local",
     // The core F13 gap: rule_count() only proves the rules were RE-DISCOVERED. Prove
     // they RE-ARMED VIA SPARK - mutual exclusion held, and each of the five distinct
     // services is actually re-watched by the (new, phase-2) mechanism.
+    //
+    // rung 9c PR-2 Unit 6: start_local()'s boot re-arm is Accepted, not yet resolved,
+    // when it returns - settle (generous bound, see the Phase 1 seeding block's own
+    // comment on this same class of full-agent-suite load sensitivity).
+    REQUIRE(yuzu::test::spin_until([&] { return engine.spark_armed_rule_count() == 5; },
+                                   std::chrono::seconds(30)));
     CHECK(engine.spark_armed_rule_count() == 5);
     CHECK(engine.armed_guard_count() == 0);
     CHECK(engine.unsupported_counts_by_type().empty());
@@ -1831,7 +1923,10 @@ TEST_CASE("a production-order restart into each degraded spark posture: cached r
         *p.add_rules() = make_service_rule("r3", true, "SvcC");
         REQUIRE(yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, p.SerializeAsString())
                     .exit_code == 0);
-        REQUIRE(engine.spark_armed_rule_count() == 3); // armed via spark BEFORE the restart
+        // rung 9c PR-2 Unit 6: the arms are Accepted, not yet resolved, when dispatch
+        // returns - settle before asserting the seeded state a later phase depends on.
+        REQUIRE(yuzu::test::spin_until(
+            [&] { return engine.spark_armed_rule_count() == 3; })); // armed BEFORE the restart
         engine.stop();
         spark_engine.stop();
     };
@@ -2052,9 +2147,19 @@ TEST_CASE("prefer_spark=true: pending records are durable BEFORE stop() joins th
         }
     } release_parked_worker{send_mu, send_cv, release};
 
-    // One injected write failure leaves the armed rule's record PENDING rather than durable,
-    // so what reaches disk later is attributable to a stop()-path persist and nothing else.
-    engine.lifecycle_journal_for_test()->inject_write_failures_for_test(1);
+    // rung 9c PR-2 Unit 6: no injected write failure needed any more (this test
+    // pre-dates the cutover, where one was required - see below). apply_rules()
+    // no longer stages "armed" synchronously: it returns as soon as the arm is
+    // Accepted, well before the detached worker's commit stages anything into the
+    // journal, so its own exit-time flush is now a guaranteed no-op regardless of
+    // any injected failure - the record is genuinely PENDING (not yet even
+    // staged) at that point, for a timing reason rather than a fault-injected
+    // one. Nothing else persists it until stop()'s own pre-join flush below, so
+    // that flush is naturally the first (and only) attempt, and the same
+    // durable-during-the-join property this test is about follows without
+    // needing to force anything to fail first. (Injecting one here now would
+    // make THAT pre-join attempt the one that fails instead, since nothing
+    // upstream of it consumes the fault any more - defeating the proof.)
     gpb::GuaranteedStatePush push;
     push.set_full_sync(true);
     *push.add_rules() = make_service_rule("r1");
@@ -2231,9 +2336,21 @@ TEST_CASE("start-drain-then-stop: the this-capturing send races stop()'s join (T
 //     parked thread.
 // ---------------------------------------------------------------------------
 
-TEST_CASE("#2233 item 3 (S+): the watchdog fires while GuardianEngine::stop() is "
-          "genuinely blocked",
+TEST_CASE("rung 9c PR-2 Unit 6: ShutdownDeadlineGuard stays quiet - stop() is no longer "
+          "blocked by a hung watch()",
           "[spark][guardian][reconcile][shutdown_deadline_guard]") {
+    // Supersedes "#2233 item 3 (S+): the watchdog fires while GuardianEngine::stop() is
+    // genuinely blocked" (this test's name and premise, pre rung 9c PR-2 Unit 6). That
+    // wedge was apply_rules() (the push thread) holding mtx_ synchronously inside
+    // attach_rule()'s blocking wait, so stop() (needing mtx_ too) queued behind it long
+    // enough for a 200ms watchdog to fire. Unit 6's non-waiting cutover means
+    // apply_rules() returns as soon as the arm is ACCEPTED - stop() is never blocked on
+    // a hung watch() any more, so the watchdog it exists to catch here never has
+    // anything to catch. ShutdownDeadlineGuard's own fire-on-deadline behavior is
+    // independently covered against a synthetic seam in test_shutdown_deadline_guard.cpp
+    // ("an un-cancelled guard fires the action exactly once after the grace period") -
+    // this test only needs to prove the REAL wedge it used to catch here is gone, not
+    // re-prove the guard fires at all.
     SparkReconcileFixture f;
     f.mechanism->hang_next_watch();
 
@@ -2272,64 +2389,68 @@ TEST_CASE("#2233 item 3 (S+): the watchdog fires while GuardianEngine::stop() is
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
-    // GuardianEngine::stop() is now genuinely blocked (the pusher thread above holds
-    // mtx_, parked inside the hung watch() call). A short-grace watchdog around the real
-    // call proves it fires under a real wedge, not a synthetic one.
+    // The push itself must already have returned - proving apply_rules() does NOT wait
+    // for the hung watch() to release.
+    REQUIRE(yuzu::test::spin_until([&] { return push_done.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
+
+    // mtx_ is free the moment apply_rules() returned above - stop() proves it by also
+    // returning promptly, with the watch() STILL hung. The grace is deliberately WIDE
+    // (120s, comfortably past this test's own 10s spin bound even at TSan's 6x scale) -
+    // standing flake doctrine (this file, throughout): a real-wall-clock upper bound on
+    // stop() itself would make this a timing assertion in disguise, racing CI-runner
+    // scheduling noise rather than proving the wedge is gone. A short grace was the
+    // OLD test's whole point (catching a genuine multi-second wedge quickly); this one
+    // only needs to prove the watchdog never fires at all, so wider is strictly safer.
     cleanup.stopper_thread.emplace([&] {
         yuzu::agent::ShutdownDeadlineGuard watchdog{
-            std::chrono::milliseconds(200),
+            std::chrono::seconds(120),
             [watchdog_fired] { watchdog_fired->store(true, std::memory_order_release); }};
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
     });
-
-    REQUIRE(yuzu::test::spin_until(
-        [&] { return watchdog_fired->load(std::memory_order_acquire); },
-        std::chrono::seconds(5)));
-    // The recorder firing doesn't unblock the real, still-wedged stop() call - only the
-    // injected action ran. Prove stop() genuinely hasn't returned yet.
-    CHECK_FALSE(stop_returned.load(std::memory_order_acquire));
-
-    f.mechanism->release_hang();
     REQUIRE(yuzu::test::spin_until(
         [&] { return stop_returned.load(std::memory_order_acquire); },
         std::chrono::seconds(10)));
+    CHECK_FALSE(watchdog_fired->load(std::memory_order_acquire)); // never had anything to fire on
+
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 0; },
+                                   std::chrono::seconds(10)));
 
     cleanup.stopper_thread->join();
     cleanup.pusher_thread.join();
-
-    CHECK(push_done.load(std::memory_order_acquire));
-    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
 }
 
-TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
+TEST_CASE("rung 9c PR-2 Unit 6: a hung watch() no longer wedges apply_rules() or "
+          "stop() - the arm is dispatched off-lock, not waited for",
           "[spark][guardian][reconcile][liveness]") {
+    // Supersedes "#2233 item 3: a hung watch() wedges stop() until released" (this
+    // test's name and premise, pre rung 9c PR-2 Unit 6). That test's wedge was never
+    // stop() making a direct blocking arm call - it was apply_rules() (the push
+    // thread) holding GuardianEngine::mtx_ synchronously inside attach_rule()'s
+    // (then blocking) bounded wait, so stop() (which also needs mtx_) queued behind
+    // it. Unit 6 cut reconcile_rule_locked() over to attach_rule(NonWaiting{}, ...):
+    // apply_rules() now returns as soon as the arm is ACCEPTED, holding mtx_ for
+    // nowhere near the duration of a hung watch() - so neither the push nor a later
+    // stop() wedges on it any more. This is the arm-side half of this PR's own title
+    // ("wire apply_rules()/detach_all() onto the non-waiting executor path") landing
+    // in production, matching Unit 3's disarm-side transformation of the unwatch
+    // analogue of this same test (above, in this file).
     SparkReconcileFixture f;
     f.mechanism->hang_next_watch();
 
     std::atomic<int> push_exit_code{-1};
     std::atomic<bool> push_done{false};
-    // stop_returned is declared here, BEFORE Cleanup, even though the stopper thread that
-    // writes it isn't started until after Cleanup exists (governance Gate 3 - cpp-expert
-    // and cpp-safety independently found this): C++ destroys locals in reverse declaration
-    // order, so an atomic declared AFTER Cleanup would be destroyed BEFORE ~Cleanup() joins
-    // the thread referencing it on some future unwind between the emplace below and the
-    // explicit join - the same defect class 13800f233 already fixed for the thread objects
-    // themselves, recurring for the atomic they write to.
     std::atomic<bool> stop_returned{false};
 
     // Cleanup OWNS both worker threads as members (never a pointer to a separately-
-    // declared local) - its destructor is then the ONLY thing that ever destroys them,
-    // so C++'s reverse-declaration-order destruction rule can't race a bare std::thread
-    // local's own destructor against this guard on an unwind (an earlier draft held
-    // stopper_thread by pointer to a LATER-declared local; that local's own destructor
-    // would run BEFORE Cleanup's on an unwind between its construction and its explicit
-    // join, joinable and un-joined -> std::terminate - the exact failure this guard
-    // exists to prevent, caught by adversarial review). On ANY unwind (a fatal REQUIRE
-    // below), the destructor releases the mechanism's hang gate FIRST - so whichever
-    // thread is parked in watch() can actually finish - THEN joins both. Joining before
-    // releasing would deadlock the test's own cleanup (this is #2233 item 3's exact
-    // hazard; the last thing this test should do is reproduce it in its teardown).
+    // declared local) - see the analogous unwatch test's own comment (Unit 3, above)
+    // for the reverse-declaration-order reasoning this guards against. On ANY unwind
+    // (a fatal REQUIRE below), the destructor releases the mechanism's hang gate
+    // FIRST - so whichever thread is parked in watch() can actually finish - THEN
+    // joins both.
     struct Cleanup {
         FakeServiceMechanism* mech;
         std::thread pusher_thread;
@@ -2353,63 +2474,56 @@ TEST_CASE("#2233 item 3: a hung watch() wedges stop() until released",
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
-    // f.engine->stop() runs unguarded on a non-main thread here - relies on the same
-    // implicitly-noexcept treatment ~GuardianEngine() itself gives stop()
-    // (guardian_engine.cpp:379's "(implicitly noexcept) ~GuardianEngine destructor"
-    // comment). An uncaught throw here would std::terminate the whole test binary
-    // rather than fail one Catch2 case (governance Gate 4 unhappy-path UP-1) - not a
-    // new risk this test introduces, just the first place that reliance is exercised
-    // off the main thread.
+    // The push itself must already have returned - proving apply_rules() does NOT
+    // wait for the hung watch() to release. A regression back to a blocking arm wait
+    // makes this REQUIRE time out rather than silently pass (the mechanism is still
+    // hung at this point - release_hang() is not called until after this).
+    REQUIRE(yuzu::test::spin_until([&] { return push_done.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
+
+    // mtx_ is free the moment apply_rules() returned above - stop() proves it by
+    // also returning promptly, with the watch() STILL hung (relies on the same
+    // implicitly-noexcept treatment ~GuardianEngine() itself gives stop(), governance
+    // Gate 4 unhappy-path UP-1 - not a new risk, just exercised off the main thread).
     cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
     });
+    REQUIRE(yuzu::test::spin_until([&] { return stop_returned.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
 
-    // Weak half: a short "still blocked" sample. This is inherently non-vacuous-adjacent
-    // on a starved CI box (a slow scheduler could plausibly make stop() late for reasons
-    // unrelated to the wedge) - the STRONG half below (ordering: sample, THEN release,
-    // THEN require return) is what actually discriminates "wedged" from "just slow".
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    const bool blocked_before_release = !stop_returned.load(std::memory_order_acquire);
-
+    // The arm claim is still a real, owned attempt (Unit 6's whole point is
+    // non-blocking, not abandoned) - releasing the hang lets it actually resolve.
+    // Post-stop, a late-arriving success is disarmed rather than left live (§R5.5),
+    // so this settles at 0 either way - waiting for it also gives the detached
+    // worker a safe join point before the fixture tears down f.mechanism.
     f.mechanism->release_hang();
-
-    // stop() must return promptly now that watch() has unblocked - this is the ordering
-    // proof: if stop() had already returned before release_hang(), it wasn't wedged.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!stop_returned.load(std::memory_order_acquire) &&
-          std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 0; },
+                                   std::chrono::seconds(10)));
 
     cleanup.stopper_thread->join();
     cleanup.pusher_thread.join();
-
-    CHECK(blocked_before_release);
-    CHECK(stop_returned.load(std::memory_order_acquire));
-    CHECK(push_done.load(std::memory_order_acquire));
-    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
 }
 
-TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurrent push",
+TEST_CASE("rung 9c PR-2 Unit 6: a hung watch() on one rule no longer blocks an "
+          "unrelated concurrent push",
           "[spark][guardian][reconcile][liveness]") {
+    // Supersedes "#2233 item 3: a hung watch() on one rule blocks an unrelated
+    // concurrent push" (this test's name and premise, pre rung 9c PR-2 Unit 6): push
+    // A used to hold mtx_ synchronously inside attach_rule()'s blocking wait, so push
+    // B queued behind it. Unit 6's non-waiting cutover means push A returns as soon
+    // as its arm is ACCEPTED - push B is never blocked by it at all any more.
     SparkReconcileFixture f;
     f.mechanism->hang_next_watch();
 
     std::atomic<int> push_a_exit_code{-1};
     std::atomic<bool> push_a_done{false};
-    // push_b_exit_code/push_b_done are declared here, BEFORE Cleanup, even though the
-    // pusher_b thread that writes them isn't started until after Cleanup exists and
-    // wait_entered_hang() has returned (governance Gate 3 - cpp-expert and cpp-safety
-    // independently found this class of gap): C++ destroys locals in reverse declaration
-    // order, so an atomic declared AFTER Cleanup would be destroyed BEFORE ~Cleanup() joins
-    // the thread referencing it on some future unwind between the emplace below and the
-    // explicit join - the same defect class 13800f233 already fixed for the thread objects
-    // themselves, recurring for the atomics they write to.
     std::atomic<int> push_b_exit_code{-1};
     std::atomic<bool> push_b_done{false};
 
-    // See the "hung watch() wedges stop()" test above for why Cleanup must OWN both
-    // threads as members rather than point to separately-declared locals.
+    // See the analogous wedge test above for why Cleanup must OWN both threads as
+    // members rather than point to separately-declared locals.
     struct Cleanup {
         FakeServiceMechanism* mech;
         std::thread pusher_a_thread;
@@ -2433,9 +2547,15 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
-    // r2 is a distinct spark key (different service name) and full_sync=false, so this
-    // push does not also try to detach r1 - it exercises apply_rules() -> mtx_ contention
-    // alone, independent of r1's own arm outcome.
+    // Push A must already have returned - proving apply_rules() does not hold mtx_
+    // for the hung watch()'s duration.
+    REQUIRE(yuzu::test::spin_until([&] { return push_a_done.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    CHECK(push_a_exit_code.load(std::memory_order_acquire) == 0);
+
+    // Push B (a distinct spark key, full_sync=false, so it doesn't also try to
+    // detach r1) proves mtx_ is free: it returns promptly too, with r1's watch()
+    // STILL hung.
     cleanup.pusher_b_thread.emplace([&] {
         gpb::GuaranteedStatePush p;
         p.set_full_sync(false);
@@ -2445,25 +2565,16 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
         push_b_exit_code.store(dr.exit_code, std::memory_order_release);
         push_b_done.store(true, std::memory_order_release);
     });
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    const bool b_blocked_before_release = !push_b_done.load(std::memory_order_acquire);
+    REQUIRE(yuzu::test::spin_until([&] { return push_b_done.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    CHECK(push_b_exit_code.load(std::memory_order_acquire) == 0);
 
     f.mechanism->release_hang();
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!push_b_done.load(std::memory_order_acquire) &&
-          std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 2; },
+                                   std::chrono::seconds(10)));
 
     cleanup.pusher_a_thread.join();
     cleanup.pusher_b_thread->join();
-
-    CHECK(b_blocked_before_release);
-    CHECK(push_a_done.load(std::memory_order_acquire));
-    CHECK(push_b_done.load(std::memory_order_acquire));
-    CHECK(push_a_exit_code.load(std::memory_order_acquire) == 0);
-    CHECK(push_b_exit_code.load(std::memory_order_acquire) == 0);
 }
 
 TEST_CASE("rung 9c PR-2 Unit 3: a hung unwatch() no longer wedges apply_rules() or "
@@ -2667,35 +2778,23 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     CHECK(yuzu::test::wait_until_quiescent(std::chrono::seconds(5)));
 #endif
 }
+#endif // !_WIN32 - wait_until_quiescent is the fork-death-test gate, Linux/macOS only
 
 // ---------------------------------------------------------------------------
 // rung 9c PR-2 (non-waiting cutover) - RED, target-behaviour regression net
 // ---------------------------------------------------------------------------
 //
-// The test below is deliberately RED against today's HEAD: it asserts the behaviour
-// docs/spark-stage2-guardian-consumer-design.md R5 rules for GuardianEngine::apply_rules()
-// once the rung 9c PR-2 cutover lands (~/.claude/plans/spark-rung9c-pr2-cutover-KICKOFF.md),
-// which as of this test's authoring is NOT yet implemented - apply_rules() still holds
-// mtx_ across GuardianSparkRuntime::attach_rule()'s bounded wait_for_claim() (rung 9c
-// PR-1, guardian_spark_runtime.cpp:1213-1216).
-//
-// Tagged `[!shouldfail]` - Catch2's own mechanism for a checked-in, deliberately-red
-// assertion of not-yet-built behaviour (not this repo's prior practice; there is no
-// earlier precedent for this tag here, noted for reviewers). This is NOT a broken test:
-// Catch2 reports `[!shouldfail]` GREEN when the body fails (today, for the right reason -
-// see the deadline-margin note below) and RED when the body unexpectedly passes in full,
-// which is what makes it a live tripwire rather than inert documentation - NOT a stronger
-// guarantee than that. `[!shouldfail]` reports which TEST CASE failed, not which assertion
-// within it did or whether it failed for the intended reason (Astra opine review,
-// 2026-09-12) - a maintenance edit that broke this test for an unrelated reason would
-// also read as "failed as expected" here. Treat a green run of this case as "still red for
-// SOME reason", and re-run it with the tag stripped (or step through it) before trusting
-// that reason is the intended one. Whoever implements the cutover should watch this test
-// flip from pass-via-failure to a real, unexpected pass, and then remove the tag, turning
-// this into an ordinary enforced regression test.
-TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule resolves, "
+// This test asserts docs/spark-stage2-guardian-consumer-design.md R5's rules for
+// GuardianEngine::apply_rules() under the rung 9c PR-2 cutover. It was checked in
+// RED (tagged `[!shouldfail]`) before Unit 6 implemented the cutover - apply_rules()
+// used to hold mtx_ across GuardianSparkRuntime::attach_rule()'s bounded
+// wait_for_claim() (rung 9c PR-1). Unit 6 flipped it to a real, unexpected pass
+// against the untagged assertions, exactly as this comment block originally said
+// whoever implemented the cutover should do; the tag is removed and this is now an
+// ordinary enforced regression test.
+TEST_CASE("rung 9c PR-2: apply_rules returns before a slow-arming rule resolves, "
           "and holds the policy generation until it does",
-          "[spark][guardian][reconcile][!shouldfail]") {
+          "[spark][guardian][reconcile]") {
     // Shrink backend_op_deadline (production 5s), but keep a WIDE margin over the poll
     // window below even after sanitizer scaling (Astra opine review, 2026-09-12: the
     // original 300ms deadline / 60ms poll window was scheduling-sensitive, not
@@ -2752,10 +2851,9 @@ TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule res
     // backend call is still parked - it must not still be blocked inside attach_rule's
     // bounded wait. spin_until is liveness-only (never a bare sleep-based timing
     // assertion, per its own doc); the margin between this 100ms request (600ms worst-
-    // case scaled) and the 2000ms deadline above is what makes this fail TODAY for the
-    // intended reason (apply_rules is still blocked, having not reached anywhere near
-    // its own deadline) rather than by scheduling accident, and pass once the wait is
-    // actually removed.
+    // case scaled) and the 2000ms deadline above is what made this fail, before Unit 6,
+    // for the intended reason (apply_rules was still blocked, having not reached
+    // anywhere near its own deadline) rather than by scheduling accident.
     REQUIRE(yuzu::test::spin_until([&] { return dispatch_returned.load(std::memory_order_acquire); },
                                    std::chrono::milliseconds{100}));
 
@@ -2796,4 +2894,123 @@ TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule res
 
     pusher.join();
 }
-#endif
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-2 Unit 6 - additional advisor-required coverage
+// ---------------------------------------------------------------------------
+
+// Advisor round (a): §R5.3's duplicate-retry suppression, at the engine level (the
+// ledger's own decide_retry() unit tests already cover the decision in isolation -
+// see test_guardian_arm_ack.cpp - this proves apply_rules() actually WIRES it, so a
+// same-generation full_sync heartbeat retry while r1 is still parked never reaches
+// the mechanism a second time).
+TEST_CASE("rung 9c PR-2 Unit 6: a same-generation retry while the prior push's arm is still "
+          "parked is suppressed before it ever reaches the mechanism",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds{2000}};
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(1);
+    *p.add_rules() = make_service_rule("r1");
+    const std::string push_bytes = p.SerializeAsString();
+
+    f.mechanism->hang_next_watch();
+
+    std::atomic<bool> first_returned{false};
+    yuzu::agent::GuardianDispatchResult dr1{};
+    std::thread pusher([&] {
+        dr1 = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+        first_returned.store(true, std::memory_order_release);
+    });
+    // Same exception-safety shape as the target cutover test above: release + join on
+    // ANY exit path, so a failed REQUIRE between spawn and join can never unwind past
+    // a still-joinable std::thread.
+    struct PusherGuard {
+        FakeServiceMechanism* mech;
+        std::thread* t;
+        ~PusherGuard() {
+            mech->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } pusher_guard{f.mechanism, &pusher};
+
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{5}));
+    REQUIRE(yuzu::test::spin_until([&] { return first_returned.load(std::memory_order_acquire); },
+                                   std::chrono::milliseconds{100}));
+    CHECK(dr1.exit_code == 0);
+    CHECK(f.mechanism->watch_call_count() == 1);
+    CHECK(f.mechanism->watching_count() == 0); // still parked mid-watch, not yet committed
+
+    // Same generation, identical content, sent again while r1 is still parked. This
+    // call runs on THIS (the test) thread, not a spawned one - decide_retry()'s
+    // Suppress means apply_rules() returns without ever reaching the full_sync
+    // teardown or the per-rule reconcile loop a second time, so unlike the first
+    // push it needs no hang-gate/thread pair of its own to prove it doesn't block.
+    const auto dr2 =
+        yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+    CHECK(dr2.exit_code == 0);
+    CHECK(f.mechanism->watch_call_count() == 1); // no second watch() - suppressed upstream of it
+    CHECK(f.engine->policy_generation() == 0);   // still held: r1 is still unresolved
+
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE(yuzu::test::spin_until([&] {
+        f.engine->journal_maintenance_tick();
+        return f.engine->policy_generation() == 1;
+    }));
+    pusher.join();
+}
+
+// Advisor round (b): the one synchronous Failed path GuardianSparkRuntime::
+// attach_core() can still take post-cutover is the stopping_ race, which apply_rules()
+// can never observe under mtx_ (stop() holds it across begin_stop()) - so a genuine
+// per-rule synchronous ReconcileOutcome::Failed is not exercisable here. What IS still
+// reachable, and still had no test, is apply_rules()'s OWN full_sync-teardown throw
+// (guardian_spark_runtime.cpp's detach_all()/detach_rule_locked() "the claim allocation
+// threw" seam, the same one that file's own rung 9c R5.2 adversarial-review-r2-C1 test
+// exercises directly against the runtime) - reconcile_failures > 0 latches the
+// application even though every rule THIS push actually reconciles goes on to commit.
+TEST_CASE("rung 9c PR-2 Unit 6: a full_sync teardown throw holds the generation even though "
+          "the same push's own rule commits fine",
+          "[spark][guardian][reconcile]") {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds{2000}};
+
+    // r1 commits via an ordinary push first, so it is a genuine armed rules_ entry -
+    // the "known, last-on-key, queued-tier" condition detach_rule_locked's
+    // detach_fault_here_for_test() seam requires.
+    f.apply(make_service_rule("r1", true, "SvcA"));
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 1; }));
+    REQUIRE(f.engine->policy_generation() == 0); // f.apply()'s push never sets a generation
+
+    // Consumed once (GuardianSparkRuntime::detach_fault_here_for_test's exchange(false)):
+    // fires on r1, the only currently-armed rule, inside the incoming full_sync's
+    // detach_all().
+    f.engine->spark_runtime_for_test()->set_detach_fault_for_test(true);
+
+    gpb::GuaranteedStatePush p2;
+    p2.set_full_sync(true);
+    p2.set_policy_generation(1); // > policy_generation_ (0) - would advance without the latch
+    *p2.add_rules() = make_service_rule("r2", true, "SvcB");
+    const auto dr =
+        yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, p2.SerializeAsString());
+    // apply_rules() itself does not fail on this - the teardown throw is caught and
+    // counted by guardian_engine.cpp's own full_sync-teardown try/catch, never
+    // propagated to the dispatch caller.
+    CHECK(dr.exit_code == 0);
+
+    // r2 gets a fair shot: the caught throw doesn't abort the rest of the push - it
+    // still reconciles, arms and commits normally. r1 is left exactly as it was (the
+    // seam fires before any durable mutation, per detach_rule_locked's own comment),
+    // so both end up armed.
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->spark_armed_rule_count() == 2; }));
+
+    // TARGET: the teardown throw latched this application's failure - the generation
+    // must stay held even after r2's own arm resolves cleanly and repeated ticks run.
+    for (int i = 0; i < 5; ++i)
+        f.engine->journal_maintenance_tick();
+    CHECK(f.engine->policy_generation() == 0);
+}
