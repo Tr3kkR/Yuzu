@@ -23,11 +23,17 @@
 /// apply tail executes it. This makes every decision unit-testable with no
 /// Postgres at all (see tests/unit/server/test_gateway_route_reap_rules.cpp).
 ///
-/// The semantics here are BYTE-IDENTICAL to the pre-split behaviour for every
-/// path EXCEPT the bad-`now()` branch: that path used to LEAVE the marker
+/// The decision semantics here are BYTE-IDENTICAL to the pre-split behaviour for
+/// every path EXCEPT the bad-`now()` branch: that path used to LEAVE the marker
 /// (round-3 defect), and now CLEARs it — a distinct anomaly must not leave a
 /// stale recovery identity behind, so a later same-direction skew is judged
 /// fresh. See docs/clock-guarded-retention.md's GatewayRouteStore entry.
+/// (The ONE other in-diff change is input hardening, not decision semantics:
+/// `parse_reap_i64` was tightened past a bare `strtoll` to full-consumption +
+/// canonical round-trip, so a non-canonical STORED numeric — "007", "-0", "+5",
+/// leading/trailing space — that the old parser accepted is now treated as
+/// absent/corrupt. Safe direction: a corrupt persisted anchor self-heals and a
+/// malformed marker re-declines rather than false-matching.)
 
 #include <algorithm> // std::max — anchor advance (parenthesised for the MSVC <windows.h> macro)
 #include <charconv>
@@ -134,6 +140,14 @@ private:
 /// The outcome of `decide_reap`. `marker` is MANDATORY (no default) — see
 /// `MarkerAction`. `new_anchor` is `nullopt` to LEAVE `reap_anchor_ms`
 /// untouched (a skew decline/arm never advances it), or the value to upsert.
+///
+/// COMPILE-ENFORCEMENT SCOPE: only `marker` is compiler-mandatory (its no-default
+/// ctor makes an omitting aggregate-init ill-formed — the discipline that closes
+/// the recurring forget-the-marker class). The trailing `bool`/`optional` fields
+/// below are ordinary aggregate members: an omitted one silently value-initialises
+/// (false / nullopt). EVERY branch in `decide_reap` MUST therefore name all five
+/// explicitly — a future branch that omits e.g. `.clock_anomaly` compiles with a
+/// silent `false` (an unreported decline). Keep them named, not defaulted.
 struct ReapDecision {
     MarkerAction marker;                    ///< mandatory — every branch names one
     std::optional<std::int64_t> new_anchor; ///< nullopt = leave reap_anchor_ms untouched
@@ -172,6 +186,14 @@ inline ReapDecision decide_reap(std::string_view now_raw,
                                 std::optional<std::string_view> anchor_raw,
                                 std::optional<std::string_view> marker_raw,
                                 std::int64_t max_plausible_skew_ms) {
+    // DEFENSIVE: the sole production caller passes a positive compile-time
+    // constant (kMaxPlausibleSkewMs), but this is now a public pure helper — a
+    // future/mis-wired NEGATIVE bound would invert the clean path (every
+    // now_ms >= anchor would read as forward-skew → perpetual decline/recover).
+    // Clamp to 0: a zero bound degrades SAFELY (any forward delta is treated as
+    // a skew, never the reverse), so the parameter can never flip clean → skew.
+    if (max_plausible_skew_ms < 0)
+        max_plausible_skew_ms = 0;
     // SANITISE now() (clock-guarded-retention part 3): unparseable or negative
     // is an ANOMALY, never a quiet fallback. NOT a wedge risk — nothing here
     // is persisted beyond clearing a stale marker; the next pass issues its

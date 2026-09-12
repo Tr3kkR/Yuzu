@@ -291,3 +291,19 @@ TEST_CASE("parse_declined_marker: malformed markers treated as absent",
     CHECK_FALSE(parse_declined_marker("42:forward:extra").has_value()); // multi-colon: "forward:extra" not a direction
     CHECK_FALSE(parse_declined_marker("abc:forward").has_value());  // non-numeric anchor
 }
+
+TEST_CASE("decide_reap: a negative skew bound is clamped to 0 (cannot invert the clean path)",
+          "[gateway_route][reap_rules]") {
+    // Defensive clamp: an unclamped negative max_plausible_skew_ms would make
+    // now==anchor read as forward-skew (0 > -1) — a spurious decline on an
+    // otherwise-clean pass. The entry clamp (<0 -> 0) keeps now==anchor clean.
+    // Discriminating: without the clamp these CHECK_FALSEs flip (arm + anomaly).
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(kNow)), std::nullopt, -1);
+    CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
+    REQUIRE(d.new_anchor.has_value());
+    CHECK(*d.new_anchor == kNow);
+    CHECK(d.run_sweeps);
+    CHECK_FALSE(d.clock_anomaly); // clamp present: clean pass, not a forward-skew decline
+    CHECK_FALSE(d.recovered);
+}
