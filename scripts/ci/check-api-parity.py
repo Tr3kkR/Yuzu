@@ -120,7 +120,7 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # guardian-guard-form, get.fragments-guardian-guard-param-page, get.fragments-
 # guardian-guards, get.fragments-guardian-status) on top of origin/dev's 219 --
 # reconciled post-merge against the actual measured count, not hand-added.
-BASELINE_UNTWINNED = 213
+BASELINE_UNTWINNED = 210
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

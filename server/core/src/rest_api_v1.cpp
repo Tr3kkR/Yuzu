@@ -22,6 +22,8 @@
 #include "execution_event_scope.hpp"
 #include "guardian_model.hpp" // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "response_query_model.hpp" // #2146 A2-R2: shared instruction/command-ID-keyed
+                                     // response query/aggregate/export row builders
 #include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
                                      // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
@@ -1130,6 +1132,15 @@ const std::string& openapi_spec() {
         // at compile time, so the emitted OpenAPI JSON is byte-identical to
         // the unsplit form.
         R"json(,
+    "/responses/{id}": {
+      "get": {"summary": "Query command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id} and MCP query_responses' instruction_id path (shared builder response_query_row_json, response_query_model.hpp -- REST v1 and MCP cannot drift on row shape by construction; the legacy route is frozen reference code for this PR, not retrofitted onto the shared builder). Gated by the ADR-0017 admit-then-filter fleet-read primitive (Response:Read) -- resolve-then-scope: the in-scope agent set is pushed into the store query BEFORE limit, never post-filtered. No offset parameter (unlike the legacy route): the result set orders by a non-unique, actively-growing timestamp, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400 (mirrors GET /executions/{id}/responses and MCP query_responses). limit is clamped to [1,1000] on BOTH bounds. Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row (CC7.2), and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows: id, instruction_id, agent_id, execution_id, status, output, error_detail, timestamp, plugin, received_at_ms", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/responses/{id}/aggregate": {
+      "get": {"summary": "Aggregate command/instruction responses (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/aggregate and MCP aggregate_responses (shared builder response_aggregate_row_json). group_by must be status or agent_id; op is one of count|sum|avg|min|max (default count); op_column (sum/avg/min/max only) must be one of timestamp|status|id, default id when omitted -- an invalid group_by/op_column is a 400, validated against ResponseStore's own allow-list before the query runs. Gated on Response:Read with the same resolve-then-scope confinement as the query route above (filter-before-aggregate, ADR-0017 INV-3). Audited as response.read (REST fail-closed): a scope-drop emits a distinct denied row, and every served read also emits a success row.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "group_by", "in": "query", "required": false, "schema": {"type": "string", "enum": ["status", "agent_id"], "default": "status"}}, {"name": "op", "in": "query", "required": false, "schema": {"type": "string", "enum": ["count", "sum", "avg", "min", "max"], "default": "count"}}, {"name": "op_column", "in": "query", "required": false, "schema": {"type": "string", "enum": ["timestamp", "status", "id"], "default": "id"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}], "responses": {"200": {"description": "{instruction_id, groups: [{group_value, count, aggregate_value}], total_groups, total_rows}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid group_by, op_column, or numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/responses/{id}/export": {
+      "get": {"summary": "Export command/instruction responses as CSV or JSON (#2146 A2-R2)", "tags": ["Responses"], "description": "REST v1 twin of the legacy GET /api/responses/{id}/export. format is json (default) or csv; both use the same widened field set as GET /responses/{id} (unlike the legacy CSV export's narrower 7-column shape -- this is a new endpoint with no positional-column consumer to keep compatible). limit is clamped to [1,10000] on BOTH bounds -- a real, pre-existing gap on the legacy route (an unbounded caller-supplied limit) that is not propagated here. Same resolve-then-scope confinement, gate, and fail-closed response.read audit posture as the query/aggregate routes above.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}, "description": "instruction_id (a.k.a. command_id)"}, {"name": "format", "in": "query", "required": false, "schema": {"type": "string", "enum": ["json", "csv"], "default": "json"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 10000, "maximum": 10000}}], "responses": {"200": {"description": "CSV (Content-Disposition: attachment) or {data: [...], pagination, meta} JSON, same field set as GET /responses/{id}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}, "Content-Disposition": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the response.read audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
     "/workflows": {
       "get": {"summary": "List workflows (#4030)", "tags": ["Workflows"], "description": "REST v1 twin of the legacy GET /api/workflows and MCP list_workflows (new). Requires Workflow:Read (RBAC seeding prerequisite fixed by #4030/#4032 — Workflow was gated but never seeded, so no role could hold this grant before this change). Shared builder workflow_row_json (workflow_model.hpp) — REST/MCP cannot drift on field set.", "parameters": [{"name": "name", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 500}}], "responses": {"200": {"description": "Workflow list"}, "400": {"description": "Invalid limit or numeric query parameter"}, "403": {"description": "Insufficient permission (Workflow:Read)"}, "503": {"description": "Workflow engine not available"}}}
     },
@@ -8068,6 +8079,474 @@ void RestApiV1::register_routes(
             JArr arr;
             for (const auto& r : *responses_opt)
                 arr.add_raw(execution_response_row_json(r).dump());
+            res.set_content(list_json(arr.str(), arr.size()), "application/json");
+        });
+
+    // ══════════════════════════════════════════════════════════════════════
+    // GET /api/v1/responses/{instruction_id}[/aggregate|/export] — v1 twins
+    // of the legacy, unversioned command/instruction-ID-keyed Responses API
+    // (`response_routes.cpp`, #2146 A2-R2). DISTINCT from the execution-ID-
+    // keyed `/api/v1/executions/{id}/responses` route just above — that
+    // route is a different, already-shipped capability this PR does not
+    // touch.
+    //
+    // Same confinement pattern as the legacy routes (resolve-then-scope,
+    // #1634/ADR-0017 INV-3: push the in-scope agent set into the store call
+    // BEFORE any LIMIT/aggregate, never post-filter) and the same query
+    // semantics (group_by/op/op_column/agent_id/status/since/until), gated
+    // on the SAME `Response:Read` securable via `fleet_read_fn`. The legacy
+    // routes are read-only reference for this PR (not touched) — see
+    // `response_query_model.hpp`'s file comment for why the shared row
+    // builders below are a REST-v1/MCP pair, not a three-way share.
+    //
+    // Two v1-specific corrections vs. the legacy routes (both deliberate,
+    // documented deviations — see this PR's changelog):
+    //   - `limit` is clamped on BOTH bounds (legacy's export route only
+    //     floors its own DEFAULT at 10000; a caller-supplied `limit` there
+    //     has no ceiling at all — a real, pre-existing bug this PR does not
+    //     propagate here, see the changelog for the tracked-issue decision).
+    //   - `offset` is rejected outright on the plain query route (400, not
+    //     silently accepted) — mirrors `/api/v1/executions/{id}/responses`'s
+    //     own #4030 Gate 8 fix just above: `query()`'s result set orders by
+    //     non-unique `timestamp DESC`, so offset-based paging over a table
+    //     that can still be receiving rows for this instruction silently
+    //     skips/duplicates rows with zero signal to the caller. The legacy
+    //     route accepts (and silently mis-serves) `offset` today; this PR
+    //     does not fix that pre-existing route, only declines to repeat the
+    //     defect on the new one.
+    //
+    // Audit posture: fail-closed `emit_behavioral_audit` on every audited
+    // event (a scope-drop "denied" row, parity with the legacy routes' own
+    // CC7.2 evidence, PLUS a "success" row per docs/api-twin-recipe.md §4's
+    // REST-JSON posture and the `/api/v1/executions/{id}/responses` REST
+    // precedent above) — a judgment call: the legacy routes only audit
+    // scope-drops, never success; this v1 surface adds the success audit
+    // deliberately, matching the closer response-body-read precedent rather
+    // than leaving v1 unaudited on the happy path.
+    //
+    // Registration order: aggregate/export MUST register before the plain
+    // catch-all below, matching the legacy family's own load-bearing order
+    // (response_routes.hpp's file header) — not strictly load-bearing here
+    // since all three patterns use `[^/]+` (which cannot cross a '/', unlike
+    // legacy's `.+` catch-all), but kept for parity/readability with the
+    // routes they twin.
+    // ══════════════════════════════════════════════════════════════════════
+
+    sink.Get(
+        R"(/api/v1/responses/([^/]+)/aggregate)",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error(
+                    "GET /api/v1/responses/{{id}}/aggregate: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store not available", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto instruction_id = req.matches[1].str();
+
+            auto group_by = req.get_param_value("group_by");
+            if (group_by.empty())
+                group_by = "status";
+            if (std::find(ResponseStore::allowed_group_by().begin(),
+                          ResponseStore::allowed_group_by().end(),
+                          group_by) == ResponseStore::allowed_group_by().end()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid group_by"), "application/json");
+                return;
+            }
+
+            AggregateOp op = AggregateOp::Count;
+            auto op_str = req.get_param_value("op");
+            if (op_str == "sum")
+                op = AggregateOp::Sum;
+            else if (op_str == "avg")
+                op = AggregateOp::Avg;
+            else if (op_str == "min")
+                op = AggregateOp::Min;
+            else if (op_str == "max")
+                op = AggregateOp::Max;
+
+            auto op_column_param = req.get_param_value("op_column");
+            const std::string effective_op_column =
+                op_column_param.empty() ? "id" : op_column_param;
+            if (std::find(ResponseStore::allowed_op_column().begin(),
+                          ResponseStore::allowed_op_column().end(),
+                          effective_op_column) == ResponseStore::allowed_op_column().end()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid op_column"), "application/json");
+                return;
+            }
+
+            AggregationQuery aq;
+            aq.group_by = group_by;
+            aq.op = op;
+            aq.op_column = op_column_param;
+
+            ResponseQuery filter;
+            if (req.has_param("agent_id"))
+                filter.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    filter.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    filter.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    filter.until = std::stoll(req.get_param_value("until"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+
+            AggregateScope agg_scope; // nullopt = no restriction
+            std::size_t agg_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store unavailable",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++agg_dropped;
+                }
+                agg_scope = std::move(in_scope); // engaged-empty means no rows
+            }
+            if (agg_dropped > 0 &&
+                !detail::emit_behavioral_audit(
+                    audit_fn, req, res, "response.read", "denied", "Execution", instruction_id,
+                    "scope_dropped=" + std::to_string(agg_dropped) + " surface=v1_aggregate")) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto results_opt = response_store->aggregate(instruction_id, aq, filter, agg_scope);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            const auto& results = *results_opt;
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
+                                               "Execution", instruction_id,
+                                               "REST v1 response aggregate cid=" + cid)) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            int64_t total_rows = 0;
+            JArr groups;
+            for (const auto& r : results) {
+                total_rows += r.count;
+                groups.add_raw(response_aggregate_row_json(r).dump());
+            }
+            res.set_content(ok_json(JObj()
+                                        .add("instruction_id", instruction_id)
+                                        .raw("groups", groups.str())
+                                        .add("total_groups", static_cast<int64_t>(results.size()))
+                                        .add("total_rows", total_rows)
+                                        .str()),
+                            "application/json");
+        });
+
+    sink.Get(
+        R"(/api/v1/responses/([^/]+)/export)",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/responses/{{id}}/export: fleet_read_fn unwired; cid={}",
+                             cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store not available", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto instruction_id = req.matches[1].str();
+
+            // #2146 A2-R2: this v1 twin clamps a CALLER-SUPPLIED limit too —
+            // the legacy export route (response_routes.cpp) only floors its
+            // own DEFAULT at kExportLimitCap; an explicit `?limit=` there has
+            // no ceiling at all and can attempt an unbounded fetch. Not fixed
+            // on the legacy route (out of scope for this PR — read-only
+            // reference); not propagated here.
+            static constexpr int kExportLimitCap = 10000;
+            ResponseQuery q;
+            if (req.has_param("agent_id"))
+                q.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::clamp(std::stoi(req.get_param_value("limit")), 1,
+                                         kExportLimitCap);
+                else
+                    q.limit = kExportLimitCap; // higher default for exports, matches legacy
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t export_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++export_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+            if (export_dropped > 0 &&
+                !detail::emit_behavioral_audit(
+                    audit_fn, req, res, "response.read", "denied", "Execution", instruction_id,
+                    "scope_dropped=" + std::to_string(export_dropped) + " surface=v1_export")) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto results_opt = response_store->query(instruction_id, q, scope_arg);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
+                                               "Execution", instruction_id,
+                                               "REST v1 response export cid=" + cid)) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto format = req.get_param_value("format");
+            if (format == "csv") {
+                std::string csv{kResponseExportCsvHeader};
+                for (const auto& r : results)
+                    csv += response_export_csv_row(r);
+                res.set_header("Content-Disposition",
+                               "attachment; filename=\"responses-" + instruction_id + ".csv\"");
+                res.set_content(csv, "text/csv; charset=utf-8");
+            } else {
+                JArr arr;
+                for (const auto& r : results)
+                    arr.add_raw(response_query_row_json(r).dump());
+                res.set_header("Content-Disposition",
+                               "attachment; filename=\"responses-" + instruction_id + ".json\"");
+                res.set_content(list_json(arr.str(), arr.size()), "application/json; charset=utf-8");
+            }
+        });
+
+    sink.Get(
+        R"(/api/v1/responses/([^/]+))",
+        [fleet_read_fn, audit_fn, response_store](const httplib::Request& req,
+                                                   httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("GET /api/v1/responses/{{id}}: fleet_read_fn unwired; cid={}", cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            auto gate = fleet_read_fn(req, res, "Response", "Read");
+            if (!gate.admitted)
+                return; // gate already wrote the response.
+            if (!response_store || !response_store->is_open()) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store not available", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto instruction_id = req.matches[1].str();
+
+            // #2146 A2-R2: `offset` is deliberately NOT accepted here, matching
+            // `/api/v1/executions/{id}/responses`'s own #4030 Gate 8 fix above and
+            // MCP `query_responses` — the result set orders by non-unique
+            // `timestamp DESC` and can still be gaining rows for this instruction,
+            // so offset-based paging silently skips/duplicates rows. Reject rather
+            // than silently ignore a caller-supplied `offset`; the legacy route
+            // (response_routes.cpp) accepts it today, a pre-existing gap this PR
+            // does not fix on that route.
+            if (req.has_param("offset")) {
+                res.status = 400;
+                res.set_content(
+                    detail::a4_error(res,
+                                     "offset is not supported on this route -- the result set "
+                                     "orders by a non-unique, actively-growing timestamp and "
+                                     "offset-based paging would silently skip or duplicate rows; "
+                                     "use the limit/since cursor shape instead, matching MCP "
+                                     "query_responses"),
+                    "application/json");
+                return;
+            }
+
+            ResponseQuery q;
+            if (req.has_param("agent_id"))
+                q.agent_id = req.get_param_value("agent_id");
+            try {
+                if (req.has_param("status"))
+                    q.status = std::stoi(req.get_param_value("status"));
+                if (req.has_param("since"))
+                    q.since = std::stoll(req.get_param_value("since"));
+                if (req.has_param("until"))
+                    q.until = std::stoll(req.get_param_value("until"));
+                if (req.has_param("limit"))
+                    q.limit = std::stoi(req.get_param_value("limit"));
+            } catch (const std::exception&) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "invalid numeric query parameter"),
+                                "application/json");
+                return;
+            }
+            // Clamp BOTH bounds, matching MCP query_responses and the
+            // execution-scoped v1 twin above — a negative/huge caller-supplied
+            // limit must neither bind unbounded nor silently under-serve.
+            q.limit = static_cast<int>(std::clamp<int64_t>(q.limit, 1, 1000));
+
+            AggregateScope scope_arg; // nullopt = unrestricted
+            std::size_t get_dropped = 0;
+            if (gate.scope) {
+                auto distinct = response_store->distinct_agent_ids(instruction_id);
+                if (!distinct) {
+                    res.status = 503;
+                    res.set_content(detail::a4_error(res, "response store degraded",
+                                                     {.retry_after_ms = 5000}),
+                                    "application/json");
+                    return;
+                }
+                std::vector<std::string> in_scope;
+                in_scope.reserve(distinct->size());
+                for (auto& aid : *distinct) {
+                    if (authz::in_scope(gate.scope, aid))
+                        in_scope.push_back(std::move(aid));
+                    else
+                        ++get_dropped;
+                }
+                scope_arg = std::move(in_scope); // engaged-empty means no rows
+            }
+            if (get_dropped > 0 &&
+                !detail::emit_behavioral_audit(
+                    audit_fn, req, res, "response.read", "denied", "Execution", instruction_id,
+                    "scope_dropped=" + std::to_string(get_dropped) + " surface=v1_get")) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            auto results_opt = response_store->query(instruction_id, q, scope_arg);
+            if (!results_opt) {
+                res.status = 503;
+                res.set_content(
+                    detail::a4_error(res, "response store degraded", {.retry_after_ms = 5000}),
+                    "application/json");
+                return;
+            }
+            auto results = std::move(*results_opt);
+
+            if (!detail::emit_behavioral_audit(audit_fn, req, res, "response.read", "success",
+                                               "Execution", instruction_id,
+                                               "REST v1 response query cid=" + cid)) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503,
+                                                      "audit subsystem unavailable; refusing to "
+                                                      "serve response data without durable "
+                                                      "evidence",
+                                                      cid, 5000, "retry the request"),
+                                "application/json");
+                return;
+            }
+
+            JArr arr;
+            for (const auto& r : results)
+                arr.add_raw(response_query_row_json(r).dump());
             res.set_content(list_json(arr.str(), arr.size()), "application/json");
         });
 

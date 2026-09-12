@@ -86,13 +86,20 @@ struct ExecutionKpi {
 nlohmann::json execution_kpi_json(const ExecutionKpi& k);
 
 /// Execution-scoped response row for `GET /api/v1/executions/{id}/responses`
-/// (mirrors MCP `query_responses`'s `execution_id`-filtered field set --
-/// FIELD-SET PARITY only, not a shared builder: `query_responses` builds its
-/// row inline in `mcp_server.cpp` rather than calling this function, so a
-/// future field change to one will not propagate to the other without a
-/// human remembering both, unlike this file's other builders (#4030 Gate 3,
-/// consistency-auditor -- retrofitting `query_responses` onto this function
-/// is deliberately out of scope for the Gate 8 fix round; tracked open).
+/// ONLY. *(Correction, #2146 A2-R2: this doc comment previously claimed
+/// FIELD-SET PARITY with MCP `query_responses` on the grounds that
+/// `query_responses` built its row inline with the same 5 fields --
+/// `query_responses` now calls the WIDER `response_query_row_json`
+/// (`response_query_model.hpp`, which adds id/instruction_id/error_detail/
+/// plugin/received_at_ms) on BOTH its instruction_id and execution_id
+/// paths, so that parity claim no longer holds and would be a stale-comment
+/// truth defect if left as written.)* This function remains the narrower,
+/// execution-ID-keyed shape (agent_id/execution_id/status/output/timestamp)
+/// for the `/api/v1/executions/{id}/responses` REST route specifically --
+/// out of scope for A2-R2 (a different, already-shipped capability keyed on
+/// execution_id, not instruction_id). Retrofitting THIS route onto the
+/// wider builder, or removing this function in favor of it, is a separate,
+/// future decision, not something A2-R2 does.
 nlohmann::json execution_response_row_json(const StoredResponse& r);
 
 } // namespace yuzu::server

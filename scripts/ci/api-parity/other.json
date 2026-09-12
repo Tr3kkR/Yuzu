@@ -379,25 +379,34 @@
     "method": "GET",
     "path": "/api/responses/{param}",
     "capability_id": "get.api-responses-param",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/responses/{param}"
+    },
+    "mcp_twin": "query_responses",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/responses/{param}/aggregate",
     "capability_id": "get.api-responses-param-aggregate",
-    "rest_v1_twin": null,
-    "mcp_twin": null,
-    "status": "planned:#2146"
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/responses/{param}/aggregate"
+    },
+    "mcp_twin": "aggregate_responses",
+    "status": "twinned"
   },
   {
     "method": "GET",
     "path": "/api/responses/{param}/export",
     "capability_id": "get.api-responses-param-export",
-    "rest_v1_twin": null,
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/responses/{param}/export"
+    },
     "mcp_twin": null,
-    "status": "planned:#2146"
+    "status": "twinned"
   },
   {
     "method": "GET",
