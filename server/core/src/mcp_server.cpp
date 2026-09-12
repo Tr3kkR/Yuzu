@@ -2,6 +2,7 @@
 
 #include "http_route_sink.hpp" // HttpRouteSink / HttplibRouteSink — #2542 PR-6 seam migration
 #include "mcp_server_testonly.hpp" // decls for the tool_*_for_test() defs below
+#include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "mcp_agentic_catalog.hpp" // agentic demo catalog: incident playbooks
 #include "mcp_approval_error.hpp" // shared approval-store failure body (#2786)
@@ -719,9 +720,22 @@ static const ToolDef kTools[] = {
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
 
-    {"list_pending_approvals", "List pending approval requests.",
+    {"list_pending_approvals", "List approval requests (REST v1 twin: GET /api/v1/approvals; "
+     "also matches the legacy GET /api/approvals field set — #2146 A2-R4). Rows now also carry "
+     "reviewed_by/reviewed_at/review_comment, reconciled onto the REST twins' fuller field set "
+     "(shared builder approval_row_json). Gated on query_checked: a store/pool failure returns "
+     "a retryable error rather than a false empty list. The underlying query is hard-capped at "
+     "100 rows with no limit/cursor parameter; a result hitting that cap sets "
+     "result_truncated_by_cap:true rather than presenting a partial list as complete.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
-     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","scope_expression"]}}},"required":["approvals"]})j"},
+     R"j({"type":"object","properties":{"approvals":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"definition_id":{"type":"string"},"status":{"type":"string"},"submitted_by":{"type":"string"},"submitted_at":{"type":"integer"},"reviewed_by":{"type":"string"},"reviewed_at":{"type":"integer"},"review_comment":{"type":"string"},"scope_expression":{"type":"string"}},"required":["id","definition_id","status","submitted_by","submitted_at","reviewed_by","reviewed_at","review_comment","scope_expression"]}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 100-row cap dropped rows; absent otherwise."}},"required":["approvals"]})j"},
+
+    {"get_pending_approval_count", "Count pending approval requests (REST v1 twin: GET "
+     "/api/v1/approvals/pending/count; also matches the legacy GET "
+     "/api/approvals/pending/count — #2146 A2-R4). Gated on pending_count_checked: a "
+     "store/pool failure returns a retryable error rather than a false zero count.",
+     R"({"type":"object","properties":{}})",
+     R"j({"type":"object","properties":{"count":{"type":"integer"}},"required":["count"]})j"},
 
     // ── #4031: AD/Entra directory-sync read twins — parity with GET
     // /api/v1/directory/users and /directory/status. NOT the OIDC SSO config
@@ -2428,6 +2442,10 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
     {"list_pending_approvals", {"Approval", "Read"}},
+    // #2146 A2-R4 — same gate as list_pending_approvals: a fleet-wide
+    // operator-facing review-queue count with no per-agent axis, matching
+    // the legacy GET /api/approvals/pending/count's bare gate.
+    {"get_pending_approval_count", {"Approval", "Read"}},
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
     {"get_guardian_schemas", {"GuaranteedState", "Read"}},
@@ -3010,6 +3028,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
+    {"get_pending_approval_count", {ToolEffect::ReadOnly, true, "Get pending approval count"}},
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
     {"get_guardian_schemas", {ToolEffect::ReadOnly, true, "Get Guardian schemas"}},
@@ -8673,23 +8692,82 @@ McpServer::HandlerFn McpServer::build_handler(
                 ApprovalQuery aq;
                 aq.status = param_str(args, "status", "pending");
                 aq.submitted_by = param_str(args, "submitted_by");
-                auto approvals = approval_manager->query(aq);
+                // #2146 A2-R4 review finding: was the unchecked query(), which
+                // silently returned an empty list on pool exhaustion / a
+                // failed query, indistinguishable from a genuinely empty
+                // queue -- mirrors list_schedules' checked/a4_error shape
+                // immediately above.
+                auto list_result = approval_manager->query_checked(aq);
+                if (!list_result) {
+                    res.set_content(
+                        a4_error(kInternalError, "approval store degraded", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Shared builder (approval_model.hpp, #2146 A2-R4 Rule 1) --
+                // same JSON shape as GET /api/v1/approvals and the single-
+                // fetch GET /api/v1/approvals/{id}, so the three cannot
+                // drift from each other.
                 JArr arr;
-                for (const auto& a : approvals) {
-                    arr.add(JObj()
-                                .add("id", a.id)
-                                .add("definition_id", a.definition_id)
-                                .add("status", a.status)
-                                .add("submitted_by", a.submitted_by)
-                                .add("submitted_at", a.submitted_at)
-                                .add("scope_expression", a.scope_expression));
+                for (const auto& a : list_result->approvals)
+                    arr.add_raw(approval_row_json(a).dump());
+                mcp_audit("success");
+                // result_truncated_by_cap (declared in the output schema
+                // above, precedent: list_schedules): the underlying query is
+                // hard-capped at 100 rows with no limit/cursor parameter on
+                // this tool; tells a caller when this response is a partial
+                // page rather than the complete approval queue.
+                // content[].text stays the bare `approvals` array unchanged
+                // for backward compat -- the flag lives only in
+                // structuredContent, same split as list_schedules.
+                JObj structured;
+                structured.raw("approvals", arr.str());
+                if (list_result->truncated)
+                    structured.add("result_truncated_by_cap", true);
+                res.set_content(
+                    success_response(
+                        id, tool_result_split(arr.str(), structured.str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── get_pending_approval_count (#2146 A2-R4) ───────────────────
+            if (tool_name == "get_pending_approval_count") {
+                if (!tier_allows(tier, "Approval", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Approval", "Read"))
+                    return;
+                if (!approval_manager) {
+                    res.set_content(
+                        error_response(id, kInternalError, "Approval manager unavailable"),
+                        "application/json");
+                    return;
+                }
+                // #2146 A2-R4: the unchecked pending_count() silently returns
+                // 0 on pool exhaustion / a failed query, indistinguishable
+                // from a genuine "zero pending approvals" state -- the exact
+                // false-negative a maker-checker backlog monitor cannot
+                // tolerate. Same checked/a4_error shape as list_pending_approvals
+                // above.
+                auto count_result = approval_manager->pending_count_checked();
+                if (!count_result) {
+                    mcp_audit("failure", "store degraded; get_pending_approval_count");
+                    res.set_content(
+                        a4_error(kInternalError, "approval store degraded", {},
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
                 }
                 mcp_audit("success");
                 res.set_content(
-                    success_response(id,
-                                      tool_result_split(arr.str(),
-                                                         JObj().raw("approvals", arr.str()).str(),
-                                                         kObjectOutputSchema)),
+                    success_response(
+                        id, tool_result(JObj().add("count", *count_result).str(),
+                                        kObjectOutputSchema)),
                     "application/json");
                 return;
             }

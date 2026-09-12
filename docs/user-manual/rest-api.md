@@ -8797,6 +8797,49 @@ Fetch a single approval by id. This is the **A4 `status_url` target**: when an o
 
 **Errors:** `404` (no approval matches the id — A4 envelope), `503` (approval store not initialised — A4 envelope with `retry_after_ms: 5000`).
 
+#### `GET /api/v1/approvals`
+
+REST v1 twin of the legacy unversioned `GET /api/approvals` below and the widened MCP `list_pending_approvals` tool — all three share one JSON-row builder so they cannot drift. Requires `Approval:Read`. Accepts `status` and `submitted_by` query parameters, same as the legacy route. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); `pagination.result_truncated_by_cap` is added when more than 100 approvals match, so `pagination.total` is never presented as the true match count.
+
+**Response (200):**
+
+```json
+{
+  "data": [
+    {
+      "id": "…",
+      "definition_id": "…",
+      "status": "pending",
+      "submitted_by": "alice",
+      "submitted_at": 1735689600,
+      "reviewed_by": "",
+      "reviewed_at": 0,
+      "review_comment": "",
+      "scope_expression": "tag:prod"
+    }
+  ],
+  "pagination": { "total": 1, "start": 0, "page_size": 50 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `503` (approval store unavailable/degraded — A4 envelope with `retry_after_ms: 5000`, rather than a false empty list on a genuine store failure).
+
+#### `GET /api/v1/approvals/pending/count`
+
+REST v1 twin of the legacy unversioned `GET /api/approvals/pending/count` below and the new MCP `get_pending_approval_count` tool. Requires `Approval:Read`.
+
+**Response (200):**
+
+```json
+{
+  "data": { "count": 3 },
+  "meta": { "api_version": "v1" }
+}
+```
+
+**Errors:** `503` (approval store unavailable/degraded — A4 envelope with `retry_after_ms: 5000`, rather than a false zero count on a genuine store failure).
+
 #### `GET /api/approvals`
 
 List approvals. Accepts `status` and `submitted_by` as query parameters.
@@ -9725,6 +9768,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `validate_scope` | Validate a scope expression |
 | `preview_scope_targets` | Preview which agents match a scope |
 | `list_pending_approvals` | List pending approval requests |
+| `get_pending_approval_count` | Count pending approval requests |
 
 `query_inventory`, `list_inventory_tables`, and `get_agent_inventory` read the Postgres-backed generic `InventoryStore` (ADR-0037) and now return a JSON-RPC internal-error response (code `-32603`) when the store is unavailable or degraded (previously a silent empty result).
 

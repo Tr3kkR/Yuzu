@@ -120,7 +120,12 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # guardian-guard-form, get.fragments-guardian-guard-param-page, get.fragments-
 # guardian-guards, get.fragments-guardian-status) on top of origin/dev's 219 --
 # reconciled post-merge against the actual measured count, not hand-added.
-BASELINE_UNTWINNED = 213
+#
+# #2146 A2-R4 (approval-review REST v1/MCP parity): 2 other.json rows flip to
+# "twinned" (get.api-approvals -> GET /api/v1/approvals + list_pending_approvals;
+# get.api-approvals-pending-count -> GET /api/v1/approvals/pending/count +
+# get_pending_approval_count) on top of origin/dev's 213.
+BASELINE_UNTWINNED = 211
 
 # ── OpenAPI-missing allowlist (seed for F2) ──────────────────────────────
 # Every /api/v1/* route registered today that has no OpenAPI `paths` entry.

@@ -5698,6 +5698,204 @@ TEST_CASE("MCP C8: a non-service session still reaches list_agents "
     CHECK_FALSE(body.contains("error"));
 }
 
+// ── list_pending_approvals / get_pending_approval_count (#2146 A2-R4) ────────
+// Previously untested at the MCP dispatch layer beyond the tools/list
+// outputSchema spot-check — every other "approval"-tagged test in this file
+// exercises the ticket mint/consume recall flow (a different mechanism), not
+// these two plain list/count reads.
+
+TEST_CASE("MCP list_pending_approvals: happy path returns the widened field set",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    auto id =
+        appr.submit("def-mcp-list", "operator1", "scope-1", "", ApprovalOrigin::kInstruction);
+    REQUIRE(id.has_value());
+    REQUIRE(appr.approve(*id, "reviewer1", "looks good").has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,"params":{"name":"list_pending_approvals","arguments":{"status":"approved"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto structured = body["result"]["structuredContent"];
+    REQUIRE(structured["approvals"].size() == 1);
+    auto row = structured["approvals"][0];
+    CHECK(row["id"] == *id);
+    CHECK(row["definition_id"] == "def-mcp-list");
+    CHECK(row["status"] == "approved");
+    CHECK(row["submitted_by"] == "operator1");
+    // The widened field set (#2146 A2-R4) — previously missing from this
+    // tool relative to the REST twins.
+    CHECK(row["reviewed_by"] == "reviewer1");
+    CHECK(row["review_comment"] == "looks good");
+    CHECK(row.contains("reviewed_at"));
+    CHECK_FALSE(structured.contains("result_truncated_by_cap"));
+}
+
+TEST_CASE("MCP list_pending_approvals: RBAC denial (Approval:Read) blocks the call",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Approval" && op == "Read");
+    };
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP list_pending_approvals: no approval_manager wired is an internal error, "
+          "not an empty list",
+          "[mcp][approval]") {
+    McpTestServer ts; // approval_manager_for_test stays nullptr
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":302,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP list_pending_approvals: a genuine store failure is retryable, never a "
+          "false empty list",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    REQUIRE(
+        appr.submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction).has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                           std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "approval store degraded");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+}
+
+TEST_CASE("MCP list_pending_approvals: result_truncated_by_cap appears past the 100-row "
+          "cap (#2146 A2-R4 boundary)",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    for (int i = 0; i < 101; ++i)
+        REQUIRE(appr.submit("def-cap", "operator1", "scope-" + std::to_string(i), "",
+                            ApprovalOrigin::kInstruction)
+                    .has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,"params":{"name":"list_pending_approvals"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    auto structured = body["result"]["structuredContent"];
+    CHECK(structured["approvals"].size() == 100);
+    CHECK(structured["result_truncated_by_cap"] == true);
+}
+
+TEST_CASE("MCP get_pending_approval_count: happy path reflects the pending queue",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    REQUIRE(
+        appr.submit("def-1", "operator1", "scope-1", "", ApprovalOrigin::kInstruction).has_value());
+    REQUIRE(
+        appr.submit("def-2", "operator1", "scope-2", "", ApprovalOrigin::kInstruction).has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":305,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto structured = body["result"]["structuredContent"];
+    CHECK(structured["count"] == 2);
+}
+
+TEST_CASE("MCP get_pending_approval_count: RBAC denial (Approval:Read) blocks the call",
+          "[mcp][approval]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Approval" && op == "Read");
+    };
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":306,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+TEST_CASE("MCP get_pending_approval_count: no approval_manager wired is an internal "
+          "error, not a false zero",
+          "[mcp][approval]") {
+    McpTestServer ts; // approval_manager_for_test stays nullptr
+    ts.start("operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":307,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP get_pending_approval_count: a genuine store failure is retryable, never "
+          "a false zero",
+          "[pg][mcp][approval]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+    REQUIRE(
+        appr.submit("def-x", "operator1", "scope", "", ApprovalOrigin::kInstruction).has_value());
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.start("operator");
+
+    {
+        auto lease = appr_bundle.pool().acquire();
+        REQUIRE(lease);
+        pg::PgResult res = pg::exec_params(lease.get(), "DROP TABLE approval_manager.approvals",
+                                           std::vector<std::string>{});
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":308,"params":{"name":"get_pending_approval_count"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"] == "approval store degraded");
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"] == mcp::kMcpStoreFaultRetryMs);
+}
+
 // guardian-confinement-2298 hardening sweep: ITServiceOwner grants full CRUD
 // on Schedule, and ScheduleEngine::query_schedules has no owner/service
 // filter of any kind, so a bare Schedule:Read tier/perm gate alone let a

@@ -3,6 +3,7 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "access_review_model.hpp" // Periodic Access Reviews (SOC 2 CC6.2) — pure read-model
 #include "access_review_store.hpp" // Periodic Access Reviews — campaign persistence
+#include "approval_model.hpp" // #2146 A2-R4: shared approval-row JSON builder (REST v1 + MCP)
 #include "directory_sync.hpp"      // access-review read-model optional email enrichment
 #include "engine_store_error_class.hpp" // shared REST/MCP store-error classifier
 #include "token_rotation_lookup.hpp"    // shared REST/MCP human-token rotation successor lookup (P2 #11)
@@ -1146,6 +1147,12 @@ const std::string& openapi_spec() {
         R"json(,
     "/approvals/{id}": {
       "get": {"summary": "Fetch a single approval by id", "tags": ["Approvals"], "description": "The versioned single-approval status endpoint, and the target of an A4 error envelope's status_url (the kApprovalRequired specialisation): a worker told its request needs approval polls this for the current status rather than re-issuing the gated request. Read-only — it never mutates the approval lifecycle (submit/approve/reject live on the legacy /api/approvals/* routes). Requires Approval:Read. 404 (A4 envelope) when no approval matches the id. Response always includes X-Correlation-Id.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Approval object", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}, "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"$ref": "#/components/schemas/Approval"}, "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "404": {"description": "Approval not found", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Approval store not initialised; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/approvals": {
+      "get": {"summary": "List approval requests (#2146 A2-R4)", "tags": ["Approvals"], "description": "REST v1 twin of the legacy unversioned GET /api/approvals and the widened MCP list_pending_approvals tool. Same gate as GET /api/v1/approvals/{id} (bare Approval:Read — a fleet-wide operator-facing review queue with no per-agent axis, so the ADR-0017 admit-then-filter fleet-read gate does not apply here), same status/submitted_by filters as the legacy route, and the SAME field set (shared builder approval_row_json). Gated on query_checked: a store/pool failure returns 503 with retry_after_ms rather than a false empty list. The underlying query is hard-capped at 100 rows (no caller-visible limit/cursor); when more than 100 approvals match, pagination.result_truncated_by_cap is added so pagination.total is never presented as the true match count.", "parameters": [{"name": "status", "in": "query", "required": false, "schema": {"type": "string", "enum": ["pending", "approved", "rejected", "expired"]}}, {"name": "submitted_by", "in": "query", "required": false, "schema": {"type": "string"}}], "responses": {"200": {"description": "Approval list. pagination.result_truncated_by_cap is present (true) when the 100-row cap dropped rows.", "content": {"application/json": {"schema": {"type": "object", "properties": {"data": {"type": "array", "items": {"$ref": "#/components/schemas/Approval"}}, "pagination": {"type": "object", "properties": {"total": {"type": "integer"}, "result_truncated_by_cap": {"type": "boolean"}}}, "meta": {"type": "object", "properties": {"api_version": {"type": "string"}}}}}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "503": {"description": "Approval store not available or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+    },
+    "/approvals/pending/count": {
+      "get": {"summary": "Count pending approval requests (#2146 A2-R4)", "tags": ["Approvals"], "description": "REST v1 twin of the legacy unversioned GET /api/approvals/pending/count and the new MCP get_pending_approval_count tool. Same gate as GET /api/v1/approvals. Gated on pending_count_checked: a store/pool failure returns 503 with retry_after_ms rather than a false zero count.", "responses": {"200": {"description": "{data: {count}}"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Approval:Read)"}, "503": {"description": "Approval store not available or degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) before the DEX block.
         R"json(,
@@ -8348,18 +8355,122 @@ void RestApiV1::register_routes(
             // stable agentic surface should leave a trail. Best-effort (success
             // path only; not fail-closed — no new PII beyond the legacy route).
             (void)audit_fn(req, "approval.read", "success", "Approval", id, "status=" + a.status);
-            auto data = JObj()
-                            .add("id", a.id)
-                            .add("definition_id", a.definition_id)
-                            .add("status", a.status)
-                            .add("submitted_by", a.submitted_by)
-                            .add("submitted_at", static_cast<int64_t>(a.submitted_at))
-                            .add("reviewed_by", a.reviewed_by)
-                            .add("reviewed_at", static_cast<int64_t>(a.reviewed_at))
-                            .add("review_comment", a.review_comment)
-                            .add("scope_expression", a.scope_expression)
-                            .str();
-            res.set_content(ok_json(data), "application/json");
+            // Shared builder (approval_model.hpp, #2146 A2-R4 Rule 1) — same
+            // JSON shape as GET /api/v1/approvals and MCP list_pending_approvals,
+            // so the three cannot drift from each other.
+            res.set_content(ok_json(approval_row_json(a).dump()), "application/json");
+        });
+
+    // ── GET /api/v1/approvals — approval list (v1 twin) ───────────────────
+    //
+    // REST v1 twin of the legacy unversioned GET /api/approvals. Same gate
+    // (bare Approval:Read — this is a fleet-wide operator-facing review
+    // queue with no per-agent axis, so the ADR-0017 admit-then-filter
+    // fleet-read gate does not apply here, matching the legacy route's own
+    // gate shape), same status/submitted_by filters, and the SAME field set
+    // (shared builder approval_row_json — Rule 1: this route, the single-
+    // fetch route above, and MCP list_pending_approvals all call it, so the
+    // three cannot drift). Gated on query_checked (#2146 A2-R4): a store/
+    // pool failure returns 503 with retry_after_ms rather than a false
+    // empty list — the legacy route's unchecked query() cannot tell "the
+    // store is down" from "zero approvals", a silent false-negative on
+    // exactly the signal a maker-checker workflow depends on. The
+    // underlying query is hard-capped at 100 rows (no caller-visible
+    // limit/cursor); when more than 100 approvals match,
+    // pagination.result_truncated_by_cap is added so pagination.total is
+    // never presented as the true match count (precedent: GET
+    // /api/v1/schedules).
+    sink.Get(
+        "/api/v1/approvals",
+        [perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Approval", "Read"))
+                return;
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!approval_manager) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval service unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the approval store "
+                                          "initialises during startup"),
+                    "application/json");
+                return;
+            }
+
+            ApprovalQuery q;
+            if (req.has_param("status"))
+                q.status = req.get_param_value("status");
+            if (req.has_param("submitted_by"))
+                q.submitted_by = req.get_param_value("submitted_by");
+
+            auto list_result = approval_manager->query_checked(q);
+            if (!list_result) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval store degraded", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry shortly; if this persists, escalate to an "
+                                          "operator"),
+                    "application/json");
+                return;
+            }
+
+            JArr arr;
+            for (const auto& a : list_result->approvals)
+                arr.add_raw(approval_row_json(a).dump());
+            JObj pagination;
+            pagination.add("total", arr.size()).add("start", int64_t{0}).add("page_size", int64_t{50});
+            if (list_result->truncated)
+                pagination.add("result_truncated_by_cap", true);
+            res.set_content(
+                JObj()
+                    .raw("data", arr.str())
+                    .raw("pagination", pagination.str())
+                    .raw("meta", R"({"api_version":"v1"})")
+                    .str(),
+                "application/json");
+        });
+
+    // ── GET /api/v1/approvals/pending/count — pending count (v1 twin) ─────
+    //
+    // REST v1 twin of the legacy unversioned GET /api/approvals/pending/count.
+    // Same gate as GET /api/v1/approvals. Gated on pending_count_checked
+    // (#2146 A2-R4): a store/pool failure returns 503 with retry_after_ms
+    // rather than a false zero — the legacy route's unchecked pending_count()
+    // silently returns 0, indistinguishable from "no pending approvals",
+    // exactly the ambiguity a maker-checker backlog monitor cannot tolerate.
+    sink.Get(
+        "/api/v1/approvals/pending/count",
+        [perm_fn, approval_manager](const httplib::Request& req, httplib::Response& res) {
+            if (!perm_fn(req, res, "Approval", "Read"))
+                return;
+            const auto cid = detail::ensure_correlation_id(res);
+            if (!approval_manager) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval service unavailable", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry after server warmup; the approval store "
+                                          "initialises during startup"),
+                    "application/json");
+                return;
+            }
+
+            auto count_result = approval_manager->pending_count_checked();
+            if (!count_result) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "approval store degraded", cid,
+                                          /*retry_after_ms=*/5000,
+                                          "retry shortly; if this persists, escalate to an "
+                                          "operator"),
+                    "application/json");
+                return;
+            }
+
+            res.set_content(
+                ok_json(JObj().add("count", *count_result).str()),
+                "application/json");
         });
 
     // ── Response Visualization (issue #253, capability 20.6) ─────────────

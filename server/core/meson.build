@@ -425,6 +425,7 @@ yuzu_server_core_lib = static_library(
     'src/fleet_topology_store.cpp',
     'src/heartbeat_ingestion.cpp',
     'src/approval_manager.cpp',
+    'src/approval_model.cpp',
     'src/schedule_engine.cpp',
     'src/schedule_routes.cpp',
     'src/schedule_runner.cpp',

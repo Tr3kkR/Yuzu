@@ -67,8 +67,9 @@ constexpr std::string_view kCompliance[] = {
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
 constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
                                             "preview_management_group_agent_count"};
-constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
-                                           "reject_request"};
+constexpr std::string_view kApprovals[] = {"list_pending_approvals",
+                                           "get_pending_approval_count", // #2146 A2-R4
+                                           "approve_request", "reject_request"};
 constexpr std::string_view kDexSignals[] = {
     "list_dex_signals",       "get_dex_signal_scope",     "get_dex_signal_detail",
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
