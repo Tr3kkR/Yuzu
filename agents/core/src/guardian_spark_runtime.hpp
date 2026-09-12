@@ -1100,18 +1100,93 @@ private:
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
     void dispatch_arm_off_lock(const std::string& key, const std::shared_ptr<KeyClaim>& claim);
+    /// A staged, not-yet-published outcome for one claim - what on_arm_complete's own
+    /// staging decides, before publish_arm_verdicts_locked() writes it into the claim.
+    /// (Named ArmVerdict, not Verdict: was a local struct inside on_arm_complete's
+    /// body; rung 9c PR-2 Unit 4 promotes it to a member type so ArmCompensation
+    /// below can carry a batch of them across the async compensating-disarm gap.)
+    struct ArmVerdict {
+        std::optional<std::expected<std::uint64_t, std::string>> outcome;
+        std::exception_ptr ex;
+        ClaimEnd end{ClaimEnd::None};
+    };
+    /// rung 9c PR-2 Unit 4 (Astra opine review, "Compensating disarm is a separate,
+    /// harder case"): everything on_arm_complete's deferred (compensation-owed) path
+    /// needs to finish the job once the compensating disarm - now genuinely async
+    /// (submit(), not a bounded run()) - actually completes. Built BEFORE
+    /// `compensating` is relinquished ("Prepare continuation storage before
+    /// relinquishing existing subscription ownership"), so the only fallible step
+    /// between owning the live subscription and handing off responsibility for it is
+    /// the submit() call itself - the exact same shape dispatch_arm_off_lock's own
+    /// submit() call already tolerates.
+    struct ArmCompensation {
+        std::string key;
+        std::shared_ptr<KeyClaim> claim; ///< the head; identity-checked like everywhere else
+        std::uint64_t sub{0};            ///< the unadopted subscription owed a disarm
+        std::vector<std::shared_ptr<KeyClaim>> finished;
+        std::vector<std::pair<std::shared_ptr<KeyClaim>, ArmVerdict>> verdicts;
+        std::function<void()> waker;
+        std::function<void()> outbox_waker;
+        bool firewalled{false};
+    };
+    /// registry_mu_ held. Shared publish body for on_arm_complete's own immediate
+    /// path (nothing to disarm) and finalize_arm_compensation()'s deferred path
+    /// (rung 9c PR-2 Unit 4 - previously a local lambda inside on_arm_complete,
+    /// extracted so both paths run the identical logic instead of duplicating it).
+    /// PUBLISH `verdicts` onto the matching claims in `finished`, pop the finished
+    /// prefix from `key`'s fifo, and on `firewall` sweep a never-finished head too.
+    /// `refill` is an OUT param: an arm queued behind the finished prefix, for the
+    /// caller to dispatch off-lock once unlocked. Returns true once this call has
+    /// done everything it is going to do (including the "entry already vanished"
+    /// no-op case, mirroring a lambda's own captured "published" bool) - false ONLY
+    /// if this function itself throws before reaching either return.
+    bool publish_arm_verdicts_locked(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
+                                     const std::vector<std::shared_ptr<KeyClaim>>& finished,
+                                     std::vector<std::pair<std::shared_ptr<KeyClaim>, ArmVerdict>>& verdicts,
+                                     bool firewall, std::shared_ptr<KeyClaim>& refill);
+    /// Best-effort direct disarm call, off-lock, on whichever (already detached)
+    /// worker calls it - the shared fallback for a compensating disarm that either
+    /// could not be admitted via submit() (Stopped included - Astra opine review:
+    /// "Stopped cannot silently discard a subscription that the late arm just
+    /// produced") or whose admitted attempt itself threw on the worker. A disarm
+    /// exception here is best-effort teardown failure only, not proof an OS
+    /// resource is still live - contained and logged, never retried again beyond
+    /// this one attempt (mirrors the pre-Unit-4 run_compensating_disarm's own single
+    /// direct-fallback attempt).
+    void direct_disarm_fallback(const std::string& key, std::uint64_t sub) noexcept;
+    /// The submit() completion callback for an arm's compensating disarm (rung 9c
+    /// PR-2 Unit 4), OR called directly and synchronously, off-lock, by
+    /// on_arm_complete itself when submit() refuses admission for it (there is no
+    /// worker to call back in that case, so the caller finishes the job itself,
+    /// here, right away - no async gap). Finishes what on_arm_complete's own
+    /// deferred path could not: publish (via publish_arm_verdicts_locked), pop,
+    /// notify, fire wakers, dispatch a refill. Carries the SAME double-fault
+    /// recovery on_arm_complete's own fallback path always has (a throw publishing
+    /// hands the head back to Queued so the next same-key event re-drives it,
+    /// rather than wedging the key until restart).
+    void finalize_arm_compensation(std::shared_ptr<ArmCompensation> cont) noexcept;
     /// The submit() completion callback for an ARM claim, on the detached worker:
     /// the moved post-wait commit (rung 9c R5.2, commit-in-callback). Commits the
     /// head and every live sibling against the one subscription, or fails them all;
-    /// runs the compensating disarm (bounded run() on this worker; a direct call on any
-    /// non-timeout executor failure, Stopped included) BEFORE publishing outcomes, so no waiter can observe
-    /// its result while a subscription nobody wants is still live; then publishes,
-    /// erases the entry (unless new claims queued behind meanwhile, in which case the
-    /// next head is dispatched), wakes the waiters and fires the wakers. Firewalled:
-    /// an exception in its own bookkeeping still publishes a terminal outcome on
-    /// every claim and drops the entry (claim_drain_failures_).
+    /// if a compensating disarm is owed, ownership of finishing the job (publish,
+    /// pop, notify, wake, refill) transfers to finalize_arm_compensation() (rung 9c
+    /// PR-2 Unit 4) - genuinely async now (submit(), not a bounded run()), so this
+    /// function returns as soon as that hand-off is made, rather than waiting for
+    /// the compensating disarm itself. When nothing is owed a disarm, this function
+    /// finishes the job itself, immediately, exactly as before. Firewalled: an
+    /// exception in its own staging still eventually publishes a terminal outcome on
+    /// every claim and drops the entry (claim_drain_failures_), whichever path reaches
+    /// that publish.
     void on_arm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
                          IoResult<std::expected<std::uint64_t, std::string>>&& r) noexcept;
+    /// The drain_fault_point_for_test_ seam on_arm_complete's own staging (and, since
+    /// rung 9c PR-2 Unit 4, publish_arm_verdicts_locked() when reached from
+    /// finalize_arm_compensation()) consult: 1 = bad_alloc before the fifo snapshot
+    /// (the window C2 found), 2 = a throw right after the first commit adopted the
+    /// subscription, 3 = a throw after the verdicts are staged and before the pop
+    /// (governance pass-3 sg-3/ar-4/cs-5: the terminal-tombstone sweep). Consumed
+    /// once (compare_exchange against 0); a no-op if `point` is not currently armed.
+    void fault_here_for_test(int point);
     /// registry_mu_ held. Publish `reason` on every claim in `key`'s fifo, release their
     /// index entries, and erase the entry. Reached from on_arm_complete() (noexcept):
     /// every allocating step is contained per claim (r3 C2).

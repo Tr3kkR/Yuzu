@@ -6392,3 +6392,127 @@ TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue a
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
 }
+
+// ── rung 9c PR-2, Unit 4 (compensation continuation, Astra opine review 2026-09-12)
+// ─────────────────────────────────────────────────────────────────────────────────
+// on_arm_complete's compensating disarm now dispatches through submit(), not a
+// bounded run(): the arm claim it owns stays the key's barrier - not popped, not
+// published - until the REAL disarm completion runs finalize_arm_compensation(),
+// however long that takes. Checkpoint invariant: "An unwanted successful arm is
+// owned continuously; its replacement cannot dispatch ahead of compensation."
+
+TEST_CASE("rung 9c PR-2 Unit 4: a same-key rearm queued behind a withdrawn arm's "
+          "compensating disarm cannot dispatch its own backend arm until that "
+          "disarm actually completes",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread a_thread{[&] {
+        gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    }};
+    struct ArmCleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~ArmCleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } arm_cleanup{b.get(), &a_thread};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // Case-0 withdraw: r1's dispatched head stays as the key's marker; nothing to
+    // disarm YET (the arm hasn't landed), so detach_rule() returns immediately.
+    rt->detach_rule("r1");
+
+    // Park the NEXT disarm too - the compensating disarm this withdrawal owes once
+    // r1's late arm lands.
+    b->hang_next_disarm.store(true);
+    struct DisarmCleanup {
+        FakeBackend* backend;
+        ~DisarmCleanup() { backend->release_disarm_hang(); }
+    } disarm_cleanup{b.get()};
+
+    b->release_hang(); // r1's arm lands: withdrawn -> compensation owed -> submitted -> parks
+    REQUIRE(b->wait_entered_disarm_hang(std::chrono::seconds(30)));
+
+    // r2 queues behind r1's still-present head (the compensating disarm's barrier) -
+    // Accepted, not dispatched: only r1's original arm has ever entered arm().
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+    CHECK(b->arm_entries.load() == 1); // the proof: r2 has NOT dispatched ahead of compensation
+
+    b->release_disarm_hang(); // r1's compensation actually completes now
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
+    CHECK(b->arm_entries.load() == 2); // r2 dispatched for real only after the barrier cleared
+    CHECK(b->arms.load() == 2);
+    REQUIRE(b->disarmed_ids().size() == 1);
+    CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]); // r1's OLD subscription, disarmed
+    REQUIRE(b->armed_ids().size() == 2);
+    CHECK(rt->rule_count() == 1); // only r2 - r1 was withdrawn, never committed
+    CHECK(rt->armed_key_count() == 1);
+}
+
+TEST_CASE("rung 9c PR-2 Unit 4: begin_stop() while a compensating disarm is still "
+          "parked drops a queued sibling but leaves the barrier claim for its own "
+          "completion to retire",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread a_thread{[&] {
+        gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    }};
+    struct ArmCleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~ArmCleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } arm_cleanup{b.get(), &a_thread};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    rt->detach_rule("r1");
+    b->hang_next_disarm.store(true);
+    struct DisarmCleanup {
+        FakeBackend* backend;
+        ~DisarmCleanup() { backend->release_disarm_hang(); }
+    } disarm_cleanup{b.get()};
+    b->release_hang();
+    REQUIRE(b->wait_entered_disarm_hang(std::chrono::seconds(30)));
+
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 2); // r1's barrier + r2's queued claim
+
+    const auto stopped_before = rt->claims_dropped_at_stop();
+    rt->begin_stop(); // r2 (Queued) is dropped Stopped; r1 (Dispatched) is left in place
+
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Stopped);
+    CHECK(rt->claims_dropped_at_stop() == stopped_before + 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // only r1's barrier survives
+
+    b->release_disarm_hang(); // r1's compensation completes: pops it, fifo empties, no refill
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->arm_entries.load() == 1); // r2 never dispatched - dropped before the barrier cleared
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+}
