@@ -6180,18 +6180,35 @@ TEST_CASE("Service spark (real mechanism): two spark keys folding onto one servi
     engine.stop();
 }
 
-TEST_CASE("Service spark (real mechanism): thread count is fixed at 1 regardless of watch count",
+TEST_CASE("Service spark (real mechanism): thread count settles to 1 persistent worker (plus "
+          "quiesced lane workers) regardless of watch count",
           "[spark][mechanism][windows][resource]") {
+    // #2012/#3840 PR-B3: "exactly one thread, always" is no longer the
+    // complete oracle — establishment now launches a bounded, TRANSIENT
+    // probe-lane worker per watch, which must quiesce back to zero (never
+    // grow proportional to watched-service count), not literally never
+    // exist. Sample the steady-state thread count only after
+    // service_debug_counters_for_test() confirms probe_workers_active==0,
+    // rather than immediately after the triggering emit (an emit can land a
+    // moment before the worker's OWN OS thread has actually exited).
     SparkEngine engine;
-    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    auto mech = make_service_mechanism();
+    ISparkMechanism* raw = mech.get();
+    REQUIRE(engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
     Collector got;
     auto c = engine.register_consumer("c", got.handler());
     REQUIRE(c.has_value());
     engine.start();
 
+    auto probe_workers_quiesced = [&] {
+        auto d = service_debug_counters_for_test(*raw);
+        return d.has_value() && d->probe_workers_active == 0;
+    };
+
     auto first = engine.arm(*c, service_spec("Winmgmt"));
     REQUIRE(first.has_value());
     REQUIRE(eventually([&] { return got.count() >= 1; }));
+    REQUIRE(eventually(probe_workers_quiesced));
     const DWORD threads_base = windows_thread_count();
 
     // A handful of always-present real services (read-only) + absent ones —
@@ -6218,11 +6235,12 @@ TEST_CASE("Service spark (real mechanism): thread count is fixed at 1 regardless
         ++expect;
         REQUIRE(eventually([&] { return got.count() >= expect; }));
     }
+    REQUIRE(eventually(probe_workers_quiesced));
     // Small tolerance absorbs unrelated transient OS threads (observed once
     // in this session — traced via per-arm instrumentation to an unrelated
     // blip, not this mechanism); a per-watch-thread regression (+19) still
     // fails this decisively.
-    CHECK(windows_thread_count() <= threads_base + 2); // +19 more watches, ~0 more threads
+    CHECK(windows_thread_count() <= threads_base + 2); // +19 more watches, ~0 more steady-state threads
 
     for (auto& s : subs)
         engine.disarm(s);
@@ -6330,6 +6348,418 @@ TEST_CASE("Service spark (real mechanism): live service transition + inline disp
              << "  (OS-notify latency NOT included — that is APC-delivery-scale, separate)");
         CHECK(s.median_us < 10000);
     }
+}
+
+// ── Service walkoff (#2012/#3840 PR-B3) ─────────────────────────────────────
+// Direct-mechanism tests (no SparkEngine): mirrors spark_file.cpp's/
+// spark_registry.cpp's own "(direct)" style — mech->start()/watch() called
+// straight against the real Windows mechanism, with a minimal local emit/
+// fault collector instead of SparkEngine's Collector, for determinism
+// independent of engine-level plumbing.
+namespace {
+
+struct ServiceProbeGate {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool open{false};
+    std::atomic<int> parked{0};
+    std::atomic<int> seen{0};
+    std::function<void(std::wstring_view)> hook_for(std::wstring match) {
+        return [this, match](std::wstring_view name) {
+            seen.fetch_add(1, std::memory_order_relaxed);
+            if (name != match)
+                return;
+            parked.fetch_add(1, std::memory_order_acq_rel);
+            std::unique_lock lk(mu);
+            cv.wait(lk, [&] { return open; });
+        };
+    }
+    void release() {
+        {
+            std::lock_guard lk(mu);
+            open = true;
+        }
+        cv.notify_all();
+    }
+    ~ServiceProbeGate() { release(); } // never leave a worker parked past the test
+};
+
+struct ServiceEmitCollector {
+    std::mutex mu;
+    std::vector<std::pair<std::string, ServiceRunState>> emits;
+    std::vector<std::tuple<std::string, bool, std::string>> faults; // key, faulted, reason
+    SparkEmitFn emit_fn() {
+        return [this](const std::string& key, SparkData data) {
+            std::lock_guard lk(mu);
+            if (std::holds_alternative<ServiceSparkData>(data))
+                emits.emplace_back(key, std::get<ServiceSparkData>(data).state);
+        };
+    }
+    SparkFaultFn fault_fn() {
+        return [this](const std::string& key, bool faulted, std::string_view reason) {
+            std::lock_guard lk(mu);
+            faults.emplace_back(key, faulted, std::string(reason));
+        };
+    }
+    std::size_t emit_count() {
+        std::lock_guard lk(mu);
+        return emits.size();
+    }
+};
+
+} // namespace
+
+TEST_CASE("Service mechanism (direct): a parked establishment probe for one service does not "
+          "stall a sibling's establishment (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][walkoff]") {
+    // Before PR-B3, OpenServiceW for "Winmgmt" ran INLINE on this mechanism's
+    // one thread — a parked call here would have delayed every other
+    // service's establishment by however long it took to unpark. It must
+    // not, now that establishment is isolated onto probe_lane_.
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt");
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec_a = service_spec("Winmgmt");
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    CHECK(got.emit_count() == 0); // A's own establishment has not resolved yet
+
+    const std::string absent_name = "YuzuNoSuchSvc_" + std::to_string(::GetCurrentProcessId());
+    const auto spec_b = service_spec(absent_name);
+    REQUIRE(mech->watch(spark_key(spec_b), spec_b.params).has_value());
+    REQUIRE(eventually([&] { return got.emit_count() >= 1; }, 3000ms));
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE(got.emits.size() >= 1);
+        CHECK(got.emits[0].first == spark_key(spec_b));
+        CHECK(got.emits[0].second == ServiceRunState::Stopped);
+    }
+
+    gate.release();
+    REQUIRE(eventually([&] { return got.emit_count() >= 2; }, 3000ms));
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): probe-lane admission refusal is never counted as a "
+          "backend failure, and a refused probe recovers once the lane frees up "
+          "(#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][walkoff]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt"); // parks A's probe, occupying the (capped) lane
+        ctl.probe_lane_cap = 1;
+        ctl.admission_backoff_seed = 20ms;
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec_a = service_spec("Winmgmt");
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value()); // parks, occupying the lane
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+
+    const auto d0 = service_debug_counters_for_test(*mech);
+    REQUIRE(d0.has_value());
+    const std::string absent_name = "YuzuNoSuchSvc_" + std::to_string(::GetCurrentProcessId());
+    const auto spec_b = service_spec(absent_name);
+    REQUIRE(mech->watch(spark_key(spec_b), spec_b.params).has_value()); // Service never rejects
+                                                                        // arm() itself — it's
+                                                                        // fire-and-forget
+    CHECK(eventually(
+        [&] {
+            auto d = service_debug_counters_for_test(*mech);
+            return d && d->probe_admission_rejected > d0->probe_admission_rejected;
+        },
+        3000ms));
+    {
+        auto d = service_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->probe_backend_failed == d0->probe_backend_failed); // never counted as backend
+    }
+    CHECK(got.emit_count() == 0); // never established while refused, and no false Stopped either
+
+    // Release A: the lane frees up, B's admission retry (on its own seeded
+    // backoff) eventually gets in and establishes for real. Wait for B's OWN
+    // Stopped emit specifically, not just "any emit" (#2012/#3840 PR-B3
+    // review, found by this fix round's own DGRHP re-verification): A's real
+    // Winmgmt establishment can independently satisfy an "any emit" wait
+    // before B's admission-retry resolves, which this test doesn't actually
+    // care about — the busy-spin fix (next_retry cleared on Launched) made
+    // this pre-existing race visible by legitimately slowing a Pending
+    // watch's poll cadence down from an unbounded spin to kServicePollCadence.
+    gate.release();
+    REQUIRE(eventually(
+        [&] {
+            std::lock_guard lk(got.mu);
+            for (auto& [k, st] : got.emits)
+                if (k == spark_key(spec_b) && st == ServiceRunState::Stopped)
+                    return true;
+            return false;
+        },
+        3000ms));
+    {
+        std::lock_guard lk(got.mu);
+        bool saw_b_stopped = false;
+        for (auto& [k, st] : got.emits)
+            if (k == spark_key(spec_b))
+                saw_b_stopped = (st == ServiceRunState::Stopped);
+        CHECK(saw_b_stopped);
+    }
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): a throwing establishment probe is a contained backend "
+          "failure, not a lost obligation or a dead dispatch loop (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][walkoff]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech != nullptr);
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = [](std::wstring_view name) {
+            if (name == L"Winmgmt")
+                throw std::runtime_error("injected genuine backend failure");
+        };
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    mech->start(got.emit_fn(), got.fault_fn());
+
+    const auto spec_a = service_spec("Winmgmt");
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+
+    // Contained: the throw is a genuine backend failure (never WorkerThrew
+    // silently discarded), and dispatches a fault — proving the mechanism's
+    // own dispatch loop survives it, rather than crashing or wedging.
+    // Wait for the fault itself, not the backend-failure counter alone
+    // (#2012/#3840 PR-B3 review, K9/C1-04): resolve_probe() increments the
+    // counter BEFORE the mechanism thread reaches dispatch() at the bottom
+    // of its loop, so a wait keyed on the counter can observe a window where
+    // it's already incremented but the fault hasn't been delivered to `got`
+    // yet — an occasional false failure on a correctly-behaving mechanism.
+    CHECK(eventually(
+        [&] {
+            std::lock_guard lk(got.mu);
+            return !got.faults.empty();
+        },
+        3000ms));
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE_FALSE(got.faults.empty());
+        CHECK(std::get<0>(got.faults.back()) == spark_key(spec_a));
+        CHECK(std::get<1>(got.faults.back())); // faulted == true
+    }
+    {
+        auto d = service_debug_counters_for_test(*mech);
+        REQUIRE(d.has_value());
+        CHECK(d->probe_backend_failed > 0);
+    }
+    mech->stop();
+}
+
+TEST_CASE("Service mechanism (direct): stop() completes promptly while an establishment probe "
+          "is still parked, and F3 accounting tracks the orphaned worker past the mechanism's "
+          "own lifetime (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][walkoff]") {
+    auto f3 = std::make_shared<std::atomic<std::size_t>>(0);
+    auto mech = make_service_mechanism(f3);
+    REQUIRE(mech != nullptr);
+    ServiceProbeGate gate;
+    {
+        ServiceMechanismTestControls ctl;
+        ctl.probe_hook = gate.hook_for(L"Winmgmt");
+        REQUIRE(set_service_test_controls_for_test(*mech, std::move(ctl)));
+    }
+    ServiceEmitCollector got;
+    mech->start(got.emit_fn(), got.fault_fn());
+    const auto spec_a = service_spec("Winmgmt");
+    REQUIRE(mech->watch(spark_key(spec_a), spec_a.params).has_value());
+    REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    CHECK(f3->load(std::memory_order_acquire) == 1); // the parked probe is admitted+counted
+
+    const auto t0 = std::chrono::steady_clock::now();
+    mech->stop(); // must not wait for the parked probe — it's still blocked on the gate
+    const auto stop_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - t0)
+                             .count();
+    INFO("stop() returned after " << stop_ms << " ms with a probe still parked on the gate");
+    CHECK(stop_ms < 2000);
+
+    // The orphaned worker is still parked on the gate, outliving `mech` — the
+    // F3 counter (agent-lifetime-scoped, independent of `mech`'s own
+    // lifetime by design — spark_detached_call.hpp's own "F3 / §24") must
+    // still show it.
+    CHECK(f3->load(std::memory_order_acquire) == 1);
+    mech.reset(); // the mechanism itself is gone; the counter is NOT (owned by the test, not `mech`)
+    gate.release(); // unpark the orphaned worker so it can finish and decrement f3
+    CHECK(eventually([&] { return f3->load(std::memory_order_acquire) == 0; }, 3000ms));
+}
+
+// ── Service T6-analogue (#2012/#3840 PR-B3, mirrors File's own T6-analogue) ─
+//
+// Unlike Registry, Service's unwatch() does NOT block the calling thread on a
+// SEPARATE callback-owning thread finishing its work first (this file's
+// header comment: watch()/unwatch() are O(1) queue pushes; teardown_watch()'s
+// SleepEx(0,TRUE) is a zero-timeout APC pump, not a blocking barrier — see
+// the "Design decision: probe-only lane" note at the top of this file). So
+// the SPECIFIC deadlock T6 (#4181) found in Registry has no known analogue in
+// Service's design, matching File's own precedent finding for the identical
+// reason. This test is regression insurance, not a suspected-red repro: if a
+// future change to Service's unwatch()/stop() ever introduced a blocking
+// cross-thread drain, this is the test that would catch it. Built at the
+// SUBPROCESS boundary (never in-process, mirroring spark_registry.cpp's and
+// spark_file.cpp's own T6/T6-analogue) precisely because a wrong assumption
+// here would otherwise hang the whole test binary with no recovery.
+namespace {
+constexpr DWORD kT6ServiceDeadlockExitCode = 102; // distinct from Registry's 100, File's 101
+
+std::string t6_service_log_tag() {
+    char buf[1024]{};
+    const DWORD n = ::GetEnvironmentVariableA("YUZU_SPARK_T6_SERVICE_TAG", buf, sizeof(buf));
+    if (n > 0 && n < sizeof(buf))
+        return std::string(buf, n);
+    return "spark_t6_service_" + std::to_string(::GetCurrentProcessId());
+}
+} // namespace
+
+#define YUZU_SPARK_T6_SERVICE_CHILD_CASE_NAME "Service T6 child: inline same-type re-arm during disarm"
+
+TEST_CASE(YUZU_SPARK_T6_SERVICE_CHILD_CASE_NAME, "[.][t6-service-child]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    std::atomic<bool> in_handler{false};
+    std::atomic<bool> go{false};
+    std::atomic<bool> rearmed{false};
+    std::atomic<bool> rearm_done{false};
+    std::atomic<int> fires{0};
+    std::mutex rearm_err_mu;
+    std::string rearm_err;
+    // Winmgmt's own initial-resolve fire is the ONE delivery this test needs
+    // (never toggled — read-only, exactly like every other Service test in
+    // this file); a real state TRANSITION is not required to exercise the
+    // re-entrancy shape below.
+    auto sub_k = engine.arm_inline(service_spec("Winmgmt"), [&](const SparkEvent&) {
+        if (fires.fetch_add(1, std::memory_order_acq_rel) != 0)
+            return;
+        in_handler.store(true, std::memory_order_release);
+        while (!go.load(std::memory_order_acquire))
+            std::this_thread::sleep_for(1ms);
+        auto s2 = engine.arm_inline(service_spec("EventLog"), [](const SparkEvent&) {});
+        if (!s2) {
+            std::lock_guard lk(rearm_err_mu);
+            rearm_err = s2.error();
+        }
+        rearmed.store(s2.has_value(), std::memory_order_release);
+        rearm_done.store(true, std::memory_order_release);
+    });
+    REQUIRE(sub_k.has_value());
+    engine.start();
+    REQUIRE(eventually([&] { return in_handler.load(std::memory_order_acquire); }, 8000ms));
+
+    std::atomic<bool> disarm_done{false};
+    std::thread disarmer([&] {
+        engine.disarm(*sub_k);
+        disarm_done.store(true, std::memory_order_release);
+    });
+    std::this_thread::sleep_for(300ms);
+    go.store(true, std::memory_order_release);
+
+    const bool completed =
+        eventually([&] { return disarm_done.load(std::memory_order_acquire); }, 5000ms);
+    if (!completed) {
+        std::fputs("T6-service child: disarm() did not complete while the Inline callback "
+                  "re-entered the same type - deadlock observed\n",
+                  stderr);
+        std::fflush(stderr);
+        ::TerminateProcess(::GetCurrentProcess(), kT6ServiceDeadlockExitCode);
+    }
+    CHECK(completed);
+    disarmer.join();
+    CHECK(eventually([&] { return rearm_done.load(std::memory_order_acquire); }, 5000ms));
+    {
+        std::lock_guard lk(rearm_err_mu);
+        INFO("same-type arm_inline from inside the Inline handler: "
+             << (rearm_done.load(std::memory_order_acquire)
+                     ? (rearm_err.empty() ? "returned ok" : rearm_err)
+                     : "did not return within 5s"));
+        CHECK(rearmed.load(std::memory_order_acquire));
+    }
+    engine.stop();
+}
+
+TEST_CASE("Service spark: same-type disarm() does not deadlock against an in-flight Inline "
+          "callback (T6-service analogue, subprocess boundary) (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][walkoff][t6]") {
+    wchar_t exe[MAX_PATH]{};
+    const DWORD exe_len = ::GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    REQUIRE((exe_len > 0 && exe_len < MAX_PATH));
+
+    std::wstring cmd = L"\"";
+    cmd += exe;
+    cmd += L"\" \"";
+    {
+        const std::string name = YUZU_SPARK_T6_SERVICE_CHILD_CASE_NAME;
+        cmd.append(name.begin(), name.end());
+    }
+    cmd += L"\" --reporter compact --durations no";
+
+    const std::filesystem::path child_log =
+        std::filesystem::temp_directory_path() /
+        ("yuzu_test_spark_t6_service_child_" + std::to_string(::GetCurrentProcessId()) + ".log");
+    SECURITY_ATTRIBUTES sa{};
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;
+    UniqueHandle hlog(::CreateFileW(child_log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                                    CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    REQUIRE(hlog.valid());
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = nullptr;
+    si.hStdOutput = hlog.h;
+    si.hStdError = hlog.h;
+    PROCESS_INFORMATION pi{};
+    const BOOL created = ::CreateProcessW(nullptr, cmd.data(), nullptr, nullptr, TRUE,
+                                          CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi);
+    UniqueHandle hthread(pi.hThread);
+    UniqueHandle hprocess(pi.hProcess);
+    hlog.reset();
+    REQUIRE(created);
+    hthread.reset();
+    const DWORD wr = ::WaitForSingleObject(hprocess.h, 30000);
+    if (wr == WAIT_TIMEOUT) {
+        ::TerminateProcess(hprocess.h, 9);
+        ::WaitForSingleObject(hprocess.h, 5000);
+    }
+    DWORD code = 0xFFFFFFFFu;
+    ::GetExitCodeProcess(hprocess.h, &code);
+    hprocess.reset();
+    std::error_code ec;
+    std::string child_out;
+    {
+        std::ifstream in(child_log, std::ios::binary);
+        child_out.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    std::filesystem::remove(child_log, ec);
+
+    INFO("T6-service child: WaitForSingleObject=" << wr
+                                                  << " (0=exited, 258=timeout->killed) exit code="
+                                                  << code << " (0=completed, "
+                                                  << kT6ServiceDeadlockExitCode
+                                                  << "=child saw the deadlock, 3=Catch2 matched no case)");
+    INFO("T6-service child output:\n" << child_out);
+    CHECK(wr == WAIT_OBJECT_0);
+    CHECK(code == 0);
 }
 
 // ── Watch-establishment LATENCY CHARACTERIZATION harness (PR-A; #2012/#3840) ─
@@ -7630,6 +8060,175 @@ TEST_CASE("Watch establishment: post-fix fast-path cost, bulk engine.arm() (N=20
          << "ms");
     // bulk_guard's destructor stops the engine and cleans up the registry
     // tree here, unconditionally.
+}
+
+/// Polls `got` for the first Fired SparkEvent matching `key`, returning its
+/// engine-stamped fire time (SparkEvent::at) or nullopt on timeout. Scans
+/// from the start each call rather than tracking a resume cursor - at
+/// kEstablishSamples-scale (<= 200 prior events) the O(n) rescan is a few
+/// hundred string comparisons, negligible next to the microsecond-scale
+/// latencies being measured, and it is simpler to read than cursor state
+/// shared across sequential calls for DIFFERENT keys.
+std::optional<std::chrono::system_clock::time_point> wait_for_fired(
+    Collector& got, const std::string& key, std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const std::size_t n = got.count();
+        for (std::size_t i = 0; i < n; ++i) {
+            const SparkEvent ev = got.at(i);
+            if (ev.key == key && ev.kind == SparkEventKind::Fired)
+                return ev.at;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+    return std::nullopt;
+}
+
+/// Real, distinct service names to drive kEstablishSamples INDEPENDENT
+/// establishment round-trips - capped at the host's real count (never
+/// cycled/wrapped) so a re-armed-under-a-new-key coalescing hand-off
+/// (spark_service.cpp's `else if (w->last)` immediate-state path, far
+/// cheaper than a fresh probe) never contaminates this series the way the
+/// bulk-arm case above explicitly accepts for its own, different purpose.
+std::vector<std::wstring> establish_e2e_service_names() {
+    SC_HANDLE scm =
+        ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+    REQUIRE(scm != nullptr);
+    struct ScGuard {
+        SC_HANDLE h{nullptr};
+        ~ScGuard() {
+            if (h)
+                ::CloseServiceHandle(h);
+        }
+    } scm_guard{scm};
+    DWORD needed = 0, count = 0, resume = 0;
+    ::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL, nullptr,
+                            0, &needed, &count, &resume, nullptr);
+    resume = 0;
+    std::vector<BYTE> buf(needed);
+    REQUIRE(::EnumServicesStatusExW(scm, SC_ENUM_PROCESS_INFO, SERVICE_WIN32, SERVICE_STATE_ALL,
+                                    buf.data(), static_cast<DWORD>(buf.size()), &needed, &count,
+                                    &resume, nullptr));
+    REQUIRE(count > 0);
+    const auto* entries = reinterpret_cast<const ENUM_SERVICE_STATUS_PROCESSW*>(buf.data());
+    std::vector<std::wstring> names;
+    names.reserve(count);
+    for (DWORD i = 0; i < count; ++i)
+        names.emplace_back(entries[i].lpServiceName);
+    return names;
+}
+
+TEST_CASE("Watch establishment (Service): end-to-end Add-accepted to first-trustworthy-state via "
+          "SparkEngine::arm() (E1 idle) (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][latency][establish]") {
+    // Fills the gap both S2/S3 and the bulk-arm case above leave open
+    // (#2012/#3840 PR-B3 kickoff doc, "Latency characterization"): S2/S3
+    // measure the raw OpenServiceW/NotifyServiceStatusChangeW calls
+    // directly, not through the mechanism; the bulk-arm case above measures
+    // only SparkEngine::arm()'s own synchronous return (an O(1) queue push,
+    // unaffected by PR-B3 - Service's watch()/unwatch() were already O(1)
+    // before this series, per the corrected kickoff doc's premise
+    // correction). Neither captures what a consumer actually waits on: the
+    // full round trip from arm() to the first real state delivered via the
+    // emit callback, which is exactly what PR-B3's probe-lane restructure
+    // changes the shape of (moves OpenServiceW off the shared mechanism
+    // thread onto SparkDetachedLane).
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
+        return;
+    }
+    const std::vector<std::wstring> names = establish_e2e_service_names();
+    const int n = std::min(kEstablishSamples, static_cast<int>(names.size()));
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    std::vector<std::int64_t> t_e2e;
+    int timed_out = 0;
+    for (int i = 0; i < n; ++i) {
+        const std::string name = yuzu::win::from_wide(names[static_cast<std::size_t>(i)].c_str());
+        const auto spec = service_spec(name);
+        const std::string key = spark_key(spec);
+        const auto t0 = std::chrono::system_clock::now();
+        auto r = engine.arm(*c, spec);
+        if (!r.has_value())
+            continue; // excluded, same posture as the bulk-arm case's arm failures
+        if (auto fired_at = wait_for_fired(got, key, 3000ms)) {
+            t_e2e.push_back(
+                std::chrono::duration_cast<std::chrono::microseconds>(*fired_at - t0).count());
+        } else {
+            ++timed_out;
+        }
+        engine.disarm(*r); // sequential isolation: next sample starts from a clean key set
+    }
+    engine.stop();
+
+    warn_establish("E1 Service end-to-end (idle)", "Add-accepted -> first Fired", t_e2e);
+    WARN("E1 Service end-to-end (idle): " << n << " services attempted, " << timed_out
+         << " timed out waiting for a Fired event (excluded from the series above)");
+}
+
+TEST_CASE("Watch establishment (Service): end-to-end Add-accepted to first-trustworthy-state via "
+          "SparkEngine::arm() UNDER SCM LOAD (E2) (#2012/#3840 PR-B3)",
+          "[spark][mechanism][windows][latency][establish]") {
+    if (!spark_establish_bench_enabled()) {
+        SUCCEED("YUZU_SPARK_ESTABLISH_BENCH unset - skipping establishment latency harness");
+        return;
+    }
+    const std::vector<std::wstring> names = establish_e2e_service_names();
+    const int n = std::min(kEstablishSamples, static_cast<int>(names.size()));
+
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    // Same SCM-load shape as S3: two background OpenSCManagerW-churn
+    // threads for the duration of the measurement, started only after every
+    // REQUIRE above (same ordering rationale as S3's own comment - a failed
+    // precondition must never unwind past a live joinable thread).
+    std::atomic<bool> stop{false};
+    auto scm_churn = [&stop] {
+        while (!stop.load(std::memory_order_relaxed)) {
+            if (SC_HANDLE h = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT))
+                ::CloseServiceHandle(h);
+        }
+    };
+    std::thread t1(scm_churn), t2(scm_churn);
+
+    std::vector<std::int64_t> t_e2e;
+    int timed_out = 0;
+    for (int i = 0; i < n; ++i) {
+        const std::string name = yuzu::win::from_wide(names[static_cast<std::size_t>(i)].c_str());
+        const auto spec = service_spec(name);
+        const std::string key = spark_key(spec);
+        const auto t0 = std::chrono::system_clock::now();
+        auto r = engine.arm(*c, spec);
+        if (!r.has_value())
+            continue;
+        if (auto fired_at = wait_for_fired(got, key, 3000ms)) {
+            t_e2e.push_back(
+                std::chrono::duration_cast<std::chrono::microseconds>(*fired_at - t0).count());
+        } else {
+            ++timed_out;
+        }
+        engine.disarm(*r);
+    }
+    engine.stop();
+
+    stop.store(true, std::memory_order_relaxed);
+    t1.join();
+    t2.join();
+
+    warn_establish("E2 Service end-to-end UNDER SCM LOAD", "Add-accepted -> first Fired", t_e2e);
+    WARN("E2 Service end-to-end UNDER SCM LOAD: " << n << " services attempted, " << timed_out
+         << " timed out waiting for a Fired event (excluded from the series above)");
 }
 
 // ── File walkoff (#2012/#3840 PR-B2), adversarial review round findings ────

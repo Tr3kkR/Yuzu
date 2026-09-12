@@ -327,9 +327,12 @@ both must land before the flip proceeds, the same way #3816/#3831 (row 3) and
 on the same criterion (§2) through a different, newer document, not through #2233's
 checklist.
 
-**Ladder insertion (ruling 14(c), 2026-09-08):** the #2012/#3840 same-type-serialization fix
-lands between this track's PR-1 and PR-2, as two PRs, no longer in the post-flip package (see
-the #2012 row in §5's register).
+**Ladder insertion (ruling 14(c), 2026-09-08, revised 2026-09-11):** the #2012/#3840
+same-type-serialization fix lands between this track's PR-1 and PR-2, no longer in the
+post-flip package - as **three** PRs sharing one shared primitive (PR-A/#4190), not the two
+originally planned: PR-B1 (Registry, merged), PR-B2 (File, merged), PR-B3 (Service, in review).
+See the corrected #2012 row in §5's register for the full per-mechanism status, including the
+correction that Service never actually had the hazard this row originally described.
 
 **Rung 9c PR-5 acceptance criteria (governance pass-3, independent fan-out on PR-1, 2026-09-09).**
 Three unhappy-path findings on PR-1 derive HIGH on their own facts and are capped to LOW only by
@@ -1014,8 +1017,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
 **#2012 + #2011 + #3840** (+#2014, confirm at execution)
 - Detection signal: **none today**, named explicitly in the source ruling - a stuck
   `arm_ancestor` walk (File, #2012) or a stuck `CreateThreadpoolWait`/`RegNotifyChangeKeyValue`
-  (Registry) / `OpenSCManagerW`/SCM query (Service, Windows half) has no fleet-visible symptom
-  until it starves the owning mechanism type's arm/disarm queue.
+  (Registry) has no fleet-visible symptom until it starves the owning mechanism type's per-type
+  arm/disarm queue. **Corrected 2026-09-11 for Service:** a stuck `OpenServiceW` has no
+  fleet-visible symptom either, but it starves *sibling watches sharing Service's own worker
+  thread*, not the per-type arm/disarm queue - see the Milestone entry below for the full
+  correction (Service's `watch()`/`unwatch()` were never actually gated by the per-type lock).
 - Operator action: none today (no detection signal to act on); would require a restart once
   discovered by other means (e.g. operator-reported unresponsiveness) - not a documented
   runbook step yet.
@@ -1040,18 +1046,67 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   deferring is legacy-twin #2189 parity for the Service mechanism specifically (a macOS
   launchd whole-engine `mtx_` seizure, `stop_all_guards_locked`) plus the absence of any
   production fleet today - not a blanket "no regression" claim across all three mechanisms.
-  #3840 (filed 2026-09-02, `spark_engine.hpp:536–548`) is the identical "walk-off-`mu_`"
-  hazard shape for Registry's `TP_WAIT` / Service's Windows SCM query - folded into this same
-  mechanism-hardening package.
+  #3840 (filed 2026-09-02, `spark_engine.hpp:536–548`) was originally described as the
+  identical "walk-off-`mu_`" hazard shape for Registry's `TP_WAIT` / Service's Windows SCM
+  query - **corrected below (2026-09-11): that was only ever true for Registry.**
 - Owner: for the remaining #2011/#2014 piece, the mechanism-hardening package (File + Registry +
   Service together, one restructure, reviewed once) - no individual named in source; the pulled-forward
   #2012/#3840 piece is owned by its rung 9c kickoff (Milestone below).
-- Milestone: **split by ruling 14(c) (2026-09-08)** - the #2012/#3840 same-type-serialization piece is
-  pulled forward into rung 9c's own ladder, between its PR-1 and PR-2, landing as two PRs (kickoff:
-  `~/.claude/plans/spark-2012-3840-mechanism-walkoffmu-KICKOFF.md`, operator-local, session "SPARK 3840 Decouple");
-  #2011 (lock granularity) and #2014 stay early post-flip in the named package.
+- Milestone: **split by ruling 14(c) (2026-09-08), revised 2026-09-11** - the #2012/#3840
+  same-type-serialization piece was pulled forward into rung 9c's own ladder, between its PR-1
+  and PR-2. It landed as **three** PRs sharing one primitive, not the two originally planned:
+  PR-A (#4190, shared `SparkDetachedLane` primitive), PR-B1 (Registry, #4225, merged), PR-B2
+  (File, #4284, merged), PR-B3 (Service, `fix/2012-3840-service-walkoff-mu`, in review as of
+  this note - not yet merged). **Status per mechanism, corrected against the actual landed
+  code, not the original plan:**
+  - **File:** the per-type-lock stall this row originally described is closed (PR-B2). File's
+    teardown does not block the way Registry's does, so PR-B2 built a probe-only lane, not a
+    two-lane restructure.
+  - **Registry:** the per-type-lock stall is closed (PR-B1) via a two-lane (`probe_lane_`/
+    `drain_lane_`) restructure - Registry's teardown (`WaitForThreadpoolWaitCallbacks(...,
+    TRUE)`) is a genuine blocking call, so isolating it too was warranted here specifically.
+  - **Service:** **never actually had this hazard** - `watch()`/`unwatch()` were already O(1)
+    queue pushes before this whole series (confirmed by direct code read and by
+    `spark_mechanism.hpp`'s own mechanism-contract comment; #3840's Service bullet has been
+    corrected in place, 2026-09-11, to reflect this). The real, structurally different gap:
+    `OpenServiceW` ran head-of-line on Service's own single dedicated worker thread, stalling
+    *sibling watches sharing that thread* - not the engine-wide per-type lock this row
+    describes. PR-B3 isolates that specific call onto a probe-only lane. `NotifyServiceStatusChangeW`'s
+    registration stays on the mechanism thread by design (Win32 thread-affinity requirement) -
+    an accepted, explicitly-documented residual, not a gap PR-B3 claims to close.
+  - **Service pre-flip follow-ups (governance review, PR-B3, consolidated here so they are
+    not lost one hop away in a PR/issue instead of this gating register):** tracked in
+    **#4218** - (a) the ~50-65 ms establishment-latency figure above is dominated by
+    `kServicePollCadence`, not raw API cost, and the constants governing it
+    (`kServiceProbeLaneCap=16`, `kServiceHealthGrace`, the admission-backoff pair) are copied
+    from Registry's already-reviewed values, not measured against Service's own capacity -
+    retune after a real synthetic-storm measurement before flip; (b) at >16 simultaneous
+    Service watches (boot/reconnect), the admission backoff and health-grace windows can
+    collide and produce a transient false-fault-then-recover flicker indistinguishable from a
+    genuine SCM outage, with no fleet-visible counter to disambiguate the two causes (adjudged
+    MEDIUM/non-blocking for PR-B3 itself, since the feature is dormant); (c) Service's
+    `stats()` folds none of its new probe-lane counters (`probe_admission_rejected_`,
+    `probe_backend_failed_`, `health_edges_`) into `SparkMechanismStats` at all - not even the
+    coarse tier Registry/File already populate for the equivalent gap (tracked separately for
+    those two at #4218/#4279) - so today Service has no operator-visible signal beyond a raw
+    log line if any of the above occurs; (d) `teardown_watch()` never cancels an in-flight
+    establishment probe, so a watch retired while `Pending` keeps its `probe_lane_` slot until
+    the real `OpenServiceW` call returns - sustained watch/unwatch churn faster than the
+    `retiring_` reap window, combined with backend latency exceeding it, can starve new
+    admissions. **Corroborated empirically, not just theoretically**, by this same session's
+    real-hardware verification: File's sibling mechanism, sharing the identical
+    `SparkDetachedLane` admission primitive, was observed exceeding its configured lane cap by
+    one under real storm load (`max_active=9 > kTestLaneCap=8`, 1-in-~10 real-hardware runs -
+    see #4279's corresponding note) - raising this above "spec says it can't happen."
+  #2011 (lock granularity) and #2014 stay early post-flip in the named package, unaffected by
+  the correction above.
 - Revisit trigger: for the remaining #2011/#2014 piece, **escalate to flip-gating if a production
   fleet materializes before it lands**; the #2012/#3840 piece is already pre-flip by ruling 14(c).
+  Once PR-B3 merges, re-verify **ruling 14(c)'s own "sustained same-type stall holding a
+  generation's acknowledgment indefinitely" framing** against Service's actual (corrected) stall
+  shape before treating rung 9c's PR-2 as unconditionally unblocked by this series' completion -
+  ruling 14(c) was written assuming Service had the same per-type-lock hazard Registry had, which
+  this correction shows was never the case.
 
 **#2570 + #2578** (macOS spark-test flakes)
 - Detection signal: CI red on the macOS leg for these two specific named tests.

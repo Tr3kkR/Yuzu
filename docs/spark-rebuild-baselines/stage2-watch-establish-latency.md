@@ -280,9 +280,10 @@ that caveat, not just this document.
 
 1. ~~Run the harness on DGRHP (idle x3, under load x3)~~ - DONE 2026-09-09, see
    Results above.
-2. Re-run the `post-fix-cost` case verbatim once PR-B lands, to get the "after"
-   figure the plan's "post-fix fast-path cost" note asks for (today's run here is
-   the "before" baseline only). Still open.
+2. ~~Re-run the `post-fix-cost` case verbatim once PR-B lands, to get the "after"
+   figure~~ - DONE 2026-09-11 for Service, on the PR-B3 branch (in review as of this note), see the PR-B3 addendum
+   below. Registry/File remain open (PR-B1/PR-B2 land separately; not re-run
+   here - this session's scope was Service only).
 3. ~~Compile-verify the harness itself on a real Windows toolchain~~ - DONE
    2026-09-09, see Status section above.
 4. **NEW:** give R4 (Registry ancestor-walk under hive load) its own
@@ -291,3 +292,113 @@ that caveat, not just this document.
    R2's idle number plus R1-vs-R3's no-load-effect finding, not a direct
    measurement - see the D-derivation section above for exactly what this gap
    costs and why it likely (not certainly) doesn't change the derived number.
+5. **NEW (2026-09-11):** the PR-B3 addendum below found end-to-end Service
+   establishment latency is dominated by `kServicePollCadence` (50ms), not by
+   any OS call cost - worth a deliberate decision (separate from this PR) on
+   whether that cadence should be reduced, or whether the mechanism thread
+   should wake itself immediately on probe-lane completion instead of waiting
+   for the next poll tick. Not attempted here - out of scope for a latency
+   *measurement* pass, and changing it would need its own review for the same
+   reasons kServicePollCadence's value was chosen in the first place.
+
+## PR-B3 addendum: Service end-to-end establishment latency (DGRHP run CAPTURED 2026-09-11)
+
+New evidence added per the corrected PR-B3 kickoff doc
+(`~/.claude/plans/spark-2012-3840-prb3-service-KICKOFF.md`, "Latency
+characterization" section) - the S1-S3 tables above measure raw Win32 calls
+directly, and the `post-fix-cost` bulk-arm case (Results, above) measures only
+`SparkEngine::arm()`'s synchronous return (an O(1) queue push, unaffected by
+PR-B3 - Service's `watch()`/`unwatch()` were already O(1) before this series).
+Neither captures the full round trip a consumer actually waits on: from
+`arm()` to the first real state delivered via the emit callback. New harness
+cases E1 (idle) / E2 (under SCM load, same two-churn-thread shape as S3),
+`test_spark_mechanism.cpp` (added this session), close that gap.
+
+**What E1/E2 measure:** for each of up to 200 real, DISTINCT service names
+(capped at the host's actual count, never cycled/wrapped - unlike the
+bulk-arm case, a wrap here would coalesce into `spark_service.cpp`'s far
+cheaper `else if (w->last)` immediate-state hand-off and contaminate the
+series), time from immediately before `engine.arm()` to the engine-stamped
+`SparkEvent::at` of the first `Fired` event for that key, then disarm before
+the next sample (sequential isolation - no concurrent establishments in this
+series). Host had 320 real services this run (vs. ~200 when the S1-S3/
+post-fix-cost baseline was captured 2026-09-09 - services can be added/removed
+between runs on a live Windows box; noted, not treated as noise-free).
+
+**Results (3 runs, DGRHP, 2026-09-11, `git rev-parse HEAD` = `a0b2b41a0`):**
+
+| run | E1 idle min | p50 | p90 | p99 | max | E2 SCM-load min | p50 | p90 | p99 | max |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | 59964 | 64175 | 64795 | 65114 | 65241 | 62112 | 63417 | 63959 | 64389 | 64472 |
+| 2 | 58529 | 64182 | 64767 | 65285 | 65452 | 55865 | 63535 | 64020 | 64402 | 64453 |
+| 3 | 59682 | 64167 | 64754 | 65163 | 65205 | 56564 | 63446 | 64013 | 64398 | 64478 |
+
+All times microseconds, n=199 every run (one real service excluded from
+`valid_service_name()` or a transient enumeration artifact - not investigated
+further, consistent with the small excluded-arm counts elsewhere in this doc).
+0 timed out (3000ms budget) in any of the 6 series.
+
+`p99` (worst of 3 runs): E1 = **65285us** (~65.3ms), E2 = **64402us** (~64.4ms).
+`p99_worst` (E1 vs E2, same convention as the D-derivation section above) =
+**65285us**.
+
+**This is the headline finding, stated plainly: end-to-end establishment is
+~65ms, roughly 340-790x the ~83-190us the S2/S3 per-call sums would suggest
+(65285/190 ≈ 344x at SCM-load per-call cost, 65285/83 ≈ 787x at idle per-call
+cost - not "roughly 1000x", corrected 2026-09-12 per adversarial-review
+finding R2-C03/K-R2-2, an arithmetic overstatement in the original wording),
+and SCM load makes essentially no difference (E1 and E2 are within
+run-to-run noise of each other).** The raw OS calls are not the bottleneck -
+the mechanism's own `kServicePollCadence` (`spark_service.cpp:967`, 50ms) is:
+the mechanism thread only notices a completed probe on its next poll tick
+(capped at 50ms whenever any probe is Pending, `spark_service.cpp:1657`), so
+every sample pays close to one full poll interval regardless of how fast the
+underlying `OpenServiceW`/`NotifyServiceStatusChangeW` pair actually
+completes. The remarkably tight clustering (p50 and p99 within ~1ms of each
+other, every run) is the signature of a fixed-cadence poll dominating a
+much-smaller, much-more-variable OS call cost, not measurement noise.
+
+**CORRECTED 2026-09-12 (adversarial-review finding R2-C03/K-R2-2): this IS a
+real behavior change PR-B3 introduces, not something inherited unchanged -**
+an earlier version of this paragraph claimed the opposite ("this cadence
+existed identically before PR-B3"), which is false: `kServicePollCadence`
+does not exist before this branch (`git show 78bfb9513:agents/core/src/
+spark_service.cpp | grep kServicePollCadence` → no matches), and the
+pre-PR-B3 `arm_watch()` ran `OpenServiceW`/`NotifyServiceStatusChangeW`
+synchronously with the notification delivered by an **immediate** APC - no
+poll-tick delay at all. Pre-PR-B3 arm-to-first-state latency would have
+tracked close to the raw OS call cost (low hundreds of microseconds, per
+S2/S3), not 50-65ms. **PR-B3's async restructure is what trades that
+synchronous-but-head-of-line-blocking behavior for this asynchronous-but-
+poll-delayed one** - a deliberate, accepted trade (removes the risk of one
+hung service blocking every sibling watch, at the cost of adding a
+poll-cadence delay to the ordinary happy path), not a free isolation with no
+downside. Anyone consuming Service Spark events expecting sub-millisecond
+delivery (matching the raw OS call cost, or matching pre-PR-B3 behavior)
+should expect ~50-65ms from arm to first observed state instead, engine-wide,
+as a structural property of the current design - see forward action item 5,
+which exists specifically because this is PR-B3's own tradeoff to amortize
+later, not an inherited constant to leave alone.
+
+**Post-fix-cost, Service after-figure (same case as Results above, re-run
+2026-09-11 on the PR-B3 branch, closing forward action item 2 for Service):**
+
+| | before (2026-09-09) | after (2026-09-11) |
+|---|---|---|
+| n | 199 | 199 (1 arm failed, excluded - same convention as before) |
+| p99 | 155us | 93us |
+| max | 204us | 106us |
+
+No regression - if anything, faster, though the two captures ran against
+different real service counts (~200 vs 320) on a live host, so this is not a
+controlled A/B and should not be over-read as a precise measurement of
+PR-B3's own effect on this specific call (structurally, PR-B3 does not touch
+`SparkEngine::arm()`'s synchronous path at all - see the addendum's opening
+paragraph). Registry/File after-figures remain open (action item 2, revised).
+
+Raw artifacts: `raw/e2e-run{1,2,3}.txt` (E1/E2, ESTABLISH lines only,
+console-wrap line breaks rejoined, same convention as `raw/establish-
+run{1,2,3}.txt` above) and `raw/post-fix-cost-after-service.txt` (the Service
+after-figure run, all three mechanisms' ESTABLISH lines - Registry/File
+included for completeness since the harness re-runs all three together, but
+not used as their after-figures per the note above).
