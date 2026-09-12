@@ -881,6 +881,19 @@ private:
         std::string rule_name;
         const char* guard_type{""};
         std::chrono::steady_clock::time_point attach_now{};
+        /// rung 9c PR-2 Unit 2 (Astra opine review Blocker 2 / coordinator ruling
+        /// 2026-09-12): real monotonic deadline for THIS claim's own arm attempt, set
+        /// once in attach_core() at the same instant the blocking wrapper's own
+        /// wait_for_claim() deadline has always approximated - std::chrono::
+        /// steady_clock::now(), never the injected evaluation clock_() ("Record real
+        /// monotonic deadlines in the claim. Do not reuse the injected evaluation
+        /// clock."). Meaningful for Arm claims only (a Disarm's own bound is
+        /// submit_disarm_off_lock's io_executor_.run() call, unrelated to a caller
+        /// waiting on this field). Consulted by expire_overdue_claims() so a
+        /// non-waiting caller's claim still times out with nobody blocked in
+        /// wait_for_claim() to notice - the existing timeout-fails-attempt behavior,
+        /// just relocated out of a waiter, not removed.
+        std::chrono::steady_clock::time_point deadline{};
         // Disarm payload.
         std::uint64_t subscription{0};
     };
@@ -910,6 +923,82 @@ private:
         std::shared_ptr<KeyClaim> claim;
     };
 
+public:
+    /// rung 9c PR-2 Unit 2 (Astra opine review, Blocker 3): tag selecting the
+    /// non-waiting attach_rule() overload below - a distinct type, not an easily
+    /// missed boolean, so a call site cannot silently pick the wrong overload.
+    struct NonWaiting {};
+
+    /// An OBSERVATION handle onto a claim the non-waiting attach_rule() overload
+    /// returned as Accepted (Astra opine review, Blocker 1: "The receipt should be
+    /// an observation handle. Destroying it must neither withdraw the rule nor
+    /// abandon its operation."). Wraps the SAME shared_ptr<KeyClaim> the blocking
+    /// attach_rule() would have waited on - no separate allocation, and ownership of
+    /// cancellation/commit stays entirely in claims_ and the completion callback's
+    /// own capture, exactly as it does today for attach_rule's local `arm_claim`.
+    struct ArmReceipt {
+        std::shared_ptr<KeyClaim> claim;
+    };
+
+    /// Authoritative, allocation-free status of an ArmReceipt's claim (Astra opine
+    /// review: "An asynchronous receipt needs an allocation-free authoritative
+    /// status, with diagnostic strings optional. An erased claim with no string
+    /// must not look pending forever."). receipt_status() derives this from
+    /// KeyClaim::end ALONE, not from `outcome`/`commit_exception` - `end` is a
+    /// nothrow enum write on every terminal path, set even when the accompanying
+    /// `outcome` string failed to allocate (see begin_stop's queued-claim drop and
+    /// publish_locked's own fill-in, both of which write `end` unconditionally),
+    /// which is exactly the case that must not read back as stuck Pending.
+    enum class ReceiptStatus { Pending, Committed, Failed, Expired, Withdrawn, Stopped };
+
+    /// registry_mu_ taken internally (short critical section, allocation-free). A
+    /// default-constructed (empty) receipt reports Failed - there is nothing to
+    /// observe.
+    ReceiptStatus receipt_status(const ArmReceipt& receipt) const;
+    /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
+    bool is_terminal(const ArmReceipt& receipt) const;
+
+    enum class ArmOutcomeKind { Armed, Accepted };
+    /// The non-waiting attach_rule() overload's success result. Never encodes
+    /// Accepted as a special generation number or makes it implicitly convertible
+    /// to a successful one (Astra opine review, Blocker 3) - callers must check
+    /// `kind` explicitly before reading `generation`.
+    struct ArmOutcome {
+        ArmOutcomeKind kind{ArmOutcomeKind::Armed};
+        std::uint64_t generation{0}; ///< valid iff kind == Armed
+        ArmReceipt receipt;          ///< valid iff kind == Accepted
+    };
+
+    /// Non-waiting counterpart to attach_rule() above: shares the identical
+    /// preparation/dispatch/commit/cleanup path (attach_core(), the same
+    /// claim_rollback pattern and #3831 shape - see the blocking overload's own doc
+    /// comment) but never calls wait_for_claim(). On Armed/Failed this behaves
+    /// exactly like the blocking overload, including the case where completion races
+    /// ahead of this call and the claim is observed already-terminal before return
+    /// (Astra opine review: "A claim observed committed before return can also
+    /// return Armed"). On an unresolved claim it hands ownership to claims_/the
+    /// completion callback - never marking it waiter_abandoned, since Accepted means
+    /// the operation is still wanted, not abandoned - and returns Accepted(receipt)
+    /// immediately, without waiting. Nothing in production calls this yet (Unit 6).
+    std::expected<ArmOutcome, std::string> attach_rule(NonWaiting, std::string rule_id,
+                                                       SparkSpec spec, RuleAssertion assertion,
+                                                       bool emit_compliant_edge);
+
+    /// rung 9c PR-2 Unit 2 (Astra opine review Blocker 2 / coordinator ruling
+    /// 2026-09-12): registry-locked expiry transition, callable directly - nobody is
+    /// blocked in wait_for_claim() to notice a non-waiting claim's own deadline (see
+    /// KeyClaim::deadline) elapse. Does exactly what wait_for_claim's own timeout
+    /// branch has always done for the blocking caller - abandon_claim_locked() every
+    /// live Arm claim whose deadline has passed - so today's timeout-fails-attempt
+    /// behavior is preserved, just relocated out of a waiter, not removed. A Disarm
+    /// claim is never a target (its own bound is submit_disarm_off_lock's run()
+    /// call). Idempotent: a claim already terminal or already waiter_abandoned is
+    /// skipped. A future heartbeat tick (Unit 5) is its production caller; exposed
+    /// standalone here so a test can drive it directly. Returns the number of
+    /// claims this call expired.
+    std::size_t expire_overdue_claims();
+
+private:
     /// The shared body of attach_rule(), before any wait: derive the claim/inline/
     /// shared-watcher decision, retire any prior generation, and (claim path only)
     /// dispatch off-lock. `key` is precomputed by the caller (spark_key(spec)) since

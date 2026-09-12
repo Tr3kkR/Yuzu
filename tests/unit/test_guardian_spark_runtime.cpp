@@ -6158,3 +6158,165 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 qe-4): detach_all withdraws a rule th
     REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
                                    std::chrono::seconds(10)));
 }
+
+// ── rung 9c PR-2, Unit 2 (non-waiting arm entry, Astra opine review 2026-09-12 /
+// coordinator ruling same date) ─────────────────────────────────────────────────
+// attach_rule(NonWaiting, ...) shares attach_core() with the blocking overload
+// above (Unit 1) and never calls wait_for_claim(). Checkpoint invariant per the
+// staged plan: returning Accepted never abandons a claim; completion-before-return
+// and stop races preserve ownership. Nothing in production calls this overload yet
+// (Unit 6) - these are runtime-level tests only.
+
+TEST_CASE("attach_rule(NonWaiting, ...): an inline-type arm resolves immediately as "
+          "Armed, exactly like the blocking overload",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1",
+                               SparkSpec{SparkType::Startup, StartupSparkParams{}},
+                               file_exists_rule("r1"), true);
+    REQUIRE(res.has_value());
+    CHECK(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed);
+    CHECK(res->generation != 0);
+    CHECK(rt->rule_count() == 1);
+}
+
+TEST_CASE("attach_rule(NonWaiting, ...): an inline-type arm failure resolves "
+          "immediately as Failed, exactly like the blocking overload",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    b->fail_arm = true;
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1",
+                               SparkSpec{SparkType::Startup, StartupSparkParams{}},
+                               file_exists_rule("r1"), true);
+    REQUIRE_FALSE(res.has_value());
+    CHECK(rt->rule_count() == 0);
+}
+
+TEST_CASE("attach_rule(NonWaiting, ...): a parked bounded arm returns Accepted with "
+          "a Pending receipt, and never abandons the claim - it commits normally "
+          "once released",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                               file_exists_rule("r1"), true);
+    // Release the parked worker on every exit path (governance cs-202 idiom, same
+    // as the blocking-overload timeout tests above).
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    REQUIRE(res.has_value());
+    CHECK(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK_FALSE(rt->is_terminal(res->receipt));
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+    CHECK(rt->rule_count() == 0); // not yet committed - still claimed only
+
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res->receipt); },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+}
+
+TEST_CASE("attach_rule(NonWaiting, ...): a same-key call queued behind an "
+          "in-flight blocking arm is Accepted too, and joins the same watcher "
+          "without dispatching its own backend arm",
+          "[spark][runtime][liveness]") {
+    // Mirrors the blocking-overload "QUEUES behind an in-flight arm" test above, but
+    // the SECOND (queued) call goes through the non-waiting overload - Astra opine
+    // review Blocker 1: "Queued siblings need this handoff too. They may be
+    // accepted without their own executor submission. Setting the flag only when
+    // submit() succeeds would still abandon them."
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    std::thread a_thread{[&] { rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    struct Cleanup {
+        FakeBackend* backend;
+        std::thread* t;
+        ~Cleanup() {
+            backend->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } cleanup{b.get(), &a_thread};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+    CHECK(b->arm_entries.load() == 1); // r2 queued - it never entered arm() itself
+
+    b->release_hang();
+    a_thread.join();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(res2->receipt); },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
+    CHECK(rt->rule_count() == 2);       // r1 (blocking) and r2 (non-waiting) both committed
+    CHECK(rt->armed_key_count() == 1);  // one shared watcher
+    CHECK(b->arms.load() == 1);         // exactly one real backend arm - r2 joined it
+}
+
+TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue arm "
+          "with nobody blocked in wait_for_claim() to notice, and the compensating "
+          "disarm still runs once the late success arrives",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                               file_exists_rule("r1"), true);
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res.has_value());
+    REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+
+    // Not yet overdue: a no-op, idempotent call changes nothing.
+    CHECK(rt->expire_overdue_claims() == 0);
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+
+    // Real wall-clock wait past the 50ms deadline - KeyClaim::deadline is
+    // std::chrono::steady_clock, not the injected test clock make_rt() wires for
+    // attach_now/debounce bookkeeping, so this must be an actual sleep.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+    CHECK(rt->is_terminal(res->receipt));
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Expired);
+    CHECK(rt->backend_op_timeouts() == 1);
+    CHECK(rt->rule_count() == 0); // never committed - the expiry beat the late success
+
+    // The worker is still parked; releasing it now delivers a "late success" nobody
+    // wants (waiter_abandoned was set by abandon_claim_locked above) - it must be
+    // compensated (disarmed), not leaked, and the receipt's own Expired status must
+    // not flip back to Committed once that late success lands.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->backend_op_late_arms() == 1);
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Expired);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+}

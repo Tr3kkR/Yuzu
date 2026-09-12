@@ -1002,6 +1002,153 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
     return outcome;
 }
 
+GuardianSparkRuntime::ReceiptStatus
+GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return ReceiptStatus::Failed; // nothing to observe
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    switch (receipt.claim->end) {
+    case ClaimEnd::None:
+        return ReceiptStatus::Pending;
+    case ClaimEnd::Committed:
+        return ReceiptStatus::Committed;
+    case ClaimEnd::Withdrawn:
+        return ReceiptStatus::Withdrawn;
+    case ClaimEnd::Stopped:
+        return ReceiptStatus::Stopped;
+    case ClaimEnd::WaiterTimedOutQueued:
+    case ClaimEnd::WaiterTimedOutDispatched:
+        return ReceiptStatus::Expired;
+    case ClaimEnd::BackendRefused:
+    case ClaimEnd::WorkerThrew:
+    case ClaimEnd::AdmissionRejected:
+    case ClaimEnd::CommitThrew:
+    case ClaimEnd::DeadSubscription:
+        return ReceiptStatus::Failed;
+    }
+    return ReceiptStatus::Failed; // unreachable (exhaustive above); no default so a
+                                  // new ClaimEnd enumerator fails to compile here
+}
+
+bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
+    return receipt_status(receipt) != ReceiptStatus::Pending;
+}
+
+std::expected<GuardianSparkRuntime::ArmOutcome, std::string>
+GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spec,
+                                  RuleAssertion assertion, bool emit_compliant_edge) {
+    const std::string key = spark_key(spec);
+    std::shared_ptr<KeyClaim> arm_claim; // written by attach_core() iff it returns Pending
+
+    // Identical #3831 shape to the blocking overload just above - see its own doc
+    // comment for the full reasoning (armed before registry_mu_ is even locked,
+    // matched on pointer identity, narrower-scope unwind ordering - moving this
+    // declaration into attach_core() would deadlock on unwind exactly as it would
+    // there). The only difference from here on: this function never calls
+    // wait_for_claim(), and on an unresolved claim it must NOT let claim_rollback's
+    // fn fire - Accepted means "still wanted", not "abandon on the way out" (Astra
+    // opine review Blocker 1/2).
+    GuardianRollback claim_rollback;
+    claim_rollback.fn = [this, key, &arm_claim] {
+        if (!arm_claim)
+            return; // never enqueued (or not yet) - nothing to undo
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        const auto eit = claims_.find(key);
+        if (eit == claims_.end())
+            return;
+        bool present = false;
+        for (const auto& c : eit->second.fifo)
+            if (c == arm_claim) {
+                present = true;
+                break;
+            }
+        if (!present || arm_claim->outcome || arm_claim->commit_exception)
+            return;
+        abandon_claim_locked(key, arm_claim, stopping_);
+        claim_cv_.notify_all();
+    };
+
+    AttachCoreResult core = attach_core(key, std::move(rule_id), std::move(spec),
+                                       std::move(assertion), emit_compliant_edge, arm_claim);
+    switch (core.state) {
+    case AttachCoreState::Armed:
+        return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = core.generation,
+                          .receipt = {}};
+    case AttachCoreState::Failed:
+        return std::unexpected(std::move(core.error));
+    case AttachCoreState::Pending:
+        break; // fall through: inspect below, without waiting
+    }
+
+    // Astra opine review, Blocker 1 step 3: "Reacquire registry_mu_ and inspect this
+    // claim object, not merely the current entry for its key" - completion can
+    // precede this function's own resumption (the detached worker may finish before
+    // attach_core()'s off-lock submit() call even returns control here), so a claim
+    // reported Pending a moment ago may already be terminal. Mirrors wait_for_claim's
+    // own terminal check exactly, minus the cv wait itself - this never blocks.
+    std::unique_lock<std::mutex> lk{registry_mu_};
+    if (arm_claim->commit_exception) {
+        const std::exception_ptr e = arm_claim->commit_exception;
+        claim_rollback.committed = true; // terminal result observed
+        lk.unlock();
+        std::rethrow_exception(e);
+    }
+    if (arm_claim->outcome) {
+        auto outcome = *arm_claim->outcome;
+        claim_rollback.committed = true;
+        lk.unlock();
+        if (outcome)
+            return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = *outcome,
+                              .receipt = {}};
+        return std::unexpected(std::move(outcome).error());
+    }
+    // Still unresolved: hand off to runtime-owned state, never abandon it. True for
+    // every Pending claim reaching here regardless of Queued/Dispatching/Dispatched -
+    // only outcome/commit_exception decided the branch above, not dispatch state
+    // (Astra opine review Blocker 1: "Queued siblings need this handoff too. They
+    // may be accepted without their own executor submission. Setting the flag only
+    // when submit() succeeds would still abandon them.").
+    claim_rollback.committed = true;
+    lk.unlock();
+    return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
+                      .receipt = ArmReceipt{arm_claim}};
+}
+
+std::size_t GuardianSparkRuntime::expire_overdue_claims() {
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
+    std::size_t expired_count = 0;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        // Collect first, mutate second: abandon_claim_locked() erases from a key's
+        // fifo (and possibly the claims_ entry itself), which must never happen
+        // while a range-based for is iterating those same containers. One
+        // continuous lock acquisition spans both passes, so no other thread's
+        // dispatch/completion can interleave between the scan and the abandon
+        // calls below.
+        for (auto& [key, entry] : claims_) {
+            for (auto& c : entry.fifo) {
+                if (c->kind != ClaimKind::Arm)
+                    continue; // a Disarm's own bound is submit_disarm_off_lock's run() call
+                if (c->outcome || c->commit_exception || c->waiter_abandoned)
+                    continue; // already terminal or already someone else's abandon
+                if (now < c->deadline)
+                    continue;
+                overdue.emplace_back(key, c);
+            }
+        }
+        for (auto& [key, c] : overdue) {
+            if (c->outcome || c->commit_exception || c->waiter_abandoned)
+                continue; // a sibling's abandon_claim_locked() call already reached this one
+            abandon_claim_locked(key, c, /*stopping=*/false);
+            ++expired_count;
+        }
+    }
+    if (expired_count)
+        claim_cv_.notify_all();
+    return expired_count;
+}
+
 GuardianSparkRuntime::AttachCoreResult
 GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge,
@@ -1131,6 +1278,12 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             c->rule_name = rule_name;
             c->guard_type = guard_type;
             c->attach_now = attach_now;
+            // rung 9c PR-2 Unit 2: the real monotonic deadline expire_overdue_claims()
+            // consults - std::chrono::steady_clock::now(), NOT the injected clock_()
+            // attach_now uses above, matching the blocking wrapper's own
+            // wait_for_claim() deadline (computed at the same point, just after this
+            // function returns).
+            c->deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
             auto& entry = claims_[key];               // may throw -> index_add_rollback
             entry.fifo.push_back(c);                  // may throw -> index_add_rollback
             c->index_held = true;                     // noexcept; ownership handed over
