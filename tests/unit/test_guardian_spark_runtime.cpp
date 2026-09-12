@@ -589,7 +589,11 @@ TEST_CASE("detach disarms on the ->0 edge; a sibling detach keeps the watcher", 
     REQUIRE(rt->rule_count() == 1);
 
     rt->detach_rule("r2"); // ->0 -> disarm
-    REQUIRE(b->disarms.load() == 1);
+    // rung 9c PR-2 Unit 3: submit_disarm_off_lock() is non-blocking now (submit(), not
+    // run()) - detach_rule() returns once the disarm is admitted, not once the backend
+    // call physically finishes, so the actual disarm count is observed asynchronously.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
     REQUIRE(rt->armed_key_count() == 0);
 }
 
@@ -2526,7 +2530,11 @@ TEST_CASE("attach_rule: an inline-type arm() failure still disarms the re-pushed
 
     // r1's OLD file-backed watcher must be disarmed even though the re-push
     // itself failed - it is no longer referenced anywhere in Guardian's state.
-    CHECK(b->disarms.load() == 1);
+    // rung 9c PR-2 Unit 3: the prior-generation disarm is dispatched off-lock
+    // through the same non-blocking submit_disarm_off_lock() (attach_core's own
+    // off-lock section), so it is observed asynchronously here too.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
     CHECK(rt->rule_count() == 0); // the failed re-push left nothing behind either
 }
 
@@ -2561,7 +2569,10 @@ TEST_CASE("attach_rule: a commit throw still disarms the re-pushed rule's prior 
     // the #3821 review fix - the two rollbacks nest (LIFO) and neither replaces
     // the other.
     CHECK(b->arms.load() == 2);    // old File arm + new Startup arm
-    CHECK(b->disarms.load() == 2); // both rolled back
+    // rung 9c PR-2 Unit 3: both rollback disarms dispatch off-lock through the
+    // non-blocking submit_disarm_off_lock() - observed asynchronously.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 2; },
+                                   std::chrono::seconds(10))); // both rolled back
     CHECK(rt->rule_count() == 0);
 }
 
@@ -2608,25 +2619,30 @@ TEST_CASE("#2233 item 3: a bounded arm that never returns times out, leaves no s
     // (the parked worker is released by `release_parked` above on every exit path)
 }
 
-TEST_CASE("#2233 item 3: a bounded disarm that never returns is counted too - "
-          "backend_op_timeouts() is not arm-only (sre, PR #3821 scoped-governance)",
+TEST_CASE("rung 9c PR-2 Unit 3: a hung disarm no longer blocks detach_rule() or times "
+          "out - it returns promptly and the claim resolves for real once released",
           "[spark][runtime][liveness]") {
-    // The arm-side timeout test above only pins half of backend_op_timeouts()'s
-    // documented contract (guardian_spark_runtime.hpp: "attach_rule calls... PLUS
-    // submit_disarm_off_lock calls... - one shared counter for both directions").
-    // This pins the disarm side via the simplest submit_disarm_off_lock caller,
-    // detach_rule().
+    // Supersedes "#2233 item 3: a bounded disarm that never returns is counted too"
+    // (pre-Unit-3: detach_rule() blocked up to cfg_.backend_op_deadline via run(),
+    // and a disarm timeout was counted in backend_op_timeouts()). Unit 3 converted
+    // submit_disarm_off_lock() to submit(), which has NO deadline concept at all
+    // (guardian_io_executor.hpp: "there is no waiter to time out") - so detach_rule()
+    // returns as soon as the disarm is ADMITTED, regardless of how long the backend
+    // call takes, and no disarm can ever be counted as a timeout any more. This is a
+    // real behavior improvement, not merely a relocation: the pre-Unit-3 code's own
+    // timeout branch popped the claim (and let a rearm proceed) WHILE the backend
+    // call was still physically running (Astra opine review Blocker 4) - that hazard
+    // is gone by construction now, not worked around.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
                                                           std::chrono::milliseconds(50)});
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
-    CHECK(rt->backend_op_timeouts() == 0); // arming cleanly does not touch this counter
+    CHECK(rt->backend_op_timeouts() == 0);
 
     b->hang_next_disarm.store(true);
     // Release the parked disarm worker on every exit path (governance cs-202; same
-    // shape as the arm-side case above). Nothing is parked before this line, so a
-    // failure above leaves nothing to release.
+    // shape as the arm-side liveness tests above).
     const std::function<void()> release_parked_fn = [&] {
         b->wait_entered_disarm_hang(std::chrono::seconds(30));
         b->release_disarm_hang();
@@ -2636,14 +2652,26 @@ TEST_CASE("#2233 item 3: a bounded disarm that never returns is counted too - "
         ~Cleanup() { fn(); }
     };
     Cleanup release_parked{release_parked_fn};
+
     const auto t0 = clk::now();
-    rt->detach_rule("r1"); // blocks up to backend_op_deadline waiting on the hung disarm
+    rt->detach_rule("r1"); // returns once the disarm is admitted, not once it completes
     const auto elapsed = clk::now() - t0;
 
-    CHECK(elapsed >= std::chrono::milliseconds(50));
-    CHECK(elapsed < std::chrono::seconds(10));
-    CHECK(rt->backend_op_timeouts() == 1);
-    // (the parked worker is released by `release_parked` above on every exit path)
+    // Well under the 50ms deadline that used to bound this call - proof it did not
+    // wait for anything, not just that it happened to be fast.
+    CHECK(elapsed < std::chrono::milliseconds(50));
+    CHECK(rt->rule_count() == 0);      // the confirmed-state mutation is synchronous, unchanged
+    CHECK(rt->armed_key_count() == 0); // ditto
+    CHECK(rt->backend_op_timeouts() == 0); // no timeout concept for disarm any more
+    CHECK(b->disarms.load() == 0);     // the backend call itself is still parked
+
+    b->release_disarm_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->backend_op_timeouts() == 0); // still never counted, even after the late completion
+    // (release_parked's own release_disarm_hang() call above is now a harmless no-op
+    // repeat - BlockingGate/the hang flag idiom this mirrors elsewhere in this file
+    // tolerates a second release)
 }
 
 TEST_CASE("#2233 item 3: a parked arm on one key does not block a DIFFERENT key's attach",
@@ -3156,7 +3184,11 @@ TEST_CASE("detach_all withdraws every attached rule and disarms every backend su
 
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
-    CHECK(b->disarms.load() == 2);
+    // rung 9c PR-2 Unit 3: the confirmed-state mutation (and its "disarmed" audit
+    // entry, checked below) is synchronous and unchanged; only the actual backend
+    // disarm call is now dispatched off-lock through non-blocking submit().
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 2; },
+                                   std::chrono::seconds(10)));
     const auto lc = drain_lifecycle(*rt);
     CHECK(lc.size() == 4); // armed x2, disarmed x2
 }
@@ -5261,9 +5293,11 @@ TEST_CASE("rung 9c R5.2: a rule re-pushed onto ANOTHER key while its old-key cla
     CHECK(rt->armed_key_count() == 1);
 
     // r1's LIVE mapping ("/b") survived the old claim's cleanup: detaching it disarms
-    // the "/b" watcher.
+    // the "/b" watcher. rung 9c PR-2 Unit 3: observed asynchronously (non-blocking
+    // submit_disarm_off_lock()).
     rt->detach_rule("r1");
-    CHECK(b->disarms.load() == 2);
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 2; },
+                                   std::chrono::seconds(10)));
     CHECK(rt->armed_key_count() == 0);
 }
 
@@ -5431,9 +5465,12 @@ TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): an adopted commit is publis
     CHECK(rt->claim_queue_depth_for_test(key) == 0);
     // Both rules share the ONE subscription: the ->0 edge disarms exactly that id, once.
     rt->detach_rule("r1");
-    CHECK(b->disarm_entries.load() == 0);
+    CHECK(b->disarm_entries.load() == 0); // sibling remains -> no disarm at all; race-free
     rt->detach_rule("r2");
-    CHECK(b->disarm_entries.load() == 1);
+    // rung 9c PR-2 Unit 3: the ->0 edge's disarm dispatches off-lock through
+    // non-blocking submit_disarm_off_lock() - observed asynchronously.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarm_entries.load() == 1; },
+                                   std::chrono::seconds(10)));
     REQUIRE(b->disarmed_ids().size() == 1);
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
     CHECK(rt->armed_key_count() == 0);
@@ -5574,8 +5611,10 @@ TEST_CASE("rung 9c R5.2 (adversarial review C2/K5): a throw after the first comm
     CHECK(drain_lifecycle(*rt).size() == 1); // the "armed" record the commit staged
 
     // The live rule is a normal rule: detaching it disarms exactly that subscription.
+    // rung 9c PR-2 Unit 3: observed asynchronously (non-blocking submit_disarm_off_lock()).
     rt->detach_rule("r1");
-    CHECK(b->disarms.load() == 1);
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
     REQUIRE(b->disarmed_ids().size() == 1);
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
     CHECK(rt->armed_key_count() == 0);
@@ -5612,13 +5651,19 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C1): a bad_alloc building the 
     CHECK(b->disarms.load() == 0);
     CHECK(rt->detach_claim_failures() == 0);
 
-    // The retry succeeds and disarms exactly the armed subscription, once.
+    // The retry succeeds and disarms exactly the armed subscription, once. rung 9c
+    // PR-2 Unit 3: the disarm claim is dispatched off-lock through non-blocking
+    // submit_disarm_off_lock(), and popped from the fifo by its own completion
+    // callback - both disarmed_ids() and the queue depth are observed asynchronously,
+    // so both are folded into one predicate to avoid a window where the backend call
+    // has completed but the callback has not yet popped the claim.
     rt->detach_rule("r1");
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
-    REQUIRE(b->disarmed_ids().size() == 1);
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return b->disarmed_ids().size() == 1 && rt->claim_queue_depth_for_test(key) == 0; },
+        std::chrono::seconds(10)));
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
-    CHECK(rt->claim_queue_depth_for_test(key) == 0);
 
     // A fresh attach on the same key arms cleanly (no keys_.emplace hard error).
     REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
@@ -5684,12 +5729,16 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r2 C2): a throw inside the index 
     CHECK(b->arms.load() == 1);
 
     // The real owner's detach is the ->0 edge ONLY if r2's stale mapping is gone.
+    // rung 9c PR-2 Unit 3: observed asynchronously, folded into one predicate (see
+    // the bad_alloc-building-the-disarm-claim test above for why).
     rt->detach_rule("r1");
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
-    REQUIRE(b->disarmed_ids().size() == 1);
+    const auto key_a = spark_key(file_spec("/a"));
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return b->disarmed_ids().size() == 1 && rt->claim_queue_depth_for_test(key_a) == 0; },
+        std::chrono::seconds(10)));
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
-    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
 }
 
 // rung 9c R5.2 - adversarial re-review r2 (C3 / Kimi K5): the drain's firewall
@@ -5871,9 +5920,14 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
         rt->detach_rule("r4");
         if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
             ::_exit(99);
-        // Two disarms overall: r1's compensation (its withdrawn head) and r4's own.
-        if (b->disarmed_ids().size() != 2 || b->armed_ids().size() != 2 ||
-            b->disarmed_ids()[1] != b->armed_ids()[1])
+        // Two disarms overall: r1's compensation (its withdrawn head) and r4's own -
+        // both dispatched off-lock through non-blocking submit_disarm_off_lock()
+        // (rung 9c PR-2 Unit 3), so detach_rule("r4") returning is not proof either
+        // disarm has physically completed yet.
+        if (!yuzu::test::spin_until([&] { return b->disarmed_ids().size() == 2; },
+                                    std::chrono::seconds(10)))
+            ::_exit(101);
+        if (b->armed_ids().size() != 2 || b->disarmed_ids()[1] != b->armed_ids()[1])
             ::_exit(100);
         rt->begin_stop();
         ::_exit(0);
@@ -5929,9 +5983,14 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C4): a throw in the outbox pur
     CHECK(rt->detach_post_commit_failures() == 1);
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
-    REQUIRE(b->disarmed_ids().size() == 1); // the queued disarm was driven
+    // rung 9c PR-2 Unit 3: the queued disarm dispatches off-lock through non-blocking
+    // submit_disarm_off_lock() and is popped by its own completion callback - both
+    // observed asynchronously, folded into one predicate (see the bad_alloc-building-
+    // the-disarm-claim test above for why both must be checked together).
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return b->disarmed_ids().size() == 1 && rt->claim_queue_depth_for_test(key) == 0; },
+        std::chrono::seconds(10))); // the queued disarm was driven
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
-    CHECK(rt->claim_queue_depth_for_test(key) == 0);
     CHECK(drain_lifecycle(*rt).size() == 2); // "armed" at attach + "disarmed" at detach
 }
 
@@ -5964,9 +6023,12 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C4): a throw at the lifecycle-
     rt->detach_rule("r1"); // the retry: one disarm of exactly the armed subscription
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
-    REQUIRE(b->disarmed_ids().size() == 1);
+    // rung 9c PR-2 Unit 3: observed asynchronously, folded into one predicate (see
+    // the earlier bad_alloc-building-the-disarm-claim test for why).
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return b->disarmed_ids().size() == 1 && rt->claim_queue_depth_for_test(key) == 0; },
+        std::chrono::seconds(10)));
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
-    CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
 
 // ── governance pass-3 (independent fan-out) + adversarial round 4 code findings ──────

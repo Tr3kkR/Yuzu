@@ -2466,22 +2466,29 @@ TEST_CASE("#2233 item 3: a hung watch() on one rule blocks an unrelated concurre
     CHECK(push_b_exit_code.load(std::memory_order_acquire) == 0);
 }
 
-TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
+TEST_CASE("rung 9c PR-2 Unit 3: a hung unwatch() no longer wedges apply_rules() or "
+          "stop() - detach_all()'s disarm is dispatched off-lock, not waited for",
           "[spark][guardian][reconcile][liveness]") {
-    SparkReconcileFixture f;
+    // Supersedes "#2233 item 3: a hung unwatch() wedges stop() until released" (this
+    // test's name and premise, pre rung 9c PR-2 Unit 3). That test's wedge was never
+    // stop() making a direct blocking disarm call - it was apply_rules() (the PUSH
+    // thread) holding GuardianEngine::mtx_ synchronously inside detach_all()'s (then
+    // run()-based) disarm, so stop() (which also needs mtx_) queued behind it. Unit
+    // 3 made submit_disarm_off_lock() genuinely non-blocking (submit(), not run()):
+    // apply_rules() now returns as soon as the disarm is ADMITTED, holding mtx_ for
+    // nowhere near the duration of a hung unwatch() - so neither the push nor a
+    // later stop() wedges on it any more. This is the disarm-side half of this PR's
+    // own title ("wire apply_rules()/detach_all() onto the non-waiting executor
+    // path") already landing in production, ahead of Unit 6's arm-side cutover -
+    // detach_rule()/detach_all() are called by GuardianEngine unconditionally,
+    // regardless of prefer_spark_.
+    //
     // Arm r1 normally first (no hang yet), so the hang below is specifically on the
-    // detach path. The second push below is full_sync=true, so the hang is actually
-    // entered via apply_rules()'s UNCONDITIONAL detach_all() sweep
-    // (guardian_engine.cpp, before the per-rule loop) -> detach_rule_locked ->
-    // backend_->disarm -> SparkEngine::disarm -> mech->unwatch - not via
-    // reconcile_rule_locked's disabled-rule branch, whose own detach_rule() call on
-    // r1 becomes a no-op once detach_all() has already erased it (governance Gate 3
-    // quality-engineer finding, this branch). Both routes end at the same
-    // detach_rule_locked/disarm/unwatch call, so the wedge this test proves is
-    // identical either way; a genuinely-untested adjacent case is a PARTIAL push
-    // (full_sync=false) disabling one of several armed rules, which is the only way
-    // to reach the disabled-rule branch directly - left as a follow-up, out of scope
-    // for this characterisation PR.
+    // detach path. The second push below is full_sync=true, so the hang is entered
+    // via apply_rules()'s UNCONDITIONAL detach_all() sweep (guardian_engine.cpp,
+    // before the per-rule loop) -> detach_rule_locked -> backend_->disarm ->
+    // SparkEngine::disarm -> mech->unwatch.
+    SparkReconcileFixture f;
     f.apply(make_service_rule("r1"));
     REQUIRE(f.mechanism->watching_count() == 1);
 
@@ -2517,31 +2524,30 @@ TEST_CASE("#2233 item 3: a hung unwatch() wedges stop() until released",
 
     REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
 
-    // f.engine->stop() runs unguarded on a non-main thread here - see the "hung
-    // watch() wedges stop()" test above for the implicitly-noexcept reliance this
-    // shares with ~GuardianEngine() itself (governance Gate 4 unhappy-path UP-1).
+    // The push itself must return promptly - proving apply_rules() does NOT wait for
+    // the hung unwatch() to release. A regression back to a blocking disarm wait
+    // makes this REQUIRE time out rather than silently pass (the mechanism is still
+    // hung at this point - release_hang() is not called until after this).
+    REQUIRE(yuzu::test::spin_until([&] { return push_done.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
+
+    // mtx_ is free the moment apply_rules() returned above - stop() proves it by
+    // also returning promptly, with the unwatch() STILL hung (relies on the same
+    // implicitly-noexcept treatment ~GuardianEngine() itself gives stop(), governance
+    // Gate 4 unhappy-path UP-1 - not a new risk, just exercised off the main thread).
     cleanup.stopper_thread.emplace([&] {
         f.engine->stop();
         stop_returned.store(true, std::memory_order_release);
     });
+    REQUIRE(yuzu::test::spin_until([&] { return stop_returned.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    const bool blocked_before_release = !stop_returned.load(std::memory_order_acquire);
-
+    // The disarm claim is still a real, owned attempt (Unit 3's whole point is
+    // non-blocking, not abandoned) - releasing the hang lets it actually finish.
     f.mechanism->release_hang();
-
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (!stop_returned.load(std::memory_order_acquire) &&
-          std::chrono::steady_clock::now() < deadline)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-
-    cleanup.stopper_thread->join();
-    cleanup.pusher_thread.join();
-
-    CHECK(blocked_before_release);
-    CHECK(stop_returned.load(std::memory_order_acquire));
-    CHECK(push_done.load(std::memory_order_acquire));
-    CHECK(push_exit_code.load(std::memory_order_acquire) == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 0; },
+                                   std::chrono::seconds(10)));
 }
 
 // ---------------------------------------------------------------------------

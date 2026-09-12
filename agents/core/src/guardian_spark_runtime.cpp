@@ -298,77 +298,113 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const std::shared_ptr<KeyClaim
         if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
             return; // completed, dropped, or not yet the head
         if (claim->dispatch != ClaimDispatch::Queued)
-            return; // another caller is already driving it
+            return; // another caller (or a prior admission-refusal retry) is already
+                    // driving it, or it already completed
         claim->dispatch = ClaimDispatch::Dispatching;
     }
-    // The bounded backend disarm, exactly as before rung 9c: run() holds the class
-    // quota and the single-flight key for the call's duration and bounds THIS
-    // caller's wait by cfg_.backend_op_deadline; fn's own return value is discarded
-    // (disarm() is void and was never awaited for success even in the old inline
-    // call this replaces - see the header doc). Kept on the blocking form
-    // deliberately in PR-1: the caller waits anyway, and run() supplies the bound,
-    // the quota slot and the timeout accounting for free; the claim entry supplies
-    // the same-key ordering (an arm that arrives meanwhile queues behind this claim).
-    //
-    // #3816: run() no longer has an internal throwing wait-path (a wait-lock failure
-    // returns IoFailure::LaunchFailed). The try/catch is NOT dead code even so: the
-    // argument evaluation (`key`'s copy into run()'s by-value parameter, the lambda's
-    // captures) runs in THIS frame before run() is entered - a bad_alloc there is the
-    // live trigger. Every caller treats a disarm as best-effort; a throw here leaves
-    // the claim RETAINED (below) rather than dropped, so the watcher is not forgotten.
-    std::expected<int, IoFailure> result{std::unexpect, IoFailure::LaunchFailed};
+    // rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): genuinely non-blocking now -
+    // submit(), not run(). detach_rule()/detach_all() (this function's only callers
+    // besides attach_core()'s own off-lock prior-disarm/retained-head drives) return
+    // as soon as this call is ADMITTED, not once the backend call physically
+    // finishes; on_disarm_complete() below is the completion callback, invoked by
+    // the detached worker whenever the real backend_->disarm() call actually
+    // returns or throws - however long that takes. submit() itself has NO deadline
+    // (guardian_io_executor.hpp: "there is no waiter to time out"), so the old
+    // Timeout branch this function used to have is GONE, not merely moved: nothing
+    // can ever pop this claim out from under a still-running backend call anymore
+    // (Astra's own finding on the pre-Unit-3 code: "[run()'s] timeout branch pops
+    // the claim while the backend call remains running... this is not the stronger
+    // R5.2 guarantee that teardown finishes before rearm dispatch" - fixed by
+    // construction, not by adding a new check).
+    IoResult<void> adm{std::unexpect, IoFailure::LaunchFailed};
     try {
-        result = io_executor_.run(claim->io_class, key, cfg_.backend_op_deadline,
-                                  [backend = backend_, sub = claim->subscription]() -> int {
-                                      backend->disarm(sub);
-                                      return 0;
-                                  });
+        auto self = shared_from_this();
+        adm = io_executor_.submit(
+            claim->io_class, key,
+            [backend = backend_, sub = claim->subscription]() -> int {
+                backend->disarm(sub);
+                return 0;
+            },
+            [self, key, claim](IoResult<int>&& r) {
+                self->on_disarm_complete(key, claim, std::move(r));
+            });
     } catch (const std::exception& e) {
-        spdlog::error("Guardian spark: submit_disarm_off_lock's own io_executor_.run() threw "
-                     "({}) for key '{}' - the disarm attempt itself failed, not just the "
-                     "backend call; the claim is retained for the next same-key event",
-                     e.what(), key);
+        spdlog::error("Guardian spark: building the disarm submission for key '{}' threw ({}) - "
+                     "the disarm attempt itself failed, not just the backend call; the claim "
+                     "is retained for the next same-key event",
+                     key, e.what());
     }
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        const auto eit = claims_.find(key);
+        if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+            return; // the callback already ran (a fast completion) and popped/erased
+                    // it, or begin_stop() dropped it meanwhile
+        if (adm) {
+            if (claim->dispatch == ClaimDispatch::Dispatching)
+                claim->dispatch = ClaimDispatch::Dispatched;
+            return;
+        }
+        if (adm.error() == IoFailure::Stopped) {
+            // The executor refused admission at shutdown. Dropped with a count (R5.5
+            // makes this the counted total); everything queued behind it goes with
+            // it, since nothing can dispatch any more.
+            claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
+            fail_all_claims_locked(key, "stopping", ClaimEnd::Stopped);
+        } else {
+            // Any OTHER synchronous admission refusal (capacity, key, ceiling,
+            // launch, or the throw above): the backend call never ran. Retain the
+            // claim at the head - never drop a disarm for capacity reasons (rung 9c
+            // R5.2; before it the drop was one that #3415's missing counter egress
+            // left invisible - #3415 stays OPEN, it is the egress issue, not this
+            // drop) - and count it. The next same-key event (an attach, which then
+            // queues its own arm behind this claim) re-drives it, and so does
+            // redrive_retained_disarms() below, bounded and on demand.
+            claim->dispatch = ClaimDispatch::Queued;
+            ++claim->admission_rejections;
+            disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    claim_cv_.notify_all();
+}
+
+void GuardianSparkRuntime::on_disarm_complete(const std::string& key,
+                                              const std::shared_ptr<KeyClaim>& claim,
+                                              IoResult<int>&& r) noexcept {
+    // Runs on the detached io_executor_ worker (GuardianDetachedWorkerRole marked -
+    // nothing here may take GuardianEngine::mtx_; registry_mu_ is fine), exactly
+    // like on_arm_complete. A disarm has no commit and no compensation to run - it
+    // is best-effort teardown of an OS resource nobody wants any more - so this is
+    // far smaller: decide the claim's fate, pop it if it is genuinely done, dispatch
+    // whatever queued behind it.
     std::shared_ptr<KeyClaim> refill;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         const auto eit = claims_.find(key);
         if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
-            return; // begin_stop() dropped it meanwhile
+            return; // cannot happen by construction (only this callback pops the
+                    // head) - defensive: never touch a foreign entry
         auto& fifo = eit->second.fifo;
-        if (!result && result.error() != IoFailure::Timeout && result.error() != IoFailure::Stopped) {
-            // ADMISSION refusal (capacity, key, ceiling, launch, or the throw above):
-            // the backend call never ran. Retain the claim at the head - never drop a
-            // disarm for capacity reasons (rung 9c R5.2; before it the drop was one
-            // that #3415's missing counter egress left invisible - #3415 stays OPEN,
-            // it is the egress issue, not this drop) - and count it. The next same-key event (an attach, which then
-            // queues its own arm behind this claim) re-drives it; there is no redrive
-            // timer in PR-1. The caller returns now: "retained" is not an outcome.
+        if (!r) {
+            // Only WorkerThrew is reachable here (submit() has no deadline, and
+            // Stopped/other admission refusals are handled synchronously in
+            // submit_disarm_off_lock above - a completion callback only ever fires
+            // for a call that was genuinely admitted). Astra opine review Blocker 4:
+            // "Record actual worker failure; retain for bounded retry rather than
+            // pretend admission failed" - retained exactly like an admission
+            // refusal (not popped, not marked terminal), but logged distinctly so
+            // the two causes are never conflated in diagnostics.
+            spdlog::error("Guardian spark: backend_->disarm() itself threw for key '{}' - "
+                         "the disarm attempt failed on the worker, not at admission; the "
+                         "claim is retained for the next same-key event",
+                         key);
             claim->dispatch = ClaimDispatch::Queued;
             ++claim->admission_rejections;
             disarm_retained_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        if (!result && result.error() == IoFailure::Timeout) {
-            // backend_op_timeouts_ counts deadline hits specifically - only
-            // IoFailure::Timeout, matching attach_rule's own increment site (adversarial
-            // review C3/k1). The disarm is still running on its worker and completes
-            // on its own schedule; the claim is done from this caller's view.
-            backend_op_timeouts_.fetch_add(1, std::memory_order_relaxed);
-            claim->end = ClaimEnd::WaiterTimedOutDispatched;
-            claim->outcome = std::unexpected(std::string{"disarm timed out"});
-        } else if (!result) {
-            // Stopped: the executor refused admission at shutdown. Dropped with a count
-            // (R5.5 makes this the counted total); everything queued behind it goes
-            // with it, since nothing can dispatch any more.
-            claims_dropped_at_stop_.fetch_add(1, std::memory_order_relaxed);
-            fail_all_claims_locked(key, "stopping", ClaimEnd::Stopped);
-            claim_cv_.notify_all();
-            return;
-        } else {
-            claim->end = ClaimEnd::DisarmDone;
-            claim->outcome = 0;
-        }
+        claim->end = ClaimEnd::DisarmDone;
+        claim->outcome = 0;
         fifo.pop_front();
         if (fifo.empty())
             claims_.erase(eit);
@@ -378,6 +414,38 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const std::shared_ptr<KeyClaim
     claim_cv_.notify_all();
     if (refill)
         dispatch_arm_off_lock(key, refill);
+}
+
+std::size_t GuardianSparkRuntime::redrive_retained_disarms() {
+    // rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): "Provide a bounded, fair
+    // maintenance pass for retained disarms. Otherwise rapid non-waiting
+    // detach_all() submissions can exhaust capacity and leave deleted keys retained
+    // indefinitely because no further same-key attach arrives." One attempted
+    // submission per currently-Queued Disarm head, no sleeps/recursion/waiting for
+    // quota - submit_disarm_off_lock's own admission-refusal handling re-retains it
+    // if capacity is still unavailable, so this is safe to call as often as a
+    // future heartbeat tick (Unit 5) likes. Also the general safety net for ANY
+    // Queued disarm head nobody currently holds a live handle to (e.g. a caller's
+    // own bookkeeping between detach_rule_locked() and submit_disarm_off_lock()
+    // throwing) - the claim itself is always safely queued in claims_ regardless
+    // of what happens to the caller's local handle, so this pass finds it either
+    // way. Collected first, driven second (outside any lock, matching every other
+    // off-lock dispatch site) since submit_disarm_off_lock takes registry_mu_
+    // itself. Returns the number of claims this call attempted to redrive.
+    std::vector<std::shared_ptr<KeyClaim>> retained;
+    {
+        std::lock_guard<std::mutex> lk{registry_mu_};
+        for (auto& [key, entry] : claims_) {
+            if (entry.fifo.empty())
+                continue;
+            const auto& head = entry.fifo.front();
+            if (head->kind == ClaimKind::Disarm && head->dispatch == ClaimDispatch::Queued)
+                retained.push_back(head);
+        }
+    }
+    for (const auto& c : retained)
+        submit_disarm_off_lock(c);
+    return retained.size();
 }
 
 void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
@@ -1025,6 +1093,12 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
     case ClaimEnd::CommitThrew:
     case ClaimEnd::DeadSubscription:
         return ReceiptStatus::Failed;
+    case ClaimEnd::DisarmDone:
+        // Defensive only: an ArmReceipt is constructed solely from attach_rule's own
+        // arm_claim (ClaimKind::Arm), so a Disarm claim's own terminal value can
+        // never actually reach here - kept as an explicit case (not folded into a
+        // default:) so this switch stays exhaustive against ClaimEnd's real set.
+        return ReceiptStatus::Failed;
     }
     return ReceiptStatus::Failed; // unreachable (exhaustive above); no default so a
                                   // new ClaimEnd enumerator fails to compile here
@@ -1432,6 +1506,14 @@ void GuardianSparkRuntime::detach_all() {
         // only CLAIMED (its arm in flight or queued, no rules_ entry yet) must be
         // withdrawn too - detach_rule_locked's Case 0 handles each, generalised.
         std::vector<std::string> claimed;
+        {
+            std::size_t claim_count = 0;
+            for (const auto& [k, entry] : claims_)
+                claim_count += entry.fifo.size();
+            claimed.reserve(claim_count); // Astra opine review Blocker 4: pre-reserve
+                                          // where possible - a throw growing this
+                                          // vector must not skip a withdrawal
+        }
         for (const auto& [k, entry] : claims_)
             for (const auto& c : entry.fifo)
                 if (c->kind == ClaimKind::Arm && !c->withdrawn && !c->waiter_abandoned &&
@@ -1443,16 +1525,26 @@ void GuardianSparkRuntime::detach_all() {
         rule_ids.reserve(rules_.size());
         for (const auto& [rid, rg] : rules_)
             rule_ids.push_back(rid);
+        works.reserve(rule_ids.size()); // Astra opine review Blocker 4: "detach_all()
+                                        // currently accumulates returned claims in a
+                                        // vector after individual mutations... If
+                                        // those steps throw, queued work must remain
+                                        // discoverable by maintenance." Pre-reserving
+                                        // is the cheap half of that; the real safety
+                                        // net is that a dropped handle still leaves
+                                        // the claim safely queued in claims_ itself -
+                                        // see redrive_retained_disarms().
         for (const auto& rid : rule_ids)
             if (auto work = detach_rule_locked(rid))
                 works.push_back(std::move(work));
         outbox_waker = outbox_enqueue_waker_;
     }
-    // #2233 item 3: submitted sequentially, off-lock, each bounded by
-    // cfg_.backend_op_deadline - full_sync teardown already tolerates this class of
-    // latency (see apply_rules' full_sync branch, which counts+holds the generation
-    // for the server to retry on a firewalled throw); this is the same trade,
-    // bounded instead of unbounded.
+    // rung 9c PR-2 Unit 3: submitted sequentially, off-lock, through
+    // submit_disarm_off_lock() - each returns as soon as its disarm is ADMITTED, not
+    // once the backend call physically finishes (see on_disarm_complete()). No
+    // longer bounded by cfg_.backend_op_deadline per call the way the pre-Unit-3
+    // run()-based dispatch was; this loop itself is therefore fast regardless of how
+    // long any individual backend disarm takes.
     for (const auto& work : works)
         submit_disarm_off_lock(work);
     if (outbox_waker)

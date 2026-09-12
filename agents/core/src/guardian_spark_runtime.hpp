@@ -991,12 +991,27 @@ public:
     /// branch has always done for the blocking caller - abandon_claim_locked() every
     /// live Arm claim whose deadline has passed - so today's timeout-fails-attempt
     /// behavior is preserved, just relocated out of a waiter, not removed. A Disarm
-    /// claim is never a target (its own bound is submit_disarm_off_lock's run()
-    /// call). Idempotent: a claim already terminal or already waiter_abandoned is
+    /// claim is never a target: since Unit 3, submit_disarm_off_lock() dispatches
+    /// disarms through submit() too, which has no deadline concept at all - see
+    /// redrive_retained_disarms() for the disarm-side maintenance pass instead.
+    /// Idempotent: a claim already terminal or already waiter_abandoned is
     /// skipped. A future heartbeat tick (Unit 5) is its production caller; exposed
     /// standalone here so a test can drive it directly. Returns the number of
     /// claims this call expired.
     std::size_t expire_overdue_claims();
+
+    /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
+    /// maintenance pass for retained disarms - one attempted re-submission per
+    /// currently-Queued Disarm head across every key, no sleeps/recursion/waiting
+    /// for quota. Without this, a disarm retained after an admission refusal (or
+    /// dropped by a caller-side throw between detach_rule_locked() and
+    /// submit_disarm_off_lock()) sits inert until a FUTURE same-key attach happens
+    /// to redrive it - which may never come for a key nothing re-attaches to. A
+    /// future heartbeat tick (Unit 5) is its production caller; exposed standalone
+    /// here so a test can drive it directly. Returns the number of claims this call
+    /// attempted to redrive (a redrive can itself be refused again; that retained
+    /// claim is picked up again on the next call).
+    std::size_t redrive_retained_disarms();
 
 private:
     /// The shared body of attach_rule(), before any wait: derive the claim/inline/
@@ -1044,19 +1059,32 @@ private:
     /// rule on the key.
     void on_subscription_faulted(const std::string& key, std::uint64_t subscription_id,
                                   bool faulted, const std::string& detail);
-    /// Drive a DISARM claim that detach_rule_locked already queued at the head of its
-    /// key entry: run the bounded backend disarm (io_executor_.run(), holding its
-    /// class quota exactly as before), then pop the claim and dispatch the next
-    /// head ("refill" - an arm that queued behind it). Best-effort teardown of the OS
-    /// watcher only, as unconfirmed as the void `ISparkBackend::disarm()` call it
-    /// replaces. rung 9c R5.2: an executor ADMISSION refusal (capacity, key, ceiling,
-    /// launch, or a throw building the call) does NOT drop the claim - it is
-    /// RETAINED at the head, counted (disarm_retained_), and re-driven by the next
-    /// same-key event (an attach on the key, which then queues its own arm behind
-    /// it); only Stopped drops it, counted. No-op if the claim is no longer the
-    /// Queued head (another caller is already driving it, or it completed). Never
-    /// called with either runtime lock held.
+    /// Dispatch a DISARM claim that detach_rule_locked already queued at the head of
+    /// its key entry, through io_executor_.submit() (rung 9c PR-2 Unit 3: genuinely
+    /// non-blocking, replacing the earlier bounded run() - see on_disarm_complete()
+    /// for the actual pop/refill, which now happens in that completion callback, not
+    /// here). This function only handles SYNCHRONOUS admission: an executor
+    /// ADMISSION refusal (capacity, key, ceiling, launch, or a throw building the
+    /// call) does NOT drop the claim - it is RETAINED at the head, counted
+    /// (disarm_retained_), and re-driven by the next same-key event (an attach on
+    /// the key, which then queues its own arm behind it) or by
+    /// redrive_retained_disarms(); only Stopped drops it, counted, via
+    /// fail_all_claims_locked. No-op if the claim is no longer the Queued head
+    /// (another caller, or a prior retry, is already driving it, or it already
+    /// completed). Never called with either runtime lock held.
     void submit_disarm_off_lock(const std::shared_ptr<KeyClaim>& claim);
+    /// The submit() completion callback for a DISARM claim, on the detached worker
+    /// (rung 9c PR-2 Unit 3): pop it and dispatch the next head ("refill" - an arm
+    /// queued behind it) on a real completion; on a worker throw, retain it exactly
+    /// like a synchronous admission refusal (Astra opine review Blocker 4: "Record
+    /// actual worker failure; retain for bounded retry rather than pretend
+    /// admission failed"), just logged distinctly. Only WorkerThrew is reachable
+    /// here - submit() has no deadline (so no Timeout), and every other refusal is
+    /// synchronous, handled in submit_disarm_off_lock above before a worker ever
+    /// launches. Unlike on_arm_complete there is no commit and no compensation to
+    /// run - a disarm's only "verdict" is done-or-retry.
+    void on_disarm_complete(const std::string& key, const std::shared_ptr<KeyClaim>& claim,
+                            IoResult<int>&& r) noexcept;
     /// registry_mu_ held. If `key`'s fifo has a Queued head, flip it to Dispatching and
     /// return it for the caller to dispatch off-lock; else nullptr.
     std::shared_ptr<KeyClaim> try_dispatch_head_locked(const std::string& key);
