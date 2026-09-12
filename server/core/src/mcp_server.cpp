@@ -852,9 +852,12 @@ static const ToolDef kTools[] = {
      "different value than the Guard's current mode is rejected; create a new Guard for a "
      "different Watch/Enforce posture instead. Omitting all of spark/assertion/remediation "
      "keeps the existing structured spec and applies only the supplied metadata fields "
-     "(name/enabled/severity/os_target/scope_expr/yaml_source). version is bumped by the "
-     "store on every successful update — not caller-supplied. Fleet-wide; requires "
-     "GuaranteedState:Write, denied outright to a service-scoped API token.",
+     "(name/enabled/severity/os_target/scope_expr/yaml_source). version is bumped "
+     "server-side, not caller-supplied — but there is no optimistic-concurrency check "
+     "against a concurrent writer today (last write wins silently, tracked #4303). "
+     "Marked Destructive but NOT currently approval-gated despite that (tracked #4305) — "
+     "do not assume a confirmation step exists. Fleet-wide; requires GuaranteedState:Write, "
+     "denied outright to a service-scoped API token.",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
@@ -9923,10 +9926,24 @@ McpServer::HandlerFn McpServer::build_handler(
                 // after the first read, so a degrade in any of the other three
                 // still surfaced a 500 the audit had already called successful.
                 bool store_degraded = false;
+                bool pii_access_began = false;
                 auto rollup = guardian_device_compliance_rollup(
                     *baseline_store_, *guaranteed_state_store, baseline_name, agent_id,
-                    &store_degraded);
+                    &store_degraded, &pii_access_began);
                 if (store_degraded) {
+                    // Scoped re-review fix: a degrade in the baseline lookup itself is
+                    // genuinely pre-PII (no audit owed, same posture as before), but a
+                    // degrade in any of the other three reads happens only after this
+                    // agent's per-baseline PII has already been touched - that MUST
+                    // still be audited as "failure", never silently dropped (a
+                    // completed PII read leaving zero audit trail is worse than the
+                    // mislabeled-"success" bug this whole extraction fixed).
+                    if (pii_access_began) {
+                        (void)yuzu::server::detail::try_persist_audit(
+                            audit_fn, req, "guardian.device.view", "failure", "Agent", agent_id,
+                            "baseline '" + baseline_name +
+                                "' per-device guard status via MCP - store degraded");
+                    }
                     res.set_content(
                         a4_error(kInternalError, "guaranteed-state store degraded", {},
                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),

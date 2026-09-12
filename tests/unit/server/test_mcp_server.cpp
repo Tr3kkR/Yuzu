@@ -4374,6 +4374,111 @@ TEST_CASE("MCP Guardian: get_guardian_device_compliance an unknown baseline "
     CHECK(ts.audit_log.back() == "guardian.device.view|not_found");
 }
 
+// ── #2146 Batch B1 scoped re-review fix: guardian_device_compliance_rollup's
+// pii_access_began distinction ──────────────────────────────────────────────
+//
+// The audit-timing fix (closing the "audits success before all four reads
+// complete" gap) initially introduced its own regression: a degrade in ANY
+// of the four reads returned nullopt+store_degraded with no way to tell
+// whether per-agent PII had already been touched, so both handlers skipped
+// auditing entirely on every degrade - worse than the original mislabeled-
+// "success" bug for the three reads that only run AFTER a real baseline is
+// found. These two tests pin the fix: a pre-PII (baseline lookup itself)
+// degrade stays unaudited (matches the pre-existing "no PII was looked up
+// yet" posture); a post-PII (any of the other three reads) degrade MUST be
+// audited as "failure", matching guardian_agent_status_rollup's sibling
+// posture.
+
+TEST_CASE("MCP Guardian: get_guardian_device_compliance leaves NO audit row on a "
+          "pre-PII baseline-lookup degrade",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+
+    // Degrade BEFORE any lookup - the baseline itself can never be found.
+    {
+        auto lease = bl_pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA baseline_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":219,"params":{"name":"get_guardian_device_compliance",)"
+        R"("arguments":{"baseline":"ServiceNow Compliance","agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("degraded") != std::string::npos);
+    CHECK(ts.audit_log.empty()); // no PII was looked up - no audit row owed
+}
+
+TEST_CASE("MCP Guardian: get_guardian_device_compliance audits FAILURE on a "
+          "post-baseline-found degrade (PII already touched)",
+          "[pg][mcp][integration][guardian]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    mcp_seed_rule(store, "r1", "guard-one");
+
+    YUZU_REQUIRE_PG_DB_TPL(bl_db, mcp_guardian_baseline_pg_tpl);
+    yuzu::server::pg::PgPool bl_pool{{.conninfo = bl_db.dsn(), .size = 4}};
+    BaselineStore baseline_store(bl_pool);
+    Baseline b;
+    b.name = "ServiceNow Compliance";
+    auto bid = baseline_store.create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(baseline_store.set_members(*bid, {"r1"}).has_value());
+    Baseline deployed = *baseline_store.get_baseline(*bid);
+    deployed.deployed_snapshot = nlohmann::json(std::vector<std::string>{"r1"}).dump();
+    deployed.lifecycle = kBaselineDeployed;
+    REQUIRE(baseline_store.update_baseline(deployed).has_value());
+
+    // Degrade AFTER the baseline is real and deployed - the baseline lookup
+    // and deployed_member_rule_ids (both BaselineStore) still succeed;
+    // rule_names_for/agent_rule_statuses_for_agent (GuaranteedStateStore) fail.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA guaranteed_state_store CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+
+    McpTestServer ts;
+    ts.guaranteed_state_store_for_test = &store;
+    ts.baseline_store_for_test = &baseline_store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string&) -> bool { return true; };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":220,"params":{"name":"get_guardian_device_compliance",)"
+        R"("arguments":{"baseline":"ServiceNow Compliance","agent_id":"WS-1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("degraded") != std::string::npos);
+    REQUIRE_FALSE(ts.audit_log.empty());
+    CHECK(ts.audit_log.back() == "guardian.device.view|failure");
+}
+
 TEST_CASE("MCP Guardian: get_guardian_device_compliance denies an out-of-scope device",
           "[mcp][integration][guardian][security]") {
     McpTestServer ts; // no store wired: proves the gate short-circuits first

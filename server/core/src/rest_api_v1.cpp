@@ -13801,15 +13801,42 @@ void RestApiV1::register_routes(
             // first read, so a degrade in any of the other three still surfaced a
             // 503 the audit had already called successful.
             bool store_degraded = false;
+            bool pii_access_began = false;
             auto rollup = guardian_device_compliance_rollup(*baseline_store, *guaranteed_state_store,
                                                              baseline_name, agent_id,
-                                                             &store_degraded);
+                                                             &store_degraded, &pii_access_began);
             if (store_degraded) {
                 // Store FAULT (DB locked/corrupt) in one of the four reads, NOT a
                 // genuine miss — return a retryable 503, not the 404 a CMDB would
                 // read as "no such baseline → delete this CI" on a transient fault
-                // (UP-13/sre-2). Pre-audit: no PII was looked up, and a
-                // name-independent fault leaks no baseline existence (no enumeration).
+                // (UP-13/sre-2). A fault confined to the baseline lookup itself is
+                // genuinely pre-audit (no PII was looked up, and a name-independent
+                // fault leaks no baseline existence — no enumeration). A fault in any
+                // of the other three reads happens only once this agent's per-baseline
+                // PII has already been touched, so it MUST still be audited as
+                // "failure" (scoped re-review fix — a completed PII read leaving zero
+                // audit trail is worse than the mislabeled-"success" bug this whole
+                // extraction fixed). Gate 6 compliance fix: routed through the SAME
+                // detail::emit_behavioral_audit kernel every behavioral-PII route on
+                // this page uses (device-pages routed concern - never a raw inline
+                // audit_fn call on a PII route), matching this route's own
+                // GET .../agents/{agent_id}/rules sibling exactly - a persist failure
+                // here fails closed with its OWN 503, superseding the store-degraded
+                // message, so an audit outage is never masked as an ordinary data fault.
+                if (pii_access_began &&
+                    !detail::emit_behavioral_audit(audit_fn, req, res, "guardian.device.view",
+                                                   "failure", "Agent", agent_id,
+                                                   "baseline '" + baseline_name +
+                                                       "' per-device guard status via REST - "
+                                                       "store degraded")) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::error_json_a4(503, "audit subsystem unavailable; refusing to "
+                                                   "serve device data without durable evidence",
+                                              cid, 5000, "retry the request"),
+                        "application/json");
+                    return;
+                }
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid,
                                                       {.retry_after_ms = 5000}),

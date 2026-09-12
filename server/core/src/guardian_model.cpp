@@ -99,11 +99,15 @@ guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent
 std::optional<GuardianDeviceComplianceRollup>
 guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
                                   const std::string& baseline_name, const std::string& agent_id,
-                                  bool* store_degraded) {
+                                  bool* store_degraded, bool* pii_access_began) {
     *store_degraded = false;
+    *pii_access_began = false;
     bool baseline_store_ok = true;
     const auto baseline = baseline_store.get_baseline_by_name(baseline_name, &baseline_store_ok);
     if (!baseline_store_ok) {
+        // Pre-PII fault: no per-agent data has been touched yet, same
+        // "no PII was looked up yet" posture this route has always had -
+        // pii_access_began stays false, caller owes no audit row.
         *store_degraded = true;
         return std::nullopt;
     }
@@ -113,6 +117,9 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
     // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
     // read must never render as an empty guard_ids that flows through as a
     // false-clean "0 guards, fully compliant" report for this baseline.
+    // The baseline itself was found, so this and every read below counts as
+    // having begun accessing this agent's per-baseline standing.
+    *pii_access_began = true;
     auto guard_ids_result = baseline_store.deployed_member_rule_ids(baseline->baseline_id);
     if (!guard_ids_result) {
         *store_degraded = true;
@@ -123,6 +130,10 @@ guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedState
     // ADR-0038 catastrophic-read set: this route's compliance counts are an
     // enforce-gate/census consumer - a degrade must never render as a silent
     // "0 guards reported" that would misreport the device as compliant.
+    // agent_rule_statuses_for_agent is the behavioral-PII read proper - by
+    // the time either of these two calls happens, the PII access has
+    // already executed regardless of whether it degraded, so a failure
+    // here MUST still be audited (pii_access_began is already true above).
     auto rule_names_result = store.rule_names_for(guard_ids);
     auto statuses_result = store.agent_rule_statuses_for_agent(agent_id);
     if (!rule_names_result || !statuses_result) {

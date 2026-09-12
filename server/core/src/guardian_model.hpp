@@ -192,9 +192,24 @@ struct GuardianDeviceComplianceRollup {
 /// 0/compliant result (ADR-0038/ADR-0055 catastrophic-read set) - this
 /// function's whole job is making that the only way to call these four
 /// reads.
+///
+/// `pii_access_began` is a SECOND required out-param distinguishing WHICH
+/// read degraded, because the audit obligation differs: the baseline lookup
+/// (read 1) is genuinely pre-audit (no per-agent PII has been touched yet,
+/// same "no PII was looked up yet" posture this route has always had), but
+/// the other three reads only run once a real baseline was found - by then
+/// `agent_rule_statuses_for_agent` (a behavioral-PII read) has already
+/// executed, so a degrade there MUST still be audited as "failure"
+/// (matching `guardian_agent_status_rollup`'s sibling posture - over-audit
+/// rather than silently drop evidence of a completed PII access). Set false
+/// only when `*store_degraded` is also false, or when the degrade was the
+/// baseline lookup itself; true for any degrade in the remaining three
+/// reads. The caller must audit "failure" when `*store_degraded &&
+/// *pii_access_began`, and skip the audit entirely only when
+/// `*store_degraded && !*pii_access_began`.
 std::optional<GuardianDeviceComplianceRollup>
 guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
                                   const std::string& baseline_name, const std::string& agent_id,
-                                  bool* store_degraded);
+                                  bool* store_degraded, bool* pii_access_began);
 
 } // namespace yuzu::server
