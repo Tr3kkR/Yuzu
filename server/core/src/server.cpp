@@ -166,6 +166,7 @@
 #include "dex_perf_rules.hpp"
 #include "dex_routes.hpp"
 #include "network_api_local.hpp" // ADR-0031 WS-A4: core-only /network seam factory
+#include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
 #include "inventory_ci_join.hpp"
@@ -15432,36 +15433,17 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
-        app_perf_providers.cohort =
-            [this](std::string_view group_id, std::string_view app, std::string_view baseline,
-                   std::string_view candidate, int window_days) -> std::optional<CohortRead> {
-            if (!app_perf_cohort_reader_ || !mgmt_group_store_)
-                return std::nullopt;
-            // Resolve members (one bounded read, lease released), THEN read their raw
-            // B1 rows (a second bounded read) — never a lease held across the other
-            // (ADR-0012 §1). The /auto VERIFY compare engine pairs these per machine.
-            const auto members = mgmt_group_store_->get_members(std::string(group_id));
-            std::vector<std::string> agent_ids;
-            agent_ids.reserve(members.size());
-            for (const auto& m : members)
-                agent_ids.push_back(m.agent_id);
-            CohortRead out;
-            out.member_count = static_cast<std::int64_t>(agent_ids.size());
-            if (agent_ids.empty())
-                return out; // empty/unknown group → member_count 0, no rows (not a degrade)
-            bool truncated = false;
-            auto rows = app_perf_cohort_reader_->get_cohort_rows(agent_ids, app, baseline, candidate,
-                                                                 window_days, truncated);
-            if (!rows)
-                return std::nullopt; // AUTHORITATIVE degrade (the row read failed)
-            out.rows = std::move(*rows);
-            out.truncated = truncated;
-            return out;
-        };
-        // COPY the cohort provider (std::function is copyable) so the /auto VERIFY
-        // routes keep a live seam even after app_perf_providers is moved into the
-        // REST + MCP registrars below.
-        AppPerfCohortFn verify_cohort_fn = app_perf_providers.cohort;
+        // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
+        // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
+        // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
+        // dashboard fragments, the REST GET /api/v1/dex/perf/compare twin and the
+        // MCP compare_app_perf_versions tool, so all three can never disagree
+        // (same pattern as `network_api` above/below). `mgmt_group_store_` fails
+        // startup CLOSED (ADR-0012 §1) so it is always live here;
+        // `app_perf_cohort_reader_` is nullable until its own Postgres pool is
+        // ready, degrading every `compare()` call to the AUTHORITATIVE nullopt.
+        auto verify_api =
+            make_local_verify_api(*mgmt_group_store_, app_perf_cohort_reader_.get());
         // The dashboard scope-selector's group list (id + name only). NO per-group
         // member count: that would be an N+1 get_members() over the store on every
         // render (UP-7); the selector needs names, not counts.
@@ -15976,13 +15958,15 @@ private:
             audit_fn, preflight_run_store_.get());
 
         // VerifyRoutes — /auto Stage 3 VERIFY: the cohort-paired before/after
-        // app-perf evidence (UAT non-functional). Reads the shipped B1 store via the
-        // COPIED cohort provider; the pure compare engine pairs each machine. The
-        // aggregate read is an operational `dex.app_perf.compare` audit (set-and-
-        // proceed — the accountability that stands in for the absent floor); the
-        // per-machine drill is the audited PII surface. EVIDENTIAL only — no verdict,
-        // NO cohort floor (real canaries are 2-3 devices). Shares the /auto auth +
-        // group list with PreflightRoutes.
+        // app-perf evidence (UAT non-functional). Reads via the shared VerifyApi
+        // seam (ADR-0031 WS-A4 #4250) — the SAME instance the REST + MCP compare
+        // twins below use, so all three surfaces can never disagree; the pure
+        // compare engine pairs each machine. The aggregate read is an operational
+        // `dex.app_perf.compare` audit (set-and-proceed — the accountability that
+        // stands in for the absent floor); the per-machine drill is the audited
+        // PII surface. EVIDENTIAL only — no verdict, NO cohort floor (real
+        // canaries are 2-3 devices). Shares the /auto auth + group list with
+        // PreflightRoutes.
         verify_routes_ = std::make_unique<VerifyRoutes>();
         verify_routes_->register_routes(
             *web_server_, auth_fn, perm_fn,
@@ -15993,7 +15977,7 @@ private:
                         out.emplace_back(g.id, g.name);
                 return out;
             },
-            std::move(verify_cohort_fn), audit_fn);
+            audit_fn, verify_api);
 
         // DeploymentRoutes — the /auto DEPLOY stage. As soon as a pre-flight run has
         // a go-cohort (mid-run, no completion required), stages + executes an
@@ -17522,7 +17506,11 @@ private:
             // visible_set_fn's permission-agnostic join would leak a
             // multi-role operator's OTHER groups' device ids into GET
             // /api/v1/dex/app / GET /api/v1/dex/overview.
-            dex_visible_fn);
+            dex_visible_fn,
+            // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
+            // above and the MCP compare_app_perf_versions tool below use, so
+            // all three GET /api/v1/dex/perf/compare siblings never disagree.
+            verify_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -17935,7 +17923,12 @@ private:
                        std::optional<int> validity_days,
                        const std::string& issued_by) -> std::expected<CodeSigningIssuance, std::string> {
                     return issue_code_signing_leaf(csr_pem, label, validity_days, issued_by, "mcp");
-                });
+                },
+                // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
+                // and the REST GET /api/v1/dex/perf/compare twin use, so all
+                // three compare_app_perf_versions/compare siblings never
+                // disagree.
+                verify_api);
         }
 
         // -- Listen -----------------------------------------------------------

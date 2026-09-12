@@ -66,6 +66,14 @@ EXPECTED_FAMILIES = {
             "server/core/src/network_api_local.hpp",
         ],
     },
+    "verify": {
+        "tus": [
+            "server/core/src/verify_routes.cpp",
+            "server/core/src/verify_ui.cpp",
+            "server/core/src/verify_api.hpp",
+            "server/core/src/verify_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",

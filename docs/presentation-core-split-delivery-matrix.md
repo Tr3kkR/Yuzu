@@ -7,7 +7,7 @@ tracks *what ships, in what order, who reviews it, and how we know it's done*. *
 with the ADRs, the ADR wins; on delivery status, this matrix is the source of truth.** The `/split`
 skill is a pointer to both and loses to both.
 
-**Verified against the tree 2026-09-11** (`origin/dev` @ `f9d1275c0`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2; the `network` family landed as the FIRST per-family in-process API seam — `NetworkApi`/`network_api.{hpp,cpp}` + `scripts/ci/check-seam-closure.py` — see the WS-A4 row; #4249 then split that seam's factory header into `network_api.hpp` (abstract) + `network_api_local.hpp` (core-only), with the boundary between them CI-enforced, cutting the two-header shape the remaining families copy). Re-stamp
+**Verified against the tree 2026-09-11** (`origin/dev` @ `0cf4d2d88`; WS-0 merged #4161, INV-31-4 global test found already-shipped #842/#3991/#3992 — WS-A4 re-scoped; the three-way lexical caveat re-verified against `check-api-parity.py` and `HttplibRouteSink`/`test_openapi_spec_completeness.cpp` in review round 2; the `network` family landed as the FIRST per-family in-process API seam — `NetworkApi`/`network_api.{hpp,cpp}` + `scripts/ci/check-seam-closure.py` — see the WS-A4 row; #4249 then split that seam's factory header into `network_api.hpp` (abstract) + `network_api_local.hpp` (core-only), with the boundary between them CI-enforced, cutting the two-header shape the remaining families copy; #4250 then applied that template to the SECOND family, `verify` (`/auto` VERIFY app-perf compare — `VerifyApi`, all 3 consumers routed, seam-closure now enforces 2 families) — **MERGED to dev (PR #4292)**; **WS-B1 Drogon canary added on `feat/split-b1-drogon-canary` — Linux build+link+run proven, `#375` triplet/meson branch untouched, Windows MSVC static leg deferred to CI**). Re-stamp
 this line whenever the table is revised — a matrix from a stale checkout is worse than none, and the
 current-state claims below were wrong in the first draft because they were copied from stale ADR status
 columns. Grep the tree, don't trust a doc.
@@ -49,7 +49,8 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   *per-family* seam enforcement (gates WS-B2) for the remaining families not yet done, and the handler→API seam
   refactor — do NOT rebuild the global test.
 - **The FIRST per-family seam landed: `network` (2026-09-10), then split into the two-header template
-  (2026-09-11, #4249).** The seam is now TWO headers, not one: `network_api.hpp` is the ABSTRACT
+  (2026-09-11, #4249); **`verify` followed as the SECOND family** (#4250, `/auto` VERIFY app-perf
+  compare — `VerifyApi`, all 3 consumers routed).** The seam is now TWO headers, not one: `network_api.hpp` is the ABSTRACT
   `NetworkApi` interface + `NetDeviceQuery` — a presentation TU's whole view of the family, with ZERO
   store-type references, not even a forward-declaration; `network_api_local.hpp` is CORE-ONLY — it holds
   the store-backed factory `make_local_network_api(...)`, the store forward-decls the factory signature
@@ -80,7 +81,7 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   from its own include closure, so it never self-matches — and enforcing it closes the gap for free.)
   The presentation-visible CONTRACT is a PAIR that moves together at WS-B2: `<family>_api.hpp` plus the
   family's pure model header (`network_perf_model.hpp` here); an impure model header breaks the abstract
-  header even when the abstract header itself is clean, so families copy the pair. (2) the new pattern is a
+  header even when the abstract header itself is clean, so families copy the pair. **`verify` (#4250) is the first family that had to CONSTRUCT its pure half rather than inherit it:** unlike `network` (whose `network_perf_model.hpp` already held everything the seam needed), `verify`'s pure model header (`app_perf_compare.hpp`) did not — so #4250 (a) relocated the shared validator `app_perf_param_valid`/`kAppPerfParamCap` OUT of the store-coupled `dex_app_perf_model.hpp` into it (definition unmoved, re-exposed transitively so no existing consumer's include changed), and (b) defined `VerifyRoutes::AuditFn` LOCALLY rather than alias `DexRoutes::AuditFn`, because `dex_routes.hpp` transitively reaches the B1 store headers. The lesson generalises: the pair a family copies is *the abstract api header + a pure model header*, and any pure helper a presentation TU needs (validators, caps, audit-fn shapes) must be made to live in the pure header, moved there if it currently sits in a store-coupled one. (2) the new pattern is a
   NAMING CONVENTION, not a structural one — only a header literally named `*_api_local.hpp` is caught, so
   a family that names its factory header differently (e.g. `<family>_factory.hpp`) is invisible to the
   gate; the template therefore PRESCRIBES the `<family>_api.hpp` (abstract) + `<family>_api_local.hpp`
@@ -105,6 +106,54 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   (and siblings') audit call becomes redundant with core's REST-side audit and must be REMOVED there, not
   duplicated — a double row per view would corrupt works-council countability. The relocation is
   handler→API-at-cutover, never `*_ui.cpp`→anywhere.
+- **WS-B1 Drogon canary — Linux green; the Windows MSVC static-link risk, stated concretely so a CI
+  result is interpretable.** Drogon 1.9.12 (trantor 1.5.26, jsoncpp 1.9.6) is at the pinned
+  `builtin-baseline`, added UNCONDITIONALLY (default features only). On Windows the base
+  `triplets/x64-windows.cmake` linkage is `dynamic`, and drogon/trantor/jsoncpp/brotli are NOT in the
+  `#375` static-override list (`abseil|grpc|protobuf|upb|re2|c-ares|utf8-range`), so they build as
+  ordinary DLLs + import libs — the SAME shape as sqlite3/libxml2 (which use `method:'cmake'` on
+  Windows) and libpq (hand-wired `find_library` on Windows — same dynamic-DLL shape), none hitting
+  LNK2038. So the canary uses the uniform cmake-dep pattern, not the
+  hand-wired static branch. **What the canary proves, and its two Windows caveats (corrected per the WS-B1 governance round):**
+  it proves Drogon **links and loads** into the matrix. It is registered as a meson test so CI *runs* it
+  (not just builds it), surfacing a load-time failure. Its body forces `drogon::app()` (the inline forwarder to the out-of-line `HttpAppFramework::instance()`) and marshals **no
+  STL across the DLL boundary**, so it does NOT by itself validate the C++ ABI hazard below — that, and
+  Drogon+gRPC coexistence, are WS-B2 concerns. (1) **Runtime CRT / `_ITERATOR_DEBUG_LEVEL` mismatch (NOT
+  a link-time LNK2038).** On Windows Drogon is a dynamic DLL; an MSVC import lib carries no
+  iterator-debug/`detect_mismatch` records (those live in the DLL's objects), so the debug leg **links
+  green**. The `#375`-era concern was that meson's cmake translator read `IMPORTED_LOCATION_RELEASE` even for
+  `--buildtype=debug`; that premise is NOT re-verified against the pinned Meson 1.11.1, whose
+  translator (`mesonbuild/cmake/tracetargets.py`) selects `cfg='DEBUG'` and prefers
+  `IMPORTED_IMPLIB_DEBUG` when the target exports a DEBUG config (Drogon's does) — so a `/MDd` debug
+  exe loading a `/MD` release DLL is a POSSIBLE-but-unconfirmed mismatch that
+  could bite at **runtime** when STL crosses the boundary — but this is a HAZARD TO VALIDATE, not a
+  proven outcome: the repo's own debug-build DLL selection may already resolve it. Meson picks
+  the debug-config Drogon import lib (`debug/lib/drogon.lib`) for the DIRECT dependency on a debug build, `ci.yml` prepends
+  `vcpkg_installed/x64-windows/debug/bin` to PATH before the Windows debug `server-checks` step, and
+  `deploy_build_dlls.py` selects the matching-config DLL dir — so the loader may resolve the debug DLL
+  by name regardless of what the import lib recorded. The open question is whether the debug/release
+  Drogon DLLs share a filename (no `DEBUG_POSTFIX`). If they share a name, PATH order resolves the debug
+  one; if they differ, the outcome depends on what ends up beside the exe — `deploy_build_dlls.py`'s
+  secondary gap-fill can copy the other config's differently-named DLL, which could then LOAD (a silent
+  mismatch) rather than fail. Either way the categorical "loads the release DLL" claim is unproven. A future STL-marshalling canary + a
+  `dumpbin`/import-provenance assertion resolve this at WS-B2 before prescribing the `#375` option-D
+  (build-type-conditional import lib) fix — which would not touch the grpc branch. (2) **c-ares double-linkage (LNK2005) — the canary does
+  NOT and CANNOT exercise this.** It links drogon/trantor only, never gRPC, so there is a single
+  (static, trantor-internal) c-ares copy. The two-copy LNK2005 hazard needs gRPC + trantor in one link,
+  i.e. the presentation binary linked beside the core gRPC stack — a WS-B2 concern, and per ADR-0031 the
+  two live in *separate binaries* so they may never co-link. Linux resolves the `$<LINK_ONLY:...>`-dropped
+  transitive set explicitly (OpenSSL/c-ares/zlib/uuid/brotli via pkg-config); Windows dynamic DLLs resolve
+  their own deps at load, so that append list is best-effort there. A Windows link/load red here is the
+  gate working — report it, do not paper over it. **The Windows PR leg is the ONLY leg that exercises the
+  dynamic-DLL LOAD assertion** (Linux builds+links only); it is skipped when the Wee Tam pool is
+  unhealthy, so branch protection must treat a skipped Windows context as NOT-pass, and a CI presence
+  tripwire should guard the canary from silently ceasing to run (#4296). **WS-B2 follow-ups surfaced by this round:** feature-gate
+  Drogon to a server vcpkg feature (agent/ASan/cross legs currently build it unused; #4295), a
+  STL-marshalling canary + a `dumpbin`/`ldd` import-provenance assertion, the Drogon+gRPC coexistence
+  link test, and adding Drogon/trantor/jsoncpp to `NOTICE`'s third-party attribution list once a shipped
+  binary links them. (Drogon's transitive tree already appears in the release SBOM today — `release.yml`'s Syft
+  scan covers `path: .` incl. `vcpkg_installed`, per this PR's changelog fragment — so SBOM pickup is
+  NOT a WS-B2 deferral.)
 
 ---
 
@@ -191,10 +240,10 @@ Columns: **WS · Delivers · Axis · Owner · Depends · Gates cutover? · Revie
 | **WS-A2r** | In-process public-API contracts, **read/command paths** (step 2, read half) | A | THIS | WS-A1 | — | architect | planned |
 | **WS-A2a** | In-process **admission / grant / finalisation-receipt** contracts (step 2, admission half) — **under the standing merge-gate** | A | THIS | WS-A1, WS-A6(c/d/h) | — | architect + security-guardian | blocked on interlock |
 | **WS-A3** | Capability parity — the ~40–60 missing public REST+MCP capabilities, **per family** (devices, settings, `/auto`, …) | A | THIS (ADR-0031 §3) | WS-0 | feeds A4 per-family | consistency-auditor + architect | planned |
-| **WS-A4** | **Logical seam enforcement + INV-31-4 contract test** — handlers/renderers call the API, never a store pointer; build fails on any registered route absent from the published OpenAPI; **at the WS-B2 cutover, remove the presentation-side handler's behavioural-PII audit call once core's REST-side audit covers the same view (audit continuity — not a `*_ui.cpp` relocation; see the current-state bullet above)**. **⚠️ The GLOBAL drift test (interlock-(j)'s testability half only, LEXICAL — see the current-state caveat above) SHIPPED out-of-band under #842/#3991/#3992** — see the "INV-31-4 global contract test EXISTS" current-state bullet above for detail. Interlock (j)'s **generated-projection** half (#2678) stays RED — **currently unscheduled, tracked in ADR-0032 (j), owned by no workstream row** (only (j)'s testability half was ever in WS-A4's scope). **The FIRST per-family in-process API seam landed on `network`** (`NetworkApi`, all 3 consumers routed, `scripts/ci/check-seam-closure.py` piloted — see the current-state bullet above for the pattern + honest enforcement scope + the `available_keys` A1-parity fix it surfaced and closed). **The template is now the two-header shape** (`<family>_api.hpp` abstract + `<family>_api_local.hpp` core-only factory, boundary CI-enforced, #4249) — see the current-state bullet above. **REMAINING for WS-A4:** the same seam on the other families (gates WS-B2) · handler→API seam refactor generally · the audit-removal-at-cutover step (not yet reached — no family has cut over). | A | THIS | WS-A2r, WS-A3 (that family) | **P (per family)** | architect + security-guardian + cpp-safety | **partial** — global drift test done (#842); ONE family (`network`) has the per-family seam done as the pilot; the remaining families + the general seam refactor + the cutover-time audit removal remain |
+| **WS-A4** | **Logical seam enforcement + INV-31-4 contract test** — handlers/renderers call the API, never a store pointer; build fails on any registered route absent from the published OpenAPI; **at the WS-B2 cutover, remove the presentation-side handler's behavioural-PII audit call once core's REST-side audit covers the same view (audit continuity — not a `*_ui.cpp` relocation; see the current-state bullet above)**. **⚠️ The GLOBAL drift test (interlock-(j)'s testability half only, LEXICAL — see the current-state caveat above) SHIPPED out-of-band under #842/#3991/#3992** — see the "INV-31-4 global contract test EXISTS" current-state bullet above for detail. Interlock (j)'s **generated-projection** half (#2678) stays RED — **currently unscheduled, tracked in ADR-0032 (j), owned by no workstream row** (only (j)'s testability half was ever in WS-A4's scope). **The FIRST per-family in-process API seam landed on `network`** (`NetworkApi`, all 3 consumers routed, `scripts/ci/check-seam-closure.py` piloted — see the current-state bullet above for the pattern + honest enforcement scope + the `available_keys` A1-parity fix it surfaced and closed). **The template is now the two-header shape** (`<family>_api.hpp` abstract + `<family>_api_local.hpp` core-only factory, boundary CI-enforced, #4249) — see the current-state bullet above. **REMAINING for WS-A4:** the same seam on the other families (gates WS-B2) · handler→API seam refactor generally · the audit-removal-at-cutover step (not yet reached — no family has cut over). | A | THIS | WS-A2r, WS-A3 (that family) | **P (per family)** | architect + security-guardian + cpp-safety | **partial** — global drift test done (#842); TWO families (`network` pilot + `verify`, #4250) have the per-family seam done; the remaining families + the general seam refactor + the cutover-time audit removal remain |
 | **WS-A5** | Input confinement — **SHIPPED** (`authorize_list_read` / `require_list_read` live; #1714/#1715/#1716 CLOSED). Residual: **#2665** (additive vs interlock-(b) deny-precedence) + `evaluate_as_operator` seam (absent) | A | /auth | WS-0 | **E** | security-guardian | shipped; #2665 open |
 | **WS-A6** | Admission/grant/audit substrate — (c) D12 audit with indexed `use_case_run_id`, (d) P7 release-log store, (h) capability-declaration registry with full credential fields. (a) shipped. **Under merge-gate** | A | /auth + exec-plan | WS-0, WS-A5 | **E** | security-guardian + architect + docs-writer | (a) shipped; c/d/h absent |
-| **WS-B1** | Drogon build canary (G10) — Drogon linked in the Meson/vcpkg matrix incl. MSVC static linkage | B | THIS | WS-0 | **P** | build-ci + cross-platform | planned |
+| **WS-B1** | Drogon build canary (G10) — Drogon linked into the Meson/vcpkg matrix, **structurally isolated** from the `#375` MSVC static grpc/abseil stack (Drogon is not in the static-override list and is a dynamic DLL on Windows; coexistence is by construction, with the Windows leg exercised in CI). Landed as `yuzu_drogon_canary` (`server/core/src/drogon_canary_main.cpp`, sibling of `yuzu_pg_canary`), forcing the out-of-line `HttpAppFramework::instance()` symbol via the inline `drogon::app()` forwarder; `drogon` added UNCONDITIONALLY to `vcpkg.json` (default features only — no orm/postgres/sqlite3; ADR-0031 §5), transitive trantor/jsoncpp/brotli/c-ares pulled by the port. `#375` grpc/protobuf/abseil triplet + hand-wired meson branch UNTOUCHED — drogon is not in the static-override list, so it uses the sqlite3/libxml2 dynamic-DLL cmake-dep pattern. | B | THIS | WS-0 | **P** | build-ci + cross-platform | **Linux green** (build+link+run proven locally; meson's cmake translator drops trantor/drogon `$<LINK_ONLY:...>` transitive deps, appended explicitly — OpenSSL/c-ares/zlib/uuid/brotli); **Windows MSVC static leg is CI's to exercise** — a Windows failure is the canary doing its job (report as finding), see the WS-B1 risk note below |
 | **WS-B2** | Drogon **strangler port + cutover plane** — presentation binary beside httplib; **ingress routing/steering** between the two; per-family port (async + repoint→core API + SSE rewrite + per-family seam+contract); **long-lived stream drain**; **per-family rollback**. First live cutover behind the gate | B | THIS | WS-B1, WS-A2r, WS-A4(family) | (the gate) | architect + cpp-safety + cross-platform | planned |
 | **WS-B3** | State relocation — (a) sessions inherit HA durable-PG; (b) MCP replay ring → **durable core outbox** | B | (a) HA WS-1 / (b) HA WS-2b | WS-0; HA WS-1/WS-2 | **P** | authdb + security-guardian | **(a) DONE** (HA WS-1); (b) outstanding (HA WS-2b) |
 | **WS-B4** | Cross-process event spine — **rides the HA WS-2a durable `event_outbox`** (not a second transport); record the ADR-0032 Decision 9 G1 channel choice (per-subscriber vs multiplexed-with-TCB-admission) | B | THIS + HA WS-2a | HA WS-2a, WS-A2r | **P** | architect + sre + security-guardian | HA WS-2a-1 done (table); 2a-2 NOTIFY/cursor-poll outstanding |

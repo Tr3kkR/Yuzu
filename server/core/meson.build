@@ -513,6 +513,7 @@ yuzu_server_core_lib = static_library(
     'src/preflight_runner.cpp',
     'src/verify_routes.cpp',
     'src/verify_ui.cpp',
+    'src/verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
     'src/deployment_routes.cpp',
     'src/deployment_ui.cpp',
     'src/deployment_run_store.cpp',
@@ -665,3 +666,110 @@ executable(
   dependencies: [libpq_dep],
   install: false,
 )
+
+# Drogon build canary (WS-B1 / ADR-0031 Gate G10). Proves Drogon links into the
+# existing Meson/vcpkg matrix — Windows MSVC static leg included — WITHOUT
+# disturbing the #375 grpc/protobuf/abseil static-linkage config. Sibling of
+# yuzu_pg_canary above; server-only (this whole subdir is build_server-gated).
+#
+# Wiring rationale — mirror the sqlite3/libxml2 DYNAMIC-DLL pattern, NOT the
+# grpc/protobuf hand-wired static find_library() branch. Drogon and its
+# transitive deps (trantor, jsoncpp, brotli) are NOT in
+# triplets/x64-windows.cmake's static-linkage override list (scoped to
+# abseil/grpc/protobuf/upb/re2/c-ares/utf8-range only), so on Windows they
+# resolve as ordinary dynamic DLLs + import libs — the same shape as
+# sqlite3/libxml2 (which use method:'cmake' on Windows) and libpq
+# (hand-wired find_library on Windows — same dynamic-DLL shape, see the libpq
+# block in the root meson.build), none of which hits LNK2038. So one uniform cmake dependency() call across every
+# platform, with a pkg-config fallback, is correct here. Do NOT hand-wire this
+# into the Windows find_library() branch: that machinery exists solely for the
+# forced-static #375 stack.
+#
+# Trantor (Drogon's I/O layer) pulls c-ares and OpenSSL. c-ares IS in the #375
+# static-override list (already forced static for grpc), and OpenSSL is our own
+# — Drogon's TLS therefore rides our existing OpenSSL with no feature flag.
+# Default features only (no orm/postgres/sqlite3/...): ADR-0031 Decision 5.
+drogon_dep = dependency('Drogon', method: 'cmake', modules: ['Drogon::Drogon'],
+  required: false, include_type: 'system')
+if not drogon_dep.found()
+  drogon_dep = dependency('drogon', required: true, include_type: 'system')
+endif
+
+# meson's cmake dep translator does NOT evaluate CMake generator expressions,
+# so trantor's transitive link deps — declared as
+# `$<LINK_ONLY:OpenSSL::SSL>;$<LINK_ONLY:OpenSSL::Crypto>;$<LINK_ONLY:c-ares::cares>`
+# in TrantorTargets.cmake — are silently dropped from Drogon::Drogon's closure.
+# On static-link platforms (Linux .a / macOS .a) the final link then fails with
+# undefined OpenSSL EVP_* and c-ares ares_* symbols. Append them explicitly,
+# exactly as libpq_dep appends OpenSSL for the same reason (see the libpq
+# comment in the root meson.build). openssl_dep is already in scope (declared at
+# the top of this file on every platform). c-ares is best-effort via pkg-config
+# (`libcares`): needed at final link on static Linux/macOS; on Windows drogon/
+# trantor are dynamic DLLs that resolve their own deps at load, so a missing
+# libcares.pc there is harmless. Brotli/zlib/uuid are LINK_ONLY-dropped in the
+# same way, and — proven by `nm` on the minimal canary — ARE load-bearing even
+# for this link: the bare drogon::app() path drags in trantor's EventLoop/DNS/
+# TLS plus drogon's Utilities.cc (getUuid / gzip / brotli), so a static-link
+# platform genuinely needs the lot. The presentation binary (WS-B2) will append
+# whatever else its used surface pulls.
+# The dropped transitive set is trantor's (OpenSSL, c-ares) PLUS drogon's own
+# (`$<LINK_ONLY:ZLIB::ZLIB>`, `$<LINK_ONLY:Brotli_lib>`, `$<LINK_ONLY:UUID_lib>`
+# in DrogonTargets.cmake) — libdrogon.a's Utilities.cc (getUuid / gzip / brotli)
+# references all of them, so even the minimal drogon::app() link needs the lot
+# on a static-link platform. All resolve via pkg-config in the vcpkg tree on
+# Linux; each is best-effort (required:false) so the dynamic-DLL Windows leg and
+# macOS (where libuuid is a system framework, not a vcpkg port) don't fail
+# configure on a missing .pc.
+#
+# openssl_dep guard (cross-platform FINDING 2): on Windows the required:false
+# cmake + find_library both-fail path (top of this file) leaves openssl_dep a
+# disabler(). A disabler propagated into a declare_dependency() dependency list
+# SILENTLY disables the executable() that consumes it — the canary would then
+# never build and CI would go green having proven nothing. Guard the append with
+# the same is_disabler()/found() check https_deps uses above; on Windows a
+# dynamic drogon DLL resolves its own OpenSSL at load, so omitting it is correct.
+_drogon_transitive = []
+if not is_disabler(openssl_dep) and openssl_dep.found()
+  _drogon_transitive += openssl_dep
+endif
+foreach _pc : ['libcares', 'zlib', 'uuid', 'libbrotlienc', 'libbrotlidec']
+  _d = dependency(_pc, method: 'pkg-config', required: false, include_type: 'system')
+  if _d.found()
+    _drogon_transitive += _d
+  endif
+endforeach
+drogon_dep = declare_dependency(dependencies: [drogon_dep] + _drogon_transitive)
+
+yuzu_drogon_canary_exe = executable(
+  'yuzu_drogon_canary',
+  files('src/drogon_canary_main.cpp'),
+  dependencies: [drogon_dep],
+  install: false,
+)
+
+# Actually RUN the canary in CI (cross-platform FINDING 1a / unhappy-path): a
+# link alone does not prove the process loads. The main() returns 0 after
+# forcing an out-of-line libdrogon symbol, so running it surfaces a load-time
+# failure (a missing/unresolvable Drogon or transitive DLL on the Windows
+# dynamic leg — precisely the #375-class regression this canary exists to
+# catch) that a pure link step would miss. Suite 'server-checks' because this is
+# a build/link/load structural assertion, not a functional server test — the
+# same suite as the sibling structural checks in tests/meson.build (the pg
+# shard-partition invariant, the mcp-bridge alloc-budget probe). CI executes it
+# on the Windows leg via `--suite server-checks` (ci.yml, where dynamic DLL
+# resolution actually matters) and on the unfiltered nightly ASan/TSan legs;
+# the self-hosted Linux PR/push leg selects server-checks members by name, so
+# there it still builds+links (its primary Linux value) but is not run.
+# Gated on build_tests for consistency with every other registered test
+# (tests/meson.build is only walked under build_tests); the executable itself
+# still builds whenever build_server is set (its Linux link-check value, like
+# the sibling yuzu_pg_canary). CI legs that RUN this (Windows server-checks,
+# nightly ASan/TSan) enable build_tests to invoke `meson test`.
+if build_tests
+  test(
+    'drogon build canary',
+    yuzu_drogon_canary_exe,
+    suite: ['server', 'server-checks'],
+    timeout: 30,
+  )
+endif
