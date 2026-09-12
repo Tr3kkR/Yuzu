@@ -9276,28 +9276,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status
-                if (!result_set_store_) {
-                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
-                                    "application/json");
-                    return;
-                }
-                if (!inventory_store || !inventory_store->is_open()) {
-                    res.set_content(
-                        a4_error(kInternalError, "inventory store not available",
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
-                    return;
-                }
+                // Gate 3 BLOCKING fix (#2146 Batch B2 review), reordered ahead of the store
+                // checks below (a malformed request is a client error regardless of backend
+                // availability, and this ordering makes the fix independently testable
+                // without needing a live inventory_store in the test fixture):
+                // `.value(key, default)` throws nlohmann::json::type_error on a type
+                // mismatch - it does not coerce. MCP input-schema validation is approval-
+                // gated only, so a non-object element or a non-string field reaches this
+                // loop directly from any caller and previously fell through to an uncaught
+                // exception (bare empty-body 500, no A4/JSON-RPC envelope). Validate
+                // explicitly and build the eval request before touching any store.
                 yuzu::server::InventoryEvalRequest eval_req;
                 eval_req.combine = param_str(args, "combine", "all");
                 if (args.contains("conditions") && args["conditions"].is_array()) {
-                    // Gate 3 BLOCKING fix (#2146 Batch B2 review): `.value(key, default)`
-                    // throws nlohmann::json::type_error on a type mismatch - it does not
-                    // coerce. MCP input-schema validation is approval-gated only, so a
-                    // non-object element or a non-string field reaches this loop directly
-                    // from any caller and previously fell through to an uncaught exception
-                    // (bare empty-body 500, no A4/JSON-RPC envelope). Validate explicitly.
                     for (const auto& c : args["conditions"]) {
                         if (!c.is_object()) {
                             res.set_content(
@@ -9318,6 +9309,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         cond.value = field_str("value");
                         eval_req.conditions.push_back(std::move(cond));
                     }
+                }
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!inventory_store || !inventory_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "inventory store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
                 }
                 // #2500-class guard, same shape as rs_run_async's own — a
                 // supplied parent_id must name a parent, never silently

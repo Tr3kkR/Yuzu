@@ -160,6 +160,21 @@ struct AsyncHarness {
             }
             return true;
         };
+        // #2146 Batch B2 review: from-inventory-query moved from a bare perm_fn to the
+        // admit-then-filter fleet_read_fn chokepoint. RestApiV1::FleetReadFn defaults to
+        // empty ({}), and calling an empty std::function throws bad_function_call - this
+        // fake models the same permit_exec-gated denial/admit shape as perm_fn above, so
+        // the two from-inventory-query tests below keep their original meaning rather
+        // than universally 503ing on an unwired gate.
+        RestApiV1::FleetReadFn fleet_read_fn =
+            [](const httplib::Request&, httplib::Response& r, const std::string&,
+               const std::string&) -> yuzu::server::authz::FleetReadGate {
+            if (!permit_exec) {
+                r.status = 403;
+                return {};
+            }
+            return {.admitted = true, .scope = yuzu::server::authz::VisibleSet{}};
+        };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
                                const std::string& detail) -> bool {
@@ -209,7 +224,8 @@ struct AsyncHarness {
                             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr, exec_visible_fn);
+                            /*stream_budget=*/nullptr, exec_visible_fn,
+                            /*list_read_fn=*/{}, fleet_read_fn);
     }
 
     /// Header value from the most recent `post`, "" if absent. Kept so a test

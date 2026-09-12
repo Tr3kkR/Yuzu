@@ -9166,6 +9166,12 @@ void RestApiV1::register_routes(
                       // records to `gate.scope` below — same pattern as
                       // GET /api/v1/inventory/software and this PR's own
                       // preview_scope_targets/scope-preview fix.
+                      if (!fleet_read_fn) {
+                          spdlog::error("from-inventory-query: fleet_read_fn unwired — "
+                                        "misconfigured call site; failing closed");
+                          rs_err(res, 503, "service unavailable");
+                          return;
+                      }
                       auto gate = fleet_read_fn(req, res, "Inventory", "Read");
                       if (!gate.admitted)
                           return;
@@ -9178,23 +9184,21 @@ void RestApiV1::register_routes(
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
-                      if (!inventory_store || !inventory_store->is_open()) {
-                          rs_err(res, 503, "inventory store not available");
-                          return;
-                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
 
+                      // Gate 3 BLOCKING fix (#2146 Batch B2 review), reordered ahead of the
+                      // store checks below (a malformed request is a client error regardless
+                      // of backend availability): `.value(key, default)` throws
+                      // nlohmann::json::type_error on a type mismatch - it does not coerce. A
+                      // non-object element or a non-string field previously fell through to
+                      // an uncaught exception. Validate explicitly.
                       InventoryEvalRequest eval_req;
                       eval_req.combine = body.value("combine", "all");
                       if (body.contains("conditions") && body["conditions"].is_array()) {
-                          // Gate 3 BLOCKING fix (#2146 Batch B2 review): `.value(key, default)`
-                          // throws nlohmann::json::type_error on a type mismatch - it does not
-                          // coerce. A non-object element or a non-string field previously fell
-                          // through to an uncaught exception. Validate explicitly.
                           for (const auto& c : body["conditions"]) {
                               if (!c.is_object()) {
                                   rs_err(res, 400, "each condition must be a JSON object");
@@ -9212,6 +9216,10 @@ void RestApiV1::register_routes(
                               cond.value = field_str("value");
                               eval_req.conditions.push_back(std::move(cond));
                           }
+                      }
+                      if (!inventory_store || !inventory_store->is_open()) {
+                          rs_err(res, 503, "inventory store not available");
+                          return;
                       }
 
                       // Optional parent-scope narrowing.

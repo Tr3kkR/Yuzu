@@ -20521,14 +20521,21 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
     }
 
     SECTION("create_result_set_from_inventory_query denies without Inventory:Read (the REAL "
-            "gate — matches REST's perm_fn(Inventory, Read) call exactly, independent of this "
-            "tool's kToolSecurity operation being classified \"Write\" for readOnlyHint "
-            "truthfulness). Empty tier (not an MCP token) so tier_allows defers entirely to "
-            "RBAC and this test exercises ONLY the handler's own perm_fn gate — \"operator\" "
-            "tier would itself 403 first on Inventory:Write (the kToolSecurity classification), "
-            "which is a DIFFERENT gate than the one under test here.") {
-        ts.perm_override_for_test = [](const std::string& sec, const std::string& op) {
-            return !(sec == "Inventory" && op == "Read");
+            "gate — matches REST's fleet_read_fn(Inventory, Read) call exactly, independent "
+            "of this tool's kToolSecurity operation being classified \"Write\" for "
+            "readOnlyHint truthfulness). Empty tier (not an MCP token) so tier_allows defers "
+            "entirely to RBAC and this test exercises ONLY the handler's own fleet_read_fn_ "
+            "gate — \"operator\" tier would itself 403 first on Inventory:Write (the "
+            "kToolSecurity classification), which is a DIFFERENT gate than the one under "
+            "test here. Corrected (#2146 Batch B2 review): the fix moved this handler from a "
+            "bare perm_fn to fleet_read_fn_, which is a SEPARATE test-fixture override "
+            "(fleet_read_fn_for_test) from perm_override_for_test - the latter no longer has "
+            "any effect on this tool.") {
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& r,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            r.status = 403;
+            return {};
         };
         ts.start();
         auto res = ts.call(
