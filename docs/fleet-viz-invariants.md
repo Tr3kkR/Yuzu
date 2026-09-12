@@ -8,8 +8,22 @@ invariants so they outlive any single PR description.
 Triggers for this doc: any change touching
 `viz_routes.{hpp,cpp}` / `fleet_topology_store.{hpp,cpp}` /
 `viz_page_ui.cpp` / `static/yuzu-viz.js` / `--viz-disable` /
-`Config::viz_disable`. Loaded by `security-guardian` + `docs-writer` during
-governance.
+`Config::viz_disable` / `McpServer::set_viz_deps` / the `get_fleet_topology`
+and `get_host_topology` MCP tool handlers in `mcp_server.cpp` (api-parity
+#2146 Batch B3 - a second implementation site for these same invariants:
+kill-switch-before-RBAC ordering, the `machines_max` DoS cap, the offline-merge
+rule). Loaded by `security-guardian` + `docs-writer` during governance.
+
+## MCP surface
+
+`get_fleet_topology`/`get_host_topology` (`mcp_server.cpp`) are the MCP twins
+of the REST endpoints below, wired via `McpServer::set_viz_deps()` (passes the
+SAME `fleet_topology_store_`/`offline_endpoint_store_`/`viz_disabled_`
+instances REST's `VizRoutes` registration uses, so the two surfaces cannot
+disagree about cache state). Every invariant in this doc (kill-switch
+ordering, the DoS cap, the offline-merge rule) applies identically to both
+surfaces - a change to one that doesn't preserve parity with the other is a
+regression, not a stylistic difference.
 
 ## REST and routing surface
 

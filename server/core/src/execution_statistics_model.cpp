@@ -9,11 +9,18 @@ namespace yuzu::server {
 namespace {
 
 /// JSON-quote a single string value (RFC 8259 escaping) by reusing
-/// nlohmann::json's own string serializer — used ONLY for the string fields
+/// nlohmann::json's own string serializer -- used ONLY for the string fields
 /// below (agent_id/definition_id). See the header's formatting note for why
 /// the double fields are hand-formatted with std::format instead of routed
-/// through nlohmann::json.
-std::string q(std::string_view s) { return nlohmann::json(s).dump(); }
+/// through nlohmann::json. error_handler_t::replace (matching
+/// bundle_service.cpp/analytics_event_store.cpp/approval_routes.cpp's own
+/// string-dump call sites) rather than the strict default: these fields
+/// ultimately trace back to store-persisted agent_id/definition_id values,
+/// and dump()'s strict default throws on invalid UTF-8 with no
+/// exception_handler wired on this route (cpp-expert gov finding).
+std::string q(std::string_view s) {
+    return nlohmann::json(s).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
 
 } // namespace
 

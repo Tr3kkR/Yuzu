@@ -28,9 +28,9 @@
 /// file promotes each block to a named, shared function per the recipe's §8
 /// worked example (`software_deployment_row_json`).
 
-#include "execution_tracker.hpp" // FleetExecutionSummary/AgentExecutionStats/DefinitionExecutionStats
-
 #include <string>
+
+#include "execution_tracker.hpp" // FleetExecutionSummary/AgentExecutionStats/DefinitionExecutionStats
 
 namespace yuzu::server {
 

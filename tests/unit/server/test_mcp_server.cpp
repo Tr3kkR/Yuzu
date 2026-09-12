@@ -20814,6 +20814,49 @@ TEST_CASE("MCP get_fleet_topology: machines_max rejects an oversize snapshot rat
     CHECK(body["error"]["message"].get<std::string>().find("machines_max") != std::string::npos);
 }
 
+// gov cpp-safety finding (#2146 B3): fresh=true's cache-busting semantics
+// (invalidate() before get(), same as REST) had no MCP-level test.
+TEST_CASE("MCP get_fleet_topology: fresh=true busts the shared 60s cache before reading",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
+                             /*ttl=*/std::chrono::seconds(60),
+                             /*fetch_deadline=*/std::chrono::milliseconds(50),
+                             /*max_snapshot_bytes=*/0};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    // First call: cold cache -> a miss.
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res1);
+    const auto misses_after_first = store.cache_misses();
+    CHECK(misses_after_first >= 1);
+
+    // Second call, no fresh: warm cache -> no additional miss.
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res2);
+    CHECK(store.cache_misses() == misses_after_first);
+
+    // Third call with fresh=true: must bust the cache -> another miss, even
+    // though the TTL has not elapsed.
+    auto res3 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":15,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{"fresh":true}}})");
+    REQUIRE(res3);
+    CHECK(store.cache_misses() > misses_after_first);
+
+    // The invalidate audit row precedes the read's own success row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "viz.fleet_topology.invalidate|success");
+    CHECK(ts.audit_log.back() == "viz.fleet_topology|success");
+}
+
 TEST_CASE("MCP get_fleet_topology: denies without Response:Read",
           "[mcp][integration][viz]") {
     std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};

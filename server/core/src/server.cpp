@@ -17723,6 +17723,15 @@ private:
             // registration below wires (viz_routes_->register_routes(...)), so
             // the two surfaces cannot disagree about cache state, the
             // yuzu_viz_disabled kill switch, or which hosts render stale.
+            // fleet_topology_store_/viz_disabled_ are both declared AFTER
+            // mcp_server_ (below), so on a raw member teardown this borrow
+            // would dangle for part of destruction. Safe anyway: the lifetime
+            // guarantee is stop(), not declaration order -- ~ServerImpl always
+            // runs stop(), which joins every httplib worker thread (MCP's
+            // included, since MCP is thread-per-connection like every other
+            // route) before any member destructs, so no handler runs past
+            // that join -- same discipline as gateway_route_store_/
+            // mgmt_group_store_ etc. (cpp-safety gov finding).
             mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_endpoint_store_.get(),
                                       &viz_disabled_);
             mcp_server_->set_upload_grant_ops(
