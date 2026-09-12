@@ -281,7 +281,7 @@ that caveat, not just this document.
 1. ~~Run the harness on DGRHP (idle x3, under load x3)~~ - DONE 2026-09-09, see
    Results above.
 2. ~~Re-run the `post-fix-cost` case verbatim once PR-B lands, to get the "after"
-   figure~~ - DONE 2026-09-11 for Service (PR-B3 landed), see the PR-B3 addendum
+   figure~~ - DONE 2026-09-11 for Service, on the PR-B3 branch (in review as of this note), see the PR-B3 addendum
    below. Registry/File remain open (PR-B1/PR-B2 land separately; not re-run
    here - this session's scope was Service only).
 3. ~~Compile-verify the harness itself on a real Windows toolchain~~ - DONE
@@ -381,7 +381,7 @@ which exists specifically because this is PR-B3's own tradeoff to amortize
 later, not an inherited constant to leave alone.
 
 **Post-fix-cost, Service after-figure (same case as Results above, re-run
-2026-09-11 once PR-B3 landed, closing forward action item 2 for Service):**
+2026-09-11 on the PR-B3 branch, closing forward action item 2 for Service):**
 
 | | before (2026-09-09) | after (2026-09-11) |
 |---|---|---|

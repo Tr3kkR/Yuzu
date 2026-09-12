@@ -1074,6 +1074,30 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
     describes. PR-B3 isolates that specific call onto a probe-only lane. `NotifyServiceStatusChangeW`'s
     registration stays on the mechanism thread by design (Win32 thread-affinity requirement) -
     an accepted, explicitly-documented residual, not a gap PR-B3 claims to close.
+  - **Service pre-flip follow-ups (governance review, PR-B3, consolidated here so they are
+    not lost one hop away in a PR/issue instead of this gating register):** tracked in
+    **#4218** - (a) the ~50-65 ms establishment-latency figure above is dominated by
+    `kServicePollCadence`, not raw API cost, and the constants governing it
+    (`kServiceProbeLaneCap=16`, `kServiceHealthGrace`, the admission-backoff pair) are copied
+    from Registry's already-reviewed values, not measured against Service's own capacity -
+    retune after a real synthetic-storm measurement before flip; (b) at >16 simultaneous
+    Service watches (boot/reconnect), the admission backoff and health-grace windows can
+    collide and produce a transient false-fault-then-recover flicker indistinguishable from a
+    genuine SCM outage, with no fleet-visible counter to disambiguate the two causes (adjudged
+    MEDIUM/non-blocking for PR-B3 itself, since the feature is dormant); (c) Service's
+    `stats()` folds none of its new probe-lane counters (`probe_admission_rejected_`,
+    `probe_backend_failed_`, `health_edges_`) into `SparkMechanismStats` at all - not even the
+    coarse tier Registry/File already populate for the equivalent gap (tracked separately for
+    those two at #4218/#4279) - so today Service has no operator-visible signal beyond a raw
+    log line if any of the above occurs; (d) `teardown_watch()` never cancels an in-flight
+    establishment probe, so a watch retired while `Pending` keeps its `probe_lane_` slot until
+    the real `OpenServiceW` call returns - sustained watch/unwatch churn faster than the
+    `retiring_` reap window, combined with backend latency exceeding it, can starve new
+    admissions. **Corroborated empirically, not just theoretically**, by this same session's
+    real-hardware verification: File's sibling mechanism, sharing the identical
+    `SparkDetachedLane` admission primitive, was observed exceeding its configured lane cap by
+    one under real storm load (`max_active=9 > kTestLaneCap=8`, 1-in-~10 real-hardware runs -
+    see #4279's corresponding note) - raising this above "spec says it can't happen."
   #2011 (lock granularity) and #2014 stay early post-flip in the named package, unaffected by
   the correction above.
 - Revisit trigger: for the remaining #2011/#2014 piece, **escalate to flip-gating if a production

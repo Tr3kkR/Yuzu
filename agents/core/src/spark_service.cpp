@@ -850,20 +850,28 @@ std::optional<ServiceMechanismDebugCounters> service_debug_counters_for_test(con
 // APC dispatch for every OTHER watched service sharing this thread. Establish-
 // ment is now isolated onto a bounded, F3-counted probe_lane_
 // (SparkDetachedLane, spark_detached_call.hpp) — mirroring spark_registry.cpp's
-// probe half, PROBE-ONLY, deliberately no drain-lane twin: Service's teardown
-// (CloseServiceHandle + a zero-timeout SleepEx(0,TRUE) APC pump) does not
-// block the way Registry's WaitForThreadpoolWaitCallbacks(...,TRUE) can, so
-// there is no genuinely-blocking close to isolate, and isolating one anyway
-// would trade a real hazard (Registry's #4181 same-type deadlock edge) for an
-// invented cross-thread close-vs-APC-reclamation ownership problem with no
-// measured benefit. NotifyServiceStatusChangeW and CloseServiceHandle
-// DELIBERATELY stay on this thread — the former by Win32's own thread-
-// affinity requirement (see notify_cb's own comment), the latter by design
-// decision (see begin_probe()'s doc comment). A hung NotifyServiceStatusChangeW
-// registration itself is NOT isolated by this restructure — only OpenServiceW
-// establishment is; its own measured cost is small (see
+// probe half, PROBE-ONLY, deliberately no drain-lane twin: unlike Registry's
+// WaitForThreadpoolWaitCallbacks(...,TRUE), Service's teardown
+// (CloseServiceHandle + a zero-timeout SleepEx(0,TRUE) APC pump) has no
+// documented cross-thread reclamation ownership problem to isolate a close
+// FOR, so isolating one anyway would trade a real, known hazard (Registry's
+// #4181 same-type deadlock edge) for an invented one with no measured
+// benefit. NotifyServiceStatusChangeW and CloseServiceHandle DELIBERATELY
+// stay on this thread — the former by Win32's own thread-affinity
+// requirement (see notify_cb's own comment), the latter by this design
+// decision (see begin_probe()'s doc comment). Neither call's own blocking
+// behavior is isolated by this restructure — only OpenServiceW establishment
+// is. NotifyServiceStatusChangeW's measured cost is small (see
 // docs/spark-rebuild-baselines/stage2-watch-establish-latency.md) but that is
-// not a hard bound, and this residual must not be read as "closed" by #3840.
+// not a hard bound; CloseServiceHandle is the same LRPC transport as
+// OpenServiceW and is UNVERIFIED either way — governance review (round 3)
+// found no evidence CloseServiceHandle cannot itself hang under the same
+// wedged-SCM condition #3840 exists to fix, so a wedge on close (four routine
+// paths call it with a live handle: fired-scan re-arm-failure and
+// MARKED_FOR_DELETE, Cmd::Remove's last-key teardown, and mechanism-thread
+// exit) remains a residual of the ORIGINAL #3840 hazard shape, not one this
+// restructure widens or introduces. This residual must not be read as
+// "closed" by #3840.
 // ═══════════════════════════════════════════════════════════════════════════
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -941,8 +949,7 @@ constexpr std::uint64_t kAbsentRetryMs = 30000;
 // ── PR-B3 (#2012/#3840): probe-lane policy constants. Initial policy
 // references copied from spark_registry.cpp's probe half (its already-
 // reviewed values), NOT measured Service capacity — retune after a real
-// synthetic-storm measurement (tracked as a pre-flip follow-up, see the
-// kickoff doc). ──
+// synthetic-storm measurement (tracked as a pre-flip follow-up, issue #4218). ──
 using Clock = std::chrono::steady_clock;
 constexpr std::size_t kServiceProbeLaneCap = 16; ///< concurrent detached probe workers
 /// How long an accepted establishment/re-establishment obligation may stay
@@ -1122,6 +1129,15 @@ struct SvcWatch {
     DWORD current_state{0};
     std::optional<ServiceRunState> last;
     bool faulted{false};
+    /// The reason `faulted` was last set (or "recovered" once cleared) —
+    /// governance review: a key coalescing onto an already-faulted watch was
+    /// previously handed a hardcoded "OpenService failed" regardless of the
+    /// watch's actual cause (could be a Notify-registration failure or a
+    /// health-grace timeout instead); storing the real reason here, mirroring
+    /// spark_registry.cpp's/spark_file.cpp's RegWatch::fault_reason /
+    /// FileWatch::fault_reason, lets the coalescing-Add branch hand every
+    /// subscriber the same, accurate explanation.
+    const char* fault_reason{""};
     std::chrono::steady_clock::time_point next_retry{};
     /// >0 while parked in `retiring_` awaiting quiescence before real free;
     /// 0 for a live (non-retiring) watch. See `retiring_`'s doc comment.
@@ -1444,14 +1460,23 @@ private:
             // backend failure (never a false Stopped), same retry cadence as
             // a genuine OpenServiceW error below.
             probe_backend_failed_.fetch_add(1, std::memory_order_relaxed);
+            // Split into two distinct consumer-visible reasons (governance
+            // review: was one collapsed string here, unlike
+            // spark_registry.cpp's/spark_file.cpp's "probe threw" vs
+            // "probe result could not be boxed" split) - the log line already
+            // carried the distinction, only the fault channel didn't.
+            const char* reason = r.error() == DetachedCallError::WorkerThrew
+                                     ? "OpenService probe threw"
+                                     : "OpenService probe result could not be boxed";
             spdlog::warn("spark_service: establishment probe for a watched service did not "
                         "complete cleanly ({})",
                         r.error() == DetachedCallError::WorkerThrew ? "threw"
                                                                     : "result alloc failed");
             if (!w.faulted) {
                 w.faulted = true;
+                w.fault_reason = reason;
                 for (const auto& k : w.keys)
-                    faults.push_back({k, true, "OpenService probe failed", key_epoch_.at(k)});
+                    faults.push_back({k, true, reason, key_epoch_.at(k)});
             }
             // ProbeState::Deferred (not Idle) — a due next_retry with probe
             // still Idle would never be picked up by run()'s retry scan,
@@ -1475,6 +1500,7 @@ private:
                 set_terminal(w, ServiceRunState::Stopped, emits);
                 if (w.faulted) {
                     w.faulted = false;
+                    w.fault_reason = "recovered";
                     for (const auto& k : w.keys)
                         faults.push_back({k, false, "recovered", key_epoch_.at(k)});
                 }
@@ -1483,6 +1509,7 @@ private:
                              res.err);
                 if (!w.faulted) {
                     w.faulted = true;
+                    w.fault_reason = "OpenService failed";
                     for (const auto& k : w.keys)
                         faults.push_back({k, true, "OpenService failed", key_epoch_.at(k)});
                 }
@@ -1510,6 +1537,7 @@ private:
             w.svc.reset();
             if (!w.faulted) {
                 w.faulted = true;
+                w.fault_reason = "NotifyServiceStatusChange failed";
                 for (const auto& k : w.keys)
                     faults.push_back({k, true, "NotifyServiceStatusChange failed", key_epoch_.at(k)});
             }
@@ -1530,6 +1558,7 @@ private:
         w.admission_attempts = 0;
         if (w.faulted) {
             w.faulted = false;
+            w.fault_reason = "recovered";
             for (const auto& k : w.keys)
                 faults.push_back({k, false, "recovered", key_epoch_.at(k)});
         }
@@ -1553,6 +1582,7 @@ private:
         w.grace_counted = true;
         if (!w.faulted) {
             w.faulted = true;
+            w.fault_reason = "service watch establishment pending past grace";
             health_edges_.fetch_add(1, std::memory_order_relaxed);
             for (const auto& k : w.keys)
                 faults.push_back(
@@ -1691,6 +1721,7 @@ private:
                     if (wp->faulted)
                         continue;
                     wp->faulted = true;
+                    wp->fault_reason = "mechanism thread terminating";
                     for (const auto& k : wp->keys)
                         faults.push_back({k, true, "mechanism thread terminating"});
                 }
@@ -1796,10 +1827,16 @@ private:
                     } else if (w->last) {
                         // Same UP-2 fix as the Linux mechanism: hand a
                         // newly-coalescing key the fault status too, not just
-                        // the cached state.
+                        // the cached state. Uses w->fault_reason (governance
+                        // review) rather than a hardcoded literal — the
+                        // watch's actual fault cause may be a Notify-
+                        // registration failure or a health-grace timeout, not
+                        // an OpenService failure; spark_file.cpp's own
+                        // "review finding 9" fixed the identical class of bug
+                        // for its coalescing joins.
                         emits.push_back({cmd.key, *w->last, this_key_epoch});
                         if (w->faulted)
-                            faults.push_back({cmd.key, true, "OpenService failed", this_key_epoch});
+                            faults.push_back({cmd.key, true, w->fault_reason, this_key_epoch});
                     }
                 } else { // Cmd::Remove
                     auto kit = key_svc_.find(cmd.key);
