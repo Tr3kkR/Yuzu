@@ -362,6 +362,21 @@ public:
         test_prune_interval_ = prune_interval;
     }
 
+    /// TEST-ONLY: shrink the bounded wait `GuardianSparkRuntime::attach_rule()`/
+    /// `submit_disarm_off_lock()` place on their own backend arm/disarm claim
+    /// (`GuardianSparkRuntime::Config::backend_op_deadline`, production default 5s) —
+    /// a test can drive a deterministic "backend parked" scenario without a real
+    /// multi-second wait. MUST be called BEFORE wire_spark_engine(), which is what
+    /// constructs the runtime (the same ordering constraint as
+    /// set_drain_worker_timing_for_test above); a call afterward is silently inert.
+    /// `GuardianSparkRuntime::Config` is not usable here directly — this header only
+    /// forward-declares GuardianSparkRuntime (ABI boundary), so only the one field
+    /// tests actually need is threaded through; unset means "keep the production
+    /// default". No production caller.
+    void set_spark_backend_op_deadline_for_test(std::chrono::milliseconds deadline) {
+        test_spark_backend_op_deadline_ = deadline;
+    }
+
     /// Spread this agent's journal-maintenance phase and its forced pages over their
     /// intervals (C0 flip-checklist item 12). MUST be called BEFORE wire_spark_engine(),
     /// which is what constructs the worker.
@@ -606,6 +621,8 @@ private:
     std::uint64_t test_periodic_bound_ms_{0};
     std::chrono::milliseconds test_page_interval_{0};
     std::chrono::milliseconds test_prune_interval_{0};
+    /// TEST-ONLY (see set_spark_backend_op_deadline_for_test); nullopt = production default.
+    std::optional<std::chrono::milliseconds> test_spark_backend_op_deadline_;
     /// Maintenance phase/forced-page jitter (see set_maintenance_jitter). OFF unless the
     /// production wiring turns it on, so every test's cadence stays deterministic.
     bool maintenance_jitter_{false};

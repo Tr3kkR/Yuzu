@@ -1790,7 +1790,13 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
     try {
         spark_reader_ = std::make_shared<GuardianStateReader>();
         spark_backend_ = std::make_shared<GuardianSparkEngineBackend>(*engine);
-        spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_);
+        // set_spark_backend_op_deadline_for_test: only the one Config field tests need
+        // crosses the header's forward-declaration boundary (see that setter's doc).
+        GuardianSparkRuntime::Config spark_runtime_cfg{};
+        if (test_spark_backend_op_deadline_)
+            spark_runtime_cfg.backend_op_deadline = *test_spark_backend_op_deadline_;
+        spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_,
+                                                                spark_runtime_cfg);
         // Provider captures a COPY of agent_id_, never `this` (#2237): the runtime is the
         // object built to survive the agent via a detached SparkEngine handler, so a
         // provider that reached back into GuardianEngine would be the same class of

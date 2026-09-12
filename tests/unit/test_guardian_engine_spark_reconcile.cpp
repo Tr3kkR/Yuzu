@@ -297,7 +297,12 @@ struct SparkReconcileFixture {
 
     /// `periodic_bound_ms > 0` pins the drain worker's backstop before it is constructed,
     /// so a test can attribute a page to the reconnect kick rather than the backstop.
-    explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0) {
+    /// `backend_op_deadline`, when set, shrinks GuardianSparkRuntime::Config's bounded
+    /// arm/disarm wait (production default 5s) so a test can drive a deterministic
+    /// "backend parked" scenario without a real multi-second wait (rung 9c PR-2:
+    /// set_spark_backend_op_deadline_for_test, guardian_engine.hpp).
+    explicit SparkReconcileFixture(std::uint64_t periodic_bound_ms = 0,
+                                   std::optional<std::chrono::milliseconds> backend_op_deadline = std::nullopt) {
         auto opened = KvStore::open(db_.path);
         REQUIRE(opened.has_value());
         kv = std::make_unique<KvStore>(std::move(*opened));
@@ -311,6 +316,8 @@ struct SparkReconcileFixture {
         REQUIRE(engine->start_local().has_value());
         if (periodic_bound_ms > 0)
             engine->set_drain_worker_timing_for_test(periodic_bound_ms);
+        if (backend_op_deadline)
+            engine->set_spark_backend_op_deadline_for_test(*backend_op_deadline);
         engine->wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
                                   [this](const OutboxEntry& e) {
                                       std::lock_guard<std::mutex> lk{sent_mu};
@@ -2653,5 +2660,92 @@ TEST_CASE("test helper: wait_until_quiescent returns false while another thread 
     // Exited -> quiescent (TSan's background thread is excluded by the helper's threshold).
     CHECK(yuzu::test::wait_until_quiescent(std::chrono::seconds(5)));
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-2 (non-waiting cutover) - RED, target-behaviour regression net
+// ---------------------------------------------------------------------------
+//
+// The test below is deliberately RED against today's HEAD: it asserts the behaviour
+// docs/spark-stage2-guardian-consumer-design.md R5 rules for GuardianEngine::apply_rules()
+// once the rung 9c PR-2 cutover lands (~/.claude/plans/spark-rung9c-pr2-cutover-KICKOFF.md),
+// which as of this test's authoring is NOT yet implemented - apply_rules() still holds
+// mtx_ across GuardianSparkRuntime::attach_rule()'s bounded wait_for_claim() (rung 9c
+// PR-1, guardian_spark_runtime.cpp:1213-1216).
+//
+// Tagged `[!shouldfail]` - Catch2's own mechanism for a checked-in, deliberately-red
+// assertion of not-yet-built behaviour (not this repo's prior practice; there is no
+// earlier precedent for this tag here, noted for reviewers). This is NOT a broken test
+// and NOT a false-green: Catch2 reports `[!shouldfail]` GREEN precisely because the body
+// fails (today, for the right reason - the REQUIRE below actually observes the parked
+// wait), and would report it RED the instant someone loosened the assertion back to
+// today's blocking contract without implementing the cutover, or once the cutover lands
+// and the body's REQUIREs all genuinely pass (Catch2 flags an unexpectedly-passing
+// `[!shouldfail]` case as a failure) - either way this is a live tripwire, not inert
+// documentation. Whoever implements the cutover should watch this test flip from
+// pass-via-failure to a real, unexpected pass, and then remove the tag, turning this into
+// an ordinary enforced regression test.
+TEST_CASE("rung 9c PR-2 (RED): apply_rules returns before a slow-arming rule resolves, "
+          "and holds the policy generation until it does",
+          "[spark][guardian][reconcile][!shouldfail]") {
+    // Shrink backend_op_deadline (production 5s) so a parked backend call costs this
+    // test tens of milliseconds instead of a real multi-second wait either way - whether
+    // today's blocking wait runs to completion, or the future cutover returns instantly.
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds{300}};
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(1);
+    *p.add_rules() = make_service_rule("r1");
+    const std::string push_bytes = p.SerializeAsString();
+
+    REQUIRE(f.engine->policy_generation() == 0);
+    f.mechanism->hang_next_watch(); // park mid-arm: the backend call never returns
+                                    // until release_hang() below
+
+    std::atomic<bool> dispatch_returned{false};
+    yuzu::agent::GuardianDispatchResult dr{};
+    std::thread pusher([&] {
+        dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+        dispatch_returned.store(true, std::memory_order_release);
+    });
+    // cpp-safety Gate 3 shape (matching the #2818 test above): release the hang and join
+    // on ANY exit path, so a failed REQUIRE between spawn and join can never unwind past
+    // a still-joinable std::thread.
+    struct PusherGuard {
+        FakeServiceMechanism* mech;
+        std::thread* t;
+        ~PusherGuard() {
+            mech->release_hang();
+            if (t->joinable())
+                t->join();
+        }
+    } pusher_guard{f.mechanism, &pusher};
+
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds{5}));
+
+    // TARGET (rung 9c PR-2): apply_rules() must already have returned here, while the
+    // backend call is still parked - it must not still be blocked inside attach_rule's
+    // bounded wait. spin_until is liveness-only (never a bare sleep-based timing
+    // assertion, per its own doc) - the short 60ms bound (a fifth of the shrunk 300ms
+    // deadline) is what makes this fail TODAY (apply_rules is still blocked, having not
+    // yet reached anywhere near its own deadline) and pass once the wait is actually
+    // removed.
+    REQUIRE(yuzu::test::spin_until([&] { return dispatch_returned.load(std::memory_order_acquire); },
+                                   std::chrono::milliseconds{60}));
+
+    // TARGET: the push was accepted (dispatch succeeded) but the rule's arm has not yet
+    // resolved - the generation must NOT have advanced while it's still parked.
+    CHECK(dr.exit_code == 0);
+    CHECK(f.engine->policy_generation() == 0);
+
+    // Release the parked backend call: NOW the arm resolves and the generation may
+    // advance to reflect it.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.engine->policy_generation() == 1; }));
+    CHECK(f.engine->spark_armed_rule_count() == 1);
+
+    pusher.join();
 }
 #endif
