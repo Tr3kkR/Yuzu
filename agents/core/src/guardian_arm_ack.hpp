@@ -207,7 +207,16 @@ public:
     /// (Reapply) - a different generation, changed content under the same
     /// generation number, or an application that has already seen a failure
     /// (latched or a resolved receipt). Reapply when there is no current
-    /// application at all - nothing to suppress against. Never mutates
+    /// application at all - nothing to suppress against - AND, critically
+    /// (Gate 8 doc-currency fix; see the .cpp's own longer comment and
+    /// docs/spark-stage2-guardian-consumer-design.md's R5.3 correction),
+    /// whenever `pending` is EMPTY: this dedup exists only to protect a
+    /// claim that is genuinely still in flight, and Suppressing with nothing
+    /// in flight is what let a failed persist_generation_locked() write go
+    /// unretried forever (sec-1/arch-1). A content_id that is not a real
+    /// 64-hex-char SHA-256 digest (a sentinel, never a real hash) is also
+    /// never trusted as a match, even against an identical sentinel from a
+    /// different push. Never mutates
     /// state (a query only - `runtime` is read via receipt_status(), which
     /// takes its own brief registry_mu_ internally); call this AFTER
     /// drain_locked() so a receipt that resolved this tick is reflected.

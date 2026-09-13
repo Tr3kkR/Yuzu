@@ -103,6 +103,12 @@ struct ScopedTestSqlite3 {
         if (raw)
             sqlite3_close(raw);
     }
+    // Governance finding (Gate 8, cpp-safety, SHOULD): non-copyable so a future
+    // accidental copy can never double-close this handle - neither helper below
+    // copies it today, but the invariant should be compiler-enforced, not implicit.
+    ScopedTestSqlite3() = default;
+    ScopedTestSqlite3(const ScopedTestSqlite3&) = delete;
+    ScopedTestSqlite3& operator=(const ScopedTestSqlite3&) = delete;
 };
 
 void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
@@ -3175,6 +3181,18 @@ TEST_CASE("rung 9c PR-2 governance hardening: an IDENTICAL repeat push recovers 
     // reconcile_failures stays 0 by construction, so the only thing gating the
     // generation advance is ack_ledger_->can_advance() (trivially true, nothing ever
     // Accepted at prefer_spark=false) and the persist itself.
+    //
+    // Scope note (Gate 8, unhappy-path UP-9): a REAL push whose rules also live in
+    // the dropped kv_store table would fail at put_rule_locked() first (the
+    // pre-existing, already-correct latch_failure()->Reapply path) before ever
+    // reaching the tail-gate persist this test targets - this whole-table-drop
+    // fault can't isolate "rules durably stored, only the generation marker's own
+    // write fails" from "everything in the table fails together". decide_retry()'s
+    // pending.empty() fix does not itself depend on rule count or content (proven
+    // independently, rule-content-free, by the ledger-level "EMPTY pending map"
+    // unit test in test_guardian_arm_ack.cpp) - but a selective-KV-fault test
+    // exercising this exact tail-gate failure with real, already-armed rules
+    // present is tracked as a follow-up, not fixed here.
     gpb::GuaranteedStatePush p;
     p.set_full_sync(false);
     p.set_policy_generation(1);

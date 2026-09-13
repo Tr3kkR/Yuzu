@@ -1272,12 +1272,17 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // Persist BEFORE publishing (coordinator finding, rung 9c PR-2 Unit 6 gate - this
     // call site has the identical shape as journal_maintenance_tick()'s own, fixed
     // alongside it): a failed or throwing persist leaves policy_generation_ at its
-    // prior value, so the same condition is still true on a later tick or a repeat
-    // push, retrying naturally - "naturally" depends on decide_retry() above never
-    // Suppressing a repeat push while nothing is genuinely pending (governance
-    // finding sec-1/arch-1, fixed in GuardianArmAckLedger::decide_retry() this same
-    // round: an empty `pending` map used to reach a vacuous Suppress and this gate
-    // was never reached again at all on a repeat push).
+    // prior value, so the same condition is still true on a repeat push, retrying
+    // naturally - "naturally" depends on decide_retry() above never Suppressing a
+    // repeat push while nothing is genuinely pending (governance finding
+    // sec-1/arch-1, fixed in GuardianArmAckLedger::decide_retry() this same round:
+    // an empty `pending` map used to reach a vacuous Suppress and this gate was
+    // never reached again at all on a repeat push). NOTE the asymmetry with
+    // journal_maintenance_tick()'s own retry (Gate 8, sre): that path is gated
+    // `if (stopped_ || !prefer_spark_) return;` and therefore does NOT retry at
+    // today's production default - a repeat PUSH is the only live recovery lane
+    // at prefer_spark_=false, not a heartbeat tick. Do not conflate the two in a
+    // future edit here or in the log line below.
     if (reconcile_failures == 0 && ack_ledger_->can_advance() &&
         push.policy_generation() > policy_generation_) {
         if (persist_generation_locked(push.policy_generation()))
@@ -1287,8 +1292,8 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             // silent on failure. See journal_maintenance_tick()'s identical warn
             // for the matching drain-triggered gate.
             spdlog::warn("Guardian: failed to persist policy_generation={} (kv write "
-                         "returned false) - held at {}, retried on the next repeat "
-                         "push or heartbeat tick",
+                         "returned false) - held at {}, retried on the server's next "
+                         "identical repeat push",
                          push.policy_generation(), policy_generation_);
     }
 

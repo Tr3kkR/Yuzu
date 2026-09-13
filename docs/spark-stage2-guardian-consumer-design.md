@@ -631,9 +631,14 @@ map reached a vacuous Suppress and that retry never ran - the server's own
 ordering exists to serve) was therefore unable to recover a stuck generation by
 itself; only an agent restart could. This is corrected in
 `GuardianArmAckLedger::decide_retry()`: an empty `pending` map returns `Reapply`
-immediately, restoring exactly the pre-PR-2 behavior for that case (a full
-re-run, which finds every already-armed rule unchanged and costs nothing beyond
-the retried persist). Two further precision fixes landed alongside it: (a) a
+immediately, restoring exactly the pre-PR-2 behavior for that case - a full
+re-run, NOT a free one (correction, Gate 8: three independent reviewers caught
+an earlier draft of this paragraph claiming the reapply "costs nothing" -
+`attach_core()` rebuilds eval state from scratch on every push, identical
+re-push included, so a `full_sync` retry still pays the same real
+teardown+re-arm cycle it always paid before this ledger existed; what changes
+is that the retry runs AT ALL again, not that it becomes cheap). Two further
+precision fixes landed alongside it: (a) a
 `content_id` that is not a real 64-hex-char SHA-256 digest (the `start_local()`
 boot placeholder, or `guardian_push_content_id()`'s own throw fallback) is now
 NEVER trusted as a content match, even against an identical sentinel from a

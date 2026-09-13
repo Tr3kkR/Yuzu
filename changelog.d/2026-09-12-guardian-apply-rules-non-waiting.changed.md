@@ -4,8 +4,9 @@
   hung or slow backend can no longer stall the whole push, and therefore no longer
   delays agent shutdown the way it previously could. The reported policy generation
   (`yuzu.guardian_generation`) still only advances once every accepted rule in that
-  push has actually armed or genuinely failed - tracked by a new per-push
-  acknowledgment ledger and settled on the regular heartbeat cadence - so a generation
+  push has actually confirmed armed - settled (as armed, or as a genuine failure that
+  holds the generation, unchanged from before) by a new per-push acknowledgment ledger
+  on the regular heartbeat cadence - so a generation
   can now take one or two extra heartbeat ticks to advance under a slow-arming rule,
   where it previously advanced (or blocked) synchronously. This PR is deliberately
   pre-K-bound: a rule that resolves to anything other than a confirmed arm still holds

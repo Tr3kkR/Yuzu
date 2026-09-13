@@ -420,6 +420,53 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): an EMPTY pending map is always 
     CHECK(ledger.decide_retry(5, content, false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
 }
 
+TEST_CASE("GuardianArmAckLedger::drain_locked(): failed_out feeds an async arm "
+          "failure back to the caller (UP-3 regression, Gate 8 quality-engineer gap)",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, std::string(64, 'd'), false, 1);
+    auto receipt = accept(*rt, "r1");
+    ledger.add_pending("r1", receipt);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    b->fail_arm.store(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt); }, std::chrono::seconds(10)));
+
+    // TARGET: drain_locked()'s optional out-param must be INCREMENTED (never reset)
+    // by exactly the number of receipts THIS call resolved to non-Committed, so
+    // GuardianEngine::journal_maintenance_tick() can fold it into the durable
+    // fleet-visible arm_failures_ counter (previously only this ledger's own
+    // internal resolved_failed and a local log line saw an async-resolved failure).
+    std::size_t failed = 0;
+    const auto resolved = ledger.drain_locked(*rt, 10, &failed);
+    CHECK(resolved == 1);
+    CHECK(failed == 1);
+
+    // A second call with nothing left pending must not double-count.
+    std::size_t failed_again = 0;
+    ledger.drain_locked(*rt, 10, &failed_again);
+    CHECK(failed_again == 0);
+
+    // Omitting the out-param entirely (every pre-existing call site) must remain
+    // valid and behave exactly as before - the default is nullptr, checked before
+    // every increment.
+    GuardianArmAckLedger ledger2;
+    ledger2.begin_application(2, std::string(64, 'e'), false, 1);
+    auto receipt2 = accept(*rt, "r2");
+    ledger2.add_pending("r2", receipt2);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    b->fail_arm.store(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt2); }, std::chrono::seconds(10)));
+    CHECK(ledger2.drain_locked(*rt, 10) == 1); // no third argument - must not crash
+}
+
 TEST_CASE("guardian_push_content_id(): different (spark, assertion) block splits "
           "of the SAME flat field sequence must NOT hash identically",
           "[spark][ack]") {

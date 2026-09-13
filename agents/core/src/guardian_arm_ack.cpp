@@ -252,10 +252,14 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
     // Suppress, and the retry that would have re-attempted the failed persist never
     // ran - silently and permanently wedging the reported generation below the
     // server's value until restart. Reapply here restores exact pre-PR behavior for
-    // this case (a full re-run, matching what a retry always did before this
-    // ledger existed) and costs nothing extra when the prior application already
-    // succeeded, since the resulting re-run finds every rule already correctly
-    // armed and nothing left to change.
+    // this case: a full re-run, matching what a retry always did before this ledger
+    // existed - NOT free (governance finding, Gate 8: consistency-auditor, happy-
+    // path and security-guardian each independently caught an earlier draft of this
+    // comment overclaiming "costs nothing"). A full_sync retry still pays the same
+    // real teardown+re-arm cycle (attach_core() rebuilds eval state from scratch on
+    // every push, identical re-push included - there is no diff-skip) it always
+    // paid pre-ledger; what this fix restores is that the retry runs AT ALL, not
+    // that it becomes cheap.
     if (current_->pending.empty())
         return RetryDecision::Reapply;
     if (current_->generation != generation)
