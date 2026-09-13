@@ -2380,13 +2380,17 @@ public:
                             // generation 0 — so an agent that has never received a
                             // push still converges once rules exist server-side.
                             if (guardian_) {
-                                tags["yuzu.guardian_generation"] =
-                                    std::to_string(guardian_->policy_generation());
                                 // Drive durable lifecycle-journal maintenance on the
                                 // heartbeat cadence: retry any persist a prior write left
                                 // pending, so a failed write self-heals with no new push /
-                                // reconnect (item 7 PR-Ag; inert unless prefer_spark).
+                                // reconnect (item 7 PR-Ag; inert unless prefer_spark). rung
+                                // 9c PR-2 Unit 6: this is now ALSO the ack-bookkeeping drain
+                                // (§R5.3) - called BEFORE the generation tag is read below so
+                                // an acknowledgment this tick produces is visible on THIS
+                                // heartbeat rather than one late.
                                 guardian_->journal_maintenance_tick();
+                                tags["yuzu.guardian_generation"] =
+                                    std::to_string(guardian_->policy_generation());
                                 // Sparse durable-journal telemetry (item 7 PR-Ag §8): only
                                 // non-zero counters ship, so a quiescent / inert journal adds
                                 // no heartbeat tags.
