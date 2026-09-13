@@ -20698,6 +20698,35 @@ TEST_CASE("MCP B5: create_offload_target rejects a non-integer batch_size",
     CHECK(body["error"]["message"].get<std::string>().find("batch_size") != std::string::npos);
 }
 
+// Gate 8 fix (#2146 Batch B5 review): fail-OPEN type confusion - a
+// non-boolean enabled (e.g. the JSON string "false") previously silently
+// created an ENABLED target via args.contains()+is_boolean() short-circuit
+// leaving `enabled` at its `true` default, immediately flowing fleet events
+// to the caller-specified URL despite the caller's own request expressing
+// intent to leave it inactive. Must be REJECTED, never defaulted.
+TEST_CASE("MCP B5: create_offload_target rejects a non-boolean enabled rather "
+          "than silently defaulting to enabled=true",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"strict-target","url":"https://example.com/hook",)"
+        R"("enabled":"false"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("enabled") != std::string::npos);
+
+    auto listing = store.get()->list();
+    REQUIRE(listing.has_value());
+    CHECK(listing->empty()); // no target was created from the rejected call
+}
+
 // #2970B-class regression: a JSON-type-mismatched limit (e.g. the string
 // "10") must be REJECTED, not silently coerced to the default via param_int32.
 TEST_CASE("MCP B5: list_offload_target_deliveries rejects a non-integer limit",

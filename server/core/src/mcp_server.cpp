@@ -15139,9 +15139,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const int batch_size = static_cast<int>(*batch_size_opt);
-                bool enabled = true;
-                if (args.contains("enabled") && args["enabled"].is_boolean())
-                    enabled = args["enabled"].get<bool>();
+                // Gate 8 fix (#2146 Batch B5 review): same #2970B-class type
+                // confusion as batch_size two lines above, but fail-OPEN here
+                // - {"enabled":"false"} (a JSON string) silently created an
+                // ENABLED target, immediately flowing fleet events to the
+                // caller-specified URL despite the caller's own request
+                // expressing intent to leave it inactive. Reject, don't default.
+                if (args.contains("enabled") && !args["enabled"].is_boolean()) {
+                    res.set_content(a4_error(kInvalidParams, "enabled must be a JSON boolean"),
+                                    "application/json");
+                    return;
+                }
+                bool enabled = args.value("enabled", true);
                 if (name.empty() || url.empty()) {
                     res.set_content(a4_error(kInvalidParams, "name and url are required"),
                                     "application/json");
