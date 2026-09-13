@@ -73,11 +73,10 @@ constexpr std::chrono::milliseconds kReapWriteTimeout{2000};
 // merely-late heartbeat mid-renew starts getting reaped — the static_assert
 // only catches the two constants disagreeing, not either one being wrong.
 
-// Grace >= 1 lease TTL (task spec): 2x tolerates a FULL missed renewal cycle
-// (not just the last heartbeat's worth of jitter) before treating a lease as
-// truly dead, mirroring the "tolerate a couple of missed heartbeats" margin
-// already chosen for the TTL itself.
-constexpr int kStaleLeaseGraceSecs = 2 * kKnownLeaseTtlSecs; // 180s
+// kStaleLeaseGraceSecs (grace >= 1 lease TTL; 2x tolerates a FULL missed
+// renewal cycle) was HOISTED into gateway_route_store.hpp (PR #4299 round 4) so
+// the header can compute kMinReapRecoveryGapMs from it. The sweep-(a) cutoff
+// below reads the header constant directly.
 
 // Tombstone/never-announced purge age: deliberately SHORT (task spec) — a
 // tombstone or a stuck mid-handshake row carries no state worth preserving
@@ -101,6 +100,17 @@ constexpr int kReapCap = 5000;
 // while staying far below SessionStore's 366-day bound (sized to a human
 // session's plausible lifetime, not this store's sub-10-minute signal).
 constexpr std::int64_t kMaxPlausibleSkewMs = 24LL * 3600 * 1000; // 1 day
+
+// PR #4299 round 4: the recovery window (header constants) must be well-ordered
+// AND its ceiling must not exceed the implausible-skew bound — that ceiling <=
+// kMaxPlausibleSkewMs is the TERMINATING invariant: at the ceiling, recovery is
+// no weaker than an ordinary clean pass, which already accepts any forward jump
+// up to kMaxPlausibleSkewMs. kMaxPlausibleSkewMs stays store-local (this .cpp),
+// so this assert lives here rather than in the header.
+static_assert(kMinReapRecoveryGapMs < kMaxReapRecoveryGapMs &&
+                  kMaxReapRecoveryGapMs <= kMaxPlausibleSkewMs,
+              "reap recovery window must be well-ordered and its ceiling must not exceed the "
+              "implausible-skew bound (else recovery would be weaker than a clean pass)");
 
 std::optional<std::int64_t> parse_ms(const char* v) {
     if (v == nullptr || *v == '\0')
@@ -477,6 +487,11 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
     // (server.cpp) needs it to emit a distinct `outcome="recovered"` metric,
     // separate from an ordinary `outcome="ok"` pass.
     bool recovered_from_prior_decline = false;
+    // PR #4299 round 4 (observability-only): true iff an accepted sweep hit
+    // kReapCap AND a same-txn EXISTS probe found a matching remainder. Surfaces
+    // as outcome="ok_capped" — NOT a cadence/re-arm change (see the non-
+    // acceleration rationale in docs/clock-guarded-retention.md).
+    bool cap_bound_backlog = false;
     // PR #4299 round-2 external review (SHOULD): the ReplicaSafe contract for
     // this job (background_jobs.hpp) is "all but the advisory-lock holder
     // skip", matching every sibling single-sweeper store's
@@ -559,7 +574,7 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
             now_raw,
             anchor_raw ? std::optional<std::string_view>(*anchor_raw) : std::nullopt,
             marker_raw ? std::optional<std::string_view>(*marker_raw) : std::nullopt,
-            kMaxPlausibleSkewMs);
+            kMaxPlausibleSkewMs, kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs);
         clock_anomaly = d.clock_anomaly;
         recovered_from_prior_decline = d.recovered;
         if (d.clock_anomaly)
@@ -582,6 +597,12 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // OK, so this parse always engages; value_or(0) is dead defence.
         if (d.run_sweeps) {
             const std::int64_t now_ms = parse_reap_i64(now_raw).value_or(0);
+            // Cutoffs hoisted (PR #4299 round 4) so the cap-backlog EXISTS probe
+            // below can re-use the SAME cutoffs the two sweeps applied.
+            const std::int64_t cutoff_a_ms =
+                now_ms - static_cast<std::int64_t>(kStaleLeaseGraceSecs) * 1000;
+            const std::int64_t cutoff_b_ms =
+                now_ms - static_cast<std::int64_t>(kTombstonePurgeAgeSecs) * 1000;
 
             // (a) Expired-lease routes: lease_until past the grace window. Grace
         // (>= 1 lease TTL, task spec) means a merely-late heartbeat mid-renew
@@ -605,7 +626,6 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // out, at the cost of nothing — a row that is still genuinely expired
         // passes both checks identically.
         {
-            const std::int64_t cutoff_a_ms = now_ms - static_cast<std::int64_t>(kStaleLeaseGraceSecs) * 1000;
             pg::PgResult dr = pg::exec_params(
                 c,
                 "UPDATE gateway_route_store.agent_routes SET "
@@ -653,8 +673,6 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // cost of nothing — a row that is still genuinely a stale
         // tombstone/never-announced row passes both checks identically.
         {
-            const std::int64_t cutoff_b_ms =
-                now_ms - static_cast<std::int64_t>(kTombstonePurgeAgeSecs) * 1000;
             pg::PgResult dr = pg::exec_params(
                 c,
                 "DELETE FROM gateway_route_store.agent_routes WHERE agent_id IN "
@@ -671,6 +689,40 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 return false;
             }
             tombstones_reaped = PQntuples(dr.get());
+            }
+
+            // Cap-backlog probe (PR #4299 round 4, SHOULD — observability only,
+            // NOT acceleration). Hitting kReapCap does NOT prove a backlog
+            // remains (an exact-boundary pass drained the last row), so probe
+            // for a real remainder ONLY when a sweep hit its cap — the healthy
+            // path pays nothing. Same txn, mirrors audit_store.cpp's shape.
+            // Surfaces as outcome="ok_capped"; deliberately does NOT trigger a
+            // faster re-arm (see docs/clock-guarded-retention.md — acceleration
+            // would turn a mis-recovery into kReapCap tombstones every few
+            // seconds, collapsing the operator reaction window).
+            if (expired_leases_reaped >= kReapCap || tombstones_reaped >= kReapCap) {
+                pg::PgResult more = pg::exec_params(
+                    c,
+                    "SELECT "
+                    "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
+                    "  WHERE lease_until IS NOT NULL "
+                    "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint), "
+                    "EXISTS(SELECT 1 FROM gateway_route_store.agent_routes "
+                    "  WHERE lease_until IS NULL "
+                    "    AND (extract(epoch FROM updated_at) * 1000)::bigint < $2::bigint)",
+                    std::vector<std::string>{std::to_string(cutoff_a_ms),
+                                             std::to_string(cutoff_b_ms)});
+                if (more.status() != PGRES_TUPLES_OK) {
+                    err = std::string("reap cap-backlog probe failed: ") + PQerrorMessage(c);
+                    return false;
+                }
+                const bool a_more = to_bool(PQgetvalue(more.get(), 0, 0));
+                const bool b_more = to_bool(PQgetvalue(more.get(), 0, 1));
+                // Only the predicate that actually hit its cap counts toward the
+                // backlog signal — a below-cap sweep never leaves a hidden
+                // remainder (it drained everything eligible this pass).
+                cap_bound_backlog = (expired_leases_reaped >= kReapCap && a_more) ||
+                                    (tombstones_reaped >= kReapCap && b_more);
             }
         } // end if (d.run_sweeps)
 
@@ -699,7 +751,9 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
         // this is the structural guarantee the decide/apply split buys (PR
         // #4299 round-3). CLEAR on every accepted / recovered / self-heal /
         // bad-now pass (a no-op DELETE when no marker is set costs one
-        // statement); ARM "<anchor>:<direction>" on a skew decline.
+        // statement); ARM "<anchor>:<direction>:<first_now_ms>" on a skew
+        // decline (the 3-field format, PR #4299 round 4 — first_now_ms is the
+        // reading the recovery persistence window is measured from).
         if (d.marker.kind() == MarkerAction::Kind::Clear) {
             pg::PgResult clr_declined = pg::exec_params(
                 c,
@@ -716,7 +770,8 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 "('reap_declined_anchor_ms', $1) ON CONFLICT (key) DO UPDATE SET "
                 "value=EXCLUDED.value",
                 std::vector<std::string>{std::to_string(d.marker.anchor()) + ":" +
-                                         d.marker.direction()});
+                                         d.marker.direction() + ":" +
+                                         std::to_string(d.marker.first_now_ms())});
             if (set_declined.status() != PGRES_COMMAND_OK) {
                 err = "reap declined-anchor persist failed";
                 return false;
@@ -743,7 +798,8 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                             .tombstones_reaped = tombstones_reaped,
                             .clock_anomaly = clock_anomaly,
                             .recovered = recovered_from_prior_decline,
-                            .skipped = skipped_lock};
+                            .skipped = skipped_lock,
+                            .cap_bound = cap_bound_backlog};
 }
 
 } // namespace yuzu::server

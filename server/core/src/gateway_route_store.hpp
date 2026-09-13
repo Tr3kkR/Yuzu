@@ -114,6 +114,30 @@ namespace yuzu::server {
 /// its own `kGatewayRouteLeaseTtlSecs` (PR #4299 review, MINOR).
 inline constexpr int kKnownLeaseTtlSecs = 90;
 
+/// Grace before an expired lease is treated as truly dead by `reap_stale_routes`
+/// (sweep (a)): 2x the lease TTL tolerates a FULL missed renewal cycle, not just
+/// the last heartbeat's worth of jitter. HOISTED into the header (PR #4299 round
+/// 4) from `gateway_route_store.cpp`'s anonymous namespace so the reap recovery
+/// FLOOR below can be computed from it here; the reap-sweep cutoff in the .cpp
+/// still reads this same constant.
+inline constexpr int kStaleLeaseGraceSecs = 2 * kKnownLeaseTtlSecs; // 180s
+
+/// Reap-recovery persistence window (PR #4299 round 4). A skew anomaly's
+/// decline-once/drain-on-repeat recovery fires only when the SAME (anchor,
+/// direction) anomaly has PERSISTED for `delta = now_ms - first_now_ms` within
+/// `[kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs]` (see decide_reap).
+///
+/// FLOOR = the liveness horizon `(grace + lease TTL) * 1000` = 270'000ms: below
+/// this, a spurious forward jump's exposed routes (those whose last renewal
+/// predates the jump) are not yet reap-eligible, so recovering can't tombstone a
+/// still-live route. It is load-bearing for the multi-replica future — an
+/// ε-later second-replica pass must NOT recover with no persistence evidence.
+/// CEILING = 1h (cadence-derived with slack): past it, the anomaly is a NEW,
+/// discontinuous jump rather than the same one persisting.
+inline constexpr std::int64_t kMinReapRecoveryGapMs =
+    static_cast<std::int64_t>(kStaleLeaseGraceSecs + kKnownLeaseTtlSecs) * 1000; // 270'000
+inline constexpr std::int64_t kMaxReapRecoveryGapMs = 3'600'000; // 1h
+
 /// Typed store failure.
 enum class GatewayRouteStoreError {
     store_unavailable, ///< not open / lease timeout — the store cannot answer
@@ -175,12 +199,22 @@ struct DeregisterResult {
 /// matching every sibling single-sweeper store's `pg_try_advisory_xact_lock`
 /// idiom; `skipped` implies every other field stays at its default (the
 /// lambda returns before reading now()/the anchor).
+///
+/// `cap_bound` (PR #4299 round 4, observability-only — NOT acceleration) is true
+/// iff an accepted pass hit `kReapCap` on a sweep AND a same-txn `EXISTS` probe
+/// (audit_store.cpp shape) confirmed a matching remainder still exists — i.e. a
+/// real backlog outlives this pass. It surfaces as a distinct
+/// `yuzu_server_gateway_route_reap_total{outcome="ok_capped"}` so a chronically
+/// cap-bound reaper is visible WITHOUT changing cadence. Deliberately NOT wired
+/// to a faster re-arm: see docs/clock-guarded-retention.md's GatewayRouteStore
+/// adoption register for why acceleration is declined here.
 struct ReapRoutesResult {
     int expired_leases_reaped{0}; ///< predicate (a): lease_until past the grace window
     int tombstones_reaped{0};     ///< predicate (b): NULL-lease rows past the purge age
     bool clock_anomaly{false};
     bool recovered{false};
     bool skipped{false};
+    bool cap_bound{false}; ///< an accepted sweep hit kReapCap and a remainder still exists
 };
 
 /// A durable agent→cluster route, as read by `lookup_route`. Timestamps are
@@ -270,34 +304,46 @@ public:
     ///    offline overnight legitimately expires every lease), so a
     ///    would-wipe verdict cannot separate a true positive from that
     ///    routine case.
-    ///  - Part 4 (fact-set anomaly dedup) is ADOPTED, in a simplified form
-    ///    keyed on the PAIR (declined `route_meta.reap_anchor_ms` value,
-    ///    anomaly DIRECTION) rather than the full multi-field `Facts` struct
+    ///  - Part 4 (fact-set anomaly dedup) is ADOPTED, keyed on the TRIPLE
+    ///    (declined `route_meta.reap_anchor_ms` value, anomaly DIRECTION,
+    ///    `first_now_ms` — the reading the anomaly was first observed at)
     ///    (PR #4299 review, BLOCKER 1; direction-keyed since round-2 external
-    ///    review) — a forward- or backward-skew anomaly declines ONCE
-    ///    (persisting `reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>"`)
-    ///    and an IDENTICAL repeat (the anchor still unmoved AND the same
-    ///    direction) RECOVERS and drains, capped, treating the persisted gap
-    ///    as genuine elapsed downtime rather than a transient glitch. A
-    ///    DIFFERENT-direction anomaly at the SAME frozen anchor (e.g. a
-    ///    backward decline followed by an unrelated forward reading) is NOT
-    ///    the same anomaly repeating — it re-declines and re-arms against the
-    ///    new direction rather than recovering, since recovering it would run
-    ///    the sweeps against a forward-classified `now_ms`, itself the
-    ///    corrupted/huge reading. Without the decline-once/drain-on-repeat
-    ///    mechanism at all, a routine >24h gap (weekend shutdown, DR failover,
-    ///    extended maintenance) wedged the guard PERMANENTLY — `now - anchor`
-    ///    only grows while declined, so every later pass declined forever
-    ///    with no recovery path. An OPERATOR can
-    ///    force recovery early by resetting `route_meta.reap_anchor_ms` (see
-    ///    the operator re-anchor comment at the anomaly-detection site in
-    ///    `gateway_route_store.cpp`). Every decline (first or, before this
-    ///    fix, permanent) is `spdlog::warn`'d AND counted —
+    ///    review; the `first_now_ms` reading-continuity window added round 4).
+    ///    A forward- or backward-skew anomaly declines ONCE (persisting
+    ///    `reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>:<first_now_ms>"`)
+    ///    and RECOVERS only when the SAME (anchor, direction) anomaly has
+    ///    PERSISTED a real-time-plausible interval — `delta = now_ms -
+    ///    first_now_ms` in `[kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs]`
+    ///    (270s..1h). Below the floor it re-declines PRESERVING the original
+    ///    `first_now_ms` (an ε-later repeat, e.g. a second replica ticking a
+    ///    few seconds offset, must NOT recover with no persistence evidence —
+    ///    the FLOOR is load-bearing for the multi-replica future). Above the
+    ///    ceiling, or on a negative delta (a further-backward step), it is a
+    ///    NEW distinct anomaly — re-declined once against the CURRENT reading,
+    ///    never a free recovery on a stale marker. A DIFFERENT-direction
+    ///    anomaly at the SAME frozen anchor is likewise not the same anomaly
+    ///    repeating — it re-declines and re-arms against the new direction,
+    ///    since recovering it would run the sweeps against a mis-classified
+    ///    `now_ms`. Without the decline-once/drain-on-repeat mechanism at all,
+    ///    a routine >24h gap (weekend shutdown, DR failover, extended
+    ///    maintenance) wedged the guard PERMANENTLY — `now - anchor` only grows
+    ///    while declined, so every later pass declined forever with no recovery
+    ///    path. Note the floor/ceiling correction to the old "oscillates every
+    ///    other pass" narrative: a clock stepping backward every pass, or
+    ///    forward by more than the ceiling every pass, now DECLINES every pass
+    ///    and never recovers until it stops — stricter and correct, observable
+    ///    via `outcome="declined"`. An OPERATOR can force recovery early by
+    ///    resetting `route_meta.reap_anchor_ms` (see the operator re-anchor
+    ///    comment at the anomaly-detection site in `gateway_route_store.cpp`).
+    ///    Every decline is `spdlog::warn`'d AND counted —
     ///    `yuzu_server_gateway_route_reap_total{outcome="declined"}`
     ///    (incremented at the server.cpp reap call site). A failed pass
     ///    (store/query error, distinct from a declined one) is counted the
     ///    same way under `outcome="error"`; a clean, ordinary accepted pass
-    ///    is `outcome="ok"`; a pass that ran via this recovery branch (this
+    ///    is `outcome="ok"` (or `outcome="ok_capped"` when it hit `kReapCap`
+    ///    and a same-txn `EXISTS` probe confirmed a remaining backlog —
+    ///    `ReapRoutesResult::cap_bound`, PR #4299 round 4, observability-only,
+    ///    NOT acceleration); a pass that ran via this recovery branch (this
     ///    method's `ReapRoutesResult::recovered`) is its own
     ///    `outcome="recovered"` (PR #4299 round-2 review) — worth
     ///    distinguishing since a recovery pass can drain a large backlog in

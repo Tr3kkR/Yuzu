@@ -38,6 +38,16 @@ using namespace yuzu::server;
 
 namespace {
 
+// Build the 3-field declined-anchor marker "<anchor>:<direction>:<first_now_ms>"
+// (PR #4299 round 4). `first_now_ms` is the reading the recovery persistence
+// window (kMinReapRecoveryGapMs..kMaxReapRecoveryGapMs) is measured from — an
+// immediate second pass is BELOW the floor and re-declines, so a test that
+// wants the genuine-persistence RECOVERY seeds first_now_ms roughly one window
+// (300s) in the past rather than sleeping real wall-clock minutes.
+std::string marker3(const std::string& anchor, const std::string& dir, std::int64_t first_now_ms) {
+    return anchor + ":" + dir + ":" + std::to_string(first_now_ms);
+}
+
 // One migration run, cloned per fixture.
 yuzu::test::PgTestTemplate gateway_route_tpl{"gatewayroute", [](const std::string& dsn) {
     yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
@@ -667,10 +677,15 @@ TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes caps the expired-lease sweep
     REQUIRE(first.has_value());
     CHECK(first->expired_leases_reaped == 5000); // capped exactly at kReapCap
     CHECK_FALSE(first->clock_anomaly);
+    // PR #4299 round 4: the cap-bound EXISTS probe fired (a sweep hit kReapCap)
+    // and confirmed a real remainder (the 5001st row) — surfaced as
+    // ReapRoutesResult::cap_bound (-> outcome="ok_capped"), observability only.
+    CHECK(first->cap_bound);
 
     auto second = fx.store().reap_stale_routes();
     REQUIRE(second.has_value());
     CHECK(second->expired_leases_reaped == 1); // second pass drains the remainder
+    CHECK_FALSE(second->cap_bound); // below the cap this pass -> no hidden backlog
 }
 
 // ---------------------------------------------------------------------------
@@ -733,9 +748,23 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines a forward-skew anomaly ONCE, the
     REQUIRE((*stale1)->session_id.has_value());
     CHECK(*(*stale1)->session_id == "s-stale"); // NOT tombstoned by the declined pass
 
+    // Reading-continuity window (PR #4299 round 4): an IMMEDIATE second pass is
+    // BELOW the recovery floor (delta < kMinReapRecoveryGapMs) and would decline
+    // again — the floor stops an e-later pass free-riding with no persistence
+    // evidence. Pass 1 armed the marker at its own (real, ~now) first_now_ms;
+    // push that reading ~300s into the past (still the SAME anchor:forward pair)
+    // so pass 2's delta lands inside the window and recovery genuinely fires,
+    // without sleeping 4.5 real minutes.
+    {
+        auto m1 = fx.raw_get_reap_declined_anchor();
+        REQUIRE(m1.has_value());
+        CHECK(m1->rfind(poisoned + ":forward:", 0) == 0); // 3-field, armed by pass 1
+        fx.raw_set_reap_declined_anchor(marker3(poisoned, "forward", fx.raw_db_now_ms() - 300'000));
+    }
+
     // Pass 2: the anchor is STILL the same poisoned value (pass 1 never
-    // advanced it), so the identical anomaly persisting across a FULL
-    // decline pass is exactly what BLOCKER 1's fix treats as genuine
+    // advanced it), and the anomaly has now PERSISTED a plausible interval —
+    // exactly what BLOCKER 1's fix (+ the round-4 window) treats as genuine
     // elapsed downtime — this is the recovery this fix exists to provide;
     // without it, this pass would decline forever (the pre-fix wedge).
     auto out2 = fx.store().reap_stale_routes();
@@ -804,7 +833,18 @@ TEST_CASE("GatewayRouteStore[pg]: a routine >24h gap between accepted passes (we
     REQUIRE(anchor_after1.has_value());
     CHECK(*anchor_after1 == stale_anchor);
 
-    // Pass 2: the identical anomaly persisted across a full pass — RECOVERS,
+    // Round-4 recovery window: push pass 1's armed first_now_ms ~300s into the
+    // past (same stale_anchor:forward pair) so the identical anomaly is now seen
+    // to have PERSISTED a plausible interval, rather than recovering on an
+    // immediate (below-floor) repeat.
+    {
+        auto m1 = fx.raw_get_reap_declined_anchor();
+        REQUIRE(m1.has_value());
+        CHECK(m1->rfind(stale_anchor + ":forward:", 0) == 0);
+        fx.raw_set_reap_declined_anchor(marker3(stale_anchor, "forward", fx.raw_db_now_ms() - 300'000));
+    }
+
+    // Pass 2: the identical anomaly persisted a plausible interval — RECOVERS,
     // draining only the row that is genuinely past its grace window.
     auto out2 = fx.store().reap_stale_routes();
     REQUIRE(out2.has_value());
@@ -984,7 +1024,7 @@ TEST_CASE("GatewayRouteStore[pg]: a backward-skew decline followed by a DIFFEREN
     CHECK(out1->tombstones_reaped == 0);
     auto declined_after1 = fx.raw_get_reap_declined_anchor();
     REQUIRE(declined_after1.has_value());
-    CHECK(*declined_after1 == backward_poisoned + ":backward");
+    CHECK(declined_after1->rfind(backward_poisoned + ":backward:", 0) == 0); // 3-field
     auto anchor_after1 = fx.raw_get_reap_anchor();
     REQUIRE(anchor_after1.has_value());
     CHECK(*anchor_after1 == backward_poisoned);
@@ -994,10 +1034,12 @@ TEST_CASE("GatewayRouteStore[pg]: a backward-skew decline followed by a DIFFEREN
     // (forward-skew) — a DIFFERENT anomaly at that anchor than the one the
     // marker (fabricated here to stand in for "whatever pass 1 really
     // froze") records as "backward". Anchor matches; direction does not ->
-    // MUST re-decline, never recover.
+    // MUST re-decline, never recover. The marker's first_now_ms is seeded
+    // IN-WINDOW (~300s ago) so ONLY the direction mismatch — not the recovery
+    // floor — can force this decline (round 4).
     const std::string mix_anchor = std::to_string(fx.raw_db_now_ms() - 2LL * 24 * 3600 * 1000);
     fx.raw_set_reap_anchor(mix_anchor);
-    fx.raw_set_reap_declined_anchor(mix_anchor + ":backward");
+    fx.raw_set_reap_declined_anchor(marker3(mix_anchor, "backward", fx.raw_db_now_ms() - 300'000));
 
     auto out2 = fx.store().reap_stale_routes();
     REQUIRE(out2.has_value());
@@ -1026,15 +1068,19 @@ TEST_CASE("GatewayRouteStore[pg]: a backward-skew decline followed by a DIFFEREN
     // never left at the stale "backward" claim.
     auto declined_after2 = fx.raw_get_reap_declined_anchor();
     REQUIRE(declined_after2.has_value());
-    CHECK(*declined_after2 == mix_anchor + ":forward");
+    CHECK(declined_after2->rfind(mix_anchor + ":forward:", 0) == 0); // 3-field
     auto anchor_after2 = fx.raw_get_reap_anchor();
     REQUIRE(anchor_after2.has_value());
     CHECK(*anchor_after2 == mix_anchor); // anchor itself never moves on a decline
 
-    // Pass 3 (REAL, no more fabrication): the anchor is still mix_anchor
-    // (a decline never advances it), and only a few ms of real time have
-    // passed, so this pass reads the IDENTICAL forward-skew direction again
-    // against the IDENTICAL anchor -> matches the marker pass 2 just wrote
+    // Pass 2 armed (mix_anchor, forward) at its own ~now first_now_ms; push it
+    // ~300s into the past so pass 3's delta clears the recovery floor (round 4)
+    // rather than declining on an immediate below-floor repeat.
+    fx.raw_set_reap_declined_anchor(marker3(mix_anchor, "forward", fx.raw_db_now_ms() - 300'000));
+
+    // Pass 3: the anchor is still mix_anchor (a decline never advances it) and
+    // this pass reads the IDENTICAL forward-skew direction against the IDENTICAL
+    // anchor, now PERSISTED a plausible interval -> matches the marker
     // -> RECOVERS this time.
     auto out3 = fx.store().reap_stale_routes();
     REQUIRE(out3.has_value());
@@ -1095,13 +1141,14 @@ TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a DIFFERENT
     CHECK_FALSE(out1->recovered);
     auto declined_after1 = fx.raw_get_reap_declined_anchor();
     REQUIRE(declined_after1.has_value());
-    CHECK(*declined_after1 == forward_poisoned + ":forward");
+    CHECK(declined_after1->rfind(forward_poisoned + ":forward:", 0) == 0); // 3-field
 
     // Fabricate pass 2: SAME (re-seeded) anchor, now presented as
-    // backward-skew, marker still claiming "forward" -> mismatch.
+    // backward-skew, marker still claiming "forward" -> mismatch. first_now_ms
+    // seeded IN-WINDOW so only the direction mismatch can force the decline.
     const std::string mix_anchor = std::to_string(fx.raw_db_now_ms() + 3600LL * 1000);
     fx.raw_set_reap_anchor(mix_anchor);
-    fx.raw_set_reap_declined_anchor(mix_anchor + ":forward");
+    fx.raw_set_reap_declined_anchor(marker3(mix_anchor, "forward", fx.raw_db_now_ms() - 300'000));
 
     auto out2 = fx.store().reap_stale_routes();
     REQUIRE(out2.has_value());
@@ -1116,7 +1163,7 @@ TEST_CASE("GatewayRouteStore[pg]: a forward-skew decline followed by a DIFFERENT
 
     auto declined_after2 = fx.raw_get_reap_declined_anchor();
     REQUIRE(declined_after2.has_value());
-    CHECK(*declined_after2 == mix_anchor + ":backward"); // re-armed with the CURRENT direction
+    CHECK(declined_after2->rfind(mix_anchor + ":backward:", 0) == 0); // re-armed, CURRENT direction
 }
 
 // A 4-pass strict direction alternation must never accidentally recover:
@@ -1162,11 +1209,12 @@ TEST_CASE("GatewayRouteStore[pg]: a 4-pass direction alternation never recovers 
     };
     for (const auto& leg : legs) {
         fx.raw_set_reap_anchor(leg.anchor);
-        // Seed the marker at the SAME anchor but the OPPOSITE direction, so the
-        // anchor equality holds and ONLY the direction mismatch can force the
-        // decline. (Anchor-only keying would recover here.)
+        // Seed the marker at the SAME anchor but the OPPOSITE direction, with an
+        // IN-WINDOW first_now_ms (~300s ago), so anchor equality holds AND the
+        // recovery floor is cleared — leaving ONLY the direction mismatch able to
+        // force the decline. (Anchor-only keying would recover here.)
         const std::string opposite = leg.this_pass_direction == "forward" ? "backward" : "forward";
-        fx.raw_set_reap_declined_anchor(leg.anchor + ":" + opposite);
+        fx.raw_set_reap_declined_anchor(marker3(leg.anchor, opposite, fx.raw_db_now_ms() - 300'000));
 
         auto out = fx.store().reap_stale_routes();
         REQUIRE(out.has_value());
@@ -1174,10 +1222,10 @@ TEST_CASE("GatewayRouteStore[pg]: a 4-pass direction alternation never recovers 
         CHECK_FALSE(out->recovered); // DISCRIMINATING: true under anchor-only keying
         CHECK(out->expired_leases_reaped == 0);
         CHECK(out->tombstones_reaped == 0);
-        // Re-armed with THIS pass's direction, at this anchor.
+        // Re-armed with THIS pass's direction, at this anchor (3-field).
         auto marker = fx.raw_get_reap_declined_anchor();
         REQUIRE(marker.has_value());
-        CHECK(*marker == leg.anchor + ":" + leg.this_pass_direction);
+        CHECK(marker->rfind(leg.anchor + ":" + leg.this_pass_direction + ":", 0) == 0);
     }
 
     auto live = fx.store().lookup_route("agent-alt-live");
@@ -1225,10 +1273,10 @@ TEST_CASE("GatewayRouteStore[pg]: a legacy bare-integer declined-anchor marker i
     REQUIRE((*live)->session_id.has_value());
     CHECK(*(*live)->session_id == "s-live");
 
-    // Re-armed in the NEW format.
+    // Re-armed in the NEW 3-field format.
     auto declined_after = fx.raw_get_reap_declined_anchor();
     REQUIRE(declined_after.has_value());
-    CHECK(*declined_after == anchor + ":forward");
+    CHECK(declined_after->rfind(anchor + ":forward:", 0) == 0);
 }
 
 // The self-heal path (corrupt/unparseable PERSISTED anchor) clears

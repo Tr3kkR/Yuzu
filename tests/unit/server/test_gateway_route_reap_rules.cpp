@@ -16,6 +16,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <string_view>
 
 using namespace yuzu::server;
@@ -30,7 +31,18 @@ constexpr std::int64_t kSkew = 24LL * 3600 * 1000;
 // A plausible "now" well clear of the skew bound from the anchors below.
 constexpr std::int64_t kNow = 1'000'000'000'000; // ~2001 in epoch-ms, arbitrary but positive
 
+// The production recovery-window bounds (gateway_route_store.hpp): FLOOR
+// (kStaleLeaseGraceSecs + kKnownLeaseTtlSecs) * 1000 = 270'000, CEILING 1h.
+// The pure layer takes them as parameters; pin the production values here.
+constexpr std::int64_t kMinGap = 270'000;    // kMinReapRecoveryGapMs
+constexpr std::int64_t kMaxGap = 3'600'000;  // kMaxReapRecoveryGapMs
+
 std::optional<std::string_view> sv(std::string_view s) { return std::optional<std::string_view>(s); }
+
+// Build a 3-field marker "<anchor>:<direction>:<first_now_ms>".
+std::string marker3(std::int64_t anchor, std::string_view dir, std::int64_t first_now_ms) {
+    return std::to_string(anchor) + ":" + std::string(dir) + ":" + std::to_string(first_now_ms);
+}
 
 } // namespace
 
@@ -39,7 +51,7 @@ std::optional<std::string_view> sv(std::string_view s) { return std::optional<st
 TEST_CASE("decide_reap: bad now (unparseable) -> clear marker, no sweep, anomaly",
           "[gateway_route][reap_rules]") {
     const ReapDecision d = decide_reap("not-a-number", sv("900000000000"),
-                                       sv("900000000000:forward"), kSkew);
+                                       sv("900000000000:forward"), kSkew, kMinGap, kMaxGap);
     CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
     CHECK_FALSE(d.new_anchor.has_value()); // anchor untouched
     CHECK_FALSE(d.run_sweeps);
@@ -49,7 +61,7 @@ TEST_CASE("decide_reap: bad now (unparseable) -> clear marker, no sweep, anomaly
 
 TEST_CASE("decide_reap: bad now (negative) -> clear marker, no sweep, anomaly",
           "[gateway_route][reap_rules]") {
-    const ReapDecision d = decide_reap("-5", sv("900000000000"), std::nullopt, kSkew);
+    const ReapDecision d = decide_reap("-5", sv("900000000000"), std::nullopt, kSkew, kMinGap, kMaxGap);
     CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
     CHECK_FALSE(d.new_anchor.has_value());
     CHECK_FALSE(d.run_sweeps);
@@ -61,7 +73,7 @@ TEST_CASE("decide_reap: corrupt persisted anchor -> clear + re-anchor to now, no
           "[gateway_route][reap_rules]") {
     SECTION("unparseable anchor") {
         const ReapDecision d =
-            decide_reap(std::to_string(kNow), sv("garbage"), sv("123:backward"), kSkew);
+            decide_reap(std::to_string(kNow), sv("garbage"), sv("123:backward"), kSkew, kMinGap, kMaxGap);
         CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
         REQUIRE(d.new_anchor.has_value());
         CHECK(*d.new_anchor == kNow); // re-anchored to THIS pass's now
@@ -70,7 +82,7 @@ TEST_CASE("decide_reap: corrupt persisted anchor -> clear + re-anchor to now, no
         CHECK_FALSE(d.recovered);
     }
     SECTION("negative anchor") {
-        const ReapDecision d = decide_reap(std::to_string(kNow), sv("-1"), std::nullopt, kSkew);
+        const ReapDecision d = decide_reap(std::to_string(kNow), sv("-1"), std::nullopt, kSkew, kMinGap, kMaxGap);
         CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
         REQUIRE(d.new_anchor.has_value());
         CHECK(*d.new_anchor == kNow);
@@ -81,7 +93,7 @@ TEST_CASE("decide_reap: corrupt persisted anchor -> clear + re-anchor to now, no
 
 TEST_CASE("decide_reap: no anchor (first pass) -> clear + anchor to now + run sweeps",
           "[gateway_route][reap_rules]") {
-    const ReapDecision d = decide_reap(std::to_string(kNow), std::nullopt, std::nullopt, kSkew);
+    const ReapDecision d = decide_reap(std::to_string(kNow), std::nullopt, std::nullopt, kSkew, kMinGap, kMaxGap);
     CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
     REQUIRE(d.new_anchor.has_value());
     CHECK(*d.new_anchor == kNow);
@@ -95,7 +107,7 @@ TEST_CASE("decide_reap: clean pass (valid anchor, no skew) -> clear + advance to
     SECTION("anchor behind now -> advance to now") {
         const std::int64_t anchor = kNow - 5000;
         const ReapDecision d =
-            decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew);
+            decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew, kMinGap, kMaxGap);
         CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
         REQUIRE(d.new_anchor.has_value());
         CHECK(*d.new_anchor == kNow); // max(anchor, now) == now
@@ -105,7 +117,7 @@ TEST_CASE("decide_reap: clean pass (valid anchor, no skew) -> clear + advance to
     }
     SECTION("anchor equal to now -> stays") {
         const ReapDecision d =
-            decide_reap(std::to_string(kNow), sv(std::to_string(kNow)), std::nullopt, kSkew);
+            decide_reap(std::to_string(kNow), sv(std::to_string(kNow)), std::nullopt, kSkew, kMinGap, kMaxGap);
         REQUIRE(d.new_anchor.has_value());
         CHECK(*d.new_anchor == kNow);
         CHECK(d.run_sweeps);
@@ -117,7 +129,7 @@ TEST_CASE("decide_reap: clean pass (valid anchor, no skew) -> clear + advance to
         // plausible range stays a clean advance.
         const std::int64_t anchor = kNow - 1; // now ahead by 1ms, well under skew
         const ReapDecision d =
-            decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew);
+            decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew, kMinGap, kMaxGap);
         REQUIRE(d.new_anchor.has_value());
         CHECK(*d.new_anchor == kNow);
         CHECK(d.run_sweeps);
@@ -129,7 +141,7 @@ TEST_CASE("decide_reap: fresh forward skew, no marker -> ARM(forward), no sweep,
           "[gateway_route][reap_rules]") {
     const std::int64_t anchor = kNow - 2 * kSkew; // now - anchor > 1 day
     const ReapDecision d =
-        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew);
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew, kMinGap, kMaxGap);
     REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
     CHECK(d.marker.anchor() == anchor);
     CHECK(d.marker.direction() == "forward");
@@ -143,7 +155,7 @@ TEST_CASE("decide_reap: fresh backward skew, no marker -> ARM(backward), no swee
           "[gateway_route][reap_rules]") {
     const std::int64_t anchor = kNow + 3600LL * 1000; // anchor ahead of now -> backward
     const ReapDecision d =
-        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew);
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew, kMinGap, kMaxGap);
     REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
     CHECK(d.marker.anchor() == anchor);
     CHECK(d.marker.direction() == "backward");
@@ -152,12 +164,14 @@ TEST_CASE("decide_reap: fresh backward skew, no marker -> ARM(backward), no swee
     CHECK(d.clock_anomaly);
 }
 
-TEST_CASE("decide_reap: matched (same anchor AND direction) repeat -> RECOVER, unconditional "
-          "re-anchor to now, run sweeps",
+TEST_CASE("decide_reap: matched (same anchor AND direction) IN-WINDOW repeat -> RECOVER, "
+          "unconditional re-anchor to now, run sweeps",
           "[gateway_route][reap_rules]") {
     const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
-    const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)),
-                                       sv(std::to_string(anchor) + ":forward"), kSkew);
+    // delta = now - first_now = 300s, inside [kMinGap, kMaxGap] -> recovers.
+    const std::string m = marker3(anchor, "forward", kNow - 300'000);
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
     CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
     REQUIRE(d.new_anchor.has_value());
     CHECK(*d.new_anchor == kNow); // UNCONDITIONAL now, never max(anchor, now)
@@ -166,14 +180,126 @@ TEST_CASE("decide_reap: matched (same anchor AND direction) repeat -> RECOVER, u
     CHECK(d.recovered);
 }
 
+// --- PR #4299 round 4: the reading-continuity recovery window --------------
+
+TEST_CASE("decide_reap: BELOW-FLOOR repeat (delta in [0, kMin)) -> decline, RE-ARM preserving the "
+          "ORIGINAL first_now_ms, not recovered",
+          "[gateway_route][reap_rules]") {
+    const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
+    const std::int64_t original_first = kNow - 100'000; // delta 100s < kMinGap
+    const std::string m = marker3(anchor, "forward", original_first);
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
+    REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
+    CHECK(d.marker.anchor() == anchor);
+    CHECK(d.marker.direction() == "forward");
+    // The ORIGINAL first_now_ms is PRESERVED, never reset to now — else offset
+    // replicas ticking every few seconds would reset it forever (a wedge).
+    CHECK(d.marker.first_now_ms() == original_first);
+    CHECK_FALSE(d.new_anchor.has_value());
+    CHECK_FALSE(d.run_sweeps);
+    CHECK(d.clock_anomaly);
+    CHECK_FALSE(d.recovered);
+}
+
+TEST_CASE("decide_reap: ABOVE-CEILING repeat (delta > kMax) -> decline as a NEW anomaly, RE-ARM "
+          "with now_ms, not recovered",
+          "[gateway_route][reap_rules]") {
+    const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
+    const std::int64_t original_first = kNow - (kMaxGap + 1'000'000); // delta > kMaxGap
+    const std::string m = marker3(anchor, "forward", original_first);
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
+    REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
+    CHECK(d.marker.direction() == "forward");
+    // A discontinuous jump is a NEW distinct anomaly -> re-armed with THIS
+    // pass's reading (now_ms), not the stale original.
+    CHECK(d.marker.first_now_ms() == kNow);
+    CHECK_FALSE(d.run_sweeps);
+    CHECK(d.clock_anomaly);
+    CHECK_FALSE(d.recovered);
+}
+
+TEST_CASE("decide_reap: NEGATIVE delta (marker first_now_ms AHEAD of now — a further-backward "
+          "step) -> decline as a NEW anomaly, RE-ARM with now_ms",
+          "[gateway_route][reap_rules]") {
+    const std::int64_t anchor = kNow - 2 * kSkew; // forward skew this pass
+    const std::int64_t original_first = kNow + 5'000; // first_now ahead of now -> delta < 0
+    const std::string m = marker3(anchor, "forward", original_first);
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
+    REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
+    CHECK(d.marker.first_now_ms() == kNow); // re-armed against this reading
+    CHECK_FALSE(d.run_sweeps);
+    CHECK(d.clock_anomaly);
+    CHECK_FALSE(d.recovered);
+}
+
+TEST_CASE("decide_reap: OFFSET-REPLICA sequence — an e-later repeat declines (floor), a genuine "
+          "persist recovers",
+          "[gateway_route][reap_rules]") {
+    const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
+    // Arm at first_now = T (this pass's now); the store persists (anchor, fwd, T).
+    const ReapDecision armed =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), std::nullopt, kSkew, kMinGap, kMaxGap);
+    REQUIRE(armed.marker.kind() == MarkerAction::Kind::Arm);
+    const std::int64_t first_now = armed.marker.first_now_ms();
+    CHECK(first_now == kNow);
+    const std::string m = marker3(anchor, "forward", first_now);
+
+    // A second replica ticks ~100s later (< floor): must NOT recover — no real
+    // persistence evidence yet. Preserves the original first_now.
+    const std::int64_t t_plus_100 = kNow + 100'000;
+    const ReapDecision eps =
+        decide_reap(std::to_string(t_plus_100), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
+    REQUIRE(eps.marker.kind() == MarkerAction::Kind::Arm);
+    CHECK(eps.marker.first_now_ms() == first_now); // preserved
+    CHECK_FALSE(eps.recovered);
+    CHECK(eps.clock_anomaly);
+
+    // A genuine persist ~300s later (in window): recovers and drains.
+    const std::int64_t t_plus_300 = kNow + 300'000;
+    const ReapDecision rec =
+        decide_reap(std::to_string(t_plus_300), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
+    CHECK(rec.marker.kind() == MarkerAction::Kind::Clear);
+    REQUIRE(rec.new_anchor.has_value());
+    CHECK(*rec.new_anchor == t_plus_300); // unconditional re-anchor to this pass's now
+    CHECK(rec.run_sweeps);
+    CHECK_FALSE(rec.clock_anomaly);
+    CHECK(rec.recovered);
+}
+
+TEST_CASE("decide_reap: 2-field and 4-field markers are absent -> ARM fresh (mixed-version safe)",
+          "[gateway_route][reap_rules]") {
+    const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
+    SECTION("2-field (legacy/old-binary) marker") {
+        const std::string m = std::to_string(anchor) + ":forward"; // no first_now_ms
+        const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m),
+                                           kSkew, kMinGap, kMaxGap);
+        REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm); // absent -> re-arm in 3-field
+        CHECK(d.marker.first_now_ms() == kNow);
+        CHECK_FALSE(d.recovered);
+    }
+    SECTION("4-field marker") {
+        const std::string m = std::to_string(anchor) + ":forward:" + std::to_string(kNow - 300'000) + ":extra";
+        const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m),
+                                           kSkew, kMinGap, kMaxGap);
+        REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm); // absent -> re-arm
+        CHECK_FALSE(d.recovered);
+    }
+}
+
 TEST_CASE("decide_reap: different-DIRECTION marker at same anchor (r2) -> ARM, not RECOVER",
           "[gateway_route][reap_rules]") {
     // The anomaly THIS pass sees is forward-skew; the marker frozen at the same
     // anchor claims "backward". Anchor matches, direction does not -> re-decline
     // (never recover) — the round-2 external-review defect this guards.
     const std::int64_t anchor = kNow - 2 * kSkew; // forward skew this pass
-    const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)),
-                                       sv(std::to_string(anchor) + ":backward"), kSkew);
+    // In-window first_now, so ONLY the direction mismatch (marker says backward,
+    // this pass is forward) can force the decline — not the persistence window.
+    const std::string m = marker3(anchor, "backward", kNow - 300'000);
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
     REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
     CHECK(d.marker.direction() == "forward"); // re-armed with THIS pass's direction
     CHECK_FALSE(d.new_anchor.has_value());
@@ -185,8 +311,10 @@ TEST_CASE("decide_reap: different-DIRECTION marker at same anchor (r2) -> ARM, n
 TEST_CASE("decide_reap: different-ANCHOR marker -> ARM, not RECOVER", "[gateway_route][reap_rules]") {
     const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
     const std::int64_t other_anchor = anchor - 777;
-    const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)),
-                                       sv(std::to_string(other_anchor) + ":forward"), kSkew);
+    // In-window first_now: only the ANCHOR mismatch can force the decline.
+    const std::string m = marker3(other_anchor, "forward", kNow - 300'000);
+    const ReapDecision d =
+        decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
     REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
     CHECK(d.marker.anchor() == anchor);
     CHECK(d.marker.direction() == "forward");
@@ -200,14 +328,14 @@ TEST_CASE("decide_reap: unparseable/legacy marker under a skew -> ARM (treated a
     const std::int64_t anchor = kNow - 2 * kSkew; // forward skew
     SECTION("legacy bare-integer marker (no :direction)") {
         const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)),
-                                           sv(std::to_string(anchor)), kSkew);
+                                           sv(std::to_string(anchor)), kSkew, kMinGap, kMaxGap);
         REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
         CHECK(d.marker.direction() == "forward");
         CHECK_FALSE(d.recovered);
     }
     SECTION("garbage marker") {
         const ReapDecision d =
-            decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv("total-garbage"), kSkew);
+            decide_reap(std::to_string(kNow), sv(std::to_string(anchor)), sv("total-garbage"), kSkew, kMinGap, kMaxGap);
         REQUIRE(d.marker.kind() == MarkerAction::Kind::Arm);
         CHECK_FALSE(d.recovered);
     }
@@ -220,9 +348,9 @@ TEST_CASE("decide_reap: unparseable/legacy marker under a skew -> ARM (treated a
 TEST_CASE("decide_reap: bad now with a matching-looking marker present still CLEARs it (r3 fix)",
           "[gateway_route][reap_rules]") {
     const std::int64_t anchor = kNow - 2 * kSkew;
+    const std::string m = marker3(anchor, "forward", kNow - 300'000); // would recover if now were valid
     SECTION("junk now") {
-        const ReapDecision d = decide_reap("junk", sv(std::to_string(anchor)),
-                                           sv(std::to_string(anchor) + ":forward"), kSkew);
+        const ReapDecision d = decide_reap("junk", sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
         CHECK(d.marker.kind() == MarkerAction::Kind::Clear); // NOT left, NOT recovered
         CHECK_FALSE(d.new_anchor.has_value());
         CHECK_FALSE(d.run_sweeps);
@@ -230,8 +358,7 @@ TEST_CASE("decide_reap: bad now with a matching-looking marker present still CLE
         CHECK_FALSE(d.recovered);
     }
     SECTION("negative now") {
-        const ReapDecision d = decide_reap("-1", sv(std::to_string(anchor)),
-                                           sv(std::to_string(anchor) + ":forward"), kSkew);
+        const ReapDecision d = decide_reap("-1", sv(std::to_string(anchor)), sv(m), kSkew, kMinGap, kMaxGap);
         CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
         CHECK_FALSE(d.recovered);
     }
@@ -261,35 +388,43 @@ TEST_CASE("parse_reap_i64: non-canonical / malformed rejected", "[gateway_route]
 
 // --- parse_declined_marker: the marker-format matrix ------------------------
 
-TEST_CASE("parse_declined_marker: well-formed markers accepted", "[gateway_route][reap_rules]") {
-    auto f = parse_declined_marker("42:forward");
+TEST_CASE("parse_declined_marker: well-formed 3-field markers accepted", "[gateway_route][reap_rules]") {
+    auto f = parse_declined_marker("42:forward:1000");
     REQUIRE(f.has_value());
-    CHECK(f->first == 42);
-    CHECK(f->second == "forward");
+    CHECK(f->anchor == 42);
+    CHECK(f->direction == "forward");
+    CHECK(f->first_now_ms == 1000);
 
-    auto b = parse_declined_marker("1000000000000:backward");
+    auto b = parse_declined_marker("1000000000000:backward:2000000000000");
     REQUIRE(b.has_value());
-    CHECK(b->first == 1000000000000);
-    CHECK(b->second == "backward");
+    CHECK(b->anchor == 1000000000000);
+    CHECK(b->direction == "backward");
+    CHECK(b->first_now_ms == 2000000000000);
 
-    auto zero = parse_declined_marker("0:forward");
+    auto zero = parse_declined_marker("0:forward:0");
     REQUIRE(zero.has_value());
-    CHECK(zero->first == 0);
+    CHECK(zero->anchor == 0);
+    CHECK(zero->first_now_ms == 0);
 }
 
 TEST_CASE("parse_declined_marker: malformed markers treated as absent",
           "[gateway_route][reap_rules]") {
-    CHECK_FALSE(parse_declined_marker("").has_value());            // empty
-    CHECK_FALSE(parse_declined_marker("42").has_value());          // legacy bare integer, no colon
-    CHECK_FALSE(parse_declined_marker("42:sideways").has_value()); // bad direction token
-    CHECK_FALSE(parse_declined_marker("42:FORWARD").has_value());  // case-sensitive
-    CHECK_FALSE(parse_declined_marker("42:").has_value());         // empty direction
-    CHECK_FALSE(parse_declined_marker(":forward").has_value());    // empty anchor
-    CHECK_FALSE(parse_declined_marker("-5:forward").has_value());  // negative anchor rejected
-    CHECK_FALSE(parse_declined_marker("007:forward").has_value()); // non-canonical anchor rejected
-    CHECK_FALSE(parse_declined_marker(" 5:forward").has_value());  // leading ws on anchor
-    CHECK_FALSE(parse_declined_marker("42:forward:extra").has_value()); // multi-colon: "forward:extra" not a direction
-    CHECK_FALSE(parse_declined_marker("abc:forward").has_value());  // non-numeric anchor
+    CHECK_FALSE(parse_declined_marker("").has_value());              // empty
+    CHECK_FALSE(parse_declined_marker("42").has_value());            // no colon
+    CHECK_FALSE(parse_declined_marker("42:forward").has_value());    // 2-field (legacy/old-binary)
+    CHECK_FALSE(parse_declined_marker("42:sideways:1000").has_value()); // bad direction token
+    CHECK_FALSE(parse_declined_marker("42:FORWARD:1000").has_value());  // case-sensitive
+    CHECK_FALSE(parse_declined_marker("42::1000").has_value());       // empty direction
+    CHECK_FALSE(parse_declined_marker(":forward:1000").has_value());  // empty anchor
+    CHECK_FALSE(parse_declined_marker("-5:forward:1000").has_value()); // negative anchor rejected
+    CHECK_FALSE(parse_declined_marker("42:forward:-5").has_value());  // negative first_now_ms rejected
+    CHECK_FALSE(parse_declined_marker("007:forward:1000").has_value()); // non-canonical anchor
+    CHECK_FALSE(parse_declined_marker("42:forward:007").has_value()); // non-canonical first_now_ms
+    CHECK_FALSE(parse_declined_marker(" 5:forward:1000").has_value()); // leading ws on anchor
+    CHECK_FALSE(parse_declined_marker("42:forward:1000:extra").has_value()); // 4-field
+    CHECK_FALSE(parse_declined_marker("42:forward:").has_value());    // empty first_now_ms
+    CHECK_FALSE(parse_declined_marker("abc:forward:1000").has_value()); // non-numeric anchor
+    CHECK_FALSE(parse_declined_marker("42:forward:abc").has_value()); // non-numeric first_now_ms
 }
 
 TEST_CASE("decide_reap: a negative skew bound is clamped to 0 (cannot invert the clean path)",
@@ -299,7 +434,7 @@ TEST_CASE("decide_reap: a negative skew bound is clamped to 0 (cannot invert the
     // otherwise-clean pass. The entry clamp (<0 -> 0) keeps now==anchor clean.
     // Discriminating: without the clamp these CHECK_FALSEs flip (arm + anomaly).
     const ReapDecision d =
-        decide_reap(std::to_string(kNow), sv(std::to_string(kNow)), std::nullopt, -1);
+        decide_reap(std::to_string(kNow), sv(std::to_string(kNow)), std::nullopt, -1, kMinGap, kMaxGap);
     CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
     REQUIRE(d.new_anchor.has_value());
     CHECK(*d.new_anchor == kNow);

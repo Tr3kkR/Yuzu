@@ -23,11 +23,21 @@
 /// apply tail executes it. This makes every decision unit-testable with no
 /// Postgres at all (see tests/unit/server/test_gateway_route_reap_rules.cpp).
 ///
-/// The decision semantics here are BYTE-IDENTICAL to the pre-split behaviour for
-/// every path EXCEPT the bad-`now()` branch: that path used to LEAVE the marker
-/// (round-3 defect), and now CLEARs it — a distinct anomaly must not leave a
-/// stale recovery identity behind, so a later same-direction skew is judged
-/// fresh. See docs/clock-guarded-retention.md's GatewayRouteStore entry.
+/// ROUND 4 (PR #4299, reading-continuity recovery window). The skew-recovery
+/// branch no longer recovers on a bare (anchor, direction) match: the marker now
+/// carries a THIRD field, `first_now_ms` (the `now()` reading the anomaly was
+/// first observed at), and recovery fires only when the anomaly has PERSISTED a
+/// real-time-plausible interval — `delta = now_ms - first_now_ms` in
+/// `[min_recovery_gap_ms, max_recovery_gap_ms]`. Below the floor it re-declines
+/// preserving the original reading; above the ceiling (or a negative delta) it
+/// re-declines as a NEW distinct anomaly against the current reading. The floor
+/// is load-bearing for the multi-replica future: without it an ε-later
+/// second-replica pass would recover with zero persistence evidence. See
+/// docs/clock-guarded-retention.md's GatewayRouteStore entry.
+///
+/// The round-3 semantics still hold underneath: the bad-`now()` branch CLEARs
+/// the marker (it used to LEAVE it), so a distinct anomaly never leaves a stale
+/// recovery identity behind.
 /// (The ONE other in-diff change is input hardening, not decision semantics:
 /// `parse_reap_i64` was tightened past a bare `strtoll` to full-consumption +
 /// canonical round-trip, so a non-canonical STORED numeric — "007", "-0", "+5",
@@ -69,35 +79,63 @@ inline std::optional<std::int64_t> parse_reap_i64(std::string_view val) {
     return v;
 }
 
+/// A parsed `reap_declined_anchor_ms` marker: the frozen anchor, the anomaly
+/// direction, and the `now()` reading of the FIRST pass that observed this
+/// anomaly (`first_now_ms`). The first reading is what bounds recovery to a
+/// plausible persistence window (PR #4299 round 4) — see `decide_reap`.
+struct DeclinedMarker {
+    std::int64_t anchor{0};
+    std::string direction;         ///< "forward" | "backward"
+    std::int64_t first_now_ms{0};  ///< now() at the FIRST decline of this anomaly
+};
+
 /// Parses the `reap_declined_anchor_ms` marker, format
-/// `"<anchor>:<direction>"` (direction ∈ {"forward","backward"}). The
-/// decline/recovery pair is judged on the FULL fact set (frozen anchor AND
-/// anomaly direction), never the anchor alone (docs/clock-guarded-retention.md
-/// part 4; PR #4299 round-2 external review). Direction is NEVER sign-encoded
-/// — a negative anchor is the tamper signal `parse_reap_i64` already rejects,
-/// so it stays a suffix, not an arithmetic trick.
+/// `"<anchor>:<direction>:<first_now_ms>"` (direction ∈ {"forward","backward"};
+/// THREE fields — PR #4299 round 4 added `first_now_ms`, the reading the anomaly
+/// was first observed at, so recovery can bound persistence, not just match a
+/// frozen (anchor, direction) pair). The decline/recovery pair is judged on the
+/// FULL fact set (frozen anchor AND anomaly direction AND first reading), never
+/// the anchor alone (docs/clock-guarded-retention.md part 4; PR #4299 round-2
+/// external review + round 4). Direction is NEVER sign-encoded — a negative
+/// value is the tamper signal `parse_reap_i64` already rejects, so it stays a
+/// literal field, not an arithmetic trick.
 ///
-/// Absent on any of: no `:` (a LEGACY bare-integer marker from before this
-/// fix, or a garbled value), an unrecognised direction token, or an
-/// unparseable/negative anchor half. Absent is always safe — every call site
-/// treats it as "no prior decline", which re-arms in the new format and
-/// declines once more rather than granting an unearned recovery. This is what
-/// makes a MIXED-VERSION rollout safe in both directions: an OLDER binary
-/// reading this store's new `"<int>:<dir>"` value hands the whole string to
-/// its own bare `parse_reap_i64`, which stops at the `:` and rejects the
-/// trailing text — so it too treats the marker as absent and declines.
-inline std::optional<std::pair<std::int64_t, std::string>>
-parse_declined_marker(std::string_view val) {
-    const auto colon = val.find(':');
-    if (colon == std::string_view::npos)
+/// Requires EXACTLY three fields; ANY other shape is absent (→ nullopt):
+///  - fewer than two `:` (a 2-field LEGACY/old-binary marker, or a garbled
+///    value with no colon at all),
+///  - more than two `:` (a 4+-field value — the trailing field then carries a
+///    `:` that `parse_reap_i64` rejects as non-numeric),
+///  - an unrecognised direction token,
+///  - an unparseable / non-canonical / negative anchor or `first_now_ms` half.
+///
+/// Absent is always safe — every call site treats it as "no prior decline",
+/// which re-arms in the new 3-field format and declines once more rather than
+/// granting an unearned recovery. This keeps a MIXED-VERSION rollout safe in
+/// BOTH directions: a NEW binary reading an OLD 2-field `"<int>:<dir>"` value
+/// sees only one colon → absent → re-arms in the 3-field format; an OLD binary
+/// reading this store's new 3-field value hands the whole string to its own
+/// bare `parse_reap_i64` (or its own 2-field parser), which rejects the extra
+/// field(s) → it too treats the marker as absent and declines.
+inline std::optional<DeclinedMarker> parse_declined_marker(std::string_view val) {
+    const auto c1 = val.find(':');
+    if (c1 == std::string_view::npos)
         return std::nullopt;
-    const std::string_view direction = val.substr(colon + 1);
+    const auto c2 = val.find(':', c1 + 1);
+    if (c2 == std::string_view::npos)
+        return std::nullopt; // fewer than three fields (legacy/old-binary marker)
+    const std::string_view direction = val.substr(c1 + 1, c2 - (c1 + 1));
     if (direction != "forward" && direction != "backward")
         return std::nullopt;
-    auto anchor = parse_reap_i64(val.substr(0, colon));
+    auto anchor = parse_reap_i64(val.substr(0, c1));
     if (!anchor || *anchor < 0)
         return std::nullopt;
-    return std::make_pair(*anchor, std::string(direction));
+    // A 4+-field value leaves a `:` in this trailing half, which parse_reap_i64
+    // rejects as trailing garbage — so "exactly three fields" is enforced here
+    // without a separate colon count.
+    auto first_now_ms = parse_reap_i64(val.substr(c2 + 1));
+    if (!first_now_ms || *first_now_ms < 0)
+        return std::nullopt;
+    return DeclinedMarker{*anchor, std::string(direction), *first_now_ms};
 }
 
 /// What a reap pass must do to the persisted `reap_declined_anchor_ms` marker.
@@ -113,28 +151,34 @@ class MarkerAction {
 public:
     enum class Kind {
         Clear, ///< DELETE reap_declined_anchor_ms
-        Arm,   ///< upsert reap_declined_anchor_ms = "<anchor>:<direction>"
+        Arm,   ///< upsert reap_declined_anchor_ms = "<anchor>:<direction>:<first_now_ms>"
     };
 
     /// Clear the marker (accepted pass, recovery, self-heal, bad-now decline).
-    static MarkerAction clear() { return MarkerAction(Kind::Clear, 0, ""); }
+    static MarkerAction clear() { return MarkerAction(Kind::Clear, 0, "", 0); }
 
-    /// Arm/re-arm the marker against this pass's (anchor, direction) anomaly.
-    static MarkerAction arm(std::int64_t anchor, std::string_view direction) {
-        return MarkerAction(Kind::Arm, anchor, std::string(direction));
+    /// Arm/re-arm the marker against this pass's (anchor, direction) anomaly,
+    /// recording `first_now_ms` — the `now()` reading this anomaly is being
+    /// pinned to (the CURRENT reading for a fresh/new anomaly, or the PRESERVED
+    /// original for a not-yet-persisted repeat; see `decide_reap`).
+    static MarkerAction arm(std::int64_t anchor, std::string_view direction,
+                            std::int64_t first_now_ms) {
+        return MarkerAction(Kind::Arm, anchor, std::string(direction), first_now_ms);
     }
 
     [[nodiscard]] Kind kind() const { return kind_; }
     [[nodiscard]] std::int64_t anchor() const { return anchor_; }
     [[nodiscard]] const std::string& direction() const { return direction_; }
+    [[nodiscard]] std::int64_t first_now_ms() const { return first_now_ms_; }
 
 private:
-    MarkerAction(Kind k, std::int64_t a, std::string d)
-        : kind_(k), anchor_(a), direction_(std::move(d)) {}
+    MarkerAction(Kind k, std::int64_t a, std::string d, std::int64_t f)
+        : kind_(k), anchor_(a), direction_(std::move(d)), first_now_ms_(f) {}
 
     Kind kind_;
     std::int64_t anchor_;
     std::string direction_;
+    std::int64_t first_now_ms_;
 };
 
 /// The outcome of `decide_reap`. `marker` is MANDATORY (no default) — see
@@ -174,18 +218,39 @@ struct ReapDecision {
 ///  - **valid anchor, skew present** (forward: now_ms-anchor>max_skew;
 ///    backward: now_ms<anchor):
 ///      - **marker matches** (declined anchor == anchor AND declined
-///        direction == this pass's direction): CLEAR, anchor = now_ms
-///        UNCONDITIONALLY, run sweeps, recovered — a persisted gap treated as
-///        genuine elapsed downtime.
+///        direction == this pass's direction) — the persistence window is then
+///        judged from `delta = now_ms - marker.first_now_ms` (PR #4299 round 4):
+///          - `delta < 0` OR `delta > max_recovery_gap_ms`: a NEW, distinct
+///            anomaly (a discontinuous forward jump, or a further-backward
+///            step) — **ARM(anchor, dir, now_ms)** + decline. It gets its own
+///            decline-once against THIS reading, not a free recovery.
+///          - `0 <= delta < min_recovery_gap_ms`: not yet persisted long
+///            enough — **ARM(anchor, dir, marker.first_now_ms /* PRESERVED */)**
+///            + decline. The original first reading is preserved, NEVER reset,
+///            or offset replicas ticking every few seconds would reset it
+///            forever = a wedge.
+///          - `min_recovery_gap_ms <= delta <= max_recovery_gap_ms`: the SAME
+///            anomaly genuinely persisted a real-time-plausible interval —
+///            CLEAR, anchor = now_ms UNCONDITIONALLY, run sweeps, recovered.
 ///      - **else** (no marker / different anchor / different direction /
-///        unparseable marker): ARM(anchor, direction), leave anchor, no
-///        sweeps, clock_anomaly.
+///        unparseable marker): ARM(anchor, direction, now_ms), leave anchor, no
+///        sweeps, clock_anomaly — a fresh anomaly, decline-once against this
+///        reading.
 ///  - **valid anchor, NO skew** (clean): CLEAR, anchor = max(anchor, now_ms),
 ///    run sweeps.
+///
+/// `min_recovery_gap_ms` / `max_recovery_gap_ms` bound the recovery persistence
+/// window; both are clamped to >= 0 at entry (defensive, like
+/// `max_plausible_skew_ms`). The production values are `kMinReapRecoveryGapMs` /
+/// `kMaxReapRecoveryGapMs` (gateway_route_store.hpp), with the FLOOR load-bearing
+/// for the multi-replica future this slice exists for: without it, an ε-later
+/// second-replica pass would recover with zero persistence evidence.
 inline ReapDecision decide_reap(std::string_view now_raw,
                                 std::optional<std::string_view> anchor_raw,
                                 std::optional<std::string_view> marker_raw,
-                                std::int64_t max_plausible_skew_ms) {
+                                std::int64_t max_plausible_skew_ms,
+                                std::int64_t min_recovery_gap_ms,
+                                std::int64_t max_recovery_gap_ms) {
     // DEFENSIVE: the sole production caller passes a positive compile-time
     // constant (kMaxPlausibleSkewMs), but this is now a public pure helper — a
     // future/mis-wired NEGATIVE bound would invert the clean path (every
@@ -194,6 +259,13 @@ inline ReapDecision decide_reap(std::string_view now_raw,
     // a skew, never the reverse), so the parameter can never flip clean → skew.
     if (max_plausible_skew_ms < 0)
         max_plausible_skew_ms = 0;
+    // Same defensive clamp for the recovery-window bounds (PR #4299 round 4):
+    // the production caller passes positive compile-time constants whose
+    // ordering a static_assert enforces, but this is a public pure helper.
+    if (min_recovery_gap_ms < 0)
+        min_recovery_gap_ms = 0;
+    if (max_recovery_gap_ms < 0)
+        max_recovery_gap_ms = 0;
     // SANITISE now() (clock-guarded-retention part 3): unparseable or negative
     // is an ANOMALY, never a quiet fallback. NOT a wedge risk — nothing here
     // is persisted beyond clearing a stale marker; the next pass issues its
@@ -236,25 +308,60 @@ inline ReapDecision decide_reap(std::string_view now_raw,
 
         if (forward_skew || backward_skew) {
             const std::string_view current_direction = forward_skew ? "forward" : "backward";
-            std::optional<std::pair<std::int64_t, std::string>> declined;
+            std::optional<DeclinedMarker> declined;
             if (marker_raw.has_value())
                 declined = parse_declined_marker(*marker_raw);
             // RECOVER only on the FULL (anchor, direction) match — a value-only
             // match let a DIFFERENT-direction anomaly at the same frozen anchor
             // recover and run the sweeps against a corrupted now_ms (round-2
             // external review defect).
-            if (declined.has_value() && declined->first == anchor &&
-                declined->second == current_direction) {
+            if (declined.has_value() && declined->anchor == anchor &&
+                declined->direction == current_direction) {
+                // Reading-continuity window (PR #4299 round 4): the SAME
+                // (anchor, direction) matching is necessary but no longer
+                // sufficient — the anomaly must also have PERSISTED a
+                // real-time-plausible interval measured from the reading it
+                // was first observed at. This compares the full fact set,
+                // including the magnitude/continuity of the reading, so a
+                // second UNRELATED same-direction jump at the same frozen
+                // anchor cannot free-ride the first anomaly's decline.
+                const std::int64_t delta = now_ms - declined->first_now_ms;
+                if (delta < 0 || delta > max_recovery_gap_ms) {
+                    // A NEW, distinct anomaly: a discontinuous forward jump past
+                    // the ceiling, or a further-backward step (negative delta).
+                    // It earns its OWN decline-once against this reading.
+                    return ReapDecision{
+                        .marker = MarkerAction::arm(anchor, current_direction, now_ms),
+                        .new_anchor = std::nullopt,
+                        .run_sweeps = false,
+                        .clock_anomaly = true,
+                        .recovered = false};
+                }
+                if (delta < min_recovery_gap_ms) {
+                    // Not yet persisted long enough. PRESERVE the ORIGINAL
+                    // first_now_ms (do NOT reset it, or offset replicas ticking
+                    // every few seconds would reset it forever = a wedge).
+                    return ReapDecision{
+                        .marker =
+                            MarkerAction::arm(anchor, current_direction, declined->first_now_ms),
+                        .new_anchor = std::nullopt,
+                        .run_sweeps = false,
+                        .clock_anomaly = true,
+                        .recovered = false};
+                }
+                // min <= delta <= max: the SAME anomaly genuinely persisted a
+                // real-time-plausible interval — recover and drain.
                 return ReapDecision{.marker = MarkerAction::clear(),
                                     .new_anchor = now_ms, // UNCONDITIONAL — move off the stale anchor
                                     .run_sweeps = true,
                                     .clock_anomaly = false,
                                     .recovered = true};
             }
-            // ARM / re-arm against this pass's (anchor, direction); overwrites
-            // any stale marker. Anchor unchanged (a decline never advances it,
-            // so the identical repeat presents the same frozen pair).
-            return ReapDecision{.marker = MarkerAction::arm(anchor, current_direction),
+            // ARM / re-arm against this pass's (anchor, direction) at THIS
+            // reading; overwrites any stale marker. A fresh anomaly declines
+            // once. Anchor unchanged (a decline never advances it, so the
+            // identical repeat presents the same frozen pair).
+            return ReapDecision{.marker = MarkerAction::arm(anchor, current_direction, now_ms),
                                 .new_anchor = std::nullopt,
                                 .run_sweeps = false,
                                 .clock_anomaly = true,

@@ -2851,26 +2851,33 @@ public:
         // or failed reap tick was spdlog::warn-only with no metric. THIS
         // counter is the actual compensating signal: one increment per tick
         // by outcome (ok = a clean accepted pass; declined = clock_anomaly;
-        // error = the store call itself failed).
+        // error = the store call itself failed). PR #4299 round 4: part 4
+        // (fact-set anomaly dedup) is now fully ADOPTED via the (anchor,
+        // direction, first_now_ms) reading-continuity recovery guard — so the
+        // "no fact-set anomaly dedup" phrasing above is historical; the guard
+        // and its ok_capped backlog signal are the live compensations.
         metrics_.describe("yuzu_server_gateway_route_reap_total",
                           "gateway_route_store reap_stale_routes() pass outcomes, by outcome "
-                          "(ok|recovered|declined|skipped|error). declined = the pass was "
-                          "skipped by the clock-guarded-retention anomaly guard (implausible or "
-                          "unparseable now()/anchor reading, or an anomaly that has not yet "
-                          "persisted across a full decline-and-retry at the SAME direction) and "
-                          "reaped nothing; recovered = an anomaly PERSISTED across a full "
-                          "decline pass at the SAME (anchor, direction) and this pass drained "
-                          "the capped sweeps as genuine elapsed downtime (PR #4299 round-2 "
-                          "review) -- a sustained recovered rate means the reaper is recovering "
-                          "from a clock anomaly or a real gap and is worth an operator look; "
-                          "skipped = another replica already held the gateway_route_store:reap "
-                          "advisory lock this tick (try-lock, not blocking, PR #4299 round-2 "
-                          "external review) -- routine on a multi-replica deployment, never a "
-                          "failure; error = the store call failed outright (pool/query "
-                          "degradation). This is the observable signal for the "
-                          "clock-guarded-retention part-1 carve-out and the "
-                          "decline-once/drain-on-repeat part-4 guard documented in "
-                          "gateway_route_store.hpp's reap_stale_routes header.",
+                          "(ok|ok_capped|recovered|declined|skipped|error). declined = the pass "
+                          "was skipped by the clock-guarded-retention anomaly guard (implausible "
+                          "or unparseable now()/anchor reading, or an anomaly that has not yet "
+                          "persisted across the recovery window at the SAME (anchor, direction)) "
+                          "and reaped nothing; recovered = an anomaly PERSISTED a real-time-"
+                          "plausible interval at the SAME (anchor, direction) and this pass "
+                          "drained the capped sweeps as genuine elapsed downtime (PR #4299 "
+                          "round-2 review) -- a sustained recovered rate means the reaper is "
+                          "recovering from a clock anomaly or a real gap and is worth an operator "
+                          "look; ok_capped = a clean accepted pass that hit kReapCap on a sweep "
+                          "AND a same-txn EXISTS probe confirmed a remaining backlog (PR #4299 "
+                          "round 4, observability-only -- NOT a cadence change) -- a sustained "
+                          "ok_capped rate means the reaper is chronically behind; skipped = "
+                          "another replica already held the gateway_route_store:reap advisory "
+                          "lock this tick (try-lock, not blocking, PR #4299 round-2 external "
+                          "review) -- routine on a multi-replica deployment, never a failure; "
+                          "error = the store call failed outright (pool/query degradation). This "
+                          "is the observable signal for the clock-guarded-retention part-1 "
+                          "carve-out and the decline-once/drain-on-repeat part-4 guard documented "
+                          "in gateway_route_store.hpp's reap_stale_routes header.",
                           "counter");
         // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
         // every outcome this counter can emit — following the
@@ -2879,7 +2886,7 @@ public:
         // has looked yet". Without this, a healthy server that never once
         // declines/recovers/skips/errors reads identically to one whose reap
         // job never runs at all.
-        for (const char* outcome : {"ok", "recovered", "declined", "skipped", "error"})
+        for (const char* outcome : {"ok", "ok_capped", "recovered", "declined", "skipped", "error"})
             metrics_.counter("yuzu_server_gateway_route_reap_total", {{"outcome", outcome}});
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
@@ -14955,6 +14962,17 @@ private:
                 // reaper's own clock-guard (advisory lock + persisted
                 // anchor) is what makes a slower or missed tick harmless.
                 constexpr int kGatewayRouteReapEveryNTicks = 150; // ~5 minutes at 2s/tick
+                // PR #4299 round 4: the inter-pass interval must stay STRICTLY
+                // above the reap recovery FLOOR (kMinReapRecoveryGapMs) — else a
+                // single replica's own back-to-back passes could never span the
+                // floor and its skew anomalies would never recover (a wedge).
+                // 150 ticks * 2s/tick * 1000 = 300'000ms > 270'000ms floor. A
+                // future cadence tune below ~135 ticks trips this at build time.
+                static_assert(kGatewayRouteReapEveryNTicks * 2 /*sec per tick*/ * 1000 >
+                                  kMinReapRecoveryGapMs,
+                              "gateway route reap cadence must exceed the recovery floor, or a "
+                              "single replica's skew anomalies could never persist long enough "
+                              "to recover (kMinReapRecoveryGapMs, gateway_route_store.hpp)");
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -15281,6 +15299,19 @@ private:
                                         metrics_
                                             .counter("yuzu_server_gateway_route_reap_total",
                                                      {{"outcome", "recovered"}})
+                                            .increment();
+                                    } else if (reaped->cap_bound) {
+                                        // PR #4299 round 4 (observability only):
+                                        // a clean accepted pass that hit kReapCap
+                                        // AND left a confirmed remainder behind.
+                                        // Distinct from "ok" so a chronically
+                                        // behind reaper is visible WITHOUT any
+                                        // cadence/re-arm change (the deliberate
+                                        // non-acceleration decision — see
+                                        // docs/clock-guarded-retention.md).
+                                        metrics_
+                                            .counter("yuzu_server_gateway_route_reap_total",
+                                                     {{"outcome", "ok_capped"}})
                                             .increment();
                                     } else {
                                         metrics_

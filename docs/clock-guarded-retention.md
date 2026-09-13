@@ -169,43 +169,48 @@ per-predicate cap):
    fleet going offline overnight expires every lease), so a would-wipe verdict cannot separate a true
    from a false positive here.
 4. **Fact-set anomaly dedup is ADOPTED** (PR #4299 review; an earlier revision carved this out too,
-   the way `SessionStore` does — that was the defect this fix closes), in a form simplified for this
-   store's small state: **decline-once / drain-on-repeat, keyed on the PAIR (declined `reap_anchor_ms`
-   value, anomaly DIRECTION)** (round-2 external review; the initial round-2 fix keyed on the anchor
-   value alone — see "Direction-keyed, not anchor-value-alone" below for the defect that closed)
-   rather than the full multi-field `Facts` struct `audit_store.cpp` uses. A forward- or backward-skew
-   anomaly persists `route_meta.reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>"` and declines;
-   an IDENTICAL repeat (the anchor still unmoved, because a decline never advances it, AND the same
-   direction) RECOVERS — runs both sweeps under the cap, advances `reap_anchor_ms` to `now_ms`
+   the way `SessionStore` does — that was the defect this fix closes), keyed on the TRIPLE
+   **(declined `reap_anchor_ms` value, anomaly DIRECTION, `first_now_ms` — the reading the anomaly
+   was first observed at)** (round-2 external review added DIRECTION; the round-4 review added the
+   `first_now_ms` reading-continuity window — see "Direction-keyed, not anchor-value-alone" and
+   "Reading-continuity recovery window" below) rather than the full multi-field `Facts` struct
+   `audit_store.cpp` uses. A forward- or backward-skew anomaly persists
+   `route_meta.reap_declined_anchor_ms = "<reap_anchor_ms>:<direction>:<first_now_ms>"` and declines;
+   a repeat RECOVERS — runs both sweeps under the cap, advances `reap_anchor_ms` to `now_ms`
    UNCONDITIONALLY (never `max(anchor, now_ms)`, which would leave a forward-skew-poisoned anchor
-   stuck forever), and clears the declined-anchor marker. A DIFFERENT-direction anomaly at the SAME
-   frozen anchor (e.g. a backward-skew decline followed by an unrelated forward-skew reading) does
-   NOT match — it re-declines and re-arms against the new direction instead of recovering. A normal
-   (non-anomalous) accepted pass also clears the marker, so a later transient glitch is judged fresh
-   against the new anchor rather than free-riding on a stale recovery. **Why this mattered**: the
-   carved-out version wedged PERMANENTLY after any routine >24h
-   gap (weekend shutdown, DR failover, extended maintenance) — `now - anchor` only grows while
-   declined, so every subsequent pass declined forever with no recovery path. **Corrected (round-2
-   review, then re-corrected to add direction below): there is no permanent wedge either way for a
-   clock that keeps drifting the SAME direction.** A skew that persists into the next pass at the
-   SAME direction presents the SAME frozen (anchor, direction) pair, which is exactly the match, so
-   it RECOVERS on that pass — it does not "correctly never recover on its own." A continuously-drifting
-   clock instead OSCILLATES (decline, recover, decline, recover, ...) roughly every other pass, since
-   a recovered pass re-anchors to that pass's `now_ms` unconditionally, and the next pass judges
-   itself fresh against the new anchor. The **operator re-anchor** (reset `route_meta.reap_anchor_ms`
-   and, for cleanliness, `route_meta.reap_declined_anchor_ms` to the corrected current epoch-ms once
-   the underlying clock is fixed) is an OPTIONAL escape hatch to stop that oscillation, not a
-   requirement to un-wedge anything — see the code comment at `gateway_route_store.cpp`'s
-   anomaly-detection site. Every
+   stuck forever), and clears the declined-anchor marker — **only when ALL of**: the anchor is still
+   unmoved (a decline never advances it), the direction matches, AND the anomaly has PERSISTED a
+   real-time-plausible interval `delta = now_ms - first_now_ms` in
+   `[kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs]` (270s..1h). Below the floor it re-declines
+   PRESERVING the original `first_now_ms`; above the ceiling, or on a negative delta (a
+   further-backward step), it is a NEW distinct anomaly and re-declines against the CURRENT reading. A
+   DIFFERENT-direction anomaly at the SAME frozen anchor (e.g. a backward-skew decline followed by an
+   unrelated forward-skew reading) also does NOT match — it re-declines and re-arms against the new
+   direction. A normal (non-anomalous) accepted pass also clears the marker, so a later transient
+   glitch is judged fresh against the new anchor rather than free-riding on a stale recovery.
+   **Why this mattered**: the carved-out version wedged PERMANENTLY after any routine >24h gap
+   (weekend shutdown, DR failover, extended maintenance) — `now - anchor` only grows while declined,
+   so every subsequent pass declined forever with no recovery path. **Corrected: a genuine gap that
+   PERSISTS a plausible interval at the same (anchor, direction) recovers on the pass that clears the
+   floor.** **Correcting the old "oscillates every other pass" note (round 4):** under the
+   floor/ceiling window a clock stepping BACKWARD every pass, or FORWARD by more than the ceiling
+   every pass, now DECLINES every pass and never recovers until it stops drifting — this is
+   deliberately stricter and correct (recovery is reserved for a genuinely-persisted gap, not a
+   still-drifting clock), and it is observable via `outcome="declined"`. The **operator re-anchor**
+   (reset `route_meta.reap_anchor_ms` and, for cleanliness, `route_meta.reap_declined_anchor_ms` to
+   the corrected current epoch-ms once the underlying clock is fixed) is an OPTIONAL escape hatch to
+   force recovery early, not a requirement to un-wedge anything — see the code comment at
+   `gateway_route_store.cpp`'s anomaly-detection site. Every
    decline is `spdlog::warn`'d AND counted:
    `yuzu_server_gateway_route_reap_total{outcome="declined"}` (incremented at the reap call site in
-   `server.cpp`, pre-seeded across `ok`/`recovered`/`declined`/`skipped`/`error` since PR #4299
-   round-2, `skipped` added round-2 external review). This
+   `server.cpp`, pre-seeded across `ok`/`ok_capped`/`recovered`/`declined`/`skipped`/`error`;
+   `skipped` added round-2 external review, `ok_capped` added round 4). This
    is a DEDICATED reap-outcome counter, distinct from
    `yuzu_server_gateway_route_desync_total`/`_write_failed_total`, which cover the WRITE path
    (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`), not a reap pass's own outcome.
    A reap pass that fails outright (pool/query degradation, distinct from a clock-anomaly decline) is
-   counted the same way under `outcome="error"`; a clean, ORDINARY accepted pass is `outcome="ok"`; a
+   counted the same way under `outcome="error"`; a clean, ORDINARY accepted pass is `outcome="ok"`
+   (or `outcome="ok_capped"` — see the reading-continuity + non-acceleration note below); a
    pass that ran via the recovery branch above is its own `outcome="recovered"` (PR #4299 round-2
    review, `ReapRoutesResult::recovered`) — a recovery can drain a large backlog in one go, so it is
    metric-distinguishable from a routine `ok` tick rather than reading identically to one.
@@ -228,9 +233,44 @@ per-predicate cap):
    direction change at the same anchor re-declines (and re-arms against the new direction) instead of
    recovering. Anomaly-type keying is therefore load-bearing, not unnecessary complexity — see the
    corrected "Fact-set anomaly dedup is ADOPTED" bullet above and `gateway_route_store.hpp`'s
-   `reap_stale_routes` doc comment for the marker format (`"<anchor>:<direction>"`) and its
-   mixed-version-safe parse (an unparseable value, including a legacy bare-integer marker or this
-   store's own new-format value read by an older binary, is treated as absent and re-declines).
+   `reap_stale_routes` doc comment for the marker format (`"<anchor>:<direction>:<first_now_ms>"`) and
+   its mixed-version-safe parse (an unparseable value — a legacy 2-field marker, this store's own
+   3-field value read by an older 2-field parser, or a value with the wrong field count — is treated
+   as absent and re-declines).
+
+   **Reading-continuity recovery window (PR #4299 round 4 — corrects the "recovers on the next pass"
+   reasoning above to require a plausible persistence interval).** Matching the frozen (anchor,
+   direction) pair proved the anomaly REPEATED, but not that it PERSISTED: a second, unrelated,
+   much-larger same-direction jump at the same frozen anchor satisfied the pair-match and recovered
+   on its FIRST appearance (running the sweeps against that second reading). The fix records the
+   reading the anomaly was FIRST observed at (`first_now_ms`, the marker's third field) and bounds
+   recovery to `delta = now_ms - first_now_ms` in `[kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs]`:
+   below the floor it re-declines PRESERVING the original `first_now_ms` (never resetting it, or
+   offset replicas ticking a few seconds apart would reset it forever = a wedge); above the ceiling
+   (or a negative delta) it is a NEW distinct anomaly, re-declined once against the current reading.
+   The FLOOR = `(kStaleLeaseGraceSecs + kKnownLeaseTtlSecs) * 1000` = 270'000ms — the liveness
+   horizon below which a spurious forward jump's exposed routes are not yet reap-eligible — and it is
+   **load-bearing for the multi-replica future this slice exists for**: without it, an ε-later
+   second-replica reap pass would recover with zero persistence evidence. The CEILING = 1h
+   (cadence-derived with slack), `static_assert`ed `<= kMaxPlausibleSkewMs` (the terminating
+   invariant: at the ceiling, recovery is no weaker than an ordinary clean pass, which already
+   accepts any forward jump up to `kMaxPlausibleSkewMs`) and `<` the floor. A companion
+   `static_assert` at `server.cpp`'s reap-cadence constant pins the inter-pass interval
+   (`kGatewayRouteReapEveryNTicks * 2s`) strictly ABOVE the floor, so a single replica's own
+   back-to-back passes can always span it (else a future cadence tune below ~135 ticks would wedge a
+   single replica — a build failure).
+
+   **Cap-backlog observability, NOT acceleration (PR #4299 round 4 — the architect OVERRODE the
+   reviewer's "accelerate the re-arm on a capped sweep" suggestion; recording the reasoning is the
+   requirement, per this concern).** When a sweep hits `kReapCap`, a same-txn `EXISTS` probe (the
+   `audit_store.cpp` shape) checks for a genuine remainder and, if present, sets
+   `ReapRoutesResult::cap_bound` — surfaced as a distinct `outcome="ok_capped"`. The cadence is
+   DELIBERATELY unchanged. Acceleration is declined because: `agent_routes` is `PRIMARY KEY(agent_id)`,
+   fleet-bounded and self-limiting (unlike `audit_store`'s append-only, unbounded-growth table); `is_stale`
+   is computed IN-SQL at read time, so NO correctness depends on reap latency (a not-yet-reaped stale
+   row still reads as stale); and accelerating would turn a mis-recovery into `kReapCap` tombstones
+   every few seconds, collapsing the operator reaction window. The `ok_capped` metric is the chosen
+   signal instead: a chronically cap-bound reaper is visible to an operator without a cadence change.
 
    **The decline-once/drain-on-repeat recovery above is the SKEW path only — a corrupt PERSISTED
    anchor uses a DIFFERENT mechanism (PR #4299 round-3 review).** An unparseable or negative
