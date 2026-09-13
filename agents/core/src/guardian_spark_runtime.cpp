@@ -2858,11 +2858,20 @@ void GuardianSparkRuntime::begin_stop() {
         reader->request_stop();
     // #2233 item 3: wake any attach_rule/detach_rule currently parked in a bounded
     // backend wait immediately, rather than making it ride out cfg_.backend_op_deadline.
-    // NOTE this does not make GuardianEngine::stop() itself instant: stop() takes
-    // GuardianEngine::mtx_ BEFORE calling begin_stop() (guardian_engine.cpp), so if
-    // apply_rules() is currently the one parked in a bounded wait, stop() cannot even
-    // reach this call until that wait resolves - bounded by cfg_.backend_op_deadline,
-    // same as apply_rules() itself, not instant. This DOES matter for a caller that
+    // rung 9c PR-2 Unit 6 removed the only production caller of that blocking wait:
+    // GuardianEngine::reconcile_rule_locked() now calls attach_rule(NonWaiting{}, ...)
+    // (guardian_engine.cpp), which never calls wait_for_claim(). The blocking
+    // attach_rule(rule_id, spec, deadline) overload above still exists and this wake
+    // still applies to it, but nothing in production calls it today - only its own
+    // direct unit test does.
+    // NOTE this does NOT make GuardianEngine::stop() itself prompt (§R5.5): stop()
+    // takes GuardianEngine::mtx_ BEFORE calling begin_stop() (guardian_engine.cpp), and
+    // apply_rules() - the only thing that can be holding mtx_ when stop() wants it - still
+    // does real synchronous work under that lock regardless of this change: a full_sync's
+    // KV sweep and detach_all() (scales with the rule count being torn down), the per-rule
+    // reconcile loop, and an unbounded lifecycle-journal persist on scope exit. None of
+    // that is a *backend* wait this wake-up reaches, so stop() is decoupled from backend-arm
+    // latency, not from apply_rules()'s own duration. This DOES matter for a caller that
     // already holds mtx_ across a DIFFERENT blocking section calling begin_stop()
     // directly, and for the runtime's own destructor path.
     //
