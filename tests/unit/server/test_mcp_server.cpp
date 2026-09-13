@@ -4111,17 +4111,40 @@ TEST_CASE("MCP Guardian: update_guardian_rule denies a service-scoped token",
 TEST_CASE("MCP Guardian: delete_guardian_rule removes a rule; a second delete "
           "answers not-found, not a crash",
           "[pg][mcp][integration][guardian]") {
+    // Gate 8 fix (#2146 Batch B1, follow-up review round): this test
+    // previously used ts.start("") (an MCP-tier-less session) and reached
+    // the store directly - exactly the gap the empty-mcp_tier deny-outright
+    // guard now closes. GuaranteedState:Delete is approval-gated at the
+    // supervised MCP tier (matches requires_approval()'s generic "any
+    // Delete" rule), so the happy path now goes through the full
+    // mint->approve->recall round trip, matching the confirm_engine_rotation
+    // precedent above.
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_guardian_read_twins_pg_tpl);
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     GuaranteedStateStore store(pool);
     mcp_seed_rule(store, "r1", "rule-one");
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts;
     ts.guaranteed_state_store_for_test = &store;
-    ts.start("");
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":208,"params":{"name":"delete_guardian_rule",)"
+        R"("arguments":{"rule_id":"r1"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
 
     auto res = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":208,"params":{"name":"delete_guardian_rule",)"
-        R"("arguments":{"rule_id":"r1"}}})");
+        R"("arguments":{"rule_id":"r1","approval_id":")" +
+        approval_id + R"("}}})");
     REQUIRE(res);
     CHECK(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
@@ -4131,13 +4154,45 @@ TEST_CASE("MCP Guardian: delete_guardian_rule removes a rule; a second delete "
     CHECK(data["rule_id"] == "r1");
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.delete|success");
 
-    auto res2 = ts.call(
+    // Second delete: fresh ticket, since each is one-time-use.
+    auto mint2 = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":209,"params":{"name":"delete_guardian_rule",)"
         R"("arguments":{"rule_id":"r1"}}})");
+    REQUIRE(mint2);
+    auto mint2_body = nlohmann::json::parse(mint2->body);
+    REQUIRE(mint2_body.contains("error"));
+    const std::string approval_id2 = mint2_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id2, "reviewer-bob", ""));
+
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":209,"params":{"name":"delete_guardian_rule",)"
+        R"("arguments":{"rule_id":"r1","approval_id":")" +
+        approval_id2 + R"("}}})");
     REQUIRE(res2);
     auto body2 = nlohmann::json::parse(res2->body);
     REQUIRE(body2.contains("error")); // mirrors REST's delete_rule not-found posture
     CHECK(ts.audit_log.back() == "guaranteed_state.rule.delete|denied");
+}
+
+TEST_CASE("MCP Guardian: delete_guardian_rule denies an MCP-tier-less caller - no "
+          "MFA step-up and no approval gate would otherwise fire for it",
+          "[mcp][integration][guardian][security]") {
+    // Gate 8 fix (#2146 Batch B1, follow-up review round; user directive):
+    // same shape as B4's create_api_token/revoke_api_token/unlock_account/
+    // rotate_api_token/confirm_api_token_rotation guards (#4309) - an empty
+    // mcp_tier previously reached the store with NEITHER REST's MFA
+    // step-up NOR the supervised-tier approval ticket.
+    McpTestServer ts;
+    ts.start(); // default: empty mcp_tier
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":211,"params":{"name":"delete_guardian_rule",)"
+        R"("arguments":{"rule_id":"r1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    CHECK(ts.audit_log.back() == "mcp.delete_guardian_rule|denied");
 }
 
 TEST_CASE("MCP Guardian: delete_guardian_rule denies a service-scoped token",

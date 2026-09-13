@@ -885,8 +885,12 @@ static const ToolDef kTools[] = {
      "Destructive (GuaranteedState:Delete): approval-gated at the supervised MCP tier — the "
      "first call returns an approval ticket (kApprovalRequired), re-call with the returned "
      "approval_id to consume it. Fleet-wide; denied outright to a service-scoped API token. "
-     "A cookie session (mcp_tier empty) bypasses BOTH the approval-ticket step above and "
-     "the MFA step-up REST's twin applies (architecture-wide gap - tracked in #4309).",
+     "An MCP-tier-less caller (empty mcp_tier - a cookie session, a plain non-MCP-tiered "
+     "API token, or an engine token) is DENIED outright rather than falling through to "
+     "RBAC-only enforcement, closing the #4309 gap for this tool specifically. The "
+     "architecture-wide gap remains open for create_guardian_rule/update_guardian_rule/ "
+     "push_guardian_rules (not approval-gated at any tier, so there is no approval to "
+     "bypass on those three) and every other approval-gated MCP tool not yet migrated.",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
      R"j({"type":"object","properties":{"deleted":{"const":true},"rule_id":{"type":"string"}},"required":["deleted","rule_id"]})j"},
 
@@ -9706,6 +9710,38 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 if (!perm_fn(req, res, "GuaranteedState", "Delete"))
                     return;
+                // Gate 8 fix (#2146 Batch B1, follow-up review round; user
+                // directive): delete_guardian_rule is approval-gated at the
+                // supervised MCP tier (GuaranteedState:Delete matches
+                // requires_approval()'s generic "any Delete" rule), but an
+                // empty mcp_tier reached this handler with NEITHER REST's
+                // MFA step-up (no MCP tool calls it) NOR the approval ticket
+                // (requires_approval() itself no-ops on an empty tier) -
+                // deleting a Guaranteed State rule (auto-remediation policy)
+                // with neither control. Same fix shape as B4's
+                // create_api_token/revoke_api_token/unlock_account/
+                // rotate_api_token/confirm_api_token_rotation guards
+                // (#4309). create_guardian_rule/update_guardian_rule/
+                // push_guardian_rules are NOT approval-gated at any tier
+                // (GuaranteedState:Write/Push aren't in requires_approval()'s
+                // list), so they have no approval to bypass here and are
+                // deliberately NOT included in this fix.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "delete_guardian_rule requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "use DELETE /api/v1/guaranteed-state/rules/{rule_id} instead",
+                                 "use the equivalent REST v1 route from an authenticated browser "
+                                 "session, or mint an MCP bearer token with an appropriate tier"),
+                        "application/json");
+                    return;
+                }
                 if (!guaranteed_state_store) {
                     res.set_content(
                         error_response(id, kInternalError, "Guaranteed State store unavailable"),
