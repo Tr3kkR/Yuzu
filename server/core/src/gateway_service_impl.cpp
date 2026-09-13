@@ -1087,9 +1087,15 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         registry_.remove_agent_if_session(agent_id, session_id);
         // HA WS-4 4.1: mirror the DISCONNECTED fact into the durable routing
         // directory too — session-guarded (gateway_route_store.hpp), so a
-        // stale/superseded session's DISCONNECTED can't tear down a newer
-        // re-home. Fail-open: a degraded write here does not affect the
-        // registry cleanup above.
+        // DIFFERENT, superseded session's DISCONNECTED can't tear down a newer
+        // re-home. NOTE: a SAME-session late DISCONNECTED is NOT fenced (the
+        // re-announce reuses the session id); that is #4246 #4, RE-SCOPED to a
+        // per-home generation fence and unreachable under the shipped gateway
+        // today (one CONNECTED(S)/one DISCONNECTED(S) per session) — this
+        // same-session teardown is session-keyed on the legacy in-memory path
+        // above (clear_stream_if_session/remove_agent_if_session) too, so the
+        // fence spans both when it lands. Fail-open: a degraded write here does
+        // not affect the registry cleanup above.
         if (gateway_route_store_) {
             if (auto res = gateway_route_store_->deregister(agent_id, session_id); !res) {
                 record_route_store_failure(metrics_, "deregister", res.error());

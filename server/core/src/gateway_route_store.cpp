@@ -102,11 +102,18 @@ constexpr int kReapCap = 5000;
 constexpr std::int64_t kMaxPlausibleSkewMs = 24LL * 3600 * 1000; // 1 day
 
 // PR #4299 round 4: the recovery window (header constants) must be well-ordered
-// AND its ceiling must not exceed the implausible-skew bound — that ceiling <=
-// kMaxPlausibleSkewMs is the TERMINATING invariant: at the ceiling, recovery is
-// no weaker than an ordinary clean pass, which already accepts any forward jump
-// up to kMaxPlausibleSkewMs. kMaxPlausibleSkewMs stays store-local (this .cpp),
-// so this assert lives here rather than in the header.
+// AND its ceiling must not exceed the implausible-skew bound. Scope of the claim
+// (PR #4299 round-5 review, Minor): this bounds the per-pass PERSISTENCE INTERVAL
+// a recovery may credit (delta = now - first_now <= kMaxReapRecoveryGapMs), NOT
+// the total forward jump a recovered pass then sweeps against — that jump is
+// necessarily > kMaxPlausibleSkewMs by construction, since a jump that large is
+// exactly what triggered the anomaly. The TERMINATING property is that the
+// persistence evidence a recovery requires can never be widened past
+// kMaxPlausibleSkewMs, the same horizon within which a clean pass already accepts
+// a forward jump with no anomaly treatment at all — so recovery's evidence bar
+// sits inside the clean path's plausibility envelope and the window cannot grow
+// unbounded. kMaxPlausibleSkewMs stays store-local (this .cpp), so this assert
+// lives here rather than in the header.
 static_assert(kMinReapRecoveryGapMs < kMaxReapRecoveryGapMs &&
                   kMaxReapRecoveryGapMs <= kMaxPlausibleSkewMs,
               "reap recovery window must be well-ordered and its ceiling must not exceed the "
@@ -346,11 +353,18 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
         spdlog::warn("GatewayRouteStore::deregister: lease timeout — degraded");
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
-    // Session-guarded: a stale DISCONNECTED from a superseded session must not
-    // tear down a newer re-home's row.
+    // Session-guarded: a stale DISCONNECTED from a DIFFERENT, superseded session
+    // cannot tear down a newer re-home's row (its session_id will not match).
+    // A SAME-session late DISCONNECTED is NOT fenced here — the re-announce path
+    // reuses the session id, so session_id equality alone cannot tell an old
+    // home's teardown from a newer re-home under the same id. That direction is
+    // #4246 #4, RE-SCOPED (needs a per-home generation on the wire) and
+    // unreachable under the shipped gateway today (one CONNECTED(S)/one
+    // DISCONNECTED(S) per session) — see the header SESSION GUARDS LIMIT and
+    // ADR-2002 §7.
     //
     // TOMBSTONE, not DELETE (file header "SLICE 4.2a", closes 4.2 design-doc
-    // obligations #4/#5). A DELETE lets a late/reordered CONNECTED for this
+    // obligation #5 — late-CONNECTED resurrection, NOT #4). A DELETE lets a late/reordered CONNECTED for this
     // same (now-gone) session resurrect the route via announce_connected's
     // fallback `ON CONFLICT DO NOTHING` INSERT, because that fallback only
     // refuses to clobber a row that EXISTS — against no row at all it just

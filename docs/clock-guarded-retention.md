@@ -253,8 +253,12 @@ per-predicate cap):
    **load-bearing for the multi-replica future this slice exists for**: without it, an ε-later
    second-replica reap pass would recover with zero persistence evidence. The CEILING = 1h
    (cadence-derived with slack), `static_assert`ed `<= kMaxPlausibleSkewMs` (the terminating
-   invariant: at the ceiling, recovery is no weaker than an ordinary clean pass, which already
-   accepts any forward jump up to `kMaxPlausibleSkewMs`) and, of course, `>` the floor. TWO
+   invariant, scoped precisely: this bounds the per-pass PERSISTENCE INTERVAL a recovery may credit
+   — `delta = now - first_now <= 1h` — NOT the total forward jump a recovered pass sweeps against,
+   which is necessarily `> 24h` by construction since that jump is what triggered the anomaly; the
+   terminating property is that the persistence evidence a recovery requires can never be widened
+   past `kMaxPlausibleSkewMs`, the same horizon within which a clean pass already accepts a forward
+   jump untreated, so the window cannot grow unbounded) and, of course, `>` the floor. TWO
    companion `static_assert`s at `server.cpp`'s reap-cadence constant bracket the inter-pass
    interval (`kGatewayRouteReapEveryNTicks * kMaintTickSecs`, ~300s), and they guard OPPOSITE
    failures — only the ceiling one is a true wedge: (a) the FLOOR assert (interval `>` the floor)
@@ -270,6 +274,24 @@ per-predicate cap):
    self-resolving, fail-safe (a broken clock must not drive reaping), and observed by the WS-1/1a
    DB-clock-integrity monitor rather than this reaper.
 
+   **ACCEPTED LIMITATION — the persistence window has a single time source (PR #4299 round-5 review,
+   recorded, revisit before multi-replica / 4.2b).** `delta = now - first_now` is measured entirely on
+   the Postgres `now()` clock — the same clock whose step triggered the anomaly. There is NO independent
+   witness, so a SECOND, unrelated clock step that happens to land inside `[floor, ceiling]` of the first
+   observation is indistinguishable from a genuine, continuous persistence and would satisfy the recovery
+   bar (a "compound step fusion"). This is accepted, not fixed, for three reasons: (1) on the
+   single-replica deployment that exists today the reaper's own next pass cannot arrive sooner than the
+   cadence (`static_assert`ed `>` the floor), during which routine heartbeats (`renew_leases`,
+   `lease_until = now()+90s` in-SQL) re-lease every live route out of sweep eligibility regardless of what
+   the DB clock does between passes; (2) the harmful case needs a SECOND independently-ticking replica
+   (none exists — this store is single-writer today) PLUS 4.2b's dispatch-authoritative reader (deferred)
+   PLUS a compound anomaly, stacked; (3) the obvious fix — a process-local `steady_clock`/monotonic
+   witness — does NOT close it: a local witness can only attest THIS host's clock, never prove a SECOND
+   replica's persistence, which is the only case where the gap is load-bearing. So there is no cheap fix
+   available today; the honest resolution is to record the limitation and revisit it when a real
+   independent time source (or a shared-clock coordination primitive) exists, before multi-replica or 4.2b
+   ship.
+
    **Cap-backlog observability, NOT acceleration (PR #4299 round 4 — the architect OVERRODE the
    reviewer's "accelerate the re-arm on a capped sweep" suggestion; recording the reasoning is the
    requirement, per this concern).** When a sweep hits `kReapCap`, a same-txn `EXISTS` probe (the
@@ -281,6 +303,12 @@ per-predicate cap):
    row still reads as stale); and accelerating would turn a mis-recovery into `kReapCap` tombstones
    every few seconds, collapsing the operator reaction window. The `ok_capped` metric is the chosen
    signal instead: a chronically cap-bound reaper is visible to an operator without a cadence change.
+   ONE-TICK OBSERVABILITY NOTE (PR #4299 round-5 review, LOW): the emit cascade gives `recovered`
+   precedence over `cap_bound`, so a pass that BOTH recovers AND hits `kReapCap` emits only
+   `outcome="recovered"` for that tick, never `ok_capped`. This is deliberate (a recovery is the rarer,
+   more operationally notable event) and not a correctness gap: `is_stale` is read-time, the backlog is
+   not lost, and if it persists the next ordinary capped tick surfaces `ok_capped` as usual. It is a
+   single-tick under-count of the cap signal on the exact tick a recovery also caps, nothing more.
 
    **The decline-once/drain-on-repeat recovery above is the SKEW path only — a corrupt PERSISTED
    anchor uses a DIFFERENT mechanism (PR #4299 round-3 review).** An unparseable or negative

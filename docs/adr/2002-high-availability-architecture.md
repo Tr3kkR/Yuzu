@@ -363,8 +363,8 @@ convergence reconcile) remain outstanding.
 **4.2 design obligations surfaced by the 4.1 governance review (all INERT today — latent because
 nothing reads the directory — but load-bearing the moment 4.2 makes it dispatch-authoritative; the
 "cannot overwrite a newer re-home" guarantee above is precise only for *overwrite*, and only
-intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) closed items #2, #4, #5,
-#7, #8's counter half, and #9** — the writer-path hardening only, still short of dispatch-authoritative
+intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) closed items #2, #5,
+#7, #8's counter half, and #9** (#4 RE-SCOPED, not closed — see its bullet) — the writer-path hardening only, still short of dispatch-authoritative
 4.2 itself:**
 - **Epoch orders by server PROCESSING time, not connection recency** (#4246 #2 — **CLOSED, 4.2a**). The
   `nextval` is minted when a ProxyRegister is *handled*. A zombie/delayed replay whose original session
@@ -375,12 +375,35 @@ intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) clo
   calling `register_fresh`, so it never mints a fresh epoch or reaches the clobbering branch. The
   session-id-minting/`gateway_sessions_`-population half of the gap (the S′-vs-S response desync) is
   unchanged — see the next-but-one bullet.
-- **The re-announce REUSES the session id, so a late DISCONNECTED for that same id deletes the live
-  re-homed route** (#4246 #4 — **CLOSED, 4.2a**) — the session guard could not distinguish original-home
-  teardown from re-home. **4.2a closes this**: `deregister` now TOMBSTONES the row (`session_id`/
-  `lease_until`/`cluster_id`/`gateway_node` → NULL, `connection_epoch` retained) instead of deleting it,
-  so a late CONNECTED for the same now-gone session no-ops against the tombstone instead of resurrecting
-  a dead route — see the `announce_connected` fallback-INSERT bullet below, closed by the same change.
+- **The re-announce REUSES the session id, so a late DISCONNECTED for that same id could tombstone the
+  live re-homed route** (#4246 #4 — **RE-SCOPED, NOT closed by 4.2a; mechanism confirmed, unreachable
+  under the shipped gateway protocol; a per-home generation is a PRECONDITION of the first slice that
+  re-CONNECTs under a reused session id**). The MECHANISM is real and confirmed: `deregister`
+  (`gateway_route_store.cpp`) predicates its tombstone only on `agent_id AND session_id` with no
+  per-home discriminator; the re-announce reuses the session id; and the in-memory teardown
+  (`gateway_service_impl.cpp` `clear_stream_if_session`/`remove_agent_if_session`/`gateway_sessions_.erase`)
+  is likewise session-keyed. What 4.2a's TOMBSTONE actually closed is the OPPOSITE direction — item #5,
+  the late-`CONNECTED` resurrection: `deregister` now nulls `session_id`/`lease_until`/`cluster_id`/
+  `gateway_node` (retaining `connection_epoch`) instead of deleting, so a late CONNECTED for a now-gone
+  session no-ops against the tombstone (see the `announce_connected` fallback-INSERT bullet below). It
+  does NOT fence a same-session late-`DISCONNECTED` against a newer re-home, because the SQL has no
+  per-home generation. **This direction has no producer under the shipped gateway** and so is
+  unreachable today: `CONNECTED(S)` is emitted at most ONCE per session (`yuzu_gw_agent.erl:129`, in a
+  single-shot process; the `connecting(cast,{stream_ready,_})` re-attach clause at `:143` has no sender
+  — dead code; every stream loss runs `do_cleanup` → the one `DISCONNECTED` at `:331` and stops). A
+  normal agent reconnect uses `proxy_register/1` → plain `do_rpc` with NO `x-yuzu-session-id`
+  (`yuzu_gw_upstream.erl:174-181`), so it takes the server's FRESH branch and is minted a new session
+  `S'` (a late `DISCONNECTED(S)` then misses the `S'` row — `session_mismatch`, expected); only the
+  circuit-recovery REPLAY (`do_rpc_replay`, `:547-550`) re-announces `S`, and it re-announces via
+  `renew_leases` and emits NO `CONNECTED`, so a `DISCONNECTED(S)` after it means the `S` process died and
+  the tombstone is the correct terminal state in either arrival order. Hence exactly one `CONNECTED(S)`
+  and one `DISCONNECTED(S)` per session — the only reorder is item #5, which IS closed. The invariant to
+  hold: **`session_id` ≡ exactly one gateway stream placement.** The per-home generation fence
+  (a token stamped on both `CONNECTED`/`DISCONNECTED` — a `NotifyStreamStatus` protocol change, spanning
+  the legacy in-memory teardown path too, NOT a store-only change) is deferred to the first slice that
+  introduces a same-session re-CONNECT (4.3 intra-cluster re-home / 4.4 convergence / #6 replay-response
+  writeback), and **4.2b's review MUST re-verify this once-per-session property before the directory
+  becomes dispatch-authoritative.** Tracked in #4324 (re-scoped from #4246 item #4).
 - **The re-announce/"known-session" check is PER-REPLICA in-memory** (`gateway_sessions_`) (#4246 #3 —
   **DEFERRED**, re-homed to its own slice under WS-5 shared agent presence, ADR §7a); under
   active-active a replay routed to a non-owning replica always takes the fresh branch. A durable

@@ -15324,6 +15324,16 @@ private:
                                         // to warrant its own metric outcome
                                         // rather than reading identically to a
                                         // routine tick.
+                                        // PRECEDENCE (PR #4299 round-5 review,
+                                        // LOW): `recovered` deliberately outranks
+                                        // `cap_bound` below, so a pass that BOTH
+                                        // recovers AND caps emits only "recovered"
+                                        // this tick, never "ok_capped". Not a
+                                        // correctness gap -- is_stale is read-time,
+                                        // the backlog is not lost, and a persisting
+                                        // backlog surfaces "ok_capped" on the next
+                                        // ordinary capped tick. See clock-guarded-
+                                        // retention.md's GatewayRouteStore entry.
                                         spdlog::info("gateway_route_store reap recovered: an "
                                                      "anomaly persisted across a full decline "
                                                      "pass and this pass drained the backlog");

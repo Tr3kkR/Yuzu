@@ -134,6 +134,17 @@ WS-10 10.1/10.2. In flight: WS-4 (4.1 + 4.2a built — fenced agent→cluster ro
 directory + writer-path hardening (tombstone deregister, stale-route reaper,
 fresh-epoch-clobber fix, desync counter); STILL INERT — not yet merged to
 `origin/dev`). Next gate items: WS-4 (4.2b-4.4), WS-5, WS-6, WS-8-readyz.**
+>
+> **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
+> (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
+> not closed** by 4.2a. The tombstone closed only the late-CONNECTED
+> resurrection direction (#5). #4's mechanism is real but has no producer under
+> the shipped gateway (exactly one CONNECTED(S)/one DISCONNECTED(S) per session),
+> so it is unreachable today; the per-home stream-generation fence (a
+> `NotifyStreamStatus` protocol change) is a precondition (#4324) of the first slice that
+> re-CONNECTs under a reused session id, and 4.2b's review MUST re-verify the
+> once-per-session property before the directory becomes dispatch-authoritative.
+> Invariant: `session_id` ≡ exactly one gateway stream placement.
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially
 > changes the status of a workstream here MUST update its row **and** re-stamp the

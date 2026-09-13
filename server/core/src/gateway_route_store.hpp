@@ -32,11 +32,20 @@
 /// (`announce_connected` filling in cluster/node once the gateway has fully
 /// established the session, and the eventual `deregister` on disconnect) are
 /// guarded by `session_id`, not by epoch — they only touch the row if it still
-/// belongs to THIS session. A stale CONNECTED/DISCONNECTED from an
+/// belongs to THIS session. A stale CONNECTED/DISCONNECTED from a DIFFERENT,
 /// already-superseded session therefore cannot overwrite or tear down a
 /// newer re-home: `announce_connected` no-ops (falls through to an
 /// `ON CONFLICT DO NOTHING` insert) if the session doesn't match, and
-/// `deregister` deletes zero rows.
+/// `deregister` tombstones zero rows.
+/// LIMIT — a SAME-session late notification is NOT fenced by this guard: the
+/// re-announce path deliberately REUSES the session id, so `session_id`
+/// equality alone cannot distinguish an old home's teardown from a newer
+/// re-home under the same id. This is unreachable under the shipped gateway
+/// (exactly one `CONNECTED(S)`/one `DISCONNECTED(S)` per session — see the
+/// #4246 #4 bullet in ADR-2002 §7), and the per-home generation that would
+/// fence it is a precondition of the first slice that re-CONNECTs under a
+/// reused session id — NOT a 4.2a change. Invariant to preserve:
+/// `session_id` ≡ exactly one gateway stream placement.
 ///
 /// `renew_leases` is a single batched statement over `session_id = ANY($1)` —
 /// at fleet scale a per-row renew would be one write per agent every lease
@@ -60,10 +69,15 @@
 /// a stale-lease reaper plus the fail-open->fail-closed flip must land before 4.2
 /// trusts this directory for routing.
 ///
-/// SLICE 4.2a — `deregister` TOMBSTONES instead of deleting (closes the
-/// "a late DISCONNECTED then deletes the re-homed route" obligation above,
-/// #4/#5 in the 4.2 design doc). A tombstone is `session_id IS NULL AND
-/// lease_until IS NULL`; `connection_epoch` is retained. Rationale: a bare
+/// SLICE 4.2a — `deregister` TOMBSTONES instead of deleting. This closes the
+/// late-CONNECTED RESURRECTION direction (#5 in the 4.2 design doc): a late
+/// CONNECTED for a now-gone session no-ops against the tombstone instead of
+/// reviving a dead route. It does NOT close #4 (a same-session late
+/// DISCONNECTED tombstoning a newer re-home) — that needs a per-home
+/// generation fence and is RE-SCOPED to the first same-session re-CONNECT
+/// slice (unreachable under the shipped gateway today; see the SESSION GUARDS
+/// LIMIT above and ADR-2002 §7 #4246 #4). A tombstone is `session_id IS NULL
+/// AND lease_until IS NULL`; `connection_epoch` is retained. Rationale: a bare
 /// DELETE lets `announce_connected`'s fallback `ON CONFLICT DO NOTHING`
 /// INSERT resurrect a dead route if a late/reordered CONNECTED notification
 /// for the just-torn-down session arrives after the DISCONNECTED that
