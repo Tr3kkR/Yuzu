@@ -389,16 +389,23 @@ intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) clo
   does NOT fence a same-session late-`DISCONNECTED` against a newer re-home, because the SQL has no
   per-home generation. **This direction has no producer under the shipped gateway** and so is
   unreachable today: `CONNECTED(S)` is emitted at most ONCE per session (`yuzu_gw_agent.erl:129`, in a
-  single-shot process; the `connecting(cast,{stream_ready,_})` re-attach clause at `:143` has no sender
-  — dead code; every stream loss runs `do_cleanup` → the one `DISCONNECTED` at `:331` and stops). A
+  single-shot process; the `connecting(cast,{stream_ready,_})` re-attach clause at `:143` has no
+  PRODUCTION sender (only the gen_statem unit test casts it) and in any case emits no `CONNECTED`; every
+  stream loss runs `do_cleanup` → the one `DISCONNECTED` at `:331` and stops). A
   normal agent reconnect uses `proxy_register/1` → plain `do_rpc` with NO `x-yuzu-session-id`
   (`yuzu_gw_upstream.erl:174-181`), so it takes the server's FRESH branch and is minted a new session
   `S'` (a late `DISCONNECTED(S)` then misses the `S'` row — `session_mismatch`, expected); only the
-  circuit-recovery REPLAY (`do_rpc_replay`, `:547-550`) re-announces `S`, and it re-announces via
-  `renew_leases` and emits NO `CONNECTED`, so a `DISCONNECTED(S)` after it means the `S` process died and
-  the tombstone is the correct terminal state in either arrival order. Hence exactly one `CONNECTED(S)`
-  and one `DISCONNECTED(S)` per session — the only reorder is item #5, which IS closed. The invariant to
-  hold: **`session_id` ≡ exactly one gateway stream placement.** The per-home generation fence
+  circuit-recovery REPLAY (`do_rpc_replay`, `:547-550`) re-announces `S` — and BOTH replay branches
+  (presented-session-known AND the presented-but-unknown "mechanism (c)", a replica restart) re-announce
+  via `renew_leases`, never `register_fresh`, emitting NO `CONNECTED`. `renew_leases` is session-guarded
+  (`WHERE session_id = ANY(...)`), so it can neither resurrect a tombstone (whose `session_id` is NULL)
+  nor clobber a newer session's row; in either arrival order the route is correctly torn down — a
+  delivered `DISCONNECTED(S)` tombstones it, and a `DISCONNECTED(S)` that `yuzu_gw_upstream` drops
+  (circuit-open, or the `MAX_NOTIFY_INFLIGHT` inflight cap) leaves it to lease-expiry + the stale-lease
+  reaper — and nothing resurrects a newer placement because none exists under a reused `S`. So there is
+  AT MOST ONE `CONNECTED(S)` and one `DISCONNECTED(S)` per session (an untrappable process/node kill or a
+  dropped notification only shrinks that count); the only reorder is item #5, which IS closed. The
+  invariant to hold: **`session_id` ≡ exactly one gateway stream placement.** The per-home generation fence
   (a token stamped on both `CONNECTED`/`DISCONNECTED` — a `NotifyStreamStatus` protocol change, spanning
   the legacy in-memory teardown path too, NOT a store-only change) is deferred to the first slice that
   introduces a same-session re-CONNECT (4.3 intra-cluster re-home / 4.4 convergence / #6 replay-response

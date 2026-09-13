@@ -358,9 +358,9 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     // A SAME-session late DISCONNECTED is NOT fenced here — the re-announce path
     // reuses the session id, so session_id equality alone cannot tell an old
     // home's teardown from a newer re-home under the same id. That direction is
-    // #4246 #4, RE-SCOPED (needs a per-home generation on the wire) and
-    // unreachable under the shipped gateway today (one CONNECTED(S)/one
-    // DISCONNECTED(S) per session) — see the header SESSION GUARDS LIMIT and
+    // #4246 #4 / #4324, RE-SCOPED (needs a per-home generation on the wire) and
+    // unreachable under the shipped gateway today (at most one CONNECTED(S) and
+    // one DISCONNECTED(S) per session) — see the header SESSION GUARDS LIMIT and
     // ADR-2002 §7.
     //
     // TOMBSTONE, not DELETE (file header "SLICE 4.2a", closes 4.2 design-doc

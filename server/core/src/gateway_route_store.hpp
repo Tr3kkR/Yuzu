@@ -41,7 +41,7 @@
 /// re-announce path deliberately REUSES the session id, so `session_id`
 /// equality alone cannot distinguish an old home's teardown from a newer
 /// re-home under the same id. This is unreachable under the shipped gateway
-/// (exactly one `CONNECTED(S)`/one `DISCONNECTED(S)` per session — see the
+/// (at most one `CONNECTED(S)` and one `DISCONNECTED(S)` per session — see the
 /// #4246 #4 bullet in ADR-2002 §7), and the per-home generation that would
 /// fence it is a precondition of the first slice that re-CONNECTs under a
 /// reused session id — NOT a 4.2a change. Invariant to preserve:
@@ -64,7 +64,8 @@
 /// only intra-replica with a live session. The epoch orders by server PROCESSING
 /// time, so a stale replay whose session has left `gateway_sessions_` takes the
 /// fresh branch and wins; the re-announce reuses the session id (a late
-/// DISCONNECTED then deletes the re-homed route) and its known-session check is
+/// DISCONNECTED then tombstones — logically tears down — the re-homed route,
+/// #4/#4324, RE-SCOPED) and its known-session check is
 /// per-replica in-memory; re-announce refreshes the lease, not cluster/node; and
 /// a stale-lease reaper plus the fail-open->fail-closed flip must land before 4.2
 /// trusts this directory for routing.

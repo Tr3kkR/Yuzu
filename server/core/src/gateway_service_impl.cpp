@@ -1089,9 +1089,9 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // directory too — session-guarded (gateway_route_store.hpp), so a
         // DIFFERENT, superseded session's DISCONNECTED can't tear down a newer
         // re-home. NOTE: a SAME-session late DISCONNECTED is NOT fenced (the
-        // re-announce reuses the session id); that is #4246 #4, RE-SCOPED to a
-        // per-home generation fence and unreachable under the shipped gateway
-        // today (one CONNECTED(S)/one DISCONNECTED(S) per session) — this
+        // re-announce reuses the session id); that is #4246 #4 / #4324, RE-SCOPED
+        // to a per-home generation fence and unreachable under the shipped gateway
+        // today (at most one CONNECTED(S) and one DISCONNECTED(S) per session) — this
         // same-session teardown is session-keyed on the legacy in-memory path
         // above (clear_stream_if_session/remove_agent_if_session) too, so the
         // fence spans both when it lands. Fail-open: a degraded write here does
