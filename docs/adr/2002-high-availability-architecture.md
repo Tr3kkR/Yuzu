@@ -391,7 +391,14 @@ intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) clo
   unreachable today: `CONNECTED(S)` is emitted at most ONCE per session (`yuzu_gw_agent.erl:129`, in a
   single-shot process; the `connecting(cast,{stream_ready,_})` re-attach clause at `:143` has no
   PRODUCTION sender (only the gen_statem unit test casts it) and in any case emits no `CONNECTED`; every
-  stream loss runs `do_cleanup` → the one `DISCONNECTED` at `:331` and stops). A
+  stream loss runs `do_cleanup` → the one `DISCONNECTED` at `:331` and stops). At-most-once is
+  *guaranteed*, not incidental: admission funnels through `yuzu_gw_registry:take_pending/1`, which uses
+  `ets:take/2` — a single ATOMIC retrieve-and-delete — so of N concurrent `Subscribe`s presenting the
+  same session id exactly one consumes the pending registration and spawns an agent (the others get
+  `undefined`); a per-`Subscribe` process races here on a `public` ETS table with no other serialization,
+  and this atomicity is the whole guarantee (a non-atomic lookup-then-delete previously let two win — PR
+  #4299 round 6). Pinned by the concurrent-barrier test in `yuzu_gw_registry_tests.erl` (exactly one
+  winner across many barrier-released rounds; verified RED on the old lookup+delete). A
   normal agent reconnect uses `proxy_register/1` → plain `do_rpc` with NO `x-yuzu-session-id`
   (`yuzu_gw_upstream.erl:174-181`), so it takes the server's FRESH branch and is minted a new session
   `S'` (a late `DISCONNECTED(S)` then misses the `S'` row — `session_mismatch`, expected); only the

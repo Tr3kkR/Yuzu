@@ -211,13 +211,25 @@ store_pending(SessionId, Info) ->
     ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:system_time(millisecond)}),
     ok.
 
-%% @doc Atomically retrieve and delete pending registration info.
-%% Returns the info map or undefined if not found / expired.
+%% @doc Atomically retrieve-and-delete pending registration info.
+%% Returns the info map, or undefined if not found / expired / already taken.
+%%
+%% Uses `ets:take/2' — a SINGLE atomic retrieve-and-delete BIF — NOT a
+%% lookup-then-delete pair. `?PENDING_TABLE' is `public', and this is called
+%% directly from `yuzu_gw_agent_service:subscribe/2', which grpcbox runs as an
+%% independent process per incoming stream, so two concurrent `Subscribe's
+%% presenting the SAME session id race here with zero serialization. A
+%% lookup-then-delete let BOTH win — each spawning an agent process and each
+%% emitting its own `CONNECTED(S)', which is exactly the "more than one
+%% CONNECTED(S) per session" producer that would break the HA WS-4 routing
+%% directory's once-per-session invariant (see ADR-2002 §7 #4246 #4 / #4324).
+%% `ets:take/2' guarantees exactly one concurrent caller receives the object
+%% for a given key (all others get `[]'); the once-per-session property is
+%% pinned by the concurrent-barrier test in yuzu_gw_registry_tests.erl.
 -spec take_pending(binary()) -> map() | undefined.
 take_pending(SessionId) ->
-    case ets:lookup(?PENDING_TABLE, SessionId) of
+    case ets:take(?PENDING_TABLE, SessionId) of
         [{_, Info, _}] ->
-            ets:delete(?PENDING_TABLE, SessionId),
             Info;
         [] ->
             undefined
