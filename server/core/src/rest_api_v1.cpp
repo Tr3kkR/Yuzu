@@ -8616,6 +8616,25 @@ void RestApiV1::register_routes(
                       if (body.contains("combine"))
                           eval_req.combine = body["combine"].get<std::string>();
                       if (body.contains("conditions") && body["conditions"].is_array()) {
+                          // Gate 8 fix (#2146 Batch B2 follow-up): same
+                          // kMaxInventoryConditions pre-check as the result-set
+                          // twins below - this is the third caller of
+                          // evaluate_inventory() and was left unprotected by
+                          // the original review, relying only on the
+                          // defense-in-depth backstop inside evaluate_inventory()
+                          // itself, which silently returns an empty match set
+                          // rather than telling the caller their request was
+                          // rejected (a wrong-result-presented-as-correct regression
+                          // for this specific route).
+                          if (body["conditions"].size() > kMaxInventoryConditions) {
+                              res.status = 400;
+                              res.set_content(
+                                  detail::a4_error(res, "conditions must not exceed " +
+                                                            std::to_string(kMaxInventoryConditions) +
+                                                            " entries"),
+                                  "application/json");
+                              return;
+                          }
                           for (const auto& c : body["conditions"]) {
                               InventoryCondition cond;
                               if (c.contains("plugin"))

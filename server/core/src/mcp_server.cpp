@@ -8915,8 +8915,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // Target = the expression being previewed — every sibling
                     // failure audit here carries a target (governance cons-F2).
                     mcp_audit("failure", expression);
-                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
-                                    "application/json");
+                    res.set_content(
+                        a4_error(kInternalError, "Tag store unavailable",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
                     return;
                 case yuzu::server::ScopePreviewOutcome::Kind::kOk:
                     mcp_audit("success", expression);
@@ -9449,8 +9452,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                  "inventory query truncated at the row or byte cap — refusing to "
                                  "materialise a partial result set",
-                                 "narrow the query, or wait for the row/byte cap to be raised",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                 "narrow the query, or wait for the row/byte cap to be raised"),
                         "application/json");
                     return;
                 }

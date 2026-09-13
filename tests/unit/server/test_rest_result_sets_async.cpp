@@ -527,6 +527,28 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         std::string next;
         CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
     }
+    SECTION("from-inventory-query rejects an oversized conditions[] array before "
+            "evaluating it, never creates a set") {
+        // Gate 8 fix (#2146 Batch B2 follow-up): the kMaxInventoryConditions
+        // pre-check itself had no red->green coverage - only the underlying
+        // evaluate_inventory() backstop was implicitly reachable. This proves
+        // the REST twin's own 400 fires, not merely that a huge array doesn't
+        // crash the process.
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        nlohmann::json conditions = nlohmann::json::array();
+        for (int i = 0; i < 501; ++i)
+            conditions.push_back({{"plugin", "p"}, {"field", "f"}, {"op", "eq"}, {"value", "v"}});
+        nlohmann::json body;
+        body["name"] = "must-not-exist";
+        body["conditions"] = conditions;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+        REQUIRE(status == 400);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
     SECTION("a non-object body is refused, not read as an absent parent_id") {
         AsyncHarness h(pool);
         int status = 0;
@@ -671,6 +693,36 @@ TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][re
     int status = 0;
     h.post("/api/v1/result-sets/rs_00000000000deadbeef/re-eval", "", status);
     REQUIRE(status == 404);
+}
+
+TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
+          "never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    // Gate 8 fix (#2146 Batch B2 follow-up): the re-eval route re-applies the
+    // 100 KiB tar_query cap because the ORIGINAL row may predate the cap (or
+    // was minted through a path that never enforced it) - this test proves
+    // that guard actually fires, rather than trusting the comment at the
+    // call site. Seeded directly in the store (never through
+    // /from-tar-query, which enforces the cap at creation and would itself
+    // reject this payload).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    nlohmann::json payload;
+    payload["sql"] = std::string(100001, 'x');
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
