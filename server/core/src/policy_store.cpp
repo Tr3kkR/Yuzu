@@ -608,7 +608,7 @@ PolicyStore::create_policy(const std::string& yaml_source) {
             "    scope: <scope-expression>\n"
             "    triggers:\n"
             "      - type: interval\n"
-            "        interval: 3600\n",
+            "        interval_seconds: 3600\n",
             "docs/user-manual/policy-engine.md"));
 
     auto id_val = extract_yaml_value(yaml_source, "id");
