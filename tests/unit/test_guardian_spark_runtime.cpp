@@ -5977,6 +5977,99 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     REQUIRE(WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == 0);
 }
+
+// rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318 fjarvis): on_arm_complete's
+// compensating branch built the ArmCompensation continuation (a heap allocation plus
+// a string copy) entirely OUTSIDE any try, while a live, un-disarmed backend
+// subscription was tracked only by a local no longer guarded by `compensating`. A
+// throw there escaped this noexcept function: std::terminate, the agent gone, the
+// OS watcher never disarmed. Inverted death test: the child must exit 0, never die
+// by SIGABRT.
+TEST_CASE("rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318): a throw while building "
+          "the compensating-disarm continuation is contained on the noexcept drain "
+          "(inverted death test: the child must not abort)",
+          "[spark][runtime][liveness][death]") {
+    // Mutation (the pre-fix shape): make_shared<ArmCompensation>()/the `key` copy ran
+    // unguarded -> fault point 4's throw escapes on_arm_complete (noexcept) ->
+    // std::terminate: the child dies by SIGABRT (WIFSIGNALED), exit code never reached.
+    REQUIRE(yuzu::test::wait_until_quiescent());
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // ---- child ----
+        ::signal(SIGABRT, SIG_DFL);
+        auto r = std::make_shared<FakeReader>();
+        auto b = std::make_shared<FakeBackend>();
+        b->hang_next_arm.store(true);
+        auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+        std::atomic<bool> a_done{false};
+        std::thread a_thread{[&] {
+            rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+            a_done.store(true, std::memory_order_release);
+        }};
+        if (!b->wait_entered_hang(std::chrono::seconds(30)))
+            ::_exit(90);
+
+        // Withdraw while the arm is still parked (#2233 item 3's Case-0 shape): the
+        // waiter resolves "withdrawn" now, but the backend's late arm - and the
+        // compensating disarm it needs - only lands once release_hang() fires below.
+        rt->detach_rule("r1");
+        if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
+            ::_exit(91);
+
+        // Arm fault point 4: on_arm_complete's compensating branch throws building
+        // ArmCompensation itself, with the subscription already tracked only by a
+        // local - exactly the window C1 found.
+        rt->set_drain_fault_point_for_test(4);
+        b->release_hang(); // the late arm lands -> compensating -> fault point 4
+        if (!yuzu::test::spin_until([&] { return a_done.load(std::memory_order_acquire); },
+                                    std::chrono::seconds(30)))
+            ::_exit(92);
+        if (!yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                    std::chrono::seconds(10)))
+            ::_exit(93); // the direct-disarm-and-fall-through recovery never ran
+        if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
+            ::_exit(94);
+        if (rt->claim_drain_failures() != 1)
+            ::_exit(95); // the caught throw must count as a drain failure, not vanish
+
+        // Runtime is still healthy after the contained throw: a fresh attach on the
+        // same key/rule arms cleanly.
+        const auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        if (!gen.has_value())
+            ::_exit(96);
+        if (rt->armed_key_count() != 1 || b->arms.load() != 2)
+            ::_exit(97);
+        rt->begin_stop();
+        ::_exit(0);
+    }
+
+    // ---- parent ---- poll, never block: a regression that hangs must fail, not stall the suite.
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t w = ::waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(w == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited within 60 s");
+    }
+    INFO("child status: exited=" << WIFEXITED(status) << " code=" << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
+                                 << " signaled=" << WIFSIGNALED(status)
+                                 << " sig=" << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+    CHECK_FALSE(WIFSIGNALED(status)); // the pre-fix shape: SIGABRT from std::terminate
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+}
 #endif
 
 // rung 9c R5.2 - adversarial re-review r3 (C4): after detach_rule_locked's durable

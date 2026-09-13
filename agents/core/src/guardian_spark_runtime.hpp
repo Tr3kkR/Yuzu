@@ -602,7 +602,11 @@ public:
     /// of a successful arm); 2 = a throw right after the first commit adopted the
     /// subscription (before its verdict is staged); 3 = a throw inside the publish
     /// after the verdicts were written into the claims but before the pop (governance
-    /// pass-3 ch-1 seam: exercises step (3)'s catch and the terminal-head pop). 0 = off.
+    /// pass-3 ch-1 seam: exercises step (3)'s catch and the terminal-head pop); 4 = a
+    /// throw while building the compensating-disarm continuation, i.e. while `sub` is
+    /// captured in a local but before `cont` exists (adversarial review C1, PR #4318
+    /// fjarvis: proves the direct-disarm-and-fall-through recovery, not a
+    /// std::terminate, is what happens here). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -887,9 +891,11 @@ private:
         /// wait_for_claim() deadline has always approximated - std::chrono::
         /// steady_clock::now(), never the injected evaluation clock_() ("Record real
         /// monotonic deadlines in the claim. Do not reuse the injected evaluation
-        /// clock."). Meaningful for Arm claims only (a Disarm's own bound is
-        /// submit_disarm_off_lock's io_executor_.run() call, unrelated to a caller
-        /// waiting on this field). Consulted by expire_overdue_claims() so a
+        /// clock."). Meaningful for Arm claims only - since Unit 3, a Disarm claim
+        /// has no caller-side deadline at all: submit_disarm_off_lock's submit()
+        /// call has none (guardian_io_executor.hpp: "there is no waiter to time
+        /// out"), so there is nothing for this field to bound. Consulted by
+        /// expire_overdue_claims() so a
         /// non-waiting caller's claim still times out with nobody blocked in
         /// wait_for_claim() to notice - the existing timeout-fails-attempt behavior,
         /// just relocated out of a waiter, not removed.
@@ -1186,8 +1192,11 @@ private:
     /// finalize_arm_compensation()) consult: 1 = bad_alloc before the fifo snapshot
     /// (the window C2 found), 2 = a throw right after the first commit adopted the
     /// subscription, 3 = a throw after the verdicts are staged and before the pop
-    /// (governance pass-3 sg-3/ar-4/cs-5: the terminal-tombstone sweep). Consumed
-    /// once (compare_exchange against 0); a no-op if `point` is not currently armed.
+    /// (governance pass-3 sg-3/ar-4/cs-5: the terminal-tombstone sweep), 4 = a throw
+    /// while building the ArmCompensation continuation itself (adversarial review C1,
+    /// PR #4318 fjarvis: the unguarded-allocation window under a live, un-disarmed
+    /// subscription). Consumed once (compare_exchange against 0); a no-op if `point`
+    /// is not currently armed.
     void fault_here_for_test(int point);
     /// registry_mu_ held. Publish `reason` on every claim in `key`'s fifo, release their
     /// index entries, and erase the entry. Reached from on_arm_complete() (noexcept):

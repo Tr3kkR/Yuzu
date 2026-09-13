@@ -936,64 +936,91 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // staging itself threw AFTER `compensating` was set (the old firewall path -
         // folded into this ONE shared branch instead of a separate post-hoc check,
         // since both need identical treatment: build the continuation, submit the
-        // disarm, hand off the rest of the job). Built BEFORE `compensating` is
-        // relinquished, so the only allocation between owning `sub` and handing off
-        // responsibility for it is the submit() call itself - contained exactly like
-        // dispatch_arm_off_lock's own submit() call.
-        auto cont = std::make_shared<ArmCompensation>();
-        cont->key = key;
-        cont->claim = claim;
-        cont->sub = *compensating;
-        cont->finished = std::move(finished);
-        cont->verdicts = std::move(verdicts);
-        cont->waker = std::move(waker);
-        cont->outbox_waker = std::move(outbox_waker);
-        cont->firewalled = firewalled;
-        const std::uint64_t sub = cont->sub;
-        compensating.reset(); // responsibility for `sub` now lives in `cont` / the submit below
-
-        IoResult<void> adm{std::unexpect, IoFailure::LaunchFailed};
+        // disarm, hand off the rest of the job).
+        //
+        // Adversarial review C1 (PR #4318, fjarvis): building `cont` is itself
+        // fallible (make_shared's allocation, the `key` string copy) - it MUST run
+        // under its own try while `sub` is still tracked, because this whole
+        // function is noexcept and an uncaught throw here would terminate the
+        // process with the OS watcher never disarmed. `sub` is captured into a
+        // local FIRST so ownership never depends on `cont` existing; on a throw,
+        // `finished`/`verdicts`/`waker`/`outbox_waker` are untouched (the moves
+        // into `cont` happen only after the build succeeds), so the failure path
+        // falls through to the same "nothing owed" recovery the ordinary
+        // no-compensation case already uses below.
+        const std::uint64_t sub = *compensating;
+        compensating.reset(); // ownership from here is `cont` (below) or the direct
+                               // disarm on the catch path - never this optional again
+        std::shared_ptr<ArmCompensation> cont;
         try {
-            auto self = shared_from_this();
-            adm = io_executor_.submit(
-                claim->io_class, key,
-                [backend = backend_, sub]() -> int {
-                    backend->disarm(sub);
-                    return 0;
-                },
-                [self, cont](IoResult<int>&& res) {
-                    // Only WorkerThrew is reachable here (submit() has no deadline) -
-                    // Astra opine review: "A disarm exception remains best-effort
-                    // teardown failure, not proof that an OS resource disappeared."
-                    if (!res.has_value()) {
-                        try {
-                            spdlog::error("Guardian spark: compensating disarm's own worker "
-                                         "threw for key '{}' - retrying once, best-effort",
-                                         cont->key);
-                        } catch (...) {
-                        }
-                        self->direct_disarm_fallback(cont->key, cont->sub);
-                    }
-                    self->finalize_arm_compensation(cont);
-                });
-        } catch (const std::exception& e) {
+            fault_here_for_test(4); // seam: "the continuation allocation threw"
+            cont = std::make_shared<ArmCompensation>();
+            cont->key = key; // the only other fallible op here (string copy)
+        } catch (...) {
             try {
-                spdlog::error("Guardian spark: building the compensating-disarm submission for "
-                             "key '{}' threw ({}) - falling back to a direct call on this worker",
-                             key, e.what());
+                spdlog::error("Guardian spark: building the compensating-disarm continuation "
+                             "for key '{}' threw - falling back to a direct disarm on this "
+                             "worker", key);
             } catch (...) {
             }
-        }
-        if (!adm) {
-            // Synchronous admission refusal (including Stopped - Astra opine review:
-            // "Stopped cannot silently discard a subscription that the late arm just
-            // produced"): no worker will ever call back for this attempt, so finish
-            // it right here, off-lock, on this already-detached worker (never the
-            // engine caller, never under registry_mu_).
             direct_disarm_fallback(key, sub);
-            finalize_arm_compensation(cont);
+            firewalled = true;
         }
-        return;
+        if (cont) {
+            cont->claim = claim;
+            cont->sub = sub;
+            cont->finished = std::move(finished);
+            cont->verdicts = std::move(verdicts);
+            cont->waker = std::move(waker);
+            cont->outbox_waker = std::move(outbox_waker);
+            cont->firewalled = firewalled;
+
+            IoResult<void> adm{std::unexpect, IoFailure::LaunchFailed};
+            try {
+                auto self = shared_from_this();
+                adm = io_executor_.submit(
+                    claim->io_class, key,
+                    [backend = backend_, sub]() -> int {
+                        backend->disarm(sub);
+                        return 0;
+                    },
+                    [self, cont](IoResult<int>&& res) {
+                        // Only WorkerThrew is reachable here (submit() has no deadline) -
+                        // Astra opine review: "A disarm exception remains best-effort
+                        // teardown failure, not proof that an OS resource disappeared."
+                        if (!res.has_value()) {
+                            try {
+                                spdlog::error("Guardian spark: compensating disarm's own worker "
+                                             "threw for key '{}' - retrying once, best-effort",
+                                             cont->key);
+                            } catch (...) {
+                            }
+                            self->direct_disarm_fallback(cont->key, cont->sub);
+                        }
+                        self->finalize_arm_compensation(cont);
+                    });
+            } catch (const std::exception& e) {
+                try {
+                    spdlog::error("Guardian spark: building the compensating-disarm submission for "
+                                 "key '{}' threw ({}) - falling back to a direct call on this worker",
+                                 key, e.what());
+                } catch (...) {
+                }
+            }
+            if (!adm) {
+                // Synchronous admission refusal (including Stopped - Astra opine review:
+                // "Stopped cannot silently discard a subscription that the late arm just
+                // produced"): no worker will ever call back for this attempt, so finish
+                // it right here, off-lock, on this already-detached worker (never the
+                // engine caller, never under registry_mu_).
+                direct_disarm_fallback(key, sub);
+                finalize_arm_compensation(cont);
+            }
+            return;
+        }
+        // `cont` never came into being: `sub` was already disarmed directly above,
+        // and `finished`/`verdicts`/`waker`/`outbox_waker` are still intact locals -
+        // fall through into the ordinary "nothing owed" recovery path below.
     }
 
     if (!published) {
@@ -1298,7 +1325,8 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
         for (auto& [key, entry] : claims_) {
             for (auto& c : entry.fifo) {
                 if (c->kind != ClaimKind::Arm)
-                    continue; // a Disarm's own bound is submit_disarm_off_lock's run() call
+                    continue; // since Unit 3, a Disarm claim has no caller-side deadline at
+                              // all - submit_disarm_off_lock's submit() call has none
                 if (c->outcome || c->commit_exception || c->waiter_abandoned)
                     continue; // already terminal or already someone else's abandon
                 if (now < c->deadline)
