@@ -719,9 +719,11 @@ static const ToolDef kTools[] = {
      "permission OR by the caller already holding ITServiceOwner on THIS group (skipped for a "
      "service-scoped MCP token). role_name is restricted to \"Operator\" or \"Viewer\" only — no "
      "other role, including ITServiceOwner itself, can be delegated via this route. The "
-     "underlying store ALSO runs RbacStore::validate_assignment (the same dangerous-role-block "
-     "chokepoint engine-principal role grants use) as defense in depth — relevant only if "
-     "principal_type is \"engine\", since Operator/Viewer are not on the disallowed-role list. "
+     "underlying store ALSO runs RbacStore::validate_assignment (Gate 4 happy-path fix: the "
+     "protection that actually fires here is its F2 shadow-row guard against a user/group "
+     "principal_id spoofed with an \"engine:\" prefix - assign_role already rejects "
+     "principal_type==\"engine\" unconditionally before validate_assignment ever runs, so its own "
+     "engine-role-disallow branch is unreachable at this call site). "
      "Idempotent — assigning a grant that already exists is a no-op. Approval-gated (supervised "
      "MCP tier maker-checker) as ManagementGroup:Write. Additive: extends the grant set, "
      "overwrites nothing.",
@@ -8295,6 +8297,33 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Gate 4 unhappy-path BLOCKING fix (#2146 Batch B4 review):
+                // param_str silently returns "" on a JSON type mismatch,
+                // unlike update_management_group's own explicit is_string()
+                // checks four lines below - a caller sending e.g. a numeric
+                // parent_id got a top-level group created instead of the
+                // child they asked for, with no error. Matches the sibling
+                // handler's pattern exactly.
+                if (args.contains("description") && !args["description"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "description must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("parent_id") && !args["parent_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "parent_id must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("membership_type") && !args["membership_type"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "membership_type must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("scope_expression") && !args["scope_expression"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
+                                    "application/json");
+                    return;
+                }
                 ManagementGroup g;
                 g.name = name;
                 g.description = param_str(args, "description");
@@ -8663,9 +8692,12 @@ McpServer::HandlerFn McpServer::build_handler(
             // token). role_name restricted to Operator/Viewer ONLY, matching REST's
             // own explicit check — no other role, including ITServiceOwner itself,
             // can be delegated here. The store's assign_role() ALSO runs
-            // RbacStore::validate_assignment (the dangerous-role-block chokepoint;
-            // relevant only when principal_type=="engine", since Operator/Viewer are
-            // not on that function's disallowed-role list) as defense in depth.
+            // RbacStore::validate_assignment - Gate 4 happy-path fix: the protection
+            // that actually fires here is its F2 shadow-row guard against a
+            // user/group principal_id spoofed with an "engine:" prefix, NOT the
+            // engine-role-disallow branch (assign_role already rejects
+            // principal_type=="engine" unconditionally before validate_assignment
+            // ever runs, so that branch is unreachable at this call site).
             if (tool_name == "assign_management_group_role") {
                 if (!tier_allows(tier, "ManagementGroup", "Write")) {
                     res.set_content(
@@ -16993,10 +17025,65 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ApiToken", "Write"))
                     return;
+                // Gate 6 enterprise-readiness/compliance BLOCKING fix (#2146
+                // Batch B4 review, user directive): an empty session->mcp_tier
+                // means this call bypassed BOTH REST's step_up_fn (MCP never
+                // calls it) AND the supervised-tier approval gate (requires_
+                // approval() itself no-ops on an empty tier) - mcp_policy.hpp's
+                // documented "not an MCP token -> allow everything, defer to
+                // RBAC" premise assumed that caller class is non-interactive,
+                // which #4309 disproves (an ordinary cookie session reaches
+                // this same MCP endpoint). Denying here restores that premise
+                // for exactly the two operations (self-mint a persistent
+                // credential; the sibling revoke_api_token/unlock_account
+                // below) where REST has a control this transport otherwise
+                // lacks entirely. Session::auth_source is a secondary
+                // safety net documented, not required, here: RBAC-scoped
+                // per-call denial is on mcp_tier alone, matching the exact
+                // condition tier_allows()/requires_approval() themselves key
+                // on, so this can never diverge from what those functions
+                // already decided was "not really an MCP token."
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied", "interactive session, no MCP tier");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "create_api_token requires an MCP-tier bearer token - an "
+                                 "interactive session has neither the MFA step-up REST's route "
+                                 "applies nor a maker-checker approval ticket for this operation; "
+                                 "use POST /api/v1/tokens instead"),
+                        "application/json");
+                    return;
+                }
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
                     mcp_audit("failure", "api token store unavailable");
                     res.set_content(a4_error(kInternalError, "api token store unavailable",
                                              "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Gate 4 unhappy-path BLOCKING fix (#2146 Batch B4 review):
+                // param_str silently returns "" on a JSON type mismatch. For
+                // mcp_tier specifically this is not merely a wrong-scope bug
+                // like create_management_group's - an empty mcp_tier is the
+                // MOST PERMISSIVE token shape this store can mint (no tier
+                // restriction, no 90-day TTL cap, no expires_at requirement),
+                // per mcp_policy.hpp's own documented contract ("an empty
+                // tier string means 'not an MCP token' -> allow everything").
+                // A type-mismatched mcp_tier must be REJECTED, never
+                // defaulted, or a caller's constrained-credential request
+                // silently mints the least-constrained one instead.
+                if (args.contains("name") && !args["name"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "name must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("scope_service") && !args["scope_service"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "scope_service must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("mcp_tier") && !args["mcp_tier"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "mcp_tier must be a JSON string"),
                                     "application/json");
                     return;
                 }
@@ -17144,6 +17231,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ApiToken", "Delete"))
                     return;
+                // Gate 6 enterprise-readiness/compliance BLOCKING fix (#2146
+                // Batch B4 review, user directive): see create_api_token's
+                // identical guard above - an empty session->mcp_tier means
+                // this call bypassed both REST's step_up_fn and the
+                // supervised-tier approval gate.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied", "interactive session, no MCP tier");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "revoke_api_token requires an MCP-tier bearer token - an "
+                                 "interactive session has neither the MFA step-up REST's route "
+                                 "applies nor a maker-checker approval ticket for this operation; "
+                                 "use DELETE /api/v1/tokens/{id} instead"),
+                        "application/json");
+                    return;
+                }
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
                     mcp_audit("failure", "api token store unavailable");
                     res.set_content(a4_error(kInternalError, "api token store unavailable",
@@ -17890,6 +17993,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "UserManagement", "Write"))
                     return;
+                // Gate 6 enterprise-readiness/compliance BLOCKING fix (#2146
+                // Batch B4 review, user directive): see create_api_token's
+                // identical guard above - an empty session->mcp_tier means
+                // this call bypassed both REST's step_up_fn and the
+                // supervised-tier approval gate.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied", "interactive session, no MCP tier");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "unlock_account requires an MCP-tier bearer token - an "
+                                 "interactive session has neither the MFA step-up REST's route "
+                                 "applies nor a maker-checker approval ticket for this operation; "
+                                 "use POST /api/v1/users/{username}/unlock instead"),
+                        "application/json");
+                    return;
+                }
                 if (session->username.empty()) {
                     // sec-M1 parity: an empty caller username would mis-attribute
                     // the audit row.

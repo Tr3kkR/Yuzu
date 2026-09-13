@@ -2807,11 +2807,34 @@ TEST_CASE("MCP create_api_token: happy path mints a token owned by the caller",
     yuzu::server::ApiTokenStore store{pool};
     REQUIRE(store.is_open());
 
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts;
     ts.engine_credential_store_for_test = &store;
-    ts.start();
-    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1002,)"
-                       R"("params":{"name":"create_api_token","arguments":{"name":"ci-key"}}})");
+    ts.approval_manager_for_test = &appr;
+    // Gate 6 fix (#2146 Batch B4 review, user directive): the happy path for
+    // a REAL MCP caller is a tiered (bearer-token) session, not the default
+    // empty-tier ts.start() this test previously used - that shape now
+    // correctly hits the interactive-session denial below instead.
+    // ApiToken:Write is approval-gated at supervised tier (tier_allows()
+    // denies it outright below supervised), so this exercises the full
+    // ticket-then-recall round trip, matching the revoke_certificate
+    // precedent.
+    ts.start("supervised");
+    auto mint = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1002,)"
+                        R"("params":{"name":"create_api_token","arguments":{"name":"ci-key"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1002,)"
+        R"("params":{"name":"create_api_token","arguments":{"name":"ci-key","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -2823,6 +2846,37 @@ TEST_CASE("MCP create_api_token: happy path mints a token owned by the caller",
     REQUIRE(listing->size() == 1);
     CHECK(listing->front().name == "ci-key");
     CHECK(listing->front().principal_id == "test-user"); // always self-issued
+}
+
+TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account: an interactive "
+          "(empty mcp_tier) session is denied - no MFA step-up and no approval gate "
+          "would otherwise fire for it",
+          "[mcp][token][security]") {
+    // Gate 6 BLOCKING fix (#2146 Batch B4 review, user directive): before
+    // this fix, a plain authenticated session with ordinary write permission
+    // could self-mint a persistent API token or clear an account lockout via
+    // MCP with NEITHER of the two controls its REST twin enforces - REST's
+    // step_up_fn (never called by any MCP handler) nor the supervised-tier
+    // approval gate (requires_approval() itself no-ops on an empty tier, per
+    // mcp_policy.hpp's own documented contract). #4309 tracks the
+    // architecture-wide root cause; this pins the mitigation for these three
+    // specific high-value operations.
+    McpTestServer ts;
+    ts.start(); // default: empty mcp_tier, matching an interactive session
+    for (const auto& [name, args] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"create_api_token", R"({"name":"x"})"},
+             {"revoke_api_token", R"({"token_id":"tok-does-not-matter"})"},
+             {"unlock_account", R"({"username":"someone"})"}}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":")" + name +
+            R"(","arguments":)" + args + R"(}})");
+        REQUIRE(res);
+        INFO("tool: " << name);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kPermissionDenied);
+    }
 }
 
 TEST_CASE("MCP create_api_token: RBAC denial (ApiToken:Write) blocks the call", "[mcp][token]") {
@@ -2870,10 +2924,14 @@ TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner a
     const int64_t now = static_cast<int64_t>(std::time(nullptr));
     const std::string expires_at_arg = std::to_string(now + 3600);
 
+    yuzu::test::ApprovalManagerPg denied_appr_bundle;
+    yuzu::server::ApprovalManager& denied_appr = *denied_appr_bundle;
+
     McpTestServer ts_denied;
     ts_denied.engine_credential_store_for_test = &tokens;
     ts_denied.mgmt_store_for_test = &mgmt;
     ts_denied.rbac_store_for_test = &rbac;
+    ts_denied.approval_manager_for_test = &denied_appr;
     // No ITServiceOwner grant yet, and the mock perm_fn's default-allow would
     // mask the multi-store check entirely — deny the fleet-wide
     // ManagementGroup:Write arm so only the ITServiceOwner-of-service-group
@@ -2881,12 +2939,30 @@ TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner a
     ts_denied.perm_override_for_test = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
     };
-    ts_denied.start();
-    auto denied = ts_denied.call(
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - ApiToken:Write is approval-gated at supervised tier, so
+    // the ITServiceOwner-authority business check only runs on RECALL, after
+    // the ticket is consumed - the mint itself always succeeds regardless of
+    // the eventual business decision.
+    ts_denied.start("supervised");
+    auto denied_mint = ts_denied.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1004,)"
         R"("params":{"name":"create_api_token",)"
         R"("arguments":{"name":"svc-key","scope_service":"billing","expires_at":)" +
         expires_at_arg + R"(}}})");
+    REQUIRE(denied_mint);
+    auto denied_mint_body = nlohmann::json::parse(denied_mint->body);
+    REQUIRE(denied_mint_body.contains("error"));
+    const std::string denied_approval_id =
+        denied_mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(denied_appr.approve(denied_approval_id, "reviewer-bob", ""));
+
+    std::string denied_recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1004,)"
+        R"("params":{"name":"create_api_token",)"
+        R"("arguments":{"name":"svc-key","scope_service":"billing","expires_at":)" +
+        expires_at_arg + R"(,"approval_id":")" + denied_approval_id + R"("}}})";
+    auto denied = ts_denied.call(denied_recall);
     REQUIRE(denied->status == 200);
     auto denied_body = nlohmann::json::parse(denied->body);
     REQUIRE(denied_body.contains("error"));
@@ -2909,19 +2985,39 @@ TEST_CASE("MCP create_api_token: a scope_service token requires ITServiceOwner a
     grant.role_name = "ITServiceOwner";
     REQUIRE(mgmt.assign_role(grant).has_value());
 
+    yuzu::test::ApprovalManagerPg allowed_appr_bundle;
+    yuzu::server::ApprovalManager& allowed_appr = *allowed_appr_bundle;
+
     McpTestServer ts_allowed;
     ts_allowed.engine_credential_store_for_test = &tokens;
     ts_allowed.mgmt_store_for_test = &mgmt;
     ts_allowed.rbac_store_for_test = &rbac;
+    ts_allowed.approval_manager_for_test = &allowed_appr;
     ts_allowed.perm_override_for_test = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
     };
-    ts_allowed.start();
-    auto allowed = ts_allowed.call(
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - see the "denied" half above for why mint always succeeds
+    // and the business decision is only visible on recall.
+    ts_allowed.start("supervised");
+    auto allowed_mint = ts_allowed.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1005,)"
         R"("params":{"name":"create_api_token",)"
         R"("arguments":{"name":"svc-key","scope_service":"billing","expires_at":)" +
         expires_at_arg + R"(}}})");
+    REQUIRE(allowed_mint);
+    auto allowed_mint_body = nlohmann::json::parse(allowed_mint->body);
+    REQUIRE(allowed_mint_body.contains("error"));
+    const std::string allowed_approval_id =
+        allowed_mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(allowed_appr.approve(allowed_approval_id, "reviewer-bob", ""));
+
+    std::string allowed_recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1005,)"
+        R"("params":{"name":"create_api_token",)"
+        R"("arguments":{"name":"svc-key","scope_service":"billing","expires_at":)" +
+        expires_at_arg + R"(,"approval_id":")" + allowed_approval_id + R"("}}})";
+    auto allowed = ts_allowed.call(allowed_recall);
     REQUIRE(allowed->status == 200);
     auto allowed_body = nlohmann::json::parse(allowed->body);
     REQUIRE(allowed_body.contains("result"));
@@ -2941,13 +3037,31 @@ TEST_CASE("MCP revoke_api_token: happy path revokes the caller's own token",
     REQUIRE(store.create_token("to-revoke", "test-user").has_value());
     const auto token_id = store.list_tokens("test-user").value().front().token_id;
 
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts;
     ts.engine_credential_store_for_test = &store;
-    ts.start();
-    auto res = ts.call(
+    ts.approval_manager_for_test = &appr;
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - ApiToken:Delete is approval-gated at supervised tier, so
+    // this exercises the full ticket-then-recall round trip.
+    ts.start("supervised");
+    auto mint = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
         R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
         token_id + R"("}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1006,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"(","approval_id":")" + approval_id + R"("}}})";
+    auto res = ts.call(recall);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -2968,19 +3082,37 @@ TEST_CASE("MCP revoke_api_token: another user's token is 'not found', not an enu
     REQUIRE(store.create_token("not-mine", "other-user").has_value());
     const auto token_id = store.list_tokens("other-user").value().front().token_id;
 
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts;
     ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
     // mock_username defaults to "test-user", not the owner; mock_role
     // defaults to admin, which the store's own JIT-elevation allowance would
     // let bypass the ownership check entirely (matching REST's own admin
     // override) — force a non-admin role so this test actually exercises the
     // owner-vs-nonexistent belt, not the elevated-session bypass.
     ts.mock_role = yuzu::server::auth::Role::user;
-    ts.start();
-    auto res = ts.call(
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - ApiToken:Delete is approval-gated at supervised tier, so
+    // the not-found belt only runs on RECALL, after the ticket is consumed.
+    ts.start("supervised");
+    auto mint = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":1007,)"
         R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
         token_id + R"("}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1007,)"
+        R"("params":{"name":"revoke_api_token","arguments":{"token_id":")" +
+        token_id + R"(","approval_id":")" + approval_id + R"("}}})";
+    auto res = ts.call(recall);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
@@ -4534,12 +4666,30 @@ TEST_CASE("MCP check_permission: reachable even when the caller holds NO RBAC pe
 TEST_CASE("MCP unlock_account: happy path clears the lockout and audits "
           "auth.lockout.cleared",
           "[mcp][account]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts;
     ts.lockout_clear_fn_for_test = [](const std::string&) { return true; };
-    ts.start();
-    auto res = ts.call(
+    ts.approval_manager_for_test = &appr;
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - UserManagement:Write is approval-gated at supervised
+    // tier, so this exercises the full ticket-then-recall round trip.
+    ts.start("supervised");
+    auto mint = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":2100,)"
         R"("params":{"name":"unlock_account","arguments":{"username":"alice"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2100,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"alice","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("result"));
@@ -4574,11 +4724,29 @@ TEST_CASE("MCP unlock_account: RBAC denial (UserManagement:Write) blocks the cal
 TEST_CASE("MCP unlock_account: unwired lockout_clear_fn reports subsystem unavailable, "
           "matching the REST route's degrade when its own callback is unwired",
           "[mcp][account]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts; // lockout_clear_fn_for_test left unset (default)
-    ts.start();
-    auto res = ts.call(
+    ts.approval_manager_for_test = &appr;
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - the unwired-subsystem check only runs on RECALL, after
+    // the ticket is consumed.
+    ts.start("supervised");
+    auto mint = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":2102,)"
         R"("params":{"name":"unlock_account","arguments":{"username":"alice"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2102,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"alice","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
@@ -4588,16 +4756,36 @@ TEST_CASE("MCP unlock_account: unwired lockout_clear_fn reports subsystem unavai
 TEST_CASE("MCP unlock_account: invalid username format is rejected before the store is "
           "ever reached",
           "[mcp][account]") {
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
     McpTestServer ts;
     bool called = false;
     ts.lockout_clear_fn_for_test = [&called](const std::string&) {
         called = true;
         return true;
     };
-    ts.start();
-    auto res = ts.call(
+    ts.approval_manager_for_test = &appr;
+    // Gate 6 fix (#2146 Batch B4 review): a tiered session, matching a real
+    // MCP caller - the username-format check only runs on RECALL, after the
+    // ticket is consumed (the mint step carries no tool-specific arg
+    // validation, matching the ticket-then-recall contract every approval-
+    // gated tool shares).
+    ts.start("supervised");
+    auto mint = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":2103,)"
         R"("params":{"name":"unlock_account","arguments":{"username":"bad user!"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", ""));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2103,)"
+        R"("params":{"name":"unlock_account","arguments":{"username":"bad user!","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
     REQUIRE(res->status == 200);
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
