@@ -6127,9 +6127,22 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
         if (!yuzu::test::spin_until([&] { return a_done.load(std::memory_order_acquire); },
                                     std::chrono::seconds(30)))
             ::_exit(92);
+        // Gate 8 re-review (quality-engineer, PR #4318): this file's own "withdrawn"
+        // wakeup path (see the comment above detach_rule() below) means `a_thread`'s
+        // attach_rule() can return - and this spin_until can start polling - BEFORE
+        // release_hang() even runs, so there is no ordering guarantee between when
+        // polling starts and when either disarm lands. Empirically (Gate 8 red-test
+        // against the pre-7c45c36a3 double-disarm shape, 15/15 runs, mixed timing)
+        // the synchronous catch-handler disarm and the buggy shape's second,
+        // io_executor_-submitted disarm land close enough together that this 1ms-
+        // polling spin_until times out rather than ever observing exactly 1 - so this
+        // check DOES still fail on a real double-disarm today, but by timeout, not by
+        // directly witnessing ">1"; a slower/loaded second disarm could in principle
+        // let this check see disarms==1 and pass, which is exactly why the explicit,
+        // non-waiting recheck below exists as the check that cannot age out under load.
         if (!yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                     std::chrono::seconds(10)))
-            ::_exit(93); // more than one disarm landed, or none did
+            ::_exit(93); // no disarm within 10s, or it never settled at exactly 1
         if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
             ::_exit(94);
         if (rt->claim_drain_failures() != 1)
@@ -6143,6 +6156,16 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
             ::_exit(96); // the key is wedged - exactly the bug this test guards against
         if (rt->armed_key_count() != 1 || b->arms.load() != 2)
             ::_exit(97);
+
+        // Gate 8 re-review (quality-engineer, PR #4318): a non-waiting recheck, taken
+        // here (not earlier) because by now the second attach_rule() above has fully
+        // completed - any async disarm the buggy shape would have submitted has long
+        // since landed, so this needs no spin/timeout of its own and never costs a
+        // green run any wall-clock time. Catches a double-disarm even in a future
+        // where the wedged-key symptom above (exit 96) is independently self-healed
+        // without the underlying double-disarm itself being fixed.
+        if (b->disarms.load() > 1)
+            ::_exit(98); // a second, redundant disarm landed - the double-disarm bug is back
         rt->begin_stop();
         ::_exit(0);
     }
