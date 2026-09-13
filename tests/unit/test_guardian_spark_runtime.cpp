@@ -5370,6 +5370,19 @@ TEST_CASE("rung 9c R5.2: rapid attaches on distinct keys all commit (the callbac
     // made and is a proven false invariant under CPU contention (observed under
     // TSan+starvation: as few as 4/200 actually dispatched). Asserting the sum
     // pins the real contract instead of masking ch-202's retention mechanism.
+    //
+    // rung 9c PR-2 Unit 3: detach_all() dispatches every disarm off-lock
+    // (submit_disarm_off_lock) and returns once each is ADMITTED, not once its
+    // backend call physically finishes - a disarm that was admitted but has not
+    // yet completed is in NEITHER bucket for a brief window (not in `disarms`
+    // until its own completion callback runs, not in disarm_retained() since it
+    // was never refused). The partition above is still exactly right; it just
+    // is not necessarily true the INSTANT detach_all() returns any more. Settle
+    // on it rather than asserting immediately - once true it stays true (the
+    // comment above already establishes neither bucket ever un-counts a claim).
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return b->disarms.load() + rt->disarm_retained() == 200; },
+        std::chrono::seconds(10)));
     CHECK(b->disarms.load() + rt->disarm_retained() == 200);
     CHECK(rt->armed_key_count() == 0);
 }
@@ -5522,6 +5535,12 @@ TEST_CASE("rung 9c R5.2 (adversarial review C1/K1'): a detach arriving right aft
     CHECK_FALSE(park->entered.load());
     REQUIRE(a1.gen.has_value()); // RED: "withdrawn" for a rule that was actually armed
     REQUIRE(b->armed_ids().size() == 1);
+    // rung 9c PR-2 Unit 3: detach_rule() (dt, above) returns once its disarm is
+    // ADMITTED (submit_disarm_off_lock), not once the backend call physically
+    // finishes - settle on the disarm's own observable effect before asserting it,
+    // rather than assuming d_done implies completion.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarmed_ids().size() == 1; },
+                                   std::chrono::seconds(10)));
     CHECK(b->disarm_entries.load() == 1);
     REQUIRE(b->disarmed_ids().size() == 1);
     CHECK(b->disarmed_ids()[0] == b->armed_ids()[0]);
