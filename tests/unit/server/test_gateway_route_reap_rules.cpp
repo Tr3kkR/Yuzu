@@ -442,3 +442,47 @@ TEST_CASE("decide_reap: a negative skew bound is clamped to 0 (cannot invert the
     CHECK_FALSE(d.clock_anomaly); // clamp present: clean pass, not a forward-skew decline
     CHECK_FALSE(d.recovered);
 }
+
+TEST_CASE("decide_reap: negative recovery-gap bounds are clamped to 0",
+          "[gateway_route][reap_rules]") {
+    // Parity with the skew-bound clamp above (quality-engineer governance fold):
+    // the recovery-window bounds get the same entry clamp (<0 -> 0). The
+    // production caller passes positive compile-time constants whose ordering a
+    // static_assert enforces, but this is a public pure helper a future/mis-wired
+    // caller could hand a negative bound.
+    //
+    // A same-(anchor, direction) forward-skew repeat whose reading has NOT
+    // advanced since first observation (delta == 0) is the discriminating input.
+    const std::int64_t anchor = kNow - 2 * kSkew;      // forward skew, well past kSkew
+    const std::string m = marker3(anchor, "forward", kNow); // first_now_ms == now -> delta 0
+
+    SECTION("max_recovery_gap clamp discriminates") {
+        // Both bounds negative -> both clamp to 0. delta 0 is then NOT > max(0)
+        // and NOT < min(0), so it lands in the (degenerate) recover window.
+        // WITHOUT the max clamp (max = -1) the very same delta 0 would be
+        // `> -1` and re-arm as a brand-new anomaly instead — so this flips if
+        // the clamp is removed.
+        const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)),
+                                           sv(m), kSkew, /*min*/ -1, /*max*/ -1);
+        CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
+        REQUIRE(d.new_anchor.has_value());
+        CHECK(*d.new_anchor == kNow);
+        CHECK(d.run_sweeps);
+        CHECK_FALSE(d.clock_anomaly);
+        CHECK(d.recovered); // clamped: recover, not a fresh-anomaly decline
+    }
+
+    SECTION("min_recovery_gap clamp is defense-in-depth (unobservable on delta >= 0)") {
+        // The `delta < 0` case is caught by the SAME OR-clause as the ceiling, so
+        // by the time `delta < min` is evaluated delta is always >= 0. A negative
+        // min and a clamped-0 min therefore decide identically for every reachable
+        // delta — the clamp cannot be discriminated, and this asserts the outcome
+        // is the documented one rather than claiming a discrimination that does
+        // not exist. delta 0 with a positive ceiling still recovers (min <= 0).
+        const ReapDecision d = decide_reap(std::to_string(kNow), sv(std::to_string(anchor)),
+                                           sv(m), kSkew, /*min*/ -1, /*max*/ kMaxGap);
+        CHECK(d.marker.kind() == MarkerAction::Kind::Clear);
+        CHECK(d.run_sweeps);
+        CHECK(d.recovered);
+    }
+}

@@ -14962,17 +14962,36 @@ private:
                 // reaper's own clock-guard (advisory lock + persisted
                 // anchor) is what makes a slower or missed tick harmless.
                 constexpr int kGatewayRouteReapEveryNTicks = 150; // ~5 minutes at 2s/tick
-                // PR #4299 round 4: the inter-pass interval must stay STRICTLY
-                // above the reap recovery FLOOR (kMinReapRecoveryGapMs) — else a
-                // single replica's own back-to-back passes could never span the
-                // floor and its skew anomalies would never recover (a wedge).
-                // 150 ticks * 2s/tick * 1000 = 300'000ms > 270'000ms floor. A
-                // future cadence tune below ~135 ticks trips this at build time.
+                // PR #4299 round 4/5: the inter-pass interval must land INSIDE the
+                // reap recovery window [kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs].
+                // The two bounds guard against opposite cadence failures, and only
+                // the ceiling one is a true wedge:
+                //
+                //   FLOOR (below kMin): first_now_ms is frozen and PRESERVED across
+                //   declines, so a persistent skew's delta grows monotonically and
+                //   still recovers — just over multiple passes instead of on pass 2.
+                //   Staying above the floor makes that recovery prompt (pass 2), not
+                //   the drawn-out multi-pass one; it is a promptness guard, NOT a
+                //   wedge guard. 150 * 2s * 1000 = 300'000ms > 270'000ms floor; a
+                //   future cadence below ~135 ticks trips this at build time.
+                //
+                //   CEILING (above kMax): every pass-to-pass delta would exceed the
+                //   recovery ceiling, so each pass re-arms as a BRAND-NEW anomaly
+                //   (arm(now_ms) resets first_now_ms), and the next pass is a fresh
+                //   >ceiling delta again — a PERMANENT wedge, the exact failure this
+                //   whole mechanism exists to prevent, reintroduced via cadence.
+                //   300'000ms < 3'600'000ms ceiling; a future cadence above ~1800
+                //   ticks trips this at build time.
                 static_assert(kGatewayRouteReapEveryNTicks * 2 /*sec per tick*/ * 1000 >
                                   kMinReapRecoveryGapMs,
                               "gateway route reap cadence must exceed the recovery floor, or a "
-                              "single replica's skew anomalies could never persist long enough "
-                              "to recover (kMinReapRecoveryGapMs, gateway_route_store.hpp)");
+                              "single replica's persistent skew recovers slowly over many passes "
+                              "instead of promptly (kMinReapRecoveryGapMs, gateway_route_store.hpp)");
+                static_assert(kGatewayRouteReapEveryNTicks * 2 /*sec per tick*/ * 1000 <
+                                  kMaxReapRecoveryGapMs,
+                              "gateway route reap cadence must stay below the recovery ceiling, or "
+                              "every pass-to-pass delta exceeds it and re-arms as a new anomaly — a "
+                              "permanent wedge (kMaxReapRecoveryGapMs, gateway_route_store.hpp)");
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
