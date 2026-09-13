@@ -330,9 +330,20 @@ checklist.
 **Ladder insertion (ruling 14(c), 2026-09-08, revised 2026-09-11):** the #2012/#3840
 same-type-serialization fix lands between this track's PR-1 and PR-2, no longer in the
 post-flip package - as **three** PRs sharing one shared primitive (PR-A/#4190), not the two
-originally planned: PR-B1 (Registry, merged), PR-B2 (File, merged), PR-B3 (Service, in review).
-See the corrected #2012 row in §5's register for the full per-mechanism status, including the
-correction that Service never actually had the hazard this row originally described.
+originally planned: PR-B1 (Registry, merged), PR-B2 (File, merged), **PR-B3 (Service, merged
+2026-09-12, PR #4302) - the series is now fully complete**, closing #2012/#3840/#4181. See the
+corrected #2012 row in §5's register for the full per-mechanism status, including the
+correction that Service never actually had the hazard this row originally described, and the
+re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
+
+**Ladder status, updated 2026-09-13**: **PR-0 (done, #4130) → PR-1 (done, #4224,
+2026-09-10) → [#2012/#3840 series, done, see above] → PR-2 (done, #4318, 2026-09-13) → PR-3
+(telemetry, not started) → PR-4 (audit/shutdown/legacy-note, not started) → PR-5 (fault/K-bound
+logic, not started - see acceptance criteria below) → PR-6 (Service readiness signal +
+re-measurement, not started).** PR-2 settled §R5.3's previously-open "resolved" definition:
+resolved = backend `arm()` success AND Guardian's own generation-commit, not OS-watch
+establishment - `docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.5 updated to describe
+the mechanism as implemented, not just designed.
 
 **Rung 9c PR-5 acceptance criteria (governance pass-3, independent fan-out on PR-1, 2026-09-09).**
 Three unhappy-path findings on PR-1 derive HIGH on their own facts and are capped to LOW only by
@@ -1102,11 +1113,25 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   the correction above.
 - Revisit trigger: for the remaining #2011/#2014 piece, **escalate to flip-gating if a production
   fleet materializes before it lands**; the #2012/#3840 piece is already pre-flip by ruling 14(c).
-  Once PR-B3 merges, re-verify **ruling 14(c)'s own "sustained same-type stall holding a
-  generation's acknowledgment indefinitely" framing** against Service's actual (corrected) stall
-  shape before treating rung 9c's PR-2 as unconditionally unblocked by this series' completion -
-  ruling 14(c) was written assuming Service had the same per-type-lock hazard Registry had, which
-  this correction shows was never the case.
+  **Re-verification DONE, 2026-09-12 (superseding the prior "re-verify before treating PR-2 as
+  unconditionally unblocked" open item above)**: ruling 14(c)'s own "sustained same-type stall
+  holding a generation's acknowledgment indefinitely" framing was re-checked against Service's
+  actual (corrected) stall shape - routed to Astra (opine) then Fable (advisor) for independent
+  review, both concurred. Finding: the underlying concern (same-type contention causing genuine
+  admission congestion, not just delay) is addressed for all three mechanisms, though not
+  eliminated outright - the #4279 lane-cap-overshoot observation is a tracked, characterized
+  residual (most likely a transient admission-counter artifact per both the issue's own static
+  read and Astra's independent derivation, not a confirmed cap breach), not a reopening of the
+  original hazard. **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
+  ruling 14(c)'s own rationale, since the K-bound/quarantine classification logic actually lives
+  in PR-5, not PR-2, so the accepted cost this hold existed to protect against was never live at
+  PR-2 in the first place. **PR-2 has since merged** (PR #4318, `a27ec4549baa`,
+  2026-09-13T14:46:02Z) - see `docs/spark-legacy-delta-registry.md` row A3 for its "Verify at"
+  update. #4181 (the related same-type reentrant-deadlock issue, T6) is CLOSED - verified against
+  the landed code that Service's `watch()`/`unwatch()` release `mu_` before teardown runs, so the
+  two-thread cycle that issue describes cannot occur for Service (independent of whether
+  `CloseServiceHandle` itself can hang, a separate, disclosed, still-open uncertainty tracked at
+  #4218).
 
 **#2570 + #2578** (macOS spark-test flakes)
 - Detection signal: CI red on the macOS leg for these two specific named tests.
