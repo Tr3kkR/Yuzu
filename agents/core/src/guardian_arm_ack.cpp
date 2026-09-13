@@ -1,6 +1,7 @@
 #include "guardian_arm_ack.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <vector>
 
@@ -43,6 +44,47 @@ std::string canonicalize_spec_block(const gpb::GuardianSpecBlock& block) {
     return out;
 }
 
+/// True iff `s` has the exact shape of a real `guardian_push_content_id()` output
+/// (lowercase-or-uppercase hex, 64 chars - a SHA-256 digest). Governance finding
+/// sec-1/arch-1 gate-review (rung 9c PR-2 hardening): decide_retry() must never
+/// trust a content_id comparison where EITHER side is a sentinel rather than a
+/// real hash - the empty string GuardianEngine::start_local()'s boot placeholder
+/// uses, and the empty string guardian_push_content_id()'s own throw fallback
+/// uses below, both fail this check trivially (wrong length), so two DIFFERENT
+/// pushes that both hit the throw fallback (or one that collides with the boot
+/// placeholder) can never be misread as "the same content" merely because their
+/// sentinels are byte-identical to each other.
+bool is_sha256_hex(std::string_view s) {
+    if (s.size() != 64)
+        return false;
+    return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+/// Governance finding SHOULD-1 (Gate 4, consistency-auditor): drain_locked()'s own
+/// async-failure warn previously logged no reason at all, unlike the sync-refusal
+/// warn in reconcile_rule_locked() which always names one. Exhaustive switch, no
+/// `default`, mirroring GuardianSparkRuntime::receipt_status()'s own convention -
+/// a future ReceiptStatus addition (e.g. a K-bound Quarantined) fails to COMPILE
+/// here rather than silently landing in a catch-all bucket.
+const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
+    using S = GuardianSparkRuntime::ReceiptStatus;
+    switch (status) {
+    case S::Pending:
+        return "Pending";
+    case S::Committed:
+        return "Committed";
+    case S::Failed:
+        return "Failed";
+    case S::Expired:
+        return "Expired";
+    case S::Withdrawn:
+        return "Withdrawn";
+    case S::Stopped:
+        return "Stopped";
+    }
+    return "Unknown"; // unreachable if the switch above is kept exhaustive
+}
+
 } // namespace
 
 std::string guardian_push_content_id(const gpb::GuaranteedStatePush& push) {
@@ -61,9 +103,16 @@ std::string guardian_push_content_id(const gpb::GuaranteedStatePush& push) {
         append_field(canon, r->enabled() ? "1" : "0");
         append_field(canon, r->enforcement_mode());
         append_field(canon, std::to_string(r->version()));
-        canon += canonicalize_spec_block(r->spark());
-        canon += canonicalize_spec_block(r->assertion());
-        canon += canonicalize_spec_block(r->remediation());
+        // Governance finding cae-1 (Gate 3, cpp-expert, verified with a hand-constructed
+        // collision): concatenating each block's own already-field-injective output
+        // directly is NOT block-boundary-injective - nothing marks where one block's
+        // fields end and the next begins, so two rules with different (spark,
+        // assertion) splits of the same flat field sequence canonicalize identically.
+        // append_field() on the whole block output restores injectivity the same way
+        // it already does for individual fields, by length-prefixing the boundary.
+        append_field(canon, canonicalize_spec_block(r->spark()));
+        append_field(canon, canonicalize_spec_block(r->assertion()));
+        append_field(canon, canonicalize_spec_block(r->remediation()));
     }
     return sha256_hex(canon);
 }
@@ -104,7 +153,8 @@ void GuardianArmAckLedger::latch_failure() {
 }
 
 std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
-                                               std::size_t max_per_tick) {
+                                               std::size_t max_per_tick,
+                                               std::size_t* failed_out) {
     // Runtime-wide sweep, not scoped to this application's own pending set -
     // rung 9c PR-2 Unit 2's expire_overdue_claims() abandons any Arm claim
     // whose real deadline has passed regardless of which (if any) ledger is
@@ -119,25 +169,40 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
     for (auto it = current_->pending.begin();
         it != current_->pending.end() && resolved < max_per_tick;) {
         const auto status = runtime.receipt_status(it->second);
-        if (status == GuardianSparkRuntime::ReceiptStatus::Pending) {
+        // Exhaustive switch, no `default` - SHOULD-1's own fix (see the
+        // receipt_status_name() helper above): a future ReceiptStatus value fails
+        // to compile here rather than silently landing in a catch-all "failed"
+        // bucket the way the old if/else-if/else chain would have.
+        using S = GuardianSparkRuntime::ReceiptStatus;
+        switch (status) {
+        case S::Pending:
             ++it;
             continue;
-        }
-        if (status == GuardianSparkRuntime::ReceiptStatus::Committed) {
+        case S::Committed:
             ++current_->resolved_armed;
-        } else {
+            break;
+        case S::Failed:
+        case S::Expired:
+        case S::Withdrawn:
+        case S::Stopped:
             ++current_->resolved_failed;
+            if (failed_out)
+                ++*failed_out; // UP-3: feeds GuardianEngine::arm_failures_ (see caller)
             // rung 9c PR-2 Unit 6: the only place this can be logged - reconcile_rule_locked's
             // own "spark arm failed" warn fires only for a SYNCHRONOUS refusal now; an
             // Accepted rule that later resolves to anything but Committed would otherwise be
             // silent on a Guaranteed State product. Heartbeat thread: contained, like every
-            // other log call on this path.
+            // other log call on this path. Names `status` per governance finding SHOULD-1
+            // (Gate 4, consistency-auditor) - the sync-refusal warn in
+            // reconcile_rule_locked() already names its own failure reason, and this one
+            // silently didn't.
             try {
                 spdlog::warn("Guardian: spark arm failed for rule '{}' (accepted, resolved "
-                             "asynchronously)",
-                             it->first);
+                             "asynchronously, status={})",
+                             it->first, receipt_status_name(status));
             } catch (...) {
             }
+            break;
         }
         it = current_->pending.erase(it);
         ++resolved;
@@ -174,8 +239,38 @@ GuardianArmAckLedger::RetryDecision GuardianArmAckLedger::decide_retry(
     const GuardianSparkRuntime& runtime) const {
     if (!current_)
         return RetryDecision::Reapply; // nothing open to suppress against
+    // Governance finding sec-1/arch-1 (Gates 2-4, 5x independently confirmed - the
+    // production-live wedge): the WHOLE reason this dedup exists is to protect a
+    // claim that is genuinely still in flight from a spurious re-teardown+re-arm on
+    // an identical retry (see this file's header). With nothing pending there is
+    // NOTHING to protect - either no rule was ever Accepted this application (the
+    // ordinary case at prefer_spark_=false, where Accepted never occurs at all) or
+    // everything already resolved - so Suppressing here served no purpose except to
+    // ALSO swallow the one thing apply_rules()'s own tail gate still needed to do on
+    // a repeat push: retry a policy-generation persist that failed last time. Before
+    // this fix, an empty `pending` map fell all the way through to a vacuous
+    // Suppress, and the retry that would have re-attempted the failed persist never
+    // ran - silently and permanently wedging the reported generation below the
+    // server's value until restart. Reapply here restores exact pre-PR behavior for
+    // this case (a full re-run, matching what a retry always did before this
+    // ledger existed) and costs nothing extra when the prior application already
+    // succeeded, since the resulting re-run finds every rule already correctly
+    // armed and nothing left to change.
+    if (current_->pending.empty())
+        return RetryDecision::Reapply;
     if (current_->generation != generation)
         return RetryDecision::Reapply; // a different generation is not a retry at all
+    // Governance finding UP-2/SHOULD-2 (Gate 4, converged independently from two
+    // reviewers): a content_id that is not an actual SHA-256 digest is a SENTINEL,
+    // never a real content identity - GuardianEngine::start_local()'s boot
+    // placeholder and guardian_push_content_id()'s own throw fallback both use the
+    // empty string today. Two DIFFERENT pushes that both hit the throw fallback (or
+    // a real post-boot push landing at the same generation the boot placeholder
+    // opened) must never be read as "identical content" merely because their
+    // sentinels happen to be byte-identical to each other - that comparison was
+    // never meaningful in the first place.
+    if (!is_sha256_hex(current_->content_id) || !is_sha256_hex(content_id))
+        return RetryDecision::Reapply;
     if (current_->content_id != content_id || current_->full_sync != full_sync)
         return RetryDecision::Reapply; // same generation number, changed content underneath it
     if (current_->latched_failure || current_->resolved_failed > 0)

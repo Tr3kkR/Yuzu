@@ -141,7 +141,17 @@ public:
     /// decide_retry() re-checks `runtime` directly rather than trusting
     /// resolved_failed alone: a receipt beyond this call's max_per_tick cap
     /// can still be sitting in `pending`, already resolved, uncounted.
-    std::size_t drain_locked(GuardianSparkRuntime& runtime, std::size_t max_per_tick);
+    ///
+    /// `failed_out`, if non-null, is INCREMENTED (never reset) by the number of
+    /// receipts THIS call resolved to non-Committed - governance finding UP-3
+    /// (Gate 4, unhappy-path): an async arm failure used to update only this
+    /// ledger's own internal `resolved_failed` and a local log line, never the
+    /// durable fleet-visible `arm_failures_` counter a synchronous refusal
+    /// already did. The caller (GuardianEngine::journal_maintenance_tick()) folds
+    /// this into `arm_failures_` itself - the ledger has no engine pointer of its
+    /// own and must not gain one.
+    std::size_t drain_locked(GuardianSparkRuntime& runtime, std::size_t max_per_tick,
+                             std::size_t* failed_out = nullptr);
 
     /// True iff there IS a current application, it has nothing left pending,
     /// nothing resolved to a failure, and nothing latched - i.e. its

@@ -90,21 +90,35 @@ namespace {
 /// through a second connection makes prepare_v2 fail for real" pattern. The schema
 /// matches kv_store.cpp's own CREATE TABLE exactly (governance would flag drift here
 /// as a truth mismatch against the real store).
+/// RAII owner for the raw `sqlite3*` the two test helpers below open - governance
+/// finding (Gate 3, cpp-safety, policy floor): sqlite3_open() allocates a handle
+/// EVEN ON FAILURE (SQLite's own contract - it must always be closed), and the
+/// bare-pointer version of these helpers called REQUIRE(sqlite3_open(...) ==
+/// SQLITE_OK) BEFORE any sqlite3_close(), so a REQUIRE failure on that line threw
+/// past the close and leaked the handle. A small scope-guard restores RAII without
+/// otherwise changing either helper's shape.
+struct ScopedTestSqlite3 {
+    sqlite3* raw{nullptr};
+    ~ScopedTestSqlite3() {
+        if (raw)
+            sqlite3_close(raw);
+    }
+};
+
 void drop_kv_store_table_for_test(const std::filesystem::path& db_path) {
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+    ScopedTestSqlite3 db;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
     char* err = nullptr;
-    const int rc = sqlite3_exec(raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
+    const int rc = sqlite3_exec(db.raw, "DROP TABLE kv_store", nullptr, nullptr, &err);
     if (err)
         sqlite3_free(err);
-    sqlite3_close(raw);
     REQUIRE(rc == SQLITE_OK);
 }
 void recreate_kv_store_table_for_test(const std::filesystem::path& db_path) {
-    sqlite3* raw = nullptr;
-    REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+    ScopedTestSqlite3 db;
+    REQUIRE(sqlite3_open(db_path.string().c_str(), &db.raw) == SQLITE_OK);
     char* err = nullptr;
-    const int rc = sqlite3_exec(raw,
+    const int rc = sqlite3_exec(db.raw,
                                 "CREATE TABLE IF NOT EXISTS kv_store ("
                                 "    plugin     TEXT NOT NULL,"
                                 "    key        TEXT NOT NULL,"
@@ -115,7 +129,6 @@ void recreate_kv_store_table_for_test(const std::filesystem::path& db_path) {
                                 nullptr, nullptr, &err);
     if (err)
         sqlite3_free(err);
-    sqlite3_close(raw);
     REQUIRE(rc == SQLITE_OK);
 }
 
@@ -3112,4 +3125,76 @@ TEST_CASE("rung 9c PR-2 Unit 6 gate: journal_maintenance_tick() does not advance
     recreate_kv_store_table_for_test(f.db_.path);
     f.engine->journal_maintenance_tick();
     CHECK(f.engine->policy_generation() == 1);
+}
+
+// ---------------------------------------------------------------------------
+// Governance hardening round (Gates 2-6, rung 9c PR-2): sec-1/arch-1's
+// production-live repeat-push regression. The test above exercises RECOVERY
+// via journal_maintenance_tick()'s own drain, at prefer_spark=true. sre's and
+// enterprise-readiness's independent Gate 6 traces proved the wedge is
+// reachable TODAY at prefer_spark=false too - the production default - because
+// spark_runtime_ is wired unconditionally at boot regardless of prefer_spark_,
+// and apply_rules()'s decide_retry() gate checks only spark_runtime_, never
+// prefer_spark_. At prefer_spark_=false, Accepted (and therefore any pending
+// ledger entry) is unreachable, so decide_retry() used to vacuously Suppress
+// EVERY identical retry - including the one that would have retried a failed
+// persist_generation_locked() write - permanently wedging the reported
+// generation until restart. This test drives that exact path: a real repeat
+// push through apply_rules() (not journal_maintenance_tick()'s drain), at
+// prefer_spark=false, with a genuinely failed-then-recovered KV write.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("rung 9c PR-2 governance hardening: an IDENTICAL repeat push recovers "
+          "a policy_generation() held by a failed persist, at prefer_spark=false "
+          "(the production default) - sec-1/arch-1 regression",
+          "[spark][guardian][reconcile]") {
+    // Was RED before the fix: decide_retry() vacuously Suppressed the second,
+    // identical dispatch below (pending was empty - Accepted never occurs at
+    // prefer_spark=false), so apply_rules() returned before ever re-attempting
+    // persist_generation_locked() - policy_generation() stayed wedged at 0
+    // forever, exactly the production-live defect governance found.
+    const auto kv_path = unique_kv_path();
+    auto opened = KvStore::open(kv_path);
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/false}; // the production default
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    // Matches production: spark_runtime_ is wired (non-null) even though prefer_spark_
+    // stays false - this is exactly what makes decide_retry() live today.
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    // A zero-rule push isolates the persist-retry-suppression mechanism from any
+    // platform-dependent legacy guard arm behaviour (ServiceGuard/SystemdServiceGuard) -
+    // reconcile_failures stays 0 by construction, so the only thing gating the
+    // generation advance is ack_ledger_->can_advance() (trivially true, nothing ever
+    // Accepted at prefer_spark=false) and the persist itself.
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(false);
+    p.set_policy_generation(1);
+    const std::string push_bytes = p.SerializeAsString();
+
+    drop_kv_store_table_for_test(kv_path);
+    auto dr1 = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, push_bytes);
+    CHECK(dr1.exit_code == 0); // the push itself is not an error - the persist just held
+    CHECK(engine.policy_generation() == 0); // failed write must not have published it
+
+    recreate_kv_store_table_for_test(kv_path);
+    // Identical (generation, content, full_sync) as the first dispatch - the server's
+    // own retry shape. TARGET: this must NOT be vacuously Suppressed just because
+    // nothing was ever pending (Accepted is unreachable at prefer_spark=false) - it
+    // must Reapply, re-run the (empty) reconcile loop, and retry the persist, which
+    // now succeeds.
+    auto dr2 = yuzu::agent::guardian_dispatch_push_bytes_for_test(engine, push_bytes);
+    CHECK(dr2.exit_code == 0);
+    CHECK(engine.policy_generation() == 1);
+
+    engine.stop();
+    spark_engine.stop();
 }

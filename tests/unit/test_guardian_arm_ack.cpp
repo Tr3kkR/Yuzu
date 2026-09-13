@@ -271,21 +271,35 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): identical (generation, content,
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
+    // Governance finding UP-2/SHOULD-2 (Gate 4): decide_retry() now requires BOTH
+    // sides of a content_id comparison to look like a real SHA-256 digest (64 hex
+    // chars) before trusting the comparison at all - a human-readable placeholder
+    // like the old "content-x" would now unconditionally Reapply regardless of what
+    // this test is trying to pin, since it isn't a valid hash. Use real-shaped hex
+    // stand-ins so the SUPPRESS/REAPPLY assertions below still exercise the
+    // content-comparison branch they were written to test, not the sentinel guard.
+    const std::string content_x(64, 'a');
+    const std::string content_y(64, 'b');
+
     GuardianArmAckLedger ledger;
-    ledger.begin_application(5, "content-x", false, 3);
+    ledger.begin_application(5, content_x, false, 3);
     ledger.add_pending("r1", accept(*rt, "r1"));
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
 
     ledger.drain_locked(*rt, 10); // r1 still parked - stays Pending
-    CHECK(ledger.decide_retry(5, "content-x", false, *rt) == GuardianArmAckLedger::RetryDecision::Suppress);
+    CHECK(ledger.decide_retry(5, content_x, false, *rt) == GuardianArmAckLedger::RetryDecision::Suppress);
     CHECK(ledger.applied_count() == 3);
 
     // A different generation is never a retry - always Reapply.
-    CHECK(ledger.decide_retry(6, "content-x", false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
+    CHECK(ledger.decide_retry(6, content_x, false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
     // Changed content under the SAME generation number is Reapply too.
-    CHECK(ledger.decide_retry(5, "content-y", false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
+    CHECK(ledger.decide_retry(5, content_y, false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
     // Changed full_sync flag alone is Reapply.
-    CHECK(ledger.decide_retry(5, "content-x", true, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
+    CHECK(ledger.decide_retry(5, content_x, true, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
+    // A non-hash sentinel content_id (the boot placeholder, or a hash-throw
+    // fallback) is NEVER trusted to mean "same content", even if it happens to
+    // match byte-for-byte - it degrades to Reapply instead.
+    CHECK(ledger.decide_retry(5, "", false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
 
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, std::chrono::seconds(10)));
@@ -299,8 +313,10 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): once a pending receipt resolves
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
 
+    const std::string content_x(64, 'a'); // see the sibling Suppress test above for why
+
     GuardianArmAckLedger ledger;
-    ledger.begin_application(5, "content-x", false, 1);
+    ledger.begin_application(5, content_x, false, 1);
     auto receipt = accept(*rt, "r1");
     ledger.add_pending("r1", receipt);
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
@@ -310,7 +326,7 @@ TEST_CASE("GuardianArmAckLedger::decide_retry(): once a pending receipt resolves
     REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt); }, std::chrono::seconds(10)));
 
     ledger.drain_locked(*rt, 10);
-    CHECK(ledger.decide_retry(5, "content-x", false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
+    CHECK(ledger.decide_retry(5, content_x, false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
 }
 
 TEST_CASE("GuardianArmAckLedger::drain_locked(): bounded per call - 3 pending "
@@ -366,4 +382,80 @@ TEST_CASE("GuardianArmAckLedger::retire(): drops the current application without
 
     b->release_hang(); // the runtime's own claim still resolves on its own schedule (§R5.5)
     REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; }, std::chrono::seconds(10)));
+}
+
+// ---------------------------------------------------------------------------
+// Governance hardening round (Gates 2-6, rung 9c PR-2): sec-1/arch-1 and cae-1
+// regression tests. sec-1/arch-1 was the production-live wedge (confirmed
+// reachable today via spark_runtime_, independent of prefer_spark_ - see
+// sre's and enterprise-readiness's Gate 6 findings): decide_retry() used to
+// vacuously Suppress whenever `pending` was empty, which is the case on
+// EVERY push at prefer_spark_=false (Accepted is unreachable there) - so a
+// failed generation-advance persist was never retried by any repeat push.
+// cae-1 was guardian_push_content_id()'s canonicalization not being
+// block-boundary-injective (cpp-expert, hand-verified collision).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("GuardianArmAckLedger::decide_retry(): an EMPTY pending map is always "
+          "Reapply, never a vacuous Suppress",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    const std::string content(64, 'c');
+
+    GuardianArmAckLedger ledger;
+    // Nothing was ever Accepted this application (the ordinary case at
+    // prefer_spark_=false) - pending stays empty for its whole lifetime.
+    ledger.begin_application(5, content, false, 3);
+    CHECK(ledger.can_advance()); // trivially true - nothing to hold the generation
+
+    // TARGET (sec-1/arch-1): before the fix, an identical (generation, content,
+    // full_sync) retry against an application with nothing pending fell through
+    // to a vacuous Suppress - exactly the shape of a server retry arriving after
+    // a transient persist_generation_locked() failure, which this decision
+    // alone is what silently and permanently wedged the reported generation.
+    // Reapply here is what lets the caller's own tail gate retry that persist.
+    CHECK(ledger.decide_retry(5, content, false, *rt) == GuardianArmAckLedger::RetryDecision::Reapply);
+}
+
+TEST_CASE("guardian_push_content_id(): different (spark, assertion) block splits "
+          "of the SAME flat field sequence must NOT hash identically",
+          "[spark][ack]") {
+    // TARGET (cae-1, cpp-expert's hand-constructed collision, independently
+    // re-derived by the orchestrator and confirmed with a standalone Python
+    // trace before this fix landed): concatenating canonicalize_spec_block()'s
+    // own already-field-injective output directly (no length prefix on the
+    // BLOCK as a whole) let two rules with different spark/assertion splits of
+    // an identical flat field sequence canonicalize - and therefore hash - to
+    // the same content_id. Rule X: spark={type:"T", params:{k1:v1,k2:v2}},
+    // assertion={type:"A", params:{}}. Rule Y: spark={type:"T",
+    // params:{k1:v1}}, assertion={type:"k2", params:{v2:"A"}}. Both produced
+    // the flat field sequence [T,k1,v1,k2,v2,A] before the fix.
+    gpb::GuaranteedStatePush x;
+    x.set_full_sync(false);
+    auto* rx = x.add_rules();
+    rx->set_rule_id("r1");
+    rx->set_enabled(true);
+    rx->set_enforcement_mode("enforce");
+    rx->set_version(1);
+    rx->mutable_spark()->set_type("T");
+    rx->mutable_spark()->mutable_params()->insert({"k1", "v1"});
+    rx->mutable_spark()->mutable_params()->insert({"k2", "v2"});
+    rx->mutable_assertion()->set_type("A");
+
+    gpb::GuaranteedStatePush y;
+    y.set_full_sync(false);
+    auto* ry = y.add_rules();
+    ry->set_rule_id("r1");
+    ry->set_enabled(true);
+    ry->set_enforcement_mode("enforce");
+    ry->set_version(1);
+    ry->mutable_spark()->set_type("T");
+    ry->mutable_spark()->mutable_params()->insert({"k1", "v1"});
+    ry->mutable_assertion()->set_type("k2");
+    ry->mutable_assertion()->mutable_params()->insert({"v2", "A"});
+
+    CHECK(guardian_push_content_id(x) != guardian_push_content_id(y));
 }

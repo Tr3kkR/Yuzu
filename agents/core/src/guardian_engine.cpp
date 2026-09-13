@@ -493,7 +493,19 @@ std::expected<void, std::string> GuardianEngine::start_local() {
     // application could ever hold pending. Production wires first (agent.cpp calls
     // wire_spark_engine() before start_local()), so a real boot CAN re-arm via spark
     // here; this call exists for that ordering, not the test fixture's.
-    ack_ledger_->begin_application(policy_generation_, "", /*full_sync=*/false, /*applied=*/0);
+    // Governance finding UP-1 (Gate 4, folded): same unguarded-allocation class as
+    // apply_rules()'s own begin_application() call, fixed alongside it. Non-fatal
+    // here - a failure to open the boot bookkeeping application must not block
+    // startup; the boot re-arm loop below re-arms every cached rule directly via
+    // reconcile_rule_locked() regardless of whether this ledger call succeeded.
+    try {
+        ack_ledger_->begin_application(policy_generation_, "", /*full_sync=*/false,
+                                       /*applied=*/0);
+    } catch (const std::exception& e) {
+        spdlog::warn("Guardian: failed to begin boot ack application: {}", e.what());
+    } catch (...) {
+        spdlog::warn("Guardian: failed to begin boot ack application: unknown exception");
+    }
 
     // A2 (restart re-arm). A restarted agent must keep enforcing without waiting
     // for the next server push — re-arm a guard for every cached enabled rule
@@ -774,7 +786,15 @@ void GuardianEngine::journal_maintenance_tick() {
     // above (already done) from having happened, and must not escape onto the bare
     // heartbeat thread either.
     try {
-        ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick);
+        // UP-3 (Gate 4, folded): drain_locked()'s failed_out feeds the durable
+        // fleet-visible arm_failures_ counter - an async-resolved arm failure used
+        // to update only this ledger's own internal bookkeeping and a local log
+        // line, never the counter a synchronous refusal already bumps.
+        std::size_t ack_arm_failures_this_tick = 0;
+        ack_ledger_->drain_locked(*spark_runtime_, kAckDrainMaxPerTick,
+                                  &ack_arm_failures_this_tick);
+        if (ack_arm_failures_this_tick > 0)
+            arm_failures_.fetch_add(ack_arm_failures_this_tick, std::memory_order_relaxed);
         if (ack_ledger_->can_advance()) {
             const auto gen = ack_ledger_->pending_generation();
             // Persist BEFORE publishing, and check the result: a false return or a
@@ -785,8 +805,21 @@ void GuardianEngine::journal_maintenance_tick() {
             // shape) could strand policy_generation_ already advanced with nothing
             // durable behind it, silently and permanently halting the server's
             // re-push (coordinator finding, rung 9c PR-2 Unit 6 gate).
-            if (gen > policy_generation_ && persist_generation_locked(gen))
-                policy_generation_ = gen;
+            if (gen > policy_generation_) {
+                if (persist_generation_locked(gen))
+                    policy_generation_ = gen;
+                else
+                    // Governance finding (Gate 6, sre + compliance-officer): this
+                    // branch was previously silent on failure - no log, no counter -
+                    // making a stuck generation undetectable from either the agent
+                    // or the server side. Warn-once-per-tick is cheap and closes the
+                    // detection gap; the actual retry is the `gen > policy_generation_`
+                    // condition remaining true next tick.
+                    spdlog::warn("Guardian: failed to persist policy_generation={} from "
+                                 "the ack-drain tick (kv write returned false) - held at "
+                                 "{}, retried next tick",
+                                 gen, policy_generation_);
+            }
         }
     } catch (...) {
         ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
@@ -975,8 +1008,24 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // count is not known until the loop below finishes; set_applied() near the
     // bottom of this function corrects it before any later Suppress decision reads
     // applied_count().
-    ack_ledger_->begin_application(push.policy_generation(), content_id, push.full_sync(),
-                                   /*applied=*/0);
+    //
+    // Governance finding UP-1 (Gate 4, unhappy-path, verified): this allocation
+    // (std::make_unique<Application>() inside begin_application()) sat immediately
+    // after the ONE call this preamble already firewalls (guardian_push_content_id(),
+    // #2037) with no firewall of its own - a bad_alloc here would have escaped onto
+    // the unfirewalled dispatch thread before GuardianRollback's own scope guard is
+    // even declared below. Nothing has been reconciled or staged yet at this point,
+    // so returning std::unexpected is a clean, side-effect-free abort of this push.
+    try {
+        ack_ledger_->begin_application(push.policy_generation(), content_id, push.full_sync(),
+                                       /*applied=*/0);
+    } catch (const std::exception& e) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected(std::string("failed to begin ack application: ") + e.what());
+    } catch (...) {
+        ack_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
+        return std::unexpected("failed to begin ack application: unknown exception");
+    }
 
     // Flush staged lifecycle records to the durable journal on EVERY exit - the normal
     // return, the put_rule early return below, and any un-firewalled throw. GuardianRollback
@@ -1224,11 +1273,23 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     // call site has the identical shape as journal_maintenance_tick()'s own, fixed
     // alongside it): a failed or throwing persist leaves policy_generation_ at its
     // prior value, so the same condition is still true on a later tick or a repeat
-    // push, retrying naturally.
+    // push, retrying naturally - "naturally" depends on decide_retry() above never
+    // Suppressing a repeat push while nothing is genuinely pending (governance
+    // finding sec-1/arch-1, fixed in GuardianArmAckLedger::decide_retry() this same
+    // round: an empty `pending` map used to reach a vacuous Suppress and this gate
+    // was never reached again at all on a repeat push).
     if (reconcile_failures == 0 && ack_ledger_->can_advance() &&
-        push.policy_generation() > policy_generation_ &&
-        persist_generation_locked(push.policy_generation())) {
-        policy_generation_ = push.policy_generation();
+        push.policy_generation() > policy_generation_) {
+        if (persist_generation_locked(push.policy_generation()))
+            policy_generation_ = push.policy_generation();
+        else
+            // Governance finding (Gate 6, sre + compliance-officer): previously
+            // silent on failure. See journal_maintenance_tick()'s identical warn
+            // for the matching drain-triggered gate.
+            spdlog::warn("Guardian: failed to persist policy_generation={} (kv write "
+                         "returned false) - held at {}, retried on the next repeat "
+                         "push or heartbeat tick",
+                         push.policy_generation(), policy_generation_);
     }
 
     refresh_count_locked();
