@@ -182,7 +182,7 @@ This roadmap transforms Yuzu from a functional agent/server framework into a ful
 | | 15.F | [#552](https://github.com/Tr3kkR/Yuzu/issues/552) | Reference walkthrough integration test (Chrome IR end-to-end) | **Done** (NOT_PLANNED, 2026-07-14, delivered differently: an in-process Catch2 test, `tests/unit/server/test_chrome_ir_chain.cpp`, not the originally-scoped scripted UAT variant, see body) |
 | | 15.G | [#553](https://github.com/Tr3kkR/Yuzu/issues/553) | Operational hardening — live re-eval, GC sweep, Prometheus + audit polish | **Done** (closed 2026-07-04) — `yuzu_result_set_resolve_seconds` histogram + audit-polish pass still outstanding (minor, non-blocking), see body |
 | | 15.H | [#554](https://github.com/Tr3kkR/Yuzu/issues/554) | TAR process tree viewer | **Done** 2026-06-18 (as-built: local-TAR-data-only reconstruction, no seed; `docs/tar-dashboard.md` §5). REST/MCP parity deferred. |
-| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | Open — in progress: Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI shipped; Spark is wired (`agent.cpp:1255`) but inert by default — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; 59 merged guardian PRs (issue itself still open — no sub-checklist tracks the PR ladder) |
+| **16** | 16.A | [#555](https://github.com/Tr3kkR/Yuzu/issues/555) | System Guardian — Windows-first delivery (PRs 1-15 per implementation plan) | Open — in progress: Spark engine rungs 1-7+, `GuardianEngine`, `BaselineStore`, `/guaranteed-state` UI shipped; Spark is wired (`agent.cpp:1255`) but inert by default — `prefer_spark_=false`, legacy `IGuard` remains the sole live enforcement path; 59 merged guardian PRs at the pin (more since) (issue itself still open — no sub-checklist tracks the PR ladder) |
 | | 16.B | [#556](https://github.com/Tr3kkR/Yuzu/issues/556) | System Guardian — Linux delivery (inotify, netlink, D-Bus, audit, sysctl) | Open — **started early** (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak gate, see body note |
 | | 16.C | [#557](https://github.com/Tr3kkR/Yuzu/issues/557) | System Guardian — macOS delivery (Endpoint Security, fseventsd, launchd) | Open (gated on 16.A + 16.B soak + ES entitlement) |
 
@@ -2049,7 +2049,7 @@ Phase 16 (System Guardian — Guaranteed State)
   16.A Windows-first ──── IN PROGRESS (Spark engine rungs 1-7+, GuardianEngine, BaselineStore,
                            /guaranteed-state UI shipped; Spark wired (agent.cpp:1255) but INERT by
                            default — prefer_spark_=false, legacy IGuard is the sole live enforcement
-                           path; 59 merged guardian PRs; issue #555 itself still open)
+                           path; 59 merged guardian PRs at the pin (more since); issue #555 itself still open)
     └── 16.B Linux ─────── STARTED EARLY (`guard_systemd.cpp` exists) ahead of the stated 16.A-soak
                             gate — sequencing decision pending, see 16.B body note
           └── 16.C macOS ── NOT STARTED; gated on 16.A + 16.B soak + Endpoint Security entitlement
@@ -2087,6 +2087,7 @@ Route-sink refactor (#2542) — cross-cutting, ongoing
       surfaces; PR #4083 (custom-properties) merged 2026-09-07 14:29 UTC — AFTER the pin, NOT an
       ancestor of `d295db964`; PR #4057 (dashboard/nvd) IS an ancestor — it is in fact `d295db964`
       itself (#4057's merge commit sha == the pin sha)
+  └── since the pin: complete — PR-4…PR-12 landed and #2542 is closed (re-verified 2026-09-13)
 ```
 
 ---
@@ -2131,7 +2132,8 @@ before acting on any "open" / "in progress" claim:
    window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
    itself is 2026-09-07 11:01, between #4011 and #4092).
 3. **Guardian hardening (Phase 16).** 16.A Windows-first soak continues (Spark engine, BaselineStore,
-   `/guaranteed-state` UI — 59 merged guardian PRs); 16.B Linux delivery has already started
+   `/guaranteed-state` UI — 59 merged guardian PRs at the pin, with more since, e.g. #4190, #4224, #4225,
+   #4284, #4302); 16.B Linux delivery has already started
    (`guard_systemd.cpp`) ahead of the stated 16.A-soak gate — **sequencing decision pending (PO)**:
    accept and drop the gate, or pause 16.B. 16.C macOS remains blocked on the Endpoint Security
    entitlement.
@@ -2139,7 +2141,8 @@ before acting on any "open" / "in progress" claim:
    `HttpRouteSink` for testability) — rides along with other phase work rather than blocking it. As of
    dev @ `d295db964`, verified by ancestry: PR #4083 (custom-properties) merged 2026-09-07 14:29 UTC,
    **after** the pin — not an ancestor, so it was still open at the pin; PR #4057 (dashboard/nvd) is an
-   ancestor — it is `d295db964` itself.
+   ancestor — it is `d295db964` itself. **Since the pin (re-verified 2026-09-13): done.** The remaining route
+   owners landed (PR-4 through PR-12, including #4083) and #2542 is closed.
 5. **Phase 12** — Remaining agent capabilities (closes capability map further; no blockers;
    parallelizable). 12.1 and 12.8 already shipped.
 6. **Phase 11** — Consumer model & SDKs (platform extensibility, parallelizable with 12). 11.1 closed
