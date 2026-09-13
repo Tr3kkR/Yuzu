@@ -69,6 +69,7 @@ class GuardianOutboxDrainWorker;
 class GuardianLifecycleJournal;
 struct GuardianJournalStats;
 struct GuardianJournalAgeStats;
+struct GuardianArmStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 struct OutboxEntry;
@@ -193,6 +194,40 @@ public:
     /// engine because prefer_spark_ is deliberately not exposed; the heartbeat just forwards
     /// whatever this returns.
     [[nodiscard]] std::optional<GuardianJournalAgeStats> journal_age_stats() const;
+
+    /// rung 9c PR-3: a re-statable snapshot of the ack ledger's CURRENT
+    /// application (yuzu.guardian_arm_pending / yuzu.guardian_arm_failed - see
+    /// guardian_arm_heartbeat.hpp's GuardianArmStats for the field semantics and
+    /// emit_guardian_arm_heartbeat_tags for the emission posture). Returns nullopt
+    /// while the signal is dormant: `prefer_spark_` false, or no ack ledger.
+    ///
+    /// The `prefer_spark_` check is LOAD-BEARING, not belt-and-braces (Check A,
+    /// ~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md): unlike
+    /// journal_age_stats() above, whose dormancy the drain-worker's own
+    /// zero-timestamp check would eventually catch even without the flag,
+    /// ack_ledger_->arm_stats() ALONE cannot tell "spark dormant" from "spark
+    /// live, currently clean" - GuardianEngine::apply_rules() calls
+    /// GuardianArmAckLedger::begin_application() UNCONDITIONALLY on every push,
+    /// regardless of prefer_spark_, so a legacy (non-spark) agent has a live,
+    /// empty Application (pending={}, resolved_failed=0) exactly like a spark
+    /// agent with nothing currently pending or failed. Reading `current_ !=
+    /// nullptr` as "live" would make every non-spark agent in the fleet emit
+    /// arm_pending=0/arm_failed=0 - read by a fleet consumer as "spark arming,
+    /// healthy" on agents not running spark at all. This check is what prevents
+    /// that.
+    [[nodiscard]] std::optional<GuardianArmStats> arm_stats() const;
+
+    /// rung 9c PR-3 (Decision 3, Option B): the arm/disarm executor's cumulative
+    /// physical-ceiling refusal count (R5.1's CeilingExhausted;
+    /// GuardianSparkRuntime::io_ceiling_rejections()), surfaced as
+    /// yuzu.guardian_io_arm_disarm_rejected_ceiling. A plain monitor-only
+    /// counter, zero when dormant or simply never hit - unlike arm_stats() above
+    /// this needs no prefer_spark_ dormancy gate: a zero count is equally
+    /// truthful whether spark is dormant or has just never hit the ceiling, so
+    /// there is no "always-present empty state" trap to gate around here. Zero
+    /// when prefer_spark is off / no runtime, matching
+    /// outbox_backpressure_drops()'s own shape.
+    [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
 
     /// Count of repeat-Unknown convergence re-evals whose guard.unhealthy was
     /// edge-suppressed (M1). Surfaced sparsely on the heartbeat as

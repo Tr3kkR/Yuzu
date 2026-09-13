@@ -506,3 +506,104 @@ TEST_CASE("guardian_push_content_id(): different (spark, assertion) block splits
 
     CHECK(guardian_push_content_id(x) != guardian_push_content_id(y));
 }
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-3: GuardianArmAckLedger::arm_stats() - the re-statable snapshot
+// GuardianEngine::arm_stats() forwards (behind its own prefer_spark_ dormancy
+// gate, tested at the GuardianEngine level in test_guardian_engine.cpp - this
+// file tests the LEDGER's own contract only, which has no notion of
+// prefer_spark_ and must not gain one).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("GuardianArmAckLedger::arm_stats(): no current application returns {0, 0}",
+          "[spark][ack][arm_stats]") {
+    GuardianArmAckLedger ledger;
+    const auto s = ledger.arm_stats();
+    CHECK(s.pending == 0);
+    CHECK(s.failed == 0);
+}
+
+TEST_CASE("GuardianArmAckLedger::arm_stats(): a live empty application also reads "
+          "{0, 0} - the common case, not a gap",
+          "[spark][ack][arm_stats]") {
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 0);
+    const auto s = ledger.arm_stats();
+    CHECK(s.pending == 0);
+    CHECK(s.failed == 0);
+}
+
+TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pending; "
+          "a Committed drain reduces it back to 0",
+          "[spark][ack][arm_stats]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    b->hang_next_arm.store(true);
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 1);
+    ledger.add_pending("r1", receipt);
+    {
+        const auto s = ledger.arm_stats();
+        CHECK(s.pending == 1);
+        CHECK(s.failed == 0);
+    }
+
+    b->release_hang(); // resolves Committed (fail_arm was never set)
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt); }, std::chrono::seconds(10)));
+    ledger.drain_locked(*rt, 10);
+
+    const auto s = ledger.arm_stats();
+    CHECK(s.pending == 0);
+    CHECK(s.failed == 0);
+}
+
+TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
+          "RED-FIRST - replacing the application via begin_application() (the "
+          "same path decide_retry()'s Reapply takes on an ordinary retry) "
+          "brings a PRESENT failed back to 0",
+          "[spark][ack][arm_stats]") {
+    // This proves the production snapshot CAN decrease via APPLICATION
+    // REPLACEMENT - the mechanism already live today through decide_retry()'s
+    // Reapply-on-resolved_failed>0 path (see decide_retry()'s own test above).
+    // It does NOT prove same-application late-success recovery (a still-
+    // pending receipt flipping from Failed to Committed without a new
+    // application) - that is rung 9c PR-5's job, not built here. See
+    // GuardianArmStats::failed's own doc comment (guardian_arm_heartbeat.hpp)
+    // for why "monotonic until PR-5" is the wrong way to describe this field.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+    b->hang_next_arm.store(true);
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    b->fail_arm.store(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(receipt); }, std::chrono::seconds(10)));
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 1);
+    ledger.add_pending("r1", receipt);
+    ledger.drain_locked(*rt, 10);
+
+    {
+        const auto s = ledger.arm_stats();
+        CHECK(s.pending == 0);
+        CHECK(s.failed == 1); // present, nonzero - not absent
+    }
+
+    // A fresh application replaces the failed one - exactly what happens on the
+    // NEXT push for a generation decide_retry() sent to Reapply because
+    // resolved_failed > 0 (see the "identical (generation, content, full_sync) is
+    // Suppress" test above, which pins that Reapply trigger).
+    ledger.begin_application(2, "content-2", false, 0);
+    const auto s = ledger.arm_stats();
+    CHECK(s.pending == 0);
+    CHECK(s.failed == 0); // PRESENT zero, not merely "no longer 1"
+}

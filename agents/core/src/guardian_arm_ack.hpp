@@ -51,6 +51,7 @@
 
 #include <yuzu/plugin.h>
 
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats (rung 9c PR-3)
 #include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::ArmReceipt (nested type - needs the complete class)
 
 namespace yuzu::guardian::v1 {
@@ -184,6 +185,16 @@ public:
     /// GuardianEngine::ack_pending_count_for_test() forwards to this. No production
     /// caller.
     std::size_t pending_count_for_test() const;
+
+    /// rung 9c PR-3: a re-statable snapshot of the current application's pending
+    /// and resolved-failed counts (see guardian_arm_heartbeat.hpp's
+    /// GuardianArmStats for the full field-by-field semantics). {0, 0} when there
+    /// is no current application - the CALLER (GuardianEngine::arm_stats()) is
+    /// responsible for turning that into dormancy (nullopt) when appropriate; this
+    /// ledger has no notion of prefer_spark_ and must not gain one. Production
+    /// caller: GuardianEngine::arm_stats(), called under mtx_ like every other
+    /// engine-owned accessor.
+    [[nodiscard]] GuardianArmStats arm_stats() const;
 
     /// rung 9c PR-2 Unit 6: apply_rules() calls begin_application() BEFORE its
     /// per-rule loop (so reconcile_rule_locked's add_pending() calls during
