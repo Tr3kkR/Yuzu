@@ -82,9 +82,11 @@ inline constexpr GuardianArmMetric kGuardianArmMetrics[] = {
      "awaiting a Committed/terminal resolution) - GuardianArmAckLedger's CURRENT "
      "application, summed across agents. A RE-STATABLE gauge, not a cumulative "
      "counter: it can legally decrease as receipts resolve or an application is "
-     "replaced. ABSENT means no reporting agent (prefer_spark_ on, ack ledger "
-     "live) this sweep - including every non-spark agent, which never emits this "
-     "pair at all. A completed receipt beyond one heartbeat tick's bounded drain "
+     "replaced. ABSENT means no reporting agent this sweep - prefer_spark_ off, "
+     "the engine stopped, Spark unavailable (Unwired/SparkFailed/SparkDisabled), "
+     "or no current application yet - including every non-spark agent, which "
+     "never emits this pair at all. A completed receipt beyond one heartbeat "
+     "tick's bounded drain "
      "can still count here until the next tick - a SAMPLED observation, not an "
      "instantaneous truth"},
     {"yuzu.guardian_arm_failed", "yuzu_fleet_guardian_arm_failed",
@@ -110,11 +112,15 @@ inline constexpr const char* kGuardianArmReportingGauge = "yuzu_fleet_guardian_a
 inline constexpr const char* kGuardianArmReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_arm_* tag - the coverage denominator for arm_pending/"
-    "arm_failed. Published every sweep INCLUDING 0. 0 means EITHER no agent is "
-    "running spark (prefer_spark_ off fleet-wide, pre-cutover - the expected "
-    "reading today) OR the telemetry path itself is dark; it does not by itself "
-    "distinguish the two. Cross-check yuzu_fleet_spark_reporting for whether any "
-    "agent is running spark at all";
+    "arm_failed. Published every sweep INCLUDING 0. 0 means no agent currently "
+    "has prefer_spark_ on AND live (not stopped, not "
+    "Unwired/SparkFailed/SparkDisabled) AND a current application - the expected "
+    "reading on every released fleet today, since prefer_spark_ is hardcoded "
+    "false. Do NOT cross-check yuzu_fleet_spark_reporting to disambiguate "
+    "'telemetry dark' - that gauge counts SparkEngine running observe-only, "
+    "live fleet-wide independent of prefer_spark_, so spark_reporting > 0 with "
+    "arm_reporting == 0 is the NORMAL pre-cutover reading, not a dark-telemetry "
+    "signal";
 
 /// yuzu.guardian_arm_* tags PRESENT on a heartbeat this sweep but rejected by
 /// the forged-value parse. Published every sweep INCLUDING 0, same role as

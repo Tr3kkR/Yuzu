@@ -210,6 +210,16 @@ TEST_CASE("every documented Guardian heartbeat tag is one the emitter actually e
     GuardianArmStats arm_s{.pending = 1, .failed = 1};
     emit_guardian_arm_heartbeat_tags(emitted, std::optional{arm_s});
     emit_guardian_io_ceiling_heartbeat_tags(emitted, 1);
+    // Governance fix (Gate 8, doc-scrape false-negative): yuzu.guardian_generation is a
+    // real, always-emitted heartbeat tag (agent.cpp's own inline
+    // tags["yuzu.guardian_generation"] = ..., NOT one of the extracted
+    // guardian_*_heartbeat.hpp emitter functions this test otherwise unions) - a
+    // metrics.md doc edit mentioning it by name (the arm-gauge alerting-hazard note)
+    // tripped this scrape with no way to satisfy it via an emitter call, exactly the
+    // gap this test's own comments already describe closing for yuzu.guardian_backend
+    // (F7/#2298). Inserted directly rather than via an emitter function since none
+    // exists for this one inline tag.
+    emitted["yuzu.guardian_generation"] = "1";
     REQUIRE(emitted.size() > 10); // the emitters really did populate
 
     std::ifstream in(doc);

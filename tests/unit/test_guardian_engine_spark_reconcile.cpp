@@ -1243,6 +1243,43 @@ TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true, Available, not stopp
     CHECK(s->failed == 0);
 }
 
+TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true, Available, not stopped, "
+          "but start_local() never called - the ledger's OWN 'no current application' "
+          "absence case, proven through the ENGINE's forwarding path, not just the "
+          "ledger's own direct unit test (test_guardian_arm_ack.cpp)",
+          "[spark][guardian][arm_stats]") {
+    // Governance Gate 3 (quality-engineer) fix: the fourth, orthogonal absence
+    // condition arm_stats()'s own doc comment calls out - "supplied by the ledger" -
+    // was previously proven only at GuardianArmAckLedger::arm_stats()'s own call
+    // site, never through GuardianEngine::arm_stats()'s forwarding.
+    //
+    // NOT SparkReconcileFixture: that fixture's constructor calls start_local()
+    // (which unconditionally opens a boot-bookkeeping application, guardian_engine.cpp
+    // ~line 503) BEFORE wire_spark_engine() - so by the time the fixture's own
+    // constructor returns, ack_ledger_ already has a live application and this state
+    // is unreachable through it. Uses the file's own documented PRODUCTION wire order
+    // instead (wire_spark_engine() before start_local() - see "a production-order
+    // restart..." above) and stops BEFORE calling start_local(), so ack_ledger_ has
+    // never had begin_application() called on it at all.
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    SparkEngine spark_engine;
+    auto mech = std::make_unique<FakeServiceMechanism>();
+    REQUIRE(spark_engine.register_mechanism(SparkType::Service, std::move(mech)).has_value());
+    spark_engine.start();
+
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    engine.wire_spark_engine(&spark_engine, /*spark_disabled_by_config=*/false,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Available);
+
+    CHECK_FALSE(engine.arm_stats().has_value());
+
+    engine.stop();
+    spark_engine.stop();
+}
+
 TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spark, "
           "even when Available",
           "[spark][guardian][reconcile]") {

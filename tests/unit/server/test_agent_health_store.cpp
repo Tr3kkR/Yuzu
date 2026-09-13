@@ -1552,6 +1552,65 @@ TEST_CASE("REAL AgentHealthStore: guardian io-ceiling counter sums into an "
     CHECK(unlabelled_series(out2, "yuzu_fleet_guardian_io_ceiling_reporting") == 0.0);
 }
 
+TEST_CASE("REAL AgentHealthStore: a rogue agent cannot poison the guardian io-ceiling "
+          "fleet gauge",
+          "[guardian][io][ceiling][rollup][real]") {
+    // Governance Gate 4/5 fix: the io-ceiling family had this rogue-value test at the
+    // parse-function level (test_guardian_arm_fleet_tags.cpp) but no end-to-end
+    // AgentHealthStore-level integration test proving the wiring, unlike its 3 sibling
+    // families (journal/health/arm) which each carry one - mirrors
+    // "a rogue agent cannot poison a guardian arm fleet gauge" above.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> honest;
+    honest["yuzu.os"] = "linux";
+    honest["yuzu.guardian_io_arm_disarm_rejected_ceiling"] = "7";
+    store.upsert("honest", honest);
+
+    google::protobuf::Map<std::string, std::string> rogue;
+    rogue["yuzu.os"] = "linux";
+    rogue["yuzu.guardian_io_arm_disarm_rejected_ceiling"] = "99999999999999999999"; // far above 1e9
+    store.upsert("rogue", rogue);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    // The rogue value is rejected, not clamped - the honest agent's 7 survives intact.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling") == 7.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_io_ceiling_tag_rejected") == 1.0);
+    // The rogue agent's malformed tag does not count it as a reporting endpoint.
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_io_ceiling_reporting") == 1.0);
+}
+
+TEST_CASE("REAL AgentHealthStore: a torn arm-gauge pair (one key present, its "
+          "partner missing) reads each gauge independently - absent stays absent, "
+          "present stays present, the reporting count still fires",
+          "[guardian][arm][rollup][real]") {
+    // Governance Gate 4/5 (UP-4/CH-2): arm_pending and arm_failed are parsed as two
+    // fully independent keys - a normal writer always sets both back-to-back with no
+    // yield point in between, so this state is reachable only via a non-conforming or
+    // compromised agent, or an exceedingly rare partial-write. This test pins the
+    // CURRENT, documented behavior (each gauge reads independently; reporting fires on
+    // ANY key present) as a known, low-severity, accepted shape - not a regression to
+    // catch, a contract to keep from silently changing.
+    yuzu::server::detail::AgentHealthStore store;
+    yuzu::MetricsRegistry metrics;
+
+    google::protobuf::Map<std::string, std::string> torn;
+    torn["yuzu.os"] = "linux";
+    torn["yuzu.guardian_arm_pending"] = "1"; // arm_failed deliberately absent from this heartbeat
+    store.upsert("torn", torn);
+
+    store.recompute_metrics(metrics, std::chrono::seconds{300});
+    const std::string out = metrics.serialize();
+
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_arm_pending") == 1.0);
+    CHECK_FALSE(has_unlabelled_series(out, "yuzu_fleet_guardian_arm_failed"));
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_arm_reporting") == 1.0);
+    CHECK(unlabelled_series(out, "yuzu_fleet_guardian_arm_tag_rejected") == 0.0);
+}
+
 // ── Guardian M1 health-stream rollup (#2298 gate 3, item 6d) ──────────────────────
 // Same coverage set as the journal family above, scoped to the 3-counter table.
 

@@ -697,13 +697,19 @@ settled via Astra (codex opine) + Fable (advisor) review, both checked against
    `GuardianArmAckLedger`'s CURRENT application** (`GuardianArmAckLedger::arm_stats()`,
    `GuardianEngine::arm_stats()`) - NOT `GuardianEngine::arm_failures_`, which is
    confirmed cumulative-forever and unsuitable (several `fetch_add` sites, never
-   decrements, and counts causes beyond a currently-failed rule). Absence is gated
-   explicitly on `prefer_spark_`, not on "does a current application exist": PR-2's
-   `apply_rules()` calls `begin_application()` unconditionally regardless of
-   `prefer_spark_`, so a legacy (non-spark) agent has a live, empty Application on
-   every push - gating on the Application's existence alone would make every non-spark
-   agent in the fleet emit `arm_pending=0`/`arm_failed=0`, read by a fleet consumer as
-   "spark arming, healthy" on agents not running spark at all. `arm_failed` does NOT
+   decrements, and counts causes beyond a currently-failed rule). Absence is gated on
+   FOUR conditions, not one - governance fix, adversarial review CODEX-1/K1
+   (`bb9c643d3`): `GuardianEngine::arm_stats()` originally gated only on
+   `prefer_spark_`, which left `stopped_` and `spark_availability_ != Available`
+   (Unwired/SparkFailed/SparkDisabled) emitting a false-present-healthy `{0,0}` pair.
+   The corrected gate is `!prefer_spark_ || stopped_ || spark_availability_ !=
+   Available`, layered on `GuardianArmAckLedger::arm_stats()`'s own `nullopt` when
+   there is no current application at all - PR-2's `apply_rules()` calls
+   `begin_application()` unconditionally regardless of `prefer_spark_`, so a legacy
+   (non-spark) agent has a live, empty Application on every push - gating on the
+   Application's existence alone would make every non-spark agent in the fleet emit
+   `arm_pending=0`/`arm_failed=0`, read by a fleet consumer as "spark arming, healthy"
+   on agents not running spark at all. `arm_failed` does NOT
    decrement in place within one application (`resolved_failed` is increment-only), but
    it already resets to 0 whenever `decide_retry()` returns `Reapply` on a generation
    that previously failed, which begins a FRESH application - that Reapply path is
