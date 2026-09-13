@@ -58,7 +58,9 @@ struct GuardianArmStats {
 /// Populate `tags` with the arm-ledger snapshot. Dormancy is the OPTIONAL, not a
 /// zero - matching emit_guardian_journal_age_tags's own posture. `s` is nullopt
 /// while GuardianEngine::arm_stats() considers the signal dormant: `prefer_spark_`
-/// false, spark otherwise unavailable, or stopped. THIS explicit gate is load-
+/// false, the engine stopped, Spark itself unavailable (Unwired/SparkFailed/
+/// SparkDisabled), or the ledger has no current application yet. THIS explicit
+/// four-way gate is load-
 /// bearing (Check A, KICKOFF-v2): GuardianEngine::apply_rules() calls
 /// GuardianArmAckLedger::begin_application() UNCONDITIONALLY, regardless of
 /// prefer_spark_, so "is there a current application" alone cannot distinguish

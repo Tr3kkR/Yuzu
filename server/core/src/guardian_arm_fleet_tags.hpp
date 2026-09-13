@@ -92,13 +92,18 @@ inline constexpr GuardianArmMetric kGuardianArmMetrics[] = {
     {"yuzu.guardian_arm_failed", "yuzu_fleet_guardian_arm_failed",
      "Fleet SUM of accepted spark arms whose CURRENT application resolved to a "
      "non-Committed terminal outcome (Failed/Expired/Withdrawn/Stopped), still "
-     "unresolved for acknowledgment. A RE-STATABLE gauge: decreases when an "
-     "application that saw a failure is REPLACED (an ordinary retry of that "
-     "generation, live today) - it does NOT yet reflect same-application "
-     "late-success recovery (a still-pending receipt flipping from Failed to "
-     "Committed without a new application), which is rung 9c PR-5's job. Zero "
-     "failed does not itself mean compliant or enforced - check "
-     "yuzu_fleet_spark_armed_faulted / the device's own Guardian lens for that. "
+     "unresolved for acknowledgment. A RE-STATABLE gauge: resets to 0 the instant "
+     "an application that saw a failure is REPLACED (an ordinary retry of that "
+     "generation, live today) - REGARDLESS of whether that retry itself then "
+     "succeeds, so a persistently-failing rule oscillates across heartbeat ticks "
+     "rather than holding steady at nonzero; a for:-duration alert keyed on this "
+     "gauge alone can have its timer reset every retry - prefer arm_pending + "
+     "arm_failed > 0 sustained, or yuzu.guardian_generation lag. Does NOT yet "
+     "reflect same-application late-success recovery (a still-pending receipt "
+     "flipping from Failed to Committed without a new application), which is "
+     "rung 9c PR-5's job. Zero failed does not itself mean compliant or enforced "
+     "- check yuzu_fleet_spark_armed_faulted / the device's own Guardian lens "
+     "for that. "
      "ABSENT means no reporting agent this sweep, same as arm_pending"},
 };
 

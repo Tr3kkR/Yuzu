@@ -2406,10 +2406,12 @@ public:
                                 emit_guardian_journal_age_tags(tags, guardian_->journal_age_stats());
                                 // rung 9c PR-3: ack-ledger re-statable gauges
                                 // (yuzu.guardian_arm_pending / yuzu.guardian_arm_failed).
-                                // Dormancy is guardian_->arm_stats() returning nullopt
-                                // (prefer_spark_ off, or spark otherwise unavailable) -
-                                // see GuardianEngine::arm_stats()'s own doc comment for
-                                // why that gate cannot be inferred from the ledger alone.
+                                // Dormancy is guardian_->arm_stats() returning nullopt:
+                                // prefer_spark_ off, the engine stopped, Spark itself
+                                // unavailable (Unwired/SparkFailed/SparkDisabled), or no
+                                // current application yet - see GuardianEngine::arm_stats()'s
+                                // own doc comment for why that four-way gate cannot be
+                                // inferred from the ledger alone.
                                 // A live application emits both tags including a genuine
                                 // zero, mirroring the journal age-gauge pair above.
                                 emit_guardian_arm_heartbeat_tags(tags, guardian_->arm_stats());
