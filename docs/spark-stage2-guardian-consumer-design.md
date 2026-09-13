@@ -614,6 +614,35 @@ optimization: without it, every same-generation `full_sync` heartbeat retry whil
 an episode is still genuinely pending would re-run the whole teardown+re-arm, and
 an arm slower than the 25 s retry interval would never converge.
 
+**R5.3 correction (governance hardening round, rung 9c PR-2 gate; sec-1/arch-1,
+five independently-confirming reviewers): `decide_retry()` must Reapply, never
+Suppress, whenever `pending` is EMPTY.** The paragraph above's "is a no-op while
+every outstanding episode ... is still genuinely pending" was under-specified: it
+never stated what happens when there is NOTHING outstanding at all - the ordinary
+case at `prefer_spark_=false` (today's production default), where `Accepted`
+never occurs and `pending` is therefore always empty. The dedup this section
+describes exists ONLY to protect a claim that is genuinely still in flight from a
+spurious re-teardown+re-arm; with nothing pending there is nothing to protect,
+and Suppressing anyway also swallowed the one thing `apply_rules()`'s own tail
+gate still needed to do on an identical retry: retry a `persist_generation_locked()`
+write that failed on the prior call. Before this correction, an empty `pending`
+map reached a vacuous Suppress and that retry never ran - the server's own
+25 s `full_sync` heartbeat resend (exactly the retry this section's REQUIRED
+ordering exists to serve) was therefore unable to recover a stuck generation by
+itself; only an agent restart could. This is corrected in
+`GuardianArmAckLedger::decide_retry()`: an empty `pending` map returns `Reapply`
+immediately, restoring exactly the pre-PR-2 behavior for that case (a full
+re-run, which finds every already-armed rule unchanged and costs nothing beyond
+the retried persist). Two further precision fixes landed alongside it: (a) a
+`content_id` that is not a real 64-hex-char SHA-256 digest (the `start_local()`
+boot placeholder, or `guardian_push_content_id()`'s own throw fallback) is now
+NEVER trusted as a content match, even against an identical sentinel from a
+different push, since neither sentinel means "this content" in the first place;
+(b) `guardian_push_content_id()`'s canonicalization was not block-boundary-
+injective - two rules with different `(spark, assertion)` splits of the same
+flat field sequence could hash identically, which `decide_retry()`'s content
+comparison depends on being collision-resistant.
+
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
 PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
