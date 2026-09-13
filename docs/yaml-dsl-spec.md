@@ -718,7 +718,7 @@ status:
 
 ## 6. Kind: Policy (Phase 5)
 
-> **Implementation phase:** Phase 5 -- Policy engine. Not yet implemented.
+> **Implementation phase:** Phase 5 -- Policy engine. **Corrected 2026-09-11 (Gate-of-record pass 5, arch-P5-1): this banner was stale.** `PolicyStore` is implemented and live in production (`server/core/src/policy_store.cpp`, `compliance_routes.cpp`) -- policies are created and evaluated today; remediation is operator-initiated, never automatic (see §16 of `docs/capability-map.md` and `docs/user-manual/policy-engine.md`). What is genuinely not implemented is the `spec.triggers[]` schema documented in this section (`ref:`/`with:` references to a `TriggerTemplate`) -- see the caveat under `spec.triggers[]` below for what the shipped parser actually accepts.
 
 A Policy binds a PolicyFragment to a device scope and a set of triggers. Policies are the deployment unit for compliance enforcement.
 
@@ -785,6 +785,8 @@ Each trigger object:
 | `ref` | string | Yes | -- | ID of a TriggerTemplate. |
 | `with` | map of string to varies | No | `{}` | Parameter bindings for the trigger. |
 
+> **Implementation caveat (added 2026-09-11, Gate-of-record pass 5, arch-P5-1): the shipped `PolicyStore` parser does not implement this `ref:`/`with:` schema at all.** It reads each trigger entry for a bare `type:` key (`extract_yaml_value(item_block, "type")`) and, when `type: interval`, an `interval_seconds:` key -- there is no `TriggerTemplate` resolution, no `ref:` lookup, anywhere in `policy_store.cpp`. A trigger object written exactly as this table specifies (`ref:` + optional `with:`, no `type:` key) parses with an empty `trigger_type` and is **silently dropped -- not stored at all**, not even as an unrecognized/errored trigger: `if (!t.trigger_type.empty()) triggers.push_back(...)` (`server/core/src/policy_store.cpp:678-679`) simply skips it. A policy authored per this exact schema therefore has zero triggers in the database and falls back to the 3600-second interval default (see `docs/user-manual/policy-engine.md` § Trigger Configuration). The shipped, working schema is `- type: interval` / `interval_seconds: <seconds>` per-entry -- `type` values other than `interval` are accepted and stored (unlike `ref:`, which is dropped) but do not affect evaluation cadence either. This is a real gap between this normative spec and the implementation, not a documentation nuance: content authored to this table's schema silently does nothing. Tracked as issue #4244.
+
 #### `spec.schedule`
 
 | Field | Type | Required | Default | Description |
@@ -828,6 +830,17 @@ Each trigger object:
 | `phase` | string | No | `proposed` | Lifecycle phase. Values: `proposed`, `active`, `deprecated`, `archived`. |
 
 ### 6.2 Complete Example
+
+> **This example's `triggers:` block uses the `ref:`/`with:` schema documented
+> above -- see the implementation caveat under `spec.triggers[]`: the shipped
+> parser drops these entries (zero triggers stored), and the policy falls back
+> to the 3600-second interval default rather than the `ref: trigger.interval.five_minutes` /
+> `ref: trigger.service_status_changed` cadence this example implies. This
+> example is kept as-is because it is the normative schema, unmodified by an
+> implementation gap -- do not copy its `triggers:` block into a real policy
+> and expect it to work; use the shipped `type: interval` / `interval_seconds:`
+> form from `docs/user-manual/policy-engine.md` instead. *(Added 2026-09-11,
+> Gate-of-record pass 5, arch-P5-1.)*
 
 ```yaml
 apiVersion: yuzu.io/v1alpha1

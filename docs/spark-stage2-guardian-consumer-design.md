@@ -31,6 +31,18 @@ history:
     made mutually consistent (#4148); R5.4's timing split into staging /
     acknowledgment / persistence to match the PR-1 implementation. Reviewed by Astra
     (`/codex opine`) against the PR-1 plan before the edits.
+  - 2026-09-13 - status sweep (no design change): PR-B3 (#2012/#3840, Service) recorded
+    as merged 2026-09-12 (PR #4302, closing #2012/#3840/#4181), superseding several
+    "in review as of 2026-09-11" mentions; `CloseServiceHandle`'s teardown call
+    corrected from "not a blocking call" to its actual disclosed status (same LRPC
+    transport as `OpenServiceW`, unverified against hanging - governance review found
+    no evidence it cannot hang under a wedged SCM; the #4181 non-applicability argument
+    was re-grounded on `unwatch()` releasing `mu_` before teardown runs, since it can
+    no longer rest on the retracted not-blocking claim); rung 9c PR-2 recorded as merged
+    2026-09-13 (PR #4318) in `docs/spark-flip-gate.md` and
+    `docs/spark-legacy-delta-registry.md` (this doc's own R5.2-R5.4 "as implemented"
+    stamps already reflected PR-2 from PR #4318's own commits, so only the two
+    cross-referencing docs needed the update).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -483,7 +495,33 @@ is HELD, with the server's 25 s `full_sync` retry re-applying the whole push unt
 contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
 (admission-expiry / admission-rejection / dispatched-timeout, R5.3), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
-the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. PR-B3 (Service) is in review as of 2026-09-11, closing this series - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
+the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. **PR-B3 (Service) merged 2026-09-12 as PR #4302, closing this series** (corrected 2026-09-13, superseding the prior "in review" wording) - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
+
+**R5.2 as implemented (rung 9c PR-2 Unit 2/6).** `GuardianSparkRuntime` exposes the
+non-waiting counterpart directly: `attach_rule(NonWaiting{}, rule_id, spec, assertion,
+emit_compliant_edge)` returns `ArmOutcome{kind, generation, receipt}` -
+`kind == Armed` for exactly the synchronous outcomes the blocking overload already
+produced (an inline type, an already-committed shared watcher, or a claim observed
+already-terminal before this call returns), `kind == Accepted` for everything the
+blocking overload used to wait on via `wait_for_claim()`. Both overloads share
+`attach_core()`; the non-waiting one simply never calls `wait_for_claim()`. The
+deadline this section's "dispatched-operation timeout" bullet (3) describes is
+therefore no longer discovered by a blocked waiter's own timeout - nothing is
+blocked to notice it - but by `expire_overdue_claims()`, a registry-locked
+transition callable directly: it does exactly what `wait_for_claim()`'s timeout
+branch always did (`abandon_claim_locked()` every live Arm claim whose deadline has
+passed), just relocated out of a waiter, never removed. `GuardianEngine::
+reconcile_rule_locked()` is the production caller of the non-waiting overload as of
+Unit 6; `GuardianArmAckLedger::drain_locked()` (R5.3) is the production caller of
+`expire_overdue_claims()`, from `journal_maintenance_tick()`'s own heartbeat cadence.
+
+**Structural consequence, found during Unit 6's own regression-test design:**
+`attach_core()`'s only synchronous `Failed` return is the `stopping_` guard, and
+`GuardianEngine::stop()` holds `mtx_` across `spark_runtime_->begin_stop()` -
+`apply_rules()` can never observe it. Post-cutover, a genuine per-rule synchronous
+`ReconcileOutcome::Failed` for a File/Registry/Service rule is therefore
+unreachable outside engine shutdown; every real backend arm failure now surfaces
+only asynchronously, through the ledger's drain (R5.3 below).
 
 **R5.3 - Ack model: accepted vs. acknowledged.** **Acknowledged ≠ compliant/enforced,
 stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
@@ -559,6 +597,69 @@ per tick, matching the existing lifecycle-journal's 4-batch/1024-record shape, s
 large outstanding batch drains over several heartbeat ticks rather than risking a
 heartbeat-thread stall.
 
+**R5.3 as implemented (rung 9c PR-2 Unit 5/6).** `GuardianArmAckLedger` is the
+concrete per-application tracker this section's "apply_rules() tracks, per accepted
+rule, whether its arm has resolved" describes. `begin_application(generation,
+content_id, full_sync, applied)` opens ONE current application, never a history -
+a receipt from a superseded application resolving later is simply no longer in any
+ledger's pending set, safe by construction since an `ArmReceipt` is an OBSERVATION
+handle, never an owning one. `add_pending()` registers each `Accepted` rule's
+receipt. `drain_locked()` - called every `journal_maintenance_tick()`, bounded
+(`kAckDrainMaxPerTick`) - sweeps `expire_overdue_claims()` (R5.2) first, then
+resolves as many still-pending receipts as its bound allows via
+`GuardianSparkRuntime::receipt_status()`. `can_advance()` is what the
+generation-hold gate reads: true only with a current application, nothing pending,
+and nothing resolved to anything but Committed - and, deliberately, ALSO true for a
+current application with an empty pending set because every one of its rules
+resolved synchronously (Armed/Inert, nothing Accepted) - matching this document's
+own "an `Inert` outcome... satisfies the predicate immediately" language above,
+never the "zero-accepted push" vacuous-advance case this section separately warns
+against (that case is refused AT ADMISSION and never reaches the ledger as a
+receipt at all). `decide_retry(generation, content_id, full_sync, runtime)` is this
+section's own same-generation-retry suppression (the paragraph above, "is a no-op
+while every outstanding episode... is still genuinely pending"): it consults the
+runtime directly, not just its own resolved-failure count, since `drain_locked()`'s
+per-tick bound means a receipt past one call's cap can already be resolved without
+yet being retired from `pending`. `apply_rules()` calls `decide_retry()` before
+anything else, including its own full_sync teardown - REQUIRED, not an
+optimization: without it, every same-generation `full_sync` heartbeat retry while
+an episode is still genuinely pending would re-run the whole teardown+re-arm, and
+an arm slower than the 25 s retry interval would never converge.
+
+**R5.3 correction (governance hardening round, rung 9c PR-2 gate; sec-1/arch-1,
+five independently-confirming reviewers): `decide_retry()` must Reapply, never
+Suppress, whenever `pending` is EMPTY.** The paragraph above's "is a no-op while
+every outstanding episode ... is still genuinely pending" was under-specified: it
+never stated what happens when there is NOTHING outstanding at all - the ordinary
+case at `prefer_spark_=false` (today's production default), where `Accepted`
+never occurs and `pending` is therefore always empty. The dedup this section
+describes exists ONLY to protect a claim that is genuinely still in flight from a
+spurious re-teardown+re-arm; with nothing pending there is nothing to protect,
+and Suppressing anyway also swallowed the one thing `apply_rules()`'s own tail
+gate still needed to do on an identical retry: retry a `persist_generation_locked()`
+write that failed on the prior call. Before this correction, an empty `pending`
+map reached a vacuous Suppress and that retry never ran - the server's own
+25 s `full_sync` heartbeat resend (exactly the retry this section's REQUIRED
+ordering exists to serve) was therefore unable to recover a stuck generation by
+itself; only an agent restart could. This is corrected in
+`GuardianArmAckLedger::decide_retry()`: an empty `pending` map returns `Reapply`
+immediately, restoring exactly the pre-PR-2 behavior for that case - a full
+re-run, NOT a free one (correction, Gate 8: three independent reviewers caught
+an earlier draft of this paragraph claiming the reapply "costs nothing" -
+`attach_core()` rebuilds eval state from scratch on every push, identical
+re-push included, so a `full_sync` retry still pays the same real
+teardown+re-arm cycle it always paid before this ledger existed; what changes
+is that the retry runs AT ALL again, not that it becomes cheap). Two further
+precision fixes landed alongside it: (a) a
+`content_id` that is not a real 64-hex-char SHA-256 digest (the `start_local()`
+boot placeholder, or `guardian_push_content_id()`'s own throw fallback) is now
+NEVER trusted as a content match, even against an identical sentinel from a
+different push, since neither sentinel means "this content" in the first place;
+(b) `guardian_push_content_id()`'s canonicalization was not block-boundary-
+injective - two rules with different `(spark, assertion)` splits of the same
+flat field sequence could hash identically, which `decide_retry()`'s content
+comparison depends on being collision-resistant.
+
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
 PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
@@ -606,6 +707,29 @@ failure is unchanged - but a SUBSEQUENT late success on a still-wanted rule does
 its "armed" record when it commits under ruling 14(b): expiry silences the failure, not
 the eventual success.
 
+**R5.4 as implemented (rung 9c PR-2 Unit 6).** `journal_maintenance_tick()` is the
+one heartbeat-cadence caller for BOTH (2) and (3) above - EXTENDED, not a second
+method, since both were already "periodic maintenance under `mtx_`,
+`prefer_spark_`-gated, firewalled." It runs its own persist step (3) BEFORE the
+ledger's drain step (2) - an arbitrary, harmless ordering as far as either step's
+OWN result is concerned (neither reads the other's) - but it has one consequence
+for durability timing that this section's "three timings, not one" principle
+already permits and should not be mistaken for a bug: staging (1) lands on the
+detached worker's own schedule, independent of the tick loop, including possibly
+exactly between one tick's persist (3) and its drain (2) - so the very tick whose
+drain step FIRST observes a receipt as Committed may already have run ITS OWN
+persist attempt against a `pending_journal_` that still predated the staging.
+Durable persistence of that record is therefore not guaranteed within the SAME
+tick that resolves the ack - only within the next one, on the engine's existing
+cadence, exactly as this section already promises. No data is ever lost (each
+tick's persist re-snapshots `pending_journal_` fresh, and `persist()` erases only
+what it durably wrote), only delayed by up to one additional tick beyond
+ack-observation - a delay this section's own multi-tick tolerance for a large
+outstanding batch already covers, and one the test suite accounts for directly
+(`SparkReconcileFixture::apply()`'s settle loop runs one extra
+`journal_maintenance_tick()` after observing ack settlement, specifically for this
+reason).
+
 **R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
 in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
 backend call can no longer delay agent shutdown the way it can today. In-flight workers
@@ -621,7 +745,16 @@ destroyed in the trampoline (the latest self-observable point before OS-thread e
 uncounted tail after it and why no grace covers it are stated in R5.1), never the
 early-releasing quota count, so a worker that has returned from `fn()` and is still
 inside its completion callback holds the process open exactly as a worker still inside
-the OS call does.
+the OS call does. `GuardianEngine::stop()` also retires the ack ledger (Unit 6,
+`GuardianArmAckLedger::retire()`) - belt-and-suspenders, since `journal_maintenance_
+tick()` already no-ops after `stopped_`, but it also stops watching receipts whose
+claims `begin_stop()` is tearing down; `start_local()` opens a defensive application
+at the already-loaded `policy_generation_` before its own boot re-arm walk, so a
+receipt accepted during that walk is tracked too - not exercised by
+`SparkReconcileFixture` (`test_guardian_engine_spark_reconcile.cpp`), which wires
+`start_local()` BEFORE `wire_spark_engine()` (the reverse of production's
+`agent.cpp` order), so `spark_availability_` is still `Unwired` during its boot
+walk and the walk never reaches the spark path at all in that fixture.
 
 **R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,
@@ -1055,19 +1188,19 @@ plugin call is a compile error, per Decision 3) *and* watchdog-histogram evidenc
 that a given enforce action stays inside budget. Registry write-back is the
 plausible first candidate; it is **not** promoted in Stage 2.
 
-Pre-Stage-3 dependency, **UPDATED 2026-09-11**: File's `watch()` blocking for its OS-call
+Pre-Stage-3 dependency, **UPDATED 2026-09-13**: File's `watch()` blocking for its OS-call
 duration under the ops lock is now closed (PR-B2, landed). Service's SCM open/notify running
-head-of-line on its worker is now PARTIALLY closed (PR-B3, `OpenServiceW` isolated onto a
-probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by
-Win32 thread-affinity requirement, an accepted residual) - PR-B3 in review as of this note
+head-of-line on its worker is now PARTIALLY closed (**PR-B3, merged 2026-09-12 as PR #4302**,
+`OpenServiceW` isolated onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration
+stays on the mechanism thread by Win32 thread-affinity requirement, an accepted residual)
 (`mech_ops_mu_by_type_`'s member comment, corrected in PR-B1; the earlier
 "entirely UNCHARACTERISED" wording is superseded for all three mechanisms now, whose
 establishment latencies are measured in
 `docs/spark-rebuild-baselines/stage2-watch-establish-latency.md`, including the PR-B3 addendum's
 end-to-end Service figures - ~65ms arm-to-first-observed-state, dominated by
 `kServicePollCadence`, not OS call cost); #2011's per-mechanism-type lock (rung 0) removes only
-*cross-mechanism* coupling. Gate rung 3 on PR-B3 landing (the measured ceiling this paragraph
-asked for now exists for all three mechanisms). (architect S4.)
+*cross-mechanism* coupling. Gate rung 3 satisfied - PR-B3 landed 2026-09-12 (the measured
+ceiling this paragraph asked for now exists for all three mechanisms). (architect S4.)
 
 **#2233 item 3 (landed)** bounds the wall-clock a *caller* of `GuardianSparkRuntime`
 waits for one File/Registry/Service arm/disarm - a dedicated `GuardianIoExecutor`
@@ -1113,13 +1246,13 @@ probe (target open / nearest-ancestor walk) on a detached F3-counted worker, wai
 most `kFileCallerWaitBudget` (50 ms) on the control path and otherwise publishes the
 probe to the mechanism's own IOCP-driven sweeper. `unwatch()` was already O(1) (no
 blocking callback drain to hand off, unlike Registry). The #4181 same-type reentrant
-disarm deadlock is closed on the File path; Service (PR-B3, below) is the last piece
-needed to close the issue itself. Costs mirror Registry's: a consumed target completion
+disarm deadlock is closed on the File path; Service (PR-B3, below - merged 2026-09-12,
+closing #4181 itself) was the last piece needed. Costs mirror Registry's: a consumed target completion
 is covered by a synthetic resync fire rather than redelivering the lost notification, a
 shared ancestor's fan-out uses whole-batch retry (never per-key debt, Dave's decision #4),
 and an Ancestor->Target appearance is emitted via the same commit-time resync path.
 
-**#2012/#3840 PR-B3 (in review, Service added, closes the series)**: Service's
+**#2012/#3840 PR-B3 (merged 2026-09-12 as PR #4302, Service added, closes the series)**: Service's
 `watch()`/`unwatch()` needed no restructuring - unlike Registry and File, they were
 already O(1) queue pushes before this series (confirmed by direct code read and by
 `spark_mechanism.hpp`'s own mechanism-contract comment; #3840's issue text, originally
@@ -1128,17 +1261,29 @@ establishment ran head-of-line on Service's single dedicated mechanism thread, d
 every *other* watched service's establishment, retries, and APC dispatch while one was
 in flight - a stall on that shared worker thread, not on the engine-wide per-type lock
 Registry/File had. PR-B3 isolates `OpenServiceW` onto a probe-only `SparkDetachedLane`,
-mirroring Registry's probe half. **Deliberately no drain-lane twin**: Service's teardown
-(`CloseServiceHandle` + a zero-timeout `SleepEx(0,TRUE)` APC pump) is not a blocking call
-the way Registry's `WaitForThreadpoolWaitCallbacks(...,TRUE)` is, so there is no
-equivalent close operation to isolate; `CloseServiceHandle` and
-`NotifyServiceStatusChangeW`'s registration both stay on the mechanism thread (the latter
-by Win32 thread-affinity requirement, not a shortcut). The #4181 same-type reentrant
-disarm deadlock does not apply to Service at all - its `unwatch()` already lacked the
-blocking teardown call that creates the deadlock's first wait-edge (confirmed by direct
-code read; only Registry ever had it, contrary to this design's own earlier assumption
-that Registry and Service shared the hazard) - a dedicated subprocess-boundary T6-analogue
-regression test was added anyway, as insurance. End-to-end establishment latency (arm to
+mirroring Registry's probe half. **Deliberately no drain-lane twin**: the design
+rationale was that Service's teardown (`CloseServiceHandle` + a zero-timeout
+`SleepEx(0,TRUE)` APC pump) doesn't have Registry's documented cross-thread
+reclamation-ownership problem - the thing a drain lane would exist to isolate.
+
+**Corrected 2026-09-13**: an earlier version of this paragraph overstated that
+rationale as "is not a blocking call." The real disclosure (governance review,
+round 3) is more cautious: `CloseServiceHandle` is the same LRPC transport as
+`OpenServiceW` and is UNVERIFIED either way - no evidence found that it cannot
+itself hang under the same wedged-SCM condition #3840 exists to fix.
+`CloseServiceHandle` and `NotifyServiceStatusChangeW`'s registration both stay on the
+mechanism thread regardless (the latter by Win32 thread-affinity requirement, not a
+shortcut; the former by this design decision).
+
+The #4181 same-type reentrant disarm deadlock does not apply to Service at all - and
+this argument no longer rests on the retracted "not a blocking call" claim above: its
+`unwatch()` releases `mu_` before teardown runs, so the disarmer is never blocked
+holding the per-type lock waiting on a callback the way the deadlock's diagram
+requires (confirmed by direct code read; only Registry ever had that shape, contrary
+to this design's own earlier assumption that Registry and Service shared the hazard).
+This holds independently of whether `CloseServiceHandle` itself can hang - a
+dedicated subprocess-boundary T6-analogue regression test was added anyway, as
+insurance. End-to-end establishment latency (arm to
 first observed state) measures ~65ms on real hardware, dominated by
 `kServicePollCadence` (50ms) rather than OS call cost - see
 `docs/spark-rebuild-baselines/stage2-watch-establish-latency.md`'s PR-B3 addendum.
@@ -1453,8 +1598,8 @@ upgrade note for this enforcement-posture default change (not deferred to rung 5
   (same shape). **Service (PR-B3) never actually had this same-type-lock stall** -
   its `watch()`/`unwatch()` were already O(1) queue pushes before this series; its
   real, structurally different gap (`OpenServiceW` head-of-line on Service's own
-  worker thread, not the per-type lock) is addressed by PR-B3, in review as of
-  2026-09-11 - see the PR-B3 entry above for the full correction. The observability half of #2011 (per-type
+  worker thread, not the per-type lock) is addressed by PR-B3 (merged 2026-09-12 as
+  PR #4302) - see the PR-B3 entry above for the full correction. The observability half of #2011 (per-type
   `SparkEngineStats` emission + alerts) is DEFERRED to rung 1, where SparkEngine
   is first instantiated.
 - **#2014 (BLOCKING-before-Stage-2):** resolved by the no-blocking-inline-consumer
