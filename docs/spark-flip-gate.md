@@ -336,14 +336,26 @@ corrected #2012 row in §5's register for the full per-mechanism status, includi
 correction that Service never actually had the hazard this row originally described, and the
 re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
 
-**Ladder status, updated 2026-09-13**: **PR-0 (done, #4130) → PR-1 (done, #4224,
-2026-09-10) → [#2012/#3840 series, done, see above] → PR-2 (done, #4318, 2026-09-13) → PR-3
-(telemetry, not started) → PR-4 (audit/shutdown/legacy-note, not started) → PR-5 (fault/K-bound
-logic, not started - see acceptance criteria below) → PR-6 (Service readiness signal +
-re-measurement, not started).** PR-2 settled §R5.3's previously-open "resolved" definition:
-resolved = backend `arm()` success AND Guardian's own generation-commit, not OS-watch
-establishment - `docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.5 updated to describe
-the mechanism as implemented, not just designed.
+**Ladder status, updated 2026-09-13** (this track's OWN PR-0 through PR-6, not to be
+confused with #2233's item-3 PR-2 or the 7.7b-split's "PR-2 (thin cutover)" - those are
+different PRs entirely; see "Why it doesn't gate on #2233" above): **PR-0 (done, #4130)
+→ PR-1 (done, #4224, 2026-09-10) → [#2012/#3840 series, done, see above] → PR-2 (done,
+#4318, 2026-09-13) → PR-3 (telemetry, not started) → PR-4 (audit + R5.5's shutdown
+decoupling + legacy-note, not started - **note, found during this doc-sweep's own
+governance, not yet fixed**: `guardian_spark_runtime.cpp`'s `begin_stop()` comment
+already describes a scenario PR-2 made impossible - it still reasons about
+`apply_rules()` "parked in a bounded wait," which PR-2 removed - a stale comment in
+shipped code, filed as **#4322**, not fixed in this docs-only pass) → PR-5 (fault/K-bound logic, not started - see acceptance criteria below,
+now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
+diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
+§R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
+Guardian's own generation-commit, not OS-watch establishment -
+`docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.4 updated to describe the
+mechanism as implemented, not just designed (R5.5/shutdown stays design-only until
+PR-4). **Sequencing note, not yet ruled**: since #3990's diagnostic and the CH-5-UAT
+evidence campaign (§4) both measure a latency this ladder is still actively changing,
+whether either should start before PR-3 through PR-6 land, or wait for the full ladder,
+is an open scheduling question - not answered by this doc today.
 
 **Rung 9c PR-5 acceptance criteria (governance pass-3, independent fan-out on PR-1, 2026-09-09).**
 Three unhappy-path findings on PR-1 derive HIGH on their own facts and are capped to LOW only by
@@ -390,6 +402,14 @@ flip, with a red-first test each:
   the flip. Test-side note: `tests/unit/test_guardian_spark_runtime.cpp`'s 200-key `detach_all` test
   (governance qe-303) now asserts `disarms + disarm_retained() == 200` rather than the false invariant
   `disarms == 200` this row's chaos reproduction disproved.
+- **NEW (added 2026-09-13, sre finding on the #2012/#3840 doc-sweep)**: #4279's lane-cap-overshoot
+  observation (`SparkDetachedLane`'s shared admission primitive, `max_active=9 > cap=8` on a real
+  storm-load test, 1-in-~10 hardware runs, root cause undetermined) has no PR-5 acceptance
+  criterion binding its resolution to the point where it would actually matter - the K-bound
+  logic PR-5 implements is exactly what this residual could interact with under sustained
+  same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
+  against the landed K-bound logic and records the outcome here, rather than leaving it to drift
+  as an unrelated open issue.
 
 ## 4. #2340 scenario contract
 
@@ -1108,7 +1128,14 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
     real-hardware verification: File's sibling mechanism, sharing the identical
     `SparkDetachedLane` admission primitive, was observed exceeding its configured lane cap by
     one under real storm load (`max_active=9 > kTestLaneCap=8`, 1-in-~10 real-hardware runs -
-    see #4279's corresponding note) - raising this above "spec says it can't happen."
+    see #4279's corresponding note) - raising this above "spec says it can't happen."; (e)
+    **NEW, added to #4218 2026-09-12**: `CloseServiceHandle`'s own hang potential is disclosed
+    but unverified, not yet measured or given a synthetic-storm test - same LRPC transport as
+    `OpenServiceW`, governance found no evidence it cannot hang under a wedged SCM, and four
+    routine paths call it with a live handle. This was previously mis-described elsewhere as
+    "not a blocking call" (corrected in place, both here and in
+    `docs/spark-stage2-guardian-consumer-design.md`, 2026-09-13) - split into its own item so it
+    isn't silently read as settled.
   #2011 (lock granularity) and #2014 stay early post-flip in the named package, unaffected by
   the correction above.
 - Revisit trigger: for the remaining #2011/#2014 piece, **escalate to flip-gating if a production
@@ -1120,8 +1147,11 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   review, both concurred. Finding: the underlying concern (same-type contention causing genuine
   admission congestion, not just delay) is addressed for all three mechanisms, though not
   eliminated outright - the #4279 lane-cap-overshoot observation is a tracked, characterized
-  residual (most likely a transient admission-counter artifact per both the issue's own static
-  read and Astra's independent derivation, not a confirmed cap breach), not a reopening of the
+  residual. **Corrected 2026-09-13**: an earlier version of this cell leaned toward "most likely
+  a transient admission-counter artifact" - the issue's own static read (a single atomic
+  fetch-add-then-compare-then-rollback, no obvious TOCTOU) and Astra's independent derivation
+  both point the same direction but neither confirms it; the issue's own words are the accurate
+  ones - "root cause undetermined... not confirmed either way." Either way, not a reopening of the
   original hazard. **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
   ruling 14(c)'s own rationale, since the K-bound/quarantine classification logic actually lives
   in PR-5, not PR-2, so the accepted cost this hold existed to protect against was never live at

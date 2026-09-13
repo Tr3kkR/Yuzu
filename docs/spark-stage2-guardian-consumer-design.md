@@ -31,6 +31,16 @@ history:
     made mutually consistent (#4148); R5.4's timing split into staging /
     acknowledgment / persistence to match the PR-1 implementation. Reviewed by Astra
     (`/codex opine`) against the PR-1 plan before the edits.
+  - 2026-09-13 - status sweep (no design change): PR-B3 (#2012/#3840, Service) recorded
+    as merged 2026-09-12 (PR #4302, closing #2012/#3840/#4181), superseding several
+    "in review as of 2026-09-11" mentions; `CloseServiceHandle`'s teardown call
+    corrected from "not a blocking call" to its actual disclosed status (same LRPC
+    transport as `OpenServiceW`, unverified against hanging - governance review found
+    no evidence it cannot hang under a wedged SCM); rung 9c PR-2 recorded as merged
+    2026-09-13 (PR #4318) in `docs/spark-flip-gate.md` and
+    `docs/spark-legacy-delta-registry.md` (this doc's own R5.2-R5.4 "as implemented"
+    stamps already reflected PR-2 from PR #4318's own commits, so only the two
+    cross-referencing docs needed the update).
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -483,7 +493,7 @@ is HELD, with the server's 25 s `full_sync` retry re-applying the whole push unt
 contention clears. `yuzu.guardian_arm_failed` therefore carries a reason/phase
 (admission-expiry / admission-rejection / dispatched-timeout, R5.3), so an operator
 paged on it can tell a genuinely dead target from a key queued behind a slow sibling of
-the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. PR-B3 (Service) is in review as of 2026-09-11, closing this series - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
+the same mechanism type. PR-B1 (#2012/#3840, Registry) and PR-B2 (#2012/#3840, File) have since landed - see the landed-in notes below. **PR-B3 (Service) merged 2026-09-12 as PR #4302, closing this series** (corrected 2026-09-13, superseding the prior "in review" wording) - **with one correction found during PR-B3's own delivery**: Service never actually had the per-type-lock stall this paragraph describes (`watch()`/`unwatch()` were already O(1) queue pushes before any of PR-B1/B2/B3). Service's real, structurally different gap was `OpenServiceW` running head-of-line on its own dedicated worker thread, stalling sibling watches sharing that thread rather than the engine-wide per-type lock. #3840's issue text carries the full correction. PR-B3 isolates `OpenServiceW` onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by design (Win32 thread-affinity requirement) - an accepted residual, not a gap this fix claims to close.
 
 **R5.2 as implemented (rung 9c PR-2 Unit 2/6).** `GuardianSparkRuntime` exposes the
 non-waiting counterpart directly: `attach_rule(NonWaiting{}, rule_id, spec, assertion,
@@ -1176,19 +1186,19 @@ plugin call is a compile error, per Decision 3) *and* watchdog-histogram evidenc
 that a given enforce action stays inside budget. Registry write-back is the
 plausible first candidate; it is **not** promoted in Stage 2.
 
-Pre-Stage-3 dependency, **UPDATED 2026-09-11**: File's `watch()` blocking for its OS-call
+Pre-Stage-3 dependency, **UPDATED 2026-09-13**: File's `watch()` blocking for its OS-call
 duration under the ops lock is now closed (PR-B2, landed). Service's SCM open/notify running
-head-of-line on its worker is now PARTIALLY closed (PR-B3, `OpenServiceW` isolated onto a
-probe-only lane; `NotifyServiceStatusChangeW`'s registration stays on the mechanism thread by
-Win32 thread-affinity requirement, an accepted residual) - PR-B3 in review as of this note
+head-of-line on its worker is now PARTIALLY closed (**PR-B3, merged 2026-09-12 as PR #4302**,
+`OpenServiceW` isolated onto a probe-only lane; `NotifyServiceStatusChangeW`'s registration
+stays on the mechanism thread by Win32 thread-affinity requirement, an accepted residual)
 (`mech_ops_mu_by_type_`'s member comment, corrected in PR-B1; the earlier
 "entirely UNCHARACTERISED" wording is superseded for all three mechanisms now, whose
 establishment latencies are measured in
 `docs/spark-rebuild-baselines/stage2-watch-establish-latency.md`, including the PR-B3 addendum's
 end-to-end Service figures - ~65ms arm-to-first-observed-state, dominated by
 `kServicePollCadence`, not OS call cost); #2011's per-mechanism-type lock (rung 0) removes only
-*cross-mechanism* coupling. Gate rung 3 on PR-B3 landing (the measured ceiling this paragraph
-asked for now exists for all three mechanisms). (architect S4.)
+*cross-mechanism* coupling. Gate rung 3 satisfied - PR-B3 landed 2026-09-12 (the measured
+ceiling this paragraph asked for now exists for all three mechanisms). (architect S4.)
 
 **#2233 item 3 (landed)** bounds the wall-clock a *caller* of `GuardianSparkRuntime`
 waits for one File/Registry/Service arm/disarm - a dedicated `GuardianIoExecutor`
@@ -1234,13 +1244,13 @@ probe (target open / nearest-ancestor walk) on a detached F3-counted worker, wai
 most `kFileCallerWaitBudget` (50 ms) on the control path and otherwise publishes the
 probe to the mechanism's own IOCP-driven sweeper. `unwatch()` was already O(1) (no
 blocking callback drain to hand off, unlike Registry). The #4181 same-type reentrant
-disarm deadlock is closed on the File path; Service (PR-B3, below) is the last piece
-needed to close the issue itself. Costs mirror Registry's: a consumed target completion
+disarm deadlock is closed on the File path; Service (PR-B3, below - merged 2026-09-12,
+closing #4181 itself) was the last piece needed. Costs mirror Registry's: a consumed target completion
 is covered by a synthetic resync fire rather than redelivering the lost notification, a
 shared ancestor's fan-out uses whole-batch retry (never per-key debt, Dave's decision #4),
 and an Ancestor->Target appearance is emitted via the same commit-time resync path.
 
-**#2012/#3840 PR-B3 (in review, Service added, closes the series)**: Service's
+**#2012/#3840 PR-B3 (merged 2026-09-12 as PR #4302, Service added, closes the series)**: Service's
 `watch()`/`unwatch()` needed no restructuring - unlike Registry and File, they were
 already O(1) queue pushes before this series (confirmed by direct code read and by
 `spark_mechanism.hpp`'s own mechanism-contract comment; #3840's issue text, originally
@@ -1249,16 +1259,23 @@ establishment ran head-of-line on Service's single dedicated mechanism thread, d
 every *other* watched service's establishment, retries, and APC dispatch while one was
 in flight - a stall on that shared worker thread, not on the engine-wide per-type lock
 Registry/File had. PR-B3 isolates `OpenServiceW` onto a probe-only `SparkDetachedLane`,
-mirroring Registry's probe half. **Deliberately no drain-lane twin**: Service's teardown
-(`CloseServiceHandle` + a zero-timeout `SleepEx(0,TRUE)` APC pump) is not a blocking call
-the way Registry's `WaitForThreadpoolWaitCallbacks(...,TRUE)` is, so there is no
-equivalent close operation to isolate; `CloseServiceHandle` and
-`NotifyServiceStatusChangeW`'s registration both stay on the mechanism thread (the latter
-by Win32 thread-affinity requirement, not a shortcut). The #4181 same-type reentrant
-disarm deadlock does not apply to Service at all - its `unwatch()` already lacked the
-blocking teardown call that creates the deadlock's first wait-edge (confirmed by direct
-code read; only Registry ever had it, contrary to this design's own earlier assumption
-that Registry and Service shared the hazard) - a dedicated subprocess-boundary T6-analogue
+mirroring Registry's probe half. **Deliberately no drain-lane twin**: the design
+rationale was that Service's teardown (`CloseServiceHandle` + a zero-timeout
+`SleepEx(0,TRUE)` APC pump) doesn't have Registry's documented cross-thread
+reclamation-ownership problem to isolate a close FOR - **corrected 2026-09-13**: an
+earlier version of this paragraph overstated that as "is not a blocking call." The real
+disclosure (governance review, round 3) is more cautious: `CloseServiceHandle` is the
+same LRPC transport as `OpenServiceW` and is UNVERIFIED either way - no evidence found
+that it cannot itself hang under the same wedged-SCM condition #3840 exists to fix.
+`CloseServiceHandle` and `NotifyServiceStatusChangeW`'s registration both stay on the
+mechanism thread regardless (the latter by Win32 thread-affinity requirement, not a
+shortcut; the former by this design decision). The #4181 same-type reentrant
+disarm deadlock does not apply to Service at all - its `unwatch()` releases `mu_` before
+teardown runs, so the disarmer is never blocked holding the per-type lock waiting on a
+callback the way the deadlock's diagram requires (confirmed by direct code read; only
+Registry ever had that shape, contrary to this design's own earlier assumption that
+Registry and Service shared the hazard). This holds independently of whether
+`CloseServiceHandle` itself can hang - a dedicated subprocess-boundary T6-analogue
 regression test was added anyway, as insurance. End-to-end establishment latency (arm to
 first observed state) measures ~65ms on real hardware, dominated by
 `kServicePollCadence` (50ms) rather than OS call cost - see
@@ -1574,8 +1591,8 @@ upgrade note for this enforcement-posture default change (not deferred to rung 5
   (same shape). **Service (PR-B3) never actually had this same-type-lock stall** -
   its `watch()`/`unwatch()` were already O(1) queue pushes before this series; its
   real, structurally different gap (`OpenServiceW` head-of-line on Service's own
-  worker thread, not the per-type lock) is addressed by PR-B3, in review as of
-  2026-09-11 - see the PR-B3 entry above for the full correction. The observability half of #2011 (per-type
+  worker thread, not the per-type lock) is addressed by PR-B3 (merged 2026-09-12 as
+  PR #4302) - see the PR-B3 entry above for the full correction. The observability half of #2011 (per-type
   `SparkEngineStats` emission + alerts) is DEFERRED to rung 1, where SparkEngine
   is first instantiated.
 - **#2014 (BLOCKING-before-Stage-2):** resolved by the no-blocking-inline-consumer
