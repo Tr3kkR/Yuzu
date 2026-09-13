@@ -255,6 +255,7 @@ agent_test_exe = executable(
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
+    'unit/test_guardian_arm_heartbeat.cpp', # rung 9c PR-3
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
@@ -1130,6 +1131,7 @@ if build_server
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
+      'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -1283,9 +1285,11 @@ if build_server
       # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
       # spark_heartbeat.hpp (emit_spark_heartbeat_tags),
       # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
-      # (emit_guardian_journal_heartbeat_tags), and test_guardian_health_fleet_tags.cpp
+      # (emit_guardian_journal_heartbeat_tags), test_guardian_health_fleet_tags.cpp
       # includes guardian_health_heartbeat.hpp (emit_guardian_health_heartbeat_tags,
-      # #2298 gate 3 item 6d) - each asserting the agent's actual emitted keys equal the
+      # #2298 gate 3 item 6d), and test_guardian_arm_fleet_tags.cpp (rung 9c PR-3)
+      # includes guardian_arm_heartbeat.hpp + guardian_io_ceiling_heartbeat.hpp - each
+      # asserting the agent's actual emitted keys equal the
       # matching server-side *_fleet_tags.hpp table - a full writer↔reader compile/run
       # bind, no silent zero-reporting drift. Header-only templates - no link to
       # yuzu_agent_core, just the include path.

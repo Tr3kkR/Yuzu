@@ -12,6 +12,8 @@
 #include "custom_properties_store.hpp"
 #include "dex_perf_rules.hpp"
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet telemetry table (#2298 gate 3, item 6d)
+#include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet telemetry table (rung 9c PR-3)
+#include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet telemetry table (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet telemetry table (#2298 gate 3)
 #include "network_perf_rules.hpp"
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
@@ -1761,6 +1763,16 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // a fabricated 0.
     for (const auto& m : kGuardianHealthMetrics)
         metrics.clear_gauge_family(m.gauge);
+    // rung 9c PR-3: the arm-ledger re-statable-gauge pair (Decision 1) and the
+    // io-ceiling monitor-only counter (Decision 3, Option B). Same absent-not-
+    // zero rule: on a fleet where no agent is running spark (prefer_spark_ off
+    // fleet-wide, today's default), the writer never emits either family at all,
+    // so both must go fully ABSENT here, never a fabricated 0 that would read as
+    // "spark arming, healthy".
+    for (const auto& m : kGuardianArmMetrics)
+        metrics.clear_gauge_family(m.gauge);
+    for (const auto& m : kGuardianIoCeilingMetrics)
+        metrics.clear_gauge_family(m.gauge);
 
     // Aggregate
     std::unordered_map<std::string, int> os_counts;
@@ -1897,6 +1909,35 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // separately from the sum for the same non-conforming-explicit-"0" reason.
     std::array<double, kNGuardianHealthMetrics> gh_sum{};
     std::array<bool, kNGuardianHealthMetrics> gh_reported{};
+    // rung 9c PR-3: the arm-ledger pair (Decision 1). SUM accumulate - same
+    // mechanical shape as the 32-row journal counter family (gj_sum above)
+    // despite being RE-STATABLE gauges rather than monotonic counters on the
+    // agent side: this reader only ever sees one CURRENT value per agent per
+    // sweep either way, so "sum the current values" is correct regardless of
+    // whether the agent-side field is cumulative or re-statable.
+    std::array<double, kNGuardianArmMetrics> ga_sum{};
+    std::array<bool, kNGuardianArmMetrics> ga_reported{};
+    int ga_reporting = 0;
+    int ga_tag_rejected = 0;
+    static const std::array<std::string, kNGuardianArmMetrics> ga_keys = [] {
+        std::array<std::string, kNGuardianArmMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianArmMetrics; ++i)
+            keys[i] = kGuardianArmMetrics[i].tag;
+        return keys;
+    }();
+    // rung 9c PR-3 (Decision 3, Option B): the io-ceiling monitor-only counter.
+    // Genuinely cumulative on the agent side, same SUM shape as the journal
+    // family mechanically AND semantically.
+    std::array<double, kNGuardianIoCeilingMetrics> gioc_sum{};
+    std::array<bool, kNGuardianIoCeilingMetrics> gioc_reported{};
+    int gioc_reporting = 0;
+    int gioc_tag_rejected = 0;
+    static const std::array<std::string, kNGuardianIoCeilingMetrics> gioc_keys = [] {
+        std::array<std::string, kNGuardianIoCeilingMetrics> keys;
+        for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i)
+            keys[i] = kGuardianIoCeilingMetrics[i].tag;
+        return keys;
+    }();
     int gh_reporting = 0;
     int gh_tag_rejected = 0;
     // Same static-destruction-safety rationale as gj_keys above.
@@ -2223,6 +2264,43 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         }
         if (health_reported_any)
             ++gh_reporting;
+
+        // rung 9c PR-3 (Decision 1): arm-ledger pair. Same absent-vs-rejected
+        // split as every family above - an empty view means this agent did not
+        // report (dormant/non-spark, per the writer's own Check A gate), never a
+        // rejection.
+        bool arm_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianArmMetrics; ++i) {
+            const auto raw = get_view(ga_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_arm_count(raw)) {
+                ga_sum[i] += *v;
+                ga_reported[i] = true;
+                arm_reported_any = true;
+            } else {
+                ++ga_tag_rejected;
+            }
+        }
+        if (arm_reported_any)
+            ++ga_reporting;
+
+        // rung 9c PR-3 (Decision 3, Option B): io-ceiling counter.
+        bool io_ceiling_reported_any = false;
+        for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i) {
+            const auto raw = get_view(gioc_keys[i]);
+            if (raw.empty())
+                continue;
+            if (auto v = parse_guardian_io_ceiling_count(raw)) {
+                gioc_sum[i] += *v;
+                gioc_reported[i] = true;
+                io_ceiling_reported_any = true;
+            } else {
+                ++gioc_tag_rejected;
+            }
+        }
+        if (io_ceiling_reported_any)
+            ++gioc_reporting;
     }
 
     // OTA signature refusals (#416/#3807). Counts AGENTS currently reporting a
@@ -2369,6 +2447,23 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     metrics.gauge(kGuardianJournalReportingGauge).set(static_cast<double>(gj_reporting));
     metrics.gauge(kGuardianJournalTagRejectedGauge)
         .set(static_cast<double>(gj_tag_rejected));
+
+    // rung 9c PR-3: arm-ledger pair (Decision 1) + io-ceiling counter (Decision 3,
+    // Option B). Same absent-when-unreported rule as every family above - on a
+    // fleet where nothing is running spark this cycle, both stay ABSENT entirely,
+    // and the two "reporting" meta-signals below read 0 honestly rather than
+    // fabricating a healthy zero for the gauges themselves.
+    for (std::size_t i = 0; i < kNGuardianArmMetrics; ++i)
+        if (ga_reported[i])
+            metrics.gauge(kGuardianArmMetrics[i].gauge).set(ga_sum[i]);
+    metrics.gauge(kGuardianArmReportingGauge).set(static_cast<double>(ga_reporting));
+    metrics.gauge(kGuardianArmTagRejectedGauge).set(static_cast<double>(ga_tag_rejected));
+    for (std::size_t i = 0; i < kNGuardianIoCeilingMetrics; ++i)
+        if (gioc_reported[i])
+            metrics.gauge(kGuardianIoCeilingMetrics[i].gauge).set(gioc_sum[i]);
+    metrics.gauge(kGuardianIoCeilingReportingGauge).set(static_cast<double>(gioc_reporting));
+    metrics.gauge(kGuardianIoCeilingTagRejectedGauge)
+        .set(static_cast<double>(gioc_tag_rejected));
 
     // Guardian M1 health-stream rollup (#2298 gate 3, item 6d). Same absent-not-zero
     // rule as the journal family: cleared at the top, so a signal nobody reported this
