@@ -21000,7 +21000,18 @@ TEST_CASE("MCP get_host_topology: a too-long or control-character agent_id is "
 
     const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
     const std::string with_control_char = std::string("agent-") + '\x01' + "id";
-    for (const std::string& bad_id : {too_long, with_control_char}) {
+    // Gate 8 (this same review round) caught a false-green in an earlier
+    // version of this test: get_host_topology's "not found" branch ALSO
+    // returns kInvalidParams for an agent_id absent from the seeded
+    // snapshot, which BOTH bad ids here are - asserting only the error code
+    // could not distinguish "floor caught it" from "floor absent, host
+    // merely doesn't exist." Asserting the specific message text, and that
+    // NO audit row was written (the floor returns before try_persist_audit
+    // is ever called; "not found" DOES audit), closes that gap.
+    for (const auto& [bad_id, expected_fragment] :
+         std::vector<std::pair<std::string, std::string>>{{too_long, "too long"},
+                                                           {with_control_char,
+                                                            "control characters"}}) {
         nlohmann::json req_json = {{"jsonrpc", "2.0"},
                                    {"method", "tools/call"},
                                    {"id", 16},
@@ -21009,10 +21020,14 @@ TEST_CASE("MCP get_host_topology: a too-long or control-character agent_id is "
                                      {"arguments", {{"agent_id", bad_id}}}}}};
         auto res = ts.call(req_json.dump());
         REQUIRE(res);
+        INFO("expected_fragment: " << expected_fragment);
         auto body = nlohmann::json::parse(res->body);
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find(expected_fragment) !=
+              std::string::npos);
     }
+    CHECK(ts.audit_log.empty());
 }
 
 TEST_CASE("MCP get_host_topology: denies without Response:Read",
