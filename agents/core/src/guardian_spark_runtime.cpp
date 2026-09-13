@@ -948,14 +948,38 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // into `cont` happen only after the build succeeds), so the failure path
         // falls through to the same "nothing owed" recovery the ordinary
         // no-compensation case already uses below.
+        //
+        // Gate 8 re-review (cpp-safety + security-guardian, both independent):
+        // `cont` MUST NOT become observable (non-null) until BOTH fallible steps
+        // (the allocation AND the `key` copy) have succeeded - `make_shared`
+        // succeeding while the very next statement (`cont->key = key`) throws
+        // left a non-null `cont` behind (std::string::operator= gives the strong
+        // guarantee, so `cont->key` stayed "" - not the real key), which made
+        // `if (cont)` below run the FULL continuation on top of the direct
+        // disarm the catch handler had already issued: a redundant
+        // backend->disarm(sub) (harmless only because SparkEngine::disarm() is
+        // id-idempotent and ids are never recycled - not a documented contract),
+        // and a poisoned `cont->key` that made finalize_arm_compensation()'s
+        // claims_.find(cont->key) miss the real key entirely - the head claim,
+        // already terminal, was never popped, permanently wedging that key
+        // (no arm/disarm possible again on it short of a process restart, a
+        // silent enforcement hole in this exact per-rule chokepoint). Built into
+        // a local FIRST and moved into `cont` only as the LAST statement of the
+        // try, so `cont`'s nullity is atomic with respect to the whole build:
+        // any throw anywhere in the try (allocation or the key copy) leaves
+        // `cont` null, one direct_disarm_fallback() runs, and the fallthrough
+        // below is reached exactly as intended - `if (cont)` is a true single
+        // discriminator again.
         const std::uint64_t sub = *compensating;
         compensating.reset(); // ownership from here is `cont` (below) or the direct
                                // disarm on the catch path - never this optional again
         std::shared_ptr<ArmCompensation> cont;
         try {
             fault_here_for_test(4); // seam: "the continuation allocation threw"
-            cont = std::make_shared<ArmCompensation>();
-            cont->key = key; // the only other fallible op here (string copy)
+            auto built = std::make_shared<ArmCompensation>();
+            fault_here_for_test(5); // seam: "the key copy threw with `built` already alive"
+            built->key = key; // the only other fallible op here (string copy)
+            cont = std::move(built); // non-null ONLY once the whole build has succeeded
         } catch (...) {
             try {
                 spdlog::error("Guardian spark: building the compensating-disarm continuation "

@@ -603,10 +603,18 @@ public:
     /// subscription (before its verdict is staged); 3 = a throw inside the publish
     /// after the verdicts were written into the claims but before the pop (governance
     /// pass-3 ch-1 seam: exercises step (3)'s catch and the terminal-head pop); 4 = a
-    /// throw while building the compensating-disarm continuation, i.e. while `sub` is
-    /// captured in a local but before `cont` exists (adversarial review C1, PR #4318
-    /// fjarvis: proves the direct-disarm-and-fall-through recovery, not a
-    /// std::terminate, is what happens here). 0 = off.
+    /// throw before the compensating-disarm continuation's allocation, i.e. while `sub`
+    /// is captured in a local but before `built`/`cont` exist (adversarial review C1,
+    /// PR #4318 fjarvis: proves the direct-disarm-and-fall-through recovery, not a
+    /// std::terminate, is what happens here); 5 = a throw AFTER that allocation
+    /// succeeded but while copying `key` into it, i.e. `built` is alive but `cont`
+    /// is STILL null (Gate 8 re-review, cpp-safety + security-guardian, PR #4318: an
+    /// earlier fix shape assigned `cont` before the key copy was known to succeed,
+    /// so a throw here left `cont` non-null with an empty `key`, which made the
+    /// continuation branch below run on top of an already-issued direct disarm AND
+    /// made finalize_arm_compensation()'s claims_.find("") miss the real key,
+    /// permanently wedging it - `cont` is now assigned only as the LAST statement
+    /// of the try, so points 4 and 5 both leave it null identically). 0 = off.
     void set_drain_fault_point_for_test(int point) noexcept;
     /// R5.2 detach fault seam (adversarial re-review r2 C1): consumed once by the next
     /// detach_rule_locked that builds a DISARM claim - throws std::bad_alloc at the
@@ -1192,11 +1200,14 @@ private:
     /// finalize_arm_compensation()) consult: 1 = bad_alloc before the fifo snapshot
     /// (the window C2 found), 2 = a throw right after the first commit adopted the
     /// subscription, 3 = a throw after the verdicts are staged and before the pop
-    /// (governance pass-3 sg-3/ar-4/cs-5: the terminal-tombstone sweep), 4 = a throw
-    /// while building the ArmCompensation continuation itself (adversarial review C1,
-    /// PR #4318 fjarvis: the unguarded-allocation window under a live, un-disarmed
-    /// subscription). Consumed once (compare_exchange against 0); a no-op if `point`
-    /// is not currently armed.
+    /// (governance pass-3 sg-3/ar-4/cs-5: the terminal-tombstone sweep), 4/5 = a throw
+    /// while building the ArmCompensation continuation itself - 4 before the
+    /// allocation, 5 after it but before the `key` copy completes (adversarial review
+    /// C1, PR #4318 fjarvis: the unguarded-allocation window under a live, un-disarmed
+    /// subscription; Gate 8 re-review, cpp-safety + security-guardian: split into two
+    /// points because the fix must leave `cont` null on EITHER fallible step, not just
+    /// the first one - see `on_arm_complete`'s own comment at the try). Consumed once
+    /// (compare_exchange against 0); a no-op if `point` is not currently armed.
     void fault_here_for_test(int point);
     /// registry_mu_ held. Publish `reason` on every claim in `key`'s fifo, release their
     /// index entries, and erase the entry. Reached from on_arm_complete() (noexcept):

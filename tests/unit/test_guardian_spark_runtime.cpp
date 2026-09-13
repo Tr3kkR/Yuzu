@@ -6070,6 +6070,108 @@ TEST_CASE("rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318): a throw while 
     REQUIRE(WIFEXITED(status));
     CHECK(WEXITSTATUS(status) == 0);
 }
+
+// Gate 8 re-review (cpp-safety + security-guardian, PR #4318, independent of fjarvis's
+// original C1): the FIRST fix shape assigned `cont = std::make_shared<ArmCompensation>()`
+// before the fallible `cont->key = key` copy, so a throw on the key copy alone left
+// `cont` non-null with an empty `key` - `std::string::operator=` gives the strong
+// exception guarantee, so the failed assignment never touched `cont->key`. That made
+// the `if (cont)` continuation branch run a SECOND time on top of the direct disarm the
+// catch handler had already issued (harmless only because SparkEngine::disarm() happens
+// to be id-idempotent - not a documented ISparkBackend contract), and made
+// finalize_arm_compensation()'s claims_.find("") miss the real key entirely, leaving
+// its already-terminal head claim un-popped and the key PERMANENTLY wedged (no further
+// arm/disarm possible on it short of a process restart - a silent enforcement hole).
+// Fault point 5 fires after the allocation succeeds but before the key copy runs, so
+// this reproduces exactly that interleaving. Kept as an inverted death test, like Unit
+// 4 above: the true fix leaves `cont` assigned only as the LAST statement of the try
+// (regardless of which of the two fallible steps throws), so this must behave
+// identically to fault point 4 - single disarm, one drain-failure count, and critically
+// the same key re-arms cleanly afterward (proving it was never wedged).
+TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the "
+          "ArmCompensation allocation but before the key copy must not leave `cont` "
+          "half-built (double disarm / wedged key)",
+          "[spark][runtime][liveness][death]") {
+    // Mutation (the first fix's own shape): `cont` was assigned straight from
+    // make_shared() before the key copy was known to succeed -> fault point 5's throw
+    // leaves a non-null, empty-keyed `cont` -> double disarm + claims_.find("") misses
+    // the real key -> the head claim is never popped -> the key is wedged forever
+    // (surfaced here as the second attach_rule() below never completing/arming).
+    REQUIRE(yuzu::test::wait_until_quiescent());
+    const pid_t pid = ::fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        // ---- child ----
+        ::signal(SIGABRT, SIG_DFL);
+        auto r = std::make_shared<FakeReader>();
+        auto b = std::make_shared<FakeBackend>();
+        b->hang_next_arm.store(true);
+        auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+
+        std::atomic<bool> a_done{false};
+        std::thread a_thread{[&] {
+            rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+            a_done.store(true, std::memory_order_release);
+        }};
+        if (!b->wait_entered_hang(std::chrono::seconds(30)))
+            ::_exit(90);
+
+        rt->detach_rule("r1");
+        if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
+            ::_exit(91);
+
+        // Arm fault point 5: the allocation itself succeeds, then the key copy throws -
+        // exactly the window a `cont`-assigned-before-the-copy fix shape leaves open.
+        rt->set_drain_fault_point_for_test(5);
+        b->release_hang(); // the late arm lands -> compensating -> fault point 5
+        if (!yuzu::test::spin_until([&] { return a_done.load(std::memory_order_acquire); },
+                                    std::chrono::seconds(30)))
+            ::_exit(92);
+        if (!yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                    std::chrono::seconds(10)))
+            ::_exit(93); // more than one disarm landed, or none did
+        if (rt->rule_count() != 0 || rt->armed_key_count() != 0)
+            ::_exit(94);
+        if (rt->claim_drain_failures() != 1)
+            ::_exit(95); // the caught throw must count as a drain failure, not vanish
+
+        // The critical regression check: the key must NOT be wedged. If `cont` had
+        // been half-built (non-null, empty key), the withdrawn head claim above would
+        // never have been popped and this attach would queue behind it forever.
+        const auto gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+        if (!gen.has_value())
+            ::_exit(96); // the key is wedged - exactly the bug this test guards against
+        if (rt->armed_key_count() != 1 || b->arms.load() != 2)
+            ::_exit(97);
+        rt->begin_stop();
+        ::_exit(0);
+    }
+
+    // ---- parent ---- poll, never block: a regression that hangs must fail, not stall the suite.
+    int status = 0;
+    bool reaped = false;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t w = ::waitpid(pid, &status, WNOHANG);
+        if (w == pid) {
+            reaped = true;
+            break;
+        }
+        REQUIRE(w == 0);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (!reaped) {
+        ::kill(pid, SIGKILL);
+        ::waitpid(pid, &status, 0);
+        FAIL("child never exited within 60 s");
+    }
+    INFO("child status: exited=" << WIFEXITED(status) << " code=" << (WIFEXITED(status) ? WEXITSTATUS(status) : -1)
+                                 << " signaled=" << WIFSIGNALED(status)
+                                 << " sig=" << (WIFSIGNALED(status) ? WTERMSIG(status) : 0));
+    CHECK_FALSE(WIFSIGNALED(status));
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+}
 #endif
 
 // rung 9c R5.2 - adversarial re-review r3 (C4): after detach_rule_locked's durable
