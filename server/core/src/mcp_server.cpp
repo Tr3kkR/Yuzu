@@ -1742,8 +1742,9 @@ static const ToolDef kTools[] = {
      "permission) — the SAME multi-store check (rbac_store + mgmt_store) the REST route runs; "
      "RBAC must be enabled for a scope_service token at all. The raw token is returned exactly "
      "once - store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write (approval-gated "
-     "at the supervised MCP tier - maker-checker for self-service credential minting). An "
-     "interactive (cookie) session - empty mcp_tier - is DENIED outright rather than falling "
+     "at the supervised MCP tier - maker-checker for self-service credential minting). A caller "
+     "with an empty mcp_tier (a cookie session, a plain non-MCP-tiered API token, or an engine "
+     "token - not exclusively an interactive session) is DENIED outright rather than falling "
      "through to RBAC-only enforcement (kPermissionDenied, 'requires an MCP-tier bearer token'); "
      "closes the #4309 interactive-session gap for this tool specifically, still open for other "
      "approval-gated MCP tools. "
@@ -17065,8 +17066,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "create_api_token requires an MCP-tier bearer token - an "
-                                 "interactive session has neither the MFA step-up REST's route "
-                                 "applies nor a maker-checker approval ticket for this operation; "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
                                  "use POST /api/v1/tokens instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -17268,8 +17270,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "revoke_api_token requires an MCP-tier bearer token - an "
-                                 "interactive session has neither the MFA step-up REST's route "
-                                 "applies nor a maker-checker approval ticket for this operation; "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
                                  "use DELETE /api/v1/tokens/{id} instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
@@ -18033,8 +18036,9 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "unlock_account requires an MCP-tier bearer token - an "
-                                 "interactive session has neither the MFA step-up REST's route "
-                                 "applies nor a maker-checker approval ticket for this operation; "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
                                  "use POST /api/v1/users/{username}/unlock instead",
                                  kInteractiveSessionRemediation),
                         "application/json");
