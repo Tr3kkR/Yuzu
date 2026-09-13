@@ -319,8 +319,15 @@ std::shared_ptr<const TopologySnapshot> FleetTopologyStore::get(bool include_vul
     bool oversize = false;
     if (result && max_snapshot_bytes_ > 0) {
         // dump() is O(N) on the snapshot; only run on cache miss (rare).
+        // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): a 5th
+        // call site missed by the original fix pass - dump_topology_safe()
+        // (fleet_topology_types.hpp) never throws on a byte-clamped
+        // multi-byte codepoint, unlike strict dump(). Every refill runs
+        // this sizing check, so a single poisoned agent snapshot crashed
+        // EVERY subsequent cache refill on ordinary internationalized data,
+        // not just a caller's own dump.
         nlohmann::json j = *result;
-        const auto serialised_size = j.dump().size();
+        const auto serialised_size = dump_topology_safe(j).size();
         if (serialised_size > max_snapshot_bytes_) {
             oversize = true;
             refill_oversize_drops_.fetch_add(1, std::memory_order_relaxed);

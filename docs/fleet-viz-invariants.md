@@ -23,7 +23,12 @@ instances REST's `VizRoutes` registration uses, so the two surfaces cannot
 disagree about cache state). Every invariant in this doc (kill-switch
 ordering, the DoS cap, the offline-merge rule) applies identically to both
 surfaces - a change to one that doesn't preserve parity with the other is a
-regression, not a stylistic difference.
+regression, not a stylistic difference. **One exception, named explicitly so
+"applies identically" is never misread as "both surfaces are equally safe":
+neither surface confines results to the caller's management-group scope** - a
+caller with `Response:Read` sees every connected agent's process/connection/
+listener data fleet-wide on both REST and MCP alike (#4313, tracked parallel
+to #3526's identical gap on the execution/fleet-statistics tools).
 
 ## REST and routing surface
 

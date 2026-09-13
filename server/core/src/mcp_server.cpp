@@ -2304,7 +2304,10 @@ static const ToolDef kTools[] = {
      "machines_max bounds the response size (DoS protection, default 5000, ceiling 100000): a "
      "fleet larger than the cap is refused outright, never silently truncated, so a caller "
      "never mistakes a partial view for the whole fleet -- raise machines_max or use "
-     "get_host_topology per agent instead. Answers kInternalError when an operator has "
+     "get_host_topology per agent instead. NOT confined by the caller's management-group "
+     "scope -- like its REST twin (#2146 Batch B3 review), a caller with Response:Read sees "
+     "every connected agent's process/connection/listener data fleet-wide, regardless of "
+     "management-group membership. Answers kInternalError when an operator has "
      "disabled the visualization feature (yuzu_viz_disabled / --viz-disable). Requires "
      "Response:Read.",
      R"j({"type":"object","properties":{"include_vuln":{"type":"boolean","default":false,"description":"Join known-CVE severity onto each process by name (best-effort; often inert if the fleet has no version-bearing inventory match)"},"fresh":{"type":"boolean","default":false,"description":"Force a live re-fetch, invalidating the shared 60s cache for every caller"},"machines_max":{"type":"integer","minimum":1,"maximum":100000,"default":5000,"description":"Refuse (do not truncate) a snapshot with more machines than this"}}})j",
@@ -2319,7 +2322,8 @@ static const ToolDef kTools[] = {
      "NOT fall back to a durable stale placeholder for a host that aged out of the cache, so "
      "not-found here means 'not in the live snapshot right now', not 'never existed'. Answers "
      "kInternalError when an operator has disabled the visualization feature "
-     "(yuzu_viz_disabled / --viz-disable). Requires Response:Read.",
+     "(yuzu_viz_disabled / --viz-disable). NOT confined by the caller's management-group "
+     "scope -- like its REST twin (#2146 Batch B3 review). Requires Response:Read.",
      R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The agent to slice out of the current fleet topology snapshot"}},"required":["agent_id"]})j",
      R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"stale":{"type":"boolean"},"machine":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["schema","schema_minor","generated_at","stale","machine"]})j"},
 };
@@ -14899,8 +14903,55 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 ExecutionStatsQuery q;
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review):
+                // agent_id/since were the #2970B-class type-confusion bug --
+                // param_str silently returns "" and param_int silently
+                // returns the default on a JSON type mismatch, so a
+                // well-formed-but-mistyped call (a numeric agent_id, a
+                // string-encoded since) silently widened to "every
+                // agent"/"all time" and answered success with the wrong
+                // scope, indistinguishable from a correctly-scoped result.
+                if (args.contains("agent_id") && !args["agent_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
                 q.agent_id = param_str(args, "agent_id");
-                q.since = param_int(args, "since", 0);
+                // Same floor + control-character rejection as REST GET
+                // /guaranteed-state/events (auth::kMaxAgentIdLength).
+                if (!q.agent_id.empty()) {
+                    if (q.agent_id.size() > auth::kMaxAgentIdLength) {
+                        res.set_content(a4_error(kInvalidParams, "agent_id is too long"),
+                                        "application/json");
+                        return;
+                    }
+                    bool has_control_char = false;
+                    for (unsigned char c : q.agent_id)
+                        if (c < 0x20) { has_control_char = true; break; }
+                    if (has_control_char) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "agent_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto since_opt = param_int_strict(args, "since", 0);
+                if (!since_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "since must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*since_opt < 0) {
+                    // retry-hint-exempt: schema declares minimum:0; param_int_strict
+                    // itself does not range-check.
+                    res.set_content(a4_error(kInvalidParams, "since must not be negative"),
+                                    "application/json");
+                    return;
+                }
+                q.since = *since_opt;
                 const auto limit_opt = param_int_strict(args, "limit", 50);
                 if (!limit_opt) {
                     // retry-hint-exempt: malformed client input (wrong JSON
@@ -14940,8 +14991,49 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 ExecutionStatsQuery q;
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): see
+                // get_execution_statistics_by_agent's identical fix above --
+                // definition_id/since were the same #2970B-class silent
+                // type-confusion.
+                if (args.contains("definition_id") && !args["definition_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "definition_id must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
                 q.definition_id = param_str(args, "definition_id");
-                q.since = param_int(args, "since", 0);
+                if (!q.definition_id.empty()) {
+                    if (q.definition_id.size() > auth::kMaxAgentIdLength) {
+                        res.set_content(a4_error(kInvalidParams, "definition_id is too long"),
+                                        "application/json");
+                        return;
+                    }
+                    bool has_control_char = false;
+                    for (unsigned char c : q.definition_id)
+                        if (c < 0x20) { has_control_char = true; break; }
+                    if (has_control_char) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "definition_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto since_opt = param_int_strict(args, "since", 0);
+                if (!since_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "since must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*since_opt < 0) {
+                    // retry-hint-exempt: schema declares minimum:0; param_int_strict
+                    // itself does not range-check.
+                    res.set_content(a4_error(kInvalidParams, "since must not be negative"),
+                                    "application/json");
+                    return;
+                }
+                q.since = *since_opt;
                 const auto limit_opt = param_int_strict(args, "limit", 50);
                 if (!limit_opt) {
                     // retry-hint-exempt: malformed client input (wrong JSON
@@ -14989,9 +15081,14 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             // ── #2146 Batch B3: fleet visualization read twins ───────────────────
-            // Mirrors VizRoutes::handle_topology's / handle_host_topology's own
-            // pipeline exactly: kill switch -> store availability ->
-            // Response:Read -> params -> fetch -> merge_offline_topology
+            // Gate 4 happy-path fix: this comment previously claimed "kill
+            // switch -> store availability -> Response:Read", which is REST's
+            // order but not this handler's -- MCP actually runs kill switch ->
+            // Response:Read (perm_fn) -> store availability (the stricter
+            // order: a caller lacking permission is denied before ever
+            // learning the store's health). Mirrors VizRoutes::handle_topology's
+            // / handle_host_topology's own pipeline for everything else:
+            // params -> fetch -> merge_offline_topology
             // (SHARED with the REST handler, fleet_topology_store.hpp,
             // api-twin-recipe.md Rule 1) -> the M-1 machines_max DoS cap ->
             // serialize via the SAME nlohmann to_json ADL functions
@@ -15036,12 +15133,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                bool include_vuln = false;
-                if (args.contains("include_vuln") && args["include_vuln"].is_boolean())
-                    include_vuln = args["include_vuln"].get<bool>();
-                bool fresh = false;
-                if (args.contains("fresh") && args["fresh"].is_boolean())
-                    fresh = args["fresh"].get<bool>();
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): a
+                // present-but-wrong-typed include_vuln/fresh used to be
+                // silently read as "off" instead of rejected -- the CVE join
+                // silently omitted, or the cache not busted, with the
+                // response looking identical to a correctly-scoped one.
+                if (args.contains("include_vuln") && !args["include_vuln"].is_boolean()) {
+                    res.set_content(a4_error(kInvalidParams, "include_vuln must be a JSON boolean"),
+                                    "application/json");
+                    return;
+                }
+                bool include_vuln = args.value("include_vuln", false);
+                if (args.contains("fresh") && !args["fresh"].is_boolean()) {
+                    res.set_content(a4_error(kInvalidParams, "fresh must be a JSON boolean"),
+                                    "application/json");
+                    return;
+                }
+                bool fresh = args.value("fresh", false);
 
                 const auto machines_max_opt = param_int_strict(
                     args, "machines_max",
@@ -15149,8 +15257,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     metrics->histogram("yuzu_viz_topology_request_seconds")
                         .observe(std::chrono::duration<double>(viz_elapsed).count());
                 }
-                res.set_content(success_response(id, tool_result(j.dump(), kObjectOutputSchema)),
-                                "application/json");
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review):
+                // dump_topology_safe() (fleet_topology_types.hpp) substitutes
+                // U+FFFD instead of throwing on a byte-clamped multi-byte
+                // codepoint - clamp_field() truncates by byte length with no
+                // UTF-8 boundary awareness, and strict dump()'s uncaught
+                // type_error.316 was a fleet-wide 500 (empty body, no A4
+                // envelope) triggerable by ordinary internationalized agent
+                // data, self-sustaining while the offending agent stays
+                // connected.
+                res.set_content(
+                    success_response(id, tool_result(dump_topology_safe(j), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -15244,8 +15362,15 @@ McpServer::HandlerFn McpServer::build_handler(
                         metrics->histogram("yuzu_viz_topology_request_seconds")
                             .observe(std::chrono::duration<double>(viz_host_elapsed).count());
                     }
-                    res.set_content(success_response(id, tool_result(j.dump(), kObjectOutputSchema)),
-                                    "application/json");
+                    // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review):
+                    // see get_fleet_topology's identical fix above -
+                    // dump_topology_safe() never throws on a byte-clamped
+                    // multi-byte codepoint from this host's own reported
+                    // fields.
+                    res.set_content(
+                        success_response(id,
+                                          tool_result(dump_topology_safe(j), kObjectOutputSchema)),
+                        "application/json");
                     return;
                 }
                 // Not found -- unlike get_fleet_topology, this tool does not fall

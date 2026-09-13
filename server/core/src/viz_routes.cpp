@@ -292,7 +292,14 @@ void VizRoutes::handle_topology(const httplib::Request& req, httplib::Response& 
 
     // ── 8. Serialise + respond ───────────────────────────────────────────
     nlohmann::json j = *snap;
-    auto body = j.dump();
+    // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): dump_topology_safe()
+    // (fleet_topology_types.hpp) substitutes U+FFFD instead of throwing on a
+    // byte-clamped multi-byte codepoint - clamp_field() truncates by byte
+    // length with no UTF-8 boundary awareness, and strict dump()'s uncaught
+    // type_error.316 was a fleet-wide 500 triggerable by ordinary
+    // internationalized agent data. Shared with the MCP twin so the fix
+    // cannot drift between transports the way the original bug did.
+    auto body = dump_topology_safe(j);
 
     if (as_fragment) {
         // HTMX fragment: parser-recoverable script tag carrying the JSON.
@@ -395,7 +402,9 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
         if (m.agent_id == agent_id) {
             HostTopologySnapshot wrapper{snap->generated_at, m.stale, m};
             nlohmann::json j = wrapper;
-            auto body = j.dump();
+            // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): see
+            // handle_topology's identical fix above.
+            auto body = dump_topology_safe(j);
 
             if (as_fragment) {
                 escape_json_for_script(body);

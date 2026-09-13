@@ -945,6 +945,46 @@ TEST_CASE("topology: parser clamps oversize process + hostname + conn-meta field
     CHECK(parsed->connections[0].process_name.size() == 256);
 }
 
+TEST_CASE("topology: a byte-clamped multi-byte hostname serializes without throwing",
+          "[viz][topology][hardening][gate4]") {
+    // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): clamp_field()
+    // truncates by BYTE length with no UTF-8 boundary awareness. 100
+    // repetitions of the 3-byte euro sign (U+20AC, bytes E2 82 AC) is 300
+    // bytes; clamped to the 256-byte hostname cap, byte 256 lands one byte
+    // into the 86th codepoint (85*3=255), producing an incomplete trailing
+    // sequence. Before the fix, nlohmann::json::dump()'s strict default threw
+    // an uncaught type_error.316 on exactly this input - a fleet-wide 500
+    // triggerable by ordinary internationalized agent data, not a
+    // hypothetical. The prior "clamps oversize" test above is ASCII-only and
+    // provides zero coverage of this: truncating single-byte characters can
+    // never produce an invalid sequence, so it is not valid closure evidence
+    // for this defect.
+    const std::string euro = "\xE2\x82\xAC"; // U+20AC, 3 bytes
+    std::string multibyte_hostname;
+    multibyte_hostname.reserve(300);
+    for (int i = 0; i < 100; ++i)
+        multibyte_hostname += euro;
+    REQUIRE(multibyte_hostname.size() == 300);
+
+    std::string body = snapshot_body(multibyte_hostname, "proc", "cmd", "user", "ESTABLISHED");
+    std::string ex;
+    auto parsed = FleetTopologyStore::parse_fleet_snapshot_json(body, "agent-utf8", "linux", &ex);
+    REQUIRE(parsed.has_value());
+    CHECK(parsed->hostname.size() == 256); // clamped, and split mid-codepoint
+
+    FleetTopologyStore store(fixed_fetcher({*parsed}));
+    auto snap = store.get(false);
+    REQUIRE(snap != nullptr);
+
+    nlohmann::json j = *snap;
+    std::string dumped;
+    CHECK_NOTHROW(dumped = dump_topology_safe(j));
+    CHECK_FALSE(dumped.empty());
+    // U+FFFD (EF BF BD) replaces the invalid trailing bytes rather than
+    // dropping them silently or throwing.
+    CHECK(dumped.find("\xEF\xBF\xBD") != std::string::npos);
+}
+
 TEST_CASE("topology: parser rejects malformed / hostile input without throwing",
           "[viz][topology][hardening][gate7]") {
     // Gate 7 qe-S3 — the parser is called on every heartbeat; it must
