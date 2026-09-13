@@ -10414,6 +10414,7 @@ void RestApiV1::register_routes(
                      for (const auto& a : *alerts) {
                          arr.add(JObj()
                                      .add("id", a.id)
+                                     .add("license_id", a.license_id)
                                      .add("alert_type", a.alert_type)
                                      .add("message", a.message)
                                      .add("triggered_at", a.triggered_at)

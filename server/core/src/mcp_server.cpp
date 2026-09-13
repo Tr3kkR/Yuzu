@@ -2312,7 +2312,10 @@ static const ToolDef kTools[] = {
      "never echoed back by any tool — only has_credential (bool) is ever readable afterward "
      "(ADR-0010). url must be http:// or https://; batch_size 1 delivers each event "
      "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
-     "target, overwrites nothing) but a duplicate name is rejected. Requires "
+     "target, overwrites nothing) but a duplicate name is rejected. url is NOT restricted "
+     "to external hosts - a caller with Infrastructure:Write can point deliveries at any "
+     "reachable address, including the server's own loopback/internal network (no SSRF "
+     "guard on this field today, same posture as REST's twin). Requires "
      "Infrastructure:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"
@@ -2338,7 +2341,7 @@ static const ToolDef kTools[] = {
      "reachable at the supervised MCP tier without a maker-checker ticket, same as the REST "
      "twin. A retry against an already-deleted id answers not_found, never a silent success.",
      R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"Target id from list_offload_targets"}},"required":["id"]})j",
-     R"j({"type":"object","properties":{"deleted":{"type":"boolean"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["deleted"]})j"},
+     R"j({"type":"object","properties":{"deleted":{"type":"boolean"},"status":{"const":"deleted","description":"Matches REST's twin response shape exactly"},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this action itself failed"}},"required":["deleted","status"]})j"},
 
     {"list_offload_target_deliveries",
      "Recent delivery history for one offload target, newest first (status_code/error per "
@@ -2385,7 +2388,12 @@ static const ToolDef kTools[] = {
     // LicenseStore is DELIBERATELY DORMANT on `dev` (ADR-0048) — nothing in
     // server.cpp constructs one, matching RestApiV1's own `/*license_store=*/
     // nullptr` wiring, so these three answer "unavailable" in production
-    // today, same posture as their REST siblings.
+    // today, same posture as their REST siblings. There is no
+    // remove_platform_license MCP tool twinning DELETE /api/v1/license/{id} -
+    // an intentional, recorded exception (ADR-1005), not an oversight: since
+    // LicenseStore is dormant on every transport today, this is tracked to
+    // twin alongside whichever future PR wires LicenseStore construction,
+    // rather than shipped ahead of it against a store nothing can reach.
     {"get_platform_license",
      "Get the current active platform license (organization, seats, edition, expiry, "
      "days_remaining) or {\"status\":\"none\"} if none is activated. Mirrors GET "
@@ -15120,7 +15128,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string auth_type_str = param_str(args, "auth_type", "none");
                 const std::string auth_credential = param_str(args, "auth_credential");
                 const std::string event_types = param_str(args, "event_types", "*");
-                const int batch_size = param_int32(args, "batch_size", 1);
+                const auto batch_size_opt = param_int_strict(args, "batch_size", 1);
+                if (!batch_size_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "batch_size must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                const int batch_size = static_cast<int>(*batch_size_opt);
                 bool enabled = true;
                 if (args.contains("enabled") && args["enabled"].is_boolean())
                     enabled = args["enabled"].get<bool>();
@@ -15287,7 +15302,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const bool audit_ok = audit_fn(req, "offload_target.delete", "success",
                                                "offload_target", target_id_str, snapshot_detail);
-                nlohmann::json payload_j = {{"deleted", true}};
+                // "status":"deleted" matches REST's twin shape exactly
+                // (offload_routes.cpp); "deleted":true kept alongside for an
+                // MCP caller that prefers a boolean flag.
+                nlohmann::json payload_j = {{"deleted", true}, {"status", "deleted"}};
                 if (!audit_ok)
                     payload_j["audit_persisted"] = false;
                 mcp_audit("success");
@@ -15333,8 +15351,14 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     return;
                 }
-                int limit = param_int32(args, "limit", 50);
-                limit = std::clamp(limit, 1, 1000);
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "limit must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                const int limit = std::clamp(static_cast<int>(*limit_opt), 1, 1000);
                 auto deliveries = offload_target_store->get_deliveries(target_id, limit);
                 nlohmann::json arr = nlohmann::json::array();
                 for (const auto& d : deliveries) {
@@ -15420,8 +15444,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 const std::string chain_pem = param_str(args, "chain_pem");
                 if (intermediate_pem.empty() || chain_pem.empty()) {
                     res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "intermediate_pem and chain_pem are required"),
+                        a4_error(kInvalidParams, "intermediate_pem and chain_pem are required"),
                         "application/json");
                     return;
                 }
@@ -15480,7 +15503,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 const bool audit_ok =
                     audit_fn(req, "ca.subordinate.imported", result, "CaRoot", "root", detail);
                 if (!ok) {
-                    res.set_content(error_response(id, kInvalidParams, msg), "application/json");
+                    // StoreError is a genuine server-side persistence fault (matches
+                    // REST's 500, ca_routes.cpp) - distinct from the five business
+                    // rejections above (matches REST's 400/409/422s), which stay
+                    // kInvalidParams with no retry hint. audit_ok threads through on
+                    // BOTH branches so a dropped audit row is never silent here,
+                    // same as revoke_certificate's precedent (mcp_server.cpp:~13929).
+                    if (outcome == CaRoutes::ImportOutcome::StoreError) {
+                        res.set_content(
+                            a4_error(kInternalError, msg, "retry once the server reports ready",
+                                     mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                            "application/json");
+                    } else {
+                        res.set_content(a4_error(kInvalidParams, msg, {}, -1, {}, audit_ok),
+                                        "application/json");
+                    }
                     return;
                 }
                 // Re-publish the CRL so it's signed under the new issuing cert's
@@ -15574,11 +15611,25 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                const auto seat_count_opt = param_int_strict(args, "seat_count", 0);
+                if (!seat_count_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "seat_count must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
+                const auto expires_at_opt = param_int_strict(args, "expires_at", 0);
+                if (!expires_at_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "expires_at must be a JSON integer"),
+                        "application/json");
+                    return;
+                }
                 License lic;
                 lic.organization = param_str(args, "organization");
-                lic.seat_count = param_int(args, "seat_count", 0);
+                lic.seat_count = *seat_count_opt;
                 lic.edition = param_str(args, "edition", "community");
-                lic.expires_at = param_int(args, "expires_at", 0);
+                lic.expires_at = *expires_at_opt;
                 lic.features_json = param_str(args, "features_json", "[]");
                 const std::string key = param_str(args, "license_key");
                 // Mirrors REST exactly: no route-level pre-check beyond what

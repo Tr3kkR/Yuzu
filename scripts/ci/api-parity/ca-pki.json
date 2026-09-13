@@ -7,7 +7,7 @@
       "method": "POST",
       "path": "/api/v1/ca/import-chain"
     },
-    "mcp_twin": null,
+    "mcp_twin": "import_ca_chain",
     "status": "twinned"
   },
   {

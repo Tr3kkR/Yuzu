@@ -6973,6 +6973,7 @@ List license alerts (expiration warnings, seat limit approaching, etc.).
   "data": [
     {
       "id": "alert-001",
+      "license_id": "lic-001",
       "alert_type": "expiration_warning",
       "message": "License expires in 30 days",
       "triggered_at": 1711900800,

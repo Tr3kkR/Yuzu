@@ -499,6 +499,23 @@ constexpr TwinRow kExpectedTwins[] = {
     {"list_guardian_events", "GuaranteedState", "Read", true},
     {"get_guardian_rule_status", "GuaranteedState", "Read", true},
     {"get_guardian_device_guards", "GuaranteedState", "Read", true},
+    // #2146 Batch B5 - offload targets, CA root-CSR export/subordinate-chain
+    // import, platform license, and software deployments. Pinned against
+    // offload_routes.cpp / ca_routes.cpp / rest_api_v1.cpp's own gates.
+    {"list_offload_targets", "Infrastructure", "Read", true},
+    {"create_offload_target", "Infrastructure", "Write", false},
+    {"get_offload_target", "Infrastructure", "Read", true},
+    {"delete_offload_target", "Infrastructure", "Write", false},
+    {"list_offload_target_deliveries", "Infrastructure", "Read", true},
+    {"export_ca_root_csr", "Security", "Read", true},
+    {"import_ca_chain", "Security", "Write", false},
+    {"get_platform_license", "License", "Read", true},
+    {"activate_platform_license", "License", "Write", false},
+    {"list_license_alerts", "License", "Read", true},
+    {"list_software_deployments", "SoftwareDeployment", "Read", true},
+    {"create_software_deployment", "SoftwareDeployment", "Execute", false},
+    {"rollback_software_deployment", "SoftwareDeployment", "Execute", false},
+    {"cancel_software_deployment", "SoftwareDeployment", "Execute", false},
 };
 
 } // namespace
