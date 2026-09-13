@@ -212,7 +212,12 @@ store_pending(SessionId, Info) ->
     ok.
 
 %% @doc Atomically retrieve-and-delete pending registration info.
-%% Returns the info map, or undefined if not found / expired / already taken.
+%% Returns the info map, or undefined if not found or already taken (by a
+%% concurrent consumer). NOTE: TTL expiry is enforced by the periodic
+%% `sweep_pending' handler, NOT here — this call does not inspect the stored
+%% timestamp, so an entry within up to one sweep interval past its TTL may still
+%% be returned. That admission leniency is deliberate and benign (the pending
+%% row is session-id-bound; a late Register→Subscribe handshake simply completes).
 %%
 %% Uses `ets:take/2' — a SINGLE atomic retrieve-and-delete BIF — NOT a
 %% lookup-then-delete pair. `?PENDING_TABLE' is `public', and this is called
@@ -289,6 +294,17 @@ handle_info({'DOWN', MonRef, process, _Pid, _Reason},
     end;
 
 handle_info(sweep_pending, State) ->
+    %% PRE-EXISTING narrow race (NOT introduced by the take_pending atomicity
+    %% fix; tracked as #4326): this collects expired keys then deletes each
+    %% by key in a separate pass, without re-checking the timestamp at delete
+    %% time. `store_pending/2' is a bare `ets:insert' from the (concurrent)
+    %% stream process, so a re-store of the SAME session id landing between the
+    %% foldl scan and the per-key delete would be swept. It is benign today —
+    %% the stock agent never re-Registers the same session id (reconnect mints a
+    %% fresh S', ADR-2002 §7), the window is the scan→delete gap, and the effect
+    %% is one recoverable NOT_FOUND that triggers a re-Register. A tighter delete
+    %% (ets:select_delete with a StoredAt guard) is the fix if a same-session
+    %% re-Register path is ever added.
     Now = erlang:system_time(millisecond),
     Expired = ets:foldl(fun({SessionId, _, StoredAt}, Acc) ->
         case Now - StoredAt > ?PENDING_TTL_MS of

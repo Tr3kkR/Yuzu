@@ -217,15 +217,21 @@ pending_take_concurrent_single_winner() ->
           Session = <<"race-sess-", (integer_to_binary(R))/binary>>,
           Info = #{agent_id => <<"race-agent">>, round => R},
           ok = yuzu_gw_registry:store_pending(Session, Info),
-          Barrier = make_ref(),
+          Go = make_ref(),
           Pids = [spawn(fun() ->
-                              receive Barrier -> ok end,
+                              Parent ! {ready, self()},
+                              receive Go -> ok end,
                               Res = yuzu_gw_registry:take_pending(Session),
                               Parent ! {race_result, self(), Res}
                           end) || _ <- lists:seq(1, Racers)],
-          %% Release every racer as close to simultaneously as possible, then
-          %% collect one result per racer.
-          lists:foreach(fun(P) -> P ! Barrier end, Pids),
+          %% TWO-PHASE barrier: wait until EVERY racer is blocked on Go, THEN
+          %% release them together — so the take_pending calls collide as tightly
+          %% as the scheduler allows, maximizing a reintroduced race's exposure
+          %% (a sequential release lets early racers finish before the last is
+          %% even woken). Green here is deterministic regardless (ets:take), so
+          %% this only strengthens RED power on a regression.
+          [receive {ready, P} -> ok end || P <- Pids],
+          lists:foreach(fun(P) -> P ! Go end, Pids),
           Results = [receive {race_result, P, Res} -> Res end || P <- Pids],
           Winners = [X || X <- Results, X =/= undefined],
           ?assertEqual(1, length(Winners)),
