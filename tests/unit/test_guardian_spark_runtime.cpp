@@ -6128,10 +6128,12 @@ TEST_CASE("rung 9c PR-2 Unit 4b (Gate 8 re-review, PR #4318): a throw AFTER the 
                                     std::chrono::seconds(30)))
             ::_exit(92);
         // Gate 8 re-review (quality-engineer, PR #4318): this file's own "withdrawn"
-        // wakeup path (see the comment above detach_rule() below) means `a_thread`'s
-        // attach_rule() can return - and this spin_until can start polling - BEFORE
-        // release_hang() even runs, so there is no ordering guarantee between when
-        // polling starts and when either disarm lands. Empirically (Gate 8 red-test
+        // wakeup path (see the "#2233 item 3 (C5/k3)" test case earlier in this file,
+        // where detach_rule_locked's Case 0 notifies the waiting attach_rule()
+        // immediately) means `a_thread`'s attach_rule() can return - and this
+        // spin_until can start polling - BEFORE release_hang() even runs, so there is
+        // no ordering guarantee between when polling starts and when either disarm
+        // lands. Empirically (Gate 8 red-test
         // against the pre-7c45c36a3 double-disarm shape, 15/15 runs, mixed timing)
         // the synchronous catch-handler disarm and the buggy shape's second,
         // io_executor_-submitted disarm land close enough together that this 1ms-
