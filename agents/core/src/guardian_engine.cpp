@@ -949,11 +949,17 @@ std::optional<GuardianArmStats> GuardianEngine::arm_stats() const {
     // guardian_engine.hpp): begin_application() runs unconditionally in
     // apply_rules() regardless of prefer_spark_, so ack_ledger_->arm_stats() alone
     // cannot distinguish "spark dormant" from "spark live, currently clean" - a
-    // legacy agent has a live, empty Application on every push. Gate on
-    // prefer_spark_ explicitly, mirroring journal_age_stats()'s own dormancy gate
-    // immediately above, or every non-spark agent in the fleet would read as
-    // "arming, healthy".
-    if (!prefer_spark_)
+    // legacy agent has a live, empty Application on every push. Gate on all three
+    // engine-level dormancy conditions explicitly (governance fix, adversarial
+    // review CODEX-1/K1: `prefer_spark_` alone left `stopped_` and
+    // `spark_availability_ != Available` - Unwired/SparkFailed/SparkDisabled -
+    // emitting a false-present {0,0} pair), mirroring journal_age_stats()'s own
+    // dormancy gate immediately above plus reconcile_rule_locked()'s own
+    // try_spark condition for the availability check, or a reachable agent state
+    // would read as "arming, healthy" while nothing is actually being observed.
+    // The ledger's own arm_stats() supplies the fourth, orthogonal "no current
+    // application yet" absence case.
+    if (!prefer_spark_ || stopped_ || spark_availability_ != SparkAvailability::Available)
         return std::nullopt;
     return ack_ledger_->arm_stats();
 }

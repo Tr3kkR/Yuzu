@@ -1478,7 +1478,7 @@ unmeasured threshold now - this counter names the fault class only.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling` | gauge | Fleet **SUM** of admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (workers still alive past `fn()` inside their completion callbacks while ordinary class quota was free). A genuinely cumulative per-agent counter - correctly MONITOR-ONLY: neither `increase()` nor a bare `> 0` is sound over a fleet sum of per-agent cumulative counters. Names the fault class; does not by itself say whether an endpoint is CURRENTLY wedged |
-| `yuzu_fleet_guardian_io_ceiling_reporting` | gauge | Agents whose latest heartbeat carried the ceiling tag - the coverage denominator. **Published every sweep including `0`**. The writer is sparse (a zero ceiling count ships no tag), so `0` here means no agent has ever hit the ceiling (or none is running spark), not that telemetry is dark |
+| `yuzu_fleet_guardian_io_ceiling_reporting` | gauge | Agents whose latest heartbeat carried the ceiling tag - the coverage denominator. **Published every sweep including `0`**. The writer is sparse (a zero ceiling count ships no tag), so `0` here means no currently-retained agent has hit the ceiling since its own process last started (or none is running spark) - counters reset on agent restart and this reads only the latest retained heartbeats, not durable history; not that telemetry is dark |
 | `yuzu_fleet_guardian_io_ceiling_tag_rejected` | gauge | The ceiling tag **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`** |
 
 ### Guardian M1 health-stream fleet gauges

@@ -34,7 +34,17 @@ namespace yuzu::server::detail {
 
 /// Same rationale as kMaxPlausibleGuardianArmCount: a fleet SUM accumulated into
 /// a double, so an implausible single-agent value must be rejected, not clamped.
-inline constexpr unsigned long long kMaxPlausibleGuardianIoCeilingCount = 1'000'000ULL;
+/// Governance fix, adversarial review CODEX-2/K4: `rejected_ceiling` is
+/// cumulative for the agent PROCESS LIFETIME with no reset but restart (see
+/// GuardianIoExecutor::Counters's own doc comment) - a long-running, rarely
+/// restarted endpoint under sustained ceiling pressure can plausibly accumulate
+/// well past 1e6 over weeks-to-months of real uptime, and a value above the
+/// bound is DROPPED from both the fleet sum and the reporting population (not
+/// merely flagged), losing the signal exactly while the fault persists. Matches
+/// the sibling cumulative-counter parsers' bound
+/// (kMaxPlausibleGuardianJournalCount / kMaxPlausibleGuardianHealthCount), not
+/// the tighter, unjustified 1e6 this file shipped with originally.
+inline constexpr unsigned long long kMaxPlausibleGuardianIoCeilingCount = 1'000'000'000ULL;
 
 struct GuardianIoCeilingMetric {
     const char* tag;
@@ -72,8 +82,11 @@ inline constexpr const char* kGuardianIoCeilingReportingHelp =
     "Agents whose latest heartbeat carried at least one parseable "
     "yuzu.guardian_io_* tag from this family - the coverage denominator for "
     "rejected_ceiling. Published every sweep INCLUDING 0. The writer is sparse "
-    "(0 ceiling hits ships no tag), so 0 here means no agent has EVER hit the "
-    "ceiling (or none is running spark) - not that the telemetry path is dark";
+    "(0 ceiling hits ships no tag), so 0 here means no CURRENTLY-RETAINED agent "
+    "has hit the ceiling since its own process last started (or none is running "
+    "spark) - counters reset on agent restart and this reads only the latest "
+    "retained heartbeats, so a restarted or stale-evicted agent's prior hits are "
+    "not durable history here; not that the telemetry path is dark";
 
 inline constexpr const char* kGuardianIoCeilingTagRejectedGauge =
     "yuzu_fleet_guardian_io_ceiling_tag_rejected";
@@ -82,7 +95,7 @@ inline constexpr const char* kGuardianIoCeilingTagRejectedHelp =
     "but rejected by the forged-value parse. Published every sweep INCLUDING 0. "
     "> 0 means some agent is shipping malformed io-ceiling telemetry";
 
-inline constexpr std::size_t kMaxIoCeilingTokenDigits = 7;
+inline constexpr std::size_t kMaxIoCeilingTokenDigits = 10;
 
 namespace detail_io_ceiling_pow10 {
 inline constexpr unsigned long long pow10(std::size_t n) {

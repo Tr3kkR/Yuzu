@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <yuzu/plugin.h>
@@ -188,13 +189,18 @@ public:
 
     /// rung 9c PR-3: a re-statable snapshot of the current application's pending
     /// and resolved-failed counts (see guardian_arm_heartbeat.hpp's
-    /// GuardianArmStats for the full field-by-field semantics). {0, 0} when there
-    /// is no current application - the CALLER (GuardianEngine::arm_stats()) is
-    /// responsible for turning that into dormancy (nullopt) when appropriate; this
-    /// ledger has no notion of prefer_spark_ and must not gain one. Production
-    /// caller: GuardianEngine::arm_stats(), called under mtx_ like every other
+    /// GuardianArmStats for the full field-by-field semantics). nullopt when there
+    /// is no current application (governance fix, adversarial review: the settled
+    /// KICKOFF-v2 Decision-1 interface signature, and the CALLER - GuardianEngine::
+    /// arm_stats() - still layers its OWN prefer_spark_/stopped_/spark_availability_
+    /// dormancy gate on top; this ledger still has no notion of prefer_spark_ and
+    /// must not gain one, it only reports whether IT has an application). A LIVE,
+    /// EMPTY application (begin_application() called, add_pending() never - every
+    /// accepted rule resolved synchronously) is a real, present {0, 0} - the common
+    /// case, not the same as no application at all. Production caller:
+    /// GuardianEngine::arm_stats(), called under mtx_ like every other
     /// engine-owned accessor.
-    [[nodiscard]] GuardianArmStats arm_stats() const;
+    [[nodiscard]] std::optional<GuardianArmStats> arm_stats() const;
 
     /// rung 9c PR-2 Unit 6: apply_rules() calls begin_application() BEFORE its
     /// per-rule loop (so reconcile_rule_locked's add_pending() calls during

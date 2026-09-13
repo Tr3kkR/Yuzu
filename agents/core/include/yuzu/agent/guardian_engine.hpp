@@ -199,22 +199,34 @@ public:
     /// application (yuzu.guardian_arm_pending / yuzu.guardian_arm_failed - see
     /// guardian_arm_heartbeat.hpp's GuardianArmStats for the field semantics and
     /// emit_guardian_arm_heartbeat_tags for the emission posture). Returns nullopt
-    /// while the signal is dormant: `prefer_spark_` false, or no ack ledger.
+    /// while the signal is dormant: `prefer_spark_` false, the engine stopped, Spark
+    /// itself unavailable (Unwired/SparkFailed/SparkDisabled), or the ledger has no
+    /// current application yet.
     ///
-    /// The `prefer_spark_` check is LOAD-BEARING, not belt-and-braces (Check A,
-    /// ~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md): unlike
-    /// journal_age_stats() above, whose dormancy the drain-worker's own
-    /// zero-timestamp check would eventually catch even without the flag,
-    /// ack_ledger_->arm_stats() ALONE cannot tell "spark dormant" from "spark
-    /// live, currently clean" - GuardianEngine::apply_rules() calls
+    /// ALL FOUR conditions are LOAD-BEARING, not belt-and-braces (Check A,
+    /// ~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md Decision 1;
+    /// governance fix, adversarial review CODEX-1/K1 - the original shipped gate
+    /// checked only `prefer_spark_`, silently emitting a false-present-healthy
+    /// {0,0} pair whenever Spark was stopped or unavailable while prefer_spark_
+    /// stayed true, which is the READIEST state at cutover for exactly this to
+    /// matter): unlike journal_age_stats() above, whose dormancy the drain-worker's
+    /// own zero-timestamp check would eventually catch even without the flag,
+    /// ack_ledger_->arm_stats() alone cannot tell "spark dormant" from "spark live,
+    /// currently clean" - GuardianEngine::apply_rules() calls
     /// GuardianArmAckLedger::begin_application() UNCONDITIONALLY on every push,
     /// regardless of prefer_spark_, so a legacy (non-spark) agent has a live,
     /// empty Application (pending={}, resolved_failed=0) exactly like a spark
-    /// agent with nothing currently pending or failed. Reading `current_ !=
-    /// nullptr` as "live" would make every non-spark agent in the fleet emit
-    /// arm_pending=0/arm_failed=0 - read by a fleet consumer as "spark arming,
-    /// healthy" on agents not running spark at all. This check is what prevents
-    /// that.
+    /// agent with nothing currently pending or failed - the ledger's own
+    /// arm_stats() now separately returns nullopt only when there is genuinely NO
+    /// current application (see guardian_arm_ack.hpp), which is a DIFFERENT
+    /// absence reason than any of the three engine-level ones above and must stay
+    /// additive to them, not a substitute. Reading `prefer_spark_` alone as
+    /// sufficient - or `current_ != nullptr` as sufficient - would each make some
+    /// reachable agent state emit arm_pending=0/arm_failed=0 - read by a fleet
+    /// consumer as "spark arming, healthy" - when nothing is actually being
+    /// observed. This four-way check is what prevents that in every reachable
+    /// state, not just the one that happens to be live in every released agent
+    /// today.
     [[nodiscard]] std::optional<GuardianArmStats> arm_stats() const;
 
     /// rung 9c PR-3 (Decision 3, Option B): the arm/disarm executor's cumulative

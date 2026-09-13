@@ -131,5 +131,20 @@ TEST_CASE("guardian io ceiling: parse_guardian_io_ceiling_count rejects garbage,
     CHECK_FALSE(detail::parse_guardian_io_ceiling_count("").has_value());
     CHECK_FALSE(detail::parse_guardian_io_ceiling_count("-1").has_value());
     CHECK_FALSE(detail::parse_guardian_io_ceiling_count("abc").has_value());
-    CHECK_FALSE(detail::parse_guardian_io_ceiling_count("99999999").has_value());
+    // 11 digits - too long for kMaxIoCeilingTokenDigits regardless of value.
+    CHECK_FALSE(detail::parse_guardian_io_ceiling_count("99999999999").has_value());
+}
+
+TEST_CASE("guardian io ceiling: plausibility bound matches the sibling cumulative "
+          "parsers (1e9/10-digit), governance fix CODEX-2/K4 - the original 1e6 "
+          "bound was 1000x tighter than the sibling counters with no documented "
+          "reason, dropping a genuinely wedged endpoint's honest count from the "
+          "fleet sum exactly while the fault persisted",
+          "[guardian][io][ceiling][fleet]") {
+    static_assert(detail::kMaxPlausibleGuardianIoCeilingCount == 1'000'000'000ULL);
+    static_assert(detail::kMaxIoCeilingTokenDigits == 10);
+    // Exactly at the bound: fits the digit gate AND the plausibility check - accepted.
+    CHECK(detail::parse_guardian_io_ceiling_count("1000000000") == 1'000'000'000.0);
+    // One past the bound, same digit length - the plausibility check alone rejects it.
+    CHECK_FALSE(detail::parse_guardian_io_ceiling_count("1000000001").has_value());
 }

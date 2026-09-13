@@ -9,6 +9,7 @@
 #include <yuzu/agent/kv_store.hpp>
 
 #include "guaranteed_state.pb.h"
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 #include "guardian_backend.hpp" // guardian_backend_from_state/label (#2298 F13)
 #include "guardian_convergence_scheduler.hpp" // ConvergenceScheduler (started_for_test, #2238)
 #include "guardian_journal_format.hpp" // kJournalNamespace, parse_journal_batch (item 7 PR-Ag)
@@ -1147,6 +1148,99 @@ TEST_CASE("wire_spark_engine reports Available; --spark-disable reports SparkDis
                                  [](const OutboxEntry&) { return SendResult::Sent; });
         CHECK(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
     }
+}
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-3, Check A, governance fix (adversarial review CODEX-1/K1, both
+// independently reproduced empirically before either reviewer saw the other's
+// findings): the ORIGINAL shipped GuardianEngine::arm_stats() gated only on
+// `prefer_spark_`, so a prefer_spark_=true agent whose Spark path is Unwired,
+// SparkFailed, SparkDisabled, or stopped still emitted a false-present-healthy
+// {0,0} pair - the exact inverted-Check-A trap this PR exists to prevent, one
+// state further in than the original test above covered. These pin the fix:
+// arm_stats() must return nullopt in EVERY one of these states, and remain
+// present ONLY when prefer_spark_=true, not stopped, AND Available.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true but Unwired (wire_spark_engine "
+          "never called) stays ABSENT, not a false-present {0,0}",
+          "[spark][guardian][arm_stats]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::Unwired);
+
+    // apply_rules() still opens an Application unconditionally (Check A's original
+    // trap) even though Spark was never wired - the naive `current_ != nullptr` read
+    // and the naive `prefer_spark_` read would BOTH wrongly call this "present".
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    REQUIRE(engine.apply_rules(p).has_value());
+    CHECK_FALSE(engine.arm_stats().has_value());
+}
+
+TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true but SparkFailed (boot failed) "
+          "stays ABSENT",
+          "[spark][guardian][arm_stats]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(nullptr, /*spark_disabled_by_config=*/false, // boot failed
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkFailed);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    REQUIRE(engine.apply_rules(p).has_value());
+    CHECK_FALSE(engine.arm_stats().has_value());
+}
+
+TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true but SparkDisabled "
+          "(--spark-disable) stays ABSENT",
+          "[spark][guardian][arm_stats]") {
+    auto opened = KvStore::open(unique_kv_path());
+    REQUIRE(opened.has_value());
+    KvStore kv{std::move(*opened)};
+    GuardianEngine engine{&kv, "agent-test", /*prefer_spark=*/true};
+    REQUIRE(engine.start_local().has_value());
+    engine.wire_spark_engine(nullptr, /*spark_disabled_by_config=*/true,
+                             [](const OutboxEntry&) { return SendResult::Sent; });
+    REQUIRE(engine.spark_availability() == GuardianEngine::SparkAvailability::SparkDisabled);
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    *p.add_rules() = make_service_rule("r1");
+    REQUIRE(engine.apply_rules(p).has_value());
+    CHECK_FALSE(engine.arm_stats().has_value());
+}
+
+TEST_CASE("GuardianEngine::arm_stats(): a stopped engine stays ABSENT even though "
+          "prefer_spark_ is immutable and stays true past stop()",
+          "[spark][guardian][arm_stats]") {
+    SparkReconcileFixture f; // Available - proven by the fixture's own REQUIRE
+    f.apply(make_service_rule("r1"));
+    REQUIRE(f.engine->arm_stats().has_value()); // present while genuinely live
+
+    f.engine->stop();
+    CHECK_FALSE(f.engine->arm_stats().has_value());
+}
+
+TEST_CASE("GuardianEngine::arm_stats(): prefer_spark_=true, Available, not stopped - a "
+          "live application that has fully settled reads a REAL present {0, 0}, not "
+          "absent - this is the healthy case Check A must not collapse into dormancy",
+          "[spark][guardian][arm_stats]") {
+    SparkReconcileFixture f; // Available - proven by the fixture's own REQUIRE
+    f.apply(make_service_rule("r1")); // settles: waits for the drain to reach 0 pending
+    const auto s = f.engine->arm_stats();
+    REQUIRE(s.has_value());
+    CHECK(s->pending == 0);
+    CHECK(s->failed == 0);
 }
 
 TEST_CASE("prefer_spark=false (the rung 7 production default) never attempts spark, "

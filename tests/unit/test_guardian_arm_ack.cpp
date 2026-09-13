@@ -515,22 +515,24 @@ TEST_CASE("guardian_push_content_id(): different (spark, assertion) block splits
 // prefer_spark_ and must not gain one).
 // ---------------------------------------------------------------------------
 
-TEST_CASE("GuardianArmAckLedger::arm_stats(): no current application returns {0, 0}",
+TEST_CASE("GuardianArmAckLedger::arm_stats(): no current application returns "
+          "nullopt - governance fix, adversarial review CODEX-1/K1: the settled "
+          "KICKOFF-v2 interface is std::optional, absent on no-application, not a "
+          "present {0, 0}",
           "[spark][ack][arm_stats]") {
     GuardianArmAckLedger ledger;
-    const auto s = ledger.arm_stats();
-    CHECK(s.pending == 0);
-    CHECK(s.failed == 0);
+    CHECK_FALSE(ledger.arm_stats().has_value());
 }
 
-TEST_CASE("GuardianArmAckLedger::arm_stats(): a live empty application also reads "
-          "{0, 0} - the common case, not a gap",
+TEST_CASE("GuardianArmAckLedger::arm_stats(): a live empty application reads a "
+          "PRESENT {0, 0} - the common case, not the same as no application at all",
           "[spark][ack][arm_stats]") {
     GuardianArmAckLedger ledger;
     ledger.begin_application(1, "content", false, 0);
     const auto s = ledger.arm_stats();
-    CHECK(s.pending == 0);
-    CHECK(s.failed == 0);
+    REQUIRE(s.has_value());
+    CHECK(s->pending == 0);
+    CHECK(s->failed == 0);
 }
 
 TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pending; "
@@ -549,8 +551,9 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pend
     ledger.add_pending("r1", receipt);
     {
         const auto s = ledger.arm_stats();
-        CHECK(s.pending == 1);
-        CHECK(s.failed == 0);
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 1);
+        CHECK(s->failed == 0);
     }
 
     b->release_hang(); // resolves Committed (fail_arm was never set)
@@ -558,8 +561,9 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): an accepted receipt increases pend
     ledger.drain_locked(*rt, 10);
 
     const auto s = ledger.arm_stats();
-    CHECK(s.pending == 0);
-    CHECK(s.failed == 0);
+    REQUIRE(s.has_value());
+    CHECK(s->pending == 0);
+    CHECK(s->failed == 0);
 }
 
 TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
@@ -594,8 +598,9 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
 
     {
         const auto s = ledger.arm_stats();
-        CHECK(s.pending == 0);
-        CHECK(s.failed == 1); // present, nonzero - not absent
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1); // present, nonzero - not absent
     }
 
     // A fresh application replaces the failed one - exactly what happens on the
@@ -604,6 +609,7 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
     // Suppress" test above, which pins that Reapply trigger).
     ledger.begin_application(2, "content-2", false, 0);
     const auto s = ledger.arm_stats();
-    CHECK(s.pending == 0);
-    CHECK(s.failed == 0); // PRESENT zero, not merely "no longer 1"
+    REQUIRE(s.has_value()); // PRESENT zero, not merely "no longer 1", and not absent
+    CHECK(s->pending == 0);
+    CHECK(s->failed == 0);
 }
