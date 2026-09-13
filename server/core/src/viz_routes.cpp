@@ -339,6 +339,28 @@ void VizRoutes::handle_host_topology(const httplib::Request& req, httplib::Respo
     const auto t_start = std::chrono::steady_clock::now();
     const std::string agent_id = req.matches.size() > 1 ? req.matches[1].str() : "";
 
+    // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review): this
+    // path-captured agent_id (regex [^/]+, no length/charset constraint of
+    // its own) flows unchecked into audit_fn_'s target_id below on every
+    // branch - AuditStore's sanitizer scrubs invalid UTF-8/NUL but not other
+    // C0 control bytes, so an unfloored agent_id let any Response:Read
+    // holder write raw control bytes/CR-LF into the audit trail. Same floor
+    // as GET /guaranteed-state/events and this file's own MCP twin,
+    // get_host_topology (auth::kMaxAgentIdLength).
+    if (agent_id.size() > auth::kMaxAgentIdLength) {
+        res.status = 400;
+        res.set_content(error_envelope(res, "agent_id is too long"), "application/json");
+        return;
+    }
+    for (unsigned char c : agent_id) {
+        if (c < 0x20) {
+            res.status = 400;
+            res.set_content(error_envelope(res, "agent_id contains control characters"),
+                            "application/json");
+            return;
+        }
+    }
+
     // ── 1. Kill switch (tier-before-permission) ──────────────────────────
     if (kill_switch_ && kill_switch_->load(std::memory_order_acquire)) {
         res.status = 503;

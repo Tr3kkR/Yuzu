@@ -15280,11 +15280,37 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                if (args.contains("agent_id") && !args["agent_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
                 const auto agent_id = param_str(args, "agent_id");
                 if (agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "agent_id is required"),
                                     "application/json");
                     return;
+                }
+                // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review):
+                // this agent_id flows unchecked into try_persist_audit's
+                // target_id below - AuditStore's sanitizer scrubs invalid
+                // UTF-8/NUL but not other C0 control bytes, so an unfloored
+                // agent_id let any Response:Read holder write raw control
+                // bytes/CR-LF into the audit trail. Same floor as REST GET
+                // /guaranteed-state/events and this file's own
+                // get_execution_statistics_by_agent (auth::kMaxAgentIdLength).
+                if (agent_id.size() > auth::kMaxAgentIdLength) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id is too long"),
+                                    "application/json");
+                    return;
+                }
+                for (unsigned char c : agent_id) {
+                    if (c < 0x20) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "agent_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
                 }
                 if (viz_kill_switch_ && viz_kill_switch_->load(std::memory_order_acquire)) {
                     const bool audit_ok = yuzu::server::detail::try_persist_audit(

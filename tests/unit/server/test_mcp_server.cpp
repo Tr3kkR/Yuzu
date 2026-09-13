@@ -20620,6 +20620,37 @@ TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInva
     CHECK(body["error"]["code"] == mcp::kInvalidParams);
 }
 
+TEST_CASE("MCP get_execution_statistics_by_agent: a too-long or control-character "
+          "agent_id is rejected, matching list_guardian_events' own floor",
+          "[pg][mcp][integration][operator_surface]") {
+    // Gate 8 security-guardian finding (#2146 Batch B3 review): the Gate 4/6
+    // fix round added this floor (auth::kMaxAgentIdLength + control-char
+    // rejection) but shipped with no dedicated test - closes that gap.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string with_control_char = std::string("agent-") + '\x01' + "id";
+    for (const std::string& bad_id : {too_long, with_control_char}) {
+        nlohmann::json req_json = {
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 4},
+            {"params",
+             {{"name", "get_execution_statistics_by_agent"},
+              {"arguments", {{"agent_id", bad_id}}}}}};
+        auto res = ts.call(req_json.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInvalidParams);
+    }
+}
+
 TEST_CASE("MCP get_execution_statistics_by_agent: denies without Execution:Read",
           "[pg][mcp][integration][operator_surface]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -20668,6 +20699,38 @@ TEST_CASE("MCP get_execution_statistics_by_definition: reads LIVE per-definition
 
     REQUIRE(ts.audit_log.size() == 1);
     CHECK(ts.audit_log[0] == "mcp.get_execution_statistics_by_definition|success");
+}
+
+TEST_CASE("MCP get_execution_statistics_by_definition: a too-long or "
+          "control-character definition_id is rejected",
+          "[pg][mcp][integration][operator_surface]") {
+    // Gate 8 security-guardian finding (#2146 Batch B3 review): the Gate 4/6
+    // fix round added this floor (auth::kMaxAgentIdLength + control-char
+    // rejection, matching the schema's declared maxLength:256) but shipped
+    // with no dedicated test - closes that gap.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string with_control_char = std::string("def-") + '\x01' + "id";
+    for (const std::string& bad_id : {too_long, with_control_char}) {
+        nlohmann::json req_json = {
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 6},
+            {"params",
+             {{"name", "get_execution_statistics_by_definition"},
+              {"arguments", {{"definition_id", bad_id}}}}}};
+        auto res = ts.call(req_json.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInvalidParams);
+    }
 }
 
 TEST_CASE("MCP get_execution_statistics_by_definition: denies without Execution:Read",
@@ -20917,6 +20980,39 @@ TEST_CASE("MCP get_host_topology: not-found for an agent absent from the live sn
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["message"].get<std::string>().find("host not found") != std::string::npos);
+}
+
+TEST_CASE("MCP get_host_topology: a too-long or control-character agent_id is "
+          "rejected before it reaches the audit trail",
+          "[mcp][integration][viz]") {
+    // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review):
+    // AuditStore's sanitizer scrubs invalid UTF-8/NUL but not other C0
+    // control bytes, so an unfloored agent_id let any Response:Read holder
+    // write raw control bytes/CR-LF into the audit trail's target_id. Pins
+    // the fix mirroring list_guardian_events/get_execution_statistics_by_agent's
+    // own floor.
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string with_control_char = std::string("agent-") + '\x01' + "id";
+    for (const std::string& bad_id : {too_long, with_control_char}) {
+        nlohmann::json req_json = {{"jsonrpc", "2.0"},
+                                   {"method", "tools/call"},
+                                   {"id", 16},
+                                   {"params",
+                                    {{"name", "get_host_topology"},
+                                     {"arguments", {{"agent_id", bad_id}}}}}};
+        auto res = ts.call(req_json.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
 }
 
 TEST_CASE("MCP get_host_topology: denies without Response:Read",
