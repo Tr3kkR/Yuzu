@@ -4502,6 +4502,42 @@ TEST_CASE("MCP Guardian: get_guardian_device_compliance denies an out-of-scope d
     CHECK(res->body.find("Guaranteed State store unavailable") == std::string::npos);
 }
 
+// #2146 Batch B1 Gate 4 consistency-auditor fix: mirrors REST's twin control-
+// character guard (test_rest_guaranteed_state.cpp, "REST gs.device-compliance:
+// control characters in a param -> 400, no audit") -- MCP previously had none,
+// letting a CR/LF in baseline/agent_id forge lines in the guardian.device.view
+// audit detail. No store/scoped_perm_fn wired: proves rejection happens BEFORE
+// either, same "no audit row" contract REST has.
+TEST_CASE("MCP Guardian: get_guardian_device_compliance rejects control characters "
+          "in baseline/agent_id, no audit",
+          "[mcp][integration][guardian][security]") {
+    McpTestServer ts; // no store/scoped_perm_fn wired: proves the guard short-circuits first
+    ts.start("readonly");
+
+    auto crlf = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":218,"params":{"name":"get_guardian_device_compliance",)"
+        R"("arguments":{"baseline":"ok\nevil","agent_id":"WS-1"}}})");
+    REQUIRE(crlf);
+    auto crlf_body = nlohmann::json::parse(crlf->body);
+    REQUIRE(crlf_body.contains("error"));
+    CHECK(crlf_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(ts.audit_log.empty());
+
+    auto nul = ts.call(nlohmann::json{
+        {"jsonrpc", "2.0"},
+        {"method", "tools/call"},
+        {"id", 219},
+        {"params",
+         {{"name", "get_guardian_device_compliance"},
+          {"arguments", {{"baseline", "B"}, {"agent_id", std::string("WS\0x", 4)}}}}}}
+                                .dump());
+    REQUIRE(nul);
+    auto nul_body = nlohmann::json::parse(nul->body);
+    REQUIRE(nul_body.contains("error"));
+    CHECK(nul_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(ts.audit_log.empty());
+}
+
 // #2146 Batch A audit (2026-09-10): get_guardian_status's degraded-query
 // branch (guardian_status_rollup returning nullopt) silently omitted
 // retry_after_ms while the REST twin GET /guaranteed-state/status correctly

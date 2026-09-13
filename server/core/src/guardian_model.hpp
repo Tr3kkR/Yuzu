@@ -197,16 +197,19 @@ struct GuardianDeviceComplianceRollup {
 /// read degraded, because the audit obligation differs: the baseline lookup
 /// (read 1) is genuinely pre-audit (no per-agent PII has been touched yet,
 /// same "no PII was looked up yet" posture this route has always had), but
-/// the other three reads only run once a real baseline was found - by then
-/// `agent_rule_statuses_for_agent` (a behavioral-PII read) has already
-/// executed, so a degrade there MUST still be audited as "failure"
-/// (matching `guardian_agent_status_rollup`'s sibling posture - over-audit
-/// rather than silently drop evidence of a completed PII access). Set false
-/// only when `*store_degraded` is also false, or when the degrade was the
-/// baseline lookup itself; true for any degrade in the remaining three
-/// reads. The caller must audit "failure" when `*store_degraded &&
-/// *pii_access_began`, and skip the audit entirely only when
-/// `*store_degraded && !*pii_access_began`.
+/// the remaining three reads only run once a real baseline was found - the
+/// baseline itself being found already counts as having begun accessing
+/// this agent's per-baseline standing (`deployed_member_rule_ids`, read 2,
+/// derives the enforced set for it), and by the time reads 3/4 run,
+/// `agent_rule_statuses_for_agent` (the behavioral-PII read proper) has
+/// already executed too - so a degrade in ANY of reads 2/3/4 MUST still be
+/// audited as "failure" (matching `guardian_agent_status_rollup`'s sibling
+/// posture - over-audit rather than silently drop evidence of a completed
+/// PII access). Set false only when `*store_degraded` is also false, or when
+/// the degrade was the baseline lookup itself; true for any degrade in the
+/// remaining three reads. The caller must audit "failure" when
+/// `*store_degraded && *pii_access_began`, and skip the audit entirely only
+/// when `*store_degraded && !*pii_access_began`.
 std::optional<GuardianDeviceComplianceRollup>
 guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
                                   const std::string& baseline_name, const std::string& agent_id,

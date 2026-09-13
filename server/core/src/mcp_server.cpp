@@ -820,7 +820,9 @@ static const ToolDef kTools[] = {
      "structured blocks and supply 'yaml_source' instead for a legacy, non-agent-enforceable "
      "Guard. Use get_guardian_schemas to discover the spark/assertion/remediation type "
      "catalogue before authoring. Fleet-wide (a Guard has no single owning device/service); "
-     "requires GuaranteedState:Write, denied outright to a service-scoped API token.",
+     "requires GuaranteedState:Write, denied outright to a service-scoped API token. REST's "
+     "twin applies an MFA step-up check; MCP applies none for a cookie-session caller "
+     "(architecture-wide gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256,"description":"Unique Guard identifier"},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique human-authored Guard name"},)j"
@@ -857,7 +859,9 @@ static const ToolDef kTools[] = {
      "against a concurrent writer today (last write wins silently, tracked #4303). "
      "Marked Destructive but NOT currently approval-gated despite that (tracked #4305) — "
      "do not assume a confirmation step exists. Fleet-wide; requires GuaranteedState:Write, "
-     "denied outright to a service-scoped API token.",
+     "denied outright to a service-scoped API token. REST's twin applies an MFA step-up "
+     "check; MCP applies none for a cookie-session caller (architecture-wide gap, not "
+     "specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
      R"j("rule_id":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
@@ -875,10 +879,14 @@ static const ToolDef kTools[] = {
 
     {"delete_guardian_rule",
      "Delete a Guaranteed State Guard by rule_id. Mirrors DELETE "
-     "/api/v1/guaranteed-state/rules/{rule_id} exactly, same delete_rule store write. "
+     "/api/v1/guaranteed-state/rules/{rule_id} exactly, same delete_rule store write. Does "
+     "NOT automatically push an unarm to agents already enforcing it - already-armed agents "
+     "keep enforcing the deleted rule until the next push cycle (tracked in #4304). "
      "Destructive (GuaranteedState:Delete): approval-gated at the supervised MCP tier — the "
      "first call returns an approval ticket (kApprovalRequired), re-call with the returned "
-     "approval_id to consume it. Fleet-wide; denied outright to a service-scoped API token.",
+     "approval_id to consume it. Fleet-wide; denied outright to a service-scoped API token. "
+     "A cookie session (mcp_tier empty) bypasses BOTH the approval-ticket step above and "
+     "the MFA step-up REST's twin applies (architecture-wide gap - tracked in #4309).",
      R"({"type":"object","properties":{"rule_id":{"type":"string","minLength":1,"maxLength":256}},"required":["rule_id"]})",
      R"j({"type":"object","properties":{"deleted":{"const":true},"rule_id":{"type":"string"}},"required":["deleted","rule_id"]})j"},
 
@@ -892,7 +900,9 @@ static const ToolDef kTools[] = {
      "concurrent/replayed push simply re-delivers the same-or-newer generation, which "
      "agents accept idempotently on THEIR side, but the tool call itself is not safe to "
      "retry blindly assuming no-op). Fleet-wide; requires the distinct GuaranteedState:Push "
-     "verb (not Write), denied outright to a service-scoped API token.",
+     "verb (not Write), denied outright to a service-scoped API token. REST's twin applies "
+     "an MFA step-up check; MCP applies none for a cookie-session caller (architecture-wide "
+     "gap, not specific to this tool - tracked in #4309).",
      R"j({"type":"object","properties":{)j"
      R"j("scope":{"type":"string","maxLength":2048,"default":"","description":"Scope DSL expression selecting target agents; empty = fleet-wide"},)j"
      R"j("full_sync":{"type":"boolean","default":false,"description":"Force a full re-sync of the enabled rule set to in-scope agents rather than an incremental push"})j"
@@ -3177,16 +3187,19 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // idempotent (retrying a successful create hits the SAME rule_id/name
     // UNIQUE conflict, so a blind retry is not safe). update/delete overwrite
     // or remove EXISTING rule state (the effect table's own destructiveness
-    // test), matching set_tag/delete_tag's pairing; both are idempotent
-    // (re-applying the same update converges on the same fields — only the
-    // store-bumped version counter differs — and re-deleting an
-    // already-deleted rule is a safe no-op 404, never a second deletion).
-    // push is Destructive (re-arms/replaces what agents enforce) and
-    // explicitly NOT idempotent per its own kTools[] description — each call
-    // re-dispatches, so a retry is not a safe no-op.
+    // test); delete is idempotent (re-deleting an already-deleted rule is a
+    // safe no-op 404, never a second deletion). update is NOT idempotent
+    // despite converging on the same stored fields: GuaranteedStateStore::
+    // update_rule unconditionally bumps the policy generation and can
+    // re-trigger the heartbeat reconcile path for every agent behind it
+    // (docs/user-manual/mcp.md), so a blind retry can fan out a fresh
+    // fleet-wide reconcile cycle it didn't need to. push is Destructive
+    // (re-arms/replaces what agents enforce) and explicitly NOT idempotent
+    // per its own kTools[] description — each call re-dispatches, so a retry
+    // is not a safe no-op.
     {"create_guardian_rule", {ToolEffect::Additive, false, "Create Guardian rule"}},
     {"get_guardian_rule", {ToolEffect::ReadOnly, true, "Get Guardian rule"}},
-    {"update_guardian_rule", {ToolEffect::Destructive, true, "Update Guardian rule"}},
+    {"update_guardian_rule", {ToolEffect::Destructive, false, "Update Guardian rule"}},
     {"delete_guardian_rule", {ToolEffect::Destructive, true, "Delete Guardian rule"}},
     {"push_guardian_rules", {ToolEffect::Destructive, false, "Push Guardian rules"}},
     {"get_guardian_agent_status", {ToolEffect::ReadOnly, true, "Get per-agent Guardian status"}},
@@ -9903,6 +9916,24 @@ McpServer::HandlerFn McpServer::build_handler(
                     agent_id.size() > auth::kMaxAgentIdLength) {
                     res.set_content(
                         error_response(id, kInvalidParams, "baseline or agent_id is too long"),
+                        "application/json");
+                    return;
+                }
+                // Matches REST's twin (rest_api_v1.cpp) control-character guard: a
+                // CR/LF in either param would otherwise forge lines in the
+                // guardian.device.view audit detail below, and an embedded NUL would
+                // desync the queried name from the audited one. Rejected pre-audit,
+                // same "no audit row" contract as REST.
+                const auto has_control_char = [](const std::string& s) {
+                    for (unsigned char c : s)
+                        if (c < 0x20)
+                            return true;
+                    return false;
+                };
+                if (has_control_char(baseline_name) || has_control_char(agent_id)) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "baseline or agent_id contains control characters"),
                         "application/json");
                     return;
                 }
