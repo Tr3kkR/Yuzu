@@ -718,7 +718,7 @@ status:
 
 ## 6. Kind: Policy (Phase 5)
 
-> **Implementation phase:** Phase 5 -- Policy engine. **Corrected 2026-09-11 (Gate-of-record pass 5, arch-P5-1): this banner was stale.** `PolicyStore` is implemented and live in production (`server/core/src/policy_store.cpp`, `compliance_routes.cpp`) -- policies are created, evaluated, and enforced today. What is genuinely not implemented is the `spec.triggers[]` schema documented in this section (`ref:`/`with:` references to a `TriggerTemplate`) -- see the caveat under `spec.triggers[]` below for what the shipped parser actually accepts.
+> **Implementation phase:** Phase 5 -- Policy engine. **Corrected 2026-09-11 (Gate-of-record pass 5, arch-P5-1): this banner was stale.** `PolicyStore` is implemented and live in production (`server/core/src/policy_store.cpp`, `compliance_routes.cpp`) -- policies are created and evaluated today; remediation is operator-initiated, never automatic (see §16 of `docs/capability-map.md` and `docs/user-manual/policy-engine.md`). What is genuinely not implemented is the `spec.triggers[]` schema documented in this section (`ref:`/`with:` references to a `TriggerTemplate`) -- see the caveat under `spec.triggers[]` below for what the shipped parser actually accepts.
 
 A Policy binds a PolicyFragment to a device scope and a set of triggers. Policies are the deployment unit for compliance enforcement.
 
