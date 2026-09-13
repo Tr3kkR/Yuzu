@@ -339,6 +339,8 @@ status:
   phase: proposed
 ```
 
+> **Implementation caveat (added 2026-09-10, Gate-of-record pass 4 item 4):** the `triggers:` block above (`ref: trigger.interval.five_minutes`, `ref: trigger.service_status_changed`) shows the **designed** `TriggerTemplate`-reference model — `status: phase: proposed` on this same example marks the whole document as architecture, not a literal schema every field of which is shipped. The `PolicyStore` implementation live on `dev` today does not resolve `ref:`-style trigger template lookups at all; it reads an inline `type:` + `interval_seconds:` pair per trigger entry, and **only `type: interval` has any effect on evaluation cadence** — a `service_status_changed`-shaped trigger (by any syntax) is accepted and stored but does not suppress or gate evaluation; the policy still evaluates on the interval fallback (default 3600s) against its full scope. See `docs/user-manual/policy-engine.md` § Trigger Configuration for the exact shipped schema, its "Common mistake" callout, and tracking issue #4244.
+
 ### 6.5 TriggerTemplate
 
 ```yaml
