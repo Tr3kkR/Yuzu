@@ -36,7 +36,9 @@ history:
     "in review as of 2026-09-11" mentions; `CloseServiceHandle`'s teardown call
     corrected from "not a blocking call" to its actual disclosed status (same LRPC
     transport as `OpenServiceW`, unverified against hanging - governance review found
-    no evidence it cannot hang under a wedged SCM); rung 9c PR-2 recorded as merged
+    no evidence it cannot hang under a wedged SCM; the #4181 non-applicability argument
+    was re-grounded on `unwatch()` releasing `mu_` before teardown runs, since it can
+    no longer rest on the retracted not-blocking claim); rung 9c PR-2 recorded as merged
     2026-09-13 (PR #4318) in `docs/spark-flip-gate.md` and
     `docs/spark-legacy-delta-registry.md` (this doc's own R5.2-R5.4 "as implemented"
     stamps already reflected PR-2 from PR #4318's own commits, so only the two
@@ -1262,21 +1264,26 @@ Registry/File had. PR-B3 isolates `OpenServiceW` onto a probe-only `SparkDetache
 mirroring Registry's probe half. **Deliberately no drain-lane twin**: the design
 rationale was that Service's teardown (`CloseServiceHandle` + a zero-timeout
 `SleepEx(0,TRUE)` APC pump) doesn't have Registry's documented cross-thread
-reclamation-ownership problem to isolate a close FOR - **corrected 2026-09-13**: an
-earlier version of this paragraph overstated that as "is not a blocking call." The real
-disclosure (governance review, round 3) is more cautious: `CloseServiceHandle` is the
-same LRPC transport as `OpenServiceW` and is UNVERIFIED either way - no evidence found
-that it cannot itself hang under the same wedged-SCM condition #3840 exists to fix.
+reclamation-ownership problem - the thing a drain lane would exist to isolate.
+
+**Corrected 2026-09-13**: an earlier version of this paragraph overstated that
+rationale as "is not a blocking call." The real disclosure (governance review,
+round 3) is more cautious: `CloseServiceHandle` is the same LRPC transport as
+`OpenServiceW` and is UNVERIFIED either way - no evidence found that it cannot
+itself hang under the same wedged-SCM condition #3840 exists to fix.
 `CloseServiceHandle` and `NotifyServiceStatusChangeW`'s registration both stay on the
 mechanism thread regardless (the latter by Win32 thread-affinity requirement, not a
-shortcut; the former by this design decision). The #4181 same-type reentrant
-disarm deadlock does not apply to Service at all - its `unwatch()` releases `mu_` before
-teardown runs, so the disarmer is never blocked holding the per-type lock waiting on a
-callback the way the deadlock's diagram requires (confirmed by direct code read; only
-Registry ever had that shape, contrary to this design's own earlier assumption that
-Registry and Service shared the hazard). This holds independently of whether
-`CloseServiceHandle` itself can hang - a dedicated subprocess-boundary T6-analogue
-regression test was added anyway, as insurance. End-to-end establishment latency (arm to
+shortcut; the former by this design decision).
+
+The #4181 same-type reentrant disarm deadlock does not apply to Service at all - and
+this argument no longer rests on the retracted "not a blocking call" claim above: its
+`unwatch()` releases `mu_` before teardown runs, so the disarmer is never blocked
+holding the per-type lock waiting on a callback the way the deadlock's diagram
+requires (confirmed by direct code read; only Registry ever had that shape, contrary
+to this design's own earlier assumption that Registry and Service shared the hazard).
+This holds independently of whether `CloseServiceHandle` itself can hang - a
+dedicated subprocess-boundary T6-analogue regression test was added anyway, as
+insurance. End-to-end establishment latency (arm to
 first observed state) measures ~65ms on real hardware, dominated by
 `kServicePollCadence` (50ms) rather than OS call cost - see
 `docs/spark-rebuild-baselines/stage2-watch-establish-latency.md`'s PR-B3 addendum.

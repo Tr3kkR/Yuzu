@@ -474,9 +474,14 @@ doc just makes sure they're findable rather than rediscovered from scratch.
     "already holds mtx_ across a DIFFERENT blocking section calling `begin_stop()`"
     describes `GuardianEngine::stop()` as unable to reach `begin_stop()` until
     `apply_rules()`'s own bounded backend wait resolves, since `stop()` takes
-    `GuardianEngine::mtx_` first. Goes stale once `apply_rules()` no longer parks
-    under `mtx_` waiting on an arm (this design's own R5.5/D4) — `stop()` is then
-    never delayed by an in-flight arm the way this comment describes.
+    `GuardianEngine::mtx_` first. **Corrected 2026-09-13**: this cell previously said
+    the comment "goes stale once `apply_rules()` no longer parks under `mtx_` waiting
+    on an arm (this design's own R5.5/D4)" — misattributed. That trigger is R5.3/PR-2's
+    territory (`apply_rules()`'s own per-rule blocking wait, not R5.5's `stop()`-level
+    concern), and **it has already fired**: PR-2 (merged, PR #4318) removed
+    `apply_rules()`'s per-rule blocking wait, so this comment is stale NOW, not
+    pending R5.5/PR-4. Filed as **#4322** (found during a doc-sweep governance pass,
+    not yet fixed in code).
   - `agents/core/src/guardian_spark_runtime.cpp:419` (inside `attach_rule()`, **not**
     neighboring `:1615` above — corrected round 7, adversarial review Kimi/Codex both
     flagged the prior version's mislocation) — "up to 2x this deadline, not 1x"

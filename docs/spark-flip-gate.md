@@ -337,11 +337,17 @@ correction that Service never actually had the hazard this row originally descri
 re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
 
 **Ladder status, updated 2026-09-13** (this track's OWN PR-0 through PR-6, not to be
-confused with #2233's item-3 PR-2 or the 7.7b-split's "PR-2 (thin cutover)" - those are
-different PRs entirely; see "Why it doesn't gate on #2233" above): **PR-0 (done, #4130)
+confused with the 7.7b-split's own "PR-2 (thin cutover)" a few sections up in this same
+doc - two different PRs share the name; see "Why it doesn't gate on #2233" above):
+**PR-0 (done, #4130)
 → PR-1 (done, #4224, 2026-09-10) → [#2012/#3840 series, done, see above] → PR-2 (done,
-#4318, 2026-09-13) → PR-3 (telemetry, not started) → PR-4 (audit + R5.5's shutdown
-decoupling + legacy-note, not started - **note, found during this doc-sweep's own
+#4318, 2026-09-13) → PR-3 (telemetry, not started) → PR-4 (audit + R5.5's remaining
+shutdown decoupling + legacy-note, not started - **correction, 2026-09-13**: R5.5 is
+not entirely undone - `GuardianEngine::stop()` already calls `ack_ledger_->retire()`
+under a comment labeled "rung 9c PR-2 Unit 6 (§R5.5)" (`guardian_engine.cpp:644`),
+so R5.5's ack-ledger-retirement half shipped in PR-2. Still PR-4's job: `stop()`
+(`guardian_engine.cpp:612`) still takes `mtx_` unconditionally before calling
+`begin_stop()`, unchanged by PR-2 - **note, found during this doc-sweep's own
 governance, not yet fixed**: `guardian_spark_runtime.cpp`'s `begin_stop()` comment
 already describes a scenario PR-2 made impossible - it still reasons about
 `apply_rules()` "parked in a bounded wait," which PR-2 removed - a stale comment in
@@ -351,8 +357,10 @@ diagnostic's methodology against the full landed ladder, not started).** PR-2 se
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
 `docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.4 updated to describe the
-mechanism as implemented, not just designed (R5.5/shutdown stays design-only until
-PR-4). **Sequencing note, not yet ruled**: since #3990's diagnostic and the CH-5-UAT
+mechanism as implemented, not just designed. R5.5 carries no "as implemented" stamp
+of its own - its ack-ledger-retirement half already shipped in PR-2 Unit 6 (see the
+PR-4 note above), only its `stop()`/`begin_stop()` decoupling is still PR-4's.
+**Sequencing note, not yet ruled**: since #3990's diagnostic and the CH-5-UAT
 evidence campaign (§4) both measure a latency this ladder is still actively changing,
 whether either should start before PR-3 through PR-6 land, or wait for the full ladder,
 is an open scheduling question - not answered by this doc today.
@@ -1087,9 +1095,9 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   same-type-serialization piece was pulled forward into rung 9c's own ladder, between its PR-1
   and PR-2. It landed as **three** PRs sharing one primitive, not the two originally planned:
   PR-A (#4190, shared `SparkDetachedLane` primitive), PR-B1 (Registry, #4225, merged), PR-B2
-  (File, #4284, merged), PR-B3 (Service, `fix/2012-3840-service-walkoff-mu`, in review as of
-  this note - not yet merged). **Status per mechanism, corrected against the actual landed
-  code, not the original plan:**
+  (File, #4284, merged), **PR-B3 (Service, #4302, merged 2026-09-12 - corrected 2026-09-13,
+  superseding the prior "in review, not yet merged" wording here)**. **Status per mechanism,
+  corrected against the actual landed code, not the original plan:**
   - **File:** the per-type-lock stall this row originally described is closed (PR-B2). File's
     teardown does not block the way Registry's does, so PR-B2 built a probe-only lane, not a
     two-lane restructure.
