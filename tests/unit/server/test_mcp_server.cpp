@@ -1034,6 +1034,15 @@ struct McpTestServer {
     /// query_installed_software is exercised end-to-end. Default nullptr keeps
     /// existing tests on the "Software inventory store unavailable" path.
     yuzu::server::SoftwareInventoryStore* software_inventory_store_for_test{nullptr};
+    /// #2146 Batch B2 Gate 4 fix: optionally wire a real InventoryStore so
+    /// create_result_set_from_inventory_query's confinement fix (fleet_read_fn_
+    /// narrowing which agents' inventory rows are visible) is exercised
+    /// end-to-end, not just at the gate. Default nullptr keeps existing tests
+    /// on the "inventory store not available" path - this is a DIFFERENT
+    /// store from software_inventory_store_for_test above (ADR-0016 typed
+    /// daily-sync data), the generic per-plugin InventoryStore this tool
+    /// queries.
+    yuzu::server::InventoryStore* inventory_store_for_test{nullptr};
     /// #3290 Phase 2 — the fake twin of require_fleet_read (fixture-side, not
     /// production's fail-closed-when-unwired default): admits unfiltered
     /// unless a test overrides it, matching the old inventory_scope_fn's
@@ -1419,7 +1428,7 @@ private:
             /*response_store=*/response_store_for_test,
             /*audit_store=*/audit_store_for_test,
             /*tag_store=*/tag_store_for_test,
-            /*inventory_store=*/nullptr,
+            /*inventory_store=*/inventory_store_for_test,
             /*policy_store=*/nullptr,
             /*mgmt_store=*/nullptr,
             /*approval_manager=*/approval_manager_for_test,
@@ -20572,6 +20581,57 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
     }
 }
 
+// #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
+// (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
+// rows are visible) had zero red -> green test coverage on either transport -
+// every prior test above either left the gate unconfined or never wired a
+// real InventoryStore far enough to exercise the narrowing loop at all.
+// Mirrors the equivalent REST-side test (test_rest_result_sets_async.cpp).
+TEST_CASE("MCP create_result_set_from_inventory_query: matched membership is confined to "
+          "the caller's fleet_read_fn scope, never the whole fleet",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const char* agent : {"agent-visible", "agent-hidden"}) {
+            auto seeded = yuzu::server::pg::exec_params(
+                lease.get(),
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+                "'{\"field1\":\"match\"}', 1)",
+                std::vector<std::string>{agent});
+            REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        }
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    // Confine to exactly one of the two seeded agents.
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, yuzu::server::authz::VisibleSet{
+                          std::unordered_set<std::string>{"agent-visible"}}};
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"confined","conditions":[{"plugin":"custom","field":"field1","op":"==","value":"match"}]}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    // Both agents' rows match the condition - if confinement were not applied,
+    // device_count would be 2. The fix narrows the candidate records to the
+    // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
+    CHECK(payload["device_count"] == 1);
+}
+
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "
           "family), never silently treated as absent",
           "[mcp][integration][result-sets][scope]") {
@@ -20632,6 +20692,25 @@ TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused
         REQUIRE(res);
         CHECK(res->status == 200);
     }
+}
+
+// #2146 Batch B2 Gate 4 unhappy-path fix: .value() throws nlohmann::json::
+// type_error on a type mismatch rather than coercing - a non-boolean
+// include_empty must be a clean kInvalidParams, never an uncaught exception
+// (matches REST's identical fix on the same field, same handler shape).
+TEST_CASE("MCP create_result_set_from_tar_query: a non-boolean include_empty is refused "
+          "with kInvalidParams, never an uncaught nlohmann::json::type_error",
+          "[mcp][integration][result-sets]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_tar_query",)"
+        R"("arguments":{"sql":"SELECT 1","include_empty":"yes"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // JSON-RPC error is still a 200 transport response
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
 }
 
 TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "

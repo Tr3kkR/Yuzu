@@ -720,7 +720,11 @@ static const ToolDef kTools[] = {
      "back to a connected agent's own live self-reported value when the store has no row for "
      "that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
      "own live report may be previewed as excluded here but still be targeted by the real "
-     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". REST v1 twin: POST "
+     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". NOTE: "
+     "from_result_set:<id> and props.* atoms are NOT resolved by this preview (only "
+     "os/arch/hostname/agent_version/tag:* are) - an expression using from_result_set: always "
+     "previews as matched_count:0 here even though a real dispatch resolves it correctly; do "
+     "not rely on this tool for such an expression (tracked #4307). REST v1 twin: POST "
      "/api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
@@ -761,7 +765,11 @@ static const ToolDef kTools[] = {
      "conditions against every agent's stored inventory server-side; membership is every "
      "match, optionally narrowed to an owned parent set's CURRENT members. Requires "
      "Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same "
-     "securable as query_installed_software). REST v1 twin: POST "
+     "securable as query_installed_software). Unlike every other result-set tool in this "
+     "family, a service-scoped API token is admitted and confined here, not denied outright "
+     "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
+     "the minting token's username, so a service token can mint a set the minter's other "
+     "credentials can later read back. REST v1 twin: POST "
      "/api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string"},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"field":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}}}},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
@@ -9086,10 +9094,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!execution_tracker->mark_cancelled(exec_id, session->username))
                         spdlog::error("result-set: mark_cancelled also failed for execution_id={}",
                                      exec_id);
+                    // No retry_after_ms: dispatch_fn may have already reached some
+                    // agents before throwing, and this producer's own tool
+                    // description says NEVER re-send on error - a positive retry
+                    // hint here would contradict that contract (Gate 6 compliance
+                    // fix). Poll executions to learn the real outcome instead.
                     res.set_content(
-                        a4_error(kInternalError, "RESULT_SET_DISPATCH_FAILED: dispatch raised",
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        a4_error(kInternalError,
+                                 "RESULT_SET_DISPATCH_FAILED: dispatch raised - poll executions to "
+                                 "determine whether the command reached any agents before "
+                                 "retrying; do not blindly re-send"),
                         "application/json");
                     return;
                 }
@@ -9128,11 +9142,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (!execution_tracker->mark_cancelled(exec_id, session->username))
                         spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
                     if (created.error() == ResultSetError::DbError) {
+                        // No retry_after_ms: dispatch already succeeded above
+                        // (sent > 0, set_agents_targeted already called) - only the
+                        // bookkeeping row failed to persist. A positive retry hint
+                        // here would tell an agentic caller to re-send a command
+                        // that already reached the fleet, directly contradicting
+                        // this tool's own "NEVER re-send" contract (Gate 6
+                        // compliance fix).
                         res.set_content(
                             a4_error(kInternalError,
-                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
-                                     "retry once the server reports ready",
-                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable "
+                                     "after dispatch already succeeded - do not re-send; poll "
+                                     "executions for the dispatched command's outcome"),
                             "application/json");
                         return;
                     }
@@ -9305,6 +9326,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 yuzu::server::InventoryEvalRequest eval_req;
                 eval_req.combine = param_str(args, "combine", "all");
                 if (args.contains("conditions") && args["conditions"].is_array()) {
+                    // Gate 6 sre BLOCKING fix: reject an oversized array before
+                    // building/evaluating it, not after - see
+                    // kMaxInventoryConditions' doc comment (inventory_eval.hpp).
+                    if (args["conditions"].size() > yuzu::server::kMaxInventoryConditions) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "conditions must not exceed " +
+                                               std::to_string(yuzu::server::kMaxInventoryConditions) +
+                                               " entries"),
+                            "application/json");
+                        return;
+                    }
                     for (const auto& c : args["conditions"]) {
                         if (!c.is_object()) {
                             res.set_content(
@@ -9326,22 +9359,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         eval_req.conditions.push_back(std::move(cond));
                     }
                 }
-                if (!result_set_store_) {
-                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
-                                    "application/json");
-                    return;
-                }
-                if (!inventory_store || !inventory_store->is_open()) {
-                    res.set_content(
-                        a4_error(kInternalError, "inventory store not available",
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
-                    return;
-                }
                 // #2500-class guard, same shape as rs_run_async's own — a
                 // supplied parent_id must name a parent, never silently
-                // treated as absent.
+                // treated as absent. Ordered ahead of the store checks below
+                // (Gate 4 unhappy-path fix, matches REST's twin reorder): a
+                // malformed request is a client error regardless of backend
+                // availability.
                 if (args.contains("parent_id") &&
                     (!args["parent_id"].is_string() ||
                      args["parent_id"].get_ref<const std::string&>().empty())) {
@@ -9360,6 +9383,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         error_response(id, kInvalidParams,
                                        "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
                                        "no parent set; omit it entirely to search all devices"),
+                        "application/json");
+                    return;
+                }
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!inventory_store || !inventory_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "inventory store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -9492,6 +9528,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // .value() throws nlohmann::json::type_error on a type mismatch
+                // rather than coercing (Gate 4 unhappy-path fix) - check the type
+                // explicitly so a non-boolean include_empty is a clean 400, not an
+                // uncaught exception (bare empty-body 500).
+                if (args.contains("include_empty") && !args["include_empty"].is_boolean()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "include_empty must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
                 const bool include_empty = args.value("include_empty", false);
                 nlohmann::json matcher = include_empty
                                              ? nlohmann::json{{"kind", "any_response"}}
@@ -9596,6 +9642,21 @@ McpServer::HandlerFn McpServer::build_handler(
                         res.set_content(
                             error_response(id, kInvalidParams,
                                            "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                            "application/json");
+                        return;
+                    }
+                    // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
+                    // create_result_set_from_tar_query enforces before dispatch.
+                    // `orig` may have been minted via the uncapped create_result_set
+                    // (source_kind labeled tar_query with no create-time SQL-length
+                    // check of its own) - without this, re-eval would smuggle an
+                    // oversized SQL payload past the 200 KiB pre-routing body cap
+                    // that exists specifically for this SQL size, then dispatch it
+                    // fleet-wide.
+                    if (sql.size() > 100000) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
                             "application/json");
                         return;
                     }

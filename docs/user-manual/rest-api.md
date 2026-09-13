@@ -5708,8 +5708,10 @@ route had NO authorization check of any kind before this fix, CWE-862: any
 authenticated session could query up to 5000 fleet-wide inventory records
 with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
-/api/v1/inventory/software` rather than `Execution:Execute`; a
-service-scoped API token is denied by the same gate). The owner-scoped
+/api/v1/inventory/software` rather than `Execution:Execute`. **Unlike its
+result-set siblings, a service-scoped token is admitted and confined here,
+not denied outright** - see the "Result Sets" section below for the exact
+gate and the tracked cross-service-reach gap, `#4307`). The owner-scoped
 result-set row it creates is only readable/mutable by its own creator
 through the routes below, which — like their HTMX dashboard twins — also
 deny a service-scoped token outright: `session->username` is the *minting*
@@ -8886,7 +8888,15 @@ call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
 matched-agent set cannot drift between transports. A `tag:<key>` atom in the
 expression resolves from the persistent tag store **only** — unlike a real
 dispatch, which also falls back to a connected agent's own live self-report —
-see [Tag source precedence](asset-tagging-guide.md).
+see [Tag source precedence](asset-tagging-guide.md). **`from_result_set:<id>`
+and `props.*` atoms are not resolved by this preview** - the resolver only
+populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
+(including `from_result_set:`, this feature's own headline scope-walking
+primitive) is treated as unset and never matches, silently returning
+`matched_count: 0` for a composed expression that uses one - a genuine
+dispatch resolves `from_result_set:` correctly (`agent_registry.cpp`). Do not
+rely on this preview for an expression containing `from_result_set:` or
+`props.`; tracked in `#4307`.
 
 **Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
 chokepoint (ADR-0017) — this route discloses agent identities, unlike the

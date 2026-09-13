@@ -9196,9 +9196,22 @@ void RestApiV1::register_routes(
                       // nlohmann::json::type_error on a type mismatch - it does not coerce. A
                       // non-object element or a non-string field previously fell through to
                       // an uncaught exception. Validate explicitly.
+                      if (body.contains("combine") && !body["combine"].is_string()) {
+                          rs_err(res, 400, "combine must be a JSON string");
+                          return;
+                      }
                       InventoryEvalRequest eval_req;
                       eval_req.combine = body.value("combine", "all");
                       if (body.contains("conditions") && body["conditions"].is_array()) {
+                          // Gate 6 sre BLOCKING fix: reject an oversized array before
+                          // building/evaluating it - see kMaxInventoryConditions'
+                          // doc comment (inventory_eval.hpp).
+                          if (body["conditions"].size() > kMaxInventoryConditions) {
+                              rs_err(res, 400,
+                                     "conditions must not exceed " +
+                                         std::to_string(kMaxInventoryConditions) + " entries");
+                              return;
+                          }
                           for (const auto& c : body["conditions"]) {
                               if (!c.is_object()) {
                                   rs_err(res, 400, "each condition must be a JSON object");
@@ -9217,11 +9230,6 @@ void RestApiV1::register_routes(
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
-                      if (!inventory_store || !inventory_store->is_open()) {
-                          rs_err(res, 503, "inventory store not available");
-                          return;
-                      }
-
                       // Optional parent-scope narrowing.
                       //
                       // #2500, FOURTH instance — the one the original fix missed.
@@ -9256,6 +9264,19 @@ void RestApiV1::register_routes(
                           rs_err(res, 400,
                                  "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
                                  "parent set; omit it entirely to search all devices");
+                          return;
+                      }
+                      if (body.contains("name") && !body["name"].is_string()) {
+                          rs_err(res, 400, "name must be a JSON string");
+                          return;
+                      }
+                      // Gate 4 unhappy-path fix: moved below the client-input
+                      // validation above (combine/conditions/parent_id/name) - a
+                      // malformed request is a client error regardless of backend
+                      // availability, so a caller retrying a permanently-invalid
+                      // request on this 503's retry_after_ms would never succeed.
+                      if (!inventory_store || !inventory_store->is_open()) {
+                          rs_err(res, 503, "inventory store not available");
                           return;
                       }
                       std::optional<std::unordered_set<std::string>> parent_members;
@@ -9393,6 +9414,14 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                           return;
                       }
+                      // .value() throws nlohmann::json::type_error on a type mismatch
+                      // rather than coercing (Gate 4 unhappy-path fix, matches MCP's
+                      // identical fix) - check the type explicitly so a non-boolean
+                      // include_empty is a clean 400, not an uncaught exception.
+                      if (body.contains("include_empty") && !body["include_empty"].is_boolean()) {
+                          rs_err(res, 400, "include_empty must be a JSON boolean");
+                          return;
+                      }
                       const bool include_empty = body.value("include_empty", false);
                       nlohmann::json matcher =
                           include_empty ? nlohmann::json{{"kind", "any_response"}}
@@ -9526,6 +9555,16 @@ void RestApiV1::register_routes(
                           std::string sql = sp.is_object() ? sp.value("sql", "") : "";
                           if (sql.empty()) {
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
+                              return;
+                          }
+                          // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
+                          // create_result_set_from_tar_query enforces before dispatch
+                          // (matches its MCP twin's identical fix) - orig may have
+                          // been minted via the uncapped create_result_set, smuggling
+                          // an oversized SQL payload past the dedicated body cap that
+                          // exists specifically for this field.
+                          if (sql.size() > 100000) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                               return;
                           }
                           std::unordered_map<std::string, std::string> params{{"sql", sql}};
