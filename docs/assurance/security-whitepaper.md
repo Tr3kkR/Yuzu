@@ -46,10 +46,14 @@ upstream mutual TLS"):**
 | Agent → Server (direct-connect) | Mutual TLS | Per-agent client leaf certificate required. |
 | Agent → Gateway (`:50051`) | **One-way TLS** (server-authenticated only) | No client cert required, so an unenrolled agent can still bootstrap through a gateway; agent identity is app-layer (`gateway_observed_peer`), not transport-layer, on this hop. |
 | Gateway → Server upstream (`:50055`, `GatewayUpstream`) | Mutual TLS | Both peers hold CA-issued certs. |
-| Server → Gateway management (`:50063`, command fan-out) | Strict mutual TLS + SPKI peer pin | The privileged command plane; admits only CA-issued client certs pinned to the server's own key. |
+| Server → Gateway management (`:50063`, command fan-out) | Strict mutual TLS, **CA-scoped only — no server-identity pinning** | The privileged command plane; requires a client cert issued by the install CA. **Residual at `v0.13.0` (#1314 M-1):** peer verification authenticates to the *CA*, not to the server's identity, so *any* holder of *any* CA-issued cert passes — including an enrolled agent's own leaf+key extracted from its data directory, another agent's stolen leaf, or the `default-gateway` leaf. Keep `:50063` on a network only the server can reach. |
 
+<!-- yuzu:claim id=mgmt-plane-ca-scoped-mtls status=shipped evidence=docs/pki-architecture.md#Residual (#1314 M-1) -->
+<!-- yuzu:claim id=mgmt-plane-spki-pin status=planned evidence=gateway/apps/yuzu_gw/src/yuzu_gw_authz.erl#check_mgmt_peer -->
 "Mutual TLS between every hop" would overclaim the agent→gateway leg —
-correct only for direct-connect agents and the two gateway↔server hops.
+correct only for direct-connect agents and the two gateway↔server hops. An
+SPKI peer pin binding `:50063` to the server's own key is **not in
+`v0.13.0`** — see the appendix.
 
 <!-- yuzu:claim id=postgres-substrate-mandatory status=shipped evidence=server/core/src/server.cpp#no PostgreSQL DSN -->
 **Storage substrate split (ADR-0006):** `--postgres-dsn`/`YUZU_POSTGRES_DSN`
@@ -57,9 +61,11 @@ is mandatory — the server **fails closed at boot** (refuses to start, no
 SQLite fallback) if it is unset or unreachable, and several server stores
 (offline-endpoint tracking, pre-flight runs, deployment runs, vulnerability
 findings, software/device inventory, app-performance rollups) are already
-PostgreSQL-backed at this release. **The `auth`, `ca_store`, and audit
-schemas are the exception at `v0.13.0` — they remain SQLite files
-(`auth.db`, `ca.db`, `audit.db`) pending their own migration** (see the
+PostgreSQL-backed at this release. **Many server stores are not yet
+migrated at `v0.13.0` — among them `auth`, `ca_store`, and audit, which
+remain SQLite files (`auth.db`, `ca.db`, `audit.db`) pending their own
+migration, alongside other still-SQLite stores such as RBAC, management
+groups, and API tokens** (see the
 appendix for what changes once each does; `docs/ops-runbooks/auth-db-recovery.md`
 covers the `auth` case operationally). The agent stays SQLite regardless
 (local, per-endpoint, federated edge warehouse — no shared multi-tenant
@@ -104,13 +110,17 @@ do not internet-expose the agent gRPC port (`:50051`) directly; see
 
 ### 2.2 Secrets at rest
 
-<!-- yuzu:claim id=secretcodec-partial-coverage status=shipped evidence=server/core/src/offline_endpoint_store.hpp#SecretCodec -->
-Where a secret is stored in a PostgreSQL-backed store, it is never a plain
-column: each is either a verify-only hash (passwords, API tokens) or an
-envelope-encrypted blob via `SecretCodec`, wrapping a per-secret DEK under a
-KEK obtained through a pluggable `KeyProvider`/`KekProvider` seam — shipped
-today for the stores that use it (e.g. `offline_endpoint_store.hpp`,
-`vuln_finding_store.hpp`). **This is not yet universal: the MFA TOTP
+<!-- yuzu:claim id=secretcodec-substrate-shipped status=shipped evidence=server/core/src/pg/secret_codec.hpp#SecretCodec -->
+Local passwords (PBKDF2, in `auth.db`) and API tokens (SHA-256, in the
+SQLite API-token store) are stored as verify-only hashes, never as
+recoverable secrets. The envelope-encryption substrate — `SecretCodec`,
+wrapping a per-secret DEK under a KEK obtained through a pluggable
+`KeyProvider`/`KekProvider` seam — **ships in the `v0.13.0` binary but has
+no production consumer at this release**: no store at this tag encrypts a
+column with it (the PostgreSQL-backed stores that exist at this release
+hold no secrets — e.g. `offline_endpoint_store.hpp` and
+`vuln_finding_store.hpp` each state in their header that they carry no
+secrets and no `SecretCodec` envelope). **In particular, the MFA TOTP
 secret in the still-SQLite `auth.db` is plaintext at rest at this release**
 (the `0600` file mode is its only protection today) — see
 `docs/ops-runbooks/auth-db-recovery.md` and the appendix below for the
@@ -153,11 +163,21 @@ omitted from this document.
 
 ### 3.3 SCIM provisioning
 
-SCIM v2 user/group provisioning and deprovisioning, fail-closed
-configuration, a provenance guard preventing a SCIM-originated write from
-silently overriding an SSO-linked identity's own role assignment, and
-group→role mapping. Full reference: `docs/auth-architecture.md` "SCIM v2
-provisioning".
+SCIM v2 **user** provisioning and deprovisioning (a deprovision soft-deletes
+the account and cascades session revocation), fail-closed configuration, and
+a provenance guard: SCIM may only mutate accounts SCIM itself provisioned
+and only while they are still floor-privilege, so an IdP push can never
+deactivate a locally-created admin or the break-glass account. **At
+`v0.13.0` this is a users-only slice** — SCIM Groups and group→role mapping
+are not implemented (every SCIM-provisioned account is the fixed `user`
+role; OIDC and SAML have their own group→role mapping). **Known residual
+(SOC 2 CC6.8):** at this release a deprovision (via SCIM or the dashboard)
+revokes the account's cookie sessions but not its **API tokens** — the
+token path resolves the principal without checking the account is still
+active — and does not sever a linked OIDC/SAML identity. Manually revoke a
+departing operator's API tokens. The deprovision revoke seam (ADR-2001) is
+`dev`-only — see the appendix. Full reference: `docs/auth-architecture.md`
+"SCIM v2 provisioning".
 
 ### 3.4 MFA
 
@@ -176,8 +196,14 @@ an operator's visibility/authority to a confined subset of the fleet
 (`docs/user-manual/management-groups.md`). `RbacStore` is a **SQLite
 `rbac.db` file at this release** (ADR-0041 plans a PostgreSQL migration —
 see appendix); a bare global `require_permission` on a list route is a
-known-inert pattern for a confined operator and fails open if the RBAC
-store is unreadable/degraded. **The admit-then-filter `authorize_list_read`
+known-inert pattern for a confined operator. Degradation is split at this
+release: if `rbac.db` fails to load, the RBAC toggle stays at its compiled
+default (off, `rbac_store.hpp:184`), so `require_permission` takes the
+legacy path, where any authenticated session may Read and mutations require
+admin (`auth_routes.cpp:466-480`). That is effectively fail-open for
+reads. The management-group confinement fallback fails CLOSED on a
+load-failed store (#1498, `rbac_store.cpp:600-603`), and a per-request
+permission lookup against an unopened store denies (`rbac_store.cpp:1268`). **The admit-then-filter `authorize_list_read`
 chokepoint (ADR-0017) is a documented design target, not yet implemented
 in code at `v0.13.0`** — `authorize_list_read`/`authz_gates.cpp` do not
 exist at this tag (confirmed: `git grep -l authorize_list_read v0.13.0`
@@ -190,11 +216,26 @@ chokepoint.
 
 ### 3.6 API tokens and service automation
 
-Scoped, expiring API tokens with a rotation process and fleet-wide
-service-scope default-deny confinement (a service-scoped token cannot reach
-a `(securable, operation)` pair until explicitly allow-listed). Full
-reference: `docs/auth-architecture.md` "API tokens and automation", "Human
-API-token rotation".
+<!-- yuzu:claim id=service-scope-itserviceowner-ceiling status=shipped evidence=server/core/src/auth_routes.cpp#lacks ITServiceOwner permission -->
+<!-- yuzu:claim id=service-scope-default-deny status=planned evidence=server/core/src/service_scope_policy.hpp#kServiceScopeGlobalSafe -->
+<!-- yuzu:claim id=human-token-rotation status=planned evidence=server/core/src/api_token_store.hpp#rotate_token -->
+Bearer API tokens for automation, with an optional expiry (`expires_at`,
+`0` = never; MCP tokens carry a mandatory expiry of at most 90 days) and
+ownership-scoped revocation (only the token's owner, or the global `admin`
+role, can revoke it). There is **no built-in rotation primitive at
+`v0.13.0`** — rotating a token means minting a new one and revoking the old.
+
+**Service-scoped tokens at `v0.13.0` are confined by a permission
+*ceiling*, not a default-deny.** A service-scoped token is refused outright
+when RBAC is disabled and on admin routes; otherwise a request passes if the
+`ITServiceOwner` role holds the requested `(securable, operation)` pair. On
+per-device routes the target agent's `service` tag must also match the
+token's service — **but on fleet-wide (non-per-device) routes the ceiling
+check is the only gate**, so a service-scoped token can read fleet-wide data
+for any pair `ITServiceOwner` holds, unfiltered by service. Full reference:
+`docs/auth-architecture.md` "API tokens and automation". Service-scope
+default-deny confinement and self-service token rotation are **not in
+`v0.13.0`** — see the appendix.
 
 ### 3.7 Account lockout
 
@@ -252,14 +293,25 @@ independent of which database backs the store — **not** a blanket
 guarantee across every ingress: dashboard HTML routes and MCP tool calls are
 "set-and-proceed" on an audit-write failure (the request completes even if
 the audit row did not persist), a different posture from REST's fail-closed
-one. A clock-guarded, capped retention sweep bounds how
-fast the evidence table can drain even under a forward clock jump on the
-PostgreSQL host — the guard
-declines a pass it cannot trust rather than risk over-deleting, and every
-decline/anomaly is itself an alertable signal
-(`docs/ops-runbooks/audit-store-clock-guard.md`). See
-`docs/ops-runbooks/slo.md` §4 for the write-success SLO built on this
-control, and `docs/enterprise-readiness-soc2-first-customer.md` §3.5 for the
+one.
+
+<!-- yuzu:claim id=audit-retention-unguarded status=shipped evidence=server/core/src/audit_store.cpp#DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < ? -->
+<!-- yuzu:claim id=audit-retention-clock-guard status=planned evidence=common/include/yuzu/audit_retention_rules.hpp#classify -->
+**Audit retention at `v0.13.0` is not clock-guarded and not capped.** Each
+row's expiry (`ttl_expires_at`) is stamped at insert from the retention
+window (365 days by default, `audit_retention_days`); a background thread
+(`AuditStore::run_cleanup`, hourly by default) runs a single uncapped
+`DELETE FROM audit_events WHERE ttl_expires_at > 0 AND ttl_expires_at < ?`
+bound to the server host's `system_clock`. **Residual:** a forward jump of
+the server host's wall clock deletes audit evidence early — every row whose
+expiry falls inside the jump is removed in one pass, with no cap, no
+anomaly detection, and no alertable signal. Keep the server host on
+reliable, monitored time sync, and export/forward audit events to an
+external system if the evidence window must survive such an event. A
+clock-guarded, capped retention sweep is **not in `v0.13.0`** — see the
+appendix. See
+`docs/ops-runbooks/slo.md` §4 for the write-success SLO built on the audit
+write path, and `docs/enterprise-readiness-soc2-first-customer.md` §3.5 for the
 full data-inventory table (retention windows per store).
 
 **Metric-is-the-signal, audit-row-is-the-evidence:** every security-relevant
@@ -278,7 +330,12 @@ point, governance sre3-1): `docs/ops-runbooks/slo.md`
 (one caveat on "verified present": the `/readyz`-availability proxy,
 `up{job="yuzu-server"}`, is a Prometheus **scrape** metric, not a metric
 Yuzu itself emits — verified present in the *scrape config*, not in
-`server/core/src`, unlike the other four). **Backup/restore drills were
+`server/core/src`, unlike the other four). Note also that
+`docs/ops-runbooks/slo.md` does not exist at `v0.13.0` — its citations are
+pinned to a post-tag `dev` commit; the metrics its five SLOs rely on are
+present at the tag, but not every alert it names is (e.g.
+`YuzuServerRestartLoop` is absent from the tag's
+`docs/prometheus/yuzu-alerts.yml`). **Backup/restore drills were
 executed against this procedure (not merely described) — but the
 transcripts, and the corrected version of `docs/operations/disaster-recovery.md`
 they validate, do not ship on this branch/PR at all.** This document's own
@@ -330,8 +387,10 @@ Server-side data inventory (which store, what it holds, retention window,
 clock-guard coverage) and agent-side edge-warehouse retention (`tar.db`,
 federated per-device, ADR-0004) are tabulated in full in
 `docs/enterprise-readiness-soc2-first-customer.md` §3.5, including an honest
-accounting of which retention guards are fully clock-guarded-and-capped
-today versus still on a bare wall-clock `DELETE`. Behavioral telemetry (DEX)
+accounting of retention-guard coverage — at `v0.13.0` the audit, response,
+and guaranteed-state/DEX-observation retention passes are all bare
+wall-clock `DELETE`s (no clock guard, no cap); guarded passes are
+`dev`-only. Behavioral telemetry (DEX)
 carries its own PII posture and works-council/co-determination discussion in
 the same section — do not summarise that surface without reading it, the
 distinctions are load-bearing for a EU-works-council conversation.
@@ -341,10 +400,20 @@ distinctions are load-bearing for a EU-works-council conversation.
 The MCP (Model Context Protocol) surface — the mechanism by which an
 agentic/AI operator drives Yuzu — carries the same tier-before-RBAC
 ordering, kill switches, and audit pattern as every other ingress:
-`docs/mcp-server.md`. Tool annotations (destructive-hint truthfulness,
-bounded input/output schemas, honest `retry_after_ms`) are a machine-verifiable
-contract, not prose-only documentation — `docs/agentic-first-principle.md`
-invariant A5. **The spec-compliant MCP Streamable HTTP transport (session
+`docs/mcp-server.md`.
+
+<!-- yuzu:claim id=mcp-destructive-hint status=planned evidence=server/core/src/mcp_server.cpp#destructiveHint -->
+**Machine-readable tool safety metadata is not in place at `v0.13.0`.**
+`docs/agentic-first-principle.md` invariant A5 (standard MCP annotations
+including a truthful `destructiveHint`, bounded input and typed output
+schemas, honest `retry_after_ms`) was added on 2026-07-11 as a *proposed*
+architectural rule that applies forward from adoption, with the existing
+tool backlog left to a later backfill. That document's own survey at the
+tag records the state: `destructiveHint`/`idempotentHint` are absent from
+every tool (destructive tools signal danger in prose only), most core tools
+carry no annotations or output schema, and `retry_after_ms` is hardcoded
+null on the MCP tool gate. An agentic client must not rely on annotations to
+detect a destructive tool at this release. **The spec-compliant MCP Streamable HTTP transport (session
 ids, GET SSE channel, `notifications/progress`) is a `dev`-only addition —
 `v0.13.0` has the older, non-session MCP transport only.** See the
 appendix.
@@ -374,6 +443,49 @@ re-checked every time a new release cuts.
   A second server replica (raising the single-replica 99.5%/30d
   availability target to 99.9%/30d) is a further, separate, still-planned
   step (ADR-2002 Phase B) not shipped even at `dev`-HEAD.
+- **SPKI peer pin on the gateway management plane (`:50063`, #1422).**
+  `v0.13.0`'s mgmt listener is strict mTLS scoped to the install CA only —
+  any CA-issued leaf passes (§1). At `dev`-HEAD (landed 2026-09-02,
+  `gateway/apps/yuzu_gw/src/yuzu_gw_authz.erl`) the listener's `auth_fun`
+  additionally pins the peer to the SubjectPublicKeyInfo of the server's own
+  key (`{yuzu_gw, mgmt_peer_pins}`) and requires the `serverAuth` EKU, which
+  agent leaves never carry; it fails closed on empty or unresolvable pins,
+  and the gateway refuses to boot a network-reachable mgmt listener without
+  that posture unless explicitly acknowledged as a lab rig. See
+  `docs/pki-architecture.md` at `dev`-HEAD.
+- **Clock-guarded, capped audit retention (#2360).** `v0.13.0` runs a single
+  uncapped wall-clock `DELETE` (§4). At `dev`-HEAD (landed 2026-07-26, then
+  carried onto PostgreSQL by ADR-0040) the retention sweep is clock-guarded
+  and capped — it declines a pass it cannot trust rather than risk
+  over-deleting, and every decline/anomaly is an alertable signal
+  (`docs/ops-runbooks/audit-store-clock-guard.md`, which does not exist at
+  `v0.13.0`).
+- **Service-scoped API-token default-deny, and self-service human token
+  rotation.** At `v0.13.0` service-scoped tokens are bounded only by the
+  `ITServiceOwner` ceiling on fleet-wide routes, and there is no rotation
+  primitive (§3.6). At `dev`-HEAD a `(securable, operation)` pair must
+  additionally clear the seeded-empty `kServiceScopeGlobalSafe` allow-list
+  (`server/core/src/service_scope_policy.hpp`) — so a service-scoped token
+  cannot reach any fleet-wide pair until explicitly allow-listed — and
+  human-owned tokens gain overlap-pair rotation
+  (`ApiTokenStore::rotate_token`/`confirm_token_rotation`). See
+  `docs/auth-architecture.md` "Service-scoped token fleet-wide confinement"
+  and "Human API-token rotation" at `dev`-HEAD; neither section exists at
+  `v0.13.0`.
+- **SCIM ↔ OIDC/SAML identity-link revoke on deprovision (ADR-2001, SOC 2
+  CC6.8).** At `v0.13.0` a deprovision revokes the account's cookie
+  sessions only — not its API tokens, and not a linked OIDC/SAML identity
+  (§3.3). At `dev`-HEAD a single revoke seam
+  (`server/core/src/deprovision_revoke.cpp`) also revokes the account's API
+  tokens (`revoke_for_principal`) and those of its linked identities;
+  `docs/adr/2001-scim-oidc-identity-linkage.md` records the scope and its
+  known residuals.
+- **MCP tool safety annotations (A5 backfill, ADR-1005 track 2g).** At
+  `v0.13.0` `destructiveHint`/`idempotentHint` are absent from every MCP
+  tool (§8). At `dev`-HEAD, `docs/agentic-first-principle.md`'s 2026-08-20
+  survey records every tool carrying the four standard spec annotations
+  (truthfulness cross-checked by a dedicated test) and an `outputSchema`,
+  with remaining items in a tracked residual state.
 - **`CaStore` PostgreSQL migration (ADR-0053).** `v0.13.0` uses a SQLite
   `ca.db` file; `dev`-HEAD moves CA metadata, issued-cert inventory, and
   CRL version history into the `ca_store` PostgreSQL schema. The key
@@ -395,8 +507,8 @@ re-checked every time a new release cuts.
   handful, tracked #3526/#3528).
 - **`ManagementGroupStore` PostgreSQL migration (ADR-0042).** `v0.13.0`'s
   management groups are SQLite-backed; a substantial rewrite lands at
-  `dev`-HEAD (826 insertions/533 deletions in `management_group_store.cpp`
-  alone, relative to `v0.13.0`).
+  `dev`-HEAD (712 insertions/486 deletions in `management_group_store.cpp`
+  alone, `git diff --shortstat v0.13.0 18057b6b1`).
 - **`SessionStore` (durable, PostgreSQL-backed operator sessions, HA
   WS-1/1a, ADR-2002 §4).** `server/core/src/session_store.hpp` does not
   exist at all in `v0.13.0`. At `dev`-HEAD, sessions (including the idle
@@ -409,10 +521,23 @@ re-checked every time a new release cuts.
   (including the known gap in outage-time containment, tracked **#4283**)
   and `docs/user-manual/server-admin.md`'s Upgrade Notes for the
   operator-facing warning.
+<!-- yuzu:claim id=authdb-postgres status=planned evidence=server/core/src/auth_db.cpp#auth.users -->
+- **`AuthDB` PostgreSQL migration (ADR-0006 Update 2026-07-16).**
+  `v0.13.0` keeps operator accounts, password hashes, MFA enrollment, and
+  SCIM state in the SQLite `auth.db`. At `dev`-HEAD `AuthDB` is
+  PostgreSQL-backed (schema `auth`; `ScimStore` moves to schema
+  `scim_store`) with **fresh-start, no backfill**: the legacy `auth.db` is
+  never read on upgrade, so a first boot against an empty `auth.users`
+  re-seeds the config-file admin and existing accounts, roles, and MFA
+  enrollments are lost (SCIM self-heals on the IdP's next sync). Plan the
+  upgrade accordingly — see `docs/ops-runbooks/auth-db-recovery.md`'s "Not
+  in v0.13.0" section.
 - **Envelope-encrypted MFA secrets (ADR-0010, applied to `auth`).**
   `v0.13.0`'s `mfa_totp_secret` column is plaintext, `0600`-file-protected
-  only (§2.2 above). At `dev`-HEAD it is `SecretCodec`-wrapped like the
-  stores in §2.2 that already have it, which also means a Postgres dump
+  only, and `SecretCodec` has no production consumer at that tag (§2.2
+  above). At `dev`-HEAD `mfa_totp_secret` is `SecretCodec`'s first
+  production consumer, and MFA readers fail closed on a decrypt failure
+  rather than reading as "not enrolled". This also means a Postgres dump
   alone stops being a complete backup — see
   `docs/ops-runbooks/auth-db-recovery.md`'s appendix for the KEK-pairing
   backup procedure this introduces.
@@ -442,6 +567,7 @@ codebase at your installed tag rather than assume it holds.
 `docs/architecture.md` · `docs/pki-architecture.md` ·
 `docs/adr/0010-secrets-at-rest-envelope-encryption.md` ·
 `docs/auth-architecture.md` ·
+`docs/adr/2001-scim-oidc-identity-linkage.md` ·
 `docs/security-reviews/inactivity-timeout-2026-06-30.md` ·
 `docs/user-manual/rbac.md` · `docs/user-manual/management-groups.md` ·
 `docs/user-manual/audit-log.md` ·

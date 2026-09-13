@@ -33,12 +33,17 @@ This runbook assumes a single-node Yuzu deployment. For HA, see
 ## Detection signal
 
 `yuzu-server` exits with a non-zero status at startup and `journalctl -u
-yuzu-server` (Linux) or the Windows event log shows one of these lines:
+yuzu-server` (Linux) or the server log file (Windows — the installer
+configures `--log-file "<install dir>\logs\yuzu-server.log"`, default
+install dir `C:\Program Files\Yuzu Server`; the server does not write to
+the Windows event log) shows one of these
+lines, each followed by `Failed to initialize auth DB: <error-code>`:
 
 ```
-[error] Auth DB integrity check failed: <sqlite-error>
-[error] Failed to open auth DB: <path> (<errno>)
-[error] AuthDB: schema migration failed, closing database
+[error] Auth DB integrity check failed: <PRAGMA integrity_check result>
+[error] Failed to open auth DB: <sqlite-error>
+[error] Failed to create auth DB directory: <error>
+[error] AuthDB: schema migration failed
 ```
 
 If the shipped systemd unit is in use it retries `StartLimitBurst=3` times
@@ -54,7 +59,7 @@ That `failed` state is deliberate — it stops a crash-loop from drowning the
 journal. Clear it with `systemctl reset-failed yuzu-server` once fixed.
 
 **If the server fails to start with a `[PG] Refusing to start: ...` line
-instead of the three above:** that is a *different* store failing (Yuzu
+instead of the lines above:** that is a *different* store failing (Yuzu
 requires Postgres for its other stores even though auth itself doesn't use
 it yet) — see "Not in v0.13.0" below for what that means, but the fix is a
 Postgres fix (DSN, reachability, credentials), not an auth-recovery
@@ -73,9 +78,14 @@ re-authenticate after recovery.
 # Stop the service so the file is closed.
 sudo systemctl stop yuzu-server
 
-# Archive the corrupt DB for forensics. Do NOT delete it without a copy —
-# support may need to inspect the corruption signature.
-sudo sqlite3 /var/lib/yuzu/auth.db ".backup /var/lib/yuzu/auth.db.corrupt-$(date +%s)"
+# Archive the corrupt DB on-host. Do NOT delete it without a copy. The
+# archive holds password hashes AND plaintext TOTP seeds, so it is created
+# 0600 (umask inside the sudo'd shell, so it applies to sqlite3 itself) and
+# never leaves this host — see "After the server is back online" step 4.
+sudo sh -c 'set -eu; umask 077
+  out=/var/lib/yuzu/auth.db.corrupt-$(date +%s)
+  sqlite3 /var/lib/yuzu/auth.db ".backup $out"
+  chmod 0600 "$out"; ls -l "$out"'
 
 # Move the live file aside (NOT delete — keep one operator-recoverable
 # copy in case the corruption was actually a permission/ownership issue
@@ -94,22 +104,29 @@ sudo systemctl status yuzu-server
 
 ### Windows
 
+Paths below are the installer defaults (`--data-dir "C:\ProgramData\Yuzu
+Server\data"`, service name `YuzuServer`); adjust if you installed
+differently.
+
 ```powershell
 # Stop the service.
-Stop-Service Yuzu
+Stop-Service YuzuServer
+$data = 'C:\ProgramData\Yuzu Server\data'
 
-# Archive the corrupt DB.
-Copy-Item C:\ProgramData\Yuzu\auth.db `
-          C:\ProgramData\Yuzu\auth.db.corrupt-$(Get-Date -Format yyyyMMdd-HHmmss)
+# Archive the corrupt DB on-host, then restrict it to SYSTEM + Administrators
+# (it holds password hashes and plaintext TOTP seeds; never leaves this host).
+$archive = "$data\auth.db.corrupt-$(Get-Date -Format yyyyMMdd-HHmmss)"
+Copy-Item "$data\auth.db" $archive
+icacls $archive /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
 
 # Move the live file aside.
-Move-Item C:\ProgramData\Yuzu\auth.db     C:\ProgramData\Yuzu\auth.db.broken
-Move-Item C:\ProgramData\Yuzu\auth.db-wal C:\ProgramData\Yuzu\auth.db-wal.broken -ErrorAction SilentlyContinue
-Move-Item C:\ProgramData\Yuzu\auth.db-shm C:\ProgramData\Yuzu\auth.db-shm.broken -ErrorAction SilentlyContinue
+Move-Item "$data\auth.db"     "$data\auth.db.broken"
+Move-Item "$data\auth.db-wal" "$data\auth.db-wal.broken" -ErrorAction SilentlyContinue
+Move-Item "$data\auth.db-shm" "$data\auth.db-shm.broken" -ErrorAction SilentlyContinue
 
 # Start the service.
-Start-Service Yuzu
-Get-Service Yuzu
+Start-Service YuzuServer
+Get-Service YuzuServer
 ```
 
 After the server is back online:
@@ -118,31 +135,126 @@ After the server is back online:
 2. Re-create any user accounts that existed only in `auth.db` (i.e. created
    via Settings > Users after the seed config was first written). Accounts
    created via the seed config itself are restored automatically.
-3. Re-issue any enrollment tokens — token state lives in `auth.db`.
-4. File a support ticket with the archived `auth.db.corrupt-<timestamp>`
-   file attached so the corruption signature can be analysed.
+3. Enrollment tokens and the pending-agent queue do **not** need
+   re-issuing: at this release they live in `enrollment-tokens.cfg` and
+   `pending-agents.cfg` in the data directory, not in `auth.db` (the
+   `enrollment_tokens` table in `auth.db` is never written). Leave those
+   files where they are.
+4. If you open a support ticket, **do NOT attach the archived
+   `auth.db.corrupt-<timestamp>` file, the `.broken` files, or any copy of
+   them** — they contain every password hash and every plaintext TOTP seed.
+   Send sanitized diagnostics instead:
+   - the server log excerpt around the failure (the detection lines above);
+   - the output of `sqlite3 <archive> "PRAGMA integrity_check;"` (page/index
+     structure only, no row contents);
+   - the schema version, `sqlite3 <archive> "SELECT store, version FROM
+     schema_meta;"`, if it runs;
+   - file size and modification time (`ls -l` / `Get-Item`), filesystem
+     type, and whether the host had a crash, disk-full, or AV event.
+
+   If support determines the database itself is genuinely needed, that
+   acquisition happens only through an approved, encrypted
+   evidence-transfer procedure agreed with support in advance, with a
+   recorded chain of custody and a confirmed deletion date — never as a
+   ticket attachment, email, or chat upload. Until then the archive stays
+   on this host, `0600` (Linux) / SYSTEM + Administrators only (Windows).
 
 ## Prevention — routine backup
 
 `auth.db` should be backed up alongside the rest of `/var/lib/yuzu` (Linux)
-or `C:\ProgramData\Yuzu` (Windows) on the operator's existing backup
-schedule. The backup procedure must NOT rely on `cp` against the live file
-— SQLite's WAL means a naive `cp` can produce a torn copy that fails
-integrity checks on restore. Use the built-in `.backup` command, which is
-WAL-aware:
+or `C:\ProgramData\Yuzu Server\data` (Windows installer default) on the
+operator's existing backup schedule. The backup procedure must NOT rely on
+`cp` against the live file — SQLite's WAL means a naive `cp` can produce a
+torn copy that fails integrity checks on restore. Use the built-in
+`.backup` command, which is WAL-aware.
+
+Every backup copy is as sensitive as the live file (see the encryption
+requirement below), so the recipe creates it owner-only and verifies that.
+The whole recipe runs inside one `sudo sh -c` so the `umask` applies to the
+`sqlite3` process itself — a `umask` in your own shell is not reliably
+carried across `sudo`:
 
 ```bash
-sudo sqlite3 /var/lib/yuzu/auth.db ".backup /var/backups/yuzu/auth.db.$(date +%s)"
+sudo sh -c 'set -eu
+  umask 077
+  install -d -m 0700 -o root -g root /var/backups/yuzu   # creates or re-tightens
+  out=/var/backups/yuzu/auth.db.$(date +%s)
+  sqlite3 /var/lib/yuzu/auth.db ".backup $out"
+  chmod 0600 "$out"
+  test "$(stat -c %a /var/backups/yuzu)" = 700
+  test "$(stat -c %a "$out")" = 600
+  test "$(sqlite3 "$out" "PRAGMA integrity_check;")" = ok
+  ls -l "$out"'
 ```
 
+On Windows, write into a directory that only SYSTEM and Administrators can
+read, and restrict the file itself too (run elevated):
+
 ```powershell
-sqlite3 C:\ProgramData\Yuzu\auth.db `
-        ".backup C:\backups\yuzu\auth.db.$(Get-Date -Format yyyyMMdd-HHmmss)"
+$dir = 'C:\backups\yuzu'
+New-Item -ItemType Directory -Force $dir | Out-Null
+icacls $dir /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)'
+$out = "$dir\auth.db.$(Get-Date -Format yyyyMMdd-HHmmss)"
+sqlite3 'C:\ProgramData\Yuzu Server\data\auth.db' ".backup '$out'"
+icacls $out /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
+icacls $out    # verify: only NT AUTHORITY\SYSTEM and BUILTIN\Administrators
 ```
 
 Run nightly on the same cadence as the rest of the data-directory backup.
-The backup file is itself a valid SQLite database — restore by stopping the
-service, copying the backup over `auth.db`, and starting the service.
+The backup file is itself a valid SQLite database. **Restore procedure:**
+
+1. Check the backup's integrity before touching anything live.
+2. Stop the service.
+3. Move the live `auth.db` **and any `auth.db-wal` / `auth.db-shm`** aside.
+   A leftover WAL belongs to the old database; if it sits next to the
+   restored file, SQLite can replay its frames into the restored file and
+   corrupt it.
+4. Copy the backup in, owner-only.
+5. Check permissions and integrity again.
+6. Start the service.
+
+Linux (the service runs as `yuzu`, so the restored file must be
+`0600 yuzu:yuzu`):
+
+```bash
+BACKUP=/var/backups/yuzu/auth.db.<timestamp>   # the backup to restore
+sudo systemctl stop yuzu-server
+sudo sh -c 'set -eu; umask 077
+  b="$1"; d=/var/lib/yuzu; ts=$(date +%s)
+  test "$(sqlite3 "$b" "PRAGMA integrity_check;")" = ok
+  for f in auth.db auth.db-wal auth.db-shm; do
+    if [ -e "$d/$f" ]; then mv "$d/$f" "$d/$f.pre-restore-$ts"; fi
+  done
+  install -m 0600 -o yuzu -g yuzu "$b" "$d/auth.db"
+  test "$(stat -c "%a %U:%G" "$d/auth.db")" = "600 yuzu:yuzu"
+  test "$(sudo -u yuzu sqlite3 "$d/auth.db" "PRAGMA integrity_check;")" = ok
+  ls -l "$d"/auth.db*' sh "$BACKUP"
+sudo systemctl start yuzu-server
+```
+
+Windows (run elevated; the `YuzuServer` service runs as LocalSystem):
+
+```powershell
+$backup = 'C:\backups\yuzu\auth.db.<timestamp>'   # the backup to restore
+$data   = 'C:\ProgramData\Yuzu Server\data'
+if ((sqlite3 $backup 'PRAGMA integrity_check;') -ne 'ok') { throw 'backup failed integrity_check' }
+Stop-Service YuzuServer
+$ts = Get-Date -Format yyyyMMdd-HHmmss
+foreach ($f in 'auth.db', 'auth.db-wal', 'auth.db-shm') {
+  if (Test-Path "$data\$f") { Move-Item "$data\$f" "$data\$f.pre-restore-$ts" }
+}
+Copy-Item $backup "$data\auth.db"
+icacls "$data\auth.db" /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)'
+if ((sqlite3 "$data\auth.db" 'PRAGMA integrity_check;') -ne 'ok') { throw 'restored auth.db failed integrity_check' }
+icacls "$data\auth.db"   # verify: only NT AUTHORITY\SYSTEM and BUILTIN\Administrators
+Start-Service YuzuServer
+```
+
+The `*.pre-restore-<timestamp>` files are as sensitive as the live
+database: they keep their `0600` mode (Linux) or data-directory ACL
+(Windows). Delete them once the restored server is confirmed working. If
+the restored backup predates an MFA schema migration, also run
+"Post-restore migration check" below.
 
 <!-- yuzu:claim id=mfa-secret-plaintext-at-rest status=shipped evidence=server/core/src/auth_db.cpp#mfa_totp_secret BLOB -->
 **Backup encryption requirement.** `auth.db` contains the raw TOTP secret
@@ -157,20 +269,22 @@ is `0600`.
 ## Windows: Defender exclusion
 
 On Windows production deploys, Defender's real-time scan can hold the
-`auth.db-wal` file open during agent enrollment storms (multiple concurrent
-writes from the cleanup thread + token validation). The symptom is
+`auth.db-wal` file open during bursts of `auth.db` writes (for example
+failed-login lockout counters during a password spray, or bulk user/MFA
+changes). Agent enrollment does not write `auth.db` at this release
+(enrollment tokens live in `enrollment-tokens.cfg`). The symptom is
 sporadic `SQLITE_BUSY` returns in `[warn]` lines that recover after a
 retry. Adding the data directory to Defender's exclusion list eliminates
 this entirely.
 
 ```powershell
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db'
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db-wal'
-Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu\auth.db-shm'
+Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu Server\data\auth.db'
+Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu Server\data\auth.db-wal'
+Add-MpPreference -ExclusionPath 'C:\ProgramData\Yuzu Server\data\auth.db-shm'
 ```
 
 Or by glob if your policy syntax allows it: `Add-MpPreference
--ExclusionPath 'C:\ProgramData\Yuzu\auth.db*'`.
+-ExclusionPath 'C:\ProgramData\Yuzu Server\data\auth.db*'`.
 
 The exclusion is safe: `auth.db` is written only by `yuzu-server.exe`, the
 file is not user-editable, and password hashes are PBKDF2-SHA256 (salted)
@@ -178,8 +292,13 @@ so a Defender bypass does not weaken credential storage.
 
 ## Filesystem permissions
 
-`auth.db` is created with mode `0600` (owner read/write only) on Linux and
-the equivalent restricted ACL on Windows. If `ls -l` shows anything other
+`auth.db` is re-tightened to mode `0600` (owner read/write only) on every
+open on Linux, and its directory to `0700`. On Windows the server applies
+**no** ACL of its own (the permission call is a no-op there); the installer
+grants Administrators + SYSTEM full control on `C:\ProgramData\Yuzu
+Server\data`, but inherited `ProgramData` entries may still apply — check
+with `icacls "C:\ProgramData\Yuzu Server\data\auth.db"` and remove any
+entry other than SYSTEM and Administrators. If `ls -l` shows anything other
 than `-rw-------` for `auth.db` on Linux, fix it before doing anything else
 — a world-readable `auth.db` exposes password hashes AND plaintext MFA
 secrets for offline attack:
@@ -210,37 +329,29 @@ curl -fsS -X DELETE https://yuzu.internal/api/v1/sessions/me \
      -H "Authorization: Bearer $TOKEN"
 ```
 
-Both are dual-write (in-memory + `auth.db`). If the response body reports
-`db_persisted: false` or the audit row shows `result=partial` with
-`db_error=true`, the in-memory wipe succeeded but the persisted row was not
-cleared — a restart would resurrect it. Verify and remediate:
+The in-memory wipe **is** the revocation: at this release every session
+check reads only the server's in-memory session map. The handler also
+issues a best-effort `DELETE` against the `sessions` table in `auth.db`,
+but that table is a dead mirror — no production code path inserts session
+rows into it or loads sessions from it at boot. So if the response body
+reports `db_persisted: false` or the audit row shows `result=partial` with
+`db_error=true`, the revocation still took effect and **a restart cannot
+resurrect anything**; the partial flag only means the no-op mirror delete
+failed, which is worth investigating as a sign of `auth.db` trouble
+(locking, disk, permissions), not as a live session.
+
+**Last resort — dashboard/API unreachable.** Restart the server. That
+clears every operator session fleet-wide (not just the target user's) and
+needs no database access. Editing the `sessions` table in `auth.db` does
+nothing — sessions are not there. A restart produces no revocation audit
+row, so file an incident note recording the action:
 
 ```bash
-sqlite3 /var/lib/yuzu/auth.db \
-  "SELECT username, expires_at FROM sessions WHERE username = 'alice';"
+sudo systemctl restart yuzu-server
 ```
 
-If rows are returned, repeat the REST call once the DB lock clears
-(typically under a minute), or use the manual flow below and restart.
-
-**Last resort — dashboard/API unreachable.** This is the recipe of last
-resort; it produces no audit row, so file an incident note recording the
-action:
-
-```bash
-# 1. Identify how many sessions exist for the target user.
-sqlite3 /var/lib/yuzu/auth.db \
-  "SELECT username, COUNT(*) FROM sessions GROUP BY username;"
-
-# 2. Wipe every session for the target user.
-sqlite3 /var/lib/yuzu/auth.db \
-  "DELETE FROM sessions WHERE username = 'alice';"
-
-# 3. Restart the server. Without a restart, an already-established
-#    in-memory cookie session remains valid until it next hits the
-#    validate_session check (the cleanup sweeper has a finite window) —
-#    restart guarantees immediate effect fleet-wide.
-systemctl restart yuzu-server   # or service yuzu-server restart
+```powershell
+Restart-Service YuzuServer
 ```
 
 After the restart, verify the target user's previously-issued cookies
@@ -248,9 +359,12 @@ return 401 and that they can re-authenticate normally. File a manual
 audit-log entry referencing the incident ticket so the unaudited DB-level
 action is traceable in the SOC 2 evidence chain.
 
-API tokens are a separate credential class and are **not** revoked by
-either the REST calls or a restart — revoke them explicitly via the token
-endpoints.
+API tokens are a separate credential class. A restart does **not** revoke
+them, and neither does the admin `DELETE /api/v1/sessions?username=` call
+(cookie sessions only) — revoke a compromised user's tokens explicitly via
+the token endpoints. The self-service `DELETE /api/v1/sessions/me` call is
+the exception: it also revokes the caller's own API tokens (reported as
+`api_tokens_revoked` in the response).
 
 ## Account lockout recovery
 
@@ -317,7 +431,7 @@ exits **without starting the server**. It writes an audit row
 `auth.db`'s companion audit store.
 
 ```bash
-sudo -u _yuzu yuzu-server \
+sudo -u yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --data-dir /var/lib/yuzu \
   --mfa-reset alice
@@ -333,8 +447,13 @@ service account — that is an operational expectation, not a code-enforced
 gate. Treat host access to `auth.db` as equivalent to MFA-reset authority
 over every account:
 
-- Run on the server host as the service account (`_yuzu` / `yuzu` /
-  `NT SERVICE\YuzuAgent`; see `docs/agent-privilege-model.md`).
+- Run on the server host as the server's service account: `yuzu` on Linux
+  (the shipped `yuzu-server.service` sets `User=yuzu`); on Windows the
+  `YuzuServer` service runs as LocalSystem, so run it from an elevated
+  prompt with `--config "C:\ProgramData\Yuzu Server\yuzu-server.cfg"
+  --data-dir "C:\ProgramData\Yuzu Server\data"`. (The `_yuzu` /
+  `NT SERVICE\YuzuAgent` accounts in `docs/agent-privilege-model.md` are
+  the *agent daemon's*, not the server's.)
 - Keep `data-dir` (and `auth.db`) `0700`/`0600`, service-account owned.
 - Gate the invocation behind a narrow `sudoers` entry — ideally a dedicated
   break-glass group with a separate approver. The audit principal is the
@@ -359,9 +478,17 @@ audit row** — record it manually.
 
 ```bash
 sudo systemctl stop yuzu-server   # optional but safer — avoids contending SQLite
-sudo cp /var/lib/yuzu/auth.db /var/lib/yuzu/auth.db.before-mfa-rescue.$(date +%s)
 
-sudo -u _yuzu sqlite3 /var/lib/yuzu/auth.db <<'SQL'
+# Owner-only, WAL-safe snapshot first (same pattern as "Prevention — routine
+# backup"); it holds every password hash and TOTP seed, so it stays 0600 on-host.
+sudo sh -c 'set -eu; umask 077
+  out=/var/lib/yuzu/auth.db.before-mfa-rescue.$(date +%s)
+  sqlite3 /var/lib/yuzu/auth.db ".backup $out"
+  chmod 0600 "$out"
+  test "$(sqlite3 "$out" "PRAGMA integrity_check;")" = ok
+  ls -l "$out"'
+
+sudo -u yuzu sqlite3 /var/lib/yuzu/auth.db <<'SQL'
 UPDATE users
    SET mfa_totp_secret  = NULL,
        mfa_enrolled_at  = NULL,
@@ -389,7 +516,7 @@ armed**, and arming is an out-of-band host CLI operation so it works when the
 IdP does not.
 
 ```bash
-sudo -u _yuzu yuzu-server \
+sudo -u yuzu yuzu-server \
   --config /etc/yuzu/yuzu-server.cfg \
   --data-dir /var/lib/yuzu \
   --break-glass-user alice \
@@ -457,9 +584,36 @@ record.
 ## What you cannot recover from
 
 - **Lost `yuzu-server.cfg` and a lost/unreadable `auth.db`.** The config is
-  the seed for the admin account on first boot. If both are gone, run
-  `yuzu-server --first-run-setup` to create a new admin interactively and
-  write a fresh config.
+  the seed for the admin account on first boot. If both are gone, the
+  original accounts are unrecoverable; create new ones with first-run
+  setup. There is no flag for it — `yuzu-server` enters it automatically
+  when the config file (`--config`, default `/etc/yuzu/yuzu-server.cfg` on
+  Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows — the Windows
+  installer passes `C:\ProgramData\Yuzu Server\yuzu-server.cfg`) is missing
+  or contains no users. It prompts on the terminal for an admin account
+  and password and a second, non-admin account and password (passwords at
+  least 12 characters, entered twice), writes the config, and then
+  **continues booting the server in the foreground**. It needs an
+  interactive terminal: under systemd or the Windows service there is no
+  stdin, setup fails (`First-run setup failed — exiting`), and the unit
+  crash-loops into `start-limit-hit`. So stop the service, move any
+  unreadable `auth.db` aside as in "Recovery procedure" above, run the
+  binary by hand with the service's own arguments, then stop it and start
+  the service (if the foreground run instead exits with `[PG] Refusing to
+  start` because the unit's `/etc/yuzu/yuzu-server.env` DSN is not loaded
+  in your shell, that is harmless — the config was already written):
+
+  ```bash
+  sudo systemctl stop yuzu-server
+  sudo -u yuzu /usr/local/bin/yuzu-server --data-dir /var/lib/yuzu
+  # answer the prompts; after "Configuration saved to ..." press Ctrl-C
+  sudo systemctl reset-failed yuzu-server; sudo systemctl start yuzu-server
+  ```
+
+  On Linux/macOS the password prompts **echo what you type** at this
+  release — clear the terminal scrollback afterwards and do not run it
+  inside a recorded session. Change the second account's password or
+  remove it after first login if you do not need it.
 - **Encrypted backups whose key is also lost.** Standard; nothing
   Yuzu-specific — `auth.db` itself needs no key at this release (see
   above), but if *you* chose to encrypt the backup file and lost that
@@ -515,7 +669,7 @@ move aside. The detection table above does not apply; instead:
 
 **Postgres substrate unreachable.** Confirm from the Yuzu host, as the
 service account, using the server's own DSN:
-`sudo -u _yuzu psql "$YUZU_POSTGRES_DSN" -c 'SELECT 1'`. Work the usual
+`sudo -u yuzu psql "$YUZU_POSTGRES_DSN" -c 'SELECT 1'`. Work the usual
 causes: Postgres service down; `pg_hba.conf` rejecting the host/user; TLS
 mismatch; network path; credential rotation; connection limit exhausted.
 Yuzu restarts cleanly once Postgres is reachable — no auth data is lost by
@@ -616,7 +770,7 @@ pair, from the same point in time, and restore them as a pair:
 
 ```bash
 STAMP=$(date +%Y%m%dT%H%M%SZ)
-sudo -u _yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
+sudo -u yuzu pg_dump "$YUZU_POSTGRES_DSN" --format=custom \
      > /var/backups/yuzu/yuzu-$STAMP.dump
 sudo tar -czf /var/backups/yuzu/yuzu-keys-$STAMP.tar.gz \
      -C /etc/yuzu certs
@@ -631,7 +785,7 @@ taken before the rotation completed); drill it — restore into a scratch
 database + scratch keys directory and verify a real TOTP login succeeds.
 
 `SecretCodec::init()` failing at boot means the KEK is missing/unreadable
-— check ownership/permissions (`sudo -u _yuzu ls -l
+— check ownership/permissions (`sudo -u yuzu ls -l
 /etc/yuzu/certs/secrets-kek-v*.key`); absent on a fresh install is normal
 (the server generates one and logs it); absent on an existing install
 means the KEK has been lost — do **not** let the server generate a new one

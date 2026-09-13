@@ -29,6 +29,13 @@ exists at its cited line, every alert matches on `expr`, `for`, and
 `severity`), which is a narrower claim than "these SLOs would have caught
 the outage."
 
+**Citation ref.** Every `file:line` citation in this document is pinned to
+commit `c7f3a5bed9c969684b4c4b1799ad77149984c1c3` (this branch's merge-base
+with `origin/dev`, 2026-09-12) — **not** the `v0.13.0` tag and not a moving
+`dev`-HEAD. `server/core/src` churns fast; line numbers drift within days.
+Re-verify any citation with `git grep -n <metric_name> c7f3a5bed -- server/core/src`
+(or against your own ref) rather than trusting the number.
+
 **PO decision 2026-09-07** — the targets in this document were set by the
 product owner on that date and are to be **re-baselined after 90 days of
 production data**. No production Yuzu fleet exists yet (`docs/capability-map.md`
@@ -109,7 +116,7 @@ listener — see that doc's "What you get").
 ## 2. Command dispatch latency (p99)
 
 **Metric:** `yuzu_command_duration_seconds` — histogram, described
-`server/core/src/server.cpp:555`, observed at
+`server/core/src/server.cpp:600`, observed at
 `server/core/src/agent_service_impl.cpp:1438` and `:1726`.
 
 **Target:** p99 < 10s for ≥99% of 5-minute windows / 30d.
@@ -137,7 +144,7 @@ alert's own window below).
 
 **Metric:** `yuzu_agents_connected` − `yuzu_fleet_agents_healthy` (both
 gauges, `server/core/src/agent_registry.cpp:191,349,369` and `:2237`
-respectively; described `server.cpp:498`). A positive value means agents are
+respectively; described `server.cpp:543` and `:1985` respectively). A positive value means agents are
 connected but not producing a recent heartbeat. **Caveat:** the two gauges
 are independently updated (connect/disconnect events vs. a periodic
 healthy-count recomputation), so under churn — agents connecting and
@@ -180,9 +187,9 @@ connected count over 5m, `severity: critical`), which is a different signal
 ## 4. Audit write success
 
 **Metric:** `yuzu_server_audit_emit_failed_total` (gauge-published counter,
-`server/core/src/server.cpp:7830`, described `:2388`) and
+`server/core/src/server.cpp:8098`, described `:2447`) and
 `yuzu_server_audit_events_total{result}` (success/failure/denied/other,
-`server.cpp:7821-7827`) for the write-outcome breakdown.
+`server.cpp:8089-8095`, described `:2432`) for the write-outcome breakdown.
 
 **Target:** **0 emit failures / 30d — a fail-closed CONTROL, not a
 percentage (SLO = 100%).** Per ADR-0040, every behavioural-PII REST route
@@ -243,9 +250,12 @@ success.
 
 ## 5. PostgreSQL substrate degrade events
 
-Three related metrics, all described/incremented in
-`server/core/src/server.cpp` (`:1653`, `:1657`, `:1662`, `:1670`, `:1677`,
-`:3937`, `:3951`) — split into three targets per PO ruling, since pool
+Three related metrics, all described/published in
+`server/core/src/server.cpp` — described at `:1712` (`yuzu_pg_pool_in_use`),
+`:1716` (`yuzu_pg_pool_size`), `:1721` (`yuzu_pg_connect_failed_total`),
+`:1729` (`yuzu_pg_acquire_wait_seconds`, histogram registered `:1736`); the
+two pool gauges set at `:7684-7687`; the connect-failure counter incremented
+at `:4051`; the acquire-wait histogram observed at `:4065` — split into three targets per PO ruling, since pool
 saturation, acquire latency, and hard connect failure are different failure
 modes with different tolerances.
 
@@ -317,9 +327,14 @@ docker run --rm --entrypoint /bin/promtool \
   prom/prometheus:v3.2.1@sha256:6927e0919a144aa7616fd0137d4816816d42f6b816de3af269ab065250859a62 \
   check rules /r/yuzu-alerts.yml
 ```
-Expected output: `SUCCESS: 116 rules found` (115 alert rules + 1 recording
-rule — see `docs/enterprise-readiness-soc2-first-customer.md` §3.4 for
-where that count is cross-checked against a raw `grep -c` of the file).
+Expected output at commit `c7f3a5bed` (this branch's merge-base with
+`origin/dev`): `SUCCESS: 117 rules found` — 116 alert rules + 1 recording
+rule; `promtool` counts both kinds together as "rules". The file churns, so
+re-derive the split at your own ref rather than trusting these numbers:
+`grep -cE '^\s*- alert:' docs/prometheus/yuzu-alerts.yml` and
+`grep -cE '^\s*- record:' docs/prometheus/yuzu-alerts.yml` (see also
+`docs/enterprise-readiness-soc2-first-customer.md` §3.4, which cites the
+same count at the same ref).
 See #2857 for why no shipped stack on this branch loads these rules at
 all today. An attempt at wiring them into a running Prometheus — and the
 real infrastructure defects that attempt found (a merge order and a
@@ -327,7 +342,8 @@ from-scratch startup path that both silently produce zero loaded rules;
 verification commands that pass in exactly that broken case; reload
 staleness; a missing self-scrape job; a missing retention flag) — is
 tracked separately from this branch (issue #2857). The honest
-claim on this branch is **"these 115 rules exist and parse"** (`promtool
+claim on this branch is **"these 117 rules (116 alerts + 1 recording rule,
+at `c7f3a5bed`) exist and parse"** (`promtool
 check rules`, above — a real, CI-checkable fact) — **not** "these rules
 are evaluated by a live system," which this branch cannot substantiate
 regardless of what that separately-tracked work eventually proves.

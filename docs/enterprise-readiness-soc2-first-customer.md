@@ -350,11 +350,16 @@ branch's copy of `docs/operations/disaster-recovery.md`,
 `origin/dev` (pre-fix) versions — do not treat any DR-procedure defect as
 fixed or verified in this checkout.
 
-**`docs/prometheus/yuzu-alerts.yml`'s 115 alert rules + 1 recording
-rule (116 total per `promtool check rules` — measured at the time of this
-writing, not CI-bound to this figure; re-derive with `promtool check
-rules` rather than trusting this number, the file is actively churning and
-nothing gates this citation, `slo.md`, or the matrix to it) are evaluated
+**`docs/prometheus/yuzu-alerts.yml`'s 116 alert rules + 1 recording
+rule (117 total per `promtool check rules`, which counts both kinds as
+"rules" — counted at commit `c7f3a5bed`, this branch's merge-base with
+`origin/dev`, 2026-09-12; NOT the `v0.13.0` tag this document is otherwise
+anchored to, which ships 28 alert rules + 1 recording rule. Not CI-bound to
+either figure; re-derive at your own ref with `grep -cE '^\s*- alert:'
+docs/prometheus/yuzu-alerts.yml` and `grep -cE '^\s*- record:'
+docs/prometheus/yuzu-alerts.yml` rather than trusting this number — the file
+is actively churning and nothing gates this citation, `slo.md`, or the
+matrix to it) are evaluated
 by no shipped Prometheus stack on this branch — #2857 remains open here.**
 An attempt at wiring one (mount the file into a running UAT Prometheus),
 the real infrastructure defects that attempt turned up (a wrong `-f` merge
@@ -388,8 +393,8 @@ no shipped replacement when that legacy file was superseded:
 Three of the ten (`YuzuAgentDisconnected`, `YuzuHighCommandFailureRate`,
 `YuzuHighCommandLatency`) do have canonical equivalents and were not lost.
 None of the seven retired rules is restored here — `docs/prometheus/yuzu-alerts.yml`
-is not an owned file of this change — this table exists so "115 alert
-rules ship" is not read as "every alert this project has ever had still
+is not an owned file of this change — this table exists so "116 alert
+rules ship" (at `c7f3a5bed`, above) is not read as "every alert this project has ever had still
 ships". Tracked: **issue #4231** (the coverage gap for these seven,
 confirmed by two independent measurements to affect no audit/auth/certificate-expiry
 signal and no shipped rig — the deleted file was never loaded by anything).
@@ -457,7 +462,7 @@ unchanged from what this table previously presented as current.
 
 | Store | File | Data class | Retention | Deletion mechanism | Configurable via |
 |---|---|---|---|---|---|
-| Audit trail (SOC 2 evidence chain) | SQLite `audit.db` at `v0.13.0` (`audit_events` table) | Security-relevant activity: operator actions, plus agent enrolment, fleet-topology events and background schedule execution | 365 days default, TTL stamped at INSERT | `AuditStore::run_cleanup` on a background thread (`cleanup_interval_min`, default 60 min) deletes rows past their TTL — no clock guard, no cross-replica coordination (a single SQLite file has no replica to coordinate with). Writes fail hard (`503` + `Sec-Audit-Failed`); reads deny-on-degrade — both true at this release, independent of storage backend. **The clock-guarded, capped, single-sweeper-fleet-wide PostgreSQL mechanism (ADR-0040), its alert-coverage measurement, and the capacity-ceiling figures are `dev`-HEAD-only** — see "Not in v0.13.0" below. | `audit_retention_days` |
+| Audit trail (SOC 2 evidence chain) | SQLite `audit.db` at `v0.13.0` (`audit_events` table) | Security-relevant activity: operator actions, plus agent enrolment, fleet-topology events and background schedule execution | 365 days default, TTL stamped at INSERT | `AuditStore::run_cleanup` on a background thread (`cleanup_interval_min`, default 60 min) deletes rows past their TTL — no clock guard, no cross-replica coordination (a single SQLite file has no replica to coordinate with). On the security-mutation surfaces that check it, a failed audit write is reported to the caller (`Sec-Audit-Failed`, e.g. `auth_routes.cpp:2919`, `ca_routes.cpp:450`). Reads do **not** deny-on-degrade at this release: `AuditStore::query` returns an empty result when the DB is unavailable or a prepare fails (`audit_store.cpp:179-180,261-262`), which reads as "no events". Deny-on-degrade reads are `dev`-HEAD-only (ADR-0040). **The clock-guarded, capped, single-sweeper-fleet-wide PostgreSQL mechanism (ADR-0040), its alert-coverage measurement, and the capacity-ceiling figures are `dev`-HEAD-only** — see "Not in v0.13.0" below. | `audit_retention_days` |
 | Response store | SQLite `response_store.db` at `v0.13.0` (`responses`, `response_facets`) | Agent command/instruction results | 90 days | `ResponseStore` cleanup thread (TTL at insert), not clock-guarded. **PostgreSQL migration (ADR-0039) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | `response_retention_days` |
 | Guaranteed-state rules | SQLite `guaranteed-state.db` at `v0.13.0` (`guaranteed_state_rules`) | Rule definitions (configuration) | Indefinite — lifecycle via explicit delete | REST DELETE / `delete_rule`. **PostgreSQL migration (ADR-0038) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | n/a |
 | Guaranteed-state events | SQLite `guaranteed-state.db` at `v0.13.0` (`guaranteed_state_events`) | Drift/remediation telemetry (high-volume operational) | **30 days default** | `GuaranteedStateStore::run_cleanup` thread — bare `DELETE … WHERE ttl_expires_at > 0 AND ttl_expires_at < now`, no clock guard. **PostgreSQL migration (ADR-0038) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | `guardian_event_retention_days` |
