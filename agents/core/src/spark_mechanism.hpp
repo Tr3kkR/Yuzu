@@ -260,8 +260,29 @@ make_registry_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 /// with libsystemd, one alertable-wait thread + one SCM connection servicing N
 /// `NotifyServiceStatusChangeW` registrations on Windows — and `nullptr` on
 /// macOS or a Linux build without libsystemd (`systemd_guard` meson option),
-/// where arm(Service) is then rejected per the platform contract above.
+/// where arm(Service) is then rejected per the platform contract above. This
+/// zero-argument form constructs the mechanism with NO shared F3 counter (on
+/// Windows, its detached establishment probes are then counted only
+/// lane-locally; the Linux mechanism has no detached workers at all, so the
+/// counter is unused there regardless) - it exists for tests and the
+/// platform-capability cross-check; production wiring uses the counter-taking
+/// overload below (#2012/#3840 PR-B3, mirrors make_registry_mechanism's split).
 [[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism> make_service_mechanism();
+
+/// Production factory (#2012/#3840 PR-B3): the same mechanism, with the
+/// Windows mechanism's discovery-probe SparkDetachedLane constructed over
+/// `f3_counter` - the agent-lifetime orphan-exit counter
+/// (AgentImpl::spark_detached_workers_) that guardian_active_io_workers()
+/// sums, so a probe still parked at shutdown is visible to the F3 hard-exit
+/// decision (spark_detached_call.hpp, "F3 / §24"). Same platform contract as
+/// the zero-argument form: real on Windows and on Linux-with-libsystemd,
+/// `nullptr` on macOS or Linux-without-libsystemd. The Linux mechanism
+/// accepts and ignores `f3_counter` (it launches no detached workers - only
+/// the Windows SCM half restructures off `mech_ops_mu_by_type_`, per
+/// #3840's Windows-only scope). A null counter is accepted and behaves like
+/// the zero-argument form.
+[[nodiscard]] YUZU_EXPORT std::unique_ptr<ISparkMechanism>
+make_service_mechanism(std::shared_ptr<std::atomic<std::size_t>> f3_counter);
 
 /// Test seam (#2839): make the NEXT retire of a cancelled DirWatch run `hook` immediately
 /// before the file mechanism grows `retiring_` to take ownership of it — the one statement
@@ -563,5 +584,60 @@ set_registry_test_controls_for_test(ISparkMechanism& mech, RegistryMechanismTest
 /// nullopt on every non-Windows platform and for any other mechanism type.
 [[nodiscard]] YUZU_EXPORT std::optional<RegistryMechanismDebugCounters>
 registry_debug_counters_for_test(const ISparkMechanism& mech);
+
+/// Test controls for the Windows Service mechanism (#2012/#3840 PR-B3 - the
+/// probe-only `OpenServiceW` establishment restructure; unlike Registry/File
+/// there is deliberately NO drain lane here - see spark_service.cpp's header
+/// comment for why). Same TU-boundary free-function shape as
+/// RegistryMechanismTestControls above, for the same reason (the class lives
+/// in spark_service.cpp's anonymous namespace). Zero / empty means "leave
+/// unchanged"; a null `probe_hook` clears any installed hook. Set-then-use: no
+/// concurrent-access support. Only meaningful for the WINDOWS Service
+/// mechanism - the Linux sd-bus mechanism has no probe lane to control.
+struct ServiceMechanismTestControls {
+    /// Runs on the detached probe worker, BEFORE its own OpenServiceW call,
+    /// with the service name being probed (the original, unfolded name).
+    /// Parking here models a hung/unresponsive SCM; throwing models a probe
+    /// that failed inside the worker (surfaces as a WorkerThrew backend
+    /// failure). Null clears it.
+    std::function<void(std::wstring_view name)> probe_hook;
+    std::size_t probe_lane_cap{0};
+    std::chrono::milliseconds health_grace{0};
+    std::chrono::milliseconds admission_backoff_seed{0};
+};
+
+/// Mechanism-internal counters the public SparkMechanismStats does not carry.
+/// Point-in-time skew like SparkMechanismStats - never derive an invariant
+/// across two fields. Test-visible surface only (mirrors
+/// RegistryMechanismDebugCounters's probe-side fields; Service has no drain
+/// lane, so there is no drains_* equivalent here).
+struct ServiceMechanismDebugCounters {
+    std::uint64_t probe_launched{0};
+    std::uint64_t probe_admission_rejected{0};
+    std::uint64_t probe_launch_failed{0};
+    std::uint64_t probe_backend_failed{0};
+    std::uint64_t probe_discarded{0};
+    std::uint64_t health_edges{0};
+    std::size_t probe_workers_active{0};
+    // Deliberately NO live_watches/retiring fields, unlike
+    // RegistryMechanismDebugCounters above: Service's svcs_/retiring_ are
+    // mechanism-thread-confined with NO lock (unlike Registry's watches_,
+    // which is mu_-guarded), so reading their .size() from this struct's
+    // caller thread while run() concurrently inserts/erases would be a real
+    // data race, not merely a point-in-time skew like every other field
+    // here. See WindowsServiceMechanism::debug_counters()'s own comment.
+};
+
+/// Returns true if `mech` is the Windows Service mechanism and the controls
+/// were applied; false on every non-Windows platform, for the Linux sd-bus
+/// mechanism, and for any other mechanism type (a caller that forgets to
+/// check gets a visible false).
+[[nodiscard]] YUZU_EXPORT bool
+set_service_test_controls_for_test(ISparkMechanism& mech, ServiceMechanismTestControls controls);
+
+/// nullopt on every non-Windows platform, for the Linux sd-bus mechanism, and
+/// for any other mechanism type.
+[[nodiscard]] YUZU_EXPORT std::optional<ServiceMechanismDebugCounters>
+service_debug_counters_for_test(const ISparkMechanism& mech);
 
 } // namespace yuzu::agent

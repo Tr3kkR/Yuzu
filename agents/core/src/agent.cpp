@@ -1240,17 +1240,20 @@ public:
                         spdlog::warn("SparkEngine: register {} mechanism failed: {}",
                                      spark_type_token(type), r.error());
                 };
-                // File and Registry both take the shared F3 counter (#2012/#3840
-                // PR-B1 for Registry, PR-B2 for File): their detached discovery
+                // File, Registry, and Service all take the shared F3 counter
+                // (#2012/#3840 PR-B1 for Registry, PR-B2 for File, PR-B3 for
+                // Service's Windows probe lane): their detached discovery
                 // workers are admitted against spark_detached_workers_, which
-                // guardian_active_io_workers() sums. Passed unconditionally - the
-                // platform split lives inside each factory (real on Windows,
-                // nullptr elsewhere), same as the zero-argument forms. Service
-                // keeps the zero-argument form until its own restructure (PR-B3)
-                // adds a lane.
+                // guardian_active_io_workers() sums. Passed unconditionally -
+                // the platform split lives inside each factory (real on
+                // Windows for all three, plus Linux-with-libsystemd for
+                // Service, nullptr elsewhere), same as the zero-argument
+                // forms. Service's Linux mechanism accepts and ignores the
+                // counter (it launches no detached workers - only the
+                // Windows SCM half restructures off mech_ops_mu_by_type_).
                 try_register(SparkType::File, make_file_mechanism(spark_detached_workers_));
                 try_register(SparkType::Registry, make_registry_mechanism(spark_detached_workers_));
-                try_register(SparkType::Service, make_service_mechanism());
+                try_register(SparkType::Service, make_service_mechanism(spark_detached_workers_));
                 spark_engine_->start();
                 spdlog::info("SparkEngine: instantiated OBSERVE-ONLY (no consumer at rung 1); "
                              "Guardian detection path = legacy IGuard (enforcing)");
@@ -4021,7 +4024,8 @@ private:
     // guardian_active_io_workers() below, additively with guardian_'s own
     // count. First consumer: the Windows Registry mechanism (PR-B1, handed in
     // via make_registry_mechanism(spark_detached_workers_) in the spark boot
-    // block); File and Service follow in PR-B2/PR-B3.
+    // block); File (PR-B2) and the Windows Service mechanism (PR-B3) both
+    // followed the same shape.
     //
     // DEFAULT MEMBER INITIALIZER, DELIBERATELY - NOT declaration-order-
     // coupled to spark_engine_/guardian_ the way THEY are coupled to each
