@@ -40,7 +40,16 @@ ScopePreviewOutcome preview_scope_targets(const std::string& expression,
     for (const auto& a : agents) {
         auto agent_id = a.value("agent_id", "");
         std::unordered_map<std::string, std::string> attrs;
-        attrs["os"] = a.value("os", "");
+        // Gate 8 BLOCKING fix (#2146 Batch B2 review): the DSL's canonical OS
+        // attribute is "ostype" (agent_registry.cpp's real dispatch
+        // resolver, docs/user-manual/scope-engine.md), not "os" - this
+        // resolver populated the wrong key, so ostype=="linux" always
+        // resolved unset (matched_count silently 0) and, worse,
+        // ostype!="linux" resolved unset-not-equal-to-"linux" as true for
+        // EVERY agent regardless of its real OS - a preview whose entire
+        // purpose is "show what a real dispatch would target" silently
+        // returning the wrong device set as correct.
+        attrs["ostype"] = a.value("os", "");
         attrs["arch"] = a.value("arch", "");
         attrs["hostname"] = a.value("hostname", "");
         attrs["agent_version"] = a.value("agent_version", "");

@@ -8180,8 +8180,13 @@ TEST_CASE("MCP Integration: tools/call preview_scope_targets", "[mcp][integratio
     McpTestServer ts;
     ts.start();
 
+    // Gate 8 BLOCKING fix (#2146 Batch B2 review): this test used the wrong
+    // DSL attribute name ("os" instead of the canonical "ostype",
+    // agent_registry.cpp's real dispatch resolver) - it happened to pass
+    // because scope_preview.cpp's resolver had the SAME bug, locking a
+    // silent wrong-result defect in as "expected" rather than catching it.
     auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"preview_scope_targets","arguments":{"expression":"os == \"linux\""}}})");
+        R"({"jsonrpc":"2.0","method":"tools/call","id":21,"params":{"name":"preview_scope_targets","arguments":{"expression":"ostype == \"linux\""}}})");
     REQUIRE(res);
     CHECK(res->status == 200);
 
@@ -8192,10 +8197,55 @@ TEST_CASE("MCP Integration: tools/call preview_scope_targets", "[mcp][integratio
     REQUIRE(content.size() >= 1);
 
     auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
-    CHECK(text["expression"] == "os == \"linux\"");
+    CHECK(text["expression"] == "ostype == \"linux\"");
     CHECK(text["matched_count"] == 1);
     REQUIRE(text["matched_agents"].is_array());
     CHECK(text["matched_agents"][0] == "agent-001");
+}
+
+TEST_CASE("MCP Integration: preview_scope_targets negating an unresolved atom does NOT "
+          "silently match the whole fleet",
+          "[mcp][integration]") {
+    // Gate 8 BLOCKING fix (#2146 Batch B2 review): preview_scope_targets'
+    // resolver never populates from_result_set:/props.* (only
+    // os(now ostype)/arch/hostname/agent_version/tag:* are resolved), so a
+    // bare from_result_set:<id> atom always resolves unset -> correctly
+    // matches nothing. But NOT of an unset atom flips to true for every
+    // agent -- the identical "NOT inverts a no-match atom into a
+    // fleet-wide match" defect class docs/scope-walking-design.md already
+    // tracks as a fixed M1 governance issue for the REAL dispatch path,
+    // reproduced here (dsl-engineer, Gate 8) as still live on this preview
+    // surface. This test pins the honest (documented) failure direction so
+    // a future fix can't silently regress to the fleet-wide-match shape.
+    McpTestServer ts;
+    ts.start();
+
+    auto bare = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":22,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"from_result_set:rs_does_not_exist"}}})");
+    REQUIRE(bare);
+    CHECK(bare->status == 200);
+    auto bare_body = nlohmann::json::parse(bare->body);
+    auto bare_text =
+        nlohmann::json::parse(bare_body["result"]["content"][0]["text"].get<std::string>());
+    // Documented (correct) direction: an unresolved atom never matches.
+    CHECK(bare_text["matched_count"] == 0);
+
+    auto negated = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":23,)"
+        R"("params":{"name":"preview_scope_targets","arguments":)"
+        R"({"expression":"NOT from_result_set:rs_does_not_exist"}}})");
+    REQUIRE(negated);
+    CHECK(negated->status == 200);
+    auto negated_body = nlohmann::json::parse(negated->body);
+    auto negated_text =
+        nlohmann::json::parse(negated_body["result"]["content"][0]["text"].get<std::string>());
+    // KNOWN GAP (tracked, #4307): negating an unresolved atom currently
+    // matches the whole visible fleet (2 agents), not zero. This assertion
+    // pins the CURRENT behavior so a silent regression is caught either
+    // way; it is not an endorsement of this outcome as correct.
+    CHECK(negated_text["matched_count"] == 2);
 }
 
 // ── 22. Multiple sequential requests on same server ─────────────────────────
@@ -20711,6 +20761,86 @@ TEST_CASE("MCP create_result_set_from_tar_query: a non-boolean include_empty is 
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == kInvalidParams);
+}
+
+// Gate 8 BLOCKING fix (#2146 Batch B2 review): the Gate 4/6 fix round removed
+// retry_after_ms from these two error paths on the "NEVER re-send after a
+// real dispatch has fired" reasoning, but shipped with no test exercising
+// either branch - a false-green closure claim (the full-suite "green" run
+// cited as evidence could not have caught a regression here). Both tests
+// below pin the honest absence of a retry hint.
+TEST_CASE("MCP result-sets: a dispatch_fn that throws never carries a retry hint - "
+          "poll executions instead of blindly re-sending",
+          "[mcp][integration][result-sets]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    auto throwing_dispatch =
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        throw std::runtime_error("dispatch backend unavailable");
+    };
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(throwing_dispatch, "operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("poll executions") !=
+          std::string::npos);
+    // No retry_after_ms field at all on this path (a4_error's "no hint" is a
+    // null literal, not an omission) - assert the field is present and null,
+    // never a positive number a caller could misread as "safe to re-send."
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fired never "
+          "carries a retry hint - poll executions instead of blindly re-sending",
+          "[mcp][integration][result-sets]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    // Break the store's own schema AFTER construction (is_open() already
+    // latched true) so create_pending() fails with DbError specifically -
+    // the dispatch itself must still succeed first, matching the real
+    // "bookkeeping row failed to persist after the fleet was already
+    // reached" scenario this branch exists for.
+    {
+        auto lease = rs_bundle.pool().try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        auto dropped = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA result_set_store CASCADE", std::vector<std::string>{});
+        REQUIRE(dropped.status() == PGRES_COMMAND_OK);
+    }
+
+    auto succeeding_dispatch =
+        [](const std::string&, const std::string&, const std::vector<std::string>&,
+           const std::string&, const std::unordered_map<std::string, std::string>&,
+           const std::string&,
+           const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 1, .command_id = "cmd-dberror"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(succeeding_dispatch, "operator");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"create_result_set_from_tar_query","arguments":{"sql":"SELECT 1"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("do not re-send") !=
+          std::string::npos);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
 }
 
 TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "

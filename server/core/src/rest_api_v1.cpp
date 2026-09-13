@@ -8594,8 +8594,32 @@ void RestApiV1::register_routes(
 
     if (inventory_store) {
         sink.Post("/api/v1/inventory/evaluate",
-                  [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                      if (!perm_fn(req, res, "Inventory", "Read"))
+                  [fleet_read_fn, inventory_store](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                      // SECURITY (CWE-862, missing authorization) - Gate 8 BLOCKING
+                      // fix (#2146 Batch B2 review): this is the third caller of
+                      // evaluate_inventory() and was the ONE left on a bare
+                      // perm_fn(Inventory, Read) after the other two callers
+                      // (create_result_set_from_inventory_query, both transports)
+                      // were fixed in this same PR for the identical defect - a
+                      // management-group-confined caller (or any Inventory:Read
+                      // holder narrower than the whole fleet) could enumerate
+                      // fleet-wide device-identity + inventory-attribute
+                      // correlation. fleet_read_fn REPLACES the permission check
+                      // (it already performs the RBAC check internally) and the
+                      // candidate records are narrowed to gate.scope below -
+                      // same pattern as GET /api/v1/inventory/software and this
+                      // PR's own from-inventory-query fix.
+                      if (!fleet_read_fn) {
+                          spdlog::error("inventory.evaluate: fleet_read_fn unwired - "
+                                        "misconfigured call site; failing closed");
+                          res.status = 503;
+                          res.set_content(detail::a4_error(res, "service unavailable"),
+                                          "application/json");
+                          return;
+                      }
+                      auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+                      if (!gate.admitted)
                           return;
                       if (!inventory_store->is_open()) {
                           res.status = 503;
@@ -8610,11 +8634,25 @@ void RestApiV1::register_routes(
                           return;
                       }
 
+                      // Gate 8 fix (#2146 Batch B2 review): .get<std::string>()
+                      // throws nlohmann::json::type_error on a type mismatch -
+                      // it does not coerce. Validate explicitly, matching the
+                      // sibling routes' fix for the identical defect class.
+                      if (body.contains("agent_id") && !body["agent_id"].is_string()) {
+                          res.status = 400;
+                          res.set_content(detail::a4_error(res, "agent_id must be a JSON string"),
+                                          "application/json");
+                          return;
+                      }
+                      if (body.contains("combine") && !body["combine"].is_string()) {
+                          res.status = 400;
+                          res.set_content(detail::a4_error(res, "combine must be a JSON string"),
+                                          "application/json");
+                          return;
+                      }
                       InventoryEvalRequest eval_req;
-                      if (body.contains("agent_id"))
-                          eval_req.agent_id = body["agent_id"].get<std::string>();
-                      if (body.contains("combine"))
-                          eval_req.combine = body["combine"].get<std::string>();
+                      eval_req.agent_id = body.value("agent_id", "");
+                      eval_req.combine = body.value("combine", "all");
                       if (body.contains("conditions") && body["conditions"].is_array()) {
                           // Gate 8 fix (#2146 Batch B2 follow-up): same
                           // kMaxInventoryConditions pre-check as the result-set
@@ -8636,15 +8674,23 @@ void RestApiV1::register_routes(
                               return;
                           }
                           for (const auto& c : body["conditions"]) {
+                              if (!c.is_object()) {
+                                  res.status = 400;
+                                  res.set_content(
+                                      detail::a4_error(res, "each condition must be a JSON object"),
+                                      "application/json");
+                                  return;
+                              }
+                              auto field_str = [&c](const char* key) -> std::string {
+                                  return (c.contains(key) && c[key].is_string())
+                                             ? c[key].get<std::string>()
+                                             : "";
+                              };
                               InventoryCondition cond;
-                              if (c.contains("plugin"))
-                                  cond.plugin = c["plugin"].get<std::string>();
-                              if (c.contains("field"))
-                                  cond.field = c["field"].get<std::string>();
-                              if (c.contains("op"))
-                                  cond.op = c["op"].get<std::string>();
-                              if (c.contains("value"))
-                                  cond.value = c["value"].get<std::string>();
+                              cond.plugin = field_str("plugin");
+                              cond.field = field_str("field");
+                              cond.op = field_str("op");
+                              cond.value = field_str("value");
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -8662,8 +8708,14 @@ void RestApiV1::register_routes(
                                           "application/json");
                           return;
                       }
+                      // Narrow to the caller's admitted scope BEFORE evaluation -
+                      // gate.scope is the sole filter, mirroring
+                      // from-inventory-query's own identical fix above.
                       std::vector<std::pair<std::string, std::string>> records;
+                      records.reserve(records_raw->size());
                       for (const auto& r : *records_raw) {
+                          if (!authz::in_scope(gate.scope, r.agent_id))
+                              continue;
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
