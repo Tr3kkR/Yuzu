@@ -17060,7 +17060,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // already decided was "not really an MCP token."
                 if (session->mcp_tier.empty()) {
                     mcp_audit("denied",
-                              "interactive session, no MCP tier (auth_source=" +
+                              "empty mcp_tier, denied outright (auth_source=" +
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
@@ -17089,7 +17089,14 @@ McpServer::HandlerFn McpServer::build_handler(
                 // tier string means 'not an MCP token' -> allow everything").
                 // A type-mismatched mcp_tier must be REJECTED, never
                 // defaulted, or a caller's constrained-credential request
-                // silently mints the least-constrained one instead.
+                // silently mints the least-constrained one instead. In
+                // today's reachable set this is defense-in-depth, not the
+                // only backstop: ApiToken:Write is approval-gated, so the
+                // #2405 C8 pre-mint schema gate already rejects a non-string
+                // name/scope_service/mcp_tier (all three are typed "string"
+                // in this tool's schema) before a ticket is ever minted, and
+                // an empty (non-approval-gated) tier never reaches this code
+                // at all - it is denied outright above, before this block.
                 if (args.contains("name") && !args["name"].is_string()) {
                     res.set_content(a4_error(kInvalidParams, "name must be a JSON string"),
                                     "application/json");
@@ -17256,7 +17263,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // supervised-tier approval gate.
                 if (session->mcp_tier.empty()) {
                     mcp_audit("denied",
-                              "interactive session, no MCP tier (auth_source=" +
+                              "empty mcp_tier, denied outright (auth_source=" +
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
@@ -18021,7 +18028,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // supervised-tier approval gate.
                 if (session->mcp_tier.empty()) {
                     mcp_audit("denied",
-                              "interactive session, no MCP tier (auth_source=" +
+                              "empty mcp_tier, denied outright (auth_source=" +
                                   session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
