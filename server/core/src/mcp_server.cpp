@@ -15131,6 +15131,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto batch_size_opt = param_int_strict(args, "batch_size", 1);
                 if (!batch_size_opt) {
                     res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a
+                        // store/query fault - resending the identical malformed
+                        // argument cannot succeed.
                         error_response(id, kInvalidParams, "batch_size must be a JSON integer"),
                         "application/json");
                     return;
@@ -15354,6 +15357,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto limit_opt = param_int_strict(args, "limit", 50);
                 if (!limit_opt) {
                     res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a
+                        // store/query fault - resending the identical malformed
+                        // argument cannot succeed.
                         error_response(id, kInvalidParams, "limit must be a JSON integer"),
                         "application/json");
                     return;
@@ -15614,6 +15620,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto seat_count_opt = param_int_strict(args, "seat_count", 0);
                 if (!seat_count_opt) {
                     res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a
+                        // store/query fault - resending the identical malformed
+                        // argument cannot succeed.
                         error_response(id, kInvalidParams, "seat_count must be a JSON integer"),
                         "application/json");
                     return;
@@ -15621,6 +15630,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 const auto expires_at_opt = param_int_strict(args, "expires_at", 0);
                 if (!expires_at_opt) {
                     res.set_content(
+                        // retry-hint-exempt: caller-input type rejection, not a
+                        // store/query fault - resending the identical malformed
+                        // argument cannot succeed.
                         error_response(id, kInvalidParams, "expires_at must be a JSON integer"),
                         "application/json");
                     return;

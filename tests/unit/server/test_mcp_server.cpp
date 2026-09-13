@@ -21061,6 +21061,51 @@ TEST_CASE("MCP B5: import_ca_chain maps a StoreError to kInternalError with a re
                      std::string("ca.subordinate.imported|failure")) != ts.audit_log.end());
 }
 
+TEST_CASE("MCP B5: import_ca_chain's StoreError branch surfaces audit_persisted:false "
+          "when the failure audit row itself cannot persist",
+          "[mcp][integration][pki][security][approval][b5]") {
+    // Gate 8 fix (#2146 Batch B5 follow-up): the StoreError test above proved
+    // audit_ok threads into kInternalError's envelope in the ok==true case;
+    // it never exercised audit_ok==false, which is the half
+    // consistency-auditor actually asked for - a dropped audit row on a
+    // genuine store fault must never be silent.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [](const std::string&, const std::string&) {
+        return yuzu::server::CaRoutes::ImportOutcome::StoreError;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    ts.audit_succeeds_ = false; // the ca.subordinate.imported|failure row cannot persist
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
 TEST_CASE("MCP B5: import_ca_chain without a CA store answers unavailable, not a crash",
           "[mcp][integration][pki][security][approval][b5]") {
         yuzu::test::ApprovalManagerPg appr_bundle;
