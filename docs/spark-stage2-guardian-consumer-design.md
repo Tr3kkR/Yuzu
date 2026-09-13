@@ -688,6 +688,58 @@ folded silently into the same signal as ordinary contention
 (`IoFailure::CeilingExhausted` is the distinct outcome PR-1 gives it; PR-3 names the
 tag).
 
+**AS IMPLEMENTED (PR-3, 2026-09-13)** - three decisions this paragraph left open,
+settled via Astra (codex opine) + Fable (advisor) review, both checked against
+`origin/dev` code, then ruled by Dave (full history:
+`~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md`):
+
+1. **`yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` are re-statable gauges off
+   `GuardianArmAckLedger`'s CURRENT application** (`GuardianArmAckLedger::arm_stats()`,
+   `GuardianEngine::arm_stats()`) - NOT `GuardianEngine::arm_failures_`, which is
+   confirmed cumulative-forever and unsuitable (several `fetch_add` sites, never
+   decrements, and counts causes beyond a currently-failed rule). Absence is gated
+   explicitly on `prefer_spark_`, not on "does a current application exist": PR-2's
+   `apply_rules()` calls `begin_application()` unconditionally regardless of
+   `prefer_spark_`, so a legacy (non-spark) agent has a live, empty Application on
+   every push - gating on the Application's existence alone would make every non-spark
+   agent in the fleet emit `arm_pending=0`/`arm_failed=0`, read by a fleet consumer as
+   "spark arming, healthy" on agents not running spark at all. `arm_failed` does NOT
+   decrement in place within one application (`resolved_failed` is increment-only), but
+   it already resets to 0 whenever `decide_retry()` returns `Reapply` on a generation
+   that previously failed, which begins a FRESH application - that Reapply path is
+   driven by the existing ~25s `full_sync` retry cadence and is live TODAY, independent
+   of PR-5. So: "decreases on application replacement, which already happens on an
+   ordinary retry of a generation that saw a failure" - not "monotonic until PR-5".
+   Same-application late-success recovery (a still-pending receipt flipping from Failed
+   to Committed without a new application) remains PR-5's job.
+2. **The physical-orphan ceiling (R5.1) ships as a plain, monitor-only counter now**
+   (`yuzu.guardian_io_arm_disarm_rejected_ceiling`, off
+   `GuardianIoExecutor::Counters::rejected_ceiling`, summed across IO classes for the
+   arm/disarm executor instance via `GuardianSparkRuntime::io_ceiling_rejections()`) -
+   **not** the windowed "currently under repeated pressure" detector one reviewer
+   proposed. Dave ruled against baking an unmeasured threshold (a candidate 2-hits/
+   5-minute window was proposed and rejected) into shipped code before a later rung has
+   real fleet data to size it; that detector is explicitly deferred to rung 9c PR-6.
+3. **#3415** (`GuardianIoExecutor`'s general per-class fault-counter egress -
+   `timed_out`/`rejected_capacity`/`rejected_key`/`launch_failures`/
+   `worker_exceptions`/`abandoned`/`abandonment_cleanup_failures`/
+   `completed_after_stop`/`completion_failures`) stays a **separate follow-up**
+   ("PR-3a"), scheduled after PR-3 and before PR-5's fault-validation work - this PR's
+   `rejected_ceiling` counter is one narrow, separately-motivated signal (R5.1's own
+   ask), not the start of #3415's general wiring. See
+   `docs/spark-legacy-delta-registry.md` row D10.
+
+Fleet-side rollup: `server/core/src/guardian_arm_fleet_tags.hpp` (SUM of current
+values, unlabelled, its own reporting/tag_rejected meta pair) and
+`server/core/src/guardian_io_ceiling_fleet_tags.hpp` (SUM of a genuinely cumulative
+counter - the ordinary monitor-only shape, correct for THIS signal specifically).
+**Correction to this paragraph's own "C1/D1-style" shorthand above**: too broad -
+`docs/spark-legacy-delta-registry.md` row C1 already documents `unsupported` as a
+live, current-value gauge that can legally decrease, the SAME re-statable pattern PR-3
+needs, not the thing to avoid. The pattern to avoid is specifically the counter-rollup
+shape (monotonic per-sweep counters summed into a fleet gauge) - `rejected_ceiling`
+above is correctly that shape; the arm-ledger pair above is correctly not.
+
 **R5.4 - Audit and durability.** The "armed" audit record is still staged only on a
 real, confirmed backend commit — never on acceptance alone, matching today's contract
 exactly. What changes is timing, in three separate steps (corrected in the PR-1 doc

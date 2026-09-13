@@ -1447,6 +1447,40 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 32 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 32; it does not resolve it. **Counts the 32 counter tags only - an agent reporting only the three `_seconds` age tags does not count here** |
 | `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 
+### Guardian arm-ledger fleet gauges (rung 9c PR-3)
+
+Published on every fleet-health sweep, fed from `yuzu.guardian_arm_pending` /
+`yuzu.guardian_arm_failed`. Unlike the journal counters above, these are
+**re-statable gauges** - each agent reports its CURRENT ack-ledger state
+(`GuardianArmAckLedger::arm_stats()`), not a monotonic total - so the fleet gauge
+is a SUM of current values, and it can legally decrease. Absent means no agent
+reported this sweep, which today (`prefer_spark` off fleet-wide) means every
+agent, by construction - a non-spark agent never emits this pair at all.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_arm_pending` | gauge | Fleet **SUM** of accepted spark arms currently pending acknowledgment (still awaiting a Committed/terminal resolution), across every agent's CURRENT application. Re-statable, not cumulative - decreases as receipts resolve or an application is replaced |
+| `yuzu_fleet_guardian_arm_failed` | gauge | Fleet **SUM** of accepted spark arms whose CURRENT application resolved to a non-Committed terminal outcome (Failed/Expired/Withdrawn/Stopped), still unresolved for acknowledgment. Decreases when an application that saw a failure is REPLACED - an ordinary retry of that generation, live today - but does NOT yet reflect same-application late-success recovery (a still-pending receipt flipping from Failed to Committed without a new application); that lands in a later rung. Zero does not itself mean compliant or enforced |
+| `yuzu_fleet_guardian_arm_reporting` | gauge | Agents whose latest heartbeat carried at least one parseable `yuzu.guardian_arm_*` tag - the coverage denominator for the two gauges above. **Published every sweep including `0`**. `0` means either no agent is running spark fleet-wide (the expected pre-cutover reading) or the telemetry path is dark; cross-check `yuzu_fleet_spark_reporting` to tell them apart |
+| `yuzu_fleet_guardian_arm_tag_rejected` | gauge | `yuzu.guardian_arm_*` tags **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`**. `> 0` means some agent is shipping malformed arm-ledger telemetry |
+
+### Guardian io-ceiling fleet gauge (rung 9c PR-3, R5.1)
+
+`GuardianIoExecutor`'s physical-orphan alive-worker ceiling (R5.1's own flagged
+observability gap) gets one narrow, MONITOR-ONLY counter, scoped to the arm/disarm
+executor instance only - **not** #3415's general per-class executor-fault egress,
+which stays a separate, still-open follow-up (see the executor bulkhead docs in
+[guaranteed-state.md](guaranteed-state.md) and `docs/spark-legacy-delta-registry.md`
+row D10). A windowed "currently under repeated pressure" detector was considered for
+this signal and deliberately DEFERRED to a later rung rather than shipping an
+unmeasured threshold now - this counter names the fault class only.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling` | gauge | Fleet **SUM** of admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (workers still alive past `fn()` inside their completion callbacks while ordinary class quota was free). A genuinely cumulative per-agent counter - correctly MONITOR-ONLY: neither `increase()` nor a bare `> 0` is sound over a fleet sum of per-agent cumulative counters. Names the fault class; does not by itself say whether an endpoint is CURRENTLY wedged |
+| `yuzu_fleet_guardian_io_ceiling_reporting` | gauge | Agents whose latest heartbeat carried the ceiling tag - the coverage denominator. **Published every sweep including `0`**. The writer is sparse (a zero ceiling count ships no tag), so `0` here means no agent has ever hit the ceiling (or none is running spark), not that telemetry is dark |
+| `yuzu_fleet_guardian_io_ceiling_tag_rejected` | gauge | The ceiling tag **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`** |
+
 ### Guardian M1 health-stream fleet gauges
 
 The M1 flood-guard telemetry ([Guaranteed State](guaranteed-state.md)'s errored-view
@@ -1941,6 +1975,20 @@ age tags per their own posture above), so a tag absent from this table is not ne
 absent from the payload.
 
 Counters are cumulative for the agent process and reset on restart.
+
+### Guardian arm-ledger + io-ceiling health (heartbeat `status_tags`, rung 9c PR-3)
+
+> **Not yet active in a shipped release** - same caveat as the journal section above:
+> dormant until the Spark detection path becomes authoritative (`prefer_spark` off in
+> every released agent today).
+
+Two more Guardian heartbeat signals, both new in rung 9c PR-3, neither part of the
+journal family above:
+
+| Tag | Meaning | What to do |
+|---|---|---|
+| `yuzu.guardian_arm_pending` / `yuzu.guardian_arm_failed` | The ack ledger's CURRENT application snapshot - accepted-and-still-outstanding arms, and arms resolved to a non-Committed terminal outcome, respectively. **Re-statable gauges, emitted together, including a genuine `0`** - unlike the sparse journal counters above, absence here means dormant (`prefer_spark` off, or spark otherwise unavailable), not "nothing to report while live". A rule genuinely at zero pending/failed reads as `0`, not absent - an omitted tag would misreport as "dormant" rather than "checked, healthy". | Sustained nonzero `_pending` beyond a couple of heartbeat ticks (~30 s each) means arms are taking longer than expected to resolve - check backend/OS-call latency. A nonzero `_failed` means at least one rule failed to arm and its generation is held; find the failing rule (agent log) before assuming the fleet compliance view is complete. `_failed` clears on the NEXT retry of that generation (the server's ~25 s `full_sync` resend) if the retry succeeds - it does not yet reflect a same-application late recovery of one still-outstanding receipt. |
+| `yuzu.guardian_io_arm_disarm_rejected_ceiling` | Admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (R5.1). **Sparse**: `0` omits the tag. Scoped to the arm/disarm executor instance only - the state reader's own executor instance cannot reach this ceiling (it uses only the bounded, quota-released-at-return form). | A nonzero, climbing value means completion callbacks on that instance are piling up (slow or wedged OS calls) faster than they retire - investigate backend latency on that endpoint. This tag names the fault class only; it does not say whether the endpoint is CURRENTLY wedged (no windowed detector ships yet). |
 
 ### How long Guardian audit evidence is retained ON the endpoint
 
