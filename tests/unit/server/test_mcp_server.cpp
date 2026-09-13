@@ -2879,6 +2879,46 @@ TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account: an interactive 
     }
 }
 
+TEST_CASE("MCP create_api_token: a non-string mcp_tier is rejected, not silently "
+          "defaulted to the least-constrained (empty-tier) shape",
+          "[mcp][pg][token]") {
+    // Gate 8 security-guardian Finding B (#2146 Batch B4 review): the Gate 4
+    // fix round added the args["mcp_tier"].is_string() guard in mcp_server.cpp
+    // (create_api_token handler) but shipped with no dedicated regression test
+    // pinning it - this closes that gap. ApiToken:Write is approval-gated, so
+    // the #2405 C8 schema gate (mcp_tier's declared schema type is "string")
+    // rejects the type mismatch even earlier, at the MINT call itself, before
+    // a ticket is ever minted - the handler's own is_string() check is
+    // documented defense-in-depth behind that gate. Either layer catching it
+    // proves the same thing a real caller cares about: this can never reach
+    // the store as the least-constrained (untiered) token shape.
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::apitoken_pg_template);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ApiTokenStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.engine_credential_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1003,)"
+        R"("params":{"name":"create_api_token","arguments":{"name":"ci-key","mcp_tier":7}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    REQUIRE_FALSE(body["error"]["data"].contains("approval_id"));
+    // No ticket was ever minted, let alone a token created.
+    auto listing = store.list_tokens("test-user");
+    REQUIRE(listing.has_value());
+    CHECK(listing->empty());
+}
+
 TEST_CASE("MCP create_api_token: RBAC denial (ApiToken:Write) blocks the call", "[mcp][token]") {
     McpTestServer ts;
     ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
@@ -15364,6 +15404,43 @@ TEST_CASE("MCP create_management_group: RBAC denial (ManagementGroup:Write) bloc
         R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
         R"("params":{"name":"create_management_group","arguments":{"name":"x"}}})");
     REQUIRE(res->status == 403);
+}
+
+TEST_CASE("MCP create_management_group: a non-string description/parent_id is "
+          "rejected, not silently coerced to empty",
+          "[mcp][pg][management_group]") {
+    // Gate 8 security-guardian Finding B (#2146 Batch B4 review): the Gate 4
+    // fix round added args["description"]/args["parent_id"].is_string()
+    // guards in mcp_server.cpp's create_management_group handler (matching
+    // update_management_group's pre-existing pattern) but shipped with no
+    // dedicated regression test - this closes that gap. ManagementGroup:Write
+    // IS approval-gated at supervised tier, so an empty-tier (default) session
+    // skips the C8 pre-mint schema gate entirely (requires_approval() no-ops
+    // on an empty tier) and reaches the handler's own guard directly -
+    // exactly the path a plain authenticated caller without an MCP token
+    // takes, and the scenario the Gate 4 fix targeted.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    for (const std::string bad_field : {"description", "parent_id"}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,)"
+            R"("params":{"name":"create_management_group","arguments":{"name":"x",")" +
+            bad_field + R"(":42}}})");
+        REQUIRE(res);
+        INFO("field: " << bad_field);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+    // No group was created by either rejected call.
+    CHECK(store.list_groups().empty());
 }
 
 TEST_CASE("MCP get_management_group: happy path returns metadata + members",

@@ -1742,7 +1742,11 @@ static const ToolDef kTools[] = {
      "permission) — the SAME multi-store check (rbac_store + mgmt_store) the REST route runs; "
      "RBAC must be enabled for a scope_service token at all. The raw token is returned exactly "
      "once - store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write (approval-gated "
-     "at the supervised MCP tier - maker-checker for self-service credential minting). "
+     "at the supervised MCP tier - maker-checker for self-service credential minting). An "
+     "interactive (cookie) session - empty mcp_tier - is DENIED outright rather than falling "
+     "through to RBAC-only enforcement (kPermissionDenied, 'requires an MCP-tier bearer token'); "
+     "closes the #4309 interactive-session gap for this tool specifically, still open for other "
+     "approval-gated MCP tools. "
      "Additive: mints a new credential, overwrites nothing (not idempotent - each call mints a "
      "distinct token).",
      R"j({"type":"object","properties":{)j"
@@ -1759,7 +1763,8 @@ static const ToolDef kTools[] = {
      "not-owned token_id and a nonexistent one are INDISTINGUISHABLE (both report 'token not "
      "found') — not an enumeration oracle. Mirrors DELETE /api/v1/tokens/{id}. Requires "
      "ApiToken:Delete — approval-gated (supervised MCP tier maker-checker; Delete is always "
-     "destructive). Destructive, idempotent per the store's own already-revoked handling.",
+     "destructive). Same interactive-session denial as create_api_token - closed for this tool "
+     "specifically (#4309). Destructive, idempotent per the store's own already-revoked handling.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Token id to revoke (from list_api_tokens/create_api_token)"})j"
      R"j(},"required":["token_id"]})j",
@@ -2048,8 +2053,9 @@ static const ToolDef kTools[] = {
      "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
      "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "
      "Mirrors POST /api/v1/users/{username}/unlock. Requires UserManagement:Write — approval-"
-     "gated (supervised MCP tier maker-checker). Destructive: overwrites the account's existing "
-     "lockout/failed-login state.",
+     "gated (supervised MCP tier maker-checker). Same interactive-session denial as "
+     "create_api_token - closed for this tool specifically (#4309). Destructive: overwrites the "
+     "account's existing lockout/failed-login state.",
      R"j({"type":"object","properties":{)j"
      R"j("username":{"type":"string","minLength":1,"description":"Local account username to unlock"})j"
      R"j(},"required":["username"]})j",
@@ -5068,6 +5074,15 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
+            // #2146 Batch B4 Gate 8 (security-guardian Finding E): the three
+            // interactive-session deny-outright guards below (create_api_token,
+            // revoke_api_token, unlock_account) previously crammed their
+            // remediation into `message` and left a4_error's dedicated
+            // `remediation` field null; each call site below now passes its own
+            // REST-equivalent-route hint through this field instead.
+            constexpr std::string_view kInteractiveSessionRemediation =
+                "use the equivalent REST v1 route from an authenticated browser "
+                "session, or mint an MCP bearer token with an appropriate tier";
             // #3685: classify_fn_ unset (never wired, or the production wiring at
             // server.cpp regressed) — execute_instruction cannot determine whether
             // ANY plugin.action pair is Destructive, so it fails CLOSED at BOTH
@@ -17044,13 +17059,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // on, so this can never diverge from what those functions
                 // already decided was "not really an MCP token."
                 if (session->mcp_tier.empty()) {
-                    mcp_audit("denied", "interactive session, no MCP tier");
+                    mcp_audit("denied",
+                              "interactive session, no MCP tier (auth_source=" +
+                                  session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "create_api_token requires an MCP-tier bearer token - an "
                                  "interactive session has neither the MFA step-up REST's route "
                                  "applies nor a maker-checker approval ticket for this operation; "
-                                 "use POST /api/v1/tokens instead"),
+                                 "use POST /api/v1/tokens instead",
+                                 kInteractiveSessionRemediation),
                         "application/json");
                     return;
                 }
@@ -17237,13 +17255,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // this call bypassed both REST's step_up_fn and the
                 // supervised-tier approval gate.
                 if (session->mcp_tier.empty()) {
-                    mcp_audit("denied", "interactive session, no MCP tier");
+                    mcp_audit("denied",
+                              "interactive session, no MCP tier (auth_source=" +
+                                  session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "revoke_api_token requires an MCP-tier bearer token - an "
                                  "interactive session has neither the MFA step-up REST's route "
                                  "applies nor a maker-checker approval ticket for this operation; "
-                                 "use DELETE /api/v1/tokens/{id} instead"),
+                                 "use DELETE /api/v1/tokens/{id} instead",
+                                 kInteractiveSessionRemediation),
                         "application/json");
                     return;
                 }
@@ -17999,13 +18020,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 // this call bypassed both REST's step_up_fn and the
                 // supervised-tier approval gate.
                 if (session->mcp_tier.empty()) {
-                    mcp_audit("denied", "interactive session, no MCP tier");
+                    mcp_audit("denied",
+                              "interactive session, no MCP tier (auth_source=" +
+                                  session->auth_source + ")");
                     res.set_content(
                         a4_error(kPermissionDenied,
                                  "unlock_account requires an MCP-tier bearer token - an "
                                  "interactive session has neither the MFA step-up REST's route "
                                  "applies nor a maker-checker approval ticket for this operation; "
-                                 "use POST /api/v1/users/{username}/unlock instead"),
+                                 "use POST /api/v1/users/{username}/unlock instead",
+                                 kInteractiveSessionRemediation),
                         "application/json");
                     return;
                 }

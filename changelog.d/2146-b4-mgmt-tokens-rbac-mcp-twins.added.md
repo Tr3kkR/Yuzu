@@ -33,4 +33,12 @@
   tier/approval enforcement is architecture-wide inert for interactive cookie
   sessions (`mcp_tier` is only ever set on an actual MCP token), so the
   approval-gating described above applies to MCP-token callers specifically, not
-  to every caller of the underlying REST route.
+  to every caller of the underlying REST route - **except** for `create_api_token`,
+  `revoke_api_token`, and `unlock_account` specifically, where a governance review
+  round found this gap meaningfully widened (raw credential-minting and
+  account-lockout-clearing, not just an inert approval step) and a scoped fix
+  landed in the same batch: an interactive (cookie) session is now denied outright
+  on these three tools rather than falling through to RBAC-only enforcement. The
+  architecture-wide gap remains open for every other approval-gated MCP tool
+  (`execute_instruction`, `quarantine_device`, `revoke_certificate`, and the four
+  `ManagementGroup:Write` mutations in this same batch).
