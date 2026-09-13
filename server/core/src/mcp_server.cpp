@@ -1680,7 +1680,12 @@ static const ToolDef kTools[] = {
      "ALWAYS inherits the predecessor's expires_at verbatim — rotation is lifetime-neutral, "
      "never accepted as a caller argument. Requires ApiToken:Rotate (self-service, not an admin "
      "operation — unlike the engine credential arm's Security:Write, and deliberately distinct "
-     "from the create/list/revoke ApiToken:Write axis). The returned token_id is "
+     "from the create/list/revoke ApiToken:Write axis; deliberately NOT approval-gated - "
+     "rotation is lifetime-neutral and cannot move authority). An MCP-tier-less caller "
+     "(empty mcp_tier - a cookie session, a plain non-MCP-tiered API token, or an engine "
+     "token) is DENIED outright rather than falling through unenforced, matching REST's "
+     "mandatory step-up on every rotate call including a re-serve; closes the #4309 gap "
+     "for this tool specifically. The returned token_id is "
      "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
      "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
      "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
@@ -1709,7 +1714,9 @@ static const ToolDef kTools[] = {
      "binding is lost or in dispute), revoke the SPECIFIC untrusted credential via "
      "DELETE /api/v1/tokens/{token_id} — there is no engine-principal terminal route in play on "
      "this human-token arm, but the same per-credential (never per-principal) revoke discipline "
-     "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
+     "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Same "
+     "MCP-tier-less deny-outright as rotate_api_token above - closed for this tool "
+     "specifically (#4309). Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"},)j"
@@ -16612,6 +16619,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ApiToken", "Rotate"))
                     return;
+                // Gate 8 fix (#2146 Batch B4, follow-up review round; user
+                // directive): rotate_api_token/confirm_api_token_rotation
+                // shared the identical missing-step-up gap create_api_token/
+                // revoke_api_token/unlock_account were fixed for above -
+                // ApiToken:Rotate is deliberately NOT in requires_approval()
+                // (self-service, authority-inheriting, lifetime-neutral; see
+                // mcp_policy.hpp's own comment on that), so an empty mcp_tier
+                // reached this handler with NEITHER REST's step_up_fn (no MCP
+                // tool calls it) NOR an approval ticket (there was never one
+                // to bypass here - this is not the same gap shape as the
+                // three approval-gated tools above, but the SAME missing
+                // control: REST requires step-up on every rotate/confirm
+                // call, MCP required nothing). Denying here does not add an
+                // approval requirement (ApiToken:Rotate's no-approval design
+                // is preserved) and does not change deny_if_engine_session()'s
+                // separate check below - it only closes the empty-tier gap.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "rotate_api_token requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has no MFA step-up REST's route "
+                                 "requires on every rotate call, including a re-serve; "
+                                 "use POST /api/v1/tokens/{id}/rotate instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
                 if (deny_if_engine_session())
                     return;
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
@@ -16853,6 +16891,27 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ApiToken", "Rotate"))
                     return;
+                // Gate 8 fix (#2146 Batch B4, follow-up review round; user
+                // directive) - see rotate_api_token's identical guard above
+                // for the full rationale. Not counted via confirm_metric():
+                // matches this function's own stated contract that the
+                // metric is store-reaching-calls-only, never a tier/
+                // permission/ownership early-out.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "confirm_api_token_rotation requires an MCP-tier bearer token - "
+                                 "an MCP-tier-less caller (a cookie session, a plain "
+                                 "non-MCP-tiered API token, or an engine token) has no MFA "
+                                 "step-up REST's route requires; "
+                                 "use POST /api/v1/tokens/{id}/confirm instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
                 if (deny_if_engine_session())
                     return;
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {

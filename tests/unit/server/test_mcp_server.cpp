@@ -2848,9 +2848,9 @@ TEST_CASE("MCP create_api_token: happy path mints a token owned by the caller",
     CHECK(listing->front().principal_id == "test-user"); // always self-issued
 }
 
-TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account: an interactive "
-          "(empty mcp_tier) session is denied - no MFA step-up and no approval gate "
-          "would otherwise fire for it",
+TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account/rotate_api_token/"
+          "confirm_api_token_rotation: an MCP-tier-less caller is denied - no MFA "
+          "step-up and no approval gate would otherwise fire for it",
           "[mcp][token][security]") {
     // Gate 6 BLOCKING fix (#2146 Batch B4 review, user directive): before
     // this fix, a plain authenticated session with ordinary write permission
@@ -2859,15 +2859,24 @@ TEST_CASE("MCP create_api_token/revoke_api_token/unlock_account: an interactive 
     // step_up_fn (never called by any MCP handler) nor the supervised-tier
     // approval gate (requires_approval() itself no-ops on an empty tier, per
     // mcp_policy.hpp's own documented contract). #4309 tracks the
-    // architecture-wide root cause; this pins the mitigation for these three
-    // specific high-value operations.
+    // architecture-wide root cause; this pinned the mitigation for the
+    // first three high-value operations.
+    //
+    // Gate 8 follow-up review round (same batch, user directive): extended
+    // to rotate_api_token/confirm_api_token_rotation, which shared the
+    // identical missing-step-up shape - ApiToken:Rotate is deliberately not
+    // approval-gated (there was never a ticket to bypass), but REST still
+    // requires step-up on every call and MCP required nothing.
     McpTestServer ts;
-    ts.start(); // default: empty mcp_tier, matching an interactive session
+    ts.start(); // default: empty mcp_tier, matching an MCP-tier-less caller
     for (const auto& [name, args] :
          std::vector<std::pair<std::string, std::string>>{
              {"create_api_token", R"({"name":"x"})"},
              {"revoke_api_token", R"({"token_id":"tok-does-not-matter"})"},
-             {"unlock_account", R"({"username":"someone"})"}}) {
+             {"unlock_account", R"({"username":"someone"})"},
+             {"rotate_api_token", R"({"token_id":"tok-does-not-matter"})"},
+             {"confirm_api_token_rotation",
+              R"({"token_id":"tok-does-not-matter","secret":"x"})"}}) {
         auto res = ts.call(
             R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":")" + name +
             R"(","arguments":)" + args + R"(}})");

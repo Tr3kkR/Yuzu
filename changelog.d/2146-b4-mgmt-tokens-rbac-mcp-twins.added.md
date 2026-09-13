@@ -30,15 +30,23 @@
   `McpServer::LockoutClearFn` (mirroring `RestApiV1::LockoutClearFn`) is a new
   trailing `build_handler`/`register_routes` parameter backing `unlock_account`.
   Known limitation, tracked separately (#4309, not introduced by this batch): MCP
-  tier/approval enforcement is architecture-wide inert for interactive cookie
-  sessions (`mcp_tier` is only ever set on an actual MCP token), so the
+  tier/approval enforcement is architecture-wide inert for an MCP-tier-less caller
+  (a cookie session, a plain non-MCP-tiered API token, or an engine token -
+  `mcp_tier` is only ever set on an actual MCP token), so the
   approval-gating described above applies to MCP-token callers specifically, not
   to every caller of the underlying REST route - **except** for `create_api_token`,
-  `revoke_api_token`, and `unlock_account` specifically, where a governance review
-  round found this gap meaningfully widened (raw credential-minting and
-  account-lockout-clearing, not just an inert approval step) and a scoped fix
-  landed in the same batch: an interactive (cookie) session is now denied outright
-  on these three tools rather than falling through to RBAC-only enforcement. The
-  architecture-wide gap remains open for every other approval-gated MCP tool
-  (`execute_instruction`, `quarantine_device`, `revoke_certificate`, and the four
-  `ManagementGroup:Write` mutations in this same batch).
+  `revoke_api_token`, `unlock_account`, `rotate_api_token`, and
+  `confirm_api_token_rotation` specifically, where a governance review round found
+  this gap meaningfully widened (raw credential-minting, account-lockout-clearing,
+  and credential rotation/reveal with no MFA step-up at all - not just an inert
+  approval step) and a scoped fix landed in the same batch: an MCP-tier-less
+  caller is now denied outright on these five tools rather than falling through to
+  RBAC-only enforcement (`rotate_api_token`/`confirm_api_token_rotation` were
+  fixed in a follow-up review round after the other three, once the identical
+  pattern was found there too - `ApiToken:Rotate` was and remains deliberately
+  NOT approval-gated per its own documented rationale, so this closes the
+  missing-step-up gap without adding an approval requirement that was never
+  intended for rotation). The architecture-wide gap remains open for every other
+  approval-gated MCP tool (`execute_instruction`, `quarantine_device`,
+  `revoke_certificate`, and the four `ManagementGroup:Write` mutations in this
+  same batch).
