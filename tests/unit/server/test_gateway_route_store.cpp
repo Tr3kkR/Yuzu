@@ -975,9 +975,9 @@ TEST_CASE("GatewayRouteStore[pg]: reap declines when the anchor is AHEAD of the 
 // should decline-once instead drained because an unrelated backward decline
 // happened to precede it at the same anchor.
 //
-// Marker format since this fix: `reap_declined_anchor_ms` stores
-// `"<anchor>:<direction>"` (direction in {forward, backward}) — see
-// gateway_route_store.cpp's `parse_declined_marker`. Real forward/backward
+// Marker format since round 4: `reap_declined_anchor_ms` stores
+// `"<anchor>:<direction>:<first_now_ms>"` (direction in {forward, backward}) —
+// see gateway_route_reap_rules.hpp's `parse_declined_marker`. Real forward/backward
 // declines are driven exactly like the standalone single-decline tests
 // above; a real anchor scalar cannot naturally flip which direction it
 // presents on a shortly-after pass (real wall-clock time only advances
@@ -1241,7 +1241,7 @@ TEST_CASE("GatewayRouteStore[pg]: a 4-pass direction alternation never recovers 
 // be treated as absent — re-arming in the new format and declining once
 // more, never granting a recovery on anchor-value coincidence alone.
 TEST_CASE("GatewayRouteStore[pg]: a legacy bare-integer declined-anchor marker is treated as "
-          "absent — declines and re-arms in the new <anchor>:<direction> format",
+          "absent — declines and re-arms in the new <anchor>:<direction>:<first_now_ms> format",
           "[gateway_route][pg][store][reap]") {
     GatewayRoutePg fx;
     auto baseline = fx.store().reap_stale_routes();

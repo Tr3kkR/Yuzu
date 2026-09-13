@@ -254,11 +254,21 @@ per-predicate cap):
    second-replica reap pass would recover with zero persistence evidence. The CEILING = 1h
    (cadence-derived with slack), `static_assert`ed `<= kMaxPlausibleSkewMs` (the terminating
    invariant: at the ceiling, recovery is no weaker than an ordinary clean pass, which already
-   accepts any forward jump up to `kMaxPlausibleSkewMs`) and `<` the floor. A companion
-   `static_assert` at `server.cpp`'s reap-cadence constant pins the inter-pass interval
-   (`kGatewayRouteReapEveryNTicks * 2s`) strictly ABOVE the floor, so a single replica's own
-   back-to-back passes can always span it (else a future cadence tune below ~135 ticks would wedge a
-   single replica — a build failure).
+   accepts any forward jump up to `kMaxPlausibleSkewMs`) and, of course, `>` the floor. TWO
+   companion `static_assert`s at `server.cpp`'s reap-cadence constant bracket the inter-pass
+   interval (`kGatewayRouteReapEveryNTicks * kMaintTickSecs`, ~300s), and they guard OPPOSITE
+   failures — only the ceiling one is a true wedge: (a) the FLOOR assert (interval `>` the floor)
+   is a PROMPTNESS guard — a sub-floor cadence still recovers, because `first_now_ms` is preserved
+   across declines so its delta grows monotonically, just over multiple passes rather than on
+   pass 2 — so a future cadence below ~135 ticks is a build failure only because prompt recovery
+   is wanted, not because it would wedge; (b) the CEILING assert (interval `<` the ceiling) IS the
+   wedge guard — above it every pass-to-pass delta exceeds the ceiling, so each pass re-arms as a
+   brand-new anomaly and never recovers (a future cadence above ~1800 ticks is a build failure for
+   this reason). A THIRD faulted-but-not-wedged regime rounds out the corrected narrative above: a
+   FROZEN or sub-floor-oscillating clock leaves the delta pinned below the floor, so the pass
+   declines every tick until the clock advances by at least the floor from the first reading —
+   self-resolving, fail-safe (a broken clock must not drive reaping), and observed by the WS-1/1a
+   DB-clock-integrity monitor rather than this reaper.
 
    **Cap-backlog observability, NOT acceleration (PR #4299 round 4 — the architect OVERRODE the
    reviewer's "accelerate the re-arm on a capped sweep" suggestion; recording the reasoning is the

@@ -14915,6 +14915,14 @@ private:
             result_set_maint_thread_ = std::thread([this]() {
                 spdlog::info("Result-set/response/Guardian maintenance thread started "
                              "(cadence=2s, GC=5m, response/Guardian reap=60m)");
+                // Single source of truth for this loop's tick period (PR #4299
+                // adversarial-panel LOW, K1/CDX-P2-002): the loop below sleeps
+                // this many 1-second slices per tick, and the gateway-route reap
+                // cadence static_asserts multiply by it — so a future tick-period
+                // change moves the sleep AND the wedge-guarding asserts together
+                // instead of leaving a stale magic `2` behind. Every sibling
+                // "~N at 2s/tick" cadence comment below is relative to this.
+                constexpr int kMaintTickSecs = 2;
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
                 // Guardian retention reap (ADR-0038): matches the old SQLite cleanup
                 // thread's 60-minute default cadence (cleanup_interval_min). Piggybacks
@@ -14982,12 +14990,12 @@ private:
                 //   whole mechanism exists to prevent, reintroduced via cadence.
                 //   300'000ms < 3'600'000ms ceiling; a future cadence above ~1800
                 //   ticks trips this at build time.
-                static_assert(kGatewayRouteReapEveryNTicks * 2 /*sec per tick*/ * 1000 >
+                static_assert(kGatewayRouteReapEveryNTicks * kMaintTickSecs * 1000 >
                                   kMinReapRecoveryGapMs,
                               "gateway route reap cadence must exceed the recovery floor, or a "
                               "single replica's persistent skew recovers slowly over many passes "
                               "instead of promptly (kMinReapRecoveryGapMs, gateway_route_store.hpp)");
-                static_assert(kGatewayRouteReapEveryNTicks * 2 /*sec per tick*/ * 1000 <
+                static_assert(kGatewayRouteReapEveryNTicks * kMaintTickSecs * 1000 <
                                   kMaxReapRecoveryGapMs,
                               "gateway route reap cadence must stay below the recovery ceiling, or "
                               "every pass-to-pass delta exceeds it and re-arms as a new anomaly — a "
@@ -15008,7 +15016,11 @@ private:
                 ClockDriftMonitor session_clock_monitor{/*tolerance_ms=*/3000};
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
-                    for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    // kMaintTickSecs one-second slices per tick (interruptible),
+                    // so the tick period the reap-cadence static_asserts assume is
+                    // the same constant the sleep uses (PR #4299 K1/CDX-P2-002).
+                    for (int i = 0; i < kMaintTickSecs && !stop_requested_.load(std::memory_order_acquire);
+                         ++i)
                         std::this_thread::sleep_for(std::chrono::seconds{1});
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
