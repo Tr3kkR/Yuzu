@@ -241,6 +241,14 @@ inline std::string utf16le_to_utf8(std::span<const unsigned char> bytes) {
     std::string out;
     out.reserve(bytes.size());
     std::size_t i = 0;
+    // `i + 1 < bytes.size()`, not `<=`: a single dangling trailing byte (an
+    // odd total length -- a truncated final UTF-16 code unit) is silently
+    // dropped rather than emitting a replacement character for it. This is
+    // deliberate, matching this function's own documented contract (see the
+    // file banner above): a truncated code unit is not a decodable
+    // character at all, so there is nothing to represent -- callers that
+    // care about truncation (parse_reg_run_values) detect it from the
+    // surrounding hex-byte count, not from this function's output shape.
     while (i + 1 < bytes.size()) {
         const std::uint16_t unit =
             static_cast<std::uint16_t>(bytes[i]) | (static_cast<std::uint16_t>(bytes[i + 1]) << 8);
@@ -715,6 +723,10 @@ struct TaskAction {
 /// because it is reachable from an entirely different cause (a runaway/
 /// corrupt get_Xml() BSTR) than a genuine XML syntax problem, and worth its
 /// own token for anyone triaging a fleet-wide reason breakdown (#4184).
+// A new value here MUST get its own case in task_reject_reason_token below --
+// the switch there deliberately has no `default:` label so -Wswitch flags a
+// missing case (non-fatal, werror=false project-wide, so this comment is the
+// backstop a human reviewer needs since the warning alone can be missed).
 enum class TaskReject { none, empty, malformed, dtd, wrong_root, oversized };
 
 /// The `win_scheduled_tasks` wire-reason token for a parse rejection --
@@ -728,6 +740,10 @@ enum class TaskReject { none, empty, malformed, dtd, wrong_root, oversized };
 /// every rejection SHAPE distinguished, just this one different CAUSE.
 /// `none` (a successful parse) has no reason to report and returns "".
 inline std::string_view task_reject_reason_token(TaskReject reject) noexcept {
+    // No `default:` label -- see TaskReject's own comment above: a new enum
+    // value with no case here trips -Wswitch. The trailing return after the
+    // switch exists only to satisfy every compiler's return-path analysis,
+    // never to silently absorb a genuinely new, unhandled TaskReject value.
     switch (reject) {
     case TaskReject::none: return "";
     case TaskReject::oversized: return "oversized";

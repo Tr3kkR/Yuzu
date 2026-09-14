@@ -484,6 +484,34 @@ TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unres
     CHECK(result.constraint == "startup_redirect_unresolved");
 }
 
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved "
+          "for an unterminated '%' with no closing '%' anywhere in the value "
+          "(governance Gate 4 unhappy-path: an adversarial/truncated registry value "
+          "shape with no valid token boundary at all)",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%USERPROFILE%\\Startup\\%NOCLOSE", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> {
+            FAIL("no allowlisted token appears before the unterminated one");
+            return std::nullopt;
+        });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved "
+          "for an empty '%%' token name",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%USERPROFILE%\\Start%%Menu", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> {
+            FAIL("no allowlisted token appears before the empty one");
+            return std::nullopt;
+        });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
 TEST_CASE("autoruns: resolve_profile_shell_folder treats REG_SZ as a literal path, "
           "no token expansion -- a stray '%' is kept verbatim",
           "[autoruns][parsers]") {
