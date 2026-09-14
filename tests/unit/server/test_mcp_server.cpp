@@ -11228,6 +11228,137 @@ TEST_CASE("execute_instruction schema bounds equal the handler constants", "[mcp
     CHECK_FALSE(props.at("params").contains("propertyNames"));
 }
 
+// ── 26e. #4353 follow-up: schema <-> handler-constant cross-check ────────
+//
+// Gate 3 architect finding on the #4353 follow-up (governance re-review of
+// #4364): mcp_input_bounds.hpp's own header comment says test_mcp_server.cpp
+// "reads the served schema back... and asserts each literal equals its twin
+// here, so bumping one without the other fails a test instead of silently
+// reopening the gap" - true for kExecInstr* (the test above), but the 19
+// kFieldBoundTools constants added by #4353's follow-up had no such twin.
+// Same discipline as the execute_instruction test above, generalized: for
+// each (tool, JSON-pointer-into-schema, constant) triple, assert the served
+// schema's maxLength equals the handler constant exactly.
+TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds]") {
+    using namespace yuzu::server::mcp;
+
+    INFO("adding a tool to kFieldBoundTools? update docs/user-manual/metrics.md and this count");
+    CHECK(kFieldBoundTools.size() == 19);
+
+    struct BoundCheck {
+        std::string_view tool;
+        nlohmann::json::json_pointer ptr;
+        std::size_t expected;
+    };
+    const BoundCheck checks[] = {
+        {"create_management_group", nlohmann::json::json_pointer("/properties/name/maxLength"), kMgmtGroupNameMaxLen},
+        {"create_management_group", nlohmann::json::json_pointer("/properties/description/maxLength"),
+         kMgmtGroupDescriptionMaxLen},
+        {"create_management_group", nlohmann::json::json_pointer("/properties/parent_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"create_management_group", nlohmann::json::json_pointer("/properties/scope_expression/maxLength"),
+         kMgmtGroupScopeExprMaxLen},
+        {"update_management_group", nlohmann::json::json_pointer("/properties/group_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"update_management_group", nlohmann::json::json_pointer("/properties/name/maxLength"), kMgmtGroupNameMaxLen},
+        {"update_management_group", nlohmann::json::json_pointer("/properties/description/maxLength"),
+         kMgmtGroupDescriptionMaxLen},
+        {"update_management_group", nlohmann::json::json_pointer("/properties/parent_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"update_management_group", nlohmann::json::json_pointer("/properties/scope_expression/maxLength"),
+         kMgmtGroupScopeExprMaxLen},
+        {"add_management_group_member", nlohmann::json::json_pointer("/properties/group_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"add_management_group_member", nlohmann::json::json_pointer("/properties/agent_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"get_management_group", nlohmann::json::json_pointer("/properties/group_id/maxLength"), kMgmtGroupIdMaxLen},
+        {"list_management_group_roles", nlohmann::json::json_pointer("/properties/group_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"assign_management_group_role", nlohmann::json::json_pointer("/properties/group_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"assign_management_group_role", nlohmann::json::json_pointer("/properties/principal_id/maxLength"),
+         kMgmtGroupIdMaxLen},
+        {"check_permission", nlohmann::json::json_pointer("/properties/securable_type/maxLength"),
+         kCheckPermSecurableTypeMaxLen},
+        {"check_permission", nlohmann::json::json_pointer("/properties/operation/maxLength"),
+         kCheckPermOperationMaxLen},
+        {"list_result_sets", nlohmann::json::json_pointer("/properties/cursor/maxLength"), kMcpCursorMaxLen},
+        {"create_result_set", nlohmann::json::json_pointer("/properties/name/maxLength"), kResultSetNameMaxLen},
+        {"create_result_set", nlohmann::json::json_pointer("/properties/source_kind/maxLength"),
+         kResultSetSourceKindMaxLen},
+        {"create_result_set", nlohmann::json::json_pointer("/properties/parent_id/maxLength"),
+         kResultSetParentIdMaxLen},
+        {"create_result_set", nlohmann::json::json_pointer("/properties/device_ids/items/maxLength"),
+         kResultSetDeviceIdMaxLen},
+        {"create_result_set_from_inventory_query", nlohmann::json::json_pointer("/properties/name/maxLength"),
+         kResultSetNameMaxLen},
+        {"create_result_set_from_inventory_query", nlohmann::json::json_pointer("/properties/parent_id/maxLength"),
+         kResultSetParentIdMaxLen},
+        {"create_result_set_from_inventory_query",
+         nlohmann::json::json_pointer("/properties/conditions/items/properties/plugin/maxLength"),
+         kInventoryQueryPluginMaxLen},
+        {"create_result_set_from_inventory_query",
+         nlohmann::json::json_pointer("/properties/conditions/items/properties/field/maxLength"),
+         kInventoryQueryFieldMaxLen},
+        {"create_result_set_from_inventory_query",
+         nlohmann::json::json_pointer("/properties/conditions/items/properties/op/maxLength"),
+         kInventoryQueryOpMaxLen},
+        {"create_result_set_from_inventory_query",
+         nlohmann::json::json_pointer("/properties/conditions/items/properties/value/maxLength"),
+         kInventoryQueryValueMaxLen},
+        {"create_result_set_from_tar_query", nlohmann::json::json_pointer("/properties/parent_id/maxLength"),
+         kResultSetParentIdMaxLen},
+        {"create_result_set_from_tar_query", nlohmann::json::json_pointer("/properties/name/maxLength"),
+         kResultSetNameMaxLen},
+        {"create_result_set_from_instruction_result", nlohmann::json::json_pointer("/properties/instruction_id/maxLength"),
+         kInstructionIdMaxLen},
+        {"create_result_set_from_instruction_result",
+         nlohmann::json::json_pointer("/properties/matcher/properties/column/maxLength"), kMatcherColumnMaxLen},
+        {"create_result_set_from_instruction_result",
+         nlohmann::json::json_pointer("/properties/matcher/properties/op/maxLength"), kMatcherOpMaxLen},
+        {"create_result_set_from_instruction_result",
+         nlohmann::json::json_pointer("/properties/matcher/properties/value/maxLength"), kMatcherValueMaxLen},
+        {"create_result_set_from_instruction_result", nlohmann::json::json_pointer("/properties/parent_id/maxLength"),
+         kResultSetParentIdMaxLen},
+        {"create_result_set_from_instruction_result", nlohmann::json::json_pointer("/properties/name/maxLength"),
+         kResultSetNameMaxLen},
+        {"create_result_set_from_instruction_result",
+         nlohmann::json::json_pointer("/properties/params/additionalProperties/maxLength"),
+         kExecInstrParamValueMaxLen},
+        {"get_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        {"get_result_set_members", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        {"get_result_set_members", nlohmann::json::json_pointer("/properties/cursor/maxLength"), kMcpCursorMaxLen},
+        {"get_result_set_lineage", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        {"pin_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        {"unpin_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        {"reevaluate_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+        {"delete_result_set", nlohmann::json::json_pointer("/properties/id/maxLength"), kResultSetIdMaxLen},
+    };
+
+    std::unordered_map<std::string, nlohmann::json> schemas;
+    for (const auto& row : input_schemas_for_test())
+        schemas[row.name] = nlohmann::json::parse(row.schema_json);
+
+    for (const auto& c : checks) {
+        INFO("tool=" << c.tool << " pointer=" << c.ptr.to_string());
+        auto it = schemas.find(std::string(c.tool));
+        REQUIRE(it != schemas.end());
+        REQUIRE(it->second.contains(c.ptr));
+        CHECK(it->second.at(c.ptr).get<std::size_t>() == c.expected);
+    }
+
+    // Every kFieldBoundTools entry appears at least once above - a tool
+    // present in the array with zero checks here would mean its handler
+    // enforces a bound the schema is never cross-checked against.
+    for (const auto tool : kFieldBoundTools) {
+        const bool covered =
+            std::any_of(std::begin(checks), std::end(checks),
+                        [&](const BoundCheck& c) { return c.tool == tool; });
+        INFO("uncovered kFieldBoundTools entry: " << tool);
+        CHECK(covered);
+    }
+}
+
 // ── 27. Zero agents reached ──────────────────────────────────────────────
 
 TEST_CASE("MCP Integration: execute_instruction zero agents reached",
@@ -23991,6 +24122,25 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
                   .value() == 1.0);
     }
 
+    SECTION("get_result_set_members: an oversized cursor is rejected even when id does not "
+            "resolve to an owned result set - proves the check runs ahead of rs_load_owned, "
+            "not after it (Gate 3 consistency-auditor finding: a prior revision checked cursor "
+            "only after that lookup, which short-circuits on a non-resolving id before cursor "
+            "is ever inspected, reporting 'not found' instead of 'field too large')") {
+        ts.start();
+        const std::string big(2049, 'a');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_result_set_members","arguments":{"id":"nonexistent","cursor":")" +
+            big + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "get_result_set_members"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+    }
+
     SECTION("create_result_set: an oversized name is rejected at supervised tier "
             "(Infrastructure:Write is absent from requires_approval()'s list entirely, so "
             "the schema bound was never enforced even there)") {
@@ -24010,6 +24160,23 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
         const std::string big(257, 'b');
         auto res = ts.call(
             R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":[")" +
+            big + R"("]}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+
+    SECTION("create_result_set: an oversized device_ids entry is rejected even when parent_id "
+            "does not resolve to an owned result set - proves the length checks run ahead of "
+            "the parent_id ownership lookup (rs_load_owned), not after it (Gate 3 cpp-expert + "
+            "consistency-auditor finding: a prior revision's device_ids check ran after that "
+            "lookup, which short-circuits on a non-resolving parent_id before device_ids is "
+            "ever inspected)") {
+        ts.start("supervised");
+        const std::string big(257, 'b');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set","arguments":{"name":"x","parent_id":"nonexistent","device_ids":[")" +
             big + R"("]}}})");
         REQUIRE(res);
         auto body = nlohmann::json::parse(res->body);
@@ -24081,6 +24248,44 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             auto res = ts.call(
                 R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","params":{"k":{"pad":")" +
                 big + R"("}}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        SECTION("params with more than kExecInstrParamCountMax (32) keys is rejected - "
+                "the count-cap half of the execute_instruction-parity fix (Gate 3 cpp-expert "
+                "finding: the params check originally copied only the value-length third of "
+                "execute_instruction's three-part shape)") {
+            nlohmann::json params = nlohmann::json::object();
+            for (int i = 0; i < 33; ++i)
+                params[std::format("k{}", i)] = "v";
+            nlohmann::json req = {
+                {"jsonrpc", "2.0"},
+                {"method", "tools/call"},
+                {"id", 9},
+                {"params",
+                 {{"name", "create_result_set_from_instruction_result"},
+                  {"arguments", {{"instruction_id", "x"}, {"params", params}}}}}};
+            auto res = ts.call(req.dump());
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        SECTION("a params key exceeding kExecInstrParamKeyMaxLen (256) bytes is rejected - "
+                "the key-length-cap half of the same execute_instruction-parity fix") {
+            const std::string big_key(257, 'h');
+            nlohmann::json params = nlohmann::json::object();
+            params[big_key] = "v";
+            nlohmann::json req = {
+                {"jsonrpc", "2.0"},
+                {"method", "tools/call"},
+                {"id", 10},
+                {"params",
+                 {{"name", "create_result_set_from_instruction_result"},
+                  {"arguments", {{"instruction_id", "x"}, {"params", params}}}}}};
+            auto res = ts.call(req.dump());
             REQUIRE(res);
             auto body = nlohmann::json::parse(res->body);
             REQUIRE(body.contains("error"));

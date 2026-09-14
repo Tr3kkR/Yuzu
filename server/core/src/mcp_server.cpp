@@ -9639,11 +9639,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 auto updated = *existing;
-                if (new_name) updated.name = *new_name;
-                if (new_description) updated.description = *new_description;
-                if (new_parent_id) updated.parent_id = *new_parent_id;
-                if (new_membership_type) updated.membership_type = *new_membership_type;
-                if (new_scope_expression) updated.scope_expression = *new_scope_expression;
+                if (new_name) updated.name = *std::move(new_name);
+                if (new_description) updated.description = *std::move(new_description);
+                if (new_parent_id) updated.parent_id = *std::move(new_parent_id);
+                if (new_membership_type) updated.membership_type = *std::move(new_membership_type);
+                if (new_scope_expression) updated.scope_expression = *std::move(new_scope_expression);
 
                 if (group_id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "cannot re-parent root group"),
@@ -10957,33 +10957,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 // schema's maxLength was pure advice until now. Checked ahead
                 // of the store-availability gate below - a malformed request
                 // is a client error regardless of backend availability.
-                if (cr.name.size() > kResultSetNameMaxLen ||
-                    cr.source_kind.size() > kResultSetSourceKindMaxLen) {
-                    reject_field_too_large(std::format(
-                        "name must be at most {} bytes and source_kind at most {} bytes",
-                        kResultSetNameMaxLen, kResultSetSourceKindMaxLen));
-                    return;
-                }
-                if (!result_set_store_) {
-                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
-                                    "application/json");
-                    return;
-                }
+                // #4353 follow-up, Gate 3 consistency-auditor/cpp-expert
+                // finding: ALL shape/length checks below (parent_id length,
+                // device_ids entry length) are grouped here, ahead of BOTH
+                // the store-availability gate and the parent_id ownership
+                // lookup (rs_load_owned, which itself needs the store and
+                // can short-circuit) - so an oversized parent_id or
+                // device_ids entry gets the same "field too large" answer
+                // regardless of backend availability or whether parent_id
+                // happens to resolve. A prior revision checked device_ids
+                // AFTER the parent_id block's rs_load_owned() call, which
+                // returned early on a bad/foreign parent_id before the
+                // device_ids bound was ever checked - the exact "same input
+                // class, different outcome" inconsistency update_management_
+                // group's own fix (above) closed for a sibling tool.
+                std::optional<std::string> pid;
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
-                    auto pid = args["parent_id"].get<std::string>();
-                    if (pid.size() > kResultSetParentIdMaxLen) {
+                    pid = args["parent_id"].get<std::string>();
+                    if (pid->size() > kResultSetParentIdMaxLen) {
                         reject_field_too_large(std::format(
                             "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
                         return;
                     }
-                    // Owner-check the parent before persisting the lineage
-                    // edge, else an operator could parent onto a victim's id
-                    // and read its metadata back via get_result_set_lineage.
-                    auto parent = rs_load_owned(pid);
-                    if (!parent)
-                        return; // rs_load_owned already wrote the error
-                    cr.parent_id = pid;
                 }
                 std::vector<std::string> members;
                 if (args.contains("device_ids") && args["device_ids"].is_array()) {
@@ -10998,6 +10994,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                         members.push_back(std::move(member));
                     }
+                }
+                if (cr.name.size() > kResultSetNameMaxLen ||
+                    cr.source_kind.size() > kResultSetSourceKindMaxLen) {
+                    reject_field_too_large(std::format(
+                        "name must be at most {} bytes and source_kind at most {} bytes",
+                        kResultSetNameMaxLen, kResultSetSourceKindMaxLen));
+                    return;
+                }
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (pid) {
+                    // Owner-check the parent before persisting the lineage
+                    // edge, else an operator could parent onto a victim's id
+                    // and read its metadata back via get_result_set_lineage.
+                    auto parent = rs_load_owned(*pid);
+                    if (!parent)
+                        return; // rs_load_owned already wrote the error
+                    cr.parent_id = *pid;
                 }
                 if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
                     if (metrics)
@@ -11418,8 +11435,34 @@ McpServer::HandlerFn McpServer::build_handler(
                         }
                     }
                     if (args.contains("params") && args["params"].is_object()) {
-                        for (const auto& [k, v] : args["params"].items()) {
-                            (void)k;
+                        const auto& p = args["params"];
+                        // #4353 follow-up, Gate 3 cpp-expert finding: this
+                        // tool's params shares the same "InstructionDefinition
+                        // parameters" concept execute_instruction's own
+                        // params bounds, but an earlier revision of this fix
+                        // copied only that precedent's value-length cap, not
+                        // its count cap or key-length cap - leaving both
+                        // genuinely unbounded for the same ungated caller
+                        // population (the served schema has no
+                        // maxProperties/propertyNames either, same
+                        // schema-inexpressible-rule reason execute_instruction
+                        // documents for its own identical two caps). All
+                        // three now mirror execute_instruction's
+                        // check_exec_instruction_shape/handler checks exactly,
+                        // reusing its kExecInstrParamCountMax/
+                        // kExecInstrParamKeyMaxLen constants since both tools
+                        // dispatch the SAME params concept to the fleet.
+                        if (p.size() > kExecInstrParamCountMax) {
+                            reject_field_too_large(std::format(
+                                "params must have at most {} keys", kExecInstrParamCountMax));
+                            return;
+                        }
+                        for (const auto& [k, v] : p.items()) {
+                            if (k.size() > kExecInstrParamKeyMaxLen) {
+                                reject_field_too_large(std::format(
+                                    "a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
+                                return;
+                            }
                             // Measure what the handler will actually store: a
                             // non-string value is dumped to text below
                             // (`v.is_string() ? v.get<std::string>() :
@@ -11650,21 +11693,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 // #4353 follow-up: this tool is never approval-gated (Read), so
-                // the schema's maxLength was pure advice until now.
-                if (rs_id.size() > kResultSetIdMaxLen) {
-                    reject_field_too_large(
-                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
+                // the schema's maxLength was pure advice until now. Both
+                // fields checked here, ahead of rs_load_owned (Gate 3
+                // consistency-auditor finding: rs_load_owned can itself
+                // return early on a not-found/not-owned id, and a prior
+                // revision checked `cursor` only after that call - so an
+                // oversized cursor on an id that doesn't resolve reported
+                // "not found" instead of "field too large").
+                std::string cursor = param_str(args, "cursor");
+                if (rs_id.size() > kResultSetIdMaxLen || cursor.size() > kMcpCursorMaxLen) {
+                    reject_field_too_large(std::format(
+                        "id must be at most {} bytes and cursor at most {} bytes",
+                        kResultSetIdMaxLen, kMcpCursorMaxLen));
                     return;
                 }
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
-                std::string cursor = param_str(args, "cursor");
-                if (cursor.size() > kMcpCursorMaxLen) {
-                    reject_field_too_large(
-                        std::format("cursor must be at most {} bytes", kMcpCursorMaxLen));
-                    return;
-                }
                 int64_t limit = param_int(args, "limit", 1000);
                 if (limit < 1)
                     limit = 1;
