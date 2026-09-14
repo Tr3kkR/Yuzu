@@ -9718,10 +9718,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // MFA step-up (no MCP tool calls it) NOR the approval ticket
                 // (requires_approval() itself no-ops on an empty tier) -
                 // deleting a Guaranteed State rule (auto-remediation policy)
-                // with neither control. Same fix shape as B4's
-                // create_api_token/revoke_api_token/unlock_account/
-                // rotate_api_token/confirm_api_token_rotation guards
-                // (#4309). create_guardian_rule/update_guardian_rule/
+                // with neither control. Same fix shape as sibling PR "#2146
+                // Batch B4"'s create_api_token/revoke_api_token/
+                // unlock_account/rotate_api_token/confirm_api_token_rotation
+                // guards (#4309) - those tools live on a separate branch, not
+                // in this tree, so do not expect to find them here.
+                // create_guardian_rule/update_guardian_rule/
                 // push_guardian_rules are NOT approval-gated at any tier
                 // (GuaranteedState:Write/Push aren't in requires_approval()'s
                 // list), so they have no approval to bypass here and are
