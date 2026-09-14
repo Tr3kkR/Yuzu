@@ -9191,9 +9191,29 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                auto caller = caller_fn
-                                  ? caller_fn(*session)
-                                  : DispatchCaller{.exec_visible = yuzu::server::authz::deny_all()};
+                // Adversarial review (PR #4330, Codex + Kimi, confirmed against
+                // REST's identical check before accepting): an unwired caller_fn
+                // is the server's ONLY per-device authorization for these three
+                // producers (#1788, primary gate not defense-in-depth) - a
+                // silent deny_all() substitution here would read to the caller
+                // as an ordinary "no agents reached in scope" 503/empty result,
+                // hiding a broken authorization gate behind a legitimate-looking
+                // outcome. REST's run_async refuses loudly for the exact same
+                // reason (rest_api_v1.cpp, RESULT_SET_GATE_UNCONFIGURED) - mirror
+                // that here rather than substituting present-empty.
+                if (!caller_fn) {
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", "",
+                        "reason=caller_fn_unwired source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_GATE_UNCONFIGURED: dispatch visibility gate not "
+                                 "configured",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                auto caller = caller_fn(*session);
                 caller.approval_provenance = approval_ticket_just_consumed
                                                  ? yuzu::server::ApprovalProvenance::Ticket
                                                  : yuzu::server::ApprovalProvenance::None;
@@ -9830,7 +9850,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     : orig->name.ends_with(" (re-eval)") ? orig->name
                                                          : (orig->name + " (re-eval)");
                 if (orig->source_kind == source_kind::kTarQuery) {
-                    std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                    // Adversarial review (PR #4330): sp.value("sql", "") throws
+                    // nlohmann::json::type_error on a type mismatch rather than
+                    // coercing - unlike create_result_set_from_tar_query's own
+                    // caller-facing "sql" arg, which gets an explicit type check.
+                    // orig->source_payload isn't caller-supplied on THIS call,
+                    // but a row minted via the generic (uncapped) create_result_set
+                    // constructor can carry an arbitrary source_payload with a
+                    // non-string "sql" - the same #2500-class row this SQL-size
+                    // cap two lines below exists to catch. Treat a non-string
+                    // sql the same as absent: the empty check just below already
+                    // has the right error for that.
+                    std::string sql =
+                        (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
+                            ? sp.value("sql", "")
+                            : "";
                     if (sql.empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams,
@@ -9857,9 +9891,29 @@ McpServer::HandlerFn McpServer::build_handler(
                     rs_run_async("tar", "sql", params, source_kind::kTarQuery, orig->source_payload,
                                 orig->matcher, synth, reeval_name);
                 } else if (orig->source_kind == source_kind::kInstructionResult) {
-                    std::string instruction_id = sp.is_object() ? sp.value("instruction_id", "") : "";
+                    // Same type-confusion guard as the sql field above.
+                    std::string instruction_id =
+                        (sp.is_object() && sp.contains("instruction_id") &&
+                         sp["instruction_id"].is_string())
+                            ? sp.value("instruction_id", "")
+                            : "";
+                    // Adversarial review (PR #4330): this used to fall through
+                    // an unwired/closed instruction_store into the same
+                    // non-retryable 400 as "the original row genuinely has no
+                    // instruction_id" - telling an agentic caller "gone" when
+                    // the real answer is "try again". create_result_set_from_
+                    // instruction_result's own identical check (a few lines
+                    // above) already gets this right; mirrored here.
+                    if (!instruction_store || !instruction_store->is_open()) {
+                        res.set_content(
+                            a4_error(kInternalError, "instruction store not available",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
                     std::optional<InstructionDefinition> def;
-                    if (instruction_store && instruction_store->is_open()) {
+                    if (!instruction_id.empty()) {
                         auto def_result = instruction_store->get_definition(instruction_id);
                         if (!def_result) {
                             res.set_content(

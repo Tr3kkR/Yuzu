@@ -21506,6 +21506,86 @@ TEST_CASE("MCP result-sets: a store DbError AFTER a real dispatch has already fi
     CHECK(body["error"]["data"]["retry_after_ms"].is_null());
 }
 
+// Adversarial review (PR #4330, Codex + Kimi): rs_run_async silently
+// substituted deny_all() for an unwired caller_fn instead of refusing with an
+// audited 500 - the exact fail-open shape .claude/routed-concerns-access-
+// control.md's per-device-dispatch-visibility row names as catastrophic,
+// since this derivation is these 3 producers' ONLY per-device authorization
+// (#1788), not defense-in-depth. Mirrors test_rest_result_sets_async.cpp's
+// own "an UNWIRED exec-visible derivation is an audited 500, never a
+// dispatch" coverage of the identical REST chokepoint.
+TEST_CASE("MCP async result-set producers: an unwired caller_fn is an audited "
+          "500, never a dispatch",
+          "[pg][mcp][integration][result-sets][security][1788][fail-closed]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    std::string instruction_id;
+    {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Get OS Version";
+        def.version = "1.0";
+        def.plugin = "os_info";
+        def.action = "version";
+        def.type = "question";
+        def.description = "test";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        instruction_id = *created;
+    }
+    bool dispatched = false;
+    auto dispatch = [&](const std::string&, const std::string&,
+                        const std::vector<std::string>&, const std::string&,
+                        const std::unordered_map<std::string, std::string>&, const std::string&,
+                        const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    // Seed an existing set directly in the store (bypassing MCP, which would
+    // itself need a wired caller_fn to create one) so reevaluate_result_set
+    // has something to re-run.
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "seed";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    nlohmann::json payload;
+    payload["sql"] = "SELECT 1";
+    cr.source_payload = payload.dump();
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.instruction_store_for_test = &instr;
+    ts.caller_fn_for_test = {}; // genuinely unwired, not the harness default
+    ts.start_with_dispatch(dispatch, "operator");
+
+    for (const auto& [name, args] :
+         std::vector<std::pair<std::string, std::string>>{
+             {"create_result_set_from_tar_query", R"({"sql":"SELECT 1"})"},
+             {"create_result_set_from_instruction_result",
+              R"({"instruction_id":")" + instruction_id + R"("})"},
+             {"reevaluate_result_set", R"({"id":")" + seeded->id + R"("})"}}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":")" + name +
+            R"(","arguments":)" + args + R"(}})");
+        REQUIRE(res);
+        INFO("tool: " << name);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInternalError);
+        CHECK(body["error"]["message"].get<std::string>().find("RESULT_SET_GATE_UNCONFIGURED") !=
+              std::string::npos);
+    }
+    CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+}
+
 TEST_CASE("MCP result-sets: the 3 async producers derive the caller's confined exec_visible "
           "and thread it into dispatch_fn — the #1788 chokepoint, not a looser provider",
           "[mcp][integration][result-sets][scope]") {
