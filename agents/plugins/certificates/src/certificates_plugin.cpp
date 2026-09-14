@@ -152,27 +152,6 @@ struct CertRecord {
     }
 };
 
-#if defined(__linux__) || defined(__APPLE__)
-// Adopt a certificates_x509::CertFields (the pure libcrypto parse result)
-// into this file's own CertRecord shape, setting `store` from the caller --
-// certificates_x509.hpp never knows which keychain/directory a certificate
-// came from, only the plugin's platform-specific read sites do. Shared by
-// the Linux PEM-file path (read_linux_cert_record) and the macOS SecItem
-// System/root path (list/details_cert_macos) so both adopt CertFields into
-// CertRecord identically.
-CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std::string store) {
-    CertRecord rec;
-    rec.store = std::move(store);
-    rec.subject = fields.subject;
-    rec.issuer = fields.issuer;
-    rec.not_before = fields.not_before;
-    rec.not_after = fields.not_after;
-    rec.serial = fields.serial;
-    rec.thumbprint = fields.thumbprint;
-    rec.key_usage = fields.key_usage;
-    return rec;
-}
-
 /// Report a partial certificate read through the ABI4 typed result seam
 /// (`yuzu_ctx_set_result_status`, sdk/include/yuzu/plugin.hpp) in addition to
 /// the operator-visible `not_available|<reason>` row the caller writes.
@@ -204,6 +183,10 @@ CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std
 /// line. That is the one case where the agent log has to distinguish them --
 /// the result row reaches the operator, but an on-call engineer reading only
 /// the log needs to know a wedged Directory Service is the cause.
+///
+/// Defined outside every platform guard: the Windows CryptoAPI store-open
+/// path (enumerate_store) needs it too, so it can no longer live only under
+/// `#if defined(__linux__) || defined(__APPLE__)`.
 void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance,
                          std::string_view reason = {}) {
     if (reason.empty())
@@ -214,22 +197,25 @@ void mark_result_partial(yuzu::CommandContext& ctx, std::string_view provenance,
                           provenance);
 }
 
-/**
- * Canonicalize a thumbprint to uppercase hex so every downstream comparison
- * against a parsed value (certificates_x509::extract_thumbprint always emits
- * uppercase) is a plain `==`. The `thumbprint` request parameter is
- * documented as case-insensitive (content/definitions/certificates.yaml) but
- * was compared as-is on both the macOS and Linux paths, so a lowercase
- * caller-supplied value silently failed to match. `s` is assumed already
- * hex-validated by is_valid_thumbprint(); this only changes case, never
- * rejects input. Shared (not macOS-only) because details_cert_linux and
- * delete_cert_linux need the identical fold.
- */
-std::string canonical_thumbprint(std::string_view s) {
-    std::string out{s};
-    for (auto& c : out)
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    return out;
+#if defined(__linux__) || defined(__APPLE__)
+// Adopt a certificates_x509::CertFields (the pure libcrypto parse result)
+// into this file's own CertRecord shape, setting `store` from the caller --
+// certificates_x509.hpp never knows which keychain/directory a certificate
+// came from, only the plugin's platform-specific read sites do. Shared by
+// the Linux PEM-file path (read_linux_cert_record) and the macOS SecItem
+// System/root path (list/details_cert_macos) so both adopt CertFields into
+// CertRecord identically.
+CertRecord to_cert_record(const yuzu::certificates_x509::CertFields& fields, std::string store) {
+    CertRecord rec;
+    rec.store = std::move(store);
+    rec.subject = fields.subject;
+    rec.issuer = fields.issuer;
+    rec.not_before = fields.not_before;
+    rec.not_after = fields.not_after;
+    rec.serial = fields.serial;
+    rec.thumbprint = fields.thumbprint;
+    rec.key_usage = fields.key_usage;
+    return rec;
 }
 #endif
 
@@ -322,7 +308,7 @@ std::string get_key_usage(PCCERT_CONTEXT cert) {
     return result;
 }
 
-std::vector<CertRecord> enumerate_store(const char* store_name) {
+std::optional<std::vector<CertRecord>> enumerate_store(const char* store_name) {
     std::vector<CertRecord> records;
 
     HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
@@ -337,8 +323,15 @@ std::vector<CertRecord> enumerate_store(const char* store_name) {
                                    CERT_STORE_READONLY_FLAG,
                                store_name);
     }
-    if (!hStore)
-        return records;
+    if (!hStore) {
+        // Both opens failed -- an honest std::nullopt, never a silent empty
+        // vector indistinguishable from "store opened, found nothing"
+        // (consistency-auditor Gate-4 BLOCKING finding, same shape as the
+        // macOS/Linux honesty fixes elsewhere in this file).
+        spdlog::warn("certificates: CryptoAPI store '{}' could not be opened (GetLastError={})",
+                    store_name, GetLastError());
+        return std::nullopt;
+    }
 
     PCCERT_CONTEXT cert = nullptr;
     while ((cert = CertEnumCertificatesInStore(hStore, cert)) != nullptr) {
@@ -368,7 +361,17 @@ void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, in
             continue;
 
         auto records = enumerate_store(store_name);
-        for (const auto& rec : records) {
+        if (!records) {
+            // Both CertOpenStore attempts failed for this store -- say so
+            // (operator-visible row + ABI4 typed status) and keep scanning
+            // the remaining stores rather than silently reporting them as
+            // empty (consistency-auditor Gate-4 BLOCKING finding).
+            auto reason = std::format("not_available|{} store could not be opened", store_name);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-open", reason);
+            continue;
+        }
+        for (const auto& rec : *records) {
             if (expires_within_days(rec.not_after, expiring_days)) {
                 ctx.write_output(rec.to_row());
             }
@@ -381,38 +384,82 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
 
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
+    auto needle = canonical_thumbprint(thumbprint);
+    // Tracks whether every selected store was actually opened. A store this
+    // process couldn't open leaves this loop free to keep scanning the
+    // rest, but the eventual "not found" verdict must not be reported as
+    // definitive if any store was skipped -- mirrors details_cert_linux's
+    // scan_complete flag.
+    bool scan_complete = true;
+    std::string unopened;
     for (const auto* store_name : kStores) {
         auto records = enumerate_store(store_name);
-        for (const auto& rec : records) {
-            if (rec.thumbprint == thumbprint) {
+        if (!records) {
+            scan_complete = false;
+            if (!unopened.empty())
+                unopened += ", ";
+            unopened += store_name;
+            mark_result_partial(ctx, "cryptoapi:store-open");
+            continue;
+        }
+        for (const auto& rec : *records) {
+            if (rec.thumbprint == needle) {
                 ctx.write_output(rec.to_row());
                 return;
             }
         }
     }
-    ctx.write_output("status|not_found");
+    if (scan_complete) {
+        ctx.write_output("status|not_found");
+    } else {
+        // A store failed to open, so "not found" was never established --
+        // mirrors details_cert_linux's "scan incomplete" convention.
+        ctx.write_output(
+            std::format("not_available|{} store(s) could not be opened; scan incomplete",
+                        unopened));
+    }
 }
 
-void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
+bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
                      std::string_view store_name) {
-    HCERTSTORE hStore =
-        CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0, CERT_SYSTEM_STORE_LOCAL_MACHINE,
-                      std::string{store_name}.c_str());
+    // store_name is caller-supplied free text (execute() passes
+    // params.get("store", "MY") straight through, unvalidated) -- escape it
+    // (K-7/BR-07) so a hostile value containing '|' or embedded CR/LF can
+    // never inject an extra pipe-delimited column or newline-delimited row
+    // into this output, same rule the cert-derived fields already follow in
+    // CertRecord::to_row().
+    auto safe_store = yuzu::util::safe_output_field(store_name);
+
+    // CERT_STORE_OPEN_EXISTING_FLAG: without it, CertOpenStore silently
+    // CREATES a missing store and this function then reports the
+    // certificate "not_found" in a store that was never actually opened --
+    // an unopenable store must be reported honestly, not masked as a
+    // definitive negative (consistency-auditor Gate-4 BLOCKING finding).
+    HCERTSTORE hStore = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_A, 0, 0,
+        CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG,
+        std::string{store_name}.c_str());
 
     if (!hStore) {
-        hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0, CERT_SYSTEM_STORE_CURRENT_USER,
+        hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
+                               CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG,
                                std::string{store_name}.c_str());
     }
     if (!hStore) {
-        ctx.write_output("status|not_found");
-        return;
+        auto reason =
+            std::format("error|{} store could not be opened; nothing removed", safe_store);
+        ctx.write_output(reason);
+        mark_result_partial(ctx, "cryptoapi:store-open", reason);
+        return false;
     }
 
+    auto needle = canonical_thumbprint(thumbprint);
     PCCERT_CONTEXT cert = nullptr;
     bool found = false;
+    bool ok = true;
     while ((cert = CertEnumCertificatesInStore(hStore, cert)) != nullptr) {
         auto fp = get_cert_thumbprint(cert);
-        if (fp == thumbprint) {
+        if (fp == needle) {
             // Duplicate the context because CertDeleteCertificateFromStore
             // frees the context and invalidates the enumeration
             PCCERT_CONTEXT dup = CertDuplicateCertificateContext(cert);
@@ -420,6 +467,7 @@ void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 ctx.write_output("status|deleted");
             } else {
                 ctx.write_output("status|delete_failed");
+                ok = false;
             }
             found = true;
             break;
@@ -427,10 +475,14 @@ void delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
     }
 
     if (!found) {
+        // A definitive negative: the store opened and was fully scanned,
+        // so "not found" is a successful idempotent no-op, matching
+        // delete_cert_macos's pre-delete presence check.
         ctx.write_output("status|not_found");
     }
 
     CertCloseStore(hStore, 0);
+    return ok;
 }
 
 #endif // _WIN32
@@ -1197,7 +1249,8 @@ ConsoleUserResolution resolve_console_user(
     return out;
 }
 
-// canonical_thumbprint() moved to the shared __linux__/__APPLE__ block above
+// canonical_thumbprint() lives in certificates_macos_parsers.hpp (resolved
+// unqualified via `using namespace yuzu::certificates_macos;` above)
 // -- details_cert_linux/delete_cert_linux need the identical fold.
 
 // BlockIdentityOutcome / classify_block_identity moved to
@@ -2056,7 +2109,13 @@ public:
             }
 
 #ifdef _WIN32
-            delete_cert_win(ctx, thumbprint, store);
+            // delete_cert_win() returns false only when nothing was
+            // actually removed (the store couldn't be opened, or the
+            // delete call itself failed) -- propagate that as a non-zero rc
+            // so orchestration can't mistake "nothing was deleted" for a
+            // successful no-op, same rc/typed-status coherence as macOS.
+            if (!delete_cert_win(ctx, thumbprint, store))
+                return 1;
 #elif defined(__linux__)
             delete_cert_linux(ctx, thumbprint, store);
 #elif defined(__APPLE__)
