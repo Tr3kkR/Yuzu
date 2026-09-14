@@ -47,10 +47,13 @@
 /// reused session id — NOT a 4.2a change. Invariant to preserve:
 /// `session_id` ≡ exactly one gateway stream placement.
 ///
-/// `renew_leases` is a single batched statement over `session_id = ANY($1)` —
+/// `renew_leases` is a single batched statement, correlated on BOTH
+/// `agent_id` AND `session_id` (a parallel-array unnest() join — #4246 #10) —
 /// at fleet scale a per-row renew would be one write per agent every lease
 /// interval; batching keeps the steady-state write rate flat regardless of
-/// fleet size.
+/// fleet size. The agent_id correlation is a defense-in-depth hardening: a
+/// caller that knows only a session token can no longer renew a route
+/// belonging to a DIFFERENT agent.
 ///
 /// Posture (ADR-0012 §1): this store is a coordination/liveness aid, not yet
 /// an authority anything depends on for correctness (nothing reads it). A
@@ -315,10 +318,17 @@ public:
     deregister(std::string_view agent_id, std::string_view session_id);
 
     /// Batched lease renewal: bumps `lease_until` for every row whose
-    /// `session_id` is in `session_ids`, in ONE statement. Returns the number
-    /// of rows renewed.
+    /// `(agent_id, session_id)` matches a pair in the two PARALLEL arrays
+    /// `agent_ids`/`session_ids` (index i is one pair), in ONE statement.
+    /// #4246 #10 — correlating on BOTH columns (not `session_id` alone) closes
+    /// a defense-in-depth gap: a caller that only ever knows a session token
+    /// can no longer renew a DIFFERENT agent's route by presenting that token
+    /// against the wrong `agent_id`; such a call matches zero rows. A length
+    /// mismatch between the two arrays is refused (`db_error`) rather than
+    /// guessed at. Returns the number of rows renewed.
     [[nodiscard]] std::expected<int, GatewayRouteStoreError>
-    renew_leases(std::span<const std::string> session_ids, int lease_ttl_secs);
+    renew_leases(std::span<const std::string> agent_ids, std::span<const std::string> session_ids,
+                int lease_ttl_secs);
 
     /// The current route for `agent_id`, or `nullopt` if no row exists.
     /// `RouteRow::is_stale` is computed in-SQL from `lease_until` vs. `now()`.

@@ -160,11 +160,13 @@ const std::vector<pg::PgMigration>& GatewayRouteStore::migrations() {
     // announce_connected.
     //
     // The `session_id` index is load-bearing, not cosmetic: renew_leases() is
-    // the highest-frequency op (once per BatchHeartbeat batch) and filters
-    // `WHERE session_id = ANY($1)`, and deregister() filters on session_id too;
-    // without the index those are a seq scan of agent_routes per heartbeat tick,
-    // which grows with fleet size (governance perf/sre, WS-4 4.1). It ships in
-    // migration v1 because adding it later costs a second migration version.
+    // the highest-frequency op (once per BatchHeartbeat batch) and (#4246 #10)
+    // joins against it via `r.session_id = t.session_id` (correlated with
+    // `agent_id` too, but `agent_id` is already the primary key), and
+    // deregister() filters on session_id too; without the index those are a
+    // seq scan of agent_routes per heartbeat tick, which grows with fleet
+    // size (governance perf/sre, WS-4 4.1). It ships in migration v1 because
+    // adding it later costs a second migration version.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          R"(
@@ -402,9 +404,20 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
 }
 
 std::expected<int, GatewayRouteStoreError>
-GatewayRouteStore::renew_leases(std::span<const std::string> session_ids, int lease_ttl_secs) {
+GatewayRouteStore::renew_leases(std::span<const std::string> agent_ids,
+                                std::span<const std::string> session_ids, int lease_ttl_secs) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    // #4246 #10: agent_ids and session_ids are PARALLEL arrays (index i is one
+    // (agent_id, session_id) pair) — a caller-side length mismatch would
+    // silently misalign the correlation below, so refuse rather than guess
+    // which element pairs with which.
+    if (agent_ids.size() != session_ids.size()) {
+        spdlog::error("GatewayRouteStore::renew_leases: agent_ids/session_ids length mismatch "
+                      "({} vs {})",
+                      agent_ids.size(), session_ids.size());
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
     if (session_ids.empty())
         return 0;
     auto lease = pool_.try_acquire_for(kWriteTimeout);
@@ -412,21 +425,33 @@ GatewayRouteStore::renew_leases(std::span<const std::string> session_ids, int le
         spdlog::warn("GatewayRouteStore::renew_leases: lease timeout — degraded");
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
-    // ONE batched statement over session_id = ANY($1) — a per-row renew would
-    // be one write per agent every lease interval at fleet scale (file
-    // header). Session ids go through the shared pg::to_text_array helper
-    // (pg/pg_array.hpp) rather than a hand-rolled literal, matching the
-    // established idiom (app_perf_group_reader.cpp, deployment_run_store.cpp).
-    std::vector<std::string_view> views;
-    views.reserve(session_ids.size());
+    // ONE batched statement, correlated on BOTH agent_id AND session_id via a
+    // parallel-array unnest() join (#4246 #10) — a per-row renew would be one
+    // write per agent every lease interval at fleet scale (file header), and
+    // matching on session_id alone let a compromised/buggy gateway renew a
+    // foreign agent's session merely by knowing its token, with no agent_id
+    // correlation (defense-in-depth gap; see the retired trust-rationale
+    // comment this replaces at the BatchHeartbeat call site). Both arrays go
+    // through the shared pg::to_text_array helper (pg/pg_array.hpp) rather
+    // than a hand-rolled literal, matching the established idiom
+    // (app_perf_group_reader.cpp, deployment_run_store.cpp).
+    std::vector<std::string_view> agent_views;
+    agent_views.reserve(agent_ids.size());
+    for (const std::string& a : agent_ids)
+        agent_views.emplace_back(a);
+    std::vector<std::string_view> session_views;
+    session_views.reserve(session_ids.size());
     for (const std::string& s : session_ids)
-        views.emplace_back(s);
+        session_views.emplace_back(s);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE gateway_route_store.agent_routes SET "
-        "  lease_until = now() + ($2 || ' seconds')::interval, updated_at = now() "
-        "WHERE session_id = ANY($1::text[]) RETURNING agent_id",
-        std::vector<std::string>{pg::to_text_array(views), std::to_string(lease_ttl_secs)});
+        "UPDATE gateway_route_store.agent_routes AS r SET "
+        "  lease_until = now() + ($3 || ' seconds')::interval, updated_at = now() "
+        "FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
+        "WHERE r.agent_id = t.agent_id AND r.session_id = t.session_id "
+        "RETURNING r.agent_id",
+        std::vector<std::string>{pg::to_text_array(agent_views), pg::to_text_array(session_views),
+                                 std::to_string(lease_ttl_secs)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("GatewayRouteStore::renew_leases: query failed: {}",
                       PQresultErrorMessage(res.get()));

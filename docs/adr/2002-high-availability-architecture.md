@@ -341,7 +341,8 @@ cluster unit; intra-zone scale is more nodes.
   cluster they connect through a **cluster-front (VIP / DNS-multi / node list)** and reconnect on node
   loss. Both gateway endpoints are addressable by **VIP or node list — support both**.
 
-**Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done — see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
+**Status (WS-4): 4.1 done; 4.2a (writer-path hardening) done; 4.2b Task A (store layer) + Task B
+(per-site fail-closed posture + renew correlation) done — see below.** The fenced agent→cluster routing directory exists (`GatewayRouteStore`,
 `gateway_route_store.{hpp,cpp}`, Postgres schema `gateway_route_store`) and is written on the
 gateway-upstream connect/disconnect/heartbeat paths, but it is **INERT** — no dispatch surface reads it
 yet, so this slice changes no runtime routing behaviour. The epoch in "delayed replay from an older
@@ -352,12 +353,14 @@ ProxyRegister REPLAY, which now carries the agent's existing `x-yuzu-session-id`
 the server re-announces (reuses the session) rather than minting a new one. Every post-register write
 (`announce_connected`/`deregister`/`renew_leases`) is instead guarded by **`session_id` equality** — the
 epoch settles who WINS a fresh registration race, `session_id` settles who may touch the row
-afterward. The wire gained only `StreamStatusNotification.cluster_id`. Posture is fail-open on a
-runtime write failure today (the directory isn't dispatch-authoritative yet); **4.2 (northbound
-dispatch rewire) must flip that to fail-closed** before a command's undeliverable-because-route-unknown
-case can be trusted — slice **4.2a** below hardens the writer path itself (tombstone semantics, a
-stale-route reaper, a fresh-epoch-clobber fix, guard-rejection visibility) but deliberately defers that
-flip to **4.2b**. 4.3 (net-new distributed intra-cluster routing) and 4.4 (`gateway_node`
+afterward. The wire gained only `StreamStatusNotification.cluster_id`. Posture was fail-open on every
+runtime write failure through 4.2a; slice **4.2a** hardened the writer path itself (tombstone
+semantics, a stale-route reaper, a fresh-epoch-clobber fix, guard-rejection visibility) but deliberately
+deferred the fail-closed flip to **4.2b**. **4.2b Task B landed that flip as a PER-SITE contract, not a
+uniform one**: `register_fresh` (the row-CREATING write) is fail-closed, the other five writes stay
+fail-open (see the design-obligations bullets below for the full rationale) — the directory is still
+INERT, so a command's undeliverable-because-route-unknown case is not yet trusted off this store; that
+is the dispatch-wiring task. 4.3 (net-new distributed intra-cluster routing) and 4.4 (`gateway_node`
 convergence reconcile) remain outstanding.
 
 **4.2 design obligations surfaced by the 4.1 governance review (all INERT today — latent because
@@ -455,27 +458,49 @@ intra-replica with a live session). Tracked as `#4246`; **slice 4.2a (below) clo
   `outcome` ∈ `shortfall`\|`session_mismatch`\|`unknown_session`) — see
   `docs/observability-conventions.md` and `docs/user-manual/metrics.md`. The alert rule ships with the
   4.2b fail-closed flip (next bullet, #4246 #1).
-- **Optionally correlate `agent_id` on `renew_leases`** (#4246 #10 — **DEFERRED to 4.4**) — today renew
-  matches `session_id` alone (defense-in-depth gap against a compromised gateway renewing a foreign
-  session; see the trust-rationale comment at the BatchHeartbeat site). Pair `agent_id` per renewed
-  session if the directory becomes authoritative.
-- **Ship the write-failure alert rule + metrics-doc entry with the fail-closed flip** (#4246 #1 —
-  **DEFERRED to 4.2b**, alongside #8's alert-rule half above). The metrics-doc entries for BOTH counter
-  families already exist (`docs/observability-conventions.md`, `docs/user-manual/metrics.md`); what
-  remains is the fail-closed posture flip itself and the alert rule(s) that depend on the directory
-  being dispatch-authoritative.
+- **Correlate `agent_id` on `renew_leases`** (#4246 #10 — **CLOSED, 4.2b Task B**) — renew used to match
+  `session_id` alone (defense-in-depth gap against a compromised gateway renewing a foreign session).
+  `renew_leases` now takes PARALLEL `agent_ids`/`session_ids` arrays and its SQL correlates on BOTH
+  columns (`r.agent_id = t.agent_id AND r.session_id = t.session_id`, a `unnest()` join) — a renew
+  presenting the right session but the wrong agent_id now matches zero rows. All three call sites
+  (ProxyRegister's two renew branches, BatchHeartbeat) thread the resolved `agent_id` through — the
+  DURABLE `(agent_id, session_id)` binding already stored in the directory is the trust anchor, so a
+  correlation is deliberately checked against it rather than trusting any caller-supplied value; the
+  wire's `HeartbeatRequest` carries no `agent_id` at all (only `session_id`), so `BatchHeartbeat`
+  resolves it from the SAME per-replica in-memory `gateway_sessions_` map the #4246 #3 known-session
+  check above already uses. This means #10's correlation inherits THAT bullet's limitation, not a new
+  one: a heartbeat for a session this replica doesn't locally know is excluded from the renew batch
+  (surfaced via `yuzu_server_gateway_route_desync_total{op="renew_leases",outcome="unknown_session"}`,
+  new in this slice, rather than silently dropped) and stays that way until the #4246 #3 durable
+  cross-replica session lookup lands under WS-5. Unreachable on today's single-replica monolith.
+- **Ship the write-failure fail-closed posture + alert rule** (#4246 #1 — **PARTIALLY CLOSED, 4.2b Task
+  B; alert rule still DEFERRED**). The flip landed as a **per-site contract, not a uniform flip**:
+  `record_route_store_failure`'s six call sites keep DIFFERENT postures by design, since the directory
+  is still INERT (nothing reads it for dispatch) and only the write whose LOSS is unrecoverable is worth
+  refusing the RPC over. `register_fresh` (ProxyRegister's fresh-registration branch) — the ONE
+  row-CREATING write — is now fail-CLOSED (returns `UNAVAILABLE`, mirroring the existing #3401
+  `register_agent` precedent); the other five (`announce_connected`, both ProxyRegister `renew_leases`
+  branches, BatchHeartbeat's `renew_leases`, `deregister`) stay fail-OPEN — see
+  `record_route_store_failure`'s header comment (gateway_service_impl.cpp) for the per-site rationale.
+  The metrics-doc entries for both counter families already exist (`docs/observability-conventions.md`,
+  `docs/user-manual/metrics.md`); the alert rule(s) that depend on the directory being
+  dispatch-authoritative remain deferred to the dispatch-wiring slice.
 
-**Status (4.2a, 2026-09-11): writer-path hardening DONE (PR pending, branch
-`feat/ha-ws4-42a-directory-hardening`)** — `deregister` tombstone semantics, `reap_stale_routes`
-(scheduled `ReplicaSafe` in `background_jobs.hpp`, WS-10 classification), the mechanism-(c)
-unknown-presented-session fix, the `yuzu_server_gateway_route_desync_total` counter, and the
-hot-path/reaper write-timeout split (500ms/2000ms) (#4246 #9 — **CLOSED, 4.2a**) all land in this slice. **The directory is STILL
-INERT** — nothing dispatches through it — and **4.2 (northbound dispatch rewire, making the directory
-dispatch-authoritative) is NOT done**; the fail-closed posture flip and its alert rule are explicitly
-deferred to 4.2b. Remaining WS-4 sub-work after 4.2a: 4.2b (fail-closed flip + alert rule), the durable
-cross-replica session lookup (re-homed to its own slice under WS-5), 4.3 (net-new distributed
-intra-cluster agent→node routing), 4.4 (`gateway_node` convergence reconcile, replay-response
-writeback, `agent_id`-on-renew correlation).
+**Status (4.2a, 2026-09-11): writer-path hardening DONE** — `deregister` tombstone semantics,
+`reap_stale_routes` (scheduled `ReplicaSafe` in `background_jobs.hpp`, WS-10 classification), the
+mechanism-(c) unknown-presented-session fix, the `yuzu_server_gateway_route_desync_total` counter, and
+the hot-path/reaper write-timeout split (500ms/2000ms) (#4246 #9 — **CLOSED, 4.2a**) all landed in that
+slice.
+
+**Status (4.2b Task A+B, 2026-09-14): store-layer + writer-path posture DONE** — Task A made
+`announce_connected` the sole writer of placement (`register_fresh` NULLs `cluster_id`/`gateway_node`
+on a winning re-register) and added the batched `lookup_routes` read. Task B landed the per-site
+fail-closed contract above (#4246 #1, partial) and the `agent_id` renew correlation (#4246 #10,
+CLOSED). **The directory is STILL INERT** — nothing dispatches through it yet; that reader/dispatch
+wiring is a later WS-4 task. Remaining WS-4 sub-work: the dispatch-wiring task (making the directory
+dispatch-authoritative + the deferred alert rule), the durable cross-replica session lookup (re-homed to
+its own slice under WS-5), 4.3 (net-new distributed intra-cluster agent→node routing), 4.4
+(`gateway_node` convergence reconcile, replay-response writeback).
 
 ### 7a. Shared agent presence / health / scope population (new, per review)
 `AgentRegistry` is **more than a stream router** — it is also the authoritative **live-agent set,

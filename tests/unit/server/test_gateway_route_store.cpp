@@ -500,8 +500,9 @@ TEST_CASE("GatewayRouteStore[pg]: renew_leases bumps lease_until only for named 
     REQUIRE(fx.store().announce_connected("agent-8", "session-c", "c1", "n1", 30).value().matched);
 
     // Renew only session-a and session-b, in ONE batched call.
+    std::vector<std::string> agents{"agent-6", "agent-7"};
     std::vector<std::string> ids{"session-a", "session-b"};
-    auto renewed = fx.store().renew_leases(ids, 3600);
+    auto renewed = fx.store().renew_leases(agents, ids, 3600);
     REQUIRE(renewed.has_value());
     CHECK(*renewed == 2);
 
@@ -535,14 +536,70 @@ TEST_CASE("GatewayRouteStore[pg]: renew_leases renews a session id containing a 
                 .value()
                 .matched);
 
+    std::vector<std::string> agents{"agent-tricky"};
     std::vector<std::string> ids{tricky_session};
-    auto renewed = fx.store().renew_leases(ids, 3600);
+    auto renewed = fx.store().renew_leases(agents, ids, 3600);
     REQUIRE(renewed.has_value());
     CHECK(*renewed == 1);
 
     auto route = fx.store().lookup_route("agent-tricky");
     REQUIRE(route.has_value());
     REQUIRE((*route)->lease_until_ms.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: renew_leases correlates agent_id AND session_id — a matching "
+          "session with a MISMATCHED agent_id renews zero rows",
+          "[gateway_route][pg][store]") {
+    // #4246 #10: renew_leases used to match on session_id alone. A caller
+    // (compromised/buggy gateway) that knows a session token but asserts the
+    // WRONG agent_id for it must not be able to renew that agent's lease.
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-correlate-1", "session-correlate-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-correlate-1", "session-correlate-1", "c1", "n1", 30)
+                .value()
+                .matched);
+    auto row_before = fx.store().lookup_route("agent-correlate-1");
+    REQUIRE(row_before.has_value());
+    REQUIRE(row_before->has_value());
+    const auto lease_before = (*row_before)->lease_until_ms;
+    REQUIRE(lease_before.has_value());
+
+    // Right session, WRONG agent_id: matches zero rows, and the row's lease
+    // is left completely untouched.
+    std::vector<std::string> wrong_agents{"agent-correlate-WRONG"};
+    std::vector<std::string> right_sessions{"session-correlate-1"};
+    auto mismatched = fx.store().renew_leases(wrong_agents, right_sessions, 3600);
+    REQUIRE(mismatched.has_value());
+    CHECK(*mismatched == 0);
+
+    auto row_after_mismatch = fx.store().lookup_route("agent-correlate-1");
+    REQUIRE(row_after_mismatch.has_value());
+    REQUIRE(row_after_mismatch->has_value());
+    CHECK((*row_after_mismatch)->lease_until_ms == lease_before); // untouched
+
+    // The CORRECT (agent_id, session_id) pair renews the row.
+    std::vector<std::string> right_agents{"agent-correlate-1"};
+    auto correct = fx.store().renew_leases(right_agents, right_sessions, 3600);
+    REQUIRE(correct.has_value());
+    CHECK(*correct == 1);
+
+    auto row_after_correct = fx.store().lookup_route("agent-correlate-1");
+    REQUIRE(row_after_correct.has_value());
+    REQUIRE(row_after_correct->has_value());
+    REQUIRE((*row_after_correct)->lease_until_ms.has_value());
+    CHECK(*(*row_after_correct)->lease_until_ms > *lease_before); // genuinely renewed
+}
+
+TEST_CASE("GatewayRouteStore[pg]: renew_leases refuses a length-mismatched agent_ids/session_ids "
+          "pair rather than silently misaligning them",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    std::vector<std::string> agents{"agent-a", "agent-b"};
+    std::vector<std::string> sessions{"session-a"};
+    auto result = fx.store().renew_leases(agents, sessions, 3600);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == GatewayRouteStoreError::db_error);
 }
 
 TEST_CASE("GatewayRouteStore[pg]: lookup_route reports is_stale for an expired lease",

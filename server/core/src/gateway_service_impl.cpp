@@ -1,6 +1,5 @@
 #include "gateway_service_impl.hpp"
 
-#include <algorithm>
 #include <chrono>
 
 #include <nlohmann/json.hpp>
@@ -60,17 +59,33 @@ static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
              "duplicated pair (see both files' comments) — they must be bumped "
              "together or the reap grace window (>= 1x this TTL) silently erodes");
 
-// HA WS-4 slice 4.1: fail-OPEN observability for the (write-only, INERT)
-// gateway route directory (gateway_route_store.hpp). A degraded write here
-// NEVER fails the RPC — nothing reads this store for dispatch yet — but IS
-// logged and counted so a systemic Postgres problem is visible before any
-// future reader ever depends on this data being fresh.
+// HA WS-4 slice 4.1 / 4.2b Task B: shared log+metric helper for a degraded
+// GatewayRouteStore write (gateway_route_store.hpp). This function ONLY logs
+// and counts — it never decides proceed-vs-refuse. What each CALLER does next
+// is PER-SITE, not uniform (Task B's per-site fail-closed contract, decided
+// against the directory's still-INERT posture: nothing reads it for dispatch
+// yet, so only the write whose LOSS is otherwise unrecoverable is worth
+// refusing the RPC over):
+//   - register_fresh (the ProxyRegister fresh-registration branch) is the
+//     ONE fail-CLOSED site — it CREATES the row, and a missed create persists
+//     until reconnect/4.4 with no other write on the path able to fill in a
+//     first row, so its caller returns UNAVAILABLE right after this call
+//     (mirrors the existing #3401 register_agent-failure precedent).
+//   - Every OTHER site stays fail-OPEN and proceeds — see each call site's
+//     own comment for why that site specifically tolerates a degraded write:
+//     announce_connected (the CONNECTED notify is a droppable gen_server:cast
+//     and set_gateway_route already published in-memory — failing it would
+//     split memory/directory state and risk a black hole), the two
+//     ProxyRegister renew branches and BatchHeartbeat's renew (a renew
+//     failure only yields premature lease-staleness, which a future reader
+//     already treats as not-routable), and deregister (bounded by the 90s
+//     lease TTL regardless).
 void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
                                 GatewayRouteStoreError err) {
     const char* reason =
         err == GatewayRouteStoreError::store_unavailable ? "store_unavailable" : "db_error";
-    spdlog::warn("[gateway] GatewayRouteStore {} degraded ({}) — proceeding (directory write is "
-                 "fail-open, INERT this slice: nothing reads it for dispatch yet)",
+    spdlog::warn("[gateway] GatewayRouteStore {} degraded ({}) — see call site for fail-open vs "
+                 "fail-closed handling",
                  op, reason);
     if (metrics) {
         metrics
@@ -154,6 +169,12 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
         // itself is broken.
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "renew_leases"}, {"outcome", "shortfall"}});
+        // Task B (4.2b, #4246 #10): BatchHeartbeat's renew now excludes a
+        // session this replica's gateway_sessions_ doesn't recognize (no
+        // agent_id to correlate against) rather than silently dropping it —
+        // see that call site's comment.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "renew_leases"}, {"outcome", "unknown_session"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "announce_connected"}, {"outcome", "session_mismatch"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
@@ -557,9 +578,19 @@ gw_enrolled:
         // now agree with the session the gateway actually holds.
         session_id = presented_session;
         if (gateway_route_store_) {
+            std::vector<std::string> renew_agents{info.agent_id()};
             std::vector<std::string> renew_ids{session_id};
-            if (auto res = gateway_route_store_->renew_leases(renew_ids, kGatewayRouteLeaseTtlSecs);
+            if (auto res = gateway_route_store_->renew_leases(renew_agents, renew_ids,
+                                                              kGatewayRouteLeaseTtlSecs);
                 !res) {
+                // Task B (4.2b): fail-OPEN, deliberately — a degraded renew
+                // only yields premature lease-staleness on an EXISTING row
+                // (register_fresh already created it on the original
+                // connection), and a future reader already treats a stale
+                // lease as not-routable (RoutableRoute::routable's
+                // `lease_until >= now()` clause). Refusing the RPC over a
+                // renew failure would drop a re-announcing agent's connection
+                // for no correctness gain.
                 record_route_store_failure(metrics_, "renew_leases", res.error());
             } else if (*res < static_cast<int>(renew_ids.size())) {
                 record_directory_desync(metrics_, "renew_leases", "shortfall",
@@ -598,9 +629,17 @@ gw_enrolled:
         // S'-vs-S gap is out of scope for this slice (directory writes
         // only).
         if (gateway_route_store_) {
+            std::vector<std::string> renew_agents{info.agent_id()};
             std::vector<std::string> renew_ids{presented_session};
-            if (auto res = gateway_route_store_->renew_leases(renew_ids, kGatewayRouteLeaseTtlSecs);
+            if (auto res = gateway_route_store_->renew_leases(renew_agents, renew_ids,
+                                                              kGatewayRouteLeaseTtlSecs);
                 !res) {
+                // Task B (4.2b): fail-OPEN, deliberately — same rationale as
+                // the known-session re-announce renew above: this branch
+                // never CREATES a row (register_fresh never runs here), so a
+                // degraded renew here has no create to lose; at worst it
+                // leaves an existing row's lease stale, which a future reader
+                // already treats as not-routable.
                 record_route_store_failure(metrics_, "renew_leases", res.error());
             } else if (*res < static_cast<int>(renew_ids.size())) {
                 record_directory_desync(metrics_, "renew_leases", "shortfall",
@@ -626,6 +665,19 @@ gw_enrolled:
             if (auto res = gateway_route_store_->register_fresh(info.agent_id(), session_id);
                 !res) {
                 record_route_store_failure(metrics_, "register_fresh", res.error());
+                // Task B (4.2b): register_fresh is the ONE fail-CLOSED
+                // record_route_store_failure call site — every other site
+                // stays fail-open (see that function's header comment for the
+                // per-site contract). register_fresh CREATES the row; a
+                // missed create here persists until reconnect/4.4 (no other
+                // write on this path fills in a first row for this agent), so
+                // an agent whose route cannot be durably recorded must be
+                // refused rather than allowed to connect unrouteable.
+                // Mirrors the existing #3401 register_agent failure above
+                // (~line 517) exactly: UNAVAILABLE, not accepted=false, so
+                // the agent retries on its normal reconnect backoff.
+                return grpc::Status(grpc::StatusCode::UNAVAILABLE,
+                                    "routing directory unavailable");
             } else if (!res->won) {
                 // A newer connection's register_fresh already won the epoch race
                 // (out-of-order delivery, gateway_route_store.hpp). Inert this
@@ -779,80 +831,121 @@ grpc::Status GatewayUpstreamServiceImpl::BatchHeartbeat(grpc::ServerContext* con
     // HA WS-4 4.1: batch-renew the route lease for every session in this
     // heartbeat batch, in ONE call (gateway_route_store.hpp's renew_leases is
     // itself a single batched statement) — matches BatchHeartbeat's own
-    // batching rather than one write per agent per interval. Collected from
-    // the raw request (not gated on "known"/ingest success above): a lease
-    // renewal is about session liveness, independent of whether ingest
-    // happened to throw on that entry this cycle.
+    // batching rather than one write per agent per interval.
     //
-    // Trust rationale (asymmetric with ProxyRegister's known-session gate, by
-    // design): renew matches on session_id ALONE, with no agent_id correlation
-    // or gateway_sessions_ membership check. This is defense-in-depth only, not
-    // a hole in the threat model: the gateway upstream is mTLS-authenticated
-    // trusted infrastructure, and session_id is a server-minted 128-bit random
-    // token, so renewing a foreign session requires a compromised/buggy gateway
-    // that also knows that token. A 4.2 hardening option (if the directory
-    // becomes dispatch-authoritative) is to correlate agent_id per renewed
-    // session; recorded in the ADR-2002 §7 4.2 obligations.
+    // #4246 #10 (closes the prior defense-in-depth gap): renew_leases now
+    // correlates BOTH agent_id AND session_id, so every session collected
+    // here needs its own resolved agent_id from gateway_sessions_ — the SAME
+    // lookup the ingest loop above performs. The agent_id source is
+    // DELIBERATELY the per-replica in-memory map, not the wire (the wire's
+    // HeartbeatRequest carries no agent_id at all — only session_id): the
+    // renew's trust anchor is the DURABLE (agent_id, session_id) binding
+    // already stored in the directory, not a caller-supplied value, so a
+    // compromised/buggy gateway asserting the wrong pairing simply matches
+    // zero rows (counted below) rather than renewing a foreign agent's
+    // lease. A session this replica does NOT locally know (unresolved
+    // agent_id) has nothing to correlate against and is excluded from the
+    // renewal batch entirely; it was never ingested above either (see the
+    // "unknown session" branch). This is the SAME per-replica-in-memory
+    // limitation ADR-2002 §7 already records for the ProxyRegister
+    // re-announce known-session check (#4246 #3, deferred to WS-5 shared
+    // presence) — not a new gap introduced by #10's correlation. On the
+    // monolith (single replica, today's only shipped topology) it is
+    // unreachable: every session this replica minted is in its own map, so
+    // nothing is ever excluded. Re-deriving via `session_to_agent` (rather
+    // than reusing the ingest loop's per-iteration `agent_id`) keeps renewal
+    // independent of whether ingest happened to throw on that entry this
+    // cycle, matching the prior "not gated on ingest success" property.
     if (gateway_route_store_) {
-        std::vector<std::string> session_ids;
-        session_ids.reserve(static_cast<std::size_t>(request->heartbeats_size()));
-        for (const auto& hb : request->heartbeats()) {
-            if (!hb.session_id().empty())
-                session_ids.push_back(hb.session_id());
+        std::unordered_map<std::string, std::string> session_to_agent; // session_id -> agent_id
+        // Sessions this replica's gateway_sessions_ doesn't recognize —
+        // excluded from the renew batch above (nothing to correlate), but
+        // still surfaced via the desync counter below so a systemic
+        // "gateway sending heartbeats for sessions the server doesn't know"
+        // condition (or, once multi-replica routing exists, an LB handing a
+        // batch to a replica that never registered the session) stays
+        // visible rather than silently dropped — the exact signal #4246 #8
+        // exists for.
+        std::unordered_set<std::string> unknown_sessions;
+        {
+            std::lock_guard lock(sessions_mu_);
+            for (const auto& hb : request->heartbeats()) {
+                if (hb.session_id().empty())
+                    continue;
+                auto it = gateway_sessions_.find(hb.session_id());
+                if (it != gateway_sessions_.end())
+                    session_to_agent.emplace(hb.session_id(), it->second);
+                else
+                    unknown_sessions.insert(hb.session_id());
+            }
+            // PR #4299 review (SHOULD 2): a session that lost its
+            // register_fresh epoch race (lost_race_sessions_) is EXPECTED to
+            // never match a row again — it is excluded from desync on its own
+            // CONNECTED (see record_directory_desync's header comment) but
+            // was previously still counted here on every SUBSEQUENT
+            // heartbeat. Drop known race-losers BEFORE comparing against
+            // rows_updated.
+            //
+            // PR #4299 round-2 external review (LOW, disputed between the two
+            // reviewers — VERIFIED against the code): a lost-race session's
+            // agent_routes row is claimed to be "renewed by heartbeats but
+            // excluded from this eligible set", undercounting the shortfall
+            // by one. Not reachable: a lost-race session's CONNECTED handler
+            // (this file, NotifyStreamStatus) checks `lost_race_sessions_`
+            // and skips the `announce_connected` call ENTIRELY for that
+            // session_id — including its fallback `ON CONFLICT DO NOTHING`
+            // insert — so no agent_routes row is ever created under a
+            // lost-race session_id. renew_leases() (gateway_route_store.cpp)
+            // now correlates agent_id AND session_id, so it can never touch a
+            // row that doesn't exist under that pair either. There is
+            // therefore nothing for a subsequent heartbeat to "renew" for a
+            // lost-race session in the first place; excluding it from
+            // `eligible` here removes a permanent false shortfall, not a real
+            // row from the count.
+            for (auto it = session_to_agent.begin(); it != session_to_agent.end();) {
+                if (lost_race_sessions_.contains(it->first))
+                    it = session_to_agent.erase(it);
+                else
+                    ++it;
+            }
         }
-        if (!session_ids.empty()) {
-            if (auto res =
-                    gateway_route_store_->renew_leases(session_ids, kGatewayRouteLeaseTtlSecs);
+        // Distinct (deduped) count — a retried batch repeating the same
+        // unknown session id must not inflate this beyond the actual number
+        // of un-correlatable sessions, matching the dedup already applied to
+        // the eligible/shortfall accounting below.
+        if (!unknown_sessions.empty()) {
+            record_directory_desync(metrics_, "renew_leases", "unknown_session",
+                                    static_cast<double>(unknown_sessions.size()));
+        }
+        if (!session_to_agent.empty()) {
+            // A `std::unordered_map` keyed on session_id already collapses a
+            // RETRIED batch's duplicate session id (the Erlang buffer retains
+            // a failed batch and PREPENDS the next one with no dedup —
+            // gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_buffer.erl) to one
+            // entry, so the two parallel arrays below are already the
+            // distinct, race-loser-filtered eligible set — no separate
+            // sort/unique pass needed (PR #4299 review SHOULD 2).
+            std::vector<std::string> renew_agents;
+            std::vector<std::string> renew_sessions;
+            renew_agents.reserve(session_to_agent.size());
+            renew_sessions.reserve(session_to_agent.size());
+            for (const auto& [session_id, agent_id] : session_to_agent) {
+                renew_sessions.push_back(session_id);
+                renew_agents.push_back(agent_id);
+            }
+            if (auto res = gateway_route_store_->renew_leases(renew_agents, renew_sessions,
+                                                              kGatewayRouteLeaseTtlSecs);
                 !res) {
+                // Task B (4.2b): fail-OPEN, deliberately — same rationale as
+                // the ProxyRegister renew sites above: this call only extends
+                // an EXISTING row's lease, never creates one, so a degraded
+                // batch at worst leaves rows stale, which a future reader
+                // already treats as not-routable. Refusing the whole batch
+                // (thousands of agents) over one renew failure would be a
+                // much larger blast radius than the staleness it avoids.
                 record_route_store_failure(metrics_, "renew_leases", res.error());
             } else {
-                // PR #4299 review (SHOULD 2): renew_leases counts UPDATED
-                // ROWS, and comparing that against the RAW session_ids.size()
-                // over-counts the shortfall two ways (contradicting
-                // metrics.md:125's "benign race losses excluded"). (a) A
-                // RETRIED heartbeat batch can carry the SAME session id
-                // twice — the Erlang buffer retains a failed batch and
-                // PREPENDS the next one with no dedup
-                // (gateway/apps/yuzu_gw/src/yuzu_gw_heartbeat_buffer.erl) —
-                // so one row updated for a duplicate reads as one fewer
-                // "renewed" than requested even though nothing is actually
-                // missing. (b) A session that lost its register_fresh epoch
-                // race (lost_race_sessions_) is EXPECTED to never match a
-                // row again — it is excluded from desync on its own
-                // CONNECTED (see record_directory_desync's header comment)
-                // but was still counted here on every SUBSEQUENT heartbeat.
-                // Dedupe, then drop known race-losers, BEFORE comparing
-                // against rows_updated.
-                //
-                // PR #4299 round-2 external review (LOW, disputed between the two
-                // reviewers — VERIFIED against the code): a lost-race session's
-                // agent_routes row is claimed to be "renewed by heartbeats but
-                // excluded from this eligible set", undercounting the shortfall by
-                // one. Not reachable: a lost-race session's CONNECTED handler
-                // (this file, NotifyStreamStatus) checks `lost_race_sessions_` and
-                // skips the `announce_connected` call ENTIRELY for that session_id
-                // — including its fallback `ON CONFLICT DO NOTHING` insert — so no
-                // agent_routes row is ever created under a lost-race session_id.
-                // renew_leases() (gateway_route_store.cpp) matches by session_id,
-                // so it can never touch a row that doesn't exist under that id
-                // either. There is therefore nothing for a subsequent heartbeat to
-                // "renew" for a lost-race session in the first place; excluding it
-                // from `eligible` here removes a permanent false shortfall, not a
-                // real row from the count.
-                std::vector<std::string> distinct_ids(session_ids.begin(), session_ids.end());
-                std::sort(distinct_ids.begin(), distinct_ids.end());
-                distinct_ids.erase(std::unique(distinct_ids.begin(), distinct_ids.end()),
-                                   distinct_ids.end());
-                {
-                    std::lock_guard lock(sessions_mu_);
-                    distinct_ids.erase(
-                        std::remove_if(distinct_ids.begin(), distinct_ids.end(),
-                                       [this](const std::string& id) {
-                                           return lost_race_sessions_.contains(id);
-                                       }),
-                        distinct_ids.end());
-                }
-                const int eligible = static_cast<int>(distinct_ids.size());
+                const int eligible = static_cast<int>(renew_sessions.size());
                 const int shortfall = eligible - *res; // clamp >= 0 via the guard below
                 if (shortfall > 0) {
                     record_directory_desync(metrics_, "renew_leases", "shortfall",
@@ -1041,9 +1134,14 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                                     std::move(wire_capabilities));
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp) — INERT
-        // this slice, nothing reads it for dispatch yet. Fail-open: a
-        // degraded write here does NOT fail this notification or touch
-        // registry_.set_gateway_route above.
+        // this slice, nothing reads it for dispatch yet. Task B (4.2b):
+        // fail-OPEN, deliberately — this NotifyStreamStatus CONNECTED is
+        // itself a droppable gen_server:cast on the gateway side (the erlang
+        // caller does not block on it), and registry_.set_gateway_route just
+        // above has ALREADY published the in-memory route — failing this RPC
+        // now would split the two (memory says connected, directory does
+        // not) and risk a routing black hole for no correctness gain, since
+        // nothing reads this store for dispatch yet.
         if (gateway_route_store_) {
             // 4.2a #8: a session recorded in lost_race_sessions_ lost its
             // register_fresh epoch race — the durable row already belongs to
@@ -1094,8 +1192,15 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // today (at most one CONNECTED(S) and one DISCONNECTED(S) per session) — this
         // same-session teardown is session-keyed on the legacy in-memory path
         // above (clear_stream_if_session/remove_agent_if_session) too, so the
-        // fence spans both when it lands. Fail-open: a degraded write here does
-        // not affect the registry cleanup above.
+        // fence spans both when it lands. Task B (4.2b): fail-OPEN,
+        // deliberately — a degraded tombstone write here leaves a stale row
+        // behind, but that row is bounded by the 90s lease TTL regardless
+        // (kGatewayRouteLeaseTtlSecs): once the lease expires, a future
+        // routable-aware reader (`lookup_routes`' `routable` computation)
+        // already treats it as not-routable without needing the tombstone,
+        // and `reap_stale_routes` eventually cleans it up. Failing the
+        // registry cleanup above over this would be a needless correctness
+        // regression for no equivalent safety gain.
         if (gateway_route_store_) {
             if (auto res = gateway_route_store_->deregister(agent_id, session_id); !res) {
                 record_route_store_failure(metrics_, "deregister", res.error());
