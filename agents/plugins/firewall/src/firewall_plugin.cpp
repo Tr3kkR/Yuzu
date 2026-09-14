@@ -91,18 +91,15 @@ using yuzu::agent::SubprocessOptions;
 
 constexpr std::chrono::milliseconds kAcqDeadline{5000};
 
-// Strip pipe/newline/CR from a value echoed back into the pipe-delimited
-// protocol so a hostile/unusual firewall-rule name cannot inject synthetic
-// fields or rows. Platform-agnostic (mirrors rdp_control_plugin.cpp's
-// sanitize_field).
-std::string sanitize_field(std::string_view s) {
-    std::string out;
-    out.reserve(s.size());
-    for (char c : s) {
-        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
-    }
-    return out;
-}
+// BR-05: this used to be a second, byte-identical implementation of
+// yuzu::firewall::sanitize_field (hoisted into firewall_parsers.hpp by P1,
+// originally to serve only the two nft format_nft_* row formatters) --
+// every Windows/firewalld/ufw/iptables call site below kept using this
+// local copy instead, leaving it outside the new sanitizer unit test's
+// coverage. The header include above is unconditional across every
+// platform this file builds for, so the hoisted symbol is reachable here
+// with no #ifdef needed.
+using yuzu::firewall::sanitize_field;
 
 #ifdef _WIN32
 
@@ -463,8 +460,15 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
     if (!want_rules)
         return r;
 
-    if (sd_bus_message_enter_container(reply.m, 'a', "{sa{sas}}") < 0)
+    if (sd_bus_message_enter_container(reply.m, 'a', "{sa{sas}}") < 0) {
+        // Reachable but the active-zones reply didn't decode -- an empty
+        // r.zones here is NOT "zero zones", it's "we don't know". Mark
+        // incomplete so the caller reports ruleset|unknown, never a
+        // fabricated ruleset|0 (BR-01: this early return used to leave the
+        // default services_complete=true in place).
+        r.services_complete = false;
         return r;
+    }
     while (sd_bus_message_enter_container(reply.m, 'e', "sa{sas}") > 0) {
         FirewalldZoneInfo zone;
         const char* zone_name = nullptr;
@@ -538,6 +542,13 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
             if (sd_bus_message_read_strv(svc_reply.m, &strv.v) >= 0 && strv.v) {
                 for (char** p = strv.v; *p; ++p)
                     zone.services.emplace_back(*p);
+            } else {
+                // The call succeeded but the reply's string-vector didn't
+                // decode -- this zone silently contributes zero services to
+                // the total without this flag, which is an undercount, not
+                // a genuine empty zone (BR-01, mirrors the svc_rc<0 case
+                // above).
+                r.services_complete = false;
             }
         }
     }
@@ -964,13 +975,29 @@ struct NftProbeResult {
     const auto table_res =
         nft_dump(table_sock->get(), nft::kNftMsgGettable, table_buf, table_deadline);
     table_sock->reset(); // UP-1: fresh fd per dump, no undrained-leftover-bytes risk
-    if (table_res.status != yuzu::firewall::NftDumpStatus::ok)
+    if (table_res.status != yuzu::firewall::NftDumpStatus::ok) {
+        // BR-03: this used to discard table_res silently, making the
+        // documented troubleshooting token (README: "error|nftables:table:
+        // eperm means the netlink read was refused") unreachable in
+        // practice -- no no-cap host would ever actually see it. An error|
+        // row (not fallthrough|: nftables hasn't committed as the live
+        // backend yet, since GETTABLE itself never succeeded) before
+        // falling through to firewalld/ufw/iptables.
+        ctx.write_output(yuzu::firewall::nft_diag_row("table", table_res));
         return std::nullopt; // unreachable -- fall through untouched
+    }
 
     info.tables_seen = !yuzu::firewall::parse_nft_tables(table_buf).empty();
 
     NftProbeResult result;
     auto chain_sock = open_nft_socket(remaining_ms(chain_deadline));
+    // BR-03: a chain/rule socket-open failure used to silently collapse
+    // into the generic default NftDumpResult (reason "io_error"), losing
+    // the errno classification the table-socket open already gives —
+    // including fd_exhausted, the one that actually needs an operator's
+    // attention. Surface it the same way here.
+    if (!chain_sock && classify_open_errno(chain_sock.error()) == OpenNftErrClass::fd_exhausted)
+        ctx.write_output("error|fd_exhausted");
     const auto chain_res = chain_sock ? nft_dump(chain_sock->get(), nft::kNftMsgGetchain,
                                                  result.chain_buf, chain_deadline)
                                       : yuzu::firewall::NftDumpResult{};
@@ -978,13 +1005,18 @@ struct NftProbeResult {
         chain_sock->reset();
 
     auto rule_sock = open_nft_socket(remaining_ms(rule_deadline));
+    if (!rule_sock && classify_open_errno(rule_sock.error()) == OpenNftErrClass::fd_exhausted)
+        ctx.write_output("error|fd_exhausted");
     const auto rule_res = rule_sock ? nft_dump(rule_sock->get(), nft::kNftMsgGetrule,
                                                result.rule_buf, rule_deadline)
                                     : yuzu::firewall::NftDumpResult{};
 
     const bool chains_ok = chain_res.status == yuzu::firewall::NftDumpStatus::ok;
     const bool rules_ok = rule_res.status == yuzu::firewall::NftDumpStatus::ok;
-    result.trusted = chains_ok && rules_ok;
+    // BR-04: call the pure, unit-tested helper rather than re-deriving the
+    // same `&&` inline -- nft_dumps_trusted() is the single source of truth
+    // for this decision (#3463-2).
+    result.trusted = yuzu::firewall::nft_dumps_trusted(chains_ok, rules_ok);
     if (!result.trusted) {
         info.dump = chains_ok ? "rule" : "chain";
         info.result = chains_ok ? rule_res : chain_res;
@@ -1202,6 +1234,11 @@ void do_state_linux(yuzu::CommandContext& ctx) {
         ctx.write_output("backend|nftables");
         ctx.write_output("state|unknown");
         ctx.write_output(yuzu::firewall::nft_diag_row(info.dump, info.result));
+        // BR-02: the incomplete-read count contract (#3462) says every
+        // terminal state applies a ruleset row, never just the successful
+        // ones -- an unknown state with no ruleset row silently breaks that
+        // promise for a reader parsing this output mechanically.
+        ctx.write_output("ruleset|unknown");
         return;
     }
 
@@ -1213,6 +1250,7 @@ void do_state_linux(yuzu::CommandContext& ctx) {
         return;
     ctx.write_output("backend|none");
     ctx.write_output("state|unknown");
+    ctx.write_output("ruleset|unknown");
 }
 
 void do_rules_linux(yuzu::CommandContext& ctx) {
@@ -1232,10 +1270,12 @@ void do_rules_linux(yuzu::CommandContext& ctx) {
         ctx.write_output("backend|nftables");
         ctx.write_output("rules|unknown");
         ctx.write_output(yuzu::firewall::nft_diag_row(info.dump, info.result));
+        ctx.write_output("ruleset|unknown"); // BR-02, mirrors do_state_linux
         return;
     }
     ctx.write_output("backend|none");
     ctx.write_output("rules|unknown");
+    ctx.write_output("ruleset|unknown");
 }
 
 #endif // platform dispatch

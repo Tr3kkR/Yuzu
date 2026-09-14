@@ -246,6 +246,12 @@ def run(args: argparse.Namespace) -> int:
 
     sock = socket.socket(socket.AF_NETLINK, socket.SOCK_RAW, NETLINK_NETFILTER)
     sock.bind((args.portid, 0))
+    # BR-06: the --duration budget above only checks the clock BETWEEN
+    # sendto() calls; a blocking sendto (the peer stops draining its receive
+    # queue) is otherwise unbounded and the script would overrun its
+    # advertised duration. A short send timeout, well under the 0.05s
+    # inter-send sleep, keeps every iteration's own worst case negligible.
+    sock.settimeout(1.0)
     src_portid = sock.getsockname()[0]
 
     print(
