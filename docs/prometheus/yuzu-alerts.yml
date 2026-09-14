@@ -157,6 +157,83 @@ groups:
             a full command-plane outage at rotation cutover. Fix it now (the
             gateway log names the entry).
 
+      # HA WS-4 4.2b — `#4246` item #1's alert-rule half. Emitted by the
+      # SERVER (gateway_service_impl.cpp's record_route_store_failure), not
+      # the Erlang gateway, despite living in this group — it is the same
+      # fenced agent->cluster routing-directory concern as the rules above.
+      # `op="register_fresh"` is the fail-CLOSED write (ProxyRegister's
+      # fresh-registration branch returns UNAVAILABLE on this); the other
+      # five writer SITES (announce_connected, both ProxyRegister renew
+      # branches, BatchHeartbeat's renew, deregister) — which collapse to
+      # three fail-OPEN `op` label values (announce_connected, renew_leases,
+      # deregister; see the label set in docs/user-manual/metrics.md) — are
+      # deliberately fail-OPEN, so a rate here can mean silent directory drift even with
+      # no visible RPC failure. INITIAL / conservative threshold — no fleet
+      # background-rate data exists yet to tune against (same lesson as the
+      # #913 OTA-bounds alert thresholds, the single largest source of
+      # review findings on that PR); tighten once real data exists.
+      - alert: YuzuGatewayRouteWriteFailed
+        expr: |
+          rate(yuzu_server_gateway_route_write_failed_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway routing-directory write degraded (op={{ $labels.op }}, reason={{ $labels.reason }})"
+          description: >-
+            GatewayRouteStore write op="{{ $labels.op }}" has been failing
+            with reason="{{ $labels.reason }}" (Postgres pool-acquire timeout
+            or a query error) for at least 5 minutes. FIRST REMEDIATION: check
+            Postgres reachability and connection-pool saturation from the
+            server (pg_stat_activity, pool-acquire wait); a register_fresh
+            failure additionally refuses new ProxyRegister with UNAVAILABLE, so
+            gateway-fronted agents may be unable to (re)enroll until the store
+            recovers. See ADR-2002 §7 "Ship the write-failure fail-closed
+            posture" and docs/user-manual/metrics.md's Gateway routing
+            directory section. INITIAL threshold, not yet tuned against real
+            fleet data.
+
+      # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
+      # GatewayRouteStore read during confined dispatch (store_unavailable/
+      # db_error), the closest available signal to `#4246` item #8's
+      # "route-directory desync" alert-rule half. This alert does NOT cover
+      # every yuzu_server_gateway_route_desync_total{op,outcome} guard
+      # rejection (session_mismatch/shortfall/unknown_session) — that
+      # counter is expected at a low background rate (see its own doc
+      # comment) and alerting on it needs real fleet data to set a threshold
+      # that doesn't page on a routine post-restart/failover baseline rise;
+      # it remains unalerted this slice. `route_unreadable` fires the
+      # command outbox's retry-with-backoff path (the SAME reschedule
+      # containment_unreadable takes, though the two flags are not otherwise
+      # interchangeable — route_unreadable, unlike a fail-closed containment
+      # read, does not force sent==0; see ConfinedDispatchOutcome::
+      # route_unreadable), so ANY occurrence is worth
+      # surfacing — but FALLBACK-ONLY on today's single-replica monolith
+      # (the reader only ever consults the directory on a local-registry
+      # miss), so this should be rare until the reader becomes behaviorally
+      # live at WS-5. INITIAL / conservative threshold; tune once fleet data
+      # exists.
+      - alert: YuzuGatewayRouteUnreadable
+        expr: |
+          increase(yuzu_server_command_outbox_deliver_retry_cause_total{cause="route_unreadable"}[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway routing-directory read degraded — commands rescheduling"
+          description: >-
+            The command outbox delivery loop hit ConfinedDispatchOutcome::
+            route_unreadable at least once in the last 15 minutes — a
+            GatewayRouteStore directory read degraded during confined
+            dispatch, so the affected occurrence(s) were rescheduled with
+            back-off instead of delivered. FIRST REMEDIATION: check Postgres
+            reachability / pool health (same root cause as
+            YuzuGatewayRouteWriteFailed); rescheduled commands re-drive
+            automatically once the store recovers (effectively-once via the
+            stable command_id), so no manual replay is needed. See ADR-2002 §7
+            and docs/user-manual/metrics.md's Command outbox delivery / Gateway
+            routing directory sections. INITIAL threshold, not yet tuned
+            against real fleet data.
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected

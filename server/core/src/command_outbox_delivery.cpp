@@ -170,13 +170,41 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     const auto outcome = d_.dispatch_fn(c.plugin, c.action, agent_ids, c.scope_expr, params,
                                         c.execution_id, caller, c.command_id);
 
-    // 5. A systemic transient gate failure (a degraded containment read) is NOT
-    //    a delivered occurrence — retry with back-off, leave it pending.
-    if (outcome.containment_unreadable) {
+    // 5. A systemic transient gate/directory failure — a degraded containment
+    //    read, OR (WS-4 4.2b Task D) a degraded gateway routing-directory read
+    //    (`route_unreadable`) — reschedules the WHOLE occurrence with back-off,
+    //    leaving it pending.
+    //
+    //    Unlike the store consumers of this same flag (deployment_engine's
+    //    `settle_claimed_batch`, policy_evaluator's `compute_delivered`, both of
+    //    which must NOT treat it all-or-nothing), this reschedule is correct
+    //    EVEN WHEN `outcome.sent > 0` — which `route_unreadable` permits and
+    //    `containment_unreadable` does not (see
+    //    `ConfinedDispatchOutcome::route_unreadable`). The re-drive re-sends the
+    //    STABLE `c.command_id` (step 4), so a device already reached on this
+    //    pass is suppressed by the agent's command_id dedup (WS-0) and its
+    //    terminal outcome replayed — effectively-once holds. That is what lets
+    //    this consumer honour ADR-2002 §7's "undeliverable command stays
+    //    pending and is re-driven" for the directory-degraded devices without
+    //    the double-EXECUTION a fresh command_id would cause. Do NOT "fix" this
+    //    to gate on `sent == 0`: that would drop the directory-degraded devices
+    //    instead of re-driving them.
+    if (outcome.containment_unreadable || outcome.route_unreadable) {
+        // The existing unlabeled retry counter keeps firing for EITHER cause
+        // (dashboards/alerts already key on it); the cause-labeled counter is
+        // additive so a route-store degradation is separately countable
+        // without redefining what the base counter means.
         count("yuzu_server_command_outbox_deliver_retry_total");
-        spdlog::warn("command_outbox_delivery: occurrence '{}' containment unreadable — "
-                     "rescheduling",
-                     c.occurrence_id);
+        if (d_.metrics)
+            d_.metrics
+                ->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                         {{"cause", outcome.containment_unreadable ? "containment_unreadable"
+                                                                  : "route_unreadable"}})
+                .increment();
+        spdlog::warn("command_outbox_delivery: occurrence '{}' {} — rescheduling",
+                     c.occurrence_id,
+                     outcome.containment_unreadable ? "containment unreadable"
+                                                    : "gateway route directory unreadable");
         (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff);
         return;
     }

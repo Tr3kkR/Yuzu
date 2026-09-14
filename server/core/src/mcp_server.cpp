@@ -1664,7 +1664,9 @@ static const ToolDef kTools[] = {
      "the same request will not help (retry_after_ms is null on all three) - \"invalid_scope\" "
      "means the scope expression itself could not be parsed, a caller error, not a fleet fact. "
      "\"containment_unreadable\" is a transient systemic gate "
-     "failure - retry_after_ms names the wait. \"no_agents_reached\" is the generic case (offline "
+     "failure and \"route_unreadable\" (WS-4 4.2b) is a transient systemic gateway "
+     "routing-directory read failure - both are retryable, retry_after_ms names the wait. "
+     "\"no_agents_reached\" is the generic case (offline "
      "device, or a residual approval-required race) - retry_after_ms is non-null here too, since "
      "the offline-device case within it is retryable and a mixed cause must not be understated as "
      "permanent. agents_quarantined/agents_unknown_plugin are "
@@ -1697,13 +1699,17 @@ static const ToolDef kTools[] = {
      // looser oneOf - fixed there too in this commit.
      //
      // #3424/#3511: the single "no_agents_reached" zero-agents branch is now
-     // FIVE - one per status value the handler can emit (see the priority
+     // SIX - one per status value the handler can emit (see the priority
      // cascade at the dispatch site; "invalid_scope" added in the PR review
      // fix round — scope_parse_error existed on ConfinedDispatchOutcome since
-     // #881 but this schema, like the handler, never surfaced it). retry_after_ms is a per-branch `const`,
+     // #881 but this schema, like the handler, never surfaced it; "route_unreadable"
+     // added WS-4 4.2b Task D — the exact sibling of containment_unreadable, a
+     // degraded gateway routing-directory read rather than a degraded
+     // containment read). retry_after_ms is a per-branch `const`,
      // matching the exact literal the handler emits for that status - 5000 for
-     // the TWO retryable branches (containment_unreadable's systemic
-     // degradation, and no_agents_reached's own catch-all, which mixes a
+     // the THREE retryable branches (containment_unreadable's and
+     // route_unreadable's systemic degradations, and no_agents_reached's own
+     // catch-all, which mixes a
      // possible permanent approval-denial race with a possible genuinely
      // offline device and so must not claim `null`/not-retryable either),
      // null for the three permanent branches (invalid_scope, quarantined,
@@ -1717,6 +1723,7 @@ static const ToolDef kTools[] = {
      R"j({"type":"object","properties":{"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"type":"integer","minimum":1},"plugin":{"type":"string"},"action":{"type":"string"}},"required":["command_id","execution_id","agents_reached","plugin","action"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"invalid_scope"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"containment_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
+     R"j({"type":"object","properties":{"status":{"const":"route_unreadable"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"quarantined"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"plugin_not_found"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":null},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false},)j"
      R"j({"type":"object","properties":{"status":{"const":"no_agents_reached"},"command_id":{"type":"string"},"execution_id":{"type":"string"},"agents_reached":{"const":0},"plugin":{"type":"string"},"action":{"type":"string"},"message":{"type":"string"},"retry_after_ms":{"const":5000},"agents_quarantined":{"type":"integer","minimum":0},"agents_unknown_plugin":{"type":"integer","minimum":0}},"required":["status","command_id","execution_id","agents_reached","plugin","action","message","retry_after_ms","agents_quarantined","agents_unknown_plugin"],"additionalProperties":false})j"
@@ -14696,9 +14703,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     // `no_agents_reached` below, same as before #3424/#3511.
                     //
                     // PRIORITY, matching /api/command's own cascade
-                    // (server.cpp): containment_unreadable first (a systemic
-                    // gate failure, not a per-target fact) — then
-                    // quarantined — then plugin_not_found — then the
+                    // (command_routes.cpp): containment_unreadable first (a
+                    // systemic gate failure, not a per-target fact) — then
+                    // route_unreadable (WS-4 4.2b Task D, the exact sibling:
+                    // a systemic gateway routing-directory failure, not a
+                    // per-target fact) — then quarantined — then
+                    // plugin_not_found — then the
                     // generic catch-all. `> 0`, not `== agent_ids.size()`:
                     // a MIXED failure (some quarantined, some plugin-absent,
                     // some genuinely offline) is still not "just offline",
@@ -14736,6 +14746,27 @@ McpServer::HandlerFn McpServer::build_handler(
                             "unreadable, so dispatch is failing closed rather than guessing who "
                             "is quarantined. Retryable — the gate typically recovers within "
                             "seconds once the containment store is reachable again.";
+                        zero_retry_after_ms_json = "5000";
+                    } else if (dispatch_outcome.route_unreadable) {
+                        // WS-4 4.2b Task D: the exact sibling of
+                        // containment_unreadable above -- a degraded read of
+                        // the gateway routing directory (batched
+                        // GatewayRouteStore::lookup_routes), not a per-target
+                        // fact. Checked immediately after containment_unreadable
+                        // (both are "the gate/directory itself could not
+                        // answer", distinct from "answered no"); ordering
+                        // between the two is arbitrary in practice (a single
+                        // dispatch degrading BOTH stores simultaneously is
+                        // vanishingly rare and either read failing closed is
+                        // equally retryable), so containment keeps priority as
+                        // the pre-existing, more heavily reviewed check.
+                        zero_status = "route_unreadable";
+                        zero_message =
+                            "No agents reached: the gateway routing directory could not be "
+                            "read for one or more targets not locally connected to this "
+                            "replica, so dispatch to them was withheld rather than guessing "
+                            "where to route. Retryable — the directory typically recovers "
+                            "within seconds once the store is reachable again.";
                         zero_retry_after_ms_json = "5000";
                     } else if (dispatch_outcome.denied_quarantined_count > 0) {
                         zero_status = "quarantined";
