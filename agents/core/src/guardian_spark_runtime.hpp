@@ -679,6 +679,18 @@ public:
     [[nodiscard]] std::size_t rule_count() const;
     [[nodiscard]] std::size_t outbox_size() const;
     [[nodiscard]] std::uint64_t outbox_backpressure_drops() const;
+    /// rung 9c PR-3 (Decision 3, Option B): THIS instance's io_executor_ - summed
+    /// across IO classes - CeilingExhausted (R5.1's physical alive-worker ceiling)
+    /// refusal count. Deliberately narrow: NOT a general Counters/Stats egress -
+    /// #3415 (docs/spark-legacy-delta-registry.md row D10) is the broader, still-
+    /// open gap this accessor does not close (see io_executor_stats_for_test()'s
+    /// own doc comment on that gap); this is one signal Dave ruled to ship now
+    /// (~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md Decision 3), not
+    /// the start of #3415's general counter wiring. Only THIS runtime's arm/disarm
+    /// executor instance is reachable here - the state reader owns a separate
+    /// GuardianIoExecutor instance with no egress of its own yet, and per D10 its
+    /// run()-only usage means it structurally cannot hit CeilingExhausted anyway.
+    [[nodiscard]] std::uint64_t io_ceiling_rejections() const;
     /// rule_ids still awaiting a first Known eval on `key` (the pending-initial
     /// dirty-set the convergence priority lane services). Includes DEMOTED rule_ids -
     /// this reflects "never Known", not priority-lane membership; use
