@@ -69,8 +69,38 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
+#include <utility>
 
 namespace yuzu::agent {
+
+// #4223: the worker-to-caller exception hand-off (see offer()'s worker lambda below)
+// uses std::exchange, NOT std::move, to empty the worker's local `eptr` after handing
+// its value to `state_->eptr` - this is NOT stylistic. A `static_assert(is_nothrow_
+// move_assignable_v<exception_ptr>)` was tried here first (governance Gate 3
+// cpp-expert) and PASSES on every target toolchain, but that trait is satisfied by a
+// NOEXCEPT COPY-ASSIGNMENT accepting an rvalue by const& - it cannot distinguish a
+// real move from a copy that happens to bind - so it caught nothing. Verified against
+// actual toolchain sources, not assumed: libstdc++ (GCC 13+, this repo's only locally
+// buildable toolchain) has always had a real move ctor/assign that nulls the source.
+// libc++ (Clang 18+, Apple Clang 15+) does NOT: checked the exception_ptr.h shipped in
+// llvmorg-18.1.0 through llvmorg-21.1.0 and release/21.x directly - none declare a
+// move ctor or move-assignment operator, only copy. A move ctor/assign was added to
+// libc++ upstream on 2025-11-03 (llvm/llvm-project@f02b661054, "Add move constructor &
+// assignment to exception_ptr") but has not reached ANY numbered LLVM release as of
+// this writing - so `std::move(eptr)` on Clang/Apple Clang/libc++ TODAY silently binds
+// the copy-assignment operator: `st->eptr` gets a valid new reference, but the
+// worker's own `eptr` is NOT emptied, and the #4223 race this file exists to fix is
+// NOT closed on that platform. (Governance Gate 3 cpp-expert's original claim that all
+// four target toolchains have "shipped real move ctor/assignment for exception_ptr for
+// well over a decade" was wrong for libc++ - caught at Gate 8 re-review, verified
+// against primary source rather than trusted.) std::exchange(eptr, nullptr) sidesteps
+// this entirely: its `eptr = nullptr;` step is an assignment-from-nullptr, which
+// exception_ptr supports unconditionally on every toolchain regardless of move
+// support - so the worker's local is guaranteed empty here no matter which assignment
+// operator got selected above it. MSVC STL was not locally checkable; treated as
+// `likely` correct (matches the class of stdlib that has long supported this), not
+// `verified` - but no longer load-bearing, since std::exchange doesn't depend on it.
 
 class YUZU_EXPORT GuardianOutboxSendExecutor {
 public:
@@ -371,6 +401,30 @@ public:
         launch_fault_for_test_.store(fault, std::memory_order_relaxed);
     }
 
+    /// Test-only synchronization seam (#4223): parks the worker thread right after
+    /// notify_all(), before its local `eptr` destructs, until `*gate` reads true - see
+    /// the worker lambda's call site. `gate` MUST be polled/stored with
+    /// memory_order_relaxed on both sides (never a mutex/condvar/acq_rel atomic): this
+    /// seam exists to make the #4223 race's OWN interleaving deterministic, and a
+    /// synchronizing handoff would itself supply the happens-before edge the bug is
+    /// about the absence of, hiding the exact race it is meant to reproduce. Set to
+    /// nullptr (the default) to disable - production callers never set this. `gate`
+    /// must outlive every in-flight send while set; call with nullptr before letting it
+    /// go out of scope. The pointer FIELD itself (as opposed to what it points to) is
+    /// written here with no lock and read unlocked by the worker - safe only because
+    /// this is called before any worker for this executor exists (thread creation is
+    /// itself a happens-before edge) and reset only after draining to
+    /// active_worker_count()==0; never call this concurrently with an in-flight
+    /// offer()/launch(). Housed on `State` (governance Gate 4 consistency-auditor
+    /// finding), not beside the class-level seams below (`pre_launch_race_hook_for_test_`
+    /// etc.), because it is read from the DETACHED WORKER lambda, which captures `st`,
+    /// never `this`, per this class's own ORPHAN-EXIT CONTRACT (top-of-file doc
+    /// comment) - a class member here would need a `this` capture on that lambda,
+    /// exactly what that contract forbids.
+    void set_eptr_race_release_gate_for_test(std::atomic<bool>* gate) {
+        state_->eptr_race_release_gate_for_test = gate;
+    }
+
 private:
     struct State {
         std::mutex mu;
@@ -393,6 +447,7 @@ private:
         std::chrono::steady_clock::time_point launched_at{};  ///< set by launch(), under the lock
         std::chrono::steady_clock::time_point completed_at{}; ///< set by the worker, under the publish lock
         bool stall_logged{false}; ///< this in-flight send already counted/logged as stalled
+        std::atomic<bool>* eptr_race_release_gate_for_test{nullptr}; ///< #4223 test seam; null = no-op (set-then-use)
     };
 
     /// Called with state_->mu HELD. Returns true iff THIS call is the one that newly
@@ -594,14 +649,46 @@ private:
                 {
                     std::lock_guard<std::mutex> lk{st->mu};
                     st->result = r;
-                    st->eptr = eptr;
+                    // std::exchange, not a plain copy or std::move (#4223 - see the
+                    // file-scope comment above this class for why std::move alone is
+                    // NOT sufficient on every target toolchain): a copy (or a move that
+                    // silently falls back to copy semantics) leaves this worker holding
+                    // its own live reference to the shared exception control block,
+                    // destroyed at this lambda's scope exit - OFF this lock, ordered
+                    // against nothing. Under starvation the worker can be descheduled
+                    // there while offer()'s caller thread moves state_->eptr out,
+                    // rethrows, and reads e.what(); when the worker resumes and its
+                    // local `eptr` destructs, that can be the reference that brings the
+                    // control block's refcount to zero and frees the exception object -
+                    // racing the caller's already-finished read with no happens-before
+                    // edge either thread's code establishes. std::exchange(eptr,
+                    // nullptr) unconditionally empties this worker's `eptr` (its
+                    // destructor becomes a no-op) regardless of which assignment
+                    // operator the stdlib selects for the returned old value, so the
+                    // sole reference travels lock -> state_->eptr -> the caller's local
+                    // under offer()'s own lock - the caller is left the sole owner, and
+                    // every subsequent destruction runs on its thread.
+                    st->eptr = std::exchange(eptr, nullptr);
                     st->completed_at = std::chrono::steady_clock::now(); // #3953 item 2
                     st->done = true;
                 }
                 st->cv.notify_all();
+                // #4223 test-only seam: reads with memory_order_relaxed only - see
+                // set_eptr_race_release_gate_for_test()'s doc comment for why a
+                // synchronizing wait here would hide the exact race this exists to
+                // reproduce. `nullptr` in production, so this is a single relaxed load
+                // per completed send and nothing else.
+                if (auto* gate = st->eptr_race_release_gate_for_test) {
+                    while (!gate->load(std::memory_order_relaxed))
+                        std::this_thread::yield();
+                }
                 // `ticket` destructs at lambda-scope exit, after notify_all - the last
                 // observable point before this OS thread actually exits. Its dtor
-                // self-locks, so this runs safely with no lock held on this thread.
+                // self-locks, so this runs safely with no lock held on this thread. Same
+                // for `eptr` (#4223): std::exchange'd to nullptr above, so its destructor
+                // here is a no-op regardless of scheduling OR which assignment operator
+                // the stdlib actually selected - this worker no longer owns a reference
+                // to race the caller with.
             };
             // Fault injection (#3966 fold-in): SpawnRefused mirrors an OS-level
             // thread-creation refusal without depending on real resource exhaustion;
