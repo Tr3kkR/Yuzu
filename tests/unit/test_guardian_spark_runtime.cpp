@@ -5978,21 +5978,27 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     CHECK(WEXITSTATUS(status) == 0);
 }
 
-// rung 9c PR-5a (#4221 ch-102): governance correction (2026-09-14) - the comment this
-// test replaces claimed the death test above and the up-101 test below already cover
-// ch-102's "refill-inside-catch admission-refusal arm". Two independent governance
-// reviewers (quality-engineer, consistency-auditor) traced the actual branches by grep
-// for set_drain_fault_point_for_test and found that claim wrong: both cited tests
-// exercise dispatch_arm_off_lock's OWN try/catch around io_executor_.submit() for a
-// FRESH refill (a claim never previously touched by any publish), reached from
-// on_arm_complete's "not compensating" inline path. ch-102's actual target is a
-// DIFFERENT branch: the "else refill = try_dispatch_head_locked(key)" arm inside
-// finalize_arm_compensation()'s own DOUBLE-FAULT catch handler (this file, the
+// rung 9c PR-5a (#4221 ch-102): governance correction (2026-09-14, F3) - the comment
+// this test replaces claimed the death test above and the up-101 test below already
+// cover ch-102's "refill-inside-catch admission-refusal arm", and this test's own
+// first-draft comment then mis-described WHY they don't: both cited tests DO take the
+// `compensating` branch (r1 withdrawn while parked, nobody adopts it) same as this
+// test, so "on_arm_complete's not-compensating inline path" was wrong. The real
+// distinction is which of TWO textually-similar `refill = try_dispatch_head_locked(...)`
+// call sites fires: both cited tests arm only set_io_executor_fail_launch_for_test +
+// set_index_remove_fault_for_test (no drain fault point), so their compensating
+// disarm's own admission is refused, finalize_arm_compensation()'s OUTER try
+// SUCCEEDS calling publish_arm_verdicts_locked(), and the refill comes from THAT
+// function's own ordinary-completion tail (`else refill = try_dispatch_head_locked(
+// key);` near its end - the same tail on_arm_complete's inline, non-compensating path
+// also reaches on success). ch-102's actual target is the OTHER site: the
+// `else refill = try_dispatch_head_locked(cont->key);` inside finalize_arm_
+// compensation()'s own DOUBLE-FAULT catch handler (this file, the
 // `if (cont->claim->outcome || cont->claim->commit_exception) { ...; else refill = ...}`
-// block) - reached only when the DEFERRED/compensating publish_arm_verdicts_locked()
-// call itself throws (set_drain_fault_point_for_test(3), which fires inside that
-// function) WHILE a second claim is already queued behind the compensating head. That
-// branch had zero coverage; this test targets it directly.
+// block) - reached only when publish_arm_verdicts_locked() ITSELF throws
+// (set_drain_fault_point_for_test(3), which fires inside that function) WHILE a
+// second claim is already queued behind the compensating head. That branch had zero
+// coverage; this test targets it directly.
 //
 // Mutation-verify: change the catch handler's `else refill = try_dispatch_head_locked(
 // cont->key);` to a no-op (drop the refill) and this goes RED - r2 is left Queued
@@ -6031,12 +6037,20 @@ TEST_CASE("rung 9c PR-5a (#4221 ch-102): finalize_arm_compensation's double-faul
     // below runs on the main thread after a2.t.join().
     QueuedAttach a2;
     std::atomic<bool> r2_queued{false};
+    // Governance F1: spin_until's own result must be RECORDED and asserted on the main
+    // thread, not discarded - under a loaded/slow runner the inner wait could time out
+    // while the test still happens to pass for an unrelated reason (r2 hitting the same
+    // error string via ordinary admission refusal instead of exercising the target
+    // catch-handler branch at all). Same pattern as governance B2's own fix: an atomic
+    // recorded here, checked after a2.t.join() below.
+    std::atomic<bool> r2_queue_wait_ok{false};
     rt->set_drain_gap_hook_for_test([&] {
         a2.t = std::thread{[&] {
             a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
         }};
-        (void)yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
-                                     std::chrono::seconds(10));
+        r2_queue_wait_ok.store(
+            yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
         r2_queued.store(true);
         // Fires inside finalize_arm_compensation's deferred publish_arm_verdicts_locked()
         // call (NOT here, and NOT during this on_arm_complete pass, which never calls
@@ -6056,6 +6070,9 @@ TEST_CASE("rung 9c PR-5a (#4221 ch-102): finalize_arm_compensation's double-faul
     a2.t.join();
     rt->set_io_executor_fail_launch_for_test(false);
 
+    REQUIRE(r2_queue_wait_ok.load()); // r2 genuinely reached claim_queue_depth==2 before
+                                      // fault 3 armed - not a coincidental pass via a
+                                      // timed-out wait plus an unrelated admission refusal
     REQUIRE_FALSE(a2.gen.has_value()); // the refill's OWN admission was refused
     CHECK(a2.gen.error() == "arm worker launch failed");
     CHECK(rt->claim_drain_failures() >= 1); // fault 3's throw was contained and counted
