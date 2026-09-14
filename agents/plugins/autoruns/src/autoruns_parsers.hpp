@@ -217,6 +217,26 @@ inline std::string format_source_status(SourceId id, YuzuSupportLevel support,
 /// reading past the buffer -- the truncation is silent by design here because
 /// callers that care (parse_reg_run_values) detect truncation themselves from
 /// the surrounding hex-byte count.
+namespace detail {
+inline void append_utf8(std::string& out, std::uint32_t cp) {
+    if (cp < 0x80) {
+        out += static_cast<char>(cp);
+    } else if (cp < 0x800) {
+        out += static_cast<char>(0xC0 | (cp >> 6));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        out += static_cast<char>(0xE0 | (cp >> 12));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    } else {
+        out += static_cast<char>(0xF0 | (cp >> 18));
+        out += static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+        out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+        out += static_cast<char>(0x80 | (cp & 0x3F));
+    }
+}
+} // namespace detail
+
 inline std::string utf16le_to_utf8(std::span<const unsigned char> bytes) {
     std::string out;
     out.reserve(bytes.size());
@@ -226,17 +246,34 @@ inline std::string utf16le_to_utf8(std::span<const unsigned char> bytes) {
             static_cast<std::uint16_t>(bytes[i]) | (static_cast<std::uint16_t>(bytes[i + 1]) << 8);
         i += 2;
         if (unit == 0) break; // NUL terminator
-        const std::uint32_t cp = unit; // BMP-only, no surrogate pairing
-        if (cp < 0x80) {
-            out += static_cast<char>(cp);
-        } else if (cp < 0x800) {
-            out += static_cast<char>(0xC0 | (cp >> 6));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
-        } else {
-            out += static_cast<char>(0xE0 | (cp >> 12));
-            out += static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
-            out += static_cast<char>(0x80 | (cp & 0x3F));
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            // High surrogate -- pair with a following low surrogate into a
+            // real supplementary-plane code point (4-byte UTF-8), rather
+            // than encoding each surrogate half individually (CESU-8,
+            // technically invalid UTF-8). A high surrogate with no valid
+            // low surrogate following it (end of buffer, or the next unit
+            // isn't a low surrogate) is unpaired -- emit U+FFFD rather than
+            // a half-formed sequence.
+            if (i + 1 < bytes.size()) {
+                const std::uint16_t next = static_cast<std::uint16_t>(bytes[i]) |
+                                           (static_cast<std::uint16_t>(bytes[i + 1]) << 8);
+                if (next >= 0xDC00 && next <= 0xDFFF) {
+                    i += 2;
+                    const std::uint32_t cp = 0x10000 +
+                                             ((static_cast<std::uint32_t>(unit) - 0xD800) << 10) +
+                                             (static_cast<std::uint32_t>(next) - 0xDC00);
+                    detail::append_utf8(out, cp);
+                    continue;
+                }
+            }
+            detail::append_utf8(out, 0xFFFD); // unpaired high surrogate
+            continue;
         }
+        if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            detail::append_utf8(out, 0xFFFD); // lone low surrogate
+            continue;
+        }
+        detail::append_utf8(out, unit);
     }
     return out;
 }
@@ -255,6 +292,20 @@ struct SplitCommand {
 /// first space; the DLL/entry-point tail travels in `args` unparsed, which is
 /// correct here since this function's job is target/args separation, not DLL
 /// entry-point resolution).
+/// Windows Run-key convention -- NOT CommandLineToArgvW's own backslash-
+/// collapsing rules (a different consumer this string never passes
+/// through): backslashes here are ordinary path separators, verbatim in
+/// the extracted target, never unescaped. The only thing this function
+/// decides about a backslash run is whether it makes the NEXT `"` a real
+/// closing quote or an escaped one -- an EVEN run (0, 2, 4, ...) means the
+/// quote terminates; an ODD run means it's escaped (`\"` embeds a literal
+/// quote character) and scanning continues past it. A bare single-
+/// backslash check (this function's prior form) gets this wrong for any
+/// run of 2 or more, e.g. `"C:\dir\\" -flag` -- two backslashes before
+/// the closing quote is an EVEN run (a plain trailing path separator, the
+/// quote genuinely closes there), but the old check saw ONE backslash
+/// immediately before it and treated the quote as escaped, scanning past
+/// the real close into the argument tail.
 inline SplitCommand split_command_line(std::string_view raw) {
     std::size_t start = raw.find_first_not_of(' ');
     if (start == std::string_view::npos) return {};
@@ -264,7 +315,15 @@ inline SplitCommand split_command_line(std::string_view raw) {
     if (raw.front() == '"') {
         std::size_t close = 1;
         while (close < raw.size()) {
-            if (raw[close] == '"' && (close == 0 || raw[close - 1] != '\\')) break;
+            if (raw[close] == '"') {
+                std::size_t backslashes = 0;
+                std::size_t k = close;
+                while (k > 1 && raw[k - 1] == '\\') {
+                    ++backslashes;
+                    --k;
+                }
+                if (backslashes % 2 == 0) break; // even run -- this quote terminates
+            }
             ++close;
         }
         out.target = std::string{raw.substr(1, close - 1)};
@@ -1286,11 +1345,20 @@ struct AnacronEntry {
     std::string command;
 };
 
+struct AnacrontabParseResult {
+    std::vector<AnacronEntry> entries;
+    int rejected_lines = 0; // a non-comment/blank/assignment line with != 4
+                            // fields -- REJECTED AND COUNTED, never silently
+                            // dropped, mirroring CrontabParseResult's
+                            // identical contract (see parse_crontab's own
+                            // banner).
+};
+
 /// anacrontab(5): `period  delay  job-identifier  command`. Comments, blank
 /// lines and VAR=VALUE lines (SHELL=, HOME=, LOGNAME=) are skipped exactly
 /// like crontab(5)'s.
-inline std::vector<AnacronEntry> parse_anacrontab(std::string_view text) {
-    std::vector<AnacronEntry> out;
+inline AnacrontabParseResult parse_anacrontab(std::string_view text) {
+    AnacrontabParseResult result;
     std::size_t pos = 0;
     while (pos <= text.size()) {
         std::size_t nl = text.find('\n', pos);
@@ -1299,14 +1367,16 @@ inline std::vector<AnacronEntry> parse_anacrontab(std::string_view text) {
         if (!detail::is_comment_or_blank_or_assignment(line)) {
             auto tokens = detail::split_ws(line, 4);
             if (tokens.size() == 4) {
-                out.push_back(AnacronEntry{std::string{tokens[0]}, std::string{tokens[1]},
-                                           std::string{tokens[2]}, std::string{tokens[3]}});
+                result.entries.push_back(AnacronEntry{std::string{tokens[0]}, std::string{tokens[1]},
+                                                       std::string{tokens[2]}, std::string{tokens[3]}});
+            } else {
+                ++result.rejected_lines;
             }
         }
         if (nl == std::string_view::npos) break;
         pos = nl + 1;
     }
-    return out;
+    return result;
 }
 
 // ── 11. parse_systemd_timer / timer_enabled_from_wants ───────────────────
@@ -1338,8 +1408,11 @@ inline SystemdTimerFields parse_systemd_timer(std::string_view text) {
         } else if (!trimmed.empty() && trimmed.front() != '#' && trimmed.front() != ';') {
             std::size_t eq = trimmed.find('=');
             if (eq != std::string_view::npos) {
-                std::string key = std::string{trimmed.substr(0, eq)};
-                std::string val = std::string{trimmed.substr(eq + 1)};
+                // systemd.syntax(7): whitespace around '=' is ignorable --
+                // "OnCalendar = daily" is equivalent to "OnCalendar=daily",
+                // not a different (unrecognized, silently dropped) key.
+                std::string key = detail::trim(trimmed.substr(0, eq));
+                std::string val = detail::trim(trimmed.substr(eq + 1));
                 if (section == "Timer") {
                     if (key == "OnCalendar") out.on_calendar = val;
                     else if (key == "OnBootSec") out.on_boot_sec = val;
@@ -1391,6 +1464,11 @@ struct DesktopEntry {
     bool gnome_autostart_enabled_present = false;
     bool gnome_autostart_enabled = true;
     Enabled enabled = Enabled::enabled;
+    // True when this file has no `[Desktop Entry]` group at all, or that
+    // group has no (or an empty) `Exec` key -- there is nothing this leg
+    // can actually run, so a caller must not report a plain `enabled` row
+    // with an empty target as if it found a real autostart entry.
+    bool malformed = false;
 };
 
 /// Parses the `[Desktop Entry]` group of a `.desktop` file (XDG Desktop Entry
@@ -1401,6 +1479,7 @@ struct DesktopEntry {
 inline DesktopEntry parse_desktop_entry(std::string_view text) {
     DesktopEntry out;
     bool in_group = false;
+    bool group_seen = false;
     std::size_t pos = 0;
     while (pos <= text.size()) {
         std::size_t nl = text.find('\n', pos);
@@ -1408,15 +1487,18 @@ inline DesktopEntry parse_desktop_entry(std::string_view text) {
         if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
         if (!line.empty() && line.front() == '[') {
             in_group = (line == "[Desktop Entry]");
+            if (in_group) group_seen = true;
         } else if (in_group) {
             std::size_t eq = line.find('=');
             if (eq != std::string_view::npos) {
-                std::string_view key = line.substr(0, eq);
-                std::string_view val = line.substr(eq + 1);
-                if (key == "Exec") out.exec = std::string{val};
+                // XDG Desktop Entry spec: whitespace around '=' is
+                // ignorable, matching parse_systemd_timer's identical fix.
+                const std::string key = detail::trim(line.substr(0, eq));
+                const std::string val = detail::trim(line.substr(eq + 1));
+                if (key == "Exec") out.exec = val;
                 else if (key == "Hidden") out.hidden = (val == "true");
-                else if (key == "OnlyShowIn") out.only_show_in = std::string{val};
-                else if (key == "NotShowIn") out.not_show_in = std::string{val};
+                else if (key == "OnlyShowIn") out.only_show_in = val;
+                else if (key == "NotShowIn") out.not_show_in = val;
                 else if (key == "X-GNOME-Autostart-enabled") {
                     out.gnome_autostart_enabled_present = true;
                     out.gnome_autostart_enabled = (val == "true");
@@ -1429,6 +1511,7 @@ inline DesktopEntry parse_desktop_entry(std::string_view text) {
     out.enabled = (out.hidden || (out.gnome_autostart_enabled_present && !out.gnome_autostart_enabled))
                      ? Enabled::disabled
                      : Enabled::enabled;
+    out.malformed = !group_seen || out.exec.empty();
     return out;
 }
 

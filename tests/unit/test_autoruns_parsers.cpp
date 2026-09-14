@@ -123,6 +123,48 @@ TEST_CASE("autoruns: format_source_status renders '-' for a declared-only row, a
                                "foreign_os") == "source|mac_login_items|unsupported|0|foreign_os");
 }
 
+// ── 0b. utf16le_to_utf8 ───────────────────────────────────────────────────
+
+TEST_CASE("autoruns: utf16le_to_utf8 pairs a real surrogate pair into one "
+          "supplementary-plane code point (4-byte UTF-8), not two separate "
+          "3-byte CESU-8 sequences",
+          "[autoruns][parsers]") {
+    // U+1F600 GRINNING FACE -> UTF-16LE surrogate pair D83D DE00 -> UTF-8
+    // F0 9F 98 80.
+    const std::vector<unsigned char> bytes = {0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00};
+    const auto out = utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+    REQUIRE(out.size() == 4);
+    CHECK(static_cast<unsigned char>(out[0]) == 0xF0);
+    CHECK(static_cast<unsigned char>(out[1]) == 0x9F);
+    CHECK(static_cast<unsigned char>(out[2]) == 0x98);
+    CHECK(static_cast<unsigned char>(out[3]) == 0x80);
+}
+
+TEST_CASE("autoruns: utf16le_to_utf8 emits U+FFFD for an unpaired high surrogate "
+          "or a lone low surrogate, never a half-formed sequence",
+          "[autoruns][parsers]") {
+    SECTION("high surrogate followed by a non-surrogate unit") {
+        const std::vector<unsigned char> bytes = {0x3D, 0xD8, 'A', 0x00, 0x00, 0x00};
+        const auto out =
+            utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+        // U+FFFD (EF BF BD) followed by 'A'.
+        REQUIRE(out.size() == 4);
+        CHECK(static_cast<unsigned char>(out[0]) == 0xEF);
+        CHECK(static_cast<unsigned char>(out[1]) == 0xBF);
+        CHECK(static_cast<unsigned char>(out[2]) == 0xBD);
+        CHECK(out[3] == 'A');
+    }
+    SECTION("lone low surrogate with no preceding high surrogate") {
+        const std::vector<unsigned char> bytes = {0x00, 0xDE, 0x00, 0x00};
+        const auto out =
+            utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+        REQUIRE(out.size() == 3);
+        CHECK(static_cast<unsigned char>(out[0]) == 0xEF);
+        CHECK(static_cast<unsigned char>(out[1]) == 0xBF);
+        CHECK(static_cast<unsigned char>(out[2]) == 0xBD);
+    }
+}
+
 // ── 1. split_command_line ────────────────────────────────────────────────
 
 TEST_CASE("autoruns: split_command_line separates a quoted path from its flags "
@@ -155,6 +197,34 @@ TEST_CASE("autoruns: split_command_line on an empty string returns an empty spli
     const auto split = split_command_line("");
     CHECK(split.target.empty());
     CHECK(split.args.empty());
+}
+
+TEST_CASE("autoruns: split_command_line closes a quoted target on an EVEN "
+          "backslash run before the closing quote -- a bare single-backslash "
+          "check (this function's prior form) gets this wrong for a run of 2 "
+          "or more",
+          "[autoruns][parsers]") {
+    // Input: "C:\dir\\" -flag -- two backslashes immediately before the
+    // closing quote is an EVEN run, so the quote genuinely terminates the
+    // target (a plain trailing path separator; the target keeps both
+    // backslashes verbatim, this function never unescapes), and "-flag" is
+    // the argument tail -- not scanned past as if the quote were escaped.
+    const auto split = split_command_line("\"C:\\dir\\\\\" -flag");
+    CHECK(split.target == "C:\\dir\\\\");
+    CHECK(split.args == "-flag");
+}
+
+TEST_CASE("autoruns: split_command_line treats an ODD backslash run before a "
+          "quote as an escaped quote, not the real close",
+          "[autoruns][parsers]") {
+    // Input: "C:\a\"b\\" -flag -- ONE backslash immediately before the
+    // inner quote is an ODD run (escaped, not a real close), so scanning
+    // continues past it to the actual closing quote (preceded by an even,
+    // 2-backslash run) rather than stopping early and reading " -flag"
+    // (attached to the wrong half) as part of the target.
+    const auto split = split_command_line("\"C:\\a\\\"b\\\\\" -flag");
+    CHECK(split.target == "C:\\a\\\"b\\\\");
+    CHECK(split.args == "-flag");
 }
 
 // ── 2. parse_reg_run_values ──────────────────────────────────────────────
@@ -1171,19 +1241,39 @@ TEST_CASE("autoruns: parse_anacrontab parses period/delay/job/command "
           "(anacrontab, real capture)",
           "[autoruns][parsers]") {
     const auto text = read_fixture_bytes("linux/anacrontab");
-    const auto entries = parse_anacrontab(text);
-    REQUIRE(entries.size() == 3);
-    CHECK(entries[0].period == "1");
-    CHECK(entries[0].delay == "5");
-    CHECK(entries[0].job_id == "cron.daily");
-    CHECK(entries[2].period == "@monthly");
+    const auto result = parse_anacrontab(text);
+    REQUIRE(result.entries.size() == 3);
+    CHECK(result.entries[0].period == "1");
+    CHECK(result.entries[0].delay == "5");
+    CHECK(result.entries[0].job_id == "cron.daily");
+    CHECK(result.entries[2].period == "@monthly");
+    CHECK(result.rejected_lines == 0);
 }
 
-TEST_CASE("autoruns: parse_anacrontab skips a malformed short line", "[autoruns][parsers]") {
-    // RECONSTRUCTION negative: a line with fewer than 4 fields is skipped,
-    // not mis-parsed into the wrong columns.
+TEST_CASE("autoruns: parse_anacrontab counts a malformed short line as rejected, "
+          "never silently dropped (#4184 unfiled-finding cleanup: matches "
+          "parse_crontab's rejected_lines contract, now actually consumed by "
+          "the /etc/anacrontab collector)",
+          "[autoruns][parsers]") {
+    // RECONSTRUCTION negative: a line with fewer than 4 fields is rejected
+    // and counted, not silently skipped nor mis-parsed into the wrong
+    // columns.
     const std::string text = "1\t5\n";
-    CHECK(parse_anacrontab(text).empty());
+    const auto result = parse_anacrontab(text);
+    CHECK(result.entries.empty());
+    CHECK(result.rejected_lines == 1);
+}
+
+TEST_CASE("autoruns: parse_anacrontab keeps other valid entries alongside a "
+          "rejected line, never dropping the whole file",
+          "[autoruns][parsers]") {
+    const std::string text = "1 5 cron.daily /etc/cron.daily\nshort line\n7 25 cron.weekly "
+                             "/etc/cron.weekly\n";
+    const auto result = parse_anacrontab(text);
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].job_id == "cron.daily");
+    CHECK(result.entries[1].job_id == "cron.weekly");
+    CHECK(result.rejected_lines == 1);
 }
 
 // ── 11. parse_systemd_timer / timer_enabled_from_wants ───────────────────
@@ -1196,6 +1286,16 @@ TEST_CASE("autoruns: parse_systemd_timer reads OnCalendar and WantedBy "
     CHECK(fields.on_calendar == "*-*-* 6,18:00");
     CHECK(fields.wanted_by == "timers.target");
     CHECK(fields.on_boot_sec.empty());
+}
+
+TEST_CASE("autoruns: parse_systemd_timer accepts whitespace-padded 'Key = Value' "
+          "-- systemd.syntax(7) makes the whitespace ignorable, not part of a "
+          "different (unrecognized, silently dropped) key",
+          "[autoruns][parsers]") {
+    const std::string text = "[Timer]\nOnCalendar = daily\n[Install]\nWantedBy = timers.target\n";
+    const auto fields = parse_systemd_timer(text);
+    CHECK(fields.on_calendar == "daily");
+    CHECK(fields.wanted_by == "timers.target");
 }
 
 TEST_CASE("autoruns: timer_enabled_from_wants finds a real symlink "
@@ -1228,6 +1328,7 @@ TEST_CASE("autoruns: parse_desktop_entry on a normal entry is enabled "
     CHECK(entry.exec == "/usr/libexec/at-spi-bus-launcher --launch-immediately");
     CHECK_FALSE(entry.hidden);
     CHECK(entry.enabled == Enabled::enabled);
+    CHECK_FALSE(entry.malformed);
 }
 
 TEST_CASE("autoruns: parse_desktop_entry with Hidden=true is disabled "
@@ -1238,6 +1339,40 @@ TEST_CASE("autoruns: parse_desktop_entry with Hidden=true is disabled "
     CHECK(entry.hidden);
     CHECK(entry.only_show_in == "GNOME;");
     CHECK(entry.enabled == Enabled::disabled);
+    CHECK_FALSE(entry.malformed); // Hidden, but still a real Exec -- not malformed
+}
+
+TEST_CASE("autoruns: parse_desktop_entry flags malformed when there's no "
+          "[Desktop Entry] group at all -- nothing this leg could run, must not "
+          "silently report an enabled row with an empty target",
+          "[autoruns][parsers]") {
+    const std::string text = "[Some Other Group]\nExec=/bin/should-not-count\n";
+    const auto entry = parse_desktop_entry(text);
+    CHECK(entry.malformed);
+    CHECK(entry.exec.empty());
+}
+
+TEST_CASE("autoruns: parse_desktop_entry flags malformed when [Desktop Entry] is "
+          "present but Exec is absent or empty",
+          "[autoruns][parsers]") {
+    SECTION("Exec key absent entirely") {
+        const std::string text = "[Desktop Entry]\nHidden=false\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+    SECTION("Exec key present but empty") {
+        const std::string text = "[Desktop Entry]\nExec=\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+}
+
+TEST_CASE("autoruns: parse_desktop_entry accepts whitespace-padded 'Key = Value' "
+          "-- the XDG Desktop Entry spec makes the whitespace ignorable, not part "
+          "of a different key ('Exec ' silently dropped, target reads empty)",
+          "[autoruns][parsers]") {
+    const std::string text = "[Desktop Entry]\nExec = /usr/bin/real --flag\n";
+    const auto entry = parse_desktop_entry(text);
+    CHECK(entry.exec == "/usr/bin/real --flag");
+    CHECK_FALSE(entry.malformed);
 }
 
 // ── 13. LaunchdFields / launchd_row_from_fields ──────────────────────────

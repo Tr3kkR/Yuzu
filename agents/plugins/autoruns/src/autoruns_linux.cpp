@@ -664,6 +664,14 @@ CollectorScanResult scan_xdg_autostart_user(SourceId id, const std::string& home
                 continue;
             }
             auto entry = parse_desktop_entry(*content);
+            if (entry.malformed) {
+                // No [Desktop Entry] group, or an empty/absent Exec -- there
+                // is nothing this leg could run, so this is a real
+                // constraint (AC4: never a plain `enabled` row with an
+                // empty target reported as a genuine autostart entry).
+                acc.add_failure("malformed");
+                continue;
+            }
             Row row;
             row.source_id = id;
             row.catalog_version = kAutorunSourceCatalogVersion;
@@ -1270,9 +1278,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
         const SourceId id = SourceId::lnx_anacrontab;
         auto content = read_file_bounded("/etc/anacrontab");
         if (content) {
-            auto entries = parse_anacrontab(*content);
+            auto parsed = parse_anacrontab(*content);
             const std::int64_t mtime = mtime_of("/etc/anacrontab");
-            for (const auto& e : entries) {
+            for (const auto& e : parsed.entries) {
                 Row row;
                 row.source_id = id;
                 row.catalog_version = kAutorunSourceCatalogVersion;
@@ -1287,7 +1295,13 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 row.mtime = mtime;
                 ctx.write_output(format_row(row));
             }
-            emit_status(id, YUZU_SUPPORT_SUPPORTED, entries.size(), "-");
+            // A malformed line keeps its OTHER valid entries (never drops
+            // the whole file) but flags the source constrained -- matches
+            // lnx_cron_d's identical parse_crontab().rejected_lines
+            // consumption.
+            emit_status(id, parsed.rejected_lines > 0 ? YUZU_SUPPORT_CONSTRAINED
+                                                       : YUZU_SUPPORT_SUPPORTED,
+                       parsed.entries.size(), parsed.rejected_lines > 0 ? "malformed" : "-");
         } else {
             auto cls = classify_read_error(content.error(), /*required_by_catalog=*/true);
             emit_status(id, cls.support, std::size_t{0}, cls.reason);
@@ -1498,6 +1512,15 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                     continue;
                 }
                 auto entry = parse_desktop_entry(*content);
+                if (entry.malformed) {
+                    // No [Desktop Entry] group, or an empty/absent Exec --
+                    // nothing this leg could run, so this is a real
+                    // constraint (AC4), matching the per-user XDG
+                    // autostart collector's identical handling above.
+                    note_file_constraint(any_file_constrained, file_constrained_reason,
+                                         "malformed");
+                    continue;
+                }
                 Row row;
                 row.source_id = id;
                 row.catalog_version = kAutorunSourceCatalogVersion;
