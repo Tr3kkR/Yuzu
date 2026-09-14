@@ -1817,8 +1817,10 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // a never-dispatched terminal tombstone may still sit here after a
                 // double fault, and is swept first (governance pass-3 sg-3/ar-4/cs-5).
                 //
-                // rung 9c PR-5a (#4221 cs-103) reachability note: this sweep's ATTACH-
-                // path twin (try_dispatch_head_locked, this file's other
+                // rung 9c PR-5a (#4221 cs-103) reachability note (corrected 2026-09-14,
+                // governance S2 - the original (a) below was wrong for a same-rule_id
+                // tombstone; see the correction inline): this sweep's ATTACH-path twin
+                // (try_dispatch_head_locked, this file's other
                 // sweep_terminal_queued_locked call site) has concrete, tested repros
                 // (the "adversarial re-review r3 C2" death test and PR-5a's own
                 // "up-101/ch-101" test both leave a real tombstone for this call to
@@ -1826,22 +1828,34 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // of the actual call graph (attach_core, publish_arm_verdicts_locked,
                 // on_arm_complete, Case 0 in this function) did not turn up a
                 // producible sequence of public-API calls that reaches here with a
-                // non-empty fifo: any candidate same-key tombstone either (a) still
-                // holds its OWN index_->add() mapping (its release having failed),
-                // which inflates index_->refcount() for this key past 1 and blocks
-                // `last_on_key` above from ever gating entry into this branch while
-                // that tombstone persists, or (b) gets opportunistically swept by
-                // try_dispatch_head_locked's OWN call as part of the SAME rule's own
-                // next attach - see PR-5a's up-101 test, where the tombstone is
-                // cleared before the new claim ever reaches commit, not left for a
-                // later, separate detach to find. This matches the governance
-                // finding's own framing (sg-3/ar-4/cs-5 hardened BOTH sweep call
-                // sites symmetrically as defence-in-depth) rather than a distinctly
-                // reproduced defect at this specific site. Flagging rather than
-                // asserting impossibility: a future change to up-5's retained-disarm
-                // redrive (5b) or to the claim/index bookkeeping above could open a
-                // path this analysis didn't model - re-check this note rather than
-                // deleting it if either changes.
+                // non-empty fifo. Two cases, scoped by whose rule_id the tombstone
+                // holds - conflating them was the (a) defect:
+                // (a) a DIFFERENT rule sharing this key still holds its OWN
+                //     index_->add() mapping (its release having failed): by_key_ is a
+                //     std::set<rule_id>, so a SECOND, distinct rule_id inflates
+                //     index_->refcount() for this key past 1 and blocks `last_on_key`
+                //     above from ever gating entry into this branch while that
+                //     tombstone persists. This case does NOT apply to a same-rule_id
+                //     tombstone from an older generation: by_key_ counts the rule_id
+                //     string once regardless of which generation currently owns it in
+                //     by_rule_, so refcount stays 1 either way.
+                // (b) the SAME rule's own stale tombstone gets opportunistically swept
+                //     by try_dispatch_head_locked's OWN call as part of that rule's
+                //     next attach - see PR-5a's up-101 test, where the tombstone is
+                //     cleared before the new claim ever reaches commit, not left for a
+                //     later, separate detach to find. This is the case that actually
+                //     covers a same-rule_id tombstone; (a) never needs to.
+                // The overall unreachability conclusion rests on (b) alone for the
+                // same-rule case and on (a) for the different-rule case - independently
+                // traced by two reviewers with no counter-example found, but not
+                // exhaustively modeled against every background retry path. This
+                // matches the governance finding's own framing (sg-3/ar-4/cs-5 hardened
+                // BOTH sweep call sites symmetrically as defence-in-depth) rather than a
+                // distinctly reproduced defect at this specific site. Flagging rather
+                // than asserting impossibility: a future change to up-5's
+                // retained-disarm redrive (5b) or to the claim/index bookkeeping above
+                // could open a path this analysis didn't model - re-check this note
+                // rather than deleting it if either changes.
                 sweep_terminal_queued_locked(eit->second);
                 assert(eit->second.fifo.empty());
                 try {
