@@ -80,7 +80,7 @@
     }
   ],
   "caveats": [
-    "**Windows store-open failures are silent.** `enumerate_store()` returns an empty vector when neither the LOCAL_MACHINE nor CURRENT_USER handle opens (`certificates_plugin.cpp:325-341`), and the Windows leg never calls `set_result_status` — a permission or missing-store failure looks identical to \"this store is empty,\" unlike the explicit `not_available`/`CONSTRAINED` sentinels the macOS and Linux legs use.",
+    "**Windows store-open failures are no longer silent, and the Linux delete recheck still has a narrow residual window.** A CryptoAPI store that neither `CertOpenStore` attempt can open now reports `not_available|<store> store could not be opened` (`list`/`details`) or `error|<store> store could not be opened; nothing removed` with a non-zero exit (`delete`), and marks the result CONSTRAINED/PARTIAL via `cryptoapi:store-open` — the Windows leg does call `set_result_status` for this case (`certificates_plugin.cpp:369-371,402,449-453`). On Linux, `delete` re-derives the matched entry's identity — its own device/inode and, for a symlink, the target's link text plus the target's device/inode — immediately before `unlinkat`, but POSIX has no unlink-by-fd, so a residual `fstatat`-then-`unlinkat` window remains (`certificates_plugin.cpp:980-1010`); because identity binds inode and target text/inode rather than content, an in-place rewrite of the SAME inode between match and unlink is not detected. A FIFO, device, socket or directory encountered during the scan is skipped silently via a nonblocking, post-open `S_ISREG` check rather than blocking the scan (`certificates_plugin.cpp:634,685-689`), and deleting a symlinked entry always removes the link itself via `unlinkat`, never the file it points to.",
     "**The login keychain read is a registered exception, not a rung-1 promotion.** System.keychain/SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`; the login keychain stays on the `launchctl asuser` + `sudo -u` + `security find-certificate` subprocess (rung 2, #3406) because the LaunchDaemon has no login keychain of its own (`certificates_plugin.cpp:16-23,750-762`) — do not \"fix\" this to a direct API call.",
     "**SystemRootCertificates.keychain delete is permanently rejected.** It is sealed under System Integrity Protection; `delete_cert_macos` rejects `store=root` outright before ever shelling out (`certificates_plugin.cpp:1761-1771`) — a hard OS limitation, not a bug to fix.",
     "**A macOS delete self-verifies before reporting success.** `delete_cert_macos` re-enumerates the target keychain after `security delete-certificate` exits 0 and only reports `status|deleted` on a positively-proven absence; a keychain that can't be re-read or still shows the certificate reports `error|...`, never a false `status|deleted` (`certificates_plugin.cpp:1863-1900`).",
@@ -451,7 +451,7 @@
   "privileges": [
     {
       "grant": "`list`/`details`: none — `CertEnumCertificatesInStore` needs no elevation. `delete`: `SeBackupPrivilege` + `SeRestorePrivilege` to write the certificate store; already granted to the service account under LocalSystem today, no new grant.",
-      "if_refused": "`enumerate_store()` silently returns an empty vector when the store handle can't be opened (`certificates_plugin.cpp:325-341`) — `list`/`details` emit no row and no sentinel for that store; `delete` reports `status|not_found` if the store can't be opened (`certificates_plugin.cpp:406-409`)",
+      "if_refused": "`enumerate_store()` now returns an honest `std::nullopt` when neither `CertOpenStore` attempt succeeds, never a silent empty vector (`certificates_plugin.cpp:314-333`); `list` reports `not_available|<store> store could not be opened` and marks the result CONSTRAINED/PARTIAL, provenance `cryptoapi:store-open`, then keeps scanning the remaining stores (`certificates_plugin.cpp:369-371`); `details` does the same per store and, if any store was skipped, reports `not_available|<store(s)> could not be opened; scan incomplete` instead of a false `status|not_found` (`certificates_plugin.cpp:402,417-419`); `delete` reports `error|<store> store could not be opened; nothing removed` with a non-zero exit instead of `status|not_found` (`certificates_plugin.cpp:449-453`)",
       "measured": "2026-09-07, bare-metal Windows 10.0.26200.0 x64, as SYSTEM",
       "os": "Windows",
       "runs_as": "agent service account (LocalSystem today, #1442)"
@@ -464,8 +464,8 @@
       "runs_as": "agent daemon; the shipped LaunchDaemon has no `UserName` key, so it runs as root — but this sample was captured unprivileged (see Measured)"
     },
     {
-      "grant": "`list`/`details`: none — native filesystem read + in-process libcrypto parse, no subprocess. `delete`: write access to `/etc/ssl/certs` to remove the matching file (`std::filesystem::remove`, `certificates_plugin.cpp:635`).",
-      "if_refused": "An unreadable/unparseable PEM file reports `(unreadable)`/`(skipped)` and `CONSTRAINED`/`PARTIAL` rather than being silently dropped (`certificates_plugin.cpp:479-520`); `details`/`delete` report `not_available|... scan incomplete` / `error|...` rather than a false `not_found` when a candidate file couldn't be inspected (`certificates_plugin.cpp:592-596,643-649`)",
+      "grant": "`list`/`details`: none — native filesystem read + in-process libcrypto parse, no subprocess. `delete`: write access to `/etc/ssl/certs` to remove the matching file via `unlinkat` on the held `/etc/ssl/certs` dirfd (`certificates_plugin.cpp:1009`).",
+      "if_refused": "An unreadable/unparseable PEM file reports `(unreadable)`/`(skipped)` and `CONSTRAINED`/`PARTIAL` rather than being silently dropped (`certificates_plugin.cpp:779-783`); `details` reports `not_available|... scan incomplete` rather than a false `status|not_found` when a candidate file couldn't be inspected (`certificates_plugin.cpp:899`); an unreadable `/etc/ssl/certs` itself, or an enumeration that fails part-way, reports `not_available|/etc/ssl/certs could not be opened` and CONSTRAINED/PARTIAL, provenance `posix:cert-dir` (`certificates_plugin.cpp:797-799,816-817`); a `delete` whose target's identity (link inode, target text, and target inode) changed between match and unlink reports `error|certificate file changed during delete; nothing removed`, provenance `posix:delete-recheck` (`certificates_plugin.cpp:1019-1022`), instead of unlinking a different file than the one matched",
       "measured": "2026-09-06, Debian GNU/Linux 13 (trixie) aarch64 container, euid 0",
       "os": "Linux",
       "runs_as": "dedicated unprivileged `yuzu` account in production; this sample was captured as euid 0 in a container, not representative of that account"
@@ -477,7 +477,25 @@
       "completeness": "`PARTIAL`",
       "provenance": "`libcrypto:unreadable-file`",
       "status": "`CONSTRAINED`",
-      "when": "Linux: a PEM file under `/etc/ssl/certs` could not be read or parsed (`certificates_plugin.cpp:512,630`)"
+      "when": "Linux: a PEM file under `/etc/ssl/certs` could not be read or parsed (`certificates_plugin.cpp:779,971`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`cryptoapi:store-open`",
+      "status": "`CONSTRAINED`",
+      "when": "Windows: a CryptoAPI store could not be opened for `list`/`details`/`delete` (`certificates_plugin.cpp:371,402,452`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`posix:cert-dir`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: `/etc/ssl/certs` could not be opened, or a readdir(3) enumeration failed part-way through (`certificates_plugin.cpp:799,817,831,945`)"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`posix:delete-recheck`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux: `delete`'s pre-unlink identity recheck found the entry changed or could not be re-derived since the earlier match (`certificates_plugin.cpp:1021,1028`)"
     },
     {
       "completeness": "`PARTIAL`",
@@ -730,6 +748,9 @@
     ],
     "changelog": [
       "changelog.d/20260817-wave2-certificates-in-process-x509.changed.md",
+      "changelog.d/20260914-certificates-store-honesty-sentinels.changed.md",
+      "changelog.d/3245-certificates-linux-delete-toctou.fixed.md",
+      "changelog.d/3247-certificates-windows-thumbprint-case.fixed.md",
       "changelog.d/3406-certificates-login-keychain-argv.changed.md"
     ],
     "definitions": [
@@ -743,6 +764,7 @@
     "privilege_row": true,
     "tests": [
       "tests/unit/test_certificates_macos.cpp",
+      "tests/unit/test_certificates_store_honesty.cpp",
       "tests/unit/test_certificates_x509.cpp"
     ]
   },

@@ -1,12 +1,14 @@
 ## Certificate Inventory and Management Definitions
 ## Enumerates and manages certificates in system stores.
 ## Windows: CryptoAPI (MY, ROOT, CA, Trust stores)
-## Linux: PEM files in /etc/ssl/certs/ via openssl
-## macOS: System.keychain and SystemRootCertificates.keychain via security CLI,
-##        plus the current console user's login keychain (store=login/all) via
-##        `launchctl asuser <uid> sudo -u <user> security` -- the LaunchDaemon
-##        has no login keychain of its own, so this reaches into that user's
-##        per-user session to read it.
+## Linux: PEM files in /etc/ssl/certs/ parsed in-process via libcrypto
+##        (certificates_x509.hpp); no subprocess
+## macOS: System.keychain and SystemRootCertificates.keychain read in-process
+##        via SecItemCopyMatching, plus the current console user's login
+##        keychain (store=login/all) via a bounded pre-split argv `launchctl
+##        asuser <uid> sudo -n -u <user> -- security find-certificate` (the
+##        LaunchDaemon has no login keychain of its own); delete uses
+##        `security delete-certificate` through the bounded subprocess runner.
 
 ---
 apiVersion: yuzu.io/v1alpha1
