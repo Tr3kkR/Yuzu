@@ -14,10 +14,15 @@
  * on its own time. If that callable's code -- and its closure's type-
  * erasure thunks, which are compiled into whichever translation unit
  * CONSTRUCTS the lambda -- lives in a plugin's shared object, the agent's
- * teardown loop can `FreeLibrary`/`dlclose` that plugin (on every
- * "Subscribe stream ended" reconnect, not only full agent shutdown --
- * agent.cpp's Subscribe loop) while the detached thread is still executing
- * inside it. sdk/include/yuzu/plugin.hpp's shutdown() doc comment states
+ * teardown loop can `FreeLibrary`/`dlclose` that plugin while the detached
+ * thread is still executing inside it. agent.cpp's Subscribe loop gates
+ * that teardown on `stop_requested_` (a plain reconnect leaves `plugins_`
+ * loaded, `shutdown()` never runs) -- so this fires only at genuine final
+ * agent shutdown (SIGTERM, service stop, upgrade restart), not on every
+ * reconnect, which narrows EXPOSURE but does not remove the hazard: a
+ * service stop/restart is a routine, recurring operational event, and DISM
+ * has no caller-supplied timeout of its own. sdk/include/yuzu/plugin.hpp's
+ * shutdown() doc comment states
  * this exact hazard: a worker surviving the plugin's own bounded shutdown
  * quiesce "must never touch this plugin's own code or statics after that
  * point (dlclose/FreeLibrary can unmap them while it runs)."
