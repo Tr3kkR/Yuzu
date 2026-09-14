@@ -6,8 +6,8 @@
 | **What it does** | USB, PCI and Thunderbolt/USB4 device inventory |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.peripherals.usb, crossplatform.peripherals.pci, crossplatform.peripherals.thunderbolt) |
-| **Platforms** | Windows ⛔ undeclared · macOS ⛔ undeclared · Linux ⛔ undeclared |
-| **Actions** | - |
+| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Actions** | `pci` (definition `crossplatform.peripherals.pci`) · `thunderbolt` (definition `crossplatform.peripherals.thunderbolt`) · `usb` (definition `crossplatform.peripherals.usb`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -31,6 +31,14 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
+| `pci` | ✅ supported · rung 1 · SetupAPI (PCI enumerator) | ✅ supported · rung 1 · IOKit IOServiceMatching(IOPCIDevice) | ✅ supported · rung 1 · /sys/bus/pci/devices sysfs attribute reads |
+| `thunderbolt` | 🟡 constrained · rung 1 · SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 | ✅ supported · rung 1 · IOKit IOServiceMatching(IOThunderboltSwitch) | 🟡 constrained · rung 1 · /sys/bus/thunderbolt/devices sysfs reads |
+| `usb` | ✅ supported · rung 1 · SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS | ✅ supported · rung 1 · IOKit IOServiceMatching(IOUSBHostDevice) | ✅ supported · rung 1 · /sys/bus/usb/devices sysfs attribute reads |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`thunderbolt` / Windows** — string-heuristic identification; no Thunderbolt device class in SetupAPI
+- **`thunderbolt` / Linux** — walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run
 <!-- END GENERATED -->
 
 **Provisional.** The capability-matrix block above (`docs/os-capability-matrix.md`) does not yet carry a `peripherals` fragment — `tools/capmatrix-gen` populates it by dlopening the plugin's built binary on each OS, and that regeneration pass is I91-6's, not this package's. Until then this fence is empty or stale; the plugin's own descriptor (`peripherals_plugin.cpp`'s `kActionDescriptors`) is the authoritative per-leg support/rung/mechanism source in the meantime. The Windows sample's `leg-hash pending` stamp is likewise unresolved until that same block carries real rows to hash the declared legs against — completing it (`plugin_doc_gen.py --stamp`) is I91-7's.
@@ -119,7 +127,7 @@ Pipe-delimited rows, one per device, written via `write_output()`. Every field b
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash pending
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash 25220299bc79
 
 ```
 == action=usb
@@ -152,6 +160,61 @@ pci|PCI/VEN_10DE&DEV_228B&SUBSYS_40761458&REV_A1/4&1D81E16&0&0119|10de|228b|0403
 pci|PCI/VEN_1022&DEV_57A3&SUBSYS_88081043&REV_00/5&2BFB86CE&0&08000A|1022|57a3|060400|0000|0000|-|PCI-to-PCI Bridge
 pci|PCI/VEN_1022&DEV_1446&SUBSYS_00000000&REV_00/3&11583659&0&C6|1022|1446|060000|0000|0000|-|PCI standard host CPU bridge
 … 12 of 48 rows shown
+[result_status] OK / FULL
+
+== action=thunderbolt
+thunderbolt|none
+[result_status] OK / FULL
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash 25220299bc79
+
+```
+== action=usb
+usb|02200000|05ac|800c|09|00|Apple|USB3 Gen2 Hub|7423J07|super+|1
+usb|02100000|05ac|800b|09|00|Apple|USB2 Hub|7423J07|high|1
+[result_status] OK / FULL
+
+== action=pci
+pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge
+pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge
+pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge
+pci|0:0:0(2:2)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge
+pci|0:2:0(1:1)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge
+pci|1:0:0|14e4|1682|020000|14e4|1682|BCM5701Enet|ethernet
+pci|2:0:0|14e4|4434|028000|106b|4388|IOUserService|pci14e4,4434
+pci|2:0:1|14e4|5f72|028000|106b|4388|AppleConvergedPCI|pci14e4,5f72
+[result_status] OK / FULL
+
+== action=thunderbolt
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b1|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b0|-|-
+thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-14 · euid 0 · leg-hash 25220299bc79
+
+```
+== action=usb
+usb|usb1|1d6b|0002|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|480|1
+usb|usb2|1d6b|0003|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|10000|1
+[result_status] OK / FULL
+
+== action=pci
+pci|0000:00:08.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:0d.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:10.0|1af4|1045|058000|1af4|0045|virtio-pci|-
+pci|0000:00:01.0|1af4|1041|020000|1af4|0041|virtio-pci|-
+pci|0000:00:07.0|1af4|1042|018000|1af4|0042|virtio-pci|-
+pci|0000:00:0c.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:0f.0|1af4|1044|100000|1af4|0044|virtio-pci|-
+pci|0000:00:00.0|106b|1a05|060000|0000|0000|-|-
+pci|0000:00:06.0|1af4|1042|018000|1af4|0042|virtio-pci|-
+pci|0000:00:0b.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:09.0|1af4|105a|018000|1af4|005a|virtio-pci|-
+pci|0000:00:0e.0|1af4|1053|078000|1af4|0053|virtio-pci|-
+… 12 of 14 rows shown
 [result_status] OK / FULL
 
 == action=thunderbolt

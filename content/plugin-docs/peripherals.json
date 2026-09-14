@@ -1,5 +1,84 @@
 {
-  "actions": [],
+  "actions": [
+    {
+      "action": "pci",
+      "definition_ids": [
+        "crossplatform.peripherals.pci"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/bus/pci/devices sysfs attribute reads",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOKit IOServiceMatching(IOPCIDevice)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "SetupAPI (PCI enumerator)",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "thunderbolt",
+      "definition_ids": [
+        "crossplatform.peripherals.thunderbolt"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run",
+          "mechanism": "/sys/bus/thunderbolt/devices sysfs reads",
+          "rung": "1",
+          "support": "constrained"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOKit IOServiceMatching(IOThunderboltSwitch)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "string-heuristic identification; no Thunderbolt device class in SetupAPI",
+          "mechanism": "SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4",
+          "rung": "1",
+          "support": "constrained"
+        }
+      }
+    },
+    {
+      "action": "usb",
+      "definition_ids": [
+        "crossplatform.peripherals.usb"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "/sys/bus/usb/devices sysfs attribute reads",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "IOKit IOServiceMatching(IOUSBHostDevice)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    }
+  ],
   "caveats": [
     "**Windows Thunderbolt identification is a string heuristic, not a device class.** SetupAPI's PCI enumerator exposes no dedicated Thunderbolt/USB4 device class, so the Windows leg matches `DEVICEDESC` containing \"Thunderbolt\" or \"USB4\" (case-insensitive) on the PCI walk. It also only ever surfaces the host controller — SetupAPI's PCI enumerator cannot see a downstream Thunderbolt device — so every Windows Thunderbolt row reports role `host_controller`.",
     "**Linux Thunderbolt support is fixture-tree-verified only.** The `/sys/bus/thunderbolt/devices` walk has been exercised against a synthetic sysfs fixture tree (`tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/`); no live Linux host with an actual Thunderbolt bus has run this leg in this project to date.",
@@ -80,7 +159,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "a7dae239d9a2",
+  "leg_hash": "25220299bc79",
   "manifest_version": 1,
   "name": "peripherals",
   "outputs": [
@@ -402,9 +481,9 @@
   ],
   "outputs_note": "Pipe-delimited rows, one per device, written via `write_output()`. Every field beyond the fixed-vocabulary `role` column goes through the shared untrusted-output escaper; a device with no value for a given optional field reports `-` rather than an empty or omitted field. A bus with no devices reports a single `<kind>|none` row; a leg that could not attempt the read at all reports `<kind>|unavailable|<token>` instead of any device rows.",
   "platforms": {
-    "linux": "undeclared",
-    "macos": "undeclared",
-    "windows": "undeclared"
+    "linux": "supported",
+    "macos": "supported",
+    "windows": "supported"
   },
   "privileges": [
     {
@@ -463,6 +542,138 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "usb",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 2,
+          "rows": [
+            "usb|usb1|1d6b|0002|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|480|1",
+            "usb|usb2|1d6b|0003|09|00|Linux 7.0.12-linuxkit vhci_hcd|USB/IP Virtual Host Controller|vhci_hcd.0|10000|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pci",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 14,
+          "rows": [
+            "pci|0000:00:08.0|1af4|105a|018000|1af4|005a|virtio-pci|-",
+            "pci|0000:00:0d.0|1af4|105a|018000|1af4|005a|virtio-pci|-",
+            "pci|0000:00:10.0|1af4|1045|058000|1af4|0045|virtio-pci|-",
+            "pci|0000:00:01.0|1af4|1041|020000|1af4|0041|virtio-pci|-",
+            "pci|0000:00:07.0|1af4|1042|018000|1af4|0042|virtio-pci|-"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "thunderbolt",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 1,
+          "rows": [
+            "thunderbolt|none"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-14",
+        "host_class": "container",
+        "leg_hash": "25220299bc79",
+        "os": "linux",
+        "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
+        "privilege": "euid 0"
+      }
+    },
+    "macos": {
+      "actions": [
+        {
+          "action": "usb",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 2,
+          "rows": [
+            "usb|02200000|05ac|800c|09|00|Apple|USB3 Gen2 Hub|7423J07|super+|1",
+            "usb|02100000|05ac|800b|09|00|Apple|USB2 Hub|7423J07|high|1"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "pci",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 8,
+          "rows": [
+            "pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge",
+            "pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge",
+            "pci|0:0:0(1:128)|106b|1017|060400|0000|0000|ApplePCIECHostBridge|pci-bridge",
+            "pci|0:0:0(2:2)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge",
+            "pci|0:2:0(1:1)|106b|100c|060400|0000|0000|ApplePCIEHostBridge|pci-bridge"
+          ],
+          "truncated": false
+        },
+        {
+          "action": "thunderbolt",
+          "not_captured": null,
+          "params": "",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 3,
+          "rows": [
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b1|-|-",
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b0|-|-",
+            "thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-14",
+        "host_class": "bare-metal",
+        "leg_hash": "25220299bc79",
+        "os": "macos",
+        "os_version": "macOS 26.6.2 arm64",
+        "privilege": "euid 501"
+      }
+    },
     "windows": {
       "actions": [
         {
@@ -525,7 +736,7 @@
       "stamp": {
         "date": "2026-09-08",
         "host_class": "bare-metal",
-        "leg_hash": "pending",
+        "leg_hash": "25220299bc79",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"
