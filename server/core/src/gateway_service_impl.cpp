@@ -62,10 +62,11 @@ static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
 // HA WS-4 slice 4.1 / 4.2b Task B: shared log+metric helper for a degraded
 // GatewayRouteStore write (gateway_route_store.hpp). This function ONLY logs
 // and counts — it never decides proceed-vs-refuse. What each CALLER does next
-// is PER-SITE, not uniform (Task B's per-site fail-closed contract, decided
-// against the directory's still-INERT posture: nothing reads it for dispatch
-// yet, so only the write whose LOSS is otherwise unrecoverable is worth
-// refusing the RPC over):
+// is PER-SITE, not uniform (Task B's per-site fail-closed contract): as of
+// 4.2b Task C the directory IS read for dispatch (fallback-only, on a local
+// registry miss), so the reader's trust predicate — not the write posture —
+// is the integrity backstop. Only the write whose LOSS is otherwise
+// unrecoverable is worth refusing the RPC over:
 //   - register_fresh (the ProxyRegister fresh-registration branch) is the
 //     ONE fail-CLOSED site — it CREATES the row, and a missed create persists
 //     until reconnect/4.4 with no other write on the path able to fill in a
@@ -77,9 +78,9 @@ static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
 //     and set_gateway_route already published in-memory — failing it would
 //     split memory/directory state and risk a black hole), the two
 //     ProxyRegister renew branches and BatchHeartbeat's renew (a renew
-//     failure only yields premature lease-staleness, which a future reader
-//     already treats as not-routable), and deregister (bounded by the 90s
-//     lease TTL regardless).
+//     failure only yields premature lease-staleness, which the reader's
+//     `routable` predicate already treats as not-routable), and deregister
+//     (bounded by the 90s lease TTL regardless).
 void record_route_store_failure(yuzu::MetricsRegistry* metrics, std::string_view op,
                                 GatewayRouteStoreError err) {
     const char* reason =
