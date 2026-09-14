@@ -157,12 +157,15 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                  json apps = json::array();
                  for (const auto& r : *rows)
                      apps.push_back(app_usage_row_to_json(r));
+                 // collected_at is the agent-batch collection time (every row in one
+                 // replace_agent_last_used call shares it), not response-generation
+                 // wall time — the MCP twin (mcp_server.cpp) hoists the same field the
+                 // same way; 0 for an empty result.
+                 const std::int64_t collected_at = rows->empty() ? 0 : rows->front().collected_at;
                  json data;
                  data["agent_id"] = agent_id;
                  data["apps"] = std::move(apps);
-                 data["collected_at"] = std::chrono::duration_cast<std::chrono::seconds>(
-                                            std::chrono::system_clock::now().time_since_epoch())
-                                            .count();
+                 data["collected_at"] = collected_at;
                  send_json(res, 200, ok_json(std::move(data)));
              });
 }
