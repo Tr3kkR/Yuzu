@@ -158,6 +158,7 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -4535,6 +4536,23 @@ public:
                         startup_failed_ = true;
                     }
                 }
+            }
+        }
+        // Wave 7: execution_artifacts (the first Forensics-class plugin)
+        // ships default-off — an operator must explicitly enable it via
+        // PUT /api/v1/plugin-config/execution_artifacts/kill-switch. Seeded
+        // immediately after the store is constructed and open; ON CONFLICT
+        // DO NOTHING (plugin_config_store.cpp) means this never clobbers an
+        // operator's own kill-switch decision on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_kill_switch_default_off(
+                    "execution_artifacts",
+                    "default-off: forensics class (Wave 7); enable per PUT "
+                    "/api/v1/plugin-config/execution_artifacts/kill-switch")) {
+                spdlog::error(
+                    "[PG] Refusing to start: execution_artifacts default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
             }
         }
 
@@ -13938,6 +13956,7 @@ private:
                              .fleet_topology_store = fleet_topology_store_.get(),
                              .access_review_store = access_review_store_.get(),
                              .software_licensing_store = software_licensing_store_.get(),
+                             .plugin_config_store = plugin_config_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
@@ -18478,6 +18497,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
         yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
+        yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail

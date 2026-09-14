@@ -164,6 +164,7 @@ class CustomPropertiesStore;
 class FleetTopologyStore;
 class AccessReviewStore;
 class SoftwareLicensingStore;
+class PluginConfigStore;
 class ProductRegistryStore;
 class ProductPackStore;
 class ScimStore;
@@ -267,6 +268,7 @@ struct Deps {
     FleetTopologyStore* fleet_topology_store{nullptr};
     AccessReviewStore* access_review_store{nullptr};
     SoftwareLicensingStore* software_licensing_store{nullptr};
+    PluginConfigStore* plugin_config_store{nullptr};
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};
     ScimStore* scim_store{nullptr};
