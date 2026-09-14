@@ -1855,18 +1855,49 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // than asserting impossibility: a future change to up-5's
                 // retained-disarm redrive (5b) or to the claim/index bookkeeping above
                 // could open a path this analysis didn't model - re-check this note
-                // rather than deleting it if either changes.
+                // rather than deleting it if either changes. Because this conclusion is
+                // call-graph reasoning, not a compile-time guarantee, the check right
+                // below is a REAL runtime guard (counted via
+                // detach_sweep_left_residue(), logged, safe fallback) rather than a bare
+                // debug-only assert - see its own comment for why.
                 sweep_terminal_queued_locked(eit->second);
+                // rung 9c PR-5a (#4221 cs-103): a bare assert() here would compile out
+                // entirely under NDEBUG, silently proceeding as if the sweep's
+                // precondition held even though this investigation only established it
+                // via call-graph reasoning, not a compile-time guarantee. Matches this
+                // file's own established precedent for a should-never-happen branch
+                // (dispatch_arm_off_lock's "not an Arm claim" guard): keep the debug
+                // assert for immediate local visibility, but pair it with a REAL,
+                // NDEBUG-surviving fallback that never risks inserting this Disarm claim
+                // behind (or ahead of) something whose state this code no longer
+                // understands. Deliberately does NOT push/dispatch the new Disarm claim
+                // in that case - the unexpected residue is left for the next same-key
+                // event to sweep (the same recovery path an ordinary retained tombstone
+                // already uses); this rule's own rules_/index_ cleanup below still runs
+                // unconditionally, so THIS rule is not left confirmed - only the fresh
+                // disarm submission for it is deferred rather than risked.
                 assert(eit->second.fifo.empty());
-                try {
-                    eit->second.fifo.push_back(c);
-                } catch (...) {
-                    if (inserted)
-                        claims_.erase(eit); // never leave an empty entry behind
-                    throw;
+                if (!eit->second.fifo.empty()) {
+                    detach_sweep_left_residue_.fetch_add(1, std::memory_order_relaxed);
+                    try {
+                        spdlog::error("Guardian spark: key '{}' still has {} queued claim(s) "
+                                     "after the last-on-key sweep for rule '{}' - deferring "
+                                     "this disarm to the next same-key event rather than "
+                                     "risk misordering it (see detach_sweep_left_residue())",
+                                     *key_opt, eit->second.fifo.size(), rule_id);
+                    } catch (...) {
+                    }
+                } else {
+                    try {
+                        eit->second.fifo.push_back(c);
+                    } catch (...) {
+                        if (inserted)
+                            claims_.erase(eit); // never leave an empty entry behind
+                        throw;
+                    }
+                    work = c;
+                    claim_pushed = true;
                 }
-                work = c;
-                claim_pushed = true;
             } else {
                 inline_disarm = kit->second->subscription;
             }
