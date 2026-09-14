@@ -6416,12 +6416,12 @@ TEST_CASE("source tripwire: index_add_rollback's .fn uses the noexcept erase_rul
     REQUIRE(input.is_open());
     const std::string source((std::istreambuf_iterator<char>(input)),
                              std::istreambuf_iterator<char>());
-    const auto start = source.find("index_add_rollback.fn = [this, rule_id, &index_added] {");
+    const auto start = source.find("index_add_rollback.fn = [this, rule_id, gen, &index_added] {");
     REQUIRE(start != std::string::npos);
     const auto end = source.find("};", start);
     REQUIRE(end != std::string::npos);
     const std::string body = source.substr(start, end - start);
-    CHECK(body.find("index_->erase_rule(rule_id)") != std::string::npos);
+    CHECK(body.find("index_->erase_rule(rule_id, gen)") != std::string::npos);
     CHECK(body.find("index_->remove_rule(") == std::string::npos);
 }
 

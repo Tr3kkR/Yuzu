@@ -147,9 +147,17 @@ bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept 
     // `false`, and index_held stays true so the next release retries.
     try {
         index_remove_fault_here_for_test(); // seam: "the index removal threw"
-        index_->erase_rule(claim.rule_id);  // noexcept; idempotent; guarded by index_held
-                                            // so a stale claim never removes a
-                                            // replacement's mapping
+        // rung 9c PR-5a (#4221 up-101): pass claim.generation, not just claim.rule_id.
+        // `index_held` alone does NOT stop a stale, retried release from clobbering a
+        // replacement's mapping - it only stops THIS claim object calling erase twice.
+        // A DIFFERENT, older claim's legitimately-retried release (fail_all_claims_locked's
+        // "the next same-key event... retries the release" case) can fire after a
+        // same-rule re-attach has already installed a new mapping for this rule_id; the
+        // generation check inside erase_rule() is what makes that a safe no-op instead of
+        // an erroneous erase of the newer owner's entry. (An earlier version of this
+        // comment claimed index_held alone was sufficient - it was not; see the header
+        // doc comment on SparkKeyRuleIndex::erase_rule.)
+        index_->erase_rule(claim.rule_id, claim.generation); // noexcept; idempotent
     } catch (...) {
         claim_index_release_failures_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1464,11 +1472,17 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // both remove the mapping.
         bool index_added = false;
         GuardianRollback index_add_rollback;
-        index_add_rollback.fn = [this, rule_id, &index_added] {
+        index_add_rollback.fn = [this, rule_id, gen, &index_added] {
             if (index_added)
-                index_->erase_rule(rule_id); // noexcept (adversarial r4 K2/C5): remove_rule's
-                                            // key copy could throw inside ~GuardianRollback,
-                                            // which swallows it and leaves a ghost mapping
+                // rung 9c PR-5a (#4221 up-101): pass `gen` - this rollback only ever
+                // fires within THIS same attach_core() call, before anything else could
+                // have transferred ownership elsewhere, so `gen` is always still the
+                // recorded owner here; passing it keeps this call symmetric with every
+                // other erase_rule() call site now that the parameter is required for
+                // safety elsewhere.
+                index_->erase_rule(rule_id, gen); // noexcept (adversarial r4 K2/C5): remove_rule's
+                                                  // key copy could throw inside ~GuardianRollback,
+                                                  // which swallows it and leaves a ghost mapping
         };
 
         // rung 9c R5.2: a key that already has a claim entry (an arm in flight with
@@ -1482,7 +1496,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         const auto cit = claims_.find(key);
         const bool key_claimed = io_class && cit != claims_.end() && !cit->second.fifo.empty();
 
-        const bool arm_edge = index_->add(key, rule_id); // may throw; index_added still false then
+        const bool arm_edge = index_->add(key, rule_id, gen); // may throw; index_added still false
+                                                              // then. rung 9c PR-5a (#4221 up-101):
+                                                              // `gen` is this attach's own incarnation
+                                                              // token - see erase_rule()'s doc comment.
         index_added = true;
         if (key_claimed || (arm_edge && io_class)) {
             // Claim path: mark and return to the caller below WITHOUT touching
