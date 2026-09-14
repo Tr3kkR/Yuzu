@@ -341,8 +341,16 @@ TEST_CASE("execute_user_query: usage tables are denied to generic tar.sql (#4260
         t.db.execute_user_query("SELECT (SELECT COUNT(*) FROM usage_daily_user)").has_value());
 
     // Positive control: the authorizer isn't wedged shut -- a non-usage
-    // table via its dollar name still works.
-    auto ctrl = t.db.execute_user_query("SELECT COUNT(*) FROM $Process_Live");
+    // table via its dollar name still works. execute_user_query never
+    // translates $-names itself (confirmed against its implementation --
+    // it passes the raw string straight to sqlite3_prepare_v2), so this
+    // query must go through validate_and_translate_sql first, exactly like
+    // the $Usage_Daily denial check above; passing the bare $Process_Live
+    // string here previously hit SQLite's own "near $Process_Live: syntax
+    // error" before the authorizer ever ran.
+    auto ctrl_sql = validate_and_translate_sql("SELECT COUNT(*) FROM $Process_Live");
+    REQUIRE(ctrl_sql.has_value());
+    auto ctrl = t.db.execute_user_query(*ctrl_sql);
     REQUIRE(ctrl.has_value());
     REQUIRE(ctrl->rows.size() == 1);
     CHECK(ctrl->rows[0][0] == "1");
