@@ -291,4 +291,3 @@ TEST_CASE("DismSlot: a release that beats a stale mark_timed_out leaves no aband
     REQUIRE(slot.try_acquire() == DismSlot::Acquire::acquired);
     CHECK(slot.try_acquire() == DismSlot::Acquire::busy);
 }
-
