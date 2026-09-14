@@ -206,12 +206,12 @@ TEST_CASE("DismSlot: acquired, then mark_timed_out with no release, reports aban
     REQUIRE(slot.try_acquire() == DismSlot::Acquire::acquired);
     slot.mark_timed_out();
     CHECK(slot.try_acquire() == DismSlot::Acquire::abandoned);
-    // mark_timed_out() never touches in_use.
-    CHECK(slot.in_use.load());
+    // mark_timed_out() never clears the slot -- it is still in flight.
+    CHECK(slot.in_flight());
 }
 
-TEST_CASE("DismSlot: release after a timed-out acquisition clears both flags -- the next "
-          "try_acquire is `acquired`, and timed_out reads false again",
+TEST_CASE("DismSlot: release after a timed-out acquisition clears the slot -- the next "
+          "try_acquire is `acquired`",
           "[windows_optional_features][dism_slot]") {
     DismSlot slot;
     REQUIRE(slot.try_acquire() == DismSlot::Acquire::acquired);
@@ -219,8 +219,7 @@ TEST_CASE("DismSlot: release after a timed-out acquisition clears both flags -- 
     REQUIRE(slot.try_acquire() == DismSlot::Acquire::abandoned);
 
     slot.release();
-    CHECK_FALSE(slot.in_use.load());
-    CHECK_FALSE(slot.timed_out.load());
+    CHECK_FALSE(slot.in_flight());
     CHECK(slot.try_acquire() == DismSlot::Acquire::acquired);
 }
 
@@ -229,7 +228,30 @@ TEST_CASE("DismSlot: mark_timed_out on a free slot, followed by release, leaves 
     DismSlot slot;
     slot.mark_timed_out();
     slot.release();
-    CHECK_FALSE(slot.in_use.load());
-    CHECK_FALSE(slot.timed_out.load());
+    CHECK_FALSE(slot.in_flight());
     CHECK(slot.try_acquire() == DismSlot::Acquire::acquired);
 }
+
+TEST_CASE("DismSlot: a release that beats a stale mark_timed_out leaves no abandoned residue "
+          "(adversarial review C3, Wave 9 PR9.2) -- a worker finishing right at the dispatching "
+          "thread's deadline must not leave the next acquisition looking abandoned",
+          "[windows_optional_features][dism_slot]") {
+    DismSlot slot;
+    REQUIRE(slot.try_acquire() == DismSlot::Acquire::acquired);
+    // Simulates the exact race: the worker's release() (inside fn(), before
+    // bounded_call_ex's TimedOut/Completed decision is made) wins, and the
+    // dispatching thread's mark_timed_out() call -- already in flight --
+    // lands AFTER it. With two independent bools this used to leave
+    // in_use=false, timed_out=true; the CAS'd single-state design makes
+    // mark_timed_out() a no-op once the slot is no longer Busy.
+    slot.release();
+    slot.mark_timed_out();
+    CHECK_FALSE(slot.in_flight());
+
+    // The next acquisition must be a clean `acquired`, not a stale
+    // `abandoned` -- and a THIRD concurrent caller arriving while that new
+    // call is genuinely in flight must see `busy`, never `abandoned`.
+    REQUIRE(slot.try_acquire() == DismSlot::Acquire::acquired);
+    CHECK(slot.try_acquire() == DismSlot::Acquire::busy);
+}
+
