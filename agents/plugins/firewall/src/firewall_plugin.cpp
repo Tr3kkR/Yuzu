@@ -71,10 +71,16 @@
 #if defined(__linux__)
 #include <yuzu/agent/scoped_fd.hpp>
 
+#include <cerrno>
+#include <cstddef>
+#include <expected>
+#include <linux/netfilter.h>
+#include <linux/netfilter/nf_tables.h>
 #include <linux/netfilter/nfnetlink.h>
 #include <linux/netlink.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -404,6 +410,14 @@ struct FirewalldZoneInfo {
 struct FirewalldQueryResult {
     bool reachable = false; // false -> caller falls through to the next backend
     std::vector<FirewalldZoneInfo> zones;
+    // false whenever the per-zone getServices loop below either hit the
+    // remaining-budget==0 break (some zones never queried at all) or saw any
+    // individual getServices call return rc<0 (that zone's services are a
+    // silent undercount, not a genuine zero) -- a ruleset|<n> count is only
+    // ever emitted from a `true` here (#3462-... completeness-gated count).
+    // Defaults true: the want_rules=false caller never reaches the loop that
+    // would set it false, and has nothing to count anyway.
+    bool services_complete = true;
 };
 
 // NOTE: getActiveZones()'s "a{sa{sas}}" signature (zone -> {"interfaces":
@@ -474,18 +488,31 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
     sd_bus_message_exit_container(reply.m);
 
     // Per-zone getServices, each re-arming against the remaining budget —
-    // bail out (report what we have so far) once it's exhausted.
+    // bail out (report what we have so far) once it's exhausted. Either exit
+    // here (budget exhausted mid-loop) marks the result incomplete: some
+    // zones' services were never queried at all, so a total computed from
+    // `r.zones` would be a silent undercount, not a genuine "no services".
     for (auto& zone : r.zones) {
         const auto budget = remaining_budget();
-        if (budget == 0)
+        if (budget == 0) {
+            r.services_complete = false;
             break;
+        }
         sd_bus_set_method_call_timeout(bus.bus, budget);
 
         SdBusErrorGuard svc_err;
         SdBusMessageGuard svc_reply;
-        if (sd_bus_call_method(bus.bus, kFirewalldDest, kFirewalldPath, kFirewalldZoneIface,
-                               "getServices", &svc_err.err, &svc_reply.m, "s",
-                               zone.name.c_str()) >= 0) {
+        const int svc_rc = sd_bus_call_method(bus.bus, kFirewalldDest, kFirewalldPath,
+                                              kFirewalldZoneIface, "getServices", &svc_err.err,
+                                              &svc_reply.m, "s", zone.name.c_str());
+        if (svc_rc < 0) {
+            // This zone's services could not be read -- the eventual total
+            // is an undercount, not a genuine zero for this zone. Keep
+            // trying the remaining zones (best effort) but the OVERALL
+            // result is no longer trustworthy as a complete count.
+            r.services_complete = false;
+        }
+        if (svc_rc >= 0) {
             // RAII over the raw strv: a manual free() after
             // zone.services.emplace_back() (which can throw std::bad_alloc)
             // leaks the array and its remaining strings on exception --
@@ -518,11 +545,23 @@ FirewalldQueryResult query_firewalld(bool want_rules) {
 }
 
 bool try_firewalld_state(yuzu::CommandContext& ctx) {
-    auto q = query_firewalld(/*want_rules=*/false);
+    // want_rules=true (not the old false): the state action's ruleset|<n>
+    // row needs services actually enumerated -- want_rules=false returns
+    // zero services unconditionally, which would misreport as ruleset|0
+    // rather than the honest ruleset|unknown/real count this row promises.
+    auto q = query_firewalld(/*want_rules=*/true);
     if (!q.reachable)
         return false;
     ctx.write_output("backend|firewalld");
     ctx.write_output("state|running");
+    if (q.services_complete) {
+        std::size_t total = 0;
+        for (const auto& zone : q.zones)
+            total += zone.services.size();
+        ctx.write_output(std::format("ruleset|{}", total));
+    } else {
+        ctx.write_output("ruleset|unknown");
+    }
     return true;
 }
 
@@ -531,11 +570,16 @@ bool try_firewalld_rules(yuzu::CommandContext& ctx) {
     if (!q.reachable)
         return false;
     ctx.write_output("backend|firewalld");
+    std::size_t total = 0;
     for (const auto& zone : q.zones) {
-        for (const auto& svc : zone.services)
+        for (const auto& svc : zone.services) {
             ctx.write_output(
                 std::format("rule|firewalld|{}|service|{}", sanitize_field(zone.name), svc));
+            ++total;
+        }
     }
+    ctx.write_output(q.services_complete ? std::format("ruleset|{}", total)
+                                         : std::string("ruleset|unknown"));
     return true;
 }
 
@@ -586,11 +630,123 @@ constexpr std::uint16_t kNlmFDump = 0x300; // NLM_F_ROOT | NLM_F_MATCH
 
 namespace nft = yuzu::firewall::nft_raw;
 
-/// Opens and binds a NETLINK_NETFILTER socket for one dump round-trip.
-/// Returns an empty (invalid) ScopedFd on any failure — the caller treats
-/// that as "backend unreachable", the same fall-through contract as
-/// query_firewalld's D-Bus-unreachable path above.
-yuzu::agent::ScopedFd open_nft_socket() {
+// ── Linux-only UAPI cross-check (#3464-1) ───────────────────────────────
+//
+// firewall_parsers.hpp's nft_raw namespace hand-transcribes the netlink/
+// nftables wire structs and constants so the pure decode stays compilable
+// and unit-tested on every host, including ones with no Linux UAPI headers
+// at all. That transcription is verified HERE instead -- the one place this
+// file already requires the real kernel headers -- never in the header
+// itself, which must not gain a Linux-only dependency. A failure below means
+// the transcription has drifted from the UAPI on THIS build host.
+static_assert(sizeof(nft::NlMsgHdr) == sizeof(::nlmsghdr));
+static_assert(offsetof(nft::NlMsgHdr, len) == offsetof(::nlmsghdr, nlmsg_len));
+static_assert(offsetof(nft::NlMsgHdr, type) == offsetof(::nlmsghdr, nlmsg_type));
+static_assert(offsetof(nft::NlMsgHdr, flags) == offsetof(::nlmsghdr, nlmsg_flags));
+static_assert(offsetof(nft::NlMsgHdr, seq) == offsetof(::nlmsghdr, nlmsg_seq));
+static_assert(offsetof(nft::NlMsgHdr, pid) == offsetof(::nlmsghdr, nlmsg_pid));
+
+static_assert(sizeof(nft::NfGenMsg) == sizeof(::nfgenmsg));
+static_assert(offsetof(nft::NfGenMsg, family) == offsetof(::nfgenmsg, nfgen_family));
+static_assert(offsetof(nft::NfGenMsg, version) == offsetof(::nfgenmsg, version));
+static_assert(offsetof(nft::NfGenMsg, res_id) == offsetof(::nfgenmsg, res_id));
+
+static_assert(sizeof(nft::NlAttr) == sizeof(::nlattr));
+static_assert(offsetof(nft::NlAttr, len) == offsetof(::nlattr, nla_len));
+static_assert(offsetof(nft::NlAttr, type) == offsetof(::nlattr, nla_type));
+
+// parse_nlmsgerr() decodes an NLMSG_ERROR payload as "the leading 4-byte
+// signed error field" -- never accessing ::nlmsgerr directly, but valid only
+// because the real struct puts `error` first (offset 0) with `msg`
+// immediately after it (offset 4). Pins that implicit layout assumption.
+static_assert(offsetof(::nlmsgerr, error) == 0);
+static_assert(offsetof(::nlmsgerr, msg) == 4);
+
+static_assert(nft::kNlaTypeMask == static_cast<std::uint16_t>(NLA_TYPE_MASK));
+static_assert(nft::kNlaAlignTo == static_cast<std::size_t>(NLA_ALIGNTO));
+static_assert(nft::kNlmsgError == static_cast<std::uint16_t>(NLMSG_ERROR));
+static_assert(nft::kNlmsgDone == static_cast<std::uint16_t>(NLMSG_DONE));
+static_assert(nft::kNlmFDumpIntr == static_cast<std::uint16_t>(NLM_F_DUMP_INTR));
+
+static_assert(nft::kNfnlSubsysNftables == static_cast<std::uint8_t>(NFNL_SUBSYS_NFTABLES));
+static_assert(nft::kNftMsgGettable == static_cast<std::uint16_t>(NFT_MSG_GETTABLE));
+static_assert(nft::kNftMsgGetchain == static_cast<std::uint16_t>(NFT_MSG_GETCHAIN));
+static_assert(nft::kNftMsgGetrule == static_cast<std::uint16_t>(NFT_MSG_GETRULE));
+static_assert(nft::kNftMsgNewtable == static_cast<std::uint16_t>(NFT_MSG_NEWTABLE));
+static_assert(nft::kNftMsgNewchain == static_cast<std::uint16_t>(NFT_MSG_NEWCHAIN));
+static_assert(nft::kNftMsgNewrule == static_cast<std::uint16_t>(NFT_MSG_NEWRULE));
+
+static_assert(nft::kNfprotoUnspec == static_cast<std::uint8_t>(NFPROTO_UNSPEC));
+static_assert(nft::kNfprotoInet == static_cast<std::uint8_t>(NFPROTO_INET));
+static_assert(nft::kNfprotoIpv4 == static_cast<std::uint8_t>(NFPROTO_IPV4));
+static_assert(nft::kNfprotoArp == static_cast<std::uint8_t>(NFPROTO_ARP));
+static_assert(nft::kNfprotoNetdev == static_cast<std::uint8_t>(NFPROTO_NETDEV));
+static_assert(nft::kNfprotoBridge == static_cast<std::uint8_t>(NFPROTO_BRIDGE));
+static_assert(nft::kNfprotoIpv6 == static_cast<std::uint8_t>(NFPROTO_IPV6));
+
+static_assert(nft::kNftaTableName == static_cast<std::uint16_t>(NFTA_TABLE_NAME));
+static_assert(nft::kNftaChainTable == static_cast<std::uint16_t>(NFTA_CHAIN_TABLE));
+static_assert(nft::kNftaChainName == static_cast<std::uint16_t>(NFTA_CHAIN_NAME));
+static_assert(nft::kNftaChainHook == static_cast<std::uint16_t>(NFTA_CHAIN_HOOK));
+static_assert(nft::kNftaChainPolicy == static_cast<std::uint16_t>(NFTA_CHAIN_POLICY));
+static_assert(nft::kNftaHookHooknum == static_cast<std::uint16_t>(NFTA_HOOK_HOOKNUM));
+static_assert(nft::kNftaRuleTable == static_cast<std::uint16_t>(NFTA_RULE_TABLE));
+static_assert(nft::kNftaRuleChain == static_cast<std::uint16_t>(NFTA_RULE_CHAIN));
+static_assert(nft::kNftaRuleHandle == static_cast<std::uint16_t>(NFTA_RULE_HANDLE));
+
+// Base-chain policy values are the generic netfilter verdicts (NF_DROP/
+// NF_ACCEPT from <linux/netfilter.h>), not an nftables-specific enum.
+static_assert(nft::kNftPolicyDrop == static_cast<std::uint32_t>(NF_DROP));
+static_assert(nft::kNftPolicyAccept == static_cast<std::uint32_t>(NF_ACCEPT));
+
+// The two request flags this file constructs by hand (above, :584-585) are
+// transcribed constants too.
+static_assert(kNlmFRequest == static_cast<std::uint16_t>(NLM_F_REQUEST));
+static_assert(kNlmFDump == static_cast<std::uint16_t>(NLM_F_DUMP));
+
+/// Whether a subprocess-backed acquisition genuinely completed: only under
+/// this gate may a backend report a real ruleset|<n> count — anything short
+/// (didn't run, nonzero exit, killed by the deadline, or output clipped) must
+/// report ruleset|unknown instead of a fabricated/undercounted number.
+[[nodiscard]] bool subprocess_complete(const yuzu::agent::SubprocessResult& res) noexcept {
+    return res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated;
+}
+
+/// Remaining time until `deadline`, clamped to zero (never negative).
+[[nodiscard]] std::chrono::milliseconds
+remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline)
+        return std::chrono::milliseconds{0};
+    return std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+}
+
+/// How an open_nft_socket() failure should be handled by the caller.
+enum class OpenNftErrClass {
+    fd_exhausted, // EMFILE/ENFILE -- a system-wide condition worth surfacing
+    unsupported,  // EPROTONOSUPPORT/EAFNOSUPPORT -- this kernel has no
+                  // NETLINK_NETFILTER at all; not worth a diagnostic row
+    other,
+};
+
+[[nodiscard]] OpenNftErrClass classify_open_errno(int err) noexcept {
+    if (err == EMFILE || err == ENFILE)
+        return OpenNftErrClass::fd_exhausted;
+    if (err == EPROTONOSUPPORT || err == EAFNOSUPPORT)
+        return OpenNftErrClass::unsupported;
+    return OpenNftErrClass::other;
+}
+
+/// Opens and binds a NETLINK_NETFILTER socket for one dump round-trip, with
+/// SO_SNDTIMEO bounding the request send() to `send_budget` -- this socket
+/// only ever sends one small fixed-size dump request, but an unbounded send()
+/// could still stall the command-execution thread past this dump's own
+/// deadline if the netlink layer were ever throttled/wedged. Returns the
+/// errno on any failure (std::unexpected) rather than an empty ScopedFd, so
+/// the caller can classify_open_errno() it (#3462-1, #3462-4) -- EPERM on
+/// bind is not special-cased; every errno propagates identically.
+[[nodiscard]] std::expected<yuzu::agent::ScopedFd, int>
+open_nft_socket(std::chrono::milliseconds send_budget) {
     // Own the fd in a ScopedFd from creation, same discipline as
     // tar_netqual_nstat.cpp's nstat socket open: every early return below
     // closes it automatically via the destructor, so no call site here
@@ -598,26 +754,46 @@ yuzu::agent::ScopedFd open_nft_socket() {
     // socket() and the bind check.
     yuzu::agent::ScopedFd sock(::socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_NETFILTER));
     if (!sock)
-        return {};
+        return std::unexpected(errno);
+
+    struct timeval tv {};
+    if (send_budget.count() <= 0) {
+        // 0/0 means "no timeout" (block forever) on Linux, the opposite of
+        // what an already-exhausted budget should do -- use the smallest
+        // nonzero bound instead so a send() here still fails fast.
+        tv.tv_usec = 1;
+    } else {
+        tv.tv_sec = send_budget.count() / 1000;
+        tv.tv_usec = (send_budget.count() % 1000) * 1000;
+    }
+    ::setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
     sockaddr_nl addr{};
     addr.nl_family = AF_NETLINK;
     if (::bind(sock.get(), reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0)
-        return {};
+        return std::unexpected(errno);
     return sock;
 }
 
+constexpr std::size_t kNftRecvBufSize = 64 * 1024;
+
 /// One bounded NLM_F_DUMP request/response round-trip for `msg_type`
 /// (NFT_MSG_GETTABLE/GETCHAIN/GETRULE). Accumulates raw reply bytes into
-/// `out`; returns false on any send/poll/recv failure, a kernel
-/// NLMSG_ERROR, or the deadline elapsing — false means "nothing trustworthy
-/// was read", never a partial-success fabrication (mirrors
-/// try_firewalld_state's reachable=false contract).
-bool nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
-              std::chrono::steady_clock::time_point deadline) {
+/// `out`. PARTIALLY modeled on network_config_plugin.cpp's fetch_link_dump
+/// (grounding-corrected: that function checks only rsa.nl_pid!=0, with no
+/// msg_namelen/nl_family check and no size-budget check at all -- only the
+/// nl_pid check and the foreign-before-truncation ordering are shared
+/// precedent; the namelen/family sub-check and the oversized step are new).
+[[nodiscard]] yuzu::firewall::NftDumpResult
+nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
+         std::chrono::steady_clock::time_point deadline) {
+    using yuzu::firewall::NftDumpResult;
+    using yuzu::firewall::NftDumpStatus;
+
     alignas(4) unsigned char req[sizeof(nft::NlMsgHdr) + sizeof(nft::NfGenMsg)];
     nft::NlMsgHdr h{};
     h.len = sizeof(req);
-    h.type = static_cast<std::uint16_t>((nft::kNfnlSubsysNftables << 8) | msg_type);
+    h.type = nft::nft_msg_type(msg_type);
     h.flags = kNlmFRequest | kNlmFDump;
     h.seq = 1;
     h.pid = 0;
@@ -629,148 +805,232 @@ bool nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
     std::memcpy(req + sizeof(h), &g, sizeof(g));
 
     // Same bounded-deadline contract as the poll loop below: when this is the
-    // second or third dump on a shared per-call deadline (try_nftables_state/
-    // rules pass one `deadline` to all of GETTABLE/GETCHAIN/GETRULE), an
-    // earlier dump can already have consumed the whole budget -- sending a
-    // request whose reply has no chance of being read before the poll loop's
-    // own `now >= deadline` check triggers is wasted kernel-side work for no
-    // benefit (adversarial-review gate-2 finding, unverified/uncompiled).
+    // second or third dump on a shared per-call deadline, an earlier dump can
+    // already have consumed the whole budget -- sending a request whose
+    // reply has no chance of being read before the loop's own deadline check
+    // triggers is wasted kernel-side work for no benefit.
     if (std::chrono::steady_clock::now() >= deadline)
-        return false;
+        return {NftDumpStatus::timeout, 0};
 
-    if (::send(fd, req, sizeof(req), 0) != static_cast<ssize_t>(sizeof(req)))
-        return false;
+    ssize_t sent;
+    do {
+        sent = ::send(fd, req, sizeof(req), 0);
+    } while (sent < 0 && errno == EINTR);
+    if (sent != static_cast<ssize_t>(sizeof(req)))
+        return {}; // io_error (NftDumpResult's default status)
+
+    std::vector<std::byte> recv_buf(kNftRecvBufSize);
+    int foreign_datagrams = 0;
+    std::size_t parsed_off = 0; // how much of `out` earlier iterations already walked
 
     for (;;) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= deadline)
-            return false;
-        const auto remaining_ms =
+            return {NftDumpStatus::timeout, 0};
+        const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
         pollfd pfd{.fd = fd, .events = POLLIN, .revents = 0};
-        if (::poll(&pfd, 1, static_cast<int>(remaining_ms)) <= 0)
-            return false; // timeout or error -- bounded, never blocks past deadline
-        std::byte buf[8192];
-        const ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+        const int pr = ::poll(&pfd, 1, static_cast<int>(remaining));
+        if (pr == 0)
+            return {NftDumpStatus::timeout, 0};
+        if (pr < 0) {
+            if (errno == EINTR)
+                continue;
+            return {}; // io_error
+        }
+
+        sockaddr_nl rsa{};
+        iovec riov{recv_buf.data(), recv_buf.size()};
+        msghdr rm{};
+        rm.msg_name = &rsa;
+        rm.msg_namelen = sizeof(rsa);
+        rm.msg_iov = &riov;
+        rm.msg_iovlen = 1;
+        ssize_t n;
+        do {
+            // MSG_TRUNC is read from msg_flags below, never passed as a flag
+            // here (C2's other, non-negotiable half of the contract).
+            n = ::recvmsg(fd, &rm, 0);
+        } while (n < 0 && errno == EINTR);
         if (n <= 0)
-            return false;
-        out.insert(out.end(), buf, buf + n);
-        // A dump may span several recv()s -- inspect what's accumulated so
-        // far after each read rather than assuming one recv() == the whole
-        // reply.
-        for (const auto& m : nft::split_nlmsgs(out)) {
+            return {}; // io_error
+
+        // (1) Sender verification is recvmsg's own msg_name ONLY (C2) --
+        // nlmsghdr.pid is attacker-controlled payload, never a trust signal.
+        // Netlink unicast between USER sockets is permitted, so a reply
+        // arriving here is not necessarily from the kernel; only portid 0
+        // is. Bounded discard (count, mirroring network_config_plugin.cpp's
+        // fetch_link_dump): an unbounded `continue` would let a local
+        // process pin this thread indefinitely by keeping the socket busy.
+        // kAcqDeadline (not kNetlinkDiscardDeadline -- that constant belongs
+        // to the rtnetlink leg, not this one) already bounds the whole loop,
+        // so the count is the only extra bound this leg needs.
+        if (rm.msg_namelen < sizeof(rsa) || rsa.nl_family != AF_NETLINK || rsa.nl_pid != 0) {
+            if (++foreign_datagrams > yuzu::firewall::kNftMaxForeignDatagrams)
+                return {NftDumpStatus::foreign_flood, 0};
+            continue; // not from the kernel -- discard, do not parse
+        }
+
+        // (2) MSG_TRUNC means the kernel discarded this datagram's tail
+        // because it exceeded recv_buf -- checked before any size/parse
+        // accounting, same precedent as fetch_link_dump.
+        if ((rm.msg_flags & MSG_TRUNC) != 0)
+            return {NftDumpStatus::truncated, 0};
+
+        // (3) Oversized check runs on the ACCUMULATED total before this
+        // datagram is appended, so an oversized dump is reported as exactly
+        // that rather than surfacing as a much-later truncated/timeout.
+        if (out.size() + static_cast<std::size_t>(n) > yuzu::firewall::kNftDumpMaxBytes)
+            return {NftDumpStatus::oversized, 0};
+
+        // (4) Append and split ONLY the newly-arrived bytes: parsed_off
+        // tracks how much of `out` earlier iterations already walked, so
+        // this call is O(new bytes) per recv instead of re-walking the
+        // whole accumulated buffer every time (was O(n^2) over the dump's
+        // life at old :661).
+        out.insert(out.end(), recv_buf.data(), recv_buf.data() + n);
+        const auto new_msgs =
+            nft::split_nlmsgs(std::span<const std::byte>(out).subspan(parsed_off));
+        std::size_t consumed = 0;
+        for (const auto& m : new_msgs) {
+            consumed += (m.hdr.len + (nft::kNlaAlignTo - 1)) & ~(nft::kNlaAlignTo - 1);
             if (m.hdr.type == nft::kNlmsgDone) {
                 // A concurrent ruleset mutation mid-dump tears the reply --
                 // the kernel flags that on the terminating DONE rather than
                 // failing the dump outright, so an unchecked DONE would
                 // accept a torn/inconsistent read as if it were complete.
                 if ((m.hdr.flags & nft::kNlmFDumpIntr) != 0)
-                    return false;
-                return true;
+                    return {}; // io_error -- torn dump, never trusted
+                // A completed-but-errored dump is NOT trusted either (R9): a
+                // nonzero dump_done_errno means the kernel gave up partway
+                // through, even though it still sent a terminating DONE.
+                const auto done_errno = nft::parse_nft_done_errno(m.payload);
+                if (done_errno && *done_errno != 0)
+                    return {NftDumpStatus::kernel_error, *done_errno};
+                // nullopt (bare pre-v4.13 DONE) or an explicit zero errno
+                // both mean a clean, complete dump.
+                return {NftDumpStatus::ok, 0};
             }
-            if (m.hdr.type == nft::kNlmsgError)
-                return false;
+            if (m.hdr.type == nft::kNlmsgError) {
+                const auto err = nft::parse_nlmsgerr(m.payload);
+                return {NftDumpStatus::kernel_error, err.value_or(0)};
+            }
         }
+        parsed_off += consumed;
     }
 }
 
-bool try_nftables_state(yuzu::CommandContext& ctx) {
-    const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
+/// Bookkeeping try_nftables_state/rules hand back to their caller when
+/// nftables itself could not settle the answer (C4): `tables_seen` says
+/// whether GETTABLE at least succeeded (so *something* is managing this
+/// ruleset even if chain/rule content couldn't be trusted), and `dump`/
+/// `result` identify which follow-up dump failed and how, for the catch-all
+/// nft_diag_row() if no downstream backend answers either.
+struct NftFallthroughInfo {
+    bool tables_seen = false;
+    std::string_view dump; // "chain" or "rule"
+    yuzu::firewall::NftDumpResult result;
+};
 
-    // Each dump gets its OWN socket rather than sharing one across
-    // GETTABLE/GETCHAIN/GETRULE (adversarial-review/governance gate-3
-    // finding UP-1, unverified/uncompiled until this branch's Linux
-    // container check): a dump abandoned mid-recv (deadline hit after
-    // partial bytes already arrived) can leave undrained bytes sitting in
-    // the socket buffer, and nft_dump has no seq/pid check to reject them
-    // -- a later dump on the SAME fd could then consume those stale bytes
-    // first and report fabricated content instead of the honest `unknown`
-    // this function exists to guarantee. A fresh fd per dump removes the
-    // shared-buffer assumption entirely rather than trying to correctly
-    // drain an abandoned read.
-    auto table_sock = open_nft_socket();
-    if (!table_sock)
-        return false;
-    std::vector<std::byte> table_buf;
-    if (!nft_dump(table_sock.get(), nft::kNftMsgGettable, table_buf, deadline))
-        return false; // backend unreachable -- fall through to ufw/iptables
-    table_sock.reset();
-
-    auto chain_sock = open_nft_socket();
+/// Runs the shared GETTABLE -> GETCHAIN -> GETRULE probe (table/chain/rule
+/// deadlines split 1000ms/1500ms/remainder within kAcqDeadline's unchanged
+/// 5000ms envelope (C6) — a fresh socket per dump, per UP-1 above). Returns
+/// nullopt if GETTABLE itself did not succeed (nftables entirely
+/// unreachable — info.tables_seen stays false, caller falls through
+/// untouched); otherwise returns the chain/rule buffers alongside whether
+/// both were trustworthy, having already populated `info.tables_seen` and,
+/// on a chain/rule failure, written the fallthrough row and the rest of
+/// `info`.
+struct NftProbeResult {
+    bool trusted = false;
     std::vector<std::byte> chain_buf;
-    const bool chains_ok =
-        chain_sock && nft_dump(chain_sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
-    chain_sock.reset();
-
-    auto rule_sock = open_nft_socket();
     std::vector<std::byte> rule_buf;
-    const bool rules_ok =
-        rule_sock && nft_dump(rule_sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
+};
 
-    ctx.write_output("backend|nftables");
-    // Content is only trusted when BOTH follow-up dumps succeeded -- a
-    // partial read (e.g. the rule dump alone failing) must not bias toward
-    // either "active" or "inactive"; report unknown, same honest-status
-    // invariant as try_iptables_state's nonzero-exit path.
-    if (!chains_ok || !rules_ok) {
-        ctx.write_output("state|unknown");
-        return true;
+[[nodiscard]] std::optional<NftProbeResult> run_nft_probe(yuzu::CommandContext& ctx,
+                                                          NftFallthroughInfo& info) {
+    const auto start = std::chrono::steady_clock::now();
+    const auto table_deadline = start + std::chrono::milliseconds{1000};
+    const auto chain_deadline = start + std::chrono::milliseconds{2500};
+    const auto rule_deadline = start + kAcqDeadline; // remainder(>=2500ms)+slack
+
+    auto table_sock = open_nft_socket(remaining_ms(table_deadline));
+    if (!table_sock) {
+        if (classify_open_errno(table_sock.error()) == OpenNftErrClass::fd_exhausted)
+            ctx.write_output("error|fd_exhausted");
+        return std::nullopt; // unreachable -- fall through untouched
     }
-    auto chains = yuzu::firewall::parse_nft_chains(chain_buf);
-    auto rules = yuzu::firewall::parse_nft_rules(rule_buf);
+    std::vector<std::byte> table_buf;
+    const auto table_res =
+        nft_dump(table_sock->get(), nft::kNftMsgGettable, table_buf, table_deadline);
+    table_sock->reset(); // UP-1: fresh fd per dump, no undrained-leftover-bytes risk
+    if (table_res.status != yuzu::firewall::NftDumpStatus::ok)
+        return std::nullopt; // unreachable -- fall through untouched
+
+    info.tables_seen = !yuzu::firewall::parse_nft_tables(table_buf).empty();
+
+    NftProbeResult result;
+    auto chain_sock = open_nft_socket(remaining_ms(chain_deadline));
+    const auto chain_res = chain_sock ? nft_dump(chain_sock->get(), nft::kNftMsgGetchain,
+                                                 result.chain_buf, chain_deadline)
+                                      : yuzu::firewall::NftDumpResult{};
+    if (chain_sock)
+        chain_sock->reset();
+
+    auto rule_sock = open_nft_socket(remaining_ms(rule_deadline));
+    const auto rule_res = rule_sock ? nft_dump(rule_sock->get(), nft::kNftMsgGetrule,
+                                               result.rule_buf, rule_deadline)
+                                    : yuzu::firewall::NftDumpResult{};
+
+    const bool chains_ok = chain_res.status == yuzu::firewall::NftDumpStatus::ok;
+    const bool rules_ok = rule_res.status == yuzu::firewall::NftDumpStatus::ok;
+    result.trusted = chains_ok && rules_ok;
+    if (!result.trusted) {
+        info.dump = chains_ok ? "rule" : "chain";
+        info.result = chains_ok ? rule_res : chain_res;
+        ctx.write_output(yuzu::firewall::nft_fallthrough_row(info.dump, info.result));
+    }
+    return result;
+}
+
+/// true iff a trustworthy state| row was written (dispatch should stop);
+/// false means the caller continues probing ufw/iptables, clamped per
+/// `info.tables_seen` (C4).
+bool try_nftables_state(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
+    auto probe = run_nft_probe(ctx, info);
+    if (!probe)
+        return false;
+    if (!probe->trusted)
+        return false; // C4 fallthrough row already written by run_nft_probe
+
+    auto chains = yuzu::firewall::parse_nft_chains(probe->chain_buf);
+    auto rules = yuzu::firewall::parse_nft_rules(probe->rule_buf);
+    ctx.write_output("backend|nftables"); // commits: nftables IS the final answer
     ctx.write_output(std::format(
         "state|{}", yuzu::firewall::nft_has_content(chains, rules) ? "active" : "inactive"));
+    ctx.write_output(std::format("ruleset|{}", rules.size()));
     return true;
 }
 
-bool try_nftables_rules(yuzu::CommandContext& ctx) {
-    const auto deadline = std::chrono::steady_clock::now() + kAcqDeadline;
-
-    // See try_nftables_state's comment on UP-1: a fresh socket per dump
-    // (rather than one shared across GETTABLE/GETCHAIN/GETRULE) removes the
-    // undrained-leftover-bytes class entirely.
-    auto table_sock = open_nft_socket();
-    if (!table_sock)
+/// Same contract as try_nftables_state, for the "rules" action.
+bool try_nftables_rules(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
+    auto probe = run_nft_probe(ctx, info);
+    if (!probe)
         return false;
-    std::vector<std::byte> table_buf;
-    if (!nft_dump(table_sock.get(), nft::kNftMsgGettable, table_buf, deadline))
-        return false; // backend unreachable -- fall through to ufw/iptables
-    table_sock.reset();
+    if (!probe->trusted)
+        return false;
 
-    // Reachable even with zero tables -- report that honestly rather than
-    // falling through, matching try_firewalld_rules's shape (an empty
-    // active-zone list still reports backend|firewalld with no rule rows).
-    ctx.write_output("backend|nftables");
+    ctx.write_output("backend|nftables"); // commits
 
-    auto chain_sock = open_nft_socket();
-    std::vector<std::byte> chain_buf;
-    const bool chains_ok =
-        chain_sock && nft_dump(chain_sock.get(), nft::kNftMsgGetchain, chain_buf, deadline);
-    chain_sock.reset();
-
-    auto rule_sock = open_nft_socket();
-    std::vector<std::byte> rule_buf;
-    const bool rules_ok =
-        rule_sock && nft_dump(rule_sock.get(), nft::kNftMsgGetrule, rule_buf, deadline);
-
-    // Content is only trusted when BOTH dumps succeeded -- a partial read
-    // (e.g. the rule dump alone failing) must not be reported as "these are
-    // all the rules there are". Same honest-unknown invariant as
-    // try_nftables_state and try_iptables_rules's nonzero-exit path.
-    if (!chains_ok || !rules_ok) {
-        ctx.write_output("rules|unknown");
-        return true;
-    }
-
-    for (const auto& c : yuzu::firewall::parse_nft_chains(chain_buf)) {
+    for (const auto& c : yuzu::firewall::parse_nft_chains(probe->chain_buf)) {
         if (!c.is_base_chain)
             continue; // regular chains carry no hook/policy of their own
         ctx.write_output(yuzu::firewall::format_nft_chain_rule_row(c));
     }
-
-    for (const auto& r : yuzu::firewall::parse_nft_rules(rule_buf)) {
+    const auto rules = yuzu::firewall::parse_nft_rules(probe->rule_buf);
+    for (const auto& r : rules)
         ctx.write_output(yuzu::firewall::format_nft_rule_handle_row(r));
-    }
+    ctx.write_output(std::format("ruleset|{}", rules.size()));
     return true;
 }
 
@@ -780,8 +1040,13 @@ bool try_nftables_rules(yuzu::CommandContext& ctx) {
 // site in this file — a distro that installs ufw elsewhere falls through to
 // iptables, same as ufw being genuinely absent.
 
-bool try_ufw_state(yuzu::CommandContext& ctx) {
-    auto res = run_bounded_subprocess({"/usr/sbin/ufw", "status"},
+// `tables_seen` (true only when reached via nftables' C4 fallthrough, false
+// on the ordinary probe-order path where it's always a no-op) routes this
+// backend's own verdict through nft_fallthrough_clamp() before it's written,
+// so a "disabled" reading here can't contradict nftables tables already
+// known to exist.
+bool try_ufw_state(yuzu::CommandContext& ctx, bool tables_seen) {
+    auto res = run_bounded_subprocess({"/usr/sbin/ufw", "status", "numbered"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
     if (!res.tool_ran)
         return false; // ufw not installed at this path -> try the next backend
@@ -793,11 +1058,19 @@ bool try_ufw_state(yuzu::CommandContext& ctx) {
     if (res.exit_code != 0)
         return false;
     ctx.write_output("backend|ufw");
-    auto state = yuzu::firewall::parse_ufw_status(res.output);
+    // `status numbered` (not bare `status`): parse_ufw_status still reads
+    // the "Status: active/inactive" first line -- `numbered` also emits it
+    // -- and parse_ufw_rules can now count the bracketed rows from the same
+    // single command, no extra process and no extra time off the 5s budget.
+    auto state =
+        yuzu::firewall::nft_fallthrough_clamp(tables_seen, yuzu::firewall::parse_ufw_status(res.output));
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"
                                                                   : "unknown"));
+    ctx.write_output(subprocess_complete(res)
+                          ? std::format("ruleset|{}", yuzu::firewall::parse_ufw_rules(res.output).size())
+                          : std::string("ruleset|unknown"));
     return true;
 }
 
@@ -811,17 +1084,20 @@ bool try_ufw_rules(yuzu::CommandContext& ctx) {
     if (res.exit_code != 0)
         return false;
     ctx.write_output("backend|ufw");
-    for (const auto& r : yuzu::firewall::parse_ufw_rules(res.output)) {
+    auto rules = yuzu::firewall::parse_ufw_rules(res.output);
+    for (const auto& r : rules) {
         ctx.write_output(std::format("rule|{}|{}|{}|{}", sanitize_field(r.index),
                                      sanitize_field(r.to), sanitize_field(r.action),
                                      sanitize_field(r.from)));
     }
+    ctx.write_output(subprocess_complete(res) ? std::format("ruleset|{}", rules.size())
+                                              : std::string("ruleset|unknown"));
     return true;
 }
 
 // ── iptables (rung 2, argv) — the final backend before "none" ──────────
 
-bool try_iptables_state(yuzu::CommandContext& ctx) {
+bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
     auto res = run_bounded_subprocess({"/usr/sbin/iptables", "-S"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
     if (!res.tool_ran)
@@ -833,6 +1109,7 @@ bool try_iptables_state(yuzu::CommandContext& ctx) {
     // honest unknown, never a false-safe "inactive" from empty output.
     if (res.exit_code != 0) {
         ctx.write_output("state|unknown");
+        ctx.write_output("ruleset|unknown");
         return true;
     }
     auto rules = yuzu::firewall::parse_iptables_save(res.output);
@@ -841,6 +1118,7 @@ bool try_iptables_state(yuzu::CommandContext& ctx) {
     // "active"; three bare ACCEPT policies and nothing else is "inactive" —
     // matches this leg's pre-migration semantics.
     bool has_content = false;
+    int append_count = 0;
     for (const auto& r : rules) {
         if (r.type == yuzu::firewall::IptablesEntryType::policy) {
             if (r.spec != "ACCEPT")
@@ -848,8 +1126,18 @@ bool try_iptables_state(yuzu::CommandContext& ctx) {
         } else {
             has_content = true;
         }
+        if (r.type == yuzu::firewall::IptablesEntryType::append)
+            ++append_count;
     }
-    ctx.write_output(std::format("state|{}", has_content ? "active" : "inactive"));
+    auto state = yuzu::firewall::nft_fallthrough_clamp(
+        tables_seen,
+        has_content ? yuzu::firewall::FwState::enabled : yuzu::firewall::FwState::disabled);
+    ctx.write_output(std::format(
+        "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
+                    : state == yuzu::firewall::FwState::disabled ? "inactive"
+                                                                  : "unknown"));
+    ctx.write_output(subprocess_complete(res) ? std::format("ruleset|{}", append_count)
+                                              : std::string("ruleset|unknown"));
     return true;
 }
 
@@ -864,8 +1152,10 @@ bool try_iptables_rules(yuzu::CommandContext& ctx) {
     // unknown, never a false-safe empty rule set from unparsed empty output.
     if (res.exit_code != 0) {
         ctx.write_output("rules|unknown");
+        ctx.write_output("ruleset|unknown");
         return true;
     }
+    int append_count = 0;
     for (const auto& r : yuzu::firewall::parse_iptables_save(res.output)) {
         const char* type_s = r.type == yuzu::firewall::IptablesEntryType::policy      ? "policy"
                              : r.type == yuzu::firewall::IptablesEntryType::new_chain ? "new_chain"
@@ -873,8 +1163,79 @@ bool try_iptables_rules(yuzu::CommandContext& ctx) {
                                                                                        : "unknown";
         ctx.write_output(std::format("rule|{}|{}|{}", type_s, sanitize_field(r.chain),
                                      sanitize_field(r.spec)));
+        if (r.type == yuzu::firewall::IptablesEntryType::append)
+            ++append_count;
     }
+    ctx.write_output(subprocess_complete(res) ? std::format("ruleset|{}", append_count)
+                                              : std::string("ruleset|unknown"));
     return true;
+}
+
+// ── Linux dispatch (C4-aware) ───────────────────────────────────────────
+//
+// Not a simple `!try_a() && !try_b() && ...` chain any more: the nftables
+// leg's C4 fallthrough needs to thread `tables_seen` into ufw/iptables (to
+// clamp their verdict) and needs its own diagnostic row if NEITHER of them
+// answers either — bookkeeping a boolean chain can't carry.
+
+void do_state_linux(yuzu::CommandContext& ctx) {
+    if (try_firewalld_state(ctx))
+        return;
+
+    NftFallthroughInfo info;
+    if (try_nftables_state(ctx, info))
+        return;
+
+    if (info.tables_seen) {
+        // GETTABLE succeeded (something IS managing nftables here) but the
+        // chain/rule content couldn't be trusted -- a fallthrough row was
+        // already written by try_nftables_state. Probe ufw/iptables next,
+        // clamped so neither can report a confident "disabled" that
+        // contradicts the tables just seen.
+        if (try_ufw_state(ctx, /*tables_seen=*/true))
+            return;
+        if (try_iptables_state(ctx, /*tables_seen=*/true))
+            return;
+        // Nothing downstream answered either -- end at nftables' own
+        // unknown (not backend|none: nftables DID answer, just not
+        // trustworthily) plus the diagnostic for which dump failed.
+        ctx.write_output("backend|nftables");
+        ctx.write_output("state|unknown");
+        ctx.write_output(yuzu::firewall::nft_diag_row(info.dump, info.result));
+        return;
+    }
+
+    // nftables was entirely unreachable (GETTABLE itself never succeeded) --
+    // fall through exactly as before the C4 restructure, no clamp applies.
+    if (try_ufw_state(ctx, /*tables_seen=*/false))
+        return;
+    if (try_iptables_state(ctx, /*tables_seen=*/false))
+        return;
+    ctx.write_output("backend|none");
+    ctx.write_output("state|unknown");
+}
+
+void do_rules_linux(yuzu::CommandContext& ctx) {
+    if (try_firewalld_rules(ctx))
+        return;
+
+    NftFallthroughInfo info;
+    if (try_nftables_rules(ctx, info))
+        return;
+
+    if (try_ufw_rules(ctx))
+        return;
+    if (try_iptables_rules(ctx))
+        return;
+
+    if (info.tables_seen) {
+        ctx.write_output("backend|nftables");
+        ctx.write_output("rules|unknown");
+        ctx.write_output(yuzu::firewall::nft_diag_row(info.dump, info.result));
+        return;
+    }
+    ctx.write_output("backend|none");
+    ctx.write_output("rules|unknown");
 }
 
 #endif // platform dispatch
@@ -920,7 +1281,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class FirewallPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "firewall"; }
-    std::string_view version() const noexcept override { return "0.4.0"; }
+    std::string_view version() const noexcept override { return "0.4.1"; }
     std::string_view description() const noexcept override {
         return "Firewall status and rule listing";
     }
@@ -947,20 +1308,11 @@ public:
 #ifdef _WIN32
             do_state_windows(ctx);
 #elif defined(__linux__)
-            if (!try_firewalld_state(ctx) && !try_nftables_state(ctx) && !try_ufw_state(ctx) &&
-                !try_iptables_state(ctx)) {
-                // Every backend was unreachable/absent -- we could not
-                // determine anything, so the honest answer is unknown,
-                // never a false-safe "inactive" (this file's own
-                // never-fabricate invariant, governance Gate 4 unhappy-path
-                // finding UP-9: an nftables-only host with no ufw/iptables
-                // binaries would otherwise report a genuinely-active
-                // firewall as inactive -- pre-existing, byte-identical to
-                // the pre-migration fallback, fixed here while already in
-                // this exact function).
-                ctx.write_output("backend|none");
-                ctx.write_output("state|unknown");
-            }
+            // Every-backend-unreachable and nftables-C4-dead-end honest-
+            // unknown fallbacks live in do_state_linux() itself now (the
+            // C4 clamp needs to thread tables_seen through ufw/iptables,
+            // which a flat `!a() && !b() && ...` chain can't carry).
+            do_state_linux(ctx);
 #elif defined(__APPLE__)
             do_state_macos(ctx);
 #endif
@@ -971,10 +1323,7 @@ public:
 #ifdef _WIN32
             do_rules_windows(ctx);
 #elif defined(__linux__)
-            if (!try_firewalld_rules(ctx) && !try_nftables_rules(ctx) && !try_ufw_rules(ctx) &&
-                !try_iptables_rules(ctx)) {
-                ctx.write_output("backend|none");
-            }
+            do_rules_linux(ctx);
 #elif defined(__APPLE__)
             do_rules_macos(ctx);
 #endif
