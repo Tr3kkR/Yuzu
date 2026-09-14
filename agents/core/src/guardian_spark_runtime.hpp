@@ -527,7 +527,18 @@ public:
     /// rung 9c R5.2: disarm claims the executor refused at admission (capacity, key,
     /// ceiling, launch) and that were RETAINED at the head of their key entry rather
     /// than dropped (the #3415 gap, now counted); each is re-driven by the next
-    /// same-key event. Lock-free.
+    /// same-key event.
+    ///
+    /// up-5 (#4221, rung 9c PR-5b): the number CURRENTLY retained - i.e. awaiting a
+    /// redrive and not yet finally resolved. Was a monotonic, cumulative-since-boot
+    /// event counter before this PR (correction recorded on issue #4221's own
+    /// comment thread: a monotonic counter cannot answer "is anything stuck right
+    /// now"); now a real lifecycle count, decremented on this same claim's own
+    /// successful completion or any other terminal removal (Stopped-drop,
+    /// DeadSubscription shortcut) - see mark_retained_locked()/clear_retained_
+    /// locked(). A repeated refusal on the SAME already-retained claim
+    /// (KeyClaim::retained_counted) never inflates this past 1 for that claim.
+    /// Lock-free read.
     [[nodiscard]] std::uint64_t disarm_retained() const noexcept {
         return disarm_retained_.load(std::memory_order_relaxed);
     }
@@ -535,6 +546,20 @@ public:
     /// disarm claims the executor refused with Stopped. Lock-free.
     [[nodiscard]] std::uint64_t claims_dropped_at_stop() const noexcept {
         return claims_dropped_at_stop_.load(std::memory_order_relaxed);
+    }
+    /// up-3 (#4221): an arm was refused admission because its compensating-disarm
+    /// reservation pool was exhausted (compensation_reserved_count_ at capacity for
+    /// its IoClass) - the arm never dispatched, no backend call ran. Lock-free.
+    [[nodiscard]] std::uint64_t compensation_reservation_refused() const noexcept {
+        return compensation_reservation_refused_.load(std::memory_order_relaxed);
+    }
+    /// up-3 (#4221): a claim's compensation-observation deadline (KeyClaim::
+    /// compensation_deadline, from cfg_.backend_op_deadline) was observed elapsed by
+    /// expire_overdue_claims()'s maintenance pass, counted once per claim
+    /// (compensation_deadline_observed latches). Observation-only in 5b - see the
+    /// KeyClaim field's own doc comment; does not release anything. Lock-free.
+    [[nodiscard]] std::uint64_t compensation_deadline_elapsed() const noexcept {
+        return compensation_deadline_elapsed_.load(std::memory_order_relaxed);
     }
     /// rung 9c R5.2: completion-callback drains whose OWN bookkeeping threw (not a
     /// commit throw, which is delivered to the waiter) - the firewall published a
@@ -937,6 +962,38 @@ private:
         std::chrono::steady_clock::time_point deadline{};
         // Disarm payload.
         std::uint64_t subscription{0};
+
+        // up-3/up-4 (#4221, rung 9c PR-5b): Arm-claim-only compensation bookkeeping.
+        // `compensation_reserved` is set the instant dispatch_arm_off_lock() reserves
+        // this claim's compensating-disarm slot, BEFORE the arm is ever submitted -
+        // see compensation_reserved_count_'s header comment. `compensation_finished`
+        // defaults true (nothing to track yet); dispatch_arm_off_lock() never touches
+        // it, on_arm_complete() sets it false the instant a live subscription becomes
+        // compensation-owed (entering the `if (compensating)` branch) and back to true
+        // - in the SAME critical section that pops/publishes the claim - once the
+        // compensating disarm has genuinely finished (or turned out never to be
+        // needed). expire_overdue_claims()'s terminal-recovery pass (up-4) reads it to
+        // know a terminal/stranded head is safe to reap: never touch one whose
+        // compensation is not yet finished. `compensation_deadline` is set ONCE, when
+        // compensation first becomes owed, from cfg_.backend_op_deadline - never reset
+        // on a fallback retry. `compensation_deadline_observed` is a once-only latch:
+        // in 5b, an elapsed deadline only increments compensation_deadline_elapsed_
+        // (see the class-level comment there) - it does not, and must not, release the
+        // reservation, the subscription, the FIFO head, or worker accounting; a
+        // blocked OS call cannot be force-cancelled.
+        bool compensation_reserved{false};
+        bool compensation_finished{true};
+        std::chrono::steady_clock::time_point compensation_deadline{};
+        bool compensation_deadline_observed{false};
+
+        // up-5 (#4221, rung 9c PR-5b): Disarm-claim-only. True from this claim's
+        // FIRST retention (an admission refusal or worker throw) until it is either
+        // finally removed (success, Stopped-drop, DeadSubscription shortcut) or
+        // successfully redriven to completion - see disarm_retained()'s own doc
+        // comment on GuardianSparkRuntime for the full lifecycle contract. A
+        // repeated refusal on the SAME already-retained claim must never increment
+        // disarm_retained_ a second time; this flag is what makes that idempotent.
+        bool retained_counted{false};
     };
     struct KeyClaimQueue {
         std::deque<std::shared_ptr<KeyClaim>> fifo; ///< front() = the current claim
@@ -1041,6 +1098,18 @@ public:
     /// caller, from GuardianEngine::journal_maintenance_tick()'s own heartbeat
     /// cadence; exposed standalone here so a test can drive it directly. Returns
     /// the number of claims this call expired.
+    ///
+    /// up-4 (#4221, rung 9c PR-5b): in the SAME acquisition, also runs
+    /// reap_stranded_claims_locked() - a SEPARATE terminal-recovery pass over every
+    /// key's FIFO front for two residue shapes this function's own overdue-live-
+    /// claim scan above deliberately excludes (a Dispatched terminal head; a
+    /// Queued, withdrawn/abandoned head with no outcome yet - see that function's
+    /// own doc comment for why each is reachable and what reaps it) and to observe
+    /// (count-only) any elapsed compensation_deadline. Any claim newly dispatchable
+    /// as a result is dispatched off-lock after this function's own lock releases,
+    /// exactly like every other refill site in this file. This return value's
+    /// meaning is unchanged - it still counts only THIS function's own overdue-
+    /// live-claim expiries, not the terminal-recovery pass's reaps.
     std::size_t expire_overdue_claims();
 
     /// rung 9c PR-2 Unit 3 (Astra opine review Blocker 4): bounded, on-demand
@@ -1139,6 +1208,55 @@ private:
     /// by try_dispatch_head_locked (refill) and detach_rule_locked (before it queues a
     /// Disarm). noexcept by construction (iterator erases + a noexcept release).
     void sweep_terminal_queued_locked(KeyClaimQueue& entry) noexcept;
+    /// up-4 (#4221, rung 9c PR-5b): registry_mu_ held. Write a claim's fallback
+    /// outcome exactly as publish_arm_verdicts_locked's own fill-in loop would have,
+    /// had a double-fault not interrupted it before reaching this claim: an already-
+    /// committed rule (rules_ carries its generation) is honestly reported Armed;
+    /// anything else fails plainly ("arm drain failed"). A no-op if `c` already
+    /// carries an outcome or commit_exception. Shared by that fill-in loop's own
+    /// call sites are NOT yet routed through this (kept separate deliberately, to
+    /// avoid touching that already-hardened, already-tested code this late) - this
+    /// exists for reap_stranded_claims_locked() below, which needs the identical
+    /// synthesis for a claim publish_arm_verdicts_locked never got the chance to
+    /// finish deciding.
+    void synthesize_fallback_outcome_locked(KeyClaim& c) noexcept;
+    /// up-4 (#4221): registry_mu_ held. Reaps ONE residue shape neither
+    /// sweep_terminal_queued_locked (Queued-only, requires an outcome already
+    /// present), expire_overdue_claims's own overdue-live-claim pass (skips any
+    /// claim with an outcome/commit_exception/waiter_abandoned already set), nor
+    /// redrive_retained_disarms (Disarm claims only) ever reaches: a Queued,
+    /// withdrawn-or-waiter_abandoned head with NO outcome yet - a CONFIRMED real
+    /// defect (Fable review): on_arm_complete's and finalize_arm_compensation's own
+    /// deep-catch recovery hands a claim back to Queued, forever, when a double-
+    /// fault interrupts its own fill-in verdict; reachable via a genuine
+    /// std::bad_alloc, not a test-only seam. Left alone, a future same-key attach
+    /// would spuriously re-arm an already-resolved spec; a key nothing ever
+    /// revisits stays wedged.
+    ///
+    /// Deliberately does NOT also reap a Dispatched, terminal (outcome/
+    /// commit_exception already written) head - the kickoff's own literal ask, kept
+    /// out after this PR's own implementation measured it as UNSAFE: a Dispatched
+    /// head's outcome can be written EARLY by abandon_claim_locked (a caller-
+    /// deadline timeout) while the underlying async arm() call is still genuinely
+    /// running - compensation_finished defaults true and does not distinguish that
+    /// case from a genuinely stuck Dispatched head, and reaping it there ripped a
+    /// still-pending claim out from under its own not-yet-run completion callback
+    /// (regression measured directly against "expire_overdue_claims(): abandons a
+    /// non-waiting claim's own overdue arm ... the compensating disarm still runs
+    /// once the late success arrives"). Neither Astra's nor Fable's review could
+    /// construct a real reproduction of the Dispatched case either - see the PLAN
+    /// doc's own note on this; a future PR should only add it back with a genuinely
+    /// safe "the completion callback has actually run" signal, not outcome-
+    /// presence alone.
+    /// Never touches a head whose compensation_finished is still false (its own
+    /// compensating disarm is genuinely still outstanding). Also, as its own
+    /// maintenance pass, observes (once, via compensation_deadline_observed) any
+    /// STILL-outstanding compensation whose compensation_deadline has elapsed,
+    /// counting it (compensation_deadline_elapsed_) without touching anything else
+    /// about that claim - up-3's own deadline-semantics contract. Returns the number
+    /// of claims actually reaped. `refills` collects any newly-dispatchable head
+    /// (an arm queued behind a reaped entry) for the caller to dispatch off-lock.
+    std::size_t reap_stranded_claims_locked(std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills);
     /// Off-lock. Dispatch an ARM claim (already the Dispatching head) through
     /// io_executor_.submit(); on a synchronous admission refusal (or a throw building
     /// the call) fail the head and every arm queued behind it with today's strings.
@@ -1365,6 +1483,101 @@ private:
     /// independent failures and must not share a capacity budget or a single-flight
     /// key namespace with each other.
     GuardianIoExecutor io_executor_;
+
+    // up-3 (#4221, rung 9c PR-5b): a runtime-side reservation pool for the
+    // compensating-disarm fallback (direct_disarm_fallback()'s 3 entrances),
+    // deliberately NOT routed through io_executor_'s own submit()/run() admission.
+    // io_executor_ has no compensation-priority IoClass and rejects EVERY submission
+    // unconditionally once Stopped (guardian_io_executor.hpp: admit_locked checks
+    // state_->stopping first, no per-class exemption) - routing the fallback through
+    // it would silently break R5.5's "Stopped cannot discard a subscription the late
+    // arm just produced" requirement. This pool lives here instead, reserved per
+    // claim BEFORE its arm is ever dispatched (dispatch_arm_off_lock, while no
+    // subscription exists yet), so a claim that later needs compensation always has
+    // its slot - including after begin_stop(), since this pool is independent of
+    // io_executor_'s Stopped gate entirely.
+    //
+    // Sized 1:1 with io_executor_'s own per-class quota. io_executor_ is ALWAYS
+    // default-constructed here (GuardianIoExecutor() -> GuardianIoExecutor(Config{}):
+    // no constructor of this class threads a custom Config into it), so reading
+    // GuardianIoExecutor::Config{}'s default member initializers directly is exact,
+    // not an approximation - no accessor needed on GuardianIoExecutor, no risk of
+    // drift from whatever it is actually configured with. Worst case, every class
+    // simultaneously saturated: sum(reservations) + sum(quotas) ==
+    // kMaxAliveIoWorkers exactly (10 + 10 == 20) - the compensation population can
+    // never itself become the thing that drives alive-worker count past the existing
+    // ceiling.
+    static constexpr int kFileCompensationReservation = GuardianIoExecutor::Config{}.file_quota;
+    static constexpr int kRegistryCompensationReservation =
+        GuardianIoExecutor::Config{}.registry_quota;
+    static constexpr int kServiceCompensationReservation =
+        GuardianIoExecutor::Config{}.service_quota;
+    static_assert(kFileCompensationReservation + kRegistryCompensationReservation +
+                      kServiceCompensationReservation + GuardianIoExecutor::kMaxProcessIoWorkers ==
+                  GuardianIoExecutor::kMaxAliveIoWorkers,
+                  "up-3's compensation reservation must sum 1:1 with io_executor_'s own "
+                  "per-class quotas - see the comment above");
+    [[nodiscard]] static constexpr int compensation_capacity_for(IoClass c) noexcept {
+        switch (c) {
+        case IoClass::File:     return kFileCompensationReservation;
+        case IoClass::Registry: return kRegistryCompensationReservation;
+        case IoClass::Service:  return kServiceCompensationReservation;
+        }
+        return 0;
+    }
+    /// registry_mu_ held. True and reserved iff capacity was available.
+    bool try_reserve_compensation_locked(IoClass c) noexcept {
+        const auto idx = io_class_index(c);
+        if (compensation_reserved_count_[idx] >= compensation_capacity_for(c))
+            return false;
+        ++compensation_reserved_count_[idx];
+        return true;
+    }
+    /// registry_mu_ held. Idempotent: a no-op if `claim` does not currently hold a
+    /// reservation (already released, or never took one - a Disarm claim, or an Arm
+    /// claim that never reached dispatch_arm_off_lock). Always call this rather than
+    /// manipulating compensation_reserved_count_/compensation_reserved directly, so
+    /// double-release and leaks are both structurally impossible.
+    void release_compensation_locked(KeyClaim& claim) noexcept {
+        if (!claim.compensation_reserved)
+            return;
+        const auto idx = io_class_index(claim.io_class);
+        if (compensation_reserved_count_[idx] > 0)
+            --compensation_reserved_count_[idx];
+        claim.compensation_reserved = false;
+    }
+    /// up-5 (#4221, rung 9c PR-5b): registry_mu_ held. First retention of `claim`
+    /// (an admission refusal or worker throw) - idempotent: a claim already marked
+    /// retained does not increment disarm_retained_ a second time on a repeated
+    /// refusal. Callers keep their own `++claim->admission_rejections` (unconditional
+    /// attempt history, unchanged shape) - this touches ONLY the lifecycle count.
+    /// Disarm claims only, but harmless (a no-op guard) if ever called on anything
+    /// else.
+    void mark_retained_locked(KeyClaim& claim) noexcept {
+        if (claim.retained_counted)
+            return;
+        claim.retained_counted = true;
+        disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+    }
+    /// registry_mu_ held. Idempotent: a no-op if `claim` is not currently counted as
+    /// retained. Call at EVERY terminal removal of a Disarm claim (successful
+    /// completion, Stopped-drop, DeadSubscription shortcut) - never decrement
+    /// disarm_retained_ directly.
+    void clear_retained_locked(KeyClaim& claim) noexcept {
+        if (!claim.retained_counted)
+            return;
+        disarm_retained_.fetch_sub(1, std::memory_order_relaxed);
+        claim.retained_counted = false;
+    }
+    std::array<int, kIoClassCount> compensation_reserved_count_{}; ///< registry_mu_ guarded
+    /// up-3: #4221's own criterion text ("the fallback is deadline-bounded and
+    /// counted, and a ceiling hit is surfaced") - reservation-exhaustion refusals and
+    /// compensation-deadline elapses, counted separately from every pre-existing
+    /// counter. Fleet-visible egress is out of scope here; rides #3415's already-open
+    /// counter-egress scope like every other internal-only counter in this file.
+    std::atomic<std::uint64_t> compensation_reservation_refused_{0};
+    std::atomic<std::uint64_t> compensation_deadline_elapsed_{0};
+
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_queued_{0};     ///< R5.2: attach_rule queued behind a same-key claim
     std::atomic<std::uint64_t> backend_op_late_arms_{0};  ///< #3816/R5.2: late-succeeding arm disarmed by the drain
