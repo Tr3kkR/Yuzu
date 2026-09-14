@@ -14,11 +14,9 @@
 /// entry; none is minted here.
 ///
 /// All three actions are ReadOnly/None. Every OS leg is a device-tree
-/// enumeration (SetupAPI/sysfs/IOKit); nothing requests a write, format,
-/// authorization-state change, or any other mutation. (Wave 1: every leg is
-/// a placeholder that performs no OS call at all yet — see
-/// peripherals_{win,linux,macos}.cpp — but the classification below is the
-/// one the real Wave-2 reads will carry too, since none of them mutate.)
+/// enumeration (SetupAPI/sysfs/IOKit; see peripherals_{win,linux,macos}.cpp);
+/// nothing requests a write, format, authorization-state change, or any
+/// other mutation.
 ///
 ///   `usb`         — enumerates USB devices: identity, class, speed, hub flag.
 ///   `pci`         — enumerates PCI/PCIe devices: identity, class, driver.

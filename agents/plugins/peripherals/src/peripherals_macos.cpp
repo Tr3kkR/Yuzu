@@ -172,15 +172,20 @@ bool walk_usb(std::vector<std::string>& rows) {
         const auto usb_class = cf_number(entry, CFSTR("bDeviceClass")).value_or(0);
         const auto subclass = cf_number(entry, CFSTR("bDeviceSubClass")).value_or(0);
         const auto location = cf_number(entry, CFSTR("locationID")).value_or(0);
-        const auto speed = cf_number(entry, CFSTR("Device Speed")).value_or(-1);
+        const auto speed = cf_number(entry, CFSTR("Device Speed"));
         const auto vendor = io_registry_cf_string(entry, CFSTR("USB Vendor Name"));
         const auto product = io_registry_cf_string(entry, CFSTR("USB Product Name"));
         const auto serial = io_registry_cf_string(entry, CFSTR("USB Serial Number"));
         const auto bus_path = std::format("{:08x}", static_cast<std::uint32_t>(location));
+        // Keep the optional end-to-end: an absent property is the row schema's
+        // "-" unread sentinel, not the out-of-range numeric text usb_speed_name
+        // renders for a present-but-unrecognized value (those are two distinct
+        // cases -- see that function's own doc comment).
+        const std::string speed_text = speed.has_value() ? pmac::usb_speed_name(*speed) : "-";
         rows.push_back(format_usb_row(
             bus_path, static_cast<std::uint16_t>(vendor_id), static_cast<std::uint16_t>(product_id),
             static_cast<std::uint8_t>(usb_class), static_cast<std::uint8_t>(subclass), vendor,
-            product, serial, pmac::usb_speed_name(speed), usb_class == 9));
+            product, serial, speed_text, usb_class == 9));
     });
 }
 

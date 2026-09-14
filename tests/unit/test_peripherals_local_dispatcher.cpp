@@ -5,11 +5,13 @@
  * on the build host.
  *
  * FIXTURE PROVENANCE CONVENTION (wave-wide, ws91). This TU does not itself
- * ship any fixture file -- Wave 1 has no real OS reads to fixture against,
- * every leg is the `<os>:leg:not_implemented` placeholder -- but the
- * convention is recorded here because P91-6+ (Wave 2, this same TU) is where
- * fixture-backed cases land, and every wave-1 sibling package in ws91 uses
- * it. A captured fixture under tests/unit/fixtures/wave9/probes/ carries a
+ * ship any fixture file -- it drives the built plugin's real per-OS legs
+ * directly against the live host instead (see the file banner above), so
+ * there is nothing here to fixture against; the convention is recorded here
+ * because every wave-1 sibling package in ws91 uses it and the pure-parser
+ * test TUs (test_peripherals_{linux,macos,win}_parsers.cpp) are where the
+ * fixture-backed cases actually land. A captured fixture under
+ * tests/unit/fixtures/wave9/probes/ carries a
  * sibling `<name>.provenance.txt` with these lines, in order:
  *
  *   host:      the machine the capture ran on (hostname or CI runner id)
@@ -31,13 +33,12 @@
  * .cpp's own header makes the same point). LocalDispatcher and PluginHandle
  * are both platform-neutral, so nothing technical requires the exclusion.
  *
- * WAVE 1 SCOPE. The wave-1 cases below accept the placeholder
- * `<kind>|unavailable|<os>:leg:not_implemented` row as a valid unavailable
- * shape, so this suite is GREEN against the placeholder legs and any other
- * regression still fails. There is deliberately NO build-completeness
- * assertion (no "does this row contain a real device" check) in this wave --
- * that is P91-6's wave-2 addition once a real read exists to prove. There is
- * also no host-specific count/name assertion anywhere in this file: CI's
+ * SCOPE. The cases below also accept the `<kind>|unavailable|<token>` row as
+ * a valid shape (a genuine leg-level failure, e.g. a permissions error) in
+ * addition to the real per-OS reads Wave 2 (P91-6+) landed, so the suite
+ * stays green on a host where a leg legitimately cannot attempt the read,
+ * and any other regression still fails. There is deliberately NO
+ * host-specific count/name assertion anywhere in this file: CI's
  * macOS suite runs on `yuzu-bigmags-macos` (.github/workflows/ci.yml:1845;
  * no --suite filter at :2059), a shared, unknown-hardware runner.
  */
@@ -293,10 +294,10 @@ TEST_CASE("peripherals plugin: thunderbolt role is a fixed vocabulary",
 }
 
 // One capability-conditional case per action: SKIP by name when only the
-// none row came back (this host genuinely has no devices of that kind, which
-// wave-1's placeholder legs report as unavailable, not none -- so today this
-// branch is dormant until Wave 2 lands a real read that CAN report `none`),
-// else assert at least one real (non-placeholder) row.
+// none row came back (this host genuinely has no devices of that kind --
+// the real Wave-2 legs report that as `<kind>|none`, distinct from an
+// `unavailable` leg-level failure), else assert at least one real
+// (non-placeholder) row.
 TEST_CASE("peripherals plugin: usb reports a real row or is explicitly SKIPped",
           "[peripherals][actions]") {
     auto plugin = load_peripherals_plugin();

@@ -8,7 +8,6 @@ peripherals_objcpp_args = []
 if host_machine.system() == 'windows'
   peripherals_deps += [
     cxx.find_library('setupapi'),
-    cxx.find_library('cfgmgr32'),
   ]
 elif host_machine.system() == 'darwin'
   # IOKit for the device-tree walks (usb/pci/thunderbolt matching);

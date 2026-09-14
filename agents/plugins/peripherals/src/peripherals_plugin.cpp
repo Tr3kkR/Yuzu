@@ -16,11 +16,11 @@
  * only. displays/bluetooth/audio/camera are PR9.1c, deferred until after
  * this PR merges -- no EDID parser, no .mm, no CoreAudio/AVFoundation here.
  *
- * WAVE 1: every leg is a placeholder (peripherals_{win,linux,macos}.cpp each
- * report `<os>:leg:not_implemented` through mark_result_read). This TU is
- * fully wired -- actions, descriptors, dispatch -- so the plugin shape, the
- * capability catalogue and the dispatcher tests are all real from the first
- * revision; only the OS reads themselves are deferred to Wave 2 (P91-6+).
+ * Wave 2 (P91-4/5/6) replaced every leg's placeholder body with a real
+ * SetupAPI/sysfs/IOKit walk (peripherals_{win,linux,macos}.cpp) -- this TU
+ * was fully wired from Wave 1 (actions, descriptors, dispatch), so the
+ * plugin shape, the capability catalogue and the dispatcher tests were real
+ * from the first revision; only the OS reads themselves landed in Wave 2.
  *
  * This TU is portable except for its single dispatch #if, which selects the
  * one host leg to call -- the same shape disk_actions_plugin.cpp's sibling
@@ -132,6 +132,8 @@ public:
 #elif defined(__APPLE__)
         return yuzu::peripherals::run_macos(ctx, *kind);
 #endif
+        return 1; // unreachable on a supported build (see the comment above); avoids
+                  // falling off the end of a non-void function if one ever isn't.
     }
 };
 

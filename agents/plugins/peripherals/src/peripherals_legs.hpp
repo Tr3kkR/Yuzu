@@ -4,8 +4,8 @@
  *
  * Holds (a) the `Kind` enum and its string conversions, (b) the per-OS
  * entry-point declarations, and (c) the CC-07 status-reporting helper. Wave 1
- * ships every leg as a placeholder (`mark_result_read(ctx, k, 0,
- * "<os>:leg:not_implemented")`); Wave 2 replaces the bodies with the real
+ * shipped every leg as a placeholder (`mark_result_read(ctx, k, 0,
+ * "<os>:leg:not_implemented")`); Wave 2 replaced the bodies with the real
  * SetupAPI/sysfs/IOKit walks. Modelled on disk_actions_legs.hpp, the most
  * recent plugin to establish this multi-TU shape.
  */

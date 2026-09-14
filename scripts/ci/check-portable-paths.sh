@@ -74,6 +74,16 @@ selftest_flag = sys.argv[2] == "1"
 # shaped fixture data).
 ILLEGAL_CHARS = set(':*?"<>|') | {chr(c) for c in range(0x20)}
 
+# Win32/NTFS reserved device basenames -- illegal as a path component
+# REGARDLESS of extension ("NUL", "nul.txt", "Com1.log" are all rejected by
+# CreateFile/git-checkout the same way a literal ':' is). Case-insensitive;
+# compared against the component with any extension stripped.
+RESERVED_BASENAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{d}" for d in range(1, 10)),
+    *(f"LPT{d}" for d in range(1, 10)),
+}
+
 
 def illegal_reason(path):
     """None if every component of `path` is representable on Windows, else a
@@ -90,6 +100,10 @@ def illegal_reason(path):
             return f"path component {component!r} contains character(s) illegal on Windows: {shown}"
         if component[-1] in (".", " "):
             return f"path component {component!r} ends with a trailing '.' or ' ' (illegal on Windows)"
+        basename = component.split(".", 1)[0].upper()
+        if basename in RESERVED_BASENAMES:
+            return (f"path component {component!r} uses the Win32 reserved device name "
+                    f"{basename!r} (illegal on Windows regardless of extension)")
     return None
 
 
@@ -152,6 +166,26 @@ def run_selftest():
         reason = illegal_reason(bad)
         if reason is None:
             print(f"SELFTEST FAILED: trailing dot/space path was NOT flagged: {bad!r}")
+            return 1
+
+    # Seeded: Win32 reserved device basenames, bare and with an extension,
+    # case-insensitively -- the class this gate was missing (adversarial
+    # review, wave9 PR9.1a).
+    for bad in ["tests/unit/fixtures/NUL", "tests/unit/fixtures/nul",
+                "tests/unit/fixtures/COM1.log", "tests/unit/fixtures/com1.log"]:
+        reason = illegal_reason(bad)
+        if reason is None:
+            print(f"SELFTEST FAILED: reserved-basename path was NOT flagged: {bad!r}")
+            return 1
+
+    # Clean: a component that merely STARTS WITH a reserved name, or carries
+    # one mid-string, must NOT be flagged -- only an exact (extension-
+    # stripped) basename match is reserved.
+    for ok in ["tests/unit/fixtures/NULodata/file.txt",
+               "tests/unit/fixtures/console/file.txt"]:
+        reason = illegal_reason(ok)
+        if reason is not None:
+            print(f"SELFTEST FAILED: clean path {ok!r} was flagged: {reason}")
             return 1
 
     # Full-scan wiring: a clean list must exit 0, a seeded list must exit 1
