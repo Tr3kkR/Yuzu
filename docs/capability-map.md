@@ -504,7 +504,12 @@ this claim describes is real in the source. Claim holds.)*
 
 `firewall` plugin (cross-platform). macOS `state` reports the Application
 Firewall (`socketfilterfw --getglobalstate`) as the primary signal, with the
-pf packet filter demoted to a secondary row; `rules` lists pf rules.
+pf packet filter demoted to a secondary row; `rules` lists pf rules. Both
+actions also read the unprivileged per-app allow/block list
+(`socketfilterfw --listapps`) on `rules`, and the root-only pf anchor list
+(`pfctl -s Anchors`) and rule count (`pfctl -s rules`) on both actions —
+each degrading to no anchor rows / `ruleset|unknown` rather than a false
+answer when the read is refused or incomplete.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
