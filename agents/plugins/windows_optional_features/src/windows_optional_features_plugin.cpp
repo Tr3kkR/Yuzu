@@ -289,13 +289,37 @@ private:
     const dism::Api& api_;
 };
 
+/// RAII owner for a DISM-allocated buffer freed via Api::Delete
+/// (DismDelete) -- adopts the pointer IMMEDIATELY so a throwing conversion
+/// or formatting step between the DISM call and the (formerly trailing,
+/// manual) delete cannot leak it (docs/cpp-conventions.md's resource-
+/// ownership rule: adopt raw resources into RAII immediately, cover every
+/// early return/unwind path). Precedent: windows_updates_plugin.cpp's
+/// BStrGuard for a BSTR out-parameter.
+template <typename T>
+class DismResultGuard {
+public:
+    DismResultGuard(T* ptr, const dism::Api& api) noexcept : ptr_{ptr}, api_{&api} {}
+    DismResultGuard(const DismResultGuard&) = delete;
+    DismResultGuard& operator=(const DismResultGuard&) = delete;
+    ~DismResultGuard() {
+        if (ptr_)
+            api_->Delete(ptr_);
+    }
+    [[nodiscard]] T* get() const noexcept { return ptr_; }
+    T* operator->() const noexcept { return ptr_; }
+
+private:
+    T* ptr_;
+    const dism::Api* api_;
+};
+
 std::string dism_last_error_text(const dism::Api& api_table) {
-    dism::String* msg = nullptr;
-    if (FAILED(api_table.GetLastErrorMessage(&msg)) || !msg || !msg->Value)
+    dism::String* raw_msg = nullptr;
+    if (FAILED(api_table.GetLastErrorMessage(&raw_msg)) || !raw_msg || !raw_msg->Value)
         return {};
-    std::string text = yuzu::win::from_wide(msg->Value);
-    api_table.Delete(msg);
-    return text;
+    const DismResultGuard<dism::String> msg{raw_msg, api_table};
+    return yuzu::win::from_wide(msg->Value);
 }
 
 std::string format_hr_reason(HRESULT hr, const dism::Api& api_table) {
@@ -352,6 +376,11 @@ DismOutcome run_dism_list(const std::optional<std::unordered_set<yuzu::wof::Feat
             return {DismOutcome::Kind::GetFeaturesFailed, {}, reason};
         }
 
+        // Adopted immediately (docs/cpp-conventions.md resource-ownership
+        // rule): from_wide() below can throw, and the old trailing manual
+        // Delete() would then never run.
+        const DismResultGuard<dism::Feature> features_guard{features, api_table};
+
         std::vector<std::string> rows;
         rows.reserve(count);
         for (UINT i = 0; i < count; ++i) {
@@ -362,7 +391,6 @@ DismOutcome run_dism_list(const std::optional<std::unordered_set<yuzu::wof::Feat
                 features[i].FeatureName ? yuzu::win::from_wide(features[i].FeatureName) : std::string{};
             rows.push_back(yuzu::wof::format_feature_row(name, state, yuzu::wof::pending_restart(state)));
         }
-        api_table.Delete(features);
         return {DismOutcome::Kind::Ok, std::move(rows), {}};
     } catch (...) {
         return {DismOutcome::Kind::Exception, {}, "unhandled exception inside the bounded DISM call"};
@@ -400,6 +428,10 @@ DismOutcome run_dism_info(const std::string& name) {
             return {DismOutcome::Kind::GetFeatureInfoFailed, {}, reason};
         }
 
+        // Adopted immediately, same reason as run_dism_list()'s
+        // features_guard above -- from_wide()/format below can throw.
+        const DismResultGuard<dism::FeatureInfo> info_guard{info, api_table};
+
         const auto state = yuzu::wof::state_from_dism(static_cast<int>(info->State));
         std::string display_name =
             info->DisplayName ? yuzu::win::from_wide(info->DisplayName) : std::string{};
@@ -407,7 +439,6 @@ DismOutcome run_dism_info(const std::string& name) {
             info->Description ? yuzu::win::from_wide(info->Description) : std::string{};
         std::string row = yuzu::wof::format_feature_info_row(
             name, display_name, state, static_cast<int>(info->RestartRequired), description);
-        api_table.Delete(info);
         return {DismOutcome::Kind::Ok, {std::move(row)}, {}};
     } catch (...) {
         return {DismOutcome::Kind::Exception, {}, "unhandled exception inside the bounded DISM call"};
@@ -687,25 +718,51 @@ public:
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
 #ifdef _WIN32
         const auto deadline = std::chrono::steady_clock::now() + 2 * kDismTimeout;
-        while (g_dism_slot.in_use.load(std::memory_order_relaxed) &&
-               std::chrono::steady_clock::now() < deadline) {
+        while (g_dism_slot.in_flight() && std::chrono::steady_clock::now() < deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
-        if (g_dism_slot.in_use.load(std::memory_order_relaxed)) {
+        if (g_dism_slot.in_flight()) {
             std::fprintf(stderr, "windows_optional_features: shutdown quiesce timed out with a "
                                  "DISM call still outstanding\n");
         }
 #endif
     }
 
+    // No exception may escape this function -- the extern "C" plugin-ABI
+    // trampoline (sdk/include/yuzu/plugin.hpp's YUZU_PLUGIN_EXPORT) forwards
+    // straight into this call with no catch of its own, and
+    // .claude/routed-concerns.md's windows_optional_features row is
+    // explicit: "never throws across the ABI". agent.cpp's remote
+    // command-dispatch path independently wraps target->execute() as a
+    // defence-in-depth backstop (added after a real 2026-05-12 incident:
+    // agent_logging.get_log threw filesystem_error and brought the agent
+    // down), but LocalDispatcher -- used by
+    // tests/unit/test_windows_optional_features_local_dispatcher.cpp, and
+    // by the daily-sync framework's other plugin consumers -- has no such
+    // backstop, so this plugin owns its own containment rather than relying
+    // on a caller. Precedent: autoruns_plugin.cpp's execute() wraps its
+    // whole body the same way.
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
-        if (action == "list")
-            return do_list(ctx, params);
-        if (action == "info")
-            return do_info(ctx, params);
+        try {
+            if (action == "list")
+                return do_list(ctx, params);
+            if (action == "info")
+                return do_info(ctx, params);
 
-        ctx.write_output(std::format("unknown action: {}", action));
-        return 1;
+            ctx.write_output(std::format("unknown action: {}", action));
+            return 1;
+        } catch (const std::exception& e) {
+            ctx.write_output(yuzu::wof::format_unavailable_row(action, "windows:dism:exception"));
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  std::string{"unhandled exception: "} +
+                                      yuzu::util::safe_output_field(e.what()));
+            return 1;
+        } catch (...) {
+            ctx.write_output(yuzu::wof::format_unavailable_row(action, "windows:dism:exception"));
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "unhandled exception of unknown type inside execute()");
+            return 1;
+        }
     }
 };
 

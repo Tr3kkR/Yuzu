@@ -6,7 +6,7 @@
 ## Source: DismOpenSession(DISM_ONLINE_IMAGE) + DismGetFeatures/
 ## DismGetFeatureInfo, resolved at runtime from DismApi.dll (System32) --
 ## no ADK dependency, no dism.exe, no WMI, no COM. See
-## docs/user-manual/windows-optional-features.md.
+## agents/plugins/windows_optional_features/README.md.
 
 ---
 apiVersion: yuzu.io/v1alpha1

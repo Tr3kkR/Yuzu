@@ -137,9 +137,8 @@ feature|Containers-SDN|disabled|0
 feature|SMB1Protocol|disabled|0
 feature|SMB1Protocol-Client|disabled|0
 feature|SMB1Protocol-Server|disabled|0
-[result_status] UNDECLARED / UNKNOWN / 
+[result_status] UNDECLARED / UNKNOWN /
 
 == action=info feature=NetFx3
 feature_info|NetFx3|.NET Framework 3.5 (includes .NET 2.0 and 3.0)|enabled|possible|.NET Framework 3.5 (includes .NET 2.0 and 3.0)
-[result_status] UNDECLARED / UNKNOWN / 
-
+[result_status] UNDECLARED / UNKNOWN /

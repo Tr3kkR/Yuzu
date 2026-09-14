@@ -247,51 +247,80 @@ struct ProbeFeatureRow {
     return out;
 }
 
-/// Single owner of the busy/abandoned/timed-out flag's lifecycle (peer H2).
-/// `in_use` guards "a DISM call is in flight"; `timed_out` distinguishes a
-/// merely-busy slot (a call is legitimately running, will finish soon) from
-/// an abandoned one (the dispatching thread already gave up waiting on a
-/// prior call, so the worker that eventually finishes it is the only thing
-/// that can still release the slot). Every method is noexcept and touches
-/// only these two atomics -- no thread, no clock, no DISM call -- so the
-/// acquired/busy/abandoned/release sequencing is provable on every OS.
+/// Single owner of the busy/abandoned/timed-out state machine (peer H2).
+/// Every method is noexcept and touches only the one atomic below -- no
+/// thread, no clock, no DISM call -- so the acquired/busy/abandoned/release
+/// sequencing is provable on every OS.
+///
+/// One atomic `State` word, not two independent `bool`s (adversarial
+/// review C3, Wave 9 PR9.2): the dispatching thread's mark_timed_out() and
+/// the worker thread's release() run with NO ordering relationship between
+/// them -- release() happens INSIDE fn(), before bounded_call_ex's
+/// TimedOut/Completed decision is even made (bounded_wait.hpp), so a
+/// worker that finishes right at the deadline can call release() (state ->
+/// Free) followed by the dispatching thread's already-in-flight
+/// mark_timed_out() landing AFTER it. Two independent bools let that
+/// leave `in_use=false, timed_out=true` -- undefined by the old contract,
+/// and observably wrong: the NEXT try_acquire() succeeds (`acquired`) but
+/// leaves the stale timed-out flag set, so a THIRD concurrent caller reads
+/// it and reports `abandoned` for a call that never timed out (should be
+/// `busy`). A single CAS'd state word closes this: mark_timed_out() only
+/// transitions Busy->TimedOut, so if release() already fired (state is
+/// Free, or even re-acquired to Busy by a brand-new call), the CAS simply
+/// fails and does nothing -- there is no representable "stale timed-out"
+/// state left to leak.
 struct DismSlot {
-    std::atomic<bool> in_use{false};
-    std::atomic<bool> timed_out{false};
-
     enum class Acquire { acquired, busy, abandoned };
 
+    /// True while a call is in flight (Busy or TimedOut/abandoned) --
+    /// i.e. before release(). Used by shutdown()'s bounded quiesce loop.
+    [[nodiscard]] bool in_flight() const noexcept {
+        return state_.load(std::memory_order_relaxed) != State::Free;
+    }
+
     /// Called by whichever thread is about to start (or refuse to start) a
-    /// DISM call. CAS in_use false->true wins the slot (`acquired`);
-    /// otherwise the slot is already held, and `timed_out` distinguishes
-    /// `busy` (a call is genuinely still running) from `abandoned` (the
-    /// dispatching thread already gave up on a prior call and the worker
-    /// that eventually finishes it owns the only release).
+    /// DISM call. CAS Free->Busy wins the slot (`acquired`); otherwise the
+    /// slot is already held, and the state distinguishes `busy` (a call is
+    /// genuinely still running) from `abandoned` (the dispatching thread
+    /// already gave up on a prior call and the worker that eventually
+    /// finishes it owns the only release).
     [[nodiscard]] Acquire try_acquire() noexcept {
-        bool expected = false;
-        if (in_use.compare_exchange_strong(expected, true, std::memory_order_acq_rel,
+        State expected = State::Free;
+        if (state_.compare_exchange_strong(expected, State::Busy, std::memory_order_acq_rel,
                                            std::memory_order_acquire)) {
             return Acquire::acquired;
         }
-        return timed_out.load(std::memory_order_acquire) ? Acquire::abandoned : Acquire::busy;
+        return expected == State::TimedOut ? Acquire::abandoned : Acquire::busy;
     }
 
-    /// Called ONLY by the DISPATCHING thread when its bounded wait on an
-    /// in-flight call expires. Never touches `in_use` -- the worker thread
-    /// that is still running the call is the only thing allowed to clear
-    /// it, once DISM teardown actually completes.
-    void mark_timed_out() noexcept { timed_out.store(true, std::memory_order_release); }
+    /// Called ONLY by the DISPATCHING thread, synchronously and exactly
+    /// once, immediately after ITS OWN bounded_call_ex invocation reports
+    /// TimedOut (both current call sites do exactly this, with no
+    /// intervening blocking step) -- never called speculatively, deferred,
+    /// or reused across a later, unrelated acquisition. CAS Busy->TimedOut,
+    /// NOT an unconditional store: if the worker already released the slot
+    /// (state is Free -- it finished right at the deadline), this call has
+    /// nothing to mark and must not touch it -- see the class doc comment
+    /// above. The CAS does not by itself defend against a call site that
+    /// violates the synchronous/exactly-once discipline (it would then
+    /// legitimately be Busy again, owned by a different acquisition); no
+    /// such call site exists today.
+    void mark_timed_out() noexcept {
+        State expected = State::Busy;
+        state_.compare_exchange_strong(expected, State::TimedOut, std::memory_order_acq_rel,
+                                       std::memory_order_relaxed);
+    }
 
     /// Called ONLY by the WORKER thread once it has finished a DISM call it
     /// owns (or, on the Rejected bounded-call path, by the calling thread
-    /// itself, since fn() there never ran and no worker exists). Clears
-    /// `timed_out` before `in_use` so a racing try_acquire() never observes
-    /// `in_use=false, timed_out=true` -- a state this slot's contract does
-    /// not define.
-    void release() noexcept {
-        timed_out.store(false, std::memory_order_release);
-        in_use.store(false, std::memory_order_release);
-    }
+    /// itself, since fn() there never ran and no worker exists).
+    /// Unconditional: the worker that reaches release() is always the sole
+    /// current owner of the slot, timed-out or not.
+    void release() noexcept { state_.store(State::Free, std::memory_order_release); }
+
+private:
+    enum class State { Free, Busy, TimedOut };
+    std::atomic<State> state_{State::Free};
 };
 
 } // namespace yuzu::wof
