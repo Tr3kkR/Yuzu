@@ -143,7 +143,7 @@ shimcache|C:/WINDOWS/system32/SbUpdateWorker.exe|1788888386924|148|-
 shimcache|C:/Program Files/Git/usr/bin/xxd.exe|1776703802000|72|-
 shimcache|D:/yuzu-dev/Yuzu-worktrees/feat-wave9-pr91a/build-windows/tools/plugin-capture/plugin-capture.exe|1788887960842|84|-
 shimcache|C:/WINDOWS/winsxs/amd64_microsoft-windows-servicingstack_31bf3856ad364e35_10.0.26100.9441_none_a5253a19774da03c/TiWorker.exe|1788438536000|148|-
-… 12 of 314 rows shown
+… 12 of 26 rows shown
 [result_status] OK / FULL
 
 == action=amcache
@@ -159,7 +159,7 @@ amcache||5b94a0c08e13cf31493be1ce239f1e4e9c42eefb||||||
 amcache||305ac3116e895257cd38673664e0750b82ef4789||||||
 amcache||f869ae2fc9db261dba1a6e79554266cb87d8168c||||||
 amcache||c6aa7959dadf274f066b9ee093665efc34df00c1||||||
-… 12 of 9891 rows shown
+… 12 of 26 rows shown
 [result_status] OK / FULL
 
 == action=prefetch
@@ -175,7 +175,7 @@ prefetch|AM_DELTA_PATCH_1.459.105.0.EX|CEED51DA|31|1|1788879982014|1|3
 prefetch|AM_DELTA_PATCH_1.459.111.0.EX|A193E773|31|1|1788939518280|1|3
 prefetch|AM_DELTA_PATCH_1.459.79.0.EXE|9CBD8D44|31|1|1788753615690|1|3
 prefetch|AM_DELTA_PATCH_1.459.88.0.EXE|F262D07C|31|1|1788793567814|1|3
-… 12 of 501 rows shown
+… 12 of 26 rows shown
 [result_status] OK / PARTIAL / truncated_header
 ```
 

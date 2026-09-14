@@ -490,7 +490,7 @@
             "provenance": "",
             "status": "OK"
           },
-          "row_count": 314,
+          "row_count": 26,
           "rows": [
             "shimcache|00000009\t03e865f424f10000\t000a00007fff0000\t8664\tMicrosoftWindows.Client.CoreAI\tcw5n1h2txyewy\t|0|100|-",
             "shimcache|C:/Program Files/Git/usr/bin/file.exe|1776703804000|72|-",
@@ -510,7 +510,7 @@
             "provenance": "",
             "status": "OK"
           },
-          "row_count": 9891,
+          "row_count": 26,
           "rows": [
             "amcache||69cb415403de1ae2d4af937c0d2b6927a24a7553||||||",
             "amcache||3a73d566a6bcd68518fe786ae33d25b2cb0b6473||||||",
@@ -530,7 +530,7 @@
             "provenance": "truncated_header",
             "status": "OK"
           },
-          "row_count": 501,
+          "row_count": 26,
           "rows": [
             "prefetch|7Z.EXE|93D290DC|31|2|1789416093019,1789415981349|1|3",
             "prefetch|ACROBAT.EXE|4E1700B6|31|17|1782139503883,1782139502989,1781888840096,1781532567812,1781532568325,1778602224391,1778602225066,1775144109458|1|3",
