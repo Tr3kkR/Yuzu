@@ -25,6 +25,7 @@
 // unconditionally by certificates_plugin.cpp.
 
 #include <array>
+#include <charconv>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
@@ -34,6 +35,8 @@
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <yuzu/agent/keychain_read.hpp> // yuzu::agent::KeychainReadStatus (enum use only, header-only)
 
 namespace yuzu::certificates_macos {
 
@@ -348,6 +351,113 @@ inline std::chrono::milliseconds clamp_to_action_budget(
         return std::chrono::milliseconds::zero();
     auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(remaining);
     return remaining_ms < per_call_cap ? remaining_ms : per_call_cap;
+}
+
+// ── macOS keychain seam mapping (#3246 / #2318 / TerminationReason) ────────
+
+/**
+ * Map a bounded SecItem keychain read's outcome (yuzu::agent::
+ * KeychainReadStatus, keychain_read.hpp) to the human-readable detail text
+ * certificates_plugin.cpp writes alongside a `not_available` row -- or
+ * nullopt for Completed, which needs no explanatory row at all.
+ * `keychain_label` is the plugin's own literal ("System.keychain" /
+ * "SystemRootCertificates.keychain", certificates_plugin.cpp:1295-1307), not
+ * derived from anything the OS returns.
+ */
+inline std::optional<std::string> secitem_failure_reason(yuzu::agent::KeychainReadStatus status,
+                                                          std::string_view keychain_label) {
+    switch (status) {
+    case yuzu::agent::KeychainReadStatus::Completed:
+        return std::nullopt;
+    case yuzu::agent::KeychainReadStatus::Truncated:
+        return std::format("{} scan incomplete", keychain_label);
+    case yuzu::agent::KeychainReadStatus::OpenFailed:
+        return std::format("{} read failed", keychain_label);
+    case yuzu::agent::KeychainReadStatus::NotReadable:
+        return std::format("{} not readable (no read permission)", keychain_label);
+    case yuzu::agent::KeychainReadStatus::TimedOut:
+        return std::format("{} read timed out", keychain_label);
+    case yuzu::agent::KeychainReadStatus::Rejected:
+        return std::format("{} read refused (bounded-call ceiling)", keychain_label);
+    }
+    return std::format("{} read failed", keychain_label); // unreachable -- exhaustive switch above
+}
+
+/// The provenance tag a caller passes to mark_result_partial for a
+/// secitem_failure_reason-flagged row -- kept alongside it so the two can
+/// never drift on the "secitem:" prefix.
+inline std::string secitem_provenance(std::string_view keychain_label) {
+    return std::format("secitem:{}", keychain_label);
+}
+
+/// Whether a post-action recheck of the console-session owner found the same
+/// uid still logged in, a DIFFERENT uid (the session changed out from under
+/// the action -- e.g. a fast-user-switch), or the recheck itself could not be
+/// trusted. Fails closed by construction: every input shape that isn't a
+/// clean, in-range, all-digit comparison lands on kUnknown, never
+/// kUnchanged.
+enum class ConsoleOwnerRecheck { kUnchanged, kChanged, kUnknown };
+
+/**
+ * Pure comparison for a console-owner recheck: `stat_ok` is whether the
+ * console device could be stat'd at all; `current_uid` is the uid the action
+ * started against; `resolved_uid` is the freshly re-resolved console owner's
+ * uid as text. `resolved_uid` must be a non-empty run of ASCII digits (same
+ * rule as macos_console_user.hpp's is_valid_uid, reproduced inline here
+ * rather than including that header) and parse without overflow, or the
+ * result is kUnknown rather than a guess.
+ */
+inline ConsoleOwnerRecheck classify_console_owner_recheck(bool stat_ok,
+                                                          unsigned long long current_uid,
+                                                          std::string_view resolved_uid) {
+    if (!stat_ok)
+        return ConsoleOwnerRecheck::kUnknown;
+    if (resolved_uid.empty())
+        return ConsoleOwnerRecheck::kUnknown;
+    for (char c : resolved_uid) {
+        if (c < '0' || c > '9')
+            return ConsoleOwnerRecheck::kUnknown;
+    }
+
+    unsigned long long parsed = 0;
+    auto [ptr, ec] =
+        std::from_chars(resolved_uid.data(), resolved_uid.data() + resolved_uid.size(), parsed);
+    if (ec != std::errc{} || ptr != resolved_uid.data() + resolved_uid.size())
+        return ConsoleOwnerRecheck::kUnknown; // overflow or trailing garbage
+    return parsed == current_uid ? ConsoleOwnerRecheck::kUnchanged : ConsoleOwnerRecheck::kChanged;
+}
+
+/**
+ * Render a one-line reason a bounded subprocess capture is not usable
+ * (is_usable_capture's negative case), for the `not_available|<detail>` row
+ * certificates_plugin.cpp writes. `termination` is the TerminationReason
+ * name the plugin passes as text ("exited"/"signaled"/"deadline"/
+ * "cancelled"/"line_limit"/"spawn_error", subprocess_runner.hpp:61-72).
+ * Checked in priority order: a call that never spawned pre-empts every other
+ * signal, and an explicit deadline/timeout pre-empts the raw termination
+ * reason since `timed_out` can be set even when the runner's own reason text
+ * lags. A capture for which is_usable_capture(tool_ran, timed_out,
+ * output_truncated, exit_code) returns true -- i.e. tool_ran && !timed_out &&
+ * !output_truncated && exit_code == 0, which also implies termination ==
+ * "exited" -- returns "" here: a usable capture has no detail to report.
+ */
+inline std::string capture_failure_detail(bool tool_ran, bool timed_out, bool output_truncated,
+                                          int exit_code, std::string_view termination) {
+    if (!tool_ran)
+        return "spawn failed";
+    if (termination == "deadline" || timed_out)
+        return "killed at deadline";
+    if (termination == "cancelled")
+        return "cancelled";
+    if (termination == "line_limit")
+        return "output truncated (line limit)";
+    if (output_truncated)
+        return "output truncated";
+    if (termination == "signaled")
+        return "killed by signal";
+    if (exit_code != 0)
+        return std::format("exit {}", exit_code);
+    return "";
 }
 
 } // namespace yuzu::certificates_macos
