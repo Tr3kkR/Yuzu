@@ -5952,6 +5952,123 @@ TEST_CASE("MCP check_permission: reachable even when the caller holds NO RBAC pe
     CHECK(payload["allowed"] == false); // the ANSWER is false; the CALL still succeeded
 }
 
+TEST_CASE("MCP check_permission: an oversized securable_type/operation is rejected by the "
+          "#4353 handler-side bound (Infrastructure:Read is never approval-gated, at any "
+          "tier, so the schema's maxLength alone was advisory-only)",
+          "[mcp][pg][rbac][bounds]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db, mcp_rbac_tpl);
+    yuzu::server::pg::PgPool rbac_pool{{.conninfo = rbac_db.dsn(), .size = 4}};
+    REQUIRE(rbac_pool.valid());
+    yuzu::server::RbacStore rbac{rbac_pool};
+    REQUIRE(rbac.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.rbac_store_for_test = &rbac;
+    ts.start();
+    const std::string big(129, 'a');
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2003,"params":{"name":"check_permission","arguments":{"securable_type":")" +
+        big + R"(","operation":"Read"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                      {{"tool", "check_permission"}, {"reason", "arg_too_large"}})
+              .value() == 1.0);
+}
+
+// ── #4353 follow-up, empty-tier discriminating test ─────────────────────────
+//
+// The 5 management-group/result-set mutators below (ManagementGroup:Write /
+// Infrastructure:Delete) ARE approval-gated at supervised tier - unlike the
+// 14 tools tested above, a supervised-tier call to these already hit C8's
+// schema validate(). What #4353's Gate 2 re-review found is a DIFFERENT
+// bypass of the SAME class: requires_approval() returns false immediately
+// for an EMPTY mcp_tier, and /mcp/v1/'s auth_fn (require_auth) admits a
+// plain RBAC session or a non-MCP-tiered API token the same way any REST
+// route does - so that caller class never reaches C8 on these 5 either.
+// `ts.start()` with NO tier argument is exactly that caller class: it is the
+// only tier value where the OLD code (schema-only) would have accepted an
+// oversized field on these tools, so it is the one red -> green proof that
+// actually targets the gap (a supervised-tier test here would pass even
+// against the pre-fix code, via C8, and prove nothing new).
+TEST_CASE("MCP management-group/result-set mutators: an oversized field is rejected by the "
+          "#4353 handler-side bound even at EMPTY mcp_tier, where requires_approval() never "
+          "fires and C8's schema validate() is never reached",
+          "[mcp][integration][bounds]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.start(); // no tier: the untiered RBAC-session/API-token caller class
+
+    SECTION("create_management_group: an oversized name") {
+        const std::string big(257, 'a');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_management_group","arguments":{"name":")" +
+            big + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "create_management_group"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("add_management_group_member: an oversized group_id") {
+        const std::string big(257, 'b');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"add_management_group_member","arguments":{"group_id":")" +
+            big + R"(","agent_id":"x"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+
+    SECTION("delete_result_set: an oversized id") {
+        const std::string big(65, 'c');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"delete_result_set","arguments":{"id":")" +
+            big + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "delete_result_set"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("update_management_group: an oversized group_id") {
+        const std::string big(257, 'd');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"update_management_group","arguments":{"group_id":")" +
+            big + R"(","name":"x"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+
+    SECTION("assign_management_group_role: an oversized group_id") {
+        const std::string big(257, 'e');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"assign_management_group_role","arguments":{"group_id":")" +
+            big + R"(","principal_id":"x","role_name":"Viewer"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "assign_management_group_role"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+    }
+}
+
 // ── B4 (#2146 API-parity) — unlock_account ──────────────────────────────────
 
 TEST_CASE("MCP unlock_account: happy path clears the lockout and audits "
@@ -17008,6 +17125,35 @@ TEST_CASE("MCP get_management_group: RBAC denial (ManagementGroup:Read) blocks t
     REQUIRE(res->status == 403);
 }
 
+TEST_CASE("MCP get_management_group: an oversized group_id is rejected by the #4353 "
+          "handler-side bound (ManagementGroup:Read is never approval-gated, at any tier, "
+          "so the schema's maxLength alone was advisory-only)",
+          "[mcp][pg][management_group][bounds]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    ts.mgmt_store_for_test = &store;
+    ts.start();
+    const std::string big(257, 'a');
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5001,)"
+        R"("params":{"name":"get_management_group","arguments":{"group_id":")" +
+        big + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                      {{"tool", "get_management_group"}, {"reason", "arg_too_large"}})
+              .value() == 1.0);
+}
+
 TEST_CASE("MCP update_management_group: happy path renames a group",
           "[mcp][pg][management_group]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_mgmt_tpl);
@@ -23798,6 +23944,143 @@ TEST_CASE("MCP result-sets: permission-denied paths per dispatch-gated tool",
         // than crashing - proves the type-mismatched "value" field was safely defaulted, not
         // thrown on, before the store call.
         CHECK(res->status != 500);
+    }
+}
+
+// ── #4353 follow-up (Gate 2 finding on #4364): handler-side bound
+// enforcement ────────────────────────────────────────────────────────────
+//
+// #4353 added `maxLength` to these tools' served schemas, but MCP schema
+// validation runs ONLY on the approval-gated path (mcp_server.cpp's sole
+// `.validate(args)` call site sits inside `requires_approval()`) - see
+// reference-mcp-schema-validation-approval-gated-only. For a tool whose
+// (securable_type, operation) is never in requires_approval()'s list
+// (Infrastructure:Read/Write here), or that IS in the list but reachable at
+// operator tier where Execution:Execute auto-approves and skips the gate
+// entirely (reevaluate_result_set / create_result_set_from_*), the schema
+// bound was advisory-only. These tests prove the NEW handler-side check
+// (mirroring execute_instruction's own #2437 `too_large`) actually rejects
+// an oversized field on exactly the tier that used to accept it silently.
+TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-side bound, "
+          "on tiers the schema-validation gate never reaches",
+          "[pg][mcp][integration][result-sets][bounds]") {
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.metrics_for_test = &reg;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    ts.result_set_store_for_test = rs_bundle.get();
+
+    SECTION("list_result_sets: an oversized cursor is rejected (Infrastructure:Read is never "
+            "approval-gated, at any tier)") {
+        ts.start();
+        const std::string big(2049, 'a');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_result_sets","arguments":{"cursor":")" +
+            big + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "list_result_sets"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("create_result_set: an oversized name is rejected at supervised tier "
+            "(Infrastructure:Write is absent from requires_approval()'s list entirely, so "
+            "the schema bound was never enforced even there)") {
+        ts.start("supervised");
+        const std::string big(257, 'a');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_result_set","arguments":{"name":")" +
+            big + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+
+    SECTION("create_result_set: an oversized device_ids entry is rejected") {
+        ts.start("supervised");
+        const std::string big(257, 'b');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"create_result_set","arguments":{"name":"x","device_ids":[")" +
+            big + R"("]}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+    }
+
+    SECTION("reevaluate_result_set: an oversized id is rejected at operator tier - the exact "
+            "documented gap (Execution:Execute auto-approves at operator, skipping C8's "
+            "validate() entirely)") {
+        ts.start("operator");
+        const std::string big(65, 'c');
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            big + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "reevaluate_result_set"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+    }
+
+    SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "
+            "fields, and an oversized params value are each rejected at operator tier - same "
+            "documented gap as reevaluate_result_set above") {
+        YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+        yuzu::server::pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+        yuzu::server::InstructionStore instr(instr_pool);
+        REQUIRE(instr.is_open());
+        ts.instruction_store_for_test = &instr;
+        ts.start("operator");
+        SECTION("instruction_id") {
+            const std::string big(257, 'd');
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":")" +
+                big + R"("}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        SECTION("matcher.column") {
+            const std::string big(129, 'e');
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","matcher":{"column":")" +
+                big + R"("}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        SECTION("params value (Gate 2 MEDIUM finding: matches execute_instruction's "
+                "65536-byte params-value convention)") {
+            const std::string big(65537, 'f');
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","params":{"k":")" +
+                big + R"("}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
+        SECTION("a non-string params value is measured by its dump() size, not skipped - "
+                "mirrors execute_instruction's own 'measure what the handler will actually "
+                "store' fix, since a non-string value is dumped to text before use here too") {
+            const std::string big(65537, 'g');
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","params":{"k":{"pad":")" +
+                big + R"("}}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+        }
     }
 }
 

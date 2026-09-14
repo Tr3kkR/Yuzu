@@ -965,7 +965,7 @@ static const ToolDef kTools[] = {
      "or discover_instructions — do not guess. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "error — it dispatches a real command to the fleet; poll instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string"},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -6127,6 +6127,48 @@ McpServer::HandlerFn McpServer::build_handler(
                 return error_response(id, code, message, data);
             };
 
+            // #4353 follow-up (Gate 2 finding on #4364): shared responder for the
+            // 19 kFieldBoundTools whose served-schema maxLength is enforced only
+            // on the approval-gated path (mcp_policy.hpp requires_approval) -
+            // never enforced at all for 11 of them, supervised-tier-only for 3
+            // more, and skipped for an EMPTY mcp_tier on all remaining 5 (that
+            // last gap applies to every one of the 19; see mcp_input_bounds.hpp's
+            // block comment for the full breakdown). Mirrors execute_instruction's
+            // own local `too_large` (#2437) in shape - correlation id minted
+            // first so the audit row and the client envelope can be joined,
+            // metrics counted, denial audited, then the A4 error sent - but
+            // kept as ONE shared lambda here rather than restated per tool,
+            // since these 19 branches each reject on 1-6 simple fields rather
+            // than execute_instruction's schema-inexpressible shape rules.
+            // `reason` is fixed at "arg_too_large": the offending field/bound
+            // is named in `what` (the caller-visible message) and in the audit
+            // `detail`, not in a metric label - a per-field reason per tool
+            // would multiply kFieldBoundTools' 19 entries by each tool's own
+            // field count for a breakdown nothing here currently needs (unlike
+            // execute_instruction, a high-traffic, single-tool surface where
+            // that breakdown paid for itself for alerting purposes).
+            auto reject_field_too_large = [&](std::string_view what) {
+                const std::string cid = yuzu::server::detail::make_correlation_id();
+                if (metrics != nullptr) {
+                    try {
+                        metrics
+                            ->counter("yuzu_mcp_tool_args_too_large_total",
+                                  {{"tool", tool_name}, {"reason", "arg_too_large"}})
+                            .increment();
+                    } catch (...) { // NOLINT(bugprone-empty-catch)
+                        // observability must never fail the dispatch
+                    }
+                }
+                mcp_audit("denied", std::string("input bound exceeded: ") + std::string(what) +
+                                    " correlation_id=" + cid);
+                res.set_content(
+                    a4_error(kInvalidParams, what,
+                             "reduce the argument to within this tool's tools/list "
+                             "inputSchema bounds and re-call",
+                             -1, cid),
+                    "application/json");
+            };
+
             // #3687 (Gate 6 UP-5 fix): the ONE place a DispatchDenial from
             // authorize_dispatch_fn_'s pre-dispatch dry run becomes a
             // JSON-RPC response — shared by the C8 pre-mint dry run (below)
@@ -9325,15 +9367,38 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
                     return;
-                if (!mgmt_store) {
-                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto name = param_str(args, "name");
                 if (name.empty()) {
                     res.set_content(a4_error(kInvalidParams, "name is required"),
+                                    "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): ManagementGroup:Write
+                // IS approval-gated at supervised tier, but requires_approval()
+                // returns false for an EMPTY mcp_tier - and /mcp/v1/'s auth_fn
+                // (require_auth) admits a plain RBAC session or non-MCP-tiered
+                // API token same as any REST route, so C8's validate() never
+                // runs for that caller class either. Checked ahead of the
+                // store-availability gate below - a malformed request is a
+                // client error regardless of backend availability.
+                if (name.size() > kMgmtGroupNameMaxLen ||
+                    (args.contains("description") && args["description"].is_string() &&
+                     args["description"].get_ref<const std::string&>().size() >
+                         kMgmtGroupDescriptionMaxLen) ||
+                    (args.contains("parent_id") && args["parent_id"].is_string() &&
+                     args["parent_id"].get_ref<const std::string&>().size() > kMgmtGroupIdMaxLen) ||
+                    (args.contains("scope_expression") && args["scope_expression"].is_string() &&
+                     args["scope_expression"].get_ref<const std::string&>().size() >
+                         kMgmtGroupScopeExprMaxLen)) {
+                    reject_field_too_large(std::format(
+                        "name<={}, description<={}, parent_id<={}, scope_expression<={} bytes",
+                        kMgmtGroupNameMaxLen, kMgmtGroupDescriptionMaxLen, kMgmtGroupIdMaxLen,
+                        kMgmtGroupScopeExprMaxLen));
+                    return;
+                }
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9410,15 +9475,27 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
-                if (!mgmt_store) {
-                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto group_id = param_str(args, "group_id");
                 if (group_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "group_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now. Checked
+                // ahead of the store-availability gate below: a malformed
+                // request is a client error regardless of backend
+                // availability (matches create_result_set_from_inventory_
+                // query's own Gate 3/4 reordering fix for the identical
+                // reason).
+                if (group_id.size() > kMgmtGroupIdMaxLen) {
+                    reject_field_too_large(std::format(
+                        "group_id must be at most {} bytes", kMgmtGroupIdMaxLen));
+                    return;
+                }
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9460,15 +9537,95 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
                     return;
-                if (!mgmt_store) {
-                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto group_id = param_str(args, "group_id");
                 if (group_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "group_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): see
+                // create_management_group's identical comment above -
+                // requires_approval() never fires for an EMPTY mcp_tier, and
+                // /mcp/v1/'s auth_fn admits that caller class same as REST.
+                if (group_id.size() > kMgmtGroupIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("group_id must be at most {} bytes", kMgmtGroupIdMaxLen));
+                    return;
+                }
+                // #4353 follow-up: type- and length-check every optional field
+                // against the RAW args BEFORE the store lookup below, so the
+                // error a caller gets for an oversized field never depends on
+                // whether group_id happens to resolve (Gate 8 consistency-
+                // auditor finding: checking these after `get_group()` reports
+                // "group not found" for an oversized field on an unknown id,
+                // and "field too large" for the SAME oversized field on a
+                // known one - same input class, different outcome).
+                std::optional<std::string> new_name, new_description, new_parent_id,
+                    new_membership_type, new_scope_expression;
+                if (args.contains("name")) {
+                    if (!args["name"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "name must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    new_name = args["name"].get<std::string>();
+                    if (new_name->size() > kMgmtGroupNameMaxLen) {
+                        reject_field_too_large(std::format(
+                            "name must be at most {} bytes", kMgmtGroupNameMaxLen));
+                        return;
+                    }
+                }
+                if (args.contains("description")) {
+                    if (!args["description"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "description must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    new_description = args["description"].get<std::string>();
+                    if (new_description->size() > kMgmtGroupDescriptionMaxLen) {
+                        reject_field_too_large(std::format(
+                            "description must be at most {} bytes", kMgmtGroupDescriptionMaxLen));
+                        return;
+                    }
+                }
+                if (args.contains("parent_id")) {
+                    if (!args["parent_id"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "parent_id must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    new_parent_id = args["parent_id"].get<std::string>();
+                    if (new_parent_id->size() > kMgmtGroupIdMaxLen) {
+                        reject_field_too_large(std::format(
+                            "parent_id must be at most {} bytes", kMgmtGroupIdMaxLen));
+                        return;
+                    }
+                }
+                if (args.contains("membership_type")) {
+                    if (!args["membership_type"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "membership_type must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    new_membership_type = args["membership_type"].get<std::string>();
+                }
+                if (args.contains("scope_expression")) {
+                    if (!args["scope_expression"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    new_scope_expression = args["scope_expression"].get<std::string>();
+                    if (new_scope_expression->size() > kMgmtGroupScopeExprMaxLen) {
+                        reject_field_too_large(
+                            std::format("scope_expression must be at most {} bytes",
+                                        kMgmtGroupScopeExprMaxLen));
+                        return;
+                    }
+                }
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9482,46 +9639,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
 
                 auto updated = *existing;
-                if (args.contains("name")) {
-                    if (!args["name"].is_string()) {
-                        res.set_content(a4_error(kInvalidParams, "name must be a string"),
-                                        "application/json");
-                        return;
-                    }
-                    updated.name = args["name"].get<std::string>();
-                }
-                if (args.contains("description")) {
-                    if (!args["description"].is_string()) {
-                        res.set_content(a4_error(kInvalidParams, "description must be a string"),
-                                        "application/json");
-                        return;
-                    }
-                    updated.description = args["description"].get<std::string>();
-                }
-                if (args.contains("parent_id")) {
-                    if (!args["parent_id"].is_string()) {
-                        res.set_content(a4_error(kInvalidParams, "parent_id must be a string"),
-                                        "application/json");
-                        return;
-                    }
-                    updated.parent_id = args["parent_id"].get<std::string>();
-                }
-                if (args.contains("membership_type")) {
-                    if (!args["membership_type"].is_string()) {
-                        res.set_content(a4_error(kInvalidParams, "membership_type must be a string"),
-                                        "application/json");
-                        return;
-                    }
-                    updated.membership_type = args["membership_type"].get<std::string>();
-                }
-                if (args.contains("scope_expression")) {
-                    if (!args["scope_expression"].is_string()) {
-                        res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
-                                        "application/json");
-                        return;
-                    }
-                    updated.scope_expression = args["scope_expression"].get<std::string>();
-                }
+                if (new_name) updated.name = *new_name;
+                if (new_description) updated.description = *new_description;
+                if (new_parent_id) updated.parent_id = *new_parent_id;
+                if (new_membership_type) updated.membership_type = *new_membership_type;
+                if (new_scope_expression) updated.scope_expression = *new_scope_expression;
 
                 if (group_id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "cannot re-parent root group"),
@@ -9607,16 +9729,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ManagementGroup", "Write"))
                     return;
-                if (!mgmt_store) {
-                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto group_id = param_str(args, "group_id");
                 const auto agent_id = param_str(args, "agent_id");
                 if (group_id.empty() || agent_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "group_id and agent_id are required"),
+                                    "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): see
+                // create_management_group's identical comment above. Schema
+                // bounds both at 256 B; kMgmtGroupIdMaxLen is reused for
+                // agent_id (a different concept, same value) rather than a
+                // second 256 constant.
+                if (group_id.size() > kMgmtGroupIdMaxLen || agent_id.size() > kMgmtGroupIdMaxLen) {
+                    reject_field_too_large(std::format(
+                        "group_id and agent_id must each be at most {} bytes", kMgmtGroupIdMaxLen));
+                    return;
+                }
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9669,15 +9801,25 @@ McpServer::HandlerFn McpServer::build_handler(
                 // via MCP where REST would 403 them.
                 if (!perm_fn(req, res, "ManagementGroup", "Read"))
                     return;
-                if (!mgmt_store) {
-                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto group_id = param_str(args, "group_id");
                 if (group_id.empty()) {
                     res.set_content(a4_error(kInvalidParams, "group_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now. Checked
+                // ahead of the store-availability gate below - a malformed
+                // request is a client error regardless of backend
+                // availability.
+                if (group_id.size() > kMgmtGroupIdMaxLen) {
+                    reject_field_too_large(std::format(
+                        "group_id must be at most {} bytes", kMgmtGroupIdMaxLen));
+                    return;
+                }
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -9737,12 +9879,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!mgmt_store || !rbac_store) {
-                    res.set_content(a4_error(kInternalError, "service unavailable", "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto group_id = param_str(args, "group_id");
                 const auto principal_type = param_str(args, "principal_type", "user");
                 const auto principal_id = param_str(args, "principal_id");
@@ -9751,6 +9887,23 @@ McpServer::HandlerFn McpServer::build_handler(
                     res.set_content(
                         a4_error(kInvalidParams, "group_id, principal_id, and role_name are required"),
                         "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): see
+                // create_management_group's identical comment above. Checked
+                // ahead of the store-availability gate below - a malformed
+                // request is a client error regardless of backend
+                // availability.
+                if (group_id.size() > kMgmtGroupIdMaxLen || principal_id.size() > kMgmtGroupIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("group_id and principal_id must each be at most {} bytes",
+                                    kMgmtGroupIdMaxLen));
+                    return;
+                }
+                if (!mgmt_store || !rbac_store) {
+                    res.set_content(a4_error(kInternalError, "service unavailable", "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
                     return;
                 }
                 if (role_name != "Operator" && role_name != "Viewer") {
@@ -10756,12 +10909,22 @@ McpServer::HandlerFn McpServer::build_handler(
             };
 
             if (tool_name == "list_result_sets") {
+                std::string cursor = param_str(args, "cursor");
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now. Checked
+                // ahead of the store-availability gate below - a malformed
+                // request is a client error regardless of backend
+                // availability.
+                if (cursor.size() > kMcpCursorMaxLen) {
+                    reject_field_too_large(
+                        std::format("cursor must be at most {} bytes", kMcpCursorMaxLen));
+                    return;
+                }
                 if (!result_set_store_) {
                     res.set_content(a4_error(kInternalError, "result-set store unavailable"),
                                     "application/json");
                     return;
                 }
-                std::string cursor = param_str(args, "cursor");
                 int64_t limit = param_int(args, "limit", 50);
                 if (limit < 1)
                     limit = 1;
@@ -10782,20 +10945,38 @@ McpServer::HandlerFn McpServer::build_handler(
             }
 
             if (tool_name == "create_result_set") {
-                if (!result_set_store_) {
-                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
-                                    "application/json");
-                    return;
-                }
                 CreateRequest cr;
                 cr.owner_principal = session->username;
                 cr.name = param_str(args, "name");
                 cr.source_kind = param_str(args, "source_kind", "manual_curate");
                 cr.source_payload =
                     args.contains("source_payload") ? args["source_payload"].dump() : std::string("{}");
+                // #4353 follow-up: this tool is never approval-gated (Write, but
+                // no ManagementGroup/UserManagement/Security/Policy/Execution
+                // securable_type here - see requires_approval()), so the
+                // schema's maxLength was pure advice until now. Checked ahead
+                // of the store-availability gate below - a malformed request
+                // is a client error regardless of backend availability.
+                if (cr.name.size() > kResultSetNameMaxLen ||
+                    cr.source_kind.size() > kResultSetSourceKindMaxLen) {
+                    reject_field_too_large(std::format(
+                        "name must be at most {} bytes and source_kind at most {} bytes",
+                        kResultSetNameMaxLen, kResultSetSourceKindMaxLen));
+                    return;
+                }
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
                     auto pid = args["parent_id"].get<std::string>();
+                    if (pid.size() > kResultSetParentIdMaxLen) {
+                        reject_field_too_large(std::format(
+                            "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
                     // Owner-check the parent before persisting the lineage
                     // edge, else an operator could parent onto a victim's id
                     // and read its metadata back via get_result_set_lineage.
@@ -10806,9 +10987,17 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 std::vector<std::string> members;
                 if (args.contains("device_ids") && args["device_ids"].is_array()) {
-                    for (const auto& d : args["device_ids"])
-                        if (d.is_string())
-                            members.push_back(d.get<std::string>());
+                    for (const auto& d : args["device_ids"]) {
+                        if (!d.is_string())
+                            continue;
+                        auto member = d.get<std::string>();
+                        if (member.size() > kResultSetDeviceIdMaxLen) {
+                            reject_field_too_large(std::format(
+                                "a device_ids entry exceeds {} bytes", kResultSetDeviceIdMaxLen));
+                            return;
+                        }
+                        members.push_back(std::move(member));
+                    }
                 }
                 if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
                     if (metrics)
@@ -10924,6 +11113,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         cond.field = field_str("field");
                         cond.op = field_str("op");
                         cond.value = field_str("value");
+                        // #4353 follow-up: this tool is never approval-gated
+                        // (Inventory:Read, via fleet_read_fn_ above), so the
+                        // schema's maxLength was pure advice until now.
+                        if (cond.plugin.size() > kInventoryQueryPluginMaxLen ||
+                            cond.field.size() > kInventoryQueryFieldMaxLen ||
+                            cond.op.size() > kInventoryQueryOpMaxLen ||
+                            cond.value.size() > kInventoryQueryValueMaxLen) {
+                            reject_field_too_large(std::format(
+                                "a conditions entry exceeds its field bound (plugin<={}, "
+                                "field<={}, op<={}, value<={} bytes)",
+                                kInventoryQueryPluginMaxLen, kInventoryQueryFieldMaxLen,
+                                kInventoryQueryOpMaxLen, kInventoryQueryValueMaxLen));
+                            return;
+                        }
                         eval_req.conditions.push_back(std::move(cond));
                     }
                 }
@@ -10954,6 +11157,18 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4353 follow-up: this tool is never approval-gated, so the
+                // schema's maxLength was pure advice until now. Checked ahead
+                // of the store-availability gates below - a malformed request
+                // is a client error regardless of backend availability (same
+                // reordering rationale as the conditions/parent_id-shape
+                // checks above).
+                if (const auto name_arg = param_str(args, "name");
+                    name_arg.size() > kResultSetNameMaxLen) {
+                    reject_field_too_large(
+                        std::format("name must be at most {} bytes", kResultSetNameMaxLen));
+                    return;
+                }
                 if (!result_set_store_) {
                     res.set_content(a4_error(kInternalError, "result-set store unavailable"),
                                     "application/json");
@@ -10976,6 +11191,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
                     auto pid = args["parent_id"].get<std::string>();
+                    if (pid.size() > kResultSetParentIdMaxLen) {
+                        reject_field_too_large(std::format(
+                            "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
                     auto parent = rs_load_owned(pid);
                     if (!parent)
                         return;
@@ -11095,6 +11315,28 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // #4353 follow-up (Gate 2 finding on #4364): this tool IS
+                // approval-gated at supervised tier (Execution:Execute is in
+                // requires_approval()'s list), but an operator-tier call
+                // auto-approves and skips C8's validate() entirely - the
+                // schema's maxLength on name/parent_id was advisory-only on
+                // that tier until now. `sql` above is a pre-existing, already
+                // tier-independent check; this closes the other two fields.
+                {
+                    const auto name_arg = param_str(args, "name");
+                    if (name_arg.size() > kResultSetNameMaxLen) {
+                        reject_field_too_large(
+                            std::format("name must be at most {} bytes", kResultSetNameMaxLen));
+                        return;
+                    }
+                    if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                        args["parent_id"].get_ref<const std::string&>().size() >
+                            kResultSetParentIdMaxLen) {
+                        reject_field_too_large(std::format(
+                            "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
+                }
                 // .value() throws nlohmann::json::type_error on a type mismatch
                 // rather than coercing (Gate 4 unhappy-path fix) - check the type
                 // explicitly so a non-boolean include_empty is a clean 400, not an
@@ -11124,19 +11366,83 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "create_result_set_from_instruction_result") {
                 if (!perm_fn(req, res, "Execution", "Execute"))
                     return;
-                if (!instruction_store || !instruction_store->is_open()) {
-                    res.set_content(
-                        a4_error(kInternalError, "instruction store not available",
-                                 "retry once the server reports ready",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
-                    return;
-                }
                 std::string instruction_id = param_str(args, "instruction_id");
                 if (instruction_id.empty()) {
                     res.set_content(
                         error_response(id, kInvalidParams,
                                        "RESULT_SET_BAD_REQUEST: 'instruction_id' is required"),
+                        "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): this tool IS
+                // approval-gated at supervised tier (Execution:Execute), but an
+                // operator-tier call auto-approves and skips C8's validate()
+                // entirely - every one of these bounds was advisory-only on
+                // that tier until now. Checked ahead of the store-availability
+                // gate below - a malformed request is a client error
+                // regardless of backend availability.
+                if (instruction_id.size() > kInstructionIdMaxLen) {
+                    reject_field_too_large(std::format(
+                        "instruction_id must be at most {} bytes", kInstructionIdMaxLen));
+                    return;
+                }
+                {
+                    const auto name_arg = param_str(args, "name");
+                    if (name_arg.size() > kResultSetNameMaxLen) {
+                        reject_field_too_large(
+                            std::format("name must be at most {} bytes", kResultSetNameMaxLen));
+                        return;
+                    }
+                    if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                        args["parent_id"].get_ref<const std::string&>().size() >
+                            kResultSetParentIdMaxLen) {
+                        reject_field_too_large(std::format(
+                            "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
+                        return;
+                    }
+                    if (args.contains("matcher") && args["matcher"].is_object()) {
+                        const auto& m = args["matcher"];
+                        auto matcher_field_len = [&m](const char* key) -> std::size_t {
+                            return (m.contains(key) && m[key].is_string())
+                                       ? m[key].template get_ref<const std::string&>().size()
+                                       : 0;
+                        };
+                        if (matcher_field_len("column") > kMatcherColumnMaxLen ||
+                            matcher_field_len("op") > kMatcherOpMaxLen ||
+                            matcher_field_len("value") > kMatcherValueMaxLen) {
+                            reject_field_too_large(std::format(
+                                "a matcher field exceeds its bound (column<={}, op<={}, "
+                                "value<={} bytes)",
+                                kMatcherColumnMaxLen, kMatcherOpMaxLen, kMatcherValueMaxLen));
+                            return;
+                        }
+                    }
+                    if (args.contains("params") && args["params"].is_object()) {
+                        for (const auto& [k, v] : args["params"].items()) {
+                            (void)k;
+                            // Measure what the handler will actually store: a
+                            // non-string value is dumped to text below
+                            // (`v.is_string() ? v.get<std::string>() :
+                            // v.dump()`) and the dump is what reaches
+                            // source_payload/dispatch, so bounding only the
+                            // string case would under-count (same fix shape
+                            // as execute_instruction's own params-value check).
+                            const std::size_t vlen = v.is_string()
+                                                          ? v.get_ref<const std::string&>().size()
+                                                          : v.dump().size();
+                            if (vlen > kExecInstrParamValueMaxLen) {
+                                reject_field_too_large(std::format(
+                                    "a params value exceeds {} bytes", kExecInstrParamValueMaxLen));
+                                return;
+                            }
+                        }
+                    }
+                }
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "instruction store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
@@ -11184,6 +11490,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (rs_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "id is required"),
                                     "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): this tool IS
+                // approval-gated at supervised tier (Execution:Execute), but an
+                // operator-tier call auto-approves and skips C8's validate()
+                // entirely - the schema's maxLength was advisory-only on that
+                // tier until now.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
                     return;
                 }
                 auto orig = rs_load_owned(rs_id);
@@ -11309,6 +11625,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
+                    return;
+                }
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
@@ -11326,10 +11649,22 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
+                    return;
+                }
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
                 std::string cursor = param_str(args, "cursor");
+                if (cursor.size() > kMcpCursorMaxLen) {
+                    reject_field_too_large(
+                        std::format("cursor must be at most {} bytes", kMcpCursorMaxLen));
+                    return;
+                }
                 int64_t limit = param_int(args, "limit", 1000);
                 if (limit < 1)
                     limit = 1;
@@ -11356,6 +11691,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
+                    return;
+                }
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
@@ -11379,6 +11721,15 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (rs_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "id is required"),
                                     "application/json");
+                    return;
+                }
+                // #4353 follow-up: this tool is never approval-gated
+                // (Infrastructure:Write is absent from requires_approval()'s
+                // list, and tier_allows() confines it to supervised tier
+                // anyway), so the schema's maxLength was pure advice until now.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
                     return;
                 }
                 auto row = rs_load_owned(rs_id);
@@ -11421,6 +11772,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // #4353 follow-up: this tool is never approval-gated
+                // (Infrastructure:Write is absent from requires_approval()'s
+                // list, and tier_allows() confines it to supervised tier
+                // anyway), so the schema's maxLength was pure advice until now.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
+                    return;
+                }
                 auto row = rs_load_owned(rs_id);
                 if (!row)
                     return;
@@ -11460,6 +11820,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 if (rs_id.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "id is required"),
                                     "application/json");
+                    return;
+                }
+                // #4353 follow-up (Gate 2 finding on #4364): Infrastructure:Delete
+                // IS approval-gated at supervised tier (requires_approval()
+                // fires for any Delete op), and tier_allows() denies operator
+                // tier for it entirely - but requires_approval() returns false
+                // for an EMPTY mcp_tier, and /mcp/v1/'s auth_fn (require_auth)
+                // admits a plain RBAC session or non-MCP-tiered API token the
+                // same as any REST route, so C8's validate() never runs for
+                // that caller class either.
+                if (rs_id.size() > kResultSetIdMaxLen) {
+                    reject_field_too_large(
+                        std::format("id must be at most {} bytes", kResultSetIdMaxLen));
                     return;
                 }
                 auto row = rs_load_owned(rs_id);
@@ -22201,18 +22574,30 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!rbac_store) {
-                    res.set_content(a4_error(kInternalError, "service unavailable", "retry the request",
-                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 const auto securable_type = param_str(args, "securable_type");
                 const auto operation = param_str(args, "operation");
                 if (securable_type.empty() || operation.empty()) {
                     res.set_content(
                         a4_error(kInvalidParams, "securable_type and operation are required"),
                         "application/json");
+                    return;
+                }
+                // #4353 follow-up: this tool is never approval-gated (Read), so
+                // the schema's maxLength was pure advice until now. Checked
+                // ahead of the store-availability gate below - a malformed
+                // request is a client error regardless of backend
+                // availability.
+                if (securable_type.size() > kCheckPermSecurableTypeMaxLen ||
+                    operation.size() > kCheckPermOperationMaxLen) {
+                    reject_field_too_large(std::format(
+                        "securable_type must be at most {} bytes and operation at most {} bytes",
+                        kCheckPermSecurableTypeMaxLen, kCheckPermOperationMaxLen));
+                    return;
+                }
+                if (!rbac_store) {
+                    res.set_content(a4_error(kInternalError, "service unavailable", "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
                     return;
                 }
                 const bool allowed =
