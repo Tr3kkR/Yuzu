@@ -73,6 +73,54 @@ inline const std::vector<std::string>& columns_for_plugin(const std::string& plu
     return kDefaultColumns;
 }
 
+// -- Per-cell operator hints --------------------------------------------------
+//
+// A rendered cell's raw value can have a non-obvious meaning an operator
+// reading the results table has no way to infer from the value alone (#4187:
+// autoruns' `enabled=unknown` reads as "maybe disabled?" without context --
+// it actually means the scan couldn't determine enablement at all, a
+// completeness gap, not a disabled-vs-enabled fact). Table-driven so this
+// stays a small, reviewable list of (plugin, row-kind, column, value) ->
+// hint entries rather than a plugin-name branch inside the shared renderer
+// every plugin's rows pass through.
+
+struct CellHint {
+    std::string_view plugin;
+    std::string_view row_kind; // fields[0] to match; empty = any row kind
+    std::size_t field_index;
+    std::string_view value;
+    std::string_view hint;
+};
+
+inline const std::vector<CellHint>& cell_hints() {
+    static const std::vector<CellHint> kHints{
+        {"autoruns", "autorun", 7, "unknown",
+         "unknown = enablement could not be determined (a directory scan this "
+         "reading depends on was capped or hit a read error, or the rung-2 "
+         "systemctl fallback text carries no enablement evidence) -- not the "
+         "same as disabled. See the autoruns user manual."},
+    };
+    return kHints;
+}
+
+/// Returns a non-empty operator-facing hint for `fields[field_index]` when
+/// this exact (plugin, row-kind, column, value) combination has a
+/// documented non-obvious meaning; otherwise an empty string_view (the
+/// overwhelmingly common case -- most cells need no hint).
+inline std::string_view cell_hint_for(const std::string& plugin,
+                                      const std::vector<std::string>& fields,
+                                      std::size_t field_index) {
+    if (field_index >= fields.size()) return {};
+    for (const auto& h : cell_hints()) {
+        if (h.plugin != plugin) continue;
+        if (h.field_index != field_index) continue;
+        if (!h.row_kind.empty() && (fields.empty() || fields[0] != h.row_kind)) continue;
+        if (fields[field_index] != h.value) continue;
+        return h.hint;
+    }
+    return {};
+}
+
 // -- Pipe-delimited field splitting -------------------------------------------
 
 /// Find the next unescaped '|' starting at @p pos. Returns npos if not found.
