@@ -203,9 +203,9 @@ TEST_CASE("peripherals plugin: every action's row shape is well-formed",
         CHECK(result.rc == 0); // a degraded read is never a failed command
 
         const auto rows = captured_rows(result.captured);
-        // Every leg emits at least one row, including the wave-1 placeholder
-        // unavailable one: a consumer reading rows must never see silence
-        // and infer "this host has no such devices".
+        // Every leg emits at least one row, including an `unavailable` one on
+        // a genuine leg-level failure: a consumer reading rows must never see
+        // silence and infer "this host has no such devices".
         REQUIRE_FALSE(rows.empty());
 
         for (const auto& r : rows) {
@@ -216,8 +216,8 @@ TEST_CASE("peripherals plugin: every action's row shape is well-formed",
                 // <kind>|none -- the leg read cleanly and found nothing.
                 CHECK(f[1] == "none");
             } else if (f.size() == 3) {
-                // <kind>|unavailable|<token> -- wave-1's placeholder shape,
-                // or a genuine future degradation.
+                // <kind>|unavailable|<token> -- a genuine leg-level failure
+                // (see mark_result_read, peripherals_legs.hpp).
                 CHECK(f[1] == "unavailable");
             } else {
                 // A real row: the documented field count for this action.
@@ -362,12 +362,12 @@ TEST_CASE("peripherals plugin: thunderbolt reports a real row or is explicitly S
 //
 // P91-6-02 (Architect ruling, ws91): this case originally pinned the wave-1
 // truth (every leg is the not_implemented placeholder -> every action
-// reports CONSTRAINED/PARTIAL). Wave 2 replaces all three legs' bodies with
-// real bus walks, so that blanket assertion is now false on every OS the
-// moment I91-2 wires this suite in -- a healthy walk (this Mac's 8 IOPCIDevice
+// reports CONSTRAINED/PARTIAL). Wave 2 replaced all three legs' bodies with
+// real bus walks, so that blanket assertion went false on every OS the
+// moment I91-2 wired this suite in -- a healthy walk (this Mac's 8 IOPCIDevice
 // nodes, say) reports OK/FULL, not CONSTRAINED/PARTIAL. Retargeted to the
-// invariant that survives once no leg is a placeholder: the seam fired, and
-// it paired status with completeness correctly, on either branch.
+// invariant that survives now that no leg is a placeholder: the seam fired,
+// and it paired status with completeness correctly, on either branch.
 TEST_CASE("peripherals: every leg reports through the typed status seam",
           "[peripherals][status]") {
     auto plugin = load_peripherals_plugin();
@@ -410,10 +410,10 @@ TEST_CASE("peripherals plugin: an unknown action is refused, not silently ignore
 }
 
 // BUILD-COMPLETENESS CASE (P91-6, wave 2). All three legs (Windows/Linux/
-// macOS) replace their wave-1 `<os>:leg:not_implemented` placeholder in this
+// macOS) replaced their wave-1 `<os>:leg:not_implemented` placeholder in this
 // same wave, so this case is host-agnostic and carries no platform #ifdef --
-// it is GREEN on every CI OS once wave 2 integrates, and RED only if a real
-// leg placeholder survives past this wave. It does not assert row shape or
+// it is GREEN on every CI OS now that wave 2 has integrated, and RED only if
+// a real leg placeholder ever survives a future wave. It does not assert row shape or
 // count (those are the cases above); it asserts only the one thing every
 // leg's placeholder body shares regardless of OS: the `:leg:not_implemented`
 // suffix on the unavailable token's provenance string. Host-specific counts
