@@ -24294,6 +24294,176 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
     }
 }
 
+// Gate 4 unhappy-path finding (#4364 re-review): create_management_group's
+// four is_string() type checks (added by an earlier #4330 adversarial
+// review round) ran AFTER the mgmt_store availability gate, while this
+// same PR's length checks for the identical field set run ahead of it -
+// an inconsistent ordering within one handler. update_management_group,
+// the sibling touched by the same fix, already runs both ahead of its own
+// store gate. Proven here with mgmt_store deliberately left unwired
+// (nullptr), which would otherwise 503 first.
+TEST_CASE("MCP create_management_group: a type-mismatched field is a client error even when "
+          "the management-group store is unavailable",
+          "[mcp][management_group][bounds]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_management_group","arguments":{"name":"x","parent_id":123}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("parent_id must be a string") !=
+          std::string::npos);
+}
+
+// Gate 4 unhappy-path finding (#4364 re-review): create_result_set_from_
+// inventory_query's parent_id length check ran after both the
+// result_set_store_ and inventory_store availability gates, unlike every
+// sibling this same PR fixed for the identical reason (create_result_set
+// groups its length checks ahead of its store gate; the `name` field on
+// THIS tool was already moved ahead, three lines above parent_id, but
+// parent_id itself was missed). A malformed request should be a permanent
+// client error regardless of transient backend availability - here proven
+// with BOTH stores left deliberately unwired (nullptr), which would
+// otherwise 503 first.
+TEST_CASE("MCP create_result_set_from_inventory_query: an oversized parent_id is a client "
+          "error even when both backing stores are unavailable",
+          "[mcp][result-sets][bounds]") {
+    McpTestServer ts;
+    ts.start();
+    const std::string big(65, 'a');
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query","arguments":{"conditions":[{"plugin":"os_info","field":"platform","op":"==","value":"linux"}],"parent_id":")" +
+        big + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+}
+
+// Gate 4 unhappy-path finding (#4364 re-review): create_result_set has no
+// source_kind allowlist and only bounds source_kind's own length, so a row
+// can be minted directly (bypassing the create-time params checks
+// create_result_set_from_instruction_result enforces) with an arbitrarily
+// large or over-keyed params object smuggled inside source_payload.
+// reevaluate_result_set's kInstructionResult branch used to rebuild the
+// dispatch params straight from that payload with no re-check - the exact
+// bound this PR exists to add, defeated for a real fleet dispatch, not just
+// a rejected create call. Mirrors the pre-existing sql-size recheck test
+// for the sibling kTarQuery branch (the "unwired caller_fn" TEST_CASE
+// above seeds a row the same way).
+TEST_CASE("MCP reevaluate_result_set: a params object smuggled past create_result_set's "
+          "missing source_kind allowlist is still rejected before dispatch",
+          "[pg][mcp][integration][result-sets][bounds][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+    YUZU_REQUIRE_PG_DB_TPL(instr_db, mcp_instr_tpl);
+    pg::PgPool instr_pool{{.conninfo = instr_db.dsn(), .size = 2}};
+    yuzu::server::InstructionStore instr(instr_pool);
+    REQUIRE(instr.is_open());
+    std::string instruction_id;
+    {
+        yuzu::server::InstructionDefinition def;
+        def.name = "Get OS Version";
+        def.version = "1.0";
+        def.plugin = "os_info";
+        def.action = "version";
+        def.type = "question";
+        def.description = "test";
+        def.enabled = true;
+        auto created = instr.create_definition(def);
+        REQUIRE(created.has_value());
+        instruction_id = *created;
+    }
+
+    SECTION("params with more keys than kExecInstrParamCountMax (32)") {
+        nlohmann::json payload;
+        payload["instruction_id"] = instruction_id;
+        nlohmann::json params = nlohmann::json::object();
+        for (int i = 0; i < 33; ++i)
+            params[std::format("k{}", i)] = "v";
+        payload["params"] = params;
+
+        CreateRequest cr;
+        cr.owner_principal = "test-user"; // McpTestServer's default session principal
+        cr.name = "seed";
+        cr.source_kind = std::string(source_kind::kInstructionResult);
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+
+        bool dispatched = false;
+        auto dispatch =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            dispatched = true;
+            return {.sent = 1, .command_id = "cmd-should-not-happen"};
+        };
+
+        yuzu::MetricsRegistry reg;
+        McpTestServer ts;
+        ts.metrics_for_test = &reg;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.instruction_store_for_test = &instr;
+        ts.start_with_dispatch(dispatch, "operator");
+
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            seeded->id + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "reevaluate_result_set"}, {"reason", "arg_too_large"}})
+                  .value() == 1.0);
+        CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+    }
+
+    SECTION("a params value longer than kExecInstrParamValueMaxLen (65536) bytes") {
+        nlohmann::json payload;
+        payload["instruction_id"] = instruction_id;
+        payload["params"] = {{"k", std::string(65537, 'z')}};
+
+        CreateRequest cr;
+        cr.owner_principal = "test-user";
+        cr.name = "seed";
+        cr.source_kind = std::string(source_kind::kInstructionResult);
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+
+        bool dispatched = false;
+        auto dispatch =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            dispatched = true;
+            return {.sent = 1, .command_id = "cmd-should-not-happen"};
+        };
+
+        McpTestServer ts;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.instruction_store_for_test = &instr;
+        ts.start_with_dispatch(dispatch, "operator");
+
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            seeded->id + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK_FALSE(dispatched);
+    }
+}
+
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
 // (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
 // rows are visible) had zero red -> green test coverage on either transport -

@@ -9396,19 +9396,17 @@ McpServer::HandlerFn McpServer::build_handler(
                         kMgmtGroupScopeExprMaxLen));
                     return;
                 }
-                if (!mgmt_store) {
-                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
-                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                    "application/json");
-                    return;
-                }
                 // Gate 4 unhappy-path BLOCKING fix (#2146 Batch B4 review):
                 // param_str silently returns "" on a JSON type mismatch,
                 // unlike update_management_group's own explicit is_string()
-                // checks four lines below - a caller sending e.g. a numeric
-                // parent_id got a top-level group created instead of the
-                // child they asked for, with no error. Matches the sibling
-                // handler's pattern exactly.
+                // checks - a caller sending e.g. a numeric parent_id got a
+                // top-level group created instead of the child they asked
+                // for, with no error. Matches the sibling handler's pattern
+                // exactly. Gate 4 unhappy-path finding on #4364: moved ahead
+                // of the store-availability gate below, alongside the length
+                // check above - a type-mismatched field is a client error
+                // regardless of backend availability, same reordering
+                // rationale as the length check just above it.
                 if (args.contains("description") && !args["description"].is_string()) {
                     res.set_content(a4_error(kInvalidParams, "description must be a string"),
                                     "application/json");
@@ -9426,6 +9424,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (args.contains("scope_expression") && !args["scope_expression"].is_string()) {
                     res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
                     return;
                 }
@@ -11179,11 +11183,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 // of the store-availability gates below - a malformed request
                 // is a client error regardless of backend availability (same
                 // reordering rationale as the conditions/parent_id-shape
-                // checks above).
+                // checks above). Gate 4 unhappy-path finding: parent_id's own
+                // length check used to sit below these gates while name's sat
+                // above - moved parent_id's check up here too, so both fields
+                // get the same client-error classification regardless of
+                // backend availability.
                 if (const auto name_arg = param_str(args, "name");
                     name_arg.size() > kResultSetNameMaxLen) {
                     reject_field_too_large(
                         std::format("name must be at most {} bytes", kResultSetNameMaxLen));
+                    return;
+                }
+                if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                    args["parent_id"].get_ref<const std::string&>().size() >
+                        kResultSetParentIdMaxLen) {
+                    reject_field_too_large(std::format(
+                        "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
                     return;
                 }
                 if (!result_set_store_) {
@@ -11207,12 +11222,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 cr.source_payload = args.dump();
                 if (args.contains("parent_id") && args["parent_id"].is_string() &&
                     !args["parent_id"].get_ref<const std::string&>().empty()) {
+                    // Length already checked above, ahead of the store gates.
                     auto pid = args["parent_id"].get<std::string>();
-                    if (pid.size() > kResultSetParentIdMaxLen) {
-                        reject_field_too_large(std::format(
-                            "parent_id must be at most {} bytes", kResultSetParentIdMaxLen));
-                        return;
-                    }
                     auto parent = rs_load_owned(pid);
                     if (!parent)
                         return;
@@ -11644,6 +11655,38 @@ McpServer::HandlerFn McpServer::build_handler(
                                            "RESULT_SET_BAD_REQUEST: original instruction unavailable"),
                             "application/json");
                         return;
+                    }
+                    // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME three
+                    // caps create_result_set_from_instruction_result enforces at
+                    // creation time. `orig` may have been minted via the uncapped
+                    // create_result_set constructor (source_kind labeled
+                    // instruction_result with no create-time params check of its
+                    // own) - without this, re-eval would smuggle an over-keyed
+                    // or oversized params object past those caps, then dispatch
+                    // it fleet-wide. Mirrors the sql-size recheck in the
+                    // kTarQuery branch above.
+                    if (sp.contains("params") && sp["params"].is_object()) {
+                        const auto& p = sp["params"];
+                        if (p.size() > kExecInstrParamCountMax) {
+                            reject_field_too_large(std::format(
+                                "params must have at most {} keys", kExecInstrParamCountMax));
+                            return;
+                        }
+                        for (const auto& [k, v] : p.items()) {
+                            if (k.size() > kExecInstrParamKeyMaxLen) {
+                                reject_field_too_large(std::format(
+                                    "a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
+                                return;
+                            }
+                            const std::size_t vlen = v.is_string()
+                                                          ? v.get_ref<const std::string&>().size()
+                                                          : v.dump().size();
+                            if (vlen > kExecInstrParamValueMaxLen) {
+                                reject_field_too_large(std::format(
+                                    "a params value exceeds {} bytes", kExecInstrParamValueMaxLen));
+                                return;
+                            }
+                        }
                     }
                     std::unordered_map<std::string, std::string> params;
                     if (sp.contains("params") && sp["params"].is_object())
