@@ -11,7 +11,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
-#include "../../agents/plugins/windows_optional_features/src/windows_optional_features_parsers.hpp"
+#include "../../agents/shared/windows_optional_features_parsers.hpp"
 
 #include <filesystem>
 #include <fstream>
