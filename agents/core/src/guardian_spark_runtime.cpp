@@ -2874,8 +2874,9 @@ void GuardianSparkRuntime::begin_stop() {
     // under the same lock unconditionally, and journal_maintenance_tick() (every
     // heartbeat) does too, but ONLY when prefer_spark_ is true - it no-ops immediately
     // after taking mtx_ otherwise (guardian_engine.cpp:767), which is production's
-    // default today. None of that is a *backend* wait this wake-up reaches, so stop() is decoupled from
-    // backend-arm latency, not from any mtx_ holder's own duration. This DOES matter for a caller that
+    // default today. None of that is a *backend* wait this wake-up reaches - stop()
+    // is decoupled from backend-arm latency, not from any mtx_ holder's own
+    // duration. This DOES matter for a caller that
     // already holds mtx_ across a DIFFERENT blocking section calling begin_stop()
     // directly, and for the runtime's own destructor path.
     //
