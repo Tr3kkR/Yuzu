@@ -2406,7 +2406,8 @@ elif host_machine.system() == 'darwin'
     'remediation_macos.cpp',
   )
   guardian_deps += [
-    dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'EndpointSecurity']),
+    dependency('appleframeworks', modules: ['CoreFoundation', 'Security']),
+    cxx.find_library('EndpointSecurity', required: false),
   ]
 endif
 ```

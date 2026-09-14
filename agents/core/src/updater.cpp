@@ -1007,6 +1007,16 @@ void Updater::cleanup_old_binary() {
     }
 }
 
+bool Updater::perform_startup_maintenance() {
+    if (!config_.enabled) {
+        return false;
+    }
+
+    const bool rolled_back = rollback_if_needed();
+    cleanup_old_binary();
+    return rolled_back;
+}
+
 bool Updater::rollback_if_needed() {
     namespace fs = std::filesystem;
 

@@ -7,13 +7,15 @@
     const char msg[] = "[DIAG] EXE static-init starting (before C++ globals)\n";
     _write(2, msg, sizeof(msg) - 1);
 }
-__declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
+__declspec(allocate(".CRT$XCB"))
+[[maybe_unused]] static void(__cdecl* p_diag_init)() = diag_before_static_init;
 #endif
 
 #include <yuzu/agent/updater.hpp>
 #include <yuzu/agent/agent.hpp>
 #include <yuzu/agent/env_util.hpp>
 #include <yuzu/agent/identity_store.hpp>
+#include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/json_log_formatter.hpp>
 #include <yuzu/version.hpp>
 
@@ -31,7 +33,7 @@ __declspec(allocate(".CRT$XCB")) [[maybe_unused]] static void(__cdecl* p_diag_in
 #ifdef _WIN32
 #include <win_sc_handle.hpp> // shared yuzu::win SC_HANDLE RAII owner (#1822)
 #else
-#include <fcntl.h>  // O_CLOEXEC / O_NONBLOCK / FD_CLOEXEC on the shutdown self-pipe
+#include <fcntl.h> // O_CLOEXEC / O_NONBLOCK / FD_CLOEXEC on the shutdown self-pipe
 #include <unistd.h>
 #endif
 
@@ -280,7 +282,6 @@ static void on_signal(int sig) {
     errno = saved_errno;
 }
 
-
 // Verifies preconditions and constructs the Agent. Shared by the console path and
 // the Windows service path (service_win.cpp's ServiceMain calls this on its own
 // thread, after reporting SERVICE_START_PENDING) so both go through identical
@@ -288,8 +289,8 @@ static void on_signal(int sig) {
 static std::unique_ptr<yuzu::agent::Agent> make_agent(yuzu::agent::Config cfg) {
     // Verify SQLite was compiled with thread-safety (FULLMUTEX requires SQLITE_THREADSAFE != 0)
     if (sqlite3_threadsafe() == 0) {
-        spdlog::critical(
-            "SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, concurrent access unsafe");
+        spdlog::critical("SQLite compiled with SQLITE_THREADSAFE=0 — FULLMUTEX disabled, "
+                         "concurrent access unsafe");
         return nullptr;
     }
 
@@ -413,6 +414,10 @@ int main(int argc, char* argv[]) {
                  "Reject plugins that have no .sig sibling file (default: allow unsigned "
                  "if --plugin-trust-bundle is set, for transitional rollouts)")
         ->envname("YUZU_PLUGIN_REQUIRE_SIGNATURE");
+    std::filesystem::path plugin_signature_to_verify;
+    app.add_option("--verify-plugin-signature", plugin_signature_to_verify,
+                   "Verify one plugin CMS sidecar with --plugin-trust-bundle and exit")
+        ->group("");
     app.add_option("--update-trust-bundle", cfg.update_trust_bundle,
                    "PEM CA bundle for verifying the code-signing certificate on OTA update "
                    "binaries (#416). Place it at install time, NOT over the update channel: a "
@@ -488,6 +493,19 @@ int main(int argc, char* argv[]) {
 
     CLI11_PARSE(app, argc, argv);
 
+    if (!plugin_signature_to_verify.empty()) {
+        if (cfg.plugin_trust_bundle.empty()) {
+            std::cerr << "--verify-plugin-signature requires --plugin-trust-bundle\n";
+            return EXIT_FAILURE;
+        }
+        if (auto error = yuzu::agent::verify_plugin_signature(plugin_signature_to_verify,
+                                                              cfg.plugin_trust_bundle)) {
+            std::cerr << "Plugin signature rejected: " << *error << '\n';
+            return EXIT_FAILURE;
+        }
+        return EXIT_SUCCESS;
+    }
+
     // Fail closed on a combination that would silently fail OPEN.
     //
     // Signature checking is gated on a trust bundle being configured, so
@@ -560,8 +578,8 @@ int main(int argc, char* argv[]) {
                 // (pre-#1822) install that lacks the --service marker, or one whose
                 // args changed. SERVICE_NO_CHANGE preserves start type / error
                 // control / everything else.
-                svc.reset(OpenServiceW(scm.get(), yuzu::agent::win::kServiceName,
-                                       SERVICE_CHANGE_CONFIG));
+                svc.reset(
+                    OpenServiceW(scm.get(), yuzu::agent::win::kServiceName, SERVICE_CHANGE_CONFIG));
                 if (!svc) {
                     std::cerr << "Service exists but could not be opened for update\n";
                     return EXIT_FAILURE;
@@ -587,14 +605,11 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Warning: failed to set service description (" << GetLastError()
                           << ")\n";
             SERVICE_DELAYED_AUTO_START_INFO delayed = {TRUE};
-            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
-                                       &delayed))
+            if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed))
                 std::cerr << "Warning: failed to set delayed auto-start (" << GetLastError()
                           << ")\n";
             SC_ACTION actions[3] = {
-                {SC_ACTION_RESTART, 60000},
-                {SC_ACTION_RESTART, 60000},
-                {SC_ACTION_RESTART, 60000}};
+                {SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 60000}, {SC_ACTION_RESTART, 60000}};
             SERVICE_FAILURE_ACTIONSW failure = {};
             failure.dwResetPeriod = 86400;
             failure.cActions = 3;
@@ -607,8 +622,8 @@ int main(int argc, char* argv[]) {
             // startup refusal), approximating systemd's Restart=always.
             SERVICE_FAILURE_ACTIONS_FLAG flag{TRUE};
             if (!ChangeServiceConfig2W(svc.get(), SERVICE_CONFIG_FAILURE_ACTIONS_FLAG, &flag))
-                std::cerr << "Warning: failed to enable recovery-on-error-exit ("
-                          << GetLastError() << ")\n";
+                std::cerr << "Warning: failed to enable recovery-on-error-exit (" << GetLastError()
+                          << ")\n";
 
             std::cout << (updated_existing ? "Service 'YuzuAgent' updated\n"
                                            : "Service 'YuzuAgent' installed successfully\n");
@@ -730,29 +745,30 @@ int main(int argc, char* argv[]) {
     std::optional<yuzu::ShutdownWatcher> shutdown_watcher;
     try {
         shutdown_watcher.emplace(
-        g_shutdown_wfd,
-        [] {
-            auto* a = g_agent.load(std::memory_order_acquire);
-            if (!a)
-                return false; // not published yet — keep waiting, do not consume the watcher
-            a->stop();        // ordinary thread: safe to lock, join, malloc, log
-            return true;
-        },
-        [] {
-            // TRAP 6 — the watcher died on a read() error. If we leave the handlers installed,
-            // on_signal keeps writing bytes into a pipe with NO READER and every SIGTERM is
-            // SWALLOWED: the agent becomes unkillable by anything but SIGKILL.
-            //
-            // AND SIG_DFL IS NOT THE ANSWER, for the same reason it is not the answer at the
-            // construction-failure site: the agent is PID 1 in every shipped container image, and
-            // the kernel DISCARDS a default-disposition signal for pid 1. Handing the signals
-            // "back to the kernel" there means SIGTERM is IGNORED — the exact unkillable state
-            // this callback exists to escape. Install the hard-exit handler instead: ungraceful,
-            // but genuinely killable, on every platform and as pid 1.
-            // (governance: security-guardian — the sibling site I fixed at one place and not here.)
-            std::signal(SIGINT, on_signal_hard_exit);
-            std::signal(SIGTERM, on_signal_hard_exit);
-        });
+            g_shutdown_wfd,
+            [] {
+                auto* a = g_agent.load(std::memory_order_acquire);
+                if (!a)
+                    return false; // not published yet — keep waiting, do not consume the watcher
+                a->stop();        // ordinary thread: safe to lock, join, malloc, log
+                return true;
+            },
+            [] {
+                // TRAP 6 — the watcher died on a read() error. If we leave the handlers installed,
+                // on_signal keeps writing bytes into a pipe with NO READER and every SIGTERM is
+                // SWALLOWED: the agent becomes unkillable by anything but SIGKILL.
+                //
+                // AND SIG_DFL IS NOT THE ANSWER, for the same reason it is not the answer at the
+                // construction-failure site: the agent is PID 1 in every shipped container image,
+                // and the kernel DISCARDS a default-disposition signal for pid 1. Handing the
+                // signals "back to the kernel" there means SIGTERM is IGNORED — the exact
+                // unkillable state this callback exists to escape. Install the hard-exit handler
+                // instead: ungraceful, but genuinely killable, on every platform and as pid 1.
+                // (governance: security-guardian — the sibling site I fixed at one place and not
+                // here.)
+                std::signal(SIGINT, on_signal_hard_exit);
+                std::signal(SIGTERM, on_signal_hard_exit);
+            });
     } catch (...) {
         // Firewalled: an unguarded spdlog call here would terminate WITHOUT unwinding on exactly
         // the OOM/exhausted host this try exists for. And the handlers are NOT left at SIG_DFL —
@@ -780,7 +796,6 @@ int main(int argc, char* argv[]) {
     struct AgentUnpublisher {
         ~AgentUnpublisher() { g_agent.store(nullptr, std::memory_order_release); }
     } agent_unpublisher;
-
 
 #ifndef _WIN32
     // ONLY install the handlers if the watcher is live. If it is not (pipe or thread
@@ -846,8 +861,8 @@ int main(int argc, char* argv[]) {
     // once the explicit check has run to completion on the normal path (see
     // below); its destructor is a deliberately non-throwing, unlogged fallback
     // for every other path.
-    yuzu::agent::OrphanExitGuard orphan_guard{
-        [&] { return agent->guardian_active_io_workers(); }, yuzu::agent::kOrphanDrainGrace, 3};
+    yuzu::agent::OrphanExitGuard orphan_guard{[&] { return agent->guardian_active_io_workers(); },
+                                              yuzu::agent::kOrphanDrainGrace, 3};
 
     agent->run();
 
@@ -940,8 +955,7 @@ int main(int argc, char* argv[]) {
                                  "after shutdown - forcing process exit rather than race "
                                  "static/DSO teardown against them",
                                  n, yuzu::agent::kOrphanDrainGrace.count());
-            } catch (...) {
-            }
+            } catch (...) {}
             yuzu::agent::hard_exit(3); // distinct from EXIT_FAILURE(1) / signal-hard-exit(1)
         }
     }

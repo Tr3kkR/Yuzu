@@ -232,6 +232,7 @@ agent_test_exe = executable(
     'unit/test_progress_listener.cpp', # #4018 per-test START/END progress log, env-gated
     'unit/test_detached_signature.cpp', # shared detached-CMS verifier (#416/#3807)
     'unit/test_updater_signature.cpp', # OTA signature gate, end to end (#416/#3807)
+    'unit/test_agent_ota_disabled_lifecycle.cpp', # registration → command → reconnect, OTA disabled
     'unit/test_plugin_loader.cpp',
     'unit/test_capability_registry_tables.cpp',
     'unit/test_sdk_utilities.cpp',
@@ -836,11 +837,11 @@ elif host_machine.system() == 'linux'
   endif
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
-  # audit-token helpers, gated on the framework being present (full Xcode SDK).
+  # audit-token helpers, gated on the SDK library present in full Xcode.
   # The live client never starts in CI (unentitled) so the pure-mapping + clean-
-  # fallback tests run regardless; the ES TU only links the framework where it
+  # fallback tests run regardless; the ES TU only links the SDK library where it
   # exists. Mirror the plugin's capability detection (docs/darwin-compat.md).
-  es_test_dep = dependency('appleframeworks', modules: ['EndpointSecurity'], required: false, include_type: 'system')
+  es_test_dep = cxx.find_library('EndpointSecurity', required: false)
   if es_test_dep.found()
     tar_test_deps += es_test_dep
     tar_test_deps += cxx.find_library('bsm')
@@ -928,6 +929,7 @@ tar_test_exe = executable(
   ],
   cpp_args: tar_test_cpp_args,
   objcpp_args: tar_test_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_test_deps,
 )
 test('tar unit tests', tar_test_exe, suite: 'tar', timeout: 90)
@@ -2162,6 +2164,12 @@ endif
 
 # ── Proto codegen tests ────────────────────────────────────────────────────
 _python3_test = find_program('python3', 'python')
+test('macOS Endpoint Security app packaging',
+  _python3_test,
+  args: [files('test_macos_app_packaging.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],

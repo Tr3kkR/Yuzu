@@ -60,9 +60,10 @@ sudo softwareupdate -i "Command Line Tools for Xcode 26.6-26.6"   # match your O
 sudo rm -f /tmp/.com.apple.dt.CommandLineTools.installondemand.in_progress
 ```
 
-CLT SDK is sufficient for CI parity: `EndpointSecurity.framework` (full-Xcode
-only) is compiled as a `required:false` no-op without it. Install full Xcode
-only if you later want to exercise the real ES path on-device.
+CLT SDK is sufficient for CI parity: full Xcode’s Endpoint Security SDK
+(`EndpointSecurity.h` and `libEndpointSecurity.tbd`) is compiled as a
+`required:false` no-op when absent. Install full Xcode only if you later want to
+exercise the real ES path on-device.
 
 ### 2. Shared build substrate
 

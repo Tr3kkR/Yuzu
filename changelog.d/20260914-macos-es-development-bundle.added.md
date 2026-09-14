@@ -1,0 +1,1 @@
+- **macOS Endpoint Security development bundle.** Adds an opt-in signed app-package lane with strict profile preflight, immutable-runtime updater safeguards, external plugins, and recoverable installer transitions.

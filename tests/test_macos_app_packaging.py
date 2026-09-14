@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Portable contracts for the macOS Endpoint Security development package lane."""
+
+from __future__ import annotations
+
+import datetime as dt
+import importlib.util
+import json
+import plistlib
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HELPER = ROOT / "deploy/packaging/macos/build-app.py"
+PLIST_HELPER = ROOT / "deploy/packaging/macos/generate-launchd-plist.py"
+MERGE_PLIST_HELPER = ROOT / "deploy/packaging/macos/merge-launchd-plist.py"
+BUILD_PKG = ROOT / "deploy/packaging/macos/build-pkg.sh"
+MACOS_TRIPLET = ROOT / "triplets/arm64-osx.cmake"
+spec = importlib.util.spec_from_file_location("macos_bundle", HELPER)
+assert spec and spec.loader
+bundle = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(bundle)
+
+
+def profile(**changes: object) -> dict:
+    now = dt.datetime.now(dt.timezone.utc)
+    result: dict = {
+        "Platform": ["macOS"],
+        "CreationDate": now - dt.timedelta(days=1),
+        "ExpirationDate": now + dt.timedelta(days=1),
+        "TeamIdentifier": ["TEAM123"],
+        "ProvisionedDevices": ["device-1"],
+        "DeveloperCertificates": [b"test certificate"],
+        "Entitlements": {
+            "application-identifier": "PREFIX123.com.example.yuzu",
+            "com.apple.developer.team-identifier": "TEAM123",
+            "com.apple.developer.endpoint-security.client": True,
+        },
+    }
+    result.update(changes)
+    return result
+
+
+class ProfileValidationTests(unittest.TestCase):
+    def test_full_xcode_sdk_layout_requires_es_header_and_linker_stub(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_sdk_") as temporary:
+            sdk = Path(temporary)
+            header = sdk / "usr/include/EndpointSecurity/EndpointSecurity.h"
+            stub = sdk / "usr/lib/libEndpointSecurity.tbd"
+            header.parent.mkdir(parents=True)
+            stub.parent.mkdir(parents=True)
+            header.touch()
+            stub.touch()
+            with mock.patch.object(bundle, "run", return_value=str(sdk)):
+                bundle.require_es_sdk()
+            stub.unlink()
+            with mock.patch.object(bundle, "run", return_value=str(sdk)):
+                with self.assertRaisesRegex(bundle.BundleError, "linker stub"):
+                    bundle.require_es_sdk()
+
+    def test_provisioning_udid_is_not_substituted_with_hardware_uuid(self) -> None:
+        hardware_uuid = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
+        provisioning_udid = "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB"
+        system_profiler = (
+            "Hardware:\n"
+            f"    Hardware UUID: {hardware_uuid}\n"
+            f"    Provisioning UDID: {provisioning_udid}\n"
+        )
+        self.assertEqual(bundle.provisioning_udid_from_system_profiler(system_profiler),
+                         provisioning_udid)
+
+    def test_valid_profile_returns_profile_prefix_and_team(self) -> None:
+        self.assertEqual(bundle.validate_profile(profile(), "com.example.yuzu", device_id="device-1"),
+                         ("PREFIX123", "TEAM123"))
+
+    def test_documented_macos_application_identifier_key_is_required(self) -> None:
+        candidate = profile()
+        entitlements = candidate["Entitlements"].copy()
+        entitlements.pop("application-identifier")
+        entitlements["com.apple.application-identifier"] = "PREFIX123.com.example.yuzu"
+        candidate["Entitlements"] = entitlements
+        self.assertEqual(bundle.validate_profile(candidate, "com.example.yuzu", device_id="device-1"),
+                         ("PREFIX123", "TEAM123"))
+
+    def test_apple_legacy_osx_platform_tag_is_recognized_as_macos(self) -> None:
+        self.assertEqual(bundle.validate_profile(profile(Platform=["OSX"]), "com.example.yuzu",
+                                                 device_id="device-1"), ("PREFIX123", "TEAM123"))
+
+    def test_f01_rejects_missing_false_or_non_boolean_es_grant(self) -> None:
+        for value in (None, False, "true"):
+            with self.subTest(value=value):
+                candidate = profile()
+                entitlements = candidate["Entitlements"].copy()
+                if value is None:
+                    entitlements.pop("com.apple.developer.endpoint-security.client")
+                else:
+                    entitlements["com.apple.developer.endpoint-security.client"] = value
+                candidate["Entitlements"] = entitlements
+                with self.assertRaisesRegex(bundle.BundleError, "Endpoint Security"):
+                    bundle.validate_profile(candidate, "com.example.yuzu", device_id="device-1")
+
+    def test_f01_rejects_expired_wrong_platform_and_ineligible_device(self) -> None:
+        expired = profile(ExpirationDate=dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1))
+        with self.assertRaisesRegex(bundle.BundleError, "expired"):
+            bundle.validate_profile(expired, "com.example.yuzu", device_id="device-1")
+        with self.assertRaisesRegex(bundle.BundleError, "macOS"):
+            bundle.validate_profile(profile(Platform=["iOS"]), "com.example.yuzu", device_id="device-1")
+        with self.assertRaisesRegex(bundle.BundleError, "not eligible"):
+            bundle.validate_profile(profile(), "com.example.yuzu", device_id="other-device")
+
+    def test_f02_rejects_signer_not_authorized_by_profile(self) -> None:
+        with self.assertRaisesRegex(bundle.BundleError, "not authorized"):
+            bundle.validate_profile(profile(), "com.example.yuzu", device_id="device-1",
+                                    signer_fingerprint="0" * 40)
+
+    def test_f03_rejects_wrong_bundle_or_team(self) -> None:
+        with self.assertRaisesRegex(bundle.BundleError, "bundle ID"):
+            bundle.validate_profile(profile(), "com.other.yuzu", device_id="device-1")
+        candidate = profile(TeamIdentifier=["OTHERTEAM"])
+        with self.assertRaisesRegex(bundle.BundleError, "TeamIdentifier"):
+            bundle.validate_profile(candidate, "com.example.yuzu", device_id="device-1")
+
+
+class PackagingStructureTests(unittest.TestCase):
+    def test_vcpkg_macos_target_triplet_pins_the_documented_runtime_floor(self) -> None:
+        triplet = MACOS_TRIPLET.read_text()
+        self.assertIn("set(VCPKG_TARGET_ARCHITECTURE arm64)", triplet)
+        self.assertIn("set(VCPKG_CMAKE_SYSTEM_NAME Darwin)", triplet)
+        self.assertIn('set(VCPKG_OSX_DEPLOYMENT_TARGET "13.3")', triplet)
+
+    def test_builder_requires_the_documented_macos_deployment_target(self) -> None:
+        output = (
+            "binary:\n"
+            "Load command 4\n"
+            "      cmd LC_BUILD_VERSION\n"
+            "    minos 13.3\n"
+            "      sdk 26.5\n"
+        )
+        with mock.patch.object(bundle, "run", return_value=output):
+            self.assertEqual(bundle.macho_deployment_targets(Path("binary")), ["13.3"])
+            bundle.require_macos_deployment_target([Path("binary")])
+        wrong_target = output.replace("minos 13.3", "minos 26.0")
+        with mock.patch.object(bundle, "run", return_value=wrong_target):
+            with self.assertRaisesRegex(bundle.BundleError, "rebuild with meson/native"):
+                bundle.require_macos_deployment_target([Path("binary")])
+
+    def test_payload_is_staged_before_postinstall_promotes_it(self) -> None:
+        preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
+        postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
+        package_builder = BUILD_PKG.read_text()
+        self.assertIn('.YuzuAgent.incoming.app', package_builder)
+        self.assertIn('.plugins.incoming', package_builder)
+        self.assertNotIn('rm -rf "/Library/Application Support/Yuzu/YuzuAgent.app"', preinstall)
+        self.assertIn('recover_interrupted_promotion', preinstall)
+        self.assertNotIn('launchctl bootout',
+                         preinstall[:preinstall.index('recover_interrupted_promotion')])
+        self.assertIn('secure_payload_parent "$DATA_DIR" 750', preinstall)
+        self.assertIn('secure_payload_parent "$YUZU_LIB" 755', preinstall)
+        self.assertIn('root-owned and not group/world writable', preinstall)
+        self.assertIn('secure_payload_parent "$parent" 755', preinstall)
+        self.assertIn('write_recovery_phase "$RECOVERY" prepared', preinstall)
+        self.assertIn('promoting)', preinstall)
+        self.assertIn('recover_interrupted_promotion "$pending"', preinstall)
+        self.assertIn('mv "$INCOMING_APP" "$APP"', postinstall)
+        self.assertIn('require_stopped', postinstall)
+        self.assertIn('require_started', postinstall)
+        self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
+        self.assertIn('rm -rf "$recovery"', postinstall)
+
+    def test_recovery_clears_both_lanes_and_uninstall_removes_transition_paths(self) -> None:
+        postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
+        uninstall = (ROOT / "deploy/packaging/macos/uninstall.sh").read_text()
+        self.assertIn('rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib', postinstall)
+        self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
+        self.assertIn('harden_managed_plugins "$MANIFEST"', postinstall)
+        self.assertIn('collides with an unmanaged third-party plugin', postinstall)
+        self.assertIn('remove_managed_plugins "$INCOMING_MANIFEST"', postinstall)
+        self.assertIn('sync', postinstall)
+        self.assertNotIn('rm -rf "$APP" "$PLUGIN_DIR"', postinstall)
+        self.assertIn('.YuzuAgent.incoming.app', uninstall)
+        self.assertIn('.plugins.incoming', uninstall)
+        self.assertIn('invalid package plugin manifest entry', uninstall)
+        self.assertNotIn('rm -rf "/Library/Application Support/Yuzu/YuzuAgent.app" \\\n+       "/Library/Application Support/Yuzu/.YuzuAgent.incoming.app" \\\n+       /usr/local/lib/yuzu/plugins', uninstall)
+
+    def test_cms_enforcement_refuses_mixed_plugin_sidecars(self) -> None:
+        source = HELPER.read_text()
+        self.assertIn('all external plugins must have CMS sidecars', source)
+
+    def test_builder_refuses_a_populated_output_before_touching_inputs(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
+            output = Path(temporary) / "published"
+            output.mkdir()
+            sentinel = output / "keep"
+            sentinel.write_text("unchanged")
+            args = type("Args", (), {
+                "bin_dir": str(Path(temporary) / "missing-bin"),
+                "profile": str(Path(temporary) / "missing-profile"),
+                "output_dir": str(output),
+                "bundle_id": "com.example.yuzu",
+                "sign_identity": "unused",
+                "version": "1.0",
+                "final_plugin_sig_dir": None,
+            })()
+            with self.assertRaisesRegex(bundle.BundleError, "already exists and is populated"):
+                bundle.build(args)
+            self.assertEqual(sentinel.read_text(), "unchanged")
+
+    def test_otool_dependency_parser_excludes_an_id_by_load_command_type(self) -> None:
+        output = (
+            "libyuzu_agent_core.dylib:\n"
+            "Load command 4\n"
+            "          cmd LC_ID_DYLIB\n"
+            "         name @rpath/libyuzu_agent_core.dylib (offset 24)\n"
+            "Load command 12\n"
+            "          cmd LC_LOAD_DYLIB\n"
+            "         name /usr/lib/libSystem.B.dylib (offset 24)\n"
+        )
+        with mock.patch.object(bundle, "run", return_value=output):
+            self.assertEqual(bundle.otool_dependencies(Path("libyuzu_agent_core.dylib")),
+                             ["/usr/lib/libSystem.B.dylib"])
+
+    def test_otool_dependency_parser_retains_all_real_dependency_kinds(self) -> None:
+        output = (
+            "yuzu-agent:\n"
+            "Load command 14\n"
+            "          cmd LC_LOAD_DYLIB\n"
+            "         name @rpath/libyuzu_agent_core.dylib (offset 24)\n"
+            "Load command 15\n"
+            "          cmd LC_LOAD_WEAK_DYLIB\n"
+            "         name @rpath/liboptional.dylib (offset 24)\n"
+            "Load command 16\n"
+            "          cmd LC_REEXPORT_DYLIB\n"
+            "         name @rpath/libreexport.dylib (offset 24)\n"
+            "Load command 17\n"
+            "          cmd LC_LOAD_UPWARD_DYLIB\n"
+            "         name @rpath/libupward.dylib (offset 24)\n"
+            "Load command 18\n"
+            "          cmd LC_LAZY_LOAD_DYLIB\n"
+            "         name @rpath/liblazy.dylib (offset 24)\n"
+        )
+        with mock.patch.object(bundle, "run", return_value=output):
+            self.assertEqual(bundle.otool_dependencies(Path("yuzu-agent")),
+                             ["@rpath/libyuzu_agent_core.dylib", "@rpath/liboptional.dylib",
+                              "@rpath/libreexport.dylib", "@rpath/libupward.dylib",
+                              "@rpath/liblazy.dylib"])
+
+    def test_bundle_plist_preserves_external_plugins_and_disables_ota(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
+            root = Path(temporary)
+            destination = root / "output with spaces.plist"
+            result = subprocess.run(["python3", str(PLIST_HELPER), "--source",
+                                     str(ROOT / "deploy/packaging/macos/com.yuzu.agent.plist"), "--output",
+                                     str(destination), "--bundle-executable", "/example/YuzuAgent.app/Contents/MacOS/yuzu-agent"],
+                                    check=True, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0)
+            with destination.open("rb") as output:
+                plist = plistlib.load(output)
+            arguments = plist["ProgramArguments"]
+            self.assertEqual(arguments[0], "/example/YuzuAgent.app/Contents/MacOS/yuzu-agent")
+            self.assertIn("--plugin-dir", arguments)
+            self.assertEqual(arguments[arguments.index("--plugin-dir") + 1], "/usr/local/lib/yuzu/plugins")
+            self.assertIn("--no-auto-update", arguments)
+
+    def test_bundle_upgrade_preserves_hardened_plugin_policy_and_server_settings(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
+            root = Path(temporary)
+            previous, destination = root / "previous.plist", root / "new.plist"
+            with previous.open("wb") as output:
+                plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent", "--server",
+                                                       "server.example:50051", "--plugin-trust-bundle",
+                                                       "/etc/yuzu-agent/certs/plugins.pem",
+                                                       "--plugin-require-signature", "--plugin-dir",
+                                                       "/old/plugins"],
+                                "EnvironmentVariables": {
+                                    "YUZU_SERVER": "env-server.example:50051",
+                                    "YUZU_TLS_SYSTEM_ROOTS": "1",
+                                    "YUZU_PLUGIN_ALLOWLIST": "/etc/yuzu-agent/plugins.sha256",
+                                    "YUZU_PLUGIN_TRUST_BUNDLE": "/etc/yuzu-agent/certs/env-plugins.pem",
+                                    "YUZU_PLUGIN_REQUIRE_SIGNATURE": "1",
+                                }}, output)
+            subprocess.run(["python3", str(PLIST_HELPER), "--source",
+                            str(ROOT / "deploy/packaging/macos/com.yuzu.agent.plist"), "--output",
+                            str(destination), "--bundle-executable", "/bundle/yuzu-agent"], check=True)
+            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+                            "--destination", str(destination)], check=True)
+            with destination.open("rb") as output:
+                merged = plistlib.load(output)["ProgramArguments"]
+            self.assertEqual(merged[0], "/bundle/yuzu-agent")
+            self.assertIn("--no-auto-update", merged)
+            self.assertIn("--plugin-require-signature", merged)
+            self.assertEqual(merged[merged.index("--plugin-trust-bundle") + 1],
+                             "/etc/yuzu-agent/certs/plugins.pem")
+            self.assertEqual(merged[merged.index("--server") + 1], "server.example:50051")
+            self.assertEqual(merged[merged.index("--plugin-dir") + 1],
+                             "/usr/local/lib/yuzu/plugins")
+            with destination.open("rb") as output:
+                environment = plistlib.load(output)["EnvironmentVariables"]
+            self.assertEqual(environment, {
+                "YUZU_SERVER": "env-server.example:50051", "YUZU_TLS_SYSTEM_ROOTS": "1",
+                "YUZU_PLUGIN_ALLOWLIST": "/etc/yuzu-agent/plugins.sha256",
+                "YUZU_PLUGIN_TRUST_BUNDLE": "/etc/yuzu-agent/certs/env-plugins.pem",
+                "YUZU_PLUGIN_REQUIRE_SIGNATURE": "1",
+            })
+
+            policy = root / "plugin-policy.json"
+            policy.write_text(json.dumps({"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/new.pem"}))
+            policy_destination = root / "policy.plist"
+            subprocess.run(["python3", str(PLIST_HELPER), "--source",
+                            str(ROOT / "deploy/packaging/macos/com.yuzu.agent.plist"), "--output",
+                            str(policy_destination), "--bundle-executable", "/bundle/yuzu-agent",
+                            "--plugin-signing-policy", str(policy)], check=True)
+            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+                            "--destination", str(policy_destination)], check=True)
+            with policy_destination.open("rb") as output:
+                policy_plist = plistlib.load(output)
+            self.assertEqual(policy_plist["EnvironmentVariables"], {
+                "YUZU_SERVER": "env-server.example:50051", "YUZU_TLS_SYSTEM_ROOTS": "1",
+                "YUZU_PLUGIN_ALLOWLIST": "/etc/yuzu-agent/plugins.sha256",
+            })
+            policy_arguments = policy_plist["ProgramArguments"]
+            self.assertEqual(policy_arguments[policy_arguments.index("--plugin-trust-bundle") + 1],
+                             "/etc/yuzu-agent/certs/new.pem")
+            self.assertIn("--plugin-require-signature", policy_arguments)
+
+    def test_legacy_upgrade_retains_operator_disabled_ota(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
+            root = Path(temporary)
+            previous, destination = root / "previous.plist", root / "new.plist"
+            with previous.open("wb") as output:
+                plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent", "--no-auto-update"]}, output)
+            with destination.open("wb") as output:
+                plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent"]}, output)
+            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+                            "--destination", str(destination)], check=True)
+            with destination.open("rb") as output:
+                self.assertIn("--no-auto-update", plistlib.load(output)["ProgramArguments"])
+            with destination.open("wb") as output:
+                plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent"]}, output)
+            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+                            "--destination", str(destination), "--force-no-auto-update"], check=True)
+            with destination.open("rb") as output:
+                self.assertEqual(plistlib.load(output)["ProgramArguments"], ["/usr/local/bin/yuzu-agent"])
+
+    def test_final_plugin_sidecars_use_the_shared_agent_verifier(self) -> None:
+        with mock.patch.object(bundle, "run", return_value="") as run:
+            bundle.verify_final_plugin_sidecar(Path("/bundle/yuzu-agent"), Path("/plugins/tar.dylib"),
+                                               Path("/trust/plugins.pem"))
+        run.assert_called_once_with(["/bundle/yuzu-agent", "--verify-plugin-signature",
+                                     "/plugins/tar.dylib", "--plugin-trust-bundle",
+                                     "/trust/plugins.pem"])
+
+    def test_builder_rejects_ambiguous_lanes_before_invoking_macos_tools(self) -> None:
+        result = subprocess.run(["bash", str(BUILD_PKG), "--bin-dir", "x", "--bundle-dir", "y",
+                                 "--version", "1.0"], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1,37 +1,194 @@
 #!/bin/bash
-# Yuzu Agent macOS post-install script
-# Runs as root after pkgbuild installs files.
-
-set -e
+# Promote a fully delivered incoming payload, restoring the previous package
+# state on postinstall failure. The preinstall phase never removes active code.
+set -eu
 
 DATA_DIR="/Library/Application Support/Yuzu"
 LOG_DIR="/Library/Logs/Yuzu"
+CONFIG_DIR="/etc/yuzu-agent"
+CERT_DIR="$CONFIG_DIR/certs"
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
+INCOMING_PLIST="/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist"
+STATE_DIR="/var/db/yuzu-agent"
+RECOVERY_FILE="$STATE_DIR/current-recovery"
+YUZU_LIB="/usr/local/lib/yuzu"
+PLUGIN_DIR="$YUZU_LIB/plugins"
+INCOMING_PLUGIN_DIR="$YUZU_LIB/.plugins.incoming"
+MODE_FILE="$YUZU_LIB/package-mode"
+INCOMING_MODE_FILE="$YUZU_LIB/.package-mode.incoming"
+MANIFEST="$YUZU_LIB/package-files.list"
+INCOMING_MANIFEST="$YUZU_LIB/.package-files.incoming"
+APP="$DATA_DIR/YuzuAgent.app"
+INCOMING_APP="$DATA_DIR/.YuzuAgent.incoming.app"
 
-# Create directories
-mkdir -p "${DATA_DIR}" "${LOG_DIR}"
-chmod 750 "${DATA_DIR}"
-chmod 755 "${LOG_DIR}"
+recovery_path() {
+    cat "$RECOVERY_FILE" 2>/dev/null || true
+}
 
-# Trust-anchor directory for OTA update signature verification (#416/#3807).
-# Its OWN directory, NOT /etc/yuzu/certs: that path is the server's --ca-dir,
-# which the server owns and re-chmods 0700 on boot, so an anchor there is either
-# unwritable by the server or unreadable by the agent. NOTE the LaunchDaemon runs
-# as root, so the agent CAN write this - the mode keeps unprivileged local users
-# out, not the agent itself. See "Signing update binaries" in
-# docs/user-manual/server-admin.md.
-mkdir -p /etc/yuzu-agent/certs
-chown root:wheel /etc/yuzu-agent /etc/yuzu-agent/certs
-chmod 755 /etc/yuzu-agent /etc/yuzu-agent/certs
+remove_managed_plugins() {
+    local manifest="$1" relative plugin
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r relative; do
+        [[ "$relative" == plugins/* ]] || continue
+        plugin="${relative#plugins/}"
+        [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
+            echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
+        rm -f "$PLUGIN_DIR/$plugin" "$PLUGIN_DIR/$plugin.sig"
+    done < "$manifest"
+}
 
-# Load the launch daemon (starts the agent)
-if launchctl list com.yuzu.agent &>/dev/null; then
-    launchctl unload "${PLIST}" 2>/dev/null || true
+harden_managed_plugins() {
+    local manifest="$1" relative plugin
+    [[ -f "$manifest" ]] || return 0
+    chown root:wheel "$PLUGIN_DIR"
+    chmod 755 "$PLUGIN_DIR"
+    while IFS= read -r relative; do
+        [[ "$relative" == plugins/* ]] || continue
+        plugin="${relative#plugins/}"
+        [[ -n "$plugin" && "$plugin" != */* && "$plugin" != .* ]] || {
+            echo "ERROR: invalid package plugin manifest entry" >&2; return 1; }
+        chown root:wheel "$PLUGIN_DIR/$plugin"
+        chmod go-w "$PLUGIN_DIR/$plugin"
+        [[ ! -e "$PLUGIN_DIR/$plugin.sig" ]] || {
+            chown root:wheel "$PLUGIN_DIR/$plugin.sig"
+            chmod go-w "$PLUGIN_DIR/$plugin.sig"
+        }
+    done < "$manifest"
+}
+
+was_managed_plugin() {
+    local plugin="$1"
+    [[ -f "$MANIFEST" ]] && grep -Fqx -- "plugins/$plugin" "$MANIFEST"
+}
+
+require_stopped() {
+    if launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; then
+        launchctl bootout "system/com.yuzu.agent"
+        if launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; then
+            echo "ERROR: Yuzu Agent is still loaded; refusing package transition" >&2
+            return 1
+        fi
+    fi
+}
+
+require_started() {
+    local observation attempt
+    for attempt in 1 2 3; do
+        observation="$(launchctl print "system/com.yuzu.agent" 2>/dev/null || true)"
+        if grep -Eq 'state = running|pid = [1-9][0-9]*' <<<"$observation"; then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "ERROR: Yuzu Agent did not remain running after bootstrap" >&2
+    return 1
+}
+
+restore_previous() {
+    local recovery
+    recovery="$(recovery_path)"
+    [[ -d "$recovery" ]] || return 0
+    launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
+    # Clear both lanes and the generated plist first: recovery must restore an
+    # exact prior package state, including the prior "no installed agent" case.
+    rm -f "$PLIST" "$MODE_FILE"
+    remove_managed_plugins "$MANIFEST"
+    remove_managed_plugins "$INCOMING_MANIFEST"
+    rm -f "$MANIFEST"
+    rm -rf "$APP"
+    rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
+    [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
+        ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
+    [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP"
+    [[ ! -e "$recovery/loose/yuzu-agent" ]] || \
+        ditto "$recovery/loose/yuzu-agent" /usr/local/bin/yuzu-agent
+    [[ ! -e "$recovery/loose/libyuzu_agent_core.dylib" ]] || \
+        ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
+    [[ ! -e "$recovery/package-mode" ]] || ditto "$recovery/package-mode" "$MODE_FILE"
+    [[ ! -e "$recovery/package-files.list" ]] || \
+        ditto "$recovery/package-files.list" "$MANIFEST"
+    [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$PLUGIN_DIR"
+    [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$PLUGIN_DIR"
+    [[ ! -e "$PLIST" ]] || launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+}
+trap 'restore_previous' ERR
+
+mkdir -p "$DATA_DIR" "$LOG_DIR" "$CERT_DIR" "$YUZU_LIB"
+chown root:wheel "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
+chmod 750 "$DATA_DIR"
+chmod 755 "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
+
+[[ -f "$INCOMING_MODE_FILE" && -f "$INCOMING_PLIST" ]] || {
+    echo "ERROR: package payload is missing incoming mode or LaunchDaemon plist" >&2; exit 1; }
+MODE="$(cat "$INCOMING_MODE_FILE")"
+[[ "$MODE" == "bundle" || "$MODE" == "loose" ]] || {
+    echo "ERROR: invalid incoming package mode" >&2; exit 1; }
+[[ -d "$INCOMING_PLUGIN_DIR" && -f "$INCOMING_MANIFEST" ]] || {
+    echo "ERROR: package payload is missing incoming plugin state" >&2; exit 1; }
+if [[ "$MODE" == "bundle" ]]; then
+    [[ -x "$INCOMING_APP/Contents/MacOS/yuzu-agent" ]] || {
+        echo "ERROR: incoming bundle executable is missing" >&2; exit 1; }
+    codesign --verify --deep --strict --verbose=2 "$INCOMING_APP"
+else
+    [[ -x /usr/local/bin/.yuzu-agent.incoming ]] || {
+        echo "ERROR: incoming loose agent executable is missing" >&2; exit 1; }
 fi
-launchctl load -w "${PLIST}"
 
-echo "Yuzu Agent installed and started."
-echo "  Data:    ${DATA_DIR}"
-echo "  Logs:    ${LOG_DIR}"
-echo "  Service: launchctl list com.yuzu.agent"
-exit 0
+# All validation occurs before changing active paths. Any failure below invokes
+# restore_previous, which clears every selected lane before copying the snapshot.
+recovery="$(recovery_path)"
+[[ -d "$recovery" ]] || { echo "ERROR: missing installation recovery snapshot" >&2; exit 1; }
+printf 'promoting\n' > "$recovery/.phase.new"
+mv -f "$recovery/.phase.new" "$recovery/phase"
+sync
+require_stopped
+remove_managed_plugins "$MANIFEST"
+rm -rf "$APP"
+rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
+if [[ "$MODE" == "bundle" ]]; then
+    mv "$INCOMING_APP" "$APP"
+else
+    mv /usr/local/bin/.yuzu-agent.incoming /usr/local/bin/yuzu-agent
+    [[ ! -e /usr/local/lib/.libyuzu_agent_core.incoming.dylib ]] || \
+        mv /usr/local/lib/.libyuzu_agent_core.incoming.dylib /usr/local/lib/libyuzu_agent_core.dylib
+fi
+mkdir -p "$PLUGIN_DIR"
+for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
+    [[ -e "$incoming_plugin" ]] || continue
+    incoming_name="$(basename "$incoming_plugin")"
+    if [[ "$incoming_name" == *.dylib && -e "$PLUGIN_DIR/$incoming_name" ]] && \
+       ! was_managed_plugin "$incoming_name"; then
+        echo "ERROR: incoming plugin collides with an unmanaged third-party plugin: $incoming_name" >&2
+        exit 1
+    fi
+    mv "$incoming_plugin" "$PLUGIN_DIR/"
+done
+rmdir "$INCOMING_PLUGIN_DIR"
+mv "$INCOMING_MANIFEST" "$MANIFEST"
+mv "$INCOMING_MODE_FILE" "$MODE_FILE"
+if [[ -f "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]]; then
+    merge_args=(--previous "$recovery/LaunchDaemons/com.yuzu.agent.plist" --destination "$INCOMING_PLIST")
+    [[ "$MODE" != "bundle" ]] || merge_args+=(--force-no-auto-update)
+    /usr/local/lib/yuzu/merge-launchd-plist.py "${merge_args[@]}"
+fi
+mv "$INCOMING_PLIST" "$PLIST"
+
+if [[ "$MODE" == "bundle" ]]; then
+    chown -R root:wheel "$APP"
+    chmod -R go-w "$APP"
+    harden_managed_plugins "$MANIFEST"
+    /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" | grep -F -- '--no-auto-update' >/dev/null
+else
+    chown root:wheel /usr/local/bin/yuzu-agent
+    chmod go-w /usr/local/bin/yuzu-agent
+    if [[ -e /usr/local/lib/libyuzu_agent_core.dylib ]]; then
+        chown root:wheel /usr/local/lib/libyuzu_agent_core.dylib
+        chmod go-w /usr/local/lib/libyuzu_agent_core.dylib
+    fi
+    harden_managed_plugins "$MANIFEST"
+fi
+launchctl bootstrap system "$PLIST"
+require_started
+rm -f "$RECOVERY_FILE"
+[[ -z "$recovery" ]] || rm -rf "$recovery"
+echo "Yuzu Agent installed and started. Data, logs, and trust anchors were preserved."
