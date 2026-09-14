@@ -5978,6 +5978,101 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     CHECK(WEXITSTATUS(status) == 0);
 }
 
+// rung 9c PR-5a (#4221 up-101/ch-101): the death test above proves recovery when a
+// DIFFERENT rule (r4) queues behind r2's tombstone. #4221's own up-101 criterion names
+// the harder, untested case: the SAME rule_id ("r2") re-attaching behind ITS OWN
+// not-yet-released tombstone. Before the incarnation-aware SparkKeyRuleIndex fix, the
+// tombstone's retried release (keyed on rule_id alone) would erase the SECOND r2's
+// live mapping out from under it the moment the drain swept the tombstone - a leaked
+// watcher masquerading as a clean re-arm, and (per #4221) an eventually permanently
+// unarmable key. Mutation-verify: pass generation 0 unconditionally from
+// release_claim_index_locked() (or drop erase_rule()'s generation check) and this goes
+// RED - the retried release destroys r2(second)'s live mapping mid-flight.
+TEST_CASE("rung 9c PR-5a (#4221 up-101/ch-101): a same-rule_id re-attach behind its own "
+          "not-yet-released tombstone keeps its own mapping and disarms cleanly",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread t1{[&] { gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->detach_rule("r1"); // Case-0 withdraw: the dispatched head stays as the key's marker
+    t1.join();
+    REQUIRE_FALSE(gen_r1.has_value());
+    CHECK(gen_r1.error() == "withdrawn");
+
+    // In the drain's compensating gap: queue "r2" behind the withdrawn r1 head, then
+    // make its own admission fail AND its index release throw inside that failure's
+    // cleanup - producing a genuine tombstone (withdrawn, index_held retained pending
+    // retry), exactly the setup the r4-based death test above uses.
+    std::expected<std::uint64_t, std::string> gen_r2;
+    std::thread t2;
+    std::atomic<bool> r2_done{false};
+    rt->set_drain_gap_hook_for_test([&] {
+        t2 = std::thread{[&] {
+            gen_r2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+            r2_done.store(true);
+        }};
+        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                       std::chrono::seconds(10)));
+        rt->set_io_executor_fail_launch_for_test(true); // the refill's submit() is refused
+        rt->set_index_remove_fault_for_test(true);      // ...and its cleanup's release throws
+    });
+    b->release_hang(); // r1's arm lands: drain -> gap hook -> compensation -> pop -> refill r2
+    REQUIRE(yuzu::test::spin_until([&] { return r2_done.load(); }, std::chrono::seconds(30)));
+    t2.join();
+    rt->set_io_executor_fail_launch_for_test(false);
+    REQUIRE_FALSE(gen_r2.has_value());
+    CHECK(gen_r2.error() == "arm worker launch failed");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // r2's FIRST attempt is now a
+                                                     // tombstone: withdrawn, its index
+                                                     // release failed and is retained
+    CHECK(b->arms.load() == 1); // only r1's real arm so far - r2's first attempt never
+                                // reached the backend at all (admission itself was
+                                // refused)
+
+    // THE ACTUAL up-101 SCENARIO: re-attach the SAME rule_id "r2" - not a different one
+    // - behind its own tombstone. No hang needed this time: attach_core's own call
+    // transfers index ownership to this second incarnation, then sweeps and dispatches
+    // past the (now-unfaulted) tombstone synchronously before returning, so the
+    // blocking wrapper resolves as soon as the real backend arm (FakeBackend's default,
+    // non-hanging) completes.
+    auto gen_r2b = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    REQUIRE(gen_r2b); // succeeds cleanly - not stuck behind its own stale tombstone
+    CHECK(rt->claim_queue_depth_for_test(key) == 0); // tombstone swept, no leftover claim
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 2); // r1's real arm plus r2's second (real) attempt
+    const auto armed_before_detach = b->armed_ids(); // {r1's sub, r2b's sub}, in arm order
+
+    // The eventual detach disarms EXACTLY the subscription the second r2 adopted - not
+    // zero (a leaked watcher), not a phantom entry the stale tombstone's erroneous
+    // erase would have left behind. r1's own compensating disarm already ran earlier
+    // (its late "success" was withdrawn, nobody adopted it) - wait for BOTH disarms,
+    // not just the first one to land.
+    rt->detach_rule("r2");
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 2; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->disarmed_ids() == armed_before_detach); // both real arms, each disarmed
+                                                     // exactly once - nothing leaked,
+                                                     // nothing double-disarmed
+
+    // A further attach on the same key still succeeds - the key is not permanently
+    // unarmable (#4221's stated worst-case consequence of the un-fixed defect).
+    auto gen_r3 = rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3"), true);
+    REQUIRE(gen_r3);
+    CHECK(rt->armed_key_count() == 1);
+    rt->detach_rule("r3");
+    rt->begin_stop();
+}
+
 // rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318 fjarvis): on_arm_complete's
 // compensating branch built the ArmCompensation continuation (a heap allocation plus
 // a string copy) entirely OUTSIDE any try, while a live, un-disarmed backend
