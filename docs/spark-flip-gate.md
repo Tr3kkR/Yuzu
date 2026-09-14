@@ -435,9 +435,18 @@ flip, with a red-first test each:
   the CONFIRMED real shape (a `Queued`, withdrawn/abandoned head with no outcome, left behind by
   the same double-fault recovery paths, reachable via a genuine allocation failure) via a new
   `expire_overdue_claims()` terminal-recovery pass; the kickoff's literal Dispatched-terminal-head
-  variant was investigated and NOT implemented - an attempt regressed a real, already-tested
-  scenario (a caller-timeout-abandoned claim whose async arm() is still genuinely in flight), and
-  no safe "the completion callback actually ran" signal was found to distinguish the two cases.
+  variant was investigated and NOT implemented in this PR - a first attempt (reaping any
+  `Dispatched`+outcome-bearing head) regressed a real, already-tested scenario (a caller-timeout-
+  abandoned claim whose async `arm()` is still genuinely in flight; `compensation_finished`
+  defaults true and does not by itself distinguish the two cases). **Correction (Fable re-review,
+  2026-09-14): a safe signal is NOT structurally impossible** - a dedicated `completion_finished`
+  fact (distinct from `compensation_finished`), written only by the true completion callback and
+  reset at the `Queued`->`Dispatching` re-drive chokepoint, would distinguish them; it simply
+  wasn't built in this PR. Separately, the literal double-fault residue this variant targets was
+  independently confirmed unreachable on the current call graph (every path that could produce it
+  routes through a `noexcept`-only inner catch before the pop) by three independent passes (Astra,
+  Fable, and this implementation attempt) - so the risk of leaving it unbuilt is assessed as near
+  nil in practice. Tracked as a P3 defense-in-depth follow-up (issue TBD), not flip-gating.
   ch-1's fill-in-allocation seam added (both the ordinary and firewall-loop occurrences). up-5's
   redrive is now wired onto the convergence lane's priority loop (elapsed-time-gated, its own
   firewalled sweep); **this row's own "Missing telemetry" wording above is now WRONG** -

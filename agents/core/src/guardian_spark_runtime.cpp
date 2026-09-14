@@ -1547,8 +1547,26 @@ std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
             it = claims_.erase(it);
         } else {
             if (key_changed) {
-                if (auto refill = try_dispatch_head_locked(key))
-                    refills.emplace_back(key, std::move(refill));
+                if (auto refill = try_dispatch_head_locked(key)) {
+                    // Fable review (2026-09-14): try_dispatch_head_locked() already
+                    // flipped this head Queued->Dispatching before returning it - if
+                    // the collection push below throws (key's std::string copy,
+                    // vector growth), nobody will ever drive this claim: it is not
+                    // Queued any more (redrive_retained_disarms()/a same-key event
+                    // won't touch it) and the NEXT stranded-claims pass skips
+                    // non-Queued heads too. Same class of alloc-after-flip wedge this
+                    // function exists to fix - contained the same way the rest of
+                    // this file handles it (dispatch_arm_off_lock's own refusal path,
+                    // above): hand the head back to Queued so the next same-key event
+                    // or stranded-claims pass re-drives it, and count the failure.
+                    try {
+                        refills.emplace_back(key, refill);
+                    } catch (...) {
+                        claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                        if (refill->dispatch == ClaimDispatch::Dispatching)
+                            refill->dispatch = ClaimDispatch::Queued;
+                    }
+                }
             }
             ++it;
         }
