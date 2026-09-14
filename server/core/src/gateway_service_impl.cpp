@@ -140,12 +140,14 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
     if (metrics_) {
         metrics_->describe(
             "yuzu_server_gateway_route_write_failed_total",
-            "HA WS-4 4.1: GatewayRouteStore directory writes (register_fresh/"
+            "HA WS-4: GatewayRouteStore directory writes (register_fresh/"
             "announce_connected/deregister/renew_leases) that degraded instead of "
-            "succeeding, by op and reason. Fail-OPEN this slice - the RPC proceeds "
-            "regardless, since nothing reads this store for dispatch yet - so this "
-            "counter is the only signal a systemic write failure would otherwise "
-            "leave invisible.",
+            "succeeding, by op and reason. PER-SITE posture (4.2b): register_fresh "
+            "is fail-CLOSED (the ProxyRegister RPC returns UNAVAILABLE); the other "
+            "writers stay fail-OPEN (the RPC proceeds, integrity living at the "
+            "fallback-only dispatch reader's trust predicate) - so for the fail-open "
+            "writers this counter is the only signal a systemic write failure would "
+            "otherwise leave invisible.",
             "counter");
         metrics_->describe(
             "yuzu_server_gateway_route_desync_total",
@@ -1134,15 +1136,17 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         registry_.set_gateway_route(agent_id, request->gateway_node(),
                                     std::move(wire_capabilities));
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
-        // cross-replica routing directory (gateway_route_store.hpp) — INERT
-        // this slice, nothing reads it for dispatch yet. Task B (4.2b):
-        // fail-OPEN, deliberately — this NotifyStreamStatus CONNECTED is
-        // itself a droppable gen_server:cast on the gateway side (the erlang
-        // caller does not block on it), and registry_.set_gateway_route just
-        // above has ALREADY published the in-memory route — failing this RPC
-        // now would split the two (memory says connected, directory does
-        // not) and risk a routing black hole for no correctness gain, since
-        // nothing reads this store for dispatch yet.
+        // cross-replica routing directory (gateway_route_store.hpp). As of
+        // 4.2b Task C the directory IS read for dispatch (fallback-only, on a
+        // local-registry miss). announce_connected nonetheless stays fail-OPEN
+        // deliberately (Task B per-site contract) — this NotifyStreamStatus
+        // CONNECTED is itself a droppable gen_server:cast on the gateway side
+        // (the erlang caller does not block on it), and registry_.set_gateway_route
+        // just above has ALREADY published the in-memory route — failing this
+        // RPC now would split the two (memory says connected, directory does
+        // not) and risk a routing black hole for no correctness gain. The
+        // reader's `routable` trust predicate, not this write, is the integrity
+        // backstop.
         if (gateway_route_store_) {
             // 4.2a #8: a session recorded in lost_race_sessions_ lost its
             // register_fresh epoch race — the durable row already belongs to

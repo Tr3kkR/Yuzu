@@ -55,11 +55,14 @@
 /// caller that knows only a session token can no longer renew a route
 /// belonging to a DIFFERENT agent.
 ///
-/// Posture (ADR-0012 §1): this store is a coordination/liveness aid, not yet
-/// an authority anything depends on for correctness (nothing reads it). A
-/// degraded write here is logged and returned to the caller (never silently
-/// dropped), but has no fail-closed obligation beyond that until a reader
-/// exists.
+/// Posture (ADR-0012 §1): as of 4.2b this store is read for dispatch as a
+/// FALLBACK (only on a local-registry miss; it changes no routing outcome on a
+/// single-replica deployment, where every agent is locally known). Integrity
+/// lives at the reader's `routable` trust predicate, so most writes stay
+/// fail-open (a degraded write is logged and returned to the caller, never
+/// silently dropped); register_fresh — the row-CREATING write whose loss has no
+/// other writer to repair it — is the one fail-CLOSED exception (4.2b Task B,
+/// returns UNAVAILABLE).
 ///
 /// 4.2 OBLIGATIONS (latent while INERT, load-bearing once a dispatch reader
 /// exists — full list in ADR-2002 §7 "4.2 design obligations"): the "cannot

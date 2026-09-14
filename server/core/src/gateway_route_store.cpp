@@ -36,9 +36,10 @@ constexpr const char* kStoreName = "gateway_route_store";
 // SYNCHRONOUSLY on a gRPC handler thread on the agent heartbeat/connect hot
 // path (agent_service_impl.cpp's BatchHeartbeat, gateway_service_impl.cpp's
 // ProxyRegister/ProxyStreamStatus) — a 2s stall under pool pressure pins that
-// thread for 2s per call, and these calls are already fail-open (a degraded
-// write here never fails the RPC — see record_route_store_failure in
-// gateway_service_impl.cpp). A short bound fails fast back to "log and
+// thread for 2s per call. Most of these writes are fail-open (a degraded write
+// is logged and the RPC proceeds — see record_route_store_failure in
+// gateway_service_impl.cpp; register_fresh is the one fail-CLOSED exception as
+// of 4.2b Task B, returning UNAVAILABLE). A short bound fails fast back to "log and
 // proceed" instead of holding the handler thread hostage; the expected
 // consequence is that yuzu_server_gateway_route_write_failed_total rises
 // under real pool pressure rather than every heartbeat blocking for 2s each.
