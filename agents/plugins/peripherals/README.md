@@ -6,7 +6,7 @@
 | **What it does** | USB, PCI and Thunderbolt/USB4 device inventory |
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (crossplatform.peripherals.usb, crossplatform.peripherals.pci, crossplatform.peripherals.thunderbolt) |
-| **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
+| **Platforms** | Windows 🟡 planned · macOS ✅ · Linux ✅ |
 | **Actions** | `pci` (definition `crossplatform.peripherals.pci`) · `thunderbolt` (definition `crossplatform.peripherals.thunderbolt`) · `usb` (definition `crossplatform.peripherals.usb`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
@@ -31,14 +31,16 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `pci` | ✅ supported · rung 1 · SetupAPI (PCI enumerator) | ✅ supported · rung 1 · IOKit IOServiceMatching(IOPCIDevice) | ✅ supported · rung 1 · /sys/bus/pci/devices sysfs attribute reads |
-| `thunderbolt` | 🟡 constrained · rung 1 · SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 | ✅ supported · rung 1 · IOKit IOServiceMatching(IOThunderboltSwitch) | 🟡 constrained · rung 1 · /sys/bus/thunderbolt/devices sysfs reads |
-| `usb` | ✅ supported · rung 1 · SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS | ✅ supported · rung 1 · IOKit IOServiceMatching(IOUSBHostDevice) | ✅ supported · rung 1 · /sys/bus/usb/devices sysfs attribute reads |
+| `pci` | 🟡 planned · rung 1 · SetupAPI (PCI enumerator) | ✅ supported · rung 1 · IOKit IOServiceMatching(IOPCIDevice) | ✅ supported · rung 1 · /sys/bus/pci/devices sysfs attribute reads |
+| `thunderbolt` | 🟡 planned · rung 1 · SetupAPI PCI enumerator, DEVICEDESC contains Thunderbolt/USB4 | ✅ supported · rung 1 · IOKit IOServiceMatching(IOThunderboltSwitch) | 🟡 constrained · rung 1 · /sys/bus/thunderbolt/devices sysfs reads |
+| `usb` | 🟡 planned · rung 1 · SetupAPI SetupDiGetClassDevsW(USB enumerator) + SPDRP_HARDWAREID/COMPATIBLEIDS | ✅ supported · rung 1 · IOKit IOServiceMatching(IOUSBHostDevice) | ✅ supported · rung 1 · /sys/bus/usb/devices sysfs attribute reads |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`thunderbolt` / Windows** — string-heuristic identification; no Thunderbolt device class in SetupAPI
+- **`pci` / Windows** — Windows leg lands in a focused follow-up PR on top of this one
+- **`thunderbolt` / Windows** — Windows leg lands in a focused follow-up PR on top of this one
 - **`thunderbolt` / Linux** — walk verified against a sysfs fixture tree only; no live Linux venue with a Thunderbolt bus in this run
+- **`usb` / Windows** — Windows leg lands in a focused follow-up PR on top of this one
 <!-- END GENERATED -->
 
 The capability-matrix block above was regenerated on a Linux container by `tools/capmatrix-gen` dlopening the plugin's built binary on each OS (I91-6), and every sample's leg-hash stamp is resolved against it (I91-7) — the plugin's own descriptor (`peripherals_plugin.cpp`'s `kActionDescriptors`) and the generated block above now agree.
@@ -47,7 +49,7 @@ The capability-matrix block above was regenerated on a Linux container by `tools
 
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
-| Windows | agent service account (LocalSystem today, #1442) | None documented for this plugin (`docs/agent-privilege-model.md`) | 2026-09-08, bare-metal, the-rig, `LocalSystem (elevated)` — P91-7's real MSVC capture (`docs/samples/windows.txt`) | `SetupDiGetClassDevsW` fails, action reports `<kind>\|unavailable\|windows:setupapi:getclassdevs_failed:<GetLastError>` |
+| Windows | n/a — not yet implemented | n/a — not yet implemented | Not implemented in this PR; the Windows leg (planned: `SetupDiGetClassDevsW`, expected to need no elevation) lands in a focused follow-up PR | every action reports `<kind>\|unavailable\|windows:leg:not_implemented` |
 | macOS | agent daemon, root today (LaunchDaemon carries no `UserName` key — `docs/agent-privilege-model.md` TL;DR); this plugin's own reads need no elevation beyond that default | None — IOKit registry property reads are unprivileged | 2026-09-08, bare-metal, this Mac (`braga`), unprivileged (uid 501) — real `ioreg`-equivalent captures behind P91-6's fixtures (`tests/unit/fixtures/wave9/peripherals/macos/*.provenance.txt`); no root-privileged run of this plugin has been captured yet, so the root identity above is the documented production default, not a measured one | `IOServiceGetMatchingServices` itself fails (`kr != KERN_SUCCESS`), action reports `<kind>\|unavailable\|macos:iokit:matching_failed`; a query that succeeds but matches zero services is a clean `<kind>\|none`, not a failure |
 | Linux | agent daemon, default | None — sysfs bus directories under `/sys/bus/{usb,pci,thunderbolt}/devices` are world-readable by default | 2026-09-14, container (Docker VM on this Mac), root (`euid 0`) — a real live capture (`docs/samples/linux.txt`, I91-6/I91-7), plus the fixture tree at `tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/` (P91-5/P91-7) for the walk-logic unit tests | The bus directory exists but is unreadable (EACCES) or another listing error occurs, action reports `<kind>\|unavailable\|linux:sysfs:eacces` or `linux:sysfs:read_failed`; an absent bus directory (no such bus on this host) is a clean `<kind>\|none`, not a failure |
 
@@ -115,7 +117,7 @@ Pipe-delimited rows, one per device, written via `write_output()`. Every field b
 | `CONSTRAINED` | `PARTIAL` | `linux:sysfs:eacces` | Linux: the bus's `devices` directory exists but could not be opened (permission denied). |
 | `CONSTRAINED` | `PARTIAL` | `linux:sysfs:read_failed` | Linux: the bus's `devices` directory exists but listing it failed for a reason other than EACCES. |
 | `CONSTRAINED` | `PARTIAL` | `macos:iokit:matching_failed` | macOS: `IOServiceGetMatchingServices` itself returned a non-success `kern_return_t` — the IOKit main port was unreachable, not merely "no matches". |
-| `CONSTRAINED` | `PARTIAL` | `windows:setupapi:getclassdevs_failed` | Windows: `SetupDiGetClassDevsW` itself failed; the row and status reason carry the literal token with `GetLastError()`'s numeric code appended. |
+| `CONSTRAINED` | `PARTIAL` | `windows:leg:not_implemented` | Windows: this leg is not implemented yet (see the `planned` support level on every Windows action above) — lands in a focused follow-up PR. |
 
 ### Where the data goes
 
@@ -127,47 +129,7 @@ Pipe-delimited rows, one per device, written via `write_output()`. Every field b
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash 25220299bc79
-
-```
-== action=usb
-usb|USB/VID_046D&PID_C548&MI_03/7&247BA993&0&0003|046d|c548|03|00|(Standard system devices)|USB Input Device|-|-|0
-usb|USB/VID_0B05&PID_18F3/9876543210|0b05|18f3|00|00|(Standard USB Host Controller)|USB Composite Device|-|-|0
-usb|USB/VID_0B0E&PID_2E56&MI_03/9&3135CDCD&0&0003|0b0e|2e56|03|00|(Standard system devices)|USB Input Device|-|-|0
-usb|USB/VID_0B0E&PID_2E56/6CFBEDC4770B|0b0e|2e56|00|00|(Standard USB Host Controller)|USB Composite Device|-|-|0
-usb|USB/VID_8087&PID_0029/8&384B90AF&0&6|8087|0029|e0|01|Intel Corporation|Intel(R) Wireless Bluetooth(R)|-|-|0
-usb|USB/VID_0B05&PID_18F3&MI_02/A&2EFC6B98&0&0002|0b05|18f3|03|00|(Standard system devices)|USB Input Device|-|-|0
-usb|USB/ROOT_HUB30/7&14C6E8AD&0&0|0000|0000|00|00|(Standard USB HUBs)|USB Root Hub (USB 3.0)|-|-|0
-usb|USB/VID_174C&PID_3074/8&1B878445&0&8|174c|3074|00|00|(Standard USB HUBs)|Generic SuperSpeed USB Hub|-|-|0
-usb|USB/VID_046D&PID_C548&MI_01/9&32226396&0&0001|046d|c548|03|01|(Standard system devices)|USB Input Device|-|-|0
-usb|USB/VID_046D&PID_C548&MI_02/9&32226396&0&0002|046d|c548|03|00|(Standard system devices)|USB Input Device|-|-|0
-usb|USB/VID_046D&PID_C548&MI_00/7&247BA993&0&0000|046d|c548|03|01|Logitech (x64)|Logitech USB Input Device|-|-|0
-usb|USB/VID_0B0E&PID_2E56&MI_00/9&3135CDCD&0&0000|0b0e|2e56|01|01|(Generic USB Audio)|Jabra Link 390|-|-|0
-… 12 of 24 rows shown
-[result_status] OK / FULL
-
-== action=pci
-pci|PCI/VEN_1022&DEV_1444&SUBSYS_00000000&REV_00/3&11583659&0&C4|1022|1444|060000|0000|0000|-|PCI standard host CPU bridge
-pci|PCI/VEN_1022&DEV_1486&SUBSYS_88081043&REV_00/4&231A312E&0&0141|1022|1486|108000|0000|0000|-|AMD PSP 11.0 Device
-pci|PCI/VEN_8086&DEV_1539&SUBSYS_85F01043&REV_03/6&2AD155D1&0&0028000A|8086|1539|020000|0000|0000|-|Intel(R) I211 Gigabit Network Connection
-pci|PCI/VEN_1022&DEV_1441&SUBSYS_00000000&REV_00/3&11583659&0&C1|1022|1441|060000|0000|0000|-|PCI standard host CPU bridge
-pci|PCI/VEN_1022&DEV_1485&SUBSYS_88081043&REV_00/6&313998C&0&0040000A|1022|1485|130000|0000|0000|-|AMD PCI
-pci|PCI/VEN_1022&DEV_790E&SUBSYS_87C01043&REV_51/3&11583659&0&A3|1022|790e|060100|0000|0000|-|PCI standard ISA bridge
-pci|PCI/VEN_1022&DEV_1484&SUBSYS_88081043&REV_00/3&11583659&0&39|1022|1484|060400|0000|0000|-|PCI-to-PCI Bridge
-pci|PCI/VEN_1022&DEV_1484&SUBSYS_88081043&REV_00/3&11583659&0&41|1022|1484|060400|0000|0000|-|PCI-to-PCI Bridge
-pci|PCI/VEN_1022&DEV_149C&SUBSYS_88081043&REV_00/6&313998C&0&0140000A|1022|149c|0c0330|0000|0000|-|USB xHCI Compliant Host Controller
-pci|PCI/VEN_10DE&DEV_228B&SUBSYS_40761458&REV_A1/4&1D81E16&0&0119|10de|228b|040300|0000|0000|-|High Definition Audio Controller
-pci|PCI/VEN_1022&DEV_57A3&SUBSYS_88081043&REV_00/5&2BFB86CE&0&08000A|1022|57a3|060400|0000|0000|-|PCI-to-PCI Bridge
-pci|PCI/VEN_1022&DEV_1446&SUBSYS_00000000&REV_00/3&11583659&0&C6|1022|1446|060000|0000|0000|-|PCI standard host CPU bridge
-… 12 of 48 rows shown
-[result_status] OK / FULL
-
-== action=thunderbolt
-thunderbolt|none
-[result_status] OK / FULL
-```
-
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash 25220299bc79
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-14 · euid 501 · leg-hash a46d8925aec5
 
 ```
 == action=usb
@@ -193,7 +155,7 @@ thunderbolt|0|host_controller|Apple Inc.|iOS|05ac5cb2a9f494b3|-|-
 [result_status] OK / FULL
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-14 · euid 0 · leg-hash 25220299bc79
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-14 · euid 0 · leg-hash a46d8925aec5
 
 ```
 == action=usb
@@ -234,10 +196,10 @@ thunderbolt|none
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/peripherals/src/peripherals_legs.hpp` · `agents/plugins/peripherals/src/peripherals_linux.cpp` · `agents/plugins/peripherals/src/peripherals_linux_parsers.hpp` · `agents/plugins/peripherals/src/peripherals_macos.cpp` · `agents/plugins/peripherals/src/peripherals_macos_parsers.hpp` · `agents/plugins/peripherals/src/peripherals_parsers.hpp` · `agents/plugins/peripherals/src/peripherals_plugin.cpp` · `agents/plugins/peripherals/src/peripherals_win.cpp` · `agents/plugins/peripherals/src/peripherals_win_parsers.hpp`
+- Plugin: `agents/plugins/peripherals/src/peripherals_legs.hpp` · `agents/plugins/peripherals/src/peripherals_linux.cpp` · `agents/plugins/peripherals/src/peripherals_linux_parsers.hpp` · `agents/plugins/peripherals/src/peripherals_macos.cpp` · `agents/plugins/peripherals/src/peripherals_macos_parsers.hpp` · `agents/plugins/peripherals/src/peripherals_parsers.hpp` · `agents/plugins/peripherals/src/peripherals_plugin.cpp` · `agents/plugins/peripherals/src/peripherals_win.cpp`
 - Definitions: `content/definitions/peripherals.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp`
-- Tests: `tests/unit/test_peripherals_linux_parsers.cpp` · `tests/unit/test_peripherals_local_dispatcher.cpp` · `tests/unit/test_peripherals_macos_parsers.cpp` · `tests/unit/test_peripherals_parsers.cpp` · `tests/unit/test_peripherals_win_parsers.cpp`
+- Tests: `tests/unit/test_peripherals_linux_parsers.cpp` · `tests/unit/test_peripherals_local_dispatcher.cpp` · `tests/unit/test_peripherals_macos_parsers.cpp` · `tests/unit/test_peripherals_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 - Changelog: `changelog.d/wave9-pr91a-peripherals-bus.added.md`
 <!-- END GENERATED -->

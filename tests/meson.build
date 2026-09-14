@@ -484,6 +484,10 @@ agent_test_exe = executable(
     'unit/test_autoruns_win_local.cpp',         # Wave 7 PR7.1: Windows leg (+ OS-independent WMI join tests)
     'unit/test_autoruns_linux_local.cpp',       # Wave 7 PR7.1: Linux leg (+ read_file_bounded internals)
     'unit/test_autoruns_macos_local.cpp',       # Wave 7 PR7.1: macOS leg (CFPropertyList over REAL plists)
+    'unit/test_peripherals_parsers.cpp',           # Wave 9 PR9.1a: pure row formatters/hex helpers, fixture-driven
+    'unit/test_peripherals_local_dispatcher.cpp',  # Wave 9 PR9.1a: real peripherals dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_peripherals_linux_parsers.cpp',     # Wave 9 PR9.1a: pure sysfs walk/attr parsers over a committed fixture tree
+    'unit/test_peripherals_macos_parsers.cpp',     # Wave 9 PR9.1a: pure IOKit OSData decoders over this-Mac REAL CAPTURE fixtures
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
   ),
@@ -496,6 +500,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
+    include_directories('../agents/plugins/peripherals/src'),  # peripherals_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
@@ -544,7 +549,9 @@ agent_test_exe = executable(
              '"',
              # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
              # REQUIRE(exists), never skip. Wave 9 PR9.2a: test_windows_optional_features_parsers.cpp
-             # reads the-rig REAL CAPTURE fixtures via this same define.
+             # reads the-rig REAL CAPTURE fixtures via this same define. Wave 9 PR9.1a:
+             # test_peripherals_{macos,linux}_parsers.cpp read the-rig/this-Mac REAL
+             # CAPTURE fixtures via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
@@ -635,6 +642,7 @@ agent_test_exe = executable(
                 power_health_plugin_lib,
                 autoruns_plugin_lib,  # Wave 7 PR7.1
                 windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
+                peripherals_plugin_lib,  # Wave 9 PR9.1a
                 windows_updates_plugin_lib,
                 ],
 )

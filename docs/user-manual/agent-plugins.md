@@ -43,6 +43,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `network_config` | ✅ ✅ ✅ | Reports network adapter configuration, IP addresses, DNS servers, and proxy settings | [README](../../agents/plugins/network_config/README.md) |
 | `network_diag` | ✅ ✅ ✅ | Network diagnostics — listening ports and established connections | [README](../../agents/plugins/network_diag/README.md) |
 | `os_info` | ✅ ✅ ✅ | Reports OS name, version, build, architecture, and system uptime | [README](../../agents/plugins/os_info/README.md) |
+| `peripherals` | 🟡 ✅ ✅ | USB, PCI and Thunderbolt/USB4 device inventory | [README](../../agents/plugins/peripherals/README.md) |
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
 | `processes` | ✅ ✅ ✅ | Process listing — enumerate and query running processes | [README](../../agents/plugins/processes/README.md) |
 | `procfetch` | ✅ ✅ ✅ | Enumerates running processes with SHA-1 hashes of executables | [README](../../agents/plugins/procfetch/README.md) |
