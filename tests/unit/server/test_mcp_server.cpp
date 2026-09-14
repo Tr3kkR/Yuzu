@@ -5984,8 +5984,13 @@ TEST_CASE("MCP check_permission: an oversized securable_type/operation is reject
 //
 // The 5 management-group/result-set mutators below (ManagementGroup:Write /
 // Infrastructure:Delete) ARE approval-gated at supervised tier - unlike the
-// 14 tools tested above, a supervised-tier call to these already hit C8's
-// schema validate(). What #4353's Gate 2 re-review found is a DIFFERENT
+// 14 other #4353 gap-tools (only 6 of which get a dedicated oversized-field
+// test elsewhere in this file: check_permission above, get_management_group,
+// list_result_sets, create_result_set, reevaluate_result_set, and
+// create_result_set_from_instruction_result further down - the remaining 8
+// share the identical code shape but have no dedicated test), a
+// supervised-tier call to these 5 already hit C8's schema validate(). What
+// #4353's Gate 2 re-review found is a DIFFERENT
 // bypass of the SAME class: requires_approval() returns false immediately
 // for an EMPTY mcp_tier, and /mcp/v1/'s auth_fn (require_auth) admits a
 // plain RBAC session or a non-MCP-tiered API token the same way any REST

@@ -1326,7 +1326,7 @@ public:
         }
         // #4353 follow-up (Gate 2 finding on #4364): the 19 kFieldBoundTools
         // share the SAME counter as execute_instruction above but a single
-        // fixed reason ("arg_too_large") - see mcp_input_bounds.hpp's
+        // fixed reason ("arg_too_large") - see mcp_server.cpp's
         // reject_field_too_large comment for why these 19 don't get
         // execute_instruction's per-field reason breakdown. Iterated from that
         // one array for the same emitted-but-unseeded reason as above.
