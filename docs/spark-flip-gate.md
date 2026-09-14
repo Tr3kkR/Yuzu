@@ -357,9 +357,10 @@ is correct as-is - `persist_lifecycle_journal_locked`, `ack_ledger_->retire()`, 
 could make that hold backend-arm-bounded (a hung device/OS call); what remains under
 the lock is synchronous, rule-count-scaled local work - `apply_rules()`'s full_sync KV
 sweep + `detach_all()` + per-rule reconcile loop + unbounded journal persist on scope
-exit, but also `journal_maintenance_tick()`'s own periodic drain+persist and the
-boot-time `start_local()`/`wire_spark_engine()` calls - which this design was never
-meant to make instant.
+exit, and unconditionally the boot-time `start_local()`/`wire_spark_engine()` calls -
+plus `journal_maintenance_tick()`'s own periodic drain+persist when `prefer_spark_` is
+true (it no-ops immediately under the lock otherwise, which is production's default
+today) - none of which this design was ever meant to make instant.
 Also corrected R5.4's own "as implemented" stamp: "no data is ever lost" was an
 overclaim - `stage_pending_locked()` drops the oldest staged record past
 `kMaxPendingJournalRecords` under sustained persist failure, counted via

@@ -2869,10 +2869,12 @@ void GuardianSparkRuntime::begin_stop() {
     // apply_rules() still does real synchronous work under that lock regardless of this
     // change: a full_sync's KV sweep and detach_all() (scales with the rule count being
     // torn down), the per-rule reconcile loop, and an unbounded lifecycle-journal persist
-    // on scope exit. It is not the only mtx_ holder that can delay stop() this way -
-    // journal_maintenance_tick() (runs every heartbeat) and the boot-time start_local()/
-    // wire_spark_engine() calls do their own synchronous work under the same lock - but
-    // none of that is a *backend* wait this wake-up reaches, so stop() is decoupled from
+    // on scope exit. It is not the only mtx_ holder that can delay stop() this way - the
+    // boot-time start_local()/wire_spark_engine() calls do their own synchronous work
+    // under the same lock unconditionally, and journal_maintenance_tick() (every
+    // heartbeat) does too, but ONLY when prefer_spark_ is true - it no-ops immediately
+    // after taking mtx_ otherwise (guardian_engine.cpp:767), which is production's
+    // default today. None of that is a *backend* wait this wake-up reaches, so stop() is decoupled from
     // backend-arm latency, not from any mtx_ holder's own duration. This DOES matter for a caller that
     // already holds mtx_ across a DIFFERENT blocking section calling begin_stop()
     // directly, and for the runtime's own destructor path.

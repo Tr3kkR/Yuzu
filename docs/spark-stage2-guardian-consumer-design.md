@@ -835,28 +835,35 @@ synchronous work under that lock: a full_sync's KV sweep and
 `detach_all()` itself, `guardian_spark_runtime.cpp:1647`, reserves and iterates
 `rule_ids.size()`), the per-rule reconcile loop, and an unbounded lifecycle-journal
 persist via `GuardianRollback`'s destructor on every exit. `apply_rules()` is not the
-only holder that can delay `stop()` this way - `journal_maintenance_tick()`
-(`:766`, runs every heartbeat tick) and the boot-time `start_local()` (`:453`) /
+only holder that can delay `stop()` this way: the boot-time `start_local()` (`:453`) /
 `wire_spark_engine()` (`:1996`) calls do their own synchronous work under the same
-lock, not just this PR's own scope, so `stop()`'s wait is bounded by whichever
-holder it happens to contend with, not by `apply_rules()` alone. `stop()` itself also
+lock unconditionally. `journal_maintenance_tick()` (`:766`, every heartbeat tick) is a
+fourth holder but a different shape - bounded per tick
+(`kJournalPersistMaxBatchesPerTick`/`kAckDrainMaxPerTick`) and `prefer_spark_`-gated
+(`:767`): it no-ops immediately after taking `mtx_` while `prefer_spark_` is `false`,
+which is production's default today, so it is not currently a real contributor to
+`stop()`'s wait the way the other three unconditionally are. `stop()` itself also
 persists the journal unbounded, once before `begin_stop()` and once after
 (`guardian_engine.cpp:639`/`:667`). `GuardianSparkRuntime::begin_stop()`
 (`guardian_spark_runtime.cpp:2806-2849`) drops every Queued claim with a counted
 total (`claims_dropped_at_stop_`), leaves Dispatching/Dispatched claims for their own
-completion callback, and disarms a late-arriving success rather than leaving it live -
-a retained disarm dropped in the same sweep leaks its watcher exactly as the old
-silent Stopped drop did, now counted the same way (comment at
-`guardian_spark_runtime.cpp:2817-2818`), a known, counted gap rather than a silent one.
+completion callback, and disarms a late-arriving success rather than leaving it live.
 `GuardianEngine::stop()`'s `ack_ledger_->retire()` call is bookkeeping only (resets
 what the ledger is watching), not resource cleanup - the disarm guarantee above is
 what actually tears down a live claim. One known caller of `begin_stop()` outside
 `stop()`: `rollback_spark_wiring_locked()` (`guardian_engine.cpp:2166`, single call
 site at `:2048`, a boot-time wiring-failure path) resets `spark_runtime_` without
 first waiting for `active_backend_op_workers()==0` - tracked as **#3811** (filed
-during the #2233 governance sweep, OPEN as of this writing; `docs/spark-flip-gate.md`'s
-own §3 row 3 already rules it does not gate the Spark flip, unlike its sibling #3816).
-Cited here, not re-investigated or re-fixed by this PR. `#4322` (the stale
+during the #2233 governance sweep, confirmed OPEN 2026-09-14 via `gh issue view 3811`;
+`docs/spark-flip-gate.md`'s own §3 row 3 already rules it does not gate the Spark
+flip, unlike its sibling #3816).
+**Detection signal: none today**, same as #3816's own entry notes for its gap -
+`GuardianEngine::active_io_workers()` (`:2199`) sums via `if (spark_runtime_)`
+(`:2214`), so any worker `active_backend_op_workers()` still counted at reset time
+drops out of that sum the instant `spark_runtime_.reset()` runs, not when the worker
+itself finishes - whether a worker can actually outlive the reset here is not
+established either way by this note. Cited here, not re-investigated or re-fixed by
+this PR. `#4322` (the stale
 `begin_stop()` comment claiming `apply_rules()` could still park in a bounded backend
 wait) is fixed in the same PR that adds this stamp.
 
