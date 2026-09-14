@@ -905,8 +905,17 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             // Only flag "malformed" when get_Xml() actually succeeded and
             // handed back something parse_task_xml could not make sense of
             // -- a COM failure already has its own, more specific token.
-            if (!FAILED(xml_hr) && !info.parsed_ok)
-                note_constraint(outcome, "malformed");
+            if (!FAILED(xml_hr) && !info.parsed_ok) {
+                // #4184: oversized gets its own token (a runaway/corrupt
+                // get_Xml() BSTR is a different failure shape than a
+                // genuine XML syntax problem) -- every other TaskReject
+                // (empty/malformed/dtd/wrong_root) still collapses to the
+                // existing "malformed" token; a caller reading the wire
+                // reason doesn't need every rejection SHAPE distinguished,
+                // just this one different CAUSE.
+                note_constraint(outcome, info.reject == TaskReject::oversized ? "oversized"
+                                                                              : "malformed");
+            }
 
             // <RegistrationInfo>/<Date> is read through the same libxml2
             // tree parse_task_xml already built -- no second raw-text scan
@@ -930,45 +939,21 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             // Task Scheduler executes every <Exec> action in sequence -- one
             // row per action (index-suffixed once there's more than one) so
             // a later action is never silently hidden behind the first.
-            const bool multi = info.actions.size() > 1;
-            if (info.actions.empty()) {
-                Row row;
-                row.source_id = SourceId::win_scheduled_tasks;
-                row.catalog_version = kAutorunSourceCatalogVersion;
-                row.location = location;
-                row.entry = entry_base;
-                row.enabled = enabled_state;
-                row.scope = Scope::system;
-                row.user = user;
-                row.signed_state = Signed::not_checked;
-                row.mtime = task_mtime;
-                outcome.rows.push_back(std::move(row));
-            } else {
-                for (std::size_t i = 0; i < info.actions.size(); ++i) {
-                    // A task admitted just under the cap can still carry
-                    // several actions (bounded by Task Scheduler's own
-                    // per-task action limit, so not unbounded) -- re-check
-                    // per action, not just once per task, so the total row
-                    // count can't creep past the cap.
-                    if (outcome.rows.size() >= cap) {
-                        note_constraint(outcome, "row_cap");
-                        return;
-                    }
-                    Row row;
-                    row.source_id = SourceId::win_scheduled_tasks;
-                    row.catalog_version = kAutorunSourceCatalogVersion;
-                    row.location = location;
-                    row.entry = multi ? entry_base + " [action " + std::to_string(i + 1) + "]"
-                                      : entry_base;
-                    row.target = info.actions[i].command;
-                    row.args = info.actions[i].arguments;
-                    row.enabled = enabled_state;
-                    row.scope = Scope::system;
-                    row.user = user;
-                    row.signed_state = Signed::not_checked;
-                    row.mtime = task_mtime;
-                    outcome.rows.push_back(std::move(row));
+            // rows_for_task (autoruns_parsers.hpp) is the pure, cross-
+            // platform-tested row-shaping logic (#4184); this call site's
+            // own job is only the row-count cap.
+            for (auto& row : rows_for_task(info, location, entry_base, user, task_mtime,
+                                           enabled_state)) {
+                // A task admitted just under the cap can still carry several
+                // actions (bounded by Task Scheduler's own per-task action
+                // limit, so not unbounded) -- re-check per row, not just
+                // once per task, so the total row count can't creep past
+                // the cap.
+                if (outcome.rows.size() >= cap) {
+                    note_constraint(outcome, "row_cap");
+                    return;
                 }
+                outcome.rows.push_back(std::move(row));
             }
         }
     }

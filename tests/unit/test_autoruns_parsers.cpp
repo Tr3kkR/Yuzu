@@ -336,7 +336,7 @@ TEST_CASE("autoruns: parse_task_xml reads command, disabled state, principal and
           "[autoruns][parsers]") {
     const auto xml = read_fixture_reg_text("windows/sample_task.xml");
     const auto info = parse_task_xml(xml);
-    CHECK(info.parsed_ok); // a real, well-formed <Task>-rooted capture
+    CHECK(info.parsed_ok); // a real, well-formed <Task>-rooted capture (with the real xmlns)
     REQUIRE(info.actions.size() == 1);
     CHECK(info.actions[0].command == "%windir%\\system32\\appidpolicyconverter.exe");
     CHECK_FALSE(info.has_unmodelled_action);
@@ -355,7 +355,7 @@ TEST_CASE("autoruns: parse_task_xml on a truncated document reports parsed_ok=fa
           "[autoruns][parsers]") {
     // RECONSTRUCTION negative (acceptance criterion): a Command tag opened
     // but never closed must not throw or read past the buffer.
-    const std::string truncated = "<Task><Actions><Exec><Command>C:\\partial";
+    const std::string truncated = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions><Exec><Command>C:\\partial";
     const auto info = parse_task_xml(truncated);
     CHECK_FALSE(info.parsed_ok);
     CHECK(info.actions.empty());
@@ -374,7 +374,7 @@ TEST_CASE("autoruns: parse_task_xml on a well-formed task with no <Triggers> and
           "boring task, not a parse failure, and must not be conflated with the "
           "truncated/malformed cases above that also have empty actions/has_triggers)",
           "[autoruns][parsers]") {
-    const std::string xml = "<Task><RegistrationInfo><Date>2026-01-01T00:00:00</Date>"
+    const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><Date>2026-01-01T00:00:00</Date>"
                             "</RegistrationInfo></Task>";
     const auto info = parse_task_xml(xml);
     CHECK(info.parsed_ok);
@@ -393,7 +393,7 @@ TEST_CASE("autoruns: parse_task_xml reads <RegistrationInfo>/<Date> through the 
           "ahead of the real element would win a raw scan but must not win here)",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><RegistrationInfo>"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo>"
         "<!-- decoy: <Date>1999-01-01T00:00:00</Date> -->"
         "<Date>2026-06-15T12:30:00</Date>"
         "</RegistrationInfo></Task>";
@@ -405,7 +405,7 @@ TEST_CASE("autoruns: parse_task_xml reads <RegistrationInfo>/<Date> through the 
 TEST_CASE("autoruns: parse_task_xml reads every <Exec> action, not just the first",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec><Command>C:\\benign.exe</Command><Arguments>-a</Arguments></Exec>"
         "<Exec><Command>C:\\second.exe</Command><Arguments>-b</Arguments></Exec>"
         "</Actions></Task>";
@@ -421,7 +421,7 @@ TEST_CASE("autoruns: parse_task_xml reads every <Exec> action, not just the firs
 TEST_CASE("autoruns: parse_task_xml flags an unmodelled action type alongside a real Exec",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec><Command>C:\\benign.exe</Command></Exec>"
         "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>"
         "</Actions></Task>";
@@ -435,7 +435,7 @@ TEST_CASE("autoruns: parse_task_xml does not confuse <Actions> with a longer tag
           "its prefix",
           "[autoruns][parsers]") {
     // A hypothetical <ActionsFoo> block must not be mistaken for <Actions>.
-    const std::string xml = "<Task><ActionsFoo><Exec><Command>C:\\decoy.exe</Command></Exec>"
+    const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><ActionsFoo><Exec><Command>C:\\decoy.exe</Command></Exec>"
                             "</ActionsFoo></Task>";
     const auto info = parse_task_xml(xml);
     CHECK(info.actions.empty());
@@ -452,7 +452,7 @@ TEST_CASE("autoruns: a raw '>' or '/>' inside a QUOTED attribute value does not 
     SECTION("a '>' inside the quoted Id value -- must not be read as the tag terminator, "
             "and the trigger must still be found as a real (non-self-closed) element") {
         const std::string xml =
-            "<Task><Triggers><LogonTrigger Id=\"a>b\"><Enabled>true</Enabled>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger Id=\"a>b\"><Enabled>true</Enabled>"
             "</LogonTrigger></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
@@ -460,7 +460,7 @@ TEST_CASE("autoruns: a raw '>' or '/>' inside a QUOTED attribute value does not 
     SECTION("a '/>' sequence inside the quoted id value -- must not be read as a genuine "
             "self-close, so the action's real Command/Arguments still reach the row") {
         const std::string xml =
-            "<Task><Actions Context=\"Author\">"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
             "<Exec id=\"a/>b\"><Command>C:\\payload.exe</Command><Arguments>-x</Arguments></Exec>"
             "</Actions></Task>";
         const auto info = parse_task_xml(xml);
@@ -476,7 +476,7 @@ TEST_CASE("autoruns: parse_task_xml decodes the 5 predefined XML entities in "
           "exact IOC/command-string matching against the real argv)",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec><Command>C:\\tools\\a&amp;b.exe</Command>"
         "<Arguments>--filter=\"x&lt;y&gt;z\" --tag=&apos;a&amp;b&apos;</Arguments></Exec>"
         "</Actions></Task>";
@@ -495,7 +495,7 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
     SECTION("an XML comment containing '>' and quotes, sitting between real elements, "
             "must not confuse the real content around it") {
         const std::string xml =
-            "<Task><Actions Context=\"Author\">"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
             "<!-- a comment with a stray > and \"quotes\" and 'more quotes' -->"
             "<Exec><Command>C:\\real.exe</Command></Exec>"
             "</Actions></Task>";
@@ -508,14 +508,14 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
             "obstacle") {
         const std::string xml =
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>"
-            "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger/></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("a decoy element sharing a trigger-type's local name but living OUTSIDE "
             "<Triggers> must not be mistaken for a real trigger") {
         const std::string xml =
-            "<Task><RegistrationInfo><LogonTrigger>decoy, not a real trigger element here"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><LogonTrigger>decoy, not a real trigger element here"
             "</LogonTrigger></RegistrationInfo><Triggers/></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
@@ -528,7 +528,7 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
             "well-formed-but-boring task") {
         const std::string xml =
             "<?xml version=\"1.0\"?><!DOCTYPE Task [<!ENTITY x \"evil\">]>"
-            "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger/></Triggers></Task>";
         const auto info = parse_task_xml(xml);
         CHECK_FALSE(info.parsed_ok);
         CHECK_FALSE(info.has_triggers);
@@ -552,21 +552,21 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
           "[autoruns][parsers]") {
     SECTION("a single disabled trigger -> false") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><Enabled>false</Enabled>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><Enabled>false</Enabled>"
             "</CalendarTrigger></Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("a trigger with no <Enabled> tag at all -> true (schema default enabled)") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
             "</CalendarTrigger></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("one disabled, one enabled -> true (at least one will fire)") {
         const std::string xml =
-            "<Task><Triggers>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>"
             "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
             "<TimeTrigger><Enabled>true</Enabled></TimeTrigger>"
             "</Triggers></Task>";
@@ -575,7 +575,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
 
     SECTION("all disabled -> false") {
         const std::string xml =
-            "<Task><Triggers>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>"
             "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
             "<TimeTrigger><Enabled>false</Enabled></TimeTrigger>"
             "</Triggers></Task>";
@@ -590,7 +590,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "Task Scheduler UI -- was misclassified as no live trigger, even "
             "though the untagged sibling will fire the task)") {
         const std::string xml =
-            "<Task><Triggers>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>"
             "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
             "<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>"
             "</Triggers></Task>";
@@ -598,7 +598,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
     }
 
     SECTION("whitespace-only Triggers block -> false") {
-        const std::string xml = "<Task><Triggers>\n   \t\n</Triggers></Task>";
+        const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>\n   \t\n</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
@@ -606,12 +606,12 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "LogonTrigger/BootTrigger/etc. have no required children, so a bare "
             "<LogonTrigger/> is schema-valid and live; the round-4 exact-open-tag "
             "matcher missed this shape entirely)") {
-        const std::string xml = "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+        const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger/></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("a self-closed trigger with a space before the slash -> true") {
-        const std::string xml = "<Task><Triggers><LogonTrigger /></Triggers></Task>";
+        const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger /></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
@@ -620,7 +620,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "base type defines an optional Id attribute; the round-4 exact "
             "'<Tag>' match required a bare tag with no attributes)") {
         const std::string xml =
-            "<Task><Triggers><BootTrigger Id=\"boot\"><Enabled>true</Enabled>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><BootTrigger Id=\"boot\"><Enabled>true</Enabled>"
             "</BootTrigger></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
@@ -629,14 +629,14 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "(RECONSTRUCTION: pins round 5's should-fix -- a bare =='false' string "
             "compare treated '0' as live)") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><Enabled>0</Enabled></CalendarTrigger>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><Enabled>0</Enabled></CalendarTrigger>"
             "</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("whitespace-padded <Enabled> false form still disables") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><Enabled> false </Enabled></CalendarTrigger>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><Enabled> false </Enabled></CalendarTrigger>"
             "</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
@@ -649,13 +649,138 @@ TEST_CASE("autoruns: parse_task_xml reads an Exec action carrying the schema's o
           "target/args came back empty even though the task has a real command)",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec id=\"run\"><Command>C:\\real.exe</Command><Arguments>-x</Arguments></Exec>"
         "</Actions></Task>";
     const auto info = parse_task_xml(xml);
     REQUIRE(info.actions.size() == 1);
     CHECK(info.actions[0].command == "C:\\real.exe");
     CHECK(info.actions[0].arguments == "-x");
+}
+
+TEST_CASE("autoruns: parse_task_xml rejects a <Task>-named root that isn't in the Task "
+          "Scheduler namespace -- schema-garbage sharing child tag names (<Settings>/"
+          "<Actions>/<Triggers>) under an unrelated or absent namespace must not parse "
+          "as a plausible task with no signal it came from elsewhere (#4184 AC2)",
+          "[autoruns][parsers]") {
+    SECTION("root element with no namespace at all") {
+        const std::string xml =
+            "<Task><Settings><Enabled>true</Enabled></Settings>"
+            "<Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.parsed_ok);
+        CHECK(info.reject == TaskReject::wrong_root);
+        CHECK(info.actions.empty()); // safe defaults, not a partial/guessed parse
+    }
+
+    SECTION("root element in an unrelated namespace") {
+        const std::string xml =
+            "<Task xmlns=\"urn:not-task-scheduler\">"
+            "<Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.parsed_ok);
+        CHECK(info.reject == TaskReject::wrong_root);
+    }
+
+    SECTION("the real Task Scheduler namespace is still accepted") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK(info.parsed_ok);
+        CHECK(info.reject == TaskReject::none);
+    }
+}
+
+TEST_CASE("autoruns: parse_task_xml refuses an oversized document before xmlReadMemory "
+          "ever sees it, distinct from an ordinary malformed rejection (#4184)",
+          "[autoruns][parsers]") {
+    const std::string oversized(kMaxTaskXmlBytes + 1, 'a');
+    const auto info = parse_task_xml(oversized);
+    CHECK_FALSE(info.parsed_ok);
+    CHECK(info.reject == TaskReject::oversized);
+}
+
+TEST_CASE("autoruns: parse_task_xml rejects a deeply-nested, DTD-free document cleanly "
+          "-- a real error, not a crash or unbounded resource use (#4184 AC3). "
+          "XML_PARSE_HUGE is deliberately never passed (see parse_task_xml's own "
+          "banner), so libxml2's own default depth ceiling (~256 levels) is what "
+          "rejects this, not an explicit depth counter in this function",
+          "[autoruns][parsers]") {
+    std::string open, close;
+    for (int i = 0; i < 5000; ++i) {
+        open += "<x>";
+        close += "</x>";
+    }
+    const std::string xml =
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" + open +
+        close + "</Task>";
+    const auto info = parse_task_xml(xml);
+    CHECK_FALSE(info.parsed_ok);
+    // Genuinely nested, not DTD/oversized -- confirms the depth ceiling
+    // itself is what rejected it, not an unrelated guard firing first.
+    CHECK(info.reject == TaskReject::malformed);
+}
+
+TEST_CASE("autoruns: rows_for_task emits exactly one row for a task with zero decoded "
+          "actions -- whether genuinely action-less or carrying only an unmodelled "
+          "action type -- rather than silently vanishing (#4184 AC1)",
+          "[autoruns][parsers]") {
+    SECTION("genuinely no actions at all") {
+        TaskInfo info;
+        info.parsed_ok = true;
+        const auto rows =
+            rows_for_task(info, "\\MyTask", "MyTask", "SYSTEM", 12345, Enabled::enabled);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].entry == "MyTask");
+        CHECK(rows[0].target.empty());
+        CHECK(rows[0].args.empty());
+        CHECK(rows[0].enabled == Enabled::enabled);
+        CHECK(rows[0].mtime == 12345);
+    }
+
+    SECTION("only an unmodelled action type (ComHandler, no Exec) -- the row a caller "
+            "must not read as \"nothing here\"") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions><ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId>"
+            "</ComHandler></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        REQUIRE(info.parsed_ok);
+        CHECK(info.actions.empty());
+        CHECK(info.has_unmodelled_action);
+        const auto rows = rows_for_task(info, "\\MyTask", "MyTask", "-", 0, Enabled::unknown);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].target.empty());
+        CHECK(rows[0].enabled == Enabled::unknown);
+    }
+}
+
+TEST_CASE("autoruns: rows_for_task emits one row per action, index-suffixing the entry "
+          "only once there's more than one",
+          "[autoruns][parsers]") {
+    TaskInfo info;
+    info.parsed_ok = true;
+    info.actions = {{"C:\\a.exe", "-a"}, {"C:\\b.exe", "-b"}};
+    const auto rows = rows_for_task(info, "\\MyTask", "MyTask", "SYSTEM", 999, Enabled::enabled);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].entry == "MyTask [action 1]");
+    CHECK(rows[0].target == "C:\\a.exe");
+    CHECK(rows[0].args == "-a");
+    CHECK(rows[1].entry == "MyTask [action 2]");
+    CHECK(rows[1].target == "C:\\b.exe");
+    CHECK(rows[1].args == "-b");
+}
+
+TEST_CASE("autoruns: rows_for_task's single-action case does not get an index suffix",
+          "[autoruns][parsers]") {
+    TaskInfo info;
+    info.parsed_ok = true;
+    info.actions = {{"C:\\solo.exe", ""}};
+    const auto rows = rows_for_task(info, "\\MyTask", "MyTask", "-", 0, Enabled::enabled);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].entry == "MyTask");
+    CHECK(rows[0].target == "C:\\solo.exe");
 }
 
 TEST_CASE("autoruns: scheduled_task_enabled_state requires both a live COM Enabled "

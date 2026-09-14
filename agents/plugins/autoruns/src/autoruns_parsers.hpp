@@ -49,6 +49,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -544,6 +545,15 @@ struct TaskAction {
     std::string arguments;
 };
 
+/// Why parse_task_xml rejected a document (TaskInfo::parsed_ok == false) --
+/// `none` when parsing succeeded. A caller that wants a single reason token
+/// can collapse most of these to "malformed" (they all mean "this was not a
+/// usable Task Scheduler document"); `oversized` is kept distinguishable
+/// because it is reachable from an entirely different cause (a runaway/
+/// corrupt get_Xml() BSTR) than a genuine XML syntax problem, and worth its
+/// own token for anyone triaging a fleet-wide reason breakdown (#4184).
+enum class TaskReject { none, empty, malformed, dtd, wrong_root, oversized };
+
 struct TaskInfo {
     std::vector<TaskAction> actions; // one per <Exec>, in document order
     bool has_unmodelled_action = false; // an <Actions> child this scanner
@@ -566,6 +576,9 @@ struct TaskInfo {
     // "no elements" with "parse failed" is exactly the defect this field
     // exists to stop a caller from reintroducing (PR #4154 round 9 blocker).
     bool parsed_ok = false;
+    // Set alongside every parsed_ok=false return -- see TaskReject's own
+    // banner. Left at ::none whenever parsed_ok is true.
+    TaskReject reject = TaskReject::none;
 };
 
 namespace detail {
@@ -640,10 +653,28 @@ inline std::string xml_get_text(xmlNodePtr node) {
 /// `XML_PARSE_NOENT` is deliberately absent (entities aren't expanded
 /// beyond the 5 predefined ones libxml2 always decodes), and a
 /// DOCTYPE/DTD is explicitly rejected rather than trusted. A parse failure,
-/// a rejected DTD, or a missing root/section leaves TaskInfo at its
+/// a rejected DTD, or a missing/wrong root leaves TaskInfo at its
 /// documented defaults -- this is still best-effort over possibly-truncated
 /// XML, not a validating parser; it just validates well-formedness instead
 /// of hand-scanning for it.
+///
+/// Bounded twice against an adversarial or corrupt document (#4184): an
+/// explicit `kMaxTaskXmlBytes` cap rejects an oversized document before
+/// `xmlReadMemory` ever sees it (also closing the `size_t` -> `int` length
+/// narrowing that call requires -- unreachable in practice once the byte cap
+/// is well under INT_MAX, but guarded explicitly rather than relying on that
+/// incidentally). Depth is NOT explicitly capped here: `XML_PARSE_HUGE` is
+/// deliberately never passed, so libxml2's own default ~256-level parser
+/// depth ceiling applies and a document nested deeper than that fails the
+/// parse cleanly (a real error, not a crash or unbounded resource use) --
+/// this function relies on that built-in ceiling rather than re-implementing
+/// its own depth tracking over the resulting tree.
+///
+/// The expected root is validated by BOTH local name (`Task`) and namespace
+/// URI (Task Scheduler's one documented default namespace) -- a document
+/// using unrelated element names that merely happen to share `<Settings>`/
+/// `<Actions>`/`<Triggers>` tags under some other root or namespace no
+/// longer parses as a plausible task with no signal it came from elsewhere.
 ///
 /// `xml` is ALWAYS real UTF-8 bytes by the time it reaches this function --
 /// the caller (autoruns_win.cpp) converts the raw `IRegisteredTask::get_Xml()`
@@ -656,22 +687,54 @@ inline std::string xml_get_text(xmlNodePtr node) {
 /// explicitly here overrides it with the encoding this call site actually
 /// guarantees, rather than trusting a label the upstream conversion already
 /// invalidated.
+inline constexpr std::size_t kMaxTaskXmlBytes = 1 << 20; // 1 MiB, same cap
+                                                          // and reasoning as
+                                                          // saml_provider.cpp's
+                                                          // XML size guard.
+inline constexpr const char* kTaskSchedulerNamespaceUri =
+    "http://schemas.microsoft.com/windows/2004/02/mit/task";
+
 inline TaskInfo parse_task_xml(std::string_view xml) {
     TaskInfo out;
-    if (xml.empty()) return out; // nothing to parse -- parsed_ok stays false
+    if (xml.empty()) {
+        out.reject = TaskReject::empty;
+        return out; // nothing to parse -- parsed_ok stays false
+    }
+    if (xml.size() > kMaxTaskXmlBytes ||
+        xml.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+        out.reject = TaskReject::oversized;
+        return out; // refuse before xmlReadMemory ever sees it -- also
+                    // closes the size_t -> int length narrowing below
+    }
 
     xmlDocPtr doc = xmlReadMemory(xml.data(), static_cast<int>(xml.size()), "task.xml", "UTF-8",
                                   XML_PARSE_NONET | XML_PARSE_NOERROR | XML_PARSE_NOWARNING);
-    if (!doc) return out; // genuine parse failure -- parsed_ok stays false
+    if (!doc) {
+        out.reject = TaskReject::malformed;
+        return out; // genuine parse failure -- parsed_ok stays false
+    }
     detail::XmlDocGuard guard{doc};
-    if (doc->intSubset || doc->extSubset) return out; // DOCTYPE/DTD present -- malformed
+    if (doc->intSubset || doc->extSubset) {
+        out.reject = TaskReject::dtd;
+        return out; // DOCTYPE/DTD present -- malformed
+    }
 
     xmlNodePtr root = xmlDocGetRootElement(doc);
-    // The expected task-XML root is exactly <Task> -- a missing root or an
-    // unexpected one (decoy/corrupt document that still happens to parse as
-    // well-formed XML) is ALSO a genuine parse failure from this function's
-    // point of view, not merely "a task with nothing interesting in it".
-    if (!root || !root->name || !xmlStrEqual(root->name, BAD_CAST "Task")) return out;
+    // The expected task-XML root is exactly <Task> in the Task Scheduler
+    // namespace -- a missing root, an unexpected element name, OR the right
+    // element name under an unrelated/absent namespace (schema-garbage that
+    // merely happens to share child tag names like <Settings>/<Actions>) is
+    // ALSO a genuine parse failure from this function's point of view, not
+    // merely "a task with nothing interesting in it" (#4184).
+    if (!root || !root->name || !xmlStrEqual(root->name, BAD_CAST "Task")) {
+        out.reject = TaskReject::wrong_root;
+        return out;
+    }
+    if (!root->ns || !root->ns->href ||
+        !xmlStrEqual(root->ns->href, BAD_CAST kTaskSchedulerNamespaceUri)) {
+        out.reject = TaskReject::wrong_root;
+        return out;
+    }
 
     // From here on the document is well-formed AND <Task>-rooted -- every
     // early return below this point is a legitimate "this task has no X",
@@ -756,6 +819,61 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         }
     }
     return out;
+}
+
+/// Builds the win_scheduled_tasks row(s) for ONE already-parsed task -- pure,
+/// extracted out of the win.cpp COM call site so this leg's actual row-
+/// shaping logic (which action becomes which row, the multi-action
+/// "[action N]" entry suffix, how a task with zero decoded actions --
+/// whether genuinely action-less or carrying only an unmodelled action type
+/// like <ComHandler> -- still emits exactly one row rather than silently
+/// vanishing, #4184 AC1) is unit-testable on every build host, not just
+/// verified by reading COM code that only compiles on Windows. The caller
+/// (autoruns_win.cpp) still owns the row-count cap: it iterates the
+/// returned vector itself, re-checking the cap per row exactly as it did
+/// when this logic was inline.
+inline std::vector<Row> rows_for_task(const TaskInfo& info, std::string_view location,
+                                      std::string_view entry_base, std::string_view user,
+                                      std::int64_t mtime, Enabled enabled_state) {
+    std::vector<Row> rows;
+    const bool multi = info.actions.size() > 1;
+    if (info.actions.empty()) {
+        // Zero decoded actions -- either a genuinely action-less task, or
+        // one whose only action(s) are a type this scanner doesn't decode
+        // (has_unmodelled_action; the caller separately notes a
+        // "unmodelled_action_type" constraint for that case). Either way
+        // the task itself is real and must still surface as one row, with
+        // an empty target/args rather than being silently dropped.
+        Row row;
+        row.source_id = SourceId::win_scheduled_tasks;
+        row.catalog_version = kAutorunSourceCatalogVersion;
+        row.location = std::string{location};
+        row.entry = std::string{entry_base};
+        row.enabled = enabled_state;
+        row.scope = Scope::system;
+        row.user = std::string{user};
+        row.signed_state = Signed::not_checked;
+        row.mtime = mtime;
+        rows.push_back(std::move(row));
+        return rows;
+    }
+    for (std::size_t i = 0; i < info.actions.size(); ++i) {
+        Row row;
+        row.source_id = SourceId::win_scheduled_tasks;
+        row.catalog_version = kAutorunSourceCatalogVersion;
+        row.location = std::string{location};
+        row.entry = multi ? std::string{entry_base} + " [action " + std::to_string(i + 1) + "]"
+                          : std::string{entry_base};
+        row.target = info.actions[i].command;
+        row.args = info.actions[i].arguments;
+        row.enabled = enabled_state;
+        row.scope = Scope::system;
+        row.user = std::string{user};
+        row.signed_state = Signed::not_checked;
+        row.mtime = mtime;
+        rows.push_back(std::move(row));
+    }
+    return rows;
 }
 
 /// The Enabled decision for a `win_scheduled_tasks` row -- pulled out of
