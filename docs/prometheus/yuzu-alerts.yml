@@ -197,15 +197,21 @@ groups:
             server (pg_stat_activity, pool-acquire wait); a register_fresh
             failure additionally refuses new ProxyRegister with UNAVAILABLE, so
             gateway-fronted agents may be unable to (re)enroll until the store
-            recovers. TRIAGE BY op: op="register_fresh" is the higher-urgency
-            label (it blocks new enrollment); the other ops
-            (announce_connected/deregister/renew_leases) are fail-OPEN and a lone
-            failure there self-heals within the 90s lease TTL, so it is an early
-            low-cost signal of the same shared-store root cause rather than an
-            outage by itself. See ADR-2002 §7 "Ship the write-failure fail-closed
-            posture" and docs/user-manual/metrics.md's Gateway routing
-            directory section. INITIAL threshold, not yet tuned against real
-            fleet data.
+            recovers. TRIAGE BY op — the fail-open ops recover DIFFERENTLY, so do
+            not assume a uniform self-heal: op="register_fresh" (fail-CLOSED) is
+            the highest urgency, blocking new enrollment; op="renew_leases"
+            normally repairs on the next heartbeat; op="deregister" leaves a
+            stale row bounded by the ~90s lease TTL + the stale-route reaper; but
+            op="announce_connected" is the SOLE placement writer, so a lost
+            announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
+            NULL) — lease renewal does NOT repopulate placement, so it does NOT
+            self-heal on the lease TTL and needs another CONNECTED / agent
+            re-registration to restore routing. A lone fail-open failure is often
+            an early low-cost signal of the same shared-store root cause a
+            register_fresh failure hits harder. See ADR-2002 §7 "Ship the
+            write-failure fail-closed posture" and docs/user-manual/metrics.md's
+            Gateway routing directory section. INITIAL threshold, not yet tuned
+            against real fleet data.
 
       # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
       # GatewayRouteStore read during confined dispatch (store_unavailable/
