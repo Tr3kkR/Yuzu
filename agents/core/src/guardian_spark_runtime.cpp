@@ -221,6 +221,21 @@ void GuardianSparkRuntime::fail_all_claims_locked(const std::string& key, const 
         // the all_released erase below or the erase_if filter - a genuine terminal
         // removal either way. Harmless no-op for every Arm claim.
         clear_retained_locked(*c);
+        // consistency-auditor Gate 4 finding (this governance run, C-1): this
+        // function gained a second caller (dispatch_arm_off_lock's reservation-
+        // exhaustion path, up-3) that CAN reach an Arm claim holding a
+        // compensation_permit. Today that specific caller only ever fires before
+        // its own head's reservation succeeds, and a Disarm-only fifo can never
+        // hold a live Arm claim (detach_rule_locked's own invariant) - so this was
+        // provably a no-op on every reachable path even before this call was added.
+        // Added anyway, matching clear_retained_locked's own defensive placement
+        // one line above: release_compensation_locked() is idempotent (a no-op if
+        // `c` never held a permit), and calling it here means a FUTURE caller or a
+        // future up-3 change that violates either invariant above releases the
+        // slot immediately rather than only when `c`'s shared_ptr eventually goes
+        // out of scope via the RAII backstop (still correct either way, but this is
+        // more predictable and directly testable).
+        release_compensation_locked(*c);
         // noexcept; a failure (test seam / defence in depth - erase_rule cannot throw)
         // is counted and the claim keeps its index ownership for a retry.
         if (!release_claim_index_locked(*c)) {
@@ -517,7 +532,14 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
             const auto eit = claims_.find(key);
             if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
                 return; // already resolved/replaced before dispatch even began
-            if (!try_reserve_compensation_locked(claim->io_class)) {
+            if (auto permit = try_reserve_compensation_locked(claim->io_class)) {
+                // rung 9c PR-5b hardening (this governance run): the permit now
+                // lives on the claim itself (KeyClaim::compensation_permit, an
+                // RAII CompensationPermit) rather than a plain bool - see that
+                // class's own doc comment for why. Nothing else about this branch
+                // changes.
+                claim->compensation_permit = std::move(*permit);
+            } else {
                 refused = true;
                 compensation_reservation_refused_.fetch_add(1, std::memory_order_relaxed);
                 try {
@@ -528,8 +550,6 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
                     if (claim->dispatch == ClaimDispatch::Dispatching)
                         claim->dispatch = ClaimDispatch::Queued;
                 }
-            } else {
-                claim->compensation_reserved = true;
             }
         }
         if (refused) {
@@ -605,11 +625,15 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
 void GuardianSparkRuntime::fault_here_for_test(int point) {
     int expected = point;
     if (drain_fault_point_for_test_.compare_exchange_strong(expected, 0)) {
-        // ch-1 (#4221): points 6/7 name the fill-in loops' OWN allocation
-        // (std::unexpected(std::string{...})) - inject the exact exception that
+        // ch-1 (#4221): points 6/7/9 name fill-in-outcome allocations
+        // (std::unexpected(std::string{...})) - point 9 is synthesize_fallback_
+        // outcome_locked()'s own equivalent line, added this governance run
+        // alongside dropping that function's incorrect `noexcept` (consistency-
+        // auditor Gate 4 finding: the "mirror" function had no fault seam of its
+        // own, unlike the loop it mirrors). Inject the exact exception each
         // allocation would actually throw under real memory pressure, matching
         // point 1's existing precedent, not a generic runtime_error.
-        if (point == 1 || point == 6 || point == 7 || point == 8)
+        if (point == 1 || point == 6 || point == 7 || point == 8 || point == 9)
             throw std::bad_alloc{};
         throw std::runtime_error("drain fault point " + std::to_string(point) + " (test seam)");
     }
@@ -1466,14 +1490,15 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
                       .receipt = ArmReceipt{arm_claim}};
 }
 
-void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) noexcept {
+void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
     // Mirrors publish_arm_verdicts_locked's own fill-in loop (governance
     // consistency: one place decides what an unfilled claim's outcome becomes).
-    // noexcept: the std::string allocation below can throw in principle (exactly
-    // the same allocation that loop's own equivalent line carries, uncontained) -
-    // reap_stranded_claims_locked() wraps its call to this in its own try/catch so
-    // a rare allocation failure here degrades to "retry next pass", never a
-    // terminate.
+    // NOT noexcept (fixed, this governance run - see this function's own
+    // declaration comment in the header for the full story): the std::string
+    // allocation below CAN throw, exactly like that loop's own equivalent line -
+    // reap_stranded_claims_locked()'s existing try/catch around its call to this
+    // now genuinely contains it, degrading a rare allocation failure to "retry next
+    // pass" instead of a std::terminate.
     if (c.outcome || c.commit_exception)
         return;
     const auto rit = rules_.find(c.rule_id);
@@ -1483,6 +1508,13 @@ void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) noexc
         c.end = ClaimEnd::Committed;
     } else {
         release_claim_index_locked(c);
+        fault_here_for_test(9); // consistency-auditor Gate 4 finding (this
+                                // governance run): the ONE call site of this
+                                // function's own allocating line previously had no
+                                // fault seam of its own, unlike the fill-in loop it
+                                // mirrors (points 6/7) - this closes that gap so the
+                                // now-genuinely-contained catch path is directly
+                                // testable.
         c.outcome = std::unexpected(std::string{"arm drain failed"});
         c.end = ClaimEnd::CommitThrew;
     }

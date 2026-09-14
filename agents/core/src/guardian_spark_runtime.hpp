@@ -86,6 +86,7 @@
 #include <string_view>
 #include <unordered_set>
 #include <unordered_map>
+#include <utility>  // std::exchange (CompensationPermit/RetainedGuard move ops)
 #include <vector>
 
 namespace yuzu::agent {
@@ -185,6 +186,85 @@ public:
 /// Injected monotonic clock (steady). Tests supply a deterministic source; the
 /// default is steady_clock::now.
 using RuntimeClock = std::function<std::chrono::steady_clock::time_point()>;
+
+/// rung 9c PR-5b hardening (#4221, Gate 3 cpp-safety adjudication, this governance
+/// run): move-only RAII permit for one slot in an atomic<int>-backed capacity pool.
+/// Replaces a plain bool-guarded manual acquire/release pairing that cpp-safety's
+/// RAII-floor adjudication declined to exempt - the proposer's "the resource crosses
+/// a stack boundary, so RAII can't span it" reasoning was correctly rejected: the
+/// permit doesn't need to live on a stack frame, only on the long-lived KeyClaim
+/// object that already outlives both the acquiring call and the async release.
+/// Engaging (constructing with a non-null slot pointer) is done under registry_mu_
+/// by the one true acquire site (GuardianSparkRuntime::try_reserve_compensation_
+/// locked()), paired atomically with the admission check that found capacity - but
+/// the RELEASE side is deliberately NOT lock-dependent: the slot is std::atomic<int>
+/// specifically so this guard's destructor is safe to run on ANY thread, without
+/// registry_mu_ held, which is what makes it a genuine structural backstop against a
+/// future call path that forgets an explicit release (the exact class of gap
+/// cpp-safety's adjudication identified in the pre-refactor manual pairing). Never
+/// copyable - a slot has exactly one owner; moving transfers ownership without
+/// touching the counter.
+class CompensationPermit {
+public:
+    CompensationPermit() = default;
+    explicit CompensationPermit(std::atomic<int>* slot) noexcept : slot_(slot) {}
+    CompensationPermit(const CompensationPermit&) = delete;
+    CompensationPermit& operator=(const CompensationPermit&) = delete;
+    CompensationPermit(CompensationPermit&& other) noexcept
+        : slot_(std::exchange(other.slot_, nullptr)) {}
+    CompensationPermit& operator=(CompensationPermit&& other) noexcept {
+        if (this != &other) {
+            reset();
+            slot_ = std::exchange(other.slot_, nullptr);
+        }
+        return *this;
+    }
+    ~CompensationPermit() { reset(); }
+    /// Idempotent: a no-op if already released or never engaged.
+    void reset() noexcept {
+        if (slot_) {
+            slot_->fetch_sub(1, std::memory_order_relaxed);
+            slot_ = nullptr;
+        }
+    }
+
+private:
+    std::atomic<int>* slot_{nullptr};
+};
+
+/// rung 9c PR-5b hardening (#4221, same cpp-safety adjudication as CompensationPermit
+/// above): move-only RAII guard for the disarm_retained_ live-lifecycle count (see
+/// GuardianSparkRuntime::disarm_retained()'s own doc comment). The target counter is
+/// already std::atomic<std::uint64_t>, so - same reasoning as CompensationPermit -
+/// the destructor is unconditionally safe to run off-lock, giving a structural
+/// backstop against a future terminal-removal path that forgets to release it.
+class RetainedGuard {
+public:
+    RetainedGuard() = default;
+    explicit RetainedGuard(std::atomic<std::uint64_t>* counter) noexcept : counter_(counter) {}
+    RetainedGuard(const RetainedGuard&) = delete;
+    RetainedGuard& operator=(const RetainedGuard&) = delete;
+    RetainedGuard(RetainedGuard&& other) noexcept
+        : counter_(std::exchange(other.counter_, nullptr)) {}
+    RetainedGuard& operator=(RetainedGuard&& other) noexcept {
+        if (this != &other) {
+            reset();
+            counter_ = std::exchange(other.counter_, nullptr);
+        }
+        return *this;
+    }
+    ~RetainedGuard() { reset(); }
+    /// Idempotent: a no-op if already released or never engaged.
+    void reset() noexcept {
+        if (counter_) {
+            counter_->fetch_sub(1, std::memory_order_relaxed);
+            counter_ = nullptr;
+        }
+    }
+
+private:
+    std::atomic<std::uint64_t>* counter_{nullptr};
+};
 
 class YUZU_EXPORT GuardianSparkRuntime : public std::enable_shared_from_this<GuardianSparkRuntime> {
 public:
@@ -964,36 +1044,45 @@ private:
         std::uint64_t subscription{0};
 
         // up-3/up-4 (#4221, rung 9c PR-5b): Arm-claim-only compensation bookkeeping.
-        // `compensation_reserved` is set the instant dispatch_arm_off_lock() reserves
-        // this claim's compensating-disarm slot, BEFORE the arm is ever submitted -
-        // see compensation_reserved_count_'s header comment. `compensation_finished`
-        // defaults true (nothing to track yet); dispatch_arm_off_lock() never touches
-        // it, on_arm_complete() sets it false the instant a live subscription becomes
-        // compensation-owed (entering the `if (compensating)` branch) and back to true
-        // - in the SAME critical section that pops/publishes the claim - once the
-        // compensating disarm has genuinely finished (or turned out never to be
-        // needed). expire_overdue_claims()'s terminal-recovery pass (up-4) reads it to
-        // know a terminal/stranded head is safe to reap: never touch one whose
-        // compensation is not yet finished. `compensation_deadline` is set ONCE, when
-        // compensation first becomes owed, from cfg_.backend_op_deadline - never reset
-        // on a fallback retry. `compensation_deadline_observed` is a once-only latch:
-        // in 5b, an elapsed deadline only increments compensation_deadline_elapsed_
-        // (see the class-level comment there) - it does not, and must not, release the
-        // reservation, the subscription, the FIFO head, or worker accounting; a
-        // blocked OS call cannot be force-cancelled.
-        bool compensation_reserved{false};
+        // `compensation_permit`, when engaged, is this claim's held slot in the
+        // compensating-disarm reservation pool (rung 9c PR-5b hardening, this
+        // governance run: an RAII CompensationPermit - see that class's own doc
+        // comment - replacing a plain bool the pre-hardening cpp-safety RAII-floor
+        // adjudication declined to exempt). Engaged the instant
+        // dispatch_arm_off_lock() reserves this claim's slot, BEFORE the arm is
+        // ever submitted - see compensation_reserved_count_'s header comment.
+        // `compensation_finished` defaults true (nothing to track yet);
+        // dispatch_arm_off_lock() never touches it, on_arm_complete() sets it false
+        // the instant a live subscription becomes compensation-owed (entering the
+        // `if (compensating)` branch) and back to true - in the SAME critical
+        // section that pops/publishes the claim - once the compensating disarm has
+        // genuinely finished (or turned out never to be needed).
+        // expire_overdue_claims()'s terminal-recovery pass (up-4) reads it to know a
+        // terminal/stranded head is safe to reap: never touch one whose compensation
+        // is not yet finished. `compensation_deadline` is set ONCE, when
+        // compensation first becomes owed, from cfg_.backend_op_deadline - never
+        // reset on a fallback retry. `compensation_deadline_observed` is a
+        // once-only latch: in 5b, an elapsed deadline only increments
+        // compensation_deadline_elapsed_ (see the class-level comment there) - it
+        // does not, and must not, release the reservation, the subscription, the
+        // FIFO head, or worker accounting; a blocked OS call cannot be
+        // force-cancelled.
+        std::optional<CompensationPermit> compensation_permit;
         bool compensation_finished{true};
         std::chrono::steady_clock::time_point compensation_deadline{};
         bool compensation_deadline_observed{false};
 
-        // up-5 (#4221, rung 9c PR-5b): Disarm-claim-only. True from this claim's
+        // up-5 (#4221, rung 9c PR-5b): Disarm-claim-only. Engaged from this claim's
         // FIRST retention (an admission refusal or worker throw) until it is either
         // finally removed (success, Stopped-drop, DeadSubscription shortcut) or
         // successfully redriven to completion - see disarm_retained()'s own doc
         // comment on GuardianSparkRuntime for the full lifecycle contract. A
-        // repeated refusal on the SAME already-retained claim must never increment
-        // disarm_retained_ a second time; this flag is what makes that idempotent.
-        bool retained_counted{false};
+        // repeated refusal on the SAME already-retained claim must never engage a
+        // second RetainedGuard (mark_retained_locked()'s own idempotency check on
+        // this member is what makes that safe). RAII (rung 9c PR-5b hardening, this
+        // governance run) replacing a plain bool for the same cpp-safety-adjudicated
+        // reason as compensation_permit above.
+        std::optional<RetainedGuard> retained_guard;
     };
     struct KeyClaimQueue {
         std::deque<std::shared_ptr<KeyClaim>> fifo; ///< front() = the current claim
@@ -1219,7 +1308,17 @@ private:
     /// exists for reap_stranded_claims_locked() below, which needs the identical
     /// synthesis for a claim publish_arm_verdicts_locked never got the chance to
     /// finish deciding.
-    void synthesize_fallback_outcome_locked(KeyClaim& c) noexcept;
+    /// NOT noexcept (fixed, this governance run - Gate 2/3 cpp-expert/cpp-safety/
+    /// security-guardian independently found the same defect: this body's
+    /// allocating `std::unexpected(std::string{...})` line CAN throw, and a throw
+    /// escaping a noexcept function calls std::terminate() at the boundary itself,
+    /// never reaching a caller's catch - the previous `noexcept` plus this
+    /// function's own comment claiming the caller's try/catch "contains" it were
+    /// both wrong; reap_stranded_claims_locked()'s existing try/catch around its
+    /// call to this now genuinely does what it always claimed to, matching the
+    /// non-noexcept sibling line in publish_arm_verdicts_locked's own fill-in loop
+    /// this function mirrors).
+    void synthesize_fallback_outcome_locked(KeyClaim& c);
     /// up-4 (#4221): registry_mu_ held. Reaps ONE residue shape neither
     /// sweep_terminal_queued_locked (Queued-only, requires an outcome already
     /// present), expire_overdue_claims's own overdue-live-claim pass (skips any
@@ -1525,51 +1624,64 @@ private:
         }
         return 0;
     }
-    /// registry_mu_ held. True and reserved iff capacity was available.
-    bool try_reserve_compensation_locked(IoClass c) noexcept {
+    /// registry_mu_ held (both to serialize the capacity check itself and to keep it
+    /// atomic with the claim-identity recheck dispatch_arm_off_lock pairs it with).
+    /// Returns an engaged CompensationPermit iff capacity was available;
+    /// std::nullopt on refusal (nothing reserved, nothing to release). rung 9c
+    /// PR-5b hardening (this governance run, cpp-safety RAII-floor adjudication):
+    /// the returned permit's destructor/reset() is lock-independent-safe (see that
+    /// class's own doc comment) - release it via KeyClaim::compensation_permit's
+    /// own reset(), or release_compensation_locked() below, never by touching
+    /// compensation_reserved_count_ directly.
+    [[nodiscard]] std::optional<CompensationPermit> try_reserve_compensation_locked(IoClass c) noexcept {
         const auto idx = io_class_index(c);
-        if (compensation_reserved_count_[idx] >= compensation_capacity_for(c))
-            return false;
-        ++compensation_reserved_count_[idx];
-        return true;
+        if (compensation_reserved_count_[idx].load(std::memory_order_relaxed) >= compensation_capacity_for(c))
+            return std::nullopt;
+        compensation_reserved_count_[idx].fetch_add(1, std::memory_order_relaxed);
+        return CompensationPermit{&compensation_reserved_count_[idx]};
     }
-    /// registry_mu_ held. Idempotent: a no-op if `claim` does not currently hold a
-    /// reservation (already released, or never took one - a Disarm claim, or an Arm
-    /// claim that never reached dispatch_arm_off_lock). Always call this rather than
-    /// manipulating compensation_reserved_count_/compensation_reserved directly, so
-    /// double-release and leaks are both structurally impossible.
+    /// registry_mu_ NOT required for correctness (the permit's own reset() is
+    /// atomic-backed and safe off-lock - see CompensationPermit's own doc comment)
+    /// but called under it at every existing call site for locality with the rest
+    /// of this claim's bookkeeping. Idempotent: a no-op if `claim` does not
+    /// currently hold a reservation (already released, or never took one - a
+    /// Disarm claim, or an Arm claim that never reached dispatch_arm_off_lock).
+    /// Always call this (or KeyClaim::compensation_permit.reset() directly) rather
+    /// than touching compensation_reserved_count_ directly, so double-release and
+    /// leaks are both structurally impossible.
     void release_compensation_locked(KeyClaim& claim) noexcept {
-        if (!claim.compensation_reserved)
-            return;
-        const auto idx = io_class_index(claim.io_class);
-        if (compensation_reserved_count_[idx] > 0)
-            --compensation_reserved_count_[idx];
-        claim.compensation_reserved = false;
+        claim.compensation_permit.reset();
     }
     /// up-5 (#4221, rung 9c PR-5b): registry_mu_ held. First retention of `claim`
     /// (an admission refusal or worker throw) - idempotent: a claim already marked
-    /// retained does not increment disarm_retained_ a second time on a repeated
-    /// refusal. Callers keep their own `++claim->admission_rejections` (unconditional
-    /// attempt history, unchanged shape) - this touches ONLY the lifecycle count.
-    /// Disarm claims only, but harmless (a no-op guard) if ever called on anything
-    /// else.
+    /// retained does not engage a second RetainedGuard (and so does not increment
+    /// disarm_retained_ a second time) on a repeated refusal. Callers keep their
+    /// own `++claim->admission_rejections` (unconditional attempt history,
+    /// unchanged shape) - this touches ONLY the lifecycle count. Disarm claims
+    /// only, but harmless (a no-op guard) if ever called on anything else.
     void mark_retained_locked(KeyClaim& claim) noexcept {
-        if (claim.retained_counted)
+        if (claim.retained_guard)
             return;
-        claim.retained_counted = true;
         disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+        claim.retained_guard.emplace(&disarm_retained_);
     }
-    /// registry_mu_ held. Idempotent: a no-op if `claim` is not currently counted as
-    /// retained. Call at EVERY terminal removal of a Disarm claim (successful
-    /// completion, Stopped-drop, DeadSubscription shortcut) - never decrement
-    /// disarm_retained_ directly.
+    /// registry_mu_ NOT required for correctness (see RetainedGuard's own doc
+    /// comment) but called under it at every existing call site for locality.
+    /// Idempotent: a no-op if `claim` is not currently counted as retained. Call at
+    /// EVERY terminal removal of a Disarm claim (successful completion,
+    /// Stopped-drop, DeadSubscription shortcut) - never decrement disarm_retained_
+    /// directly.
     void clear_retained_locked(KeyClaim& claim) noexcept {
-        if (!claim.retained_counted)
-            return;
-        disarm_retained_.fetch_sub(1, std::memory_order_relaxed);
-        claim.retained_counted = false;
+        claim.retained_guard.reset();
     }
-    std::array<int, kIoClassCount> compensation_reserved_count_{}; ///< registry_mu_ guarded
+    /// rung 9c PR-5b hardening (this governance run): std::atomic<int> elements
+    /// (was a plain std::array<int, kIoClassCount>) specifically so a
+    /// CompensationPermit's destructor can release a slot safely regardless of
+    /// which thread or lock state is active when its owning KeyClaim is finally
+    /// destroyed - see CompensationPermit's own doc comment. ENGAGING a slot
+    /// (try_reserve_compensation_locked) still requires registry_mu_, to keep the
+    /// capacity check atomic with the claim-identity recheck it's paired with.
+    std::array<std::atomic<int>, kIoClassCount> compensation_reserved_count_{};
     /// up-3: #4221's own criterion text ("the fallback is deadline-bounded and
     /// counted, and a ceiling hit is surfaced") - reservation-exhaustion refusals and
     /// compensation-deadline elapses, counted separately from every pre-existing

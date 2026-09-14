@@ -369,8 +369,9 @@ during the #2233 item 3 governance sweep, re-surfaced while investigating this P
 `rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
 `active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
 non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
-PR-5 (fault/K-bound logic, not started - see acceptance criteria below,
-now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
+PR-5 (fault/K-bound logic, IN PROGRESS as a 5-PR sub-ladder 5a-5e - 5a merged
+#4359, 5b landed up-3/up-4 (partial, see status paragraph below)/ch-1/up-5 - see
+acceptance criteria below, now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
 diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
@@ -451,13 +452,34 @@ flip, with a red-first test each:
   redrive is now wired onto the convergence lane's priority loop (elapsed-time-gated, its own
   firewalled sweep); **this row's own "Missing telemetry" wording above is now WRONG** -
   `disarm_retained()` is no longer "current (non-monotonic)" but a real lifecycle count
-  (`retained_counted` per claim, decremented on the claim's own successful completion or any other
-  terminal removal) - the fleet-gauge alternative this row offered was itself retracted on issue
-  #4221's own comment thread as insufficient (a monotonic counter cannot answer "is anything stuck
-  right now"), so the bounded redrive is the only closure this criterion accepts. `redrive_retained_
-  disarms()` walks `claims_` directly (never `keys_`), reaching a retained disarm even behind a
-  torn-down key - closes the #4221 follow-up comment (`ar-402`) that had worried a convergence-lane
-  trigger might enumerate the wrong registry and miss that case.
+  (an RAII `RetainedGuard` per claim, released on the claim's own successful completion or any other
+  terminal removal - see the governance-hardening note below for the RAII rename) - the fleet-gauge
+  alternative this row offered was itself retracted on issue #4221's own comment thread as
+  insufficient (a monotonic counter cannot answer "is anything stuck right now"), so the bounded
+  redrive is the only closure this criterion accepts. `redrive_retained_disarms()` walks `claims_`
+  directly (never `keys_`), reaching a retained disarm even behind a torn-down key - closes the
+  #4221 follow-up comment (`ar-402`) that had worried a convergence-lane trigger might enumerate the
+  wrong registry and miss that case.
+- **Governance hardening round (full 8-gate `/governance` pass, this run, 2026-09-14)**: this PR's
+  own pre-push governance found ONE genuine BLOCKING item - cpp-safety's Gate 3 adjudication declined
+  the RAII-impossibility exception for both up-3's compensating-disarm reservation pool and up-5's
+  retained-disarm lifecycle count, which up to that point were plain bool-guarded manual
+  acquire/release pairs (`compensation_reserved`/`retained_counted`). No live leak was found on any
+  traced path, including every throw path, but the manual pairing was ruled a policy-floor contract
+  violation regardless (CLAUDE.md standing rule 2's non-RAII-cleanup-in-new-C++ floor) since a
+  stack-scoped guard was wrongly assumed impossible - the real fix is a move-only guard owned by the
+  already-long-lived `KeyClaim` object, not a stack frame. Fixed by wrapping both in dedicated RAII
+  types (`CompensationPermit`, `RetainedGuard`, `guardian_spark_runtime.hpp`) backed by
+  `std::atomic` counters so the destructor is safe to run off-lock - a structural backstop against a
+  future forgotten release call, not just a currently-correct one. Bundled into the same fix: the
+  independently-confirmed (security-guardian, cpp-expert, cpp-safety) `noexcept`-on-a-throwing-body
+  defect in `synthesize_fallback_outcome_locked` (dropped `noexcept`, added fault-injection point 9
+  matching its own now-genuinely-functional catch path), and `fail_all_claims_locked` now also
+  releases a compensation permit defensively (consistency-auditor finding, provably a no-op today,
+  kept for future-caller safety). Two new isolated `[spark]` test cases pin the RAII types' own
+  engage/move/release contract directly. Full agent suite (3033/3034 cases, 1 platform-skipped,
+  122850 assertions) and targeted `[spark]` suite (587/587, 13998 assertions) both green after the
+  fix; Gate 8 re-review follows in the same run.
 - **NEW (added 2026-09-13, sre finding on the #2012/#3840 doc-sweep)**: #4279's lane-cap-overshoot
   observation (`SparkDetachedLane`'s shared admission primitive, `max_active=9 > cap=8` on a real
   storm-load test, 1-in-~10 hardware runs, root cause undetermined) has no PR-5 acceptance

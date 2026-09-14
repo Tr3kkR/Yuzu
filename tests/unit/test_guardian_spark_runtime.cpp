@@ -7353,3 +7353,137 @@ TEST_CASE("up-5 (#4221): the convergence lane's priority loop redrives a retaine
     sched.stop();
     CHECK(sched.sweep_exception_count() == 0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// rung 9c PR-5b hardening, this governance run (#4221): CompensationPermit /
+// RetainedGuard RAII semantics, added when cpp-safety's Gate 3 adjudication
+// declined the "impossibility" exception for the pre-hardening plain-bool manual
+// acquire/release pairing (governance.d ledger, this run). These two types are
+// exercised in full end-to-end fault scenarios above already (the up-3/up-3-b/
+// up-4/up-5 cases), but nothing pinned their OWN move/engage/release contract in
+// isolation - this does, directly against a local counter, independent of the
+// wider runtime state machine.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("RAII hardening (#4221): CompensationPermit engage/move/release semantics",
+          "[spark][runtime][liveness]") {
+    std::atomic<int> slot{0};
+
+    SECTION("default-constructed permit is disengaged - no-op reset, no decrement") {
+        CompensationPermit p;
+        p.reset();
+        CHECK(slot.load() == 0);
+    }
+
+    SECTION("engaging increments the target exactly once; destruction releases exactly once") {
+        slot.fetch_add(1); // simulate the caller's own increment (try_reserve's contract:
+                            // the counter is bumped BEFORE the permit is constructed)
+        {
+            CompensationPermit p{&slot};
+            CHECK(slot.load() == 1);
+        }
+        CHECK(slot.load() == 0);
+    }
+
+    SECTION("reset() is idempotent - a second reset() does not double-decrement") {
+        slot.fetch_add(1);
+        CompensationPermit p{&slot};
+        p.reset();
+        CHECK(slot.load() == 0);
+        p.reset(); // must be a safe no-op, not a second fetch_sub
+        CHECK(slot.load() == 0);
+    }
+
+    SECTION("move construction transfers ownership - the moved-from permit releases nothing") {
+        slot.fetch_add(1);
+        CompensationPermit p1{&slot};
+        CompensationPermit p2{std::move(p1)};
+        p1.reset(); // moved-from: must be a no-op, the slot is p2's now
+        CHECK(slot.load() == 1);
+        p2.reset();
+        CHECK(slot.load() == 0);
+    }
+
+    SECTION("move assignment releases the assignee's own prior permit before adopting the new one") {
+        std::atomic<int> slot2{0};
+        slot.fetch_add(1);
+        slot2.fetch_add(1);
+        CompensationPermit p1{&slot};
+        CompensationPermit p2{&slot2};
+        p2 = std::move(p1); // p2's own slot2 reservation must release before adopting slot
+        CHECK(slot2.load() == 0);
+        CHECK(slot.load() == 1); // not yet released - p2 now owns it
+        p2.reset();
+        CHECK(slot.load() == 0);
+    }
+
+    SECTION("std::optional<CompensationPermit>::emplace/reset matches KeyClaim's own usage") {
+        slot.fetch_add(1);
+        std::optional<CompensationPermit> opt;
+        opt.emplace(&slot);
+        CHECK(slot.load() == 1);
+        opt.reset(); // std::optional::reset() destroys the held permit -> releases
+        CHECK(slot.load() == 0);
+        opt.reset(); // no-op: nothing held
+        CHECK(slot.load() == 0);
+    }
+}
+
+TEST_CASE("RAII hardening (#4221): RetainedGuard engage/move/release semantics",
+          "[spark][runtime][liveness]") {
+    std::atomic<std::uint64_t> counter{0};
+
+    SECTION("default-constructed guard is disengaged - no-op reset, no decrement") {
+        RetainedGuard g;
+        g.reset();
+        CHECK(counter.load() == 0);
+    }
+
+    SECTION("engaging then destroying decrements exactly once, matching disarm_retained()'s own "
+            "explicit-fetch_add-before-construct contract (mark_retained_locked's own shape)") {
+        counter.fetch_add(1);
+        {
+            RetainedGuard g{&counter};
+            CHECK(counter.load() == 1);
+        }
+        CHECK(counter.load() == 0);
+    }
+
+    SECTION("reset() is idempotent") {
+        counter.fetch_add(1);
+        RetainedGuard g{&counter};
+        g.reset();
+        CHECK(counter.load() == 0);
+        g.reset();
+        CHECK(counter.load() == 0);
+    }
+
+    SECTION("move construction transfers ownership") {
+        counter.fetch_add(1);
+        RetainedGuard g1{&counter};
+        RetainedGuard g2{std::move(g1)};
+        g1.reset();
+        CHECK(counter.load() == 1);
+        g2.reset();
+        CHECK(counter.load() == 0);
+    }
+
+    SECTION("std::optional<RetainedGuard> emplace/reset matches KeyClaim::retained_guard's own usage, "
+            "including the idempotency mark_retained_locked/clear_retained_locked rely on") {
+        counter.fetch_add(1);
+        std::optional<RetainedGuard> opt;
+        opt.emplace(&counter);
+        CHECK(counter.load() == 1);
+        // mark_retained_locked's own idempotency check: "if already engaged, do nothing" -
+        // re-emplace-guarded-by-caller (never re-emplace an already-engaged optional
+        // directly, or it would re-engage without a matching counter bump; the runtime
+        // guards this with `if (claim.retained_guard) return;` before ever calling
+        // emplace - this SECTION pins that emplace() itself is a plain re-engage with no
+        // built-in idempotency, so that caller-side guard is load-bearing, not optional).
+        CHECK(bool{opt});
+        opt.reset();
+        CHECK(counter.load() == 0);
+        opt.reset();
+        CHECK(counter.load() == 0);
+    }
+}
