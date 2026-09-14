@@ -204,6 +204,18 @@ using RuntimeClock = std::function<std::chrono::steady_clock::time_point()>;
 /// cpp-safety's adjudication identified in the pre-refactor manual pairing). Never
 /// copyable - a slot has exactly one owner; moving transfers ownership without
 /// touching the counter.
+///
+/// Lifetime precondition (Gate 8 re-review, this governance run, security-guardian):
+/// the pointer this permit holds is into GuardianSparkRuntime's own member storage
+/// (compensation_reserved_count_), so an engaged permit must never outlive the
+/// runtime it came from. This holds today because every async path that can hold a
+/// claim with an engaged permit (on_arm_complete, finalize_arm_compensation) is
+/// reached via a self = shared_from_this() capture, keeping the runtime alive until
+/// the same critical section that releases the permit - a precondition the old
+/// plain-bool field did not have (it read/wrote a value, not a pointer). A future
+/// caller that engages a permit without going through the runtime's own
+/// shared_from_this()-captured callback path would need to establish this same
+/// guarantee itself.
 class CompensationPermit {
 public:
     CompensationPermit() = default;
@@ -617,8 +629,8 @@ public:
     /// successful completion or any other terminal removal (Stopped-drop,
     /// DeadSubscription shortcut) - see mark_retained_locked()/clear_retained_
     /// locked(). A repeated refusal on the SAME already-retained claim
-    /// (KeyClaim::retained_counted) never inflates this past 1 for that claim.
-    /// Lock-free read.
+    /// (KeyClaim::retained_guard's own engaged check in mark_retained_locked())
+    /// never inflates this past 1 for that claim. Lock-free read.
     [[nodiscard]] std::uint64_t disarm_retained() const noexcept {
         return disarm_retained_.load(std::memory_order_relaxed);
     }
