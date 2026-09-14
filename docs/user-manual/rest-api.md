@@ -5708,8 +5708,10 @@ route had NO authorization check of any kind before this fix, CWE-862: any
 authenticated session could query up to 5000 fleet-wide inventory records
 with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
-/api/v1/inventory/software` rather than `Execution:Execute`; a
-service-scoped API token is denied by the same gate). The owner-scoped
+/api/v1/inventory/software` rather than `Execution:Execute`. **Unlike its
+result-set siblings, a service-scoped token is admitted and confined here,
+not denied outright** - see the "Result Sets" section below for the exact
+gate and the tracked cross-service-reach gap, `#4307`). The owner-scoped
 result-set row it creates is only readable/mutable by its own creator
 through the routes below, which — like their HTMX dashboard twins — also
 deny a service-scoped token outright: `session->username` is the *minting*
@@ -5919,6 +5921,8 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 ### Result Sets
 
 The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
+
+**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; 8 of the remaining 9 are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` are the one exception**: both gate via the admit-then-filter `fleet_read_fn` chokepoint, whose service-scope branch admits-and-confines a service-scoped token rather than hard-denying it - since the created result set is still owner-scoped to the minting token, a service token can mint a set the minter's other tokens/session can then read, a real cross-service-reach gap tracked in #4307.
 
 `ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
 
@@ -8858,6 +8862,79 @@ Validate a scope expression without executing it.
   "expression": "os = 'windows' AND tag:environment = 'production'"
 }
 ```
+
+#### `POST /api/v1/scope/validate`
+
+Versioned twin of the legacy route above (#2146 Batch B2) — and of the MCP
+`validate_scope` tool. All three call the same `yuzu::scope::validate()`, so
+none of them can silently diverge on what counts as a valid expression.
+
+**Permission:** Session-authenticated only — no RBAC gate (a syntax-only
+check with no data disclosure), matching the legacy route and `validate_scope`
+exactly.
+
+**Request body:** same shape as the legacy route above.
+
+**Response:** `{"data": {"valid": true, "expression": "..."}, "meta": {"api_version": "v1"}}`, or
+`{"data": {"valid": false, "error": "..."}, "meta": {"api_version": "v1"}}` for a syntactically invalid
+expression (still a `200` — the *response* reports validity, the request itself is well-formed).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `expression` missing or empty |
+
+#### `POST /api/v1/scope/preview`
+
+Versioned twin of the MCP `preview_scope_targets` tool (#2146 Batch B2) — no
+legacy unversioned twin exists (`POST /api/scope/estimate` below is a
+*different* capability: a matched/total **count** only, for the workflow
+builder's own confined `scope_fn`). Both this route and `preview_scope_targets`
+call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
+matched-agent set cannot drift between transports. A `tag:<key>` atom in the
+expression resolves from the persistent tag store **only** — unlike a real
+dispatch, which also falls back to a connected agent's own live self-report —
+see [Tag source precedence](asset-tagging-guide.md). **`from_result_set:<id>`
+and `props.*` atoms are not resolved by this preview** - the resolver only
+populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
+(including `from_result_set:`, this feature's own headline scope-walking
+primitive) is treated as unset and never matches, silently returning
+`matched_count: 0` for a composed expression that uses one - a genuine
+dispatch resolves `from_result_set:` correctly (`agent_registry.cpp`). Do not
+rely on this preview for an expression containing `from_result_set:` or
+`props.`; tracked in `#4307`.
+
+**Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
+chokepoint (ADR-0017) — this route discloses agent identities, unlike the
+syntax-only validate route above, so a management-group-confined caller's
+`matched_agents`/`matched_count` are narrowed to their own visible devices
+before the preview builder runs, never the whole fleet.
+
+**Request body:** `{"expression": "..."}`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "expression": "os = 'windows'",
+    "matched_count": 42,
+    "matched_agents": ["agent-001", "agent-002"],
+    "warning": "scope matches 63 agents (>50). Phase 2 write operations targeting this scope will require approval."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`warning` is present only above the 50-agent display threshold.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `expression` missing/empty, or fails to parse/validate |
+| 503 | The expression references a `tag:<key>` atom and the bulk tag-store preload degraded (`retry_after_ms: 5000`) — never silently under-reports the match set |
 
 #### `POST /api/scope/estimate`
 

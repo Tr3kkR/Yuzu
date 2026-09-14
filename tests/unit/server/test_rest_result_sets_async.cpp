@@ -128,6 +128,14 @@ struct AsyncHarness {
     /// meaning "this caller sees the whole fleet".
     bool wire_exec_visible{true};
 
+    /// #2146 Batch B2 Gate 4 fix: the VisibleSet from-inventory-query's own
+    /// `fleet_read_fn` gate returns, independent of `exec_visible_override`
+    /// above (a different gate, same shape). Default nullopt = unconfined,
+    /// matching every pre-existing test in this file; set to a present set to
+    /// prove the confinement fix actually narrows which agents' inventory
+    /// rows are visible, not just that the gate is called.
+    yuzu::server::authz::VisibleSet fleet_read_scope_override{};
+
     explicit AsyncHarness(pg::PgPool& pool, bool with_dispatch = true,
                           InventoryStore* inv = nullptr, bool with_exec_visible = true)
         : inventory(inv), wire_dispatch(with_dispatch), wire_exec_visible(with_exec_visible) {
@@ -159,6 +167,21 @@ struct AsyncHarness {
                 return false;
             }
             return true;
+        };
+        // #2146 Batch B2 review: from-inventory-query moved from a bare perm_fn to the
+        // admit-then-filter fleet_read_fn chokepoint. RestApiV1::FleetReadFn defaults to
+        // empty ({}), and calling an empty std::function throws bad_function_call - this
+        // fake models the same permit_exec-gated denial/admit shape as perm_fn above, so
+        // the two from-inventory-query tests below keep their original meaning rather
+        // than universally 503ing on an unwired gate.
+        RestApiV1::FleetReadFn fleet_read_fn =
+            [this](const httplib::Request&, httplib::Response& r, const std::string&,
+                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+            if (!permit_exec) {
+                r.status = 403;
+                return {};
+            }
+            return {.admitted = true, .scope = fleet_read_scope_override};
         };
         auto audit_fn = [this](const httplib::Request&, const std::string& action,
                                const std::string& result, const std::string&, const std::string&,
@@ -209,7 +232,8 @@ struct AsyncHarness {
                             /*response_scope_fn=*/{}, /*app_perf_providers=*/{},
                             /*engine_principal_store=*/nullptr, /*access_review_store=*/nullptr,
                             /*auth_db=*/nullptr, /*directory_sync=*/nullptr,
-                            /*stream_budget=*/nullptr, exec_visible_fn);
+                            /*stream_budget=*/nullptr, exec_visible_fn,
+                            /*list_read_fn=*/{}, fleet_read_fn);
     }
 
     /// Header value from the most recent `post`, "" if absent. Kept so a test
@@ -364,6 +388,24 @@ TEST_CASE("from-tar-query: include_empty selects the any_response matcher",
             std::string::npos);
 }
 
+// #2146 Batch B2 Gate 4 unhappy-path fix: .value() throws nlohmann::json::
+// type_error on a type mismatch rather than coercing - a non-boolean
+// include_empty must be a clean 400, never an uncaught exception (matches
+// MCP's identical fix on the same field, same handler shape).
+TEST_CASE("from-tar-query: a non-boolean include_empty is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query",
+           R"({"sql":"SELECT 1","include_empty":"yes"})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+}
+
 TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][async][tar]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -482,6 +524,28 @@ TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not w
         h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"must-not-exist"})",
                status);
         REQUIRE(status == 503);
+        std::string next;
+        CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    }
+    SECTION("from-inventory-query rejects an oversized conditions[] array before "
+            "evaluating it, never creates a set") {
+        // Gate 8 fix (#2146 Batch B2 follow-up): the kMaxInventoryConditions
+        // pre-check itself had no red->green coverage - only the underlying
+        // evaluate_inventory() backstop was implicitly reachable. This proves
+        // the REST twin's own 400 fires, not merely that a huge array doesn't
+        // crash the process.
+        InventoryStore inventory{pool};
+        REQUIRE(inventory.is_open());
+        AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+        nlohmann::json conditions = nlohmann::json::array();
+        for (int i = 0; i < 501; ++i)
+            conditions.push_back({{"plugin", "p"}, {"field", "f"}, {"op", "eq"}, {"value", "v"}});
+        nlohmann::json body;
+        body["name"] = "must-not-exist";
+        body["conditions"] = conditions;
+        int status = 0;
+        h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+        REQUIRE(status == 400);
         std::string next;
         CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
     }
@@ -629,6 +693,36 @@ TEST_CASE("re-eval: not-owned / missing set is 404", "[pg][result_set][async][re
     int status = 0;
     h.post("/api/v1/result-sets/rs_00000000000deadbeef/re-eval", "", status);
     REQUIRE(status == 404);
+}
+
+TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
+          "never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    // Gate 8 fix (#2146 Batch B2 follow-up): the re-eval route re-applies the
+    // 100 KiB tar_query cap because the ORIGINAL row may predate the cap (or
+    // was minted through a path that never enforced it) - this test proves
+    // that guard actually fires, rather than trusting the comment at the
+    // call site. Seeded directly in the store (never through
+    // /from-tar-query, which enforces the cap at creation and would itself
+    // reject this payload).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    nlohmann::json payload;
+    payload["sql"] = std::string(100001, 'x');
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -914,6 +1008,53 @@ TEST_CASE("from-inventory-query: an ordinary authorized caller still reaches the
     // does not itself block a legitimately-authorized caller.
     h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"x"})", status);
     CHECK(status == 503);
+}
+
+// #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
+// (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
+// rows are visible) had zero red -> green test coverage on either transport -
+// every prior test either left the gate unconfined (nullopt) or never got a
+// real InventoryStore far enough to exercise the narrowing loop at all.
+// Mirrors the equivalent test already added for preview_scope_targets
+// (test_rest_scope_v1_routes.cpp).
+TEST_CASE("from-inventory-query: matched membership is confined to the caller's "
+          "fleet_read_fn scope, never the whole fleet",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        for (const char* agent : {"agent-visible", "agent-hidden"}) {
+            auto seeded = yuzu::server::pg::exec_params(
+                lease.get(),
+                "INSERT INTO inventory_store.inventory_data "
+                "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+                "'{\"field1\":\"match\"}', 1)",
+                std::vector<std::string>{agent});
+            REQUIRE(seeded.status() == PGRES_COMMAND_OK);
+        }
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+    // Confine to exactly one of the two seeded agents.
+    h.fleet_read_scope_override =
+        yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-visible"}};
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"confined","conditions":[{"plugin":"custom","field":"field1","op":"==","value":"match"}]})",
+        status);
+    REQUIRE(status == 201);
+    // Both agents' rows match the condition - if confinement were not applied,
+    // device_count would be 2. The fix narrows the candidate records to the
+    // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
+    CHECK(body["data"]["device_count"] == 1);
 }
 
 TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",
