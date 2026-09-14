@@ -503,7 +503,7 @@
     {
       "grant": "None — sysfs bus directories under `/sys/bus/{usb,pci,thunderbolt}/devices` are world-readable by default",
       "if_refused": "The bus directory exists but is unreadable (EACCES) or another listing error occurs, action reports `<kind>|unavailable|linux:sysfs:eacces` or `linux:sysfs:read_failed`; an absent bus directory (no such bus on this host) is a clean `<kind>|none`, not a failure",
-      "measured": "Not yet captured on a live Linux host; verified only against the fixture tree at `tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/` (P91-5/P91-7)",
+      "measured": "2026-09-14, container (Docker VM on this Mac), root (`euid 0`) — a real live capture (`docs/samples/linux.txt`, I91-6/I91-7), plus the fixture tree at `tests/unit/fixtures/wave9/peripherals/linux/sysfs_tree/` (P91-5/P91-7) for the walk-logic unit tests",
       "os": "Linux",
       "runs_as": "agent daemon, default"
     }

@@ -17,11 +17,6 @@
 ##            CONSTRAINED, fixture-verified with no live Linux Thunderbolt
 ##            venue in this run).
 ##
-## WAVE 1 (this change): the plugin shape, actions and capability declarations
-## are real; every OS leg is a placeholder reporting
-## `<os>:leg:not_implemented` (agents/plugins/peripherals/src/peripherals_
-## {win,linux,macos}.cpp). Wave 2 (P91-6+) wires the real reads.
-##
 ## SCOPE: three bus-inventory kinds only. displays/bluetooth/audio/camera are
 ## PR9.1c, deferred until after this PR merges.
 
