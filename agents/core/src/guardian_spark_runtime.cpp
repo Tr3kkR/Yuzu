@@ -1870,20 +1870,32 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // assert for immediate local visibility, but pair it with a REAL,
                 // NDEBUG-surviving fallback that never risks inserting this Disarm claim
                 // behind (or ahead of) something whose state this code no longer
-                // understands. Deliberately does NOT push/dispatch the new Disarm claim
-                // in that case - the unexpected residue is left for the next same-key
-                // event to sweep (the same recovery path an ordinary retained tombstone
-                // already uses); this rule's own rules_/index_ cleanup below still runs
-                // unconditionally, so THIS rule is not left confirmed - only the fresh
-                // disarm submission for it is deferred rather than risked.
+                // understands.
+                //
+                // Gate 8 re-review correction (G2, both cpp-expert and cpp-safety):
+                // this comment and this commit's own message originally claimed the
+                // disarm itself is "deferred to the next same-key event" - that is
+                // WRONG. Deliberately not pushing the new Disarm claim here just leaves
+                // `claim_pushed` false and `inline_disarm` unset, so control falls
+                // through to the PRE-EXISTING (unrelated to this PR) `!claim_pushed`
+                // last-resort fallback further down this function (~line 1975): that
+                // fallback runs SYNCHRONOUSLY, in this SAME call, under this SAME lock -
+                // it calls backend_->disarm() on the real subscription directly and then
+                // unconditionally erases keys_[key]. So the real disarm and the key's
+                // teardown both happen immediately, not deferred. The ONLY thing
+                // genuinely left for the next same-key event is the unexpected residue
+                // still sitting in claims_[key]'s own fifo (this rule's own
+                // rules_/index_ cleanup below also runs unconditionally regardless).
                 assert(eit->second.fifo.empty());
                 if (!eit->second.fifo.empty()) {
                     detach_sweep_left_residue_.fetch_add(1, std::memory_order_relaxed);
                     try {
                         spdlog::error("Guardian spark: key '{}' still has {} queued claim(s) "
-                                     "after the last-on-key sweep for rule '{}' - deferring "
-                                     "this disarm to the next same-key event rather than "
-                                     "risk misordering it (see detach_sweep_left_residue())",
+                                     "after the last-on-key sweep for rule '{}' - the real "
+                                     "disarm still runs synchronously via the existing "
+                                     "last-resort fallback, but this leftover fifo residue "
+                                     "is left for the next same-key event to sweep (see "
+                                     "detach_sweep_left_residue())",
                                      *key_opt, eit->second.fifo.size(), rule_id);
                     } catch (...) {
                     }
@@ -1953,8 +1965,15 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
             if (inline_disarm) {
                 backend_->disarm(*inline_disarm); // inline type: unchanged, synchronous
             } else if (!claim_pushed) {
-                // Cannot happen by construction (the prediction ran under this same
-                // lock); counted last resort so a subscription is NEVER stranded.
+                // Gate 8 re-review correction (G3): this used to read "cannot happen by
+                // construction" - that stopped being true the moment the residue-sweep
+                // branch above (rung 9c PR-5a, #4221 cs-103) was added. That branch
+                // deliberately leaves `claim_pushed` false whenever the last-on-key sweep
+                // finds leftover fifo residue it can't safely reorder past, so THIS
+                // fallback is now the real, live disarm+cleanup path for that case, not
+                // just an unreachable last resort. It also still fires for whatever
+                // pre-existing edge originally motivated it. Either way this is the
+                // last-resort real disarm; counted so a subscription is NEVER stranded.
                 detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
                 try {
                     backend_->disarm(kit->second->subscription);
