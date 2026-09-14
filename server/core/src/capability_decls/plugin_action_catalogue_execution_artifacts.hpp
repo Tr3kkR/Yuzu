@@ -17,12 +17,12 @@
 /// prefetch file and never mutates host state on any platform; the data
 /// bytes of any artefact are never emitted (paths and hashes only).
 ///
-/// Grouped under the same `Forensics` securable P0 seeds and
-/// `plugin_action_catalogue_app_usage.hpp` (P22) already uses — the string
-/// MUST equal P0's seed literal byte-for-byte (server/core/src/
-/// rbac_store.cpp's `seed_defaults()` `types[]`; validated at wave-1
-/// integration by test_capability_catalogue's `kSeededSecurableTypes`
-/// check, which runs after P0 lands).
+/// Grouped under the `Forensics` securable P0 seeds
+/// (server/core/src/rbac_store.cpp's `seed_defaults()` `types[]` array,
+/// the "Forensics" entry) — the string below MUST equal that seed literal
+/// byte-for-byte; validated at wave-1 integration by
+/// test_capability_catalogue's `kSeededSecurableTypes` check, which runs
+/// after P0 lands.
 ///
 /// `execution_artifacts` and `app_usage` share the same ENFORCED authorization
 /// boundary: both authorize as `Forensics:Read` with `ExecuteGate::AdminOrApproval`,
@@ -38,9 +38,10 @@
 /// semantics are enforced at the server dispatch layer
 /// (server/core/src/dispatch_destructive_gate.hpp, P0's
 /// `kForensicsSecurable`/`requires_explicit_targets`) — this fragment only
-/// carries the per-action classification that layer keys on. See
-/// docs/user-manual/execution-artifacts.md (BR2-004) for the corrected
-/// role-boundary statement this comment mirrors.
+/// carries the per-action classification that layer keys on. See this
+/// plugin's README (agents/plugins/execution_artifacts/README.md) for the
+/// role-boundary statement this comment mirrors; the docs/user-manual page
+/// is a separate follow-up.
 namespace yuzu::server::capdecls {
 
 namespace detail {

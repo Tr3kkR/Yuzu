@@ -14,8 +14,9 @@
  *                 file-reference counts).
  *
  * FORENSICS-CLASS DATA — see content/definitions/execution_artifacts.yaml
- * and docs/user-manual/execution-artifacts.md: gated behind the Forensics
- * securable, AdminOrApproval, single-target only, DEFAULT-OFF via the
+ * and this plugin's README (agents/plugins/execution_artifacts/README.md;
+ * the docs/user-manual page is a separate follow-up): gated behind the
+ * Forensics securable, AdminOrApproval, single-target only, DEFAULT-OFF via the
  * server kill switch. This plugin performs no authz itself (that lives at
  * the server dispatch layer, server/core/src/dispatch_destructive_gate.hpp)
  * — it only ever emits paths and hashes, never file contents.
