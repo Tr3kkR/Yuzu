@@ -3,7 +3,7 @@
 **This file is a contents page, not a knowledge base.** Before adding anything, read
 `docs/instruction-file-standard.md` — it defines where a rule belongs and why the default is *not
 here*. This file, `AGENTS.md`, and the two routed-concern tables load into every session; each is
-budgeted at 32,000 characters and capped at 40,000 (`tests/test_issue_docs.py`).
+budgeted at 40,000 characters and capped at 48,000 (`tests/test_issue_docs.py`).
 
 ## What is Yuzu?
 

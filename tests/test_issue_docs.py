@@ -5,8 +5,8 @@ and the instruction-file standard (docs/instruction-file-standard.md).
 Invariants that must hold on every platform:
 
 1. The four ALWAYS-LOADED instruction files -- CLAUDE.md, AGENTS.md, and the
-   two routed-concern tables CLAUDE.md @-imports -- each stay under a 32,000
-   character budget, behind the 40,000 hard cap. Counted UTF-8-decoded in
+   two routed-concern tables CLAUDE.md @-imports -- each stay under a 40,000
+   character budget, behind the 48,000 hard cap. Counted UTF-8-decoded in
    Python deliberately: these files are dense with multi-byte punctuation, so
    byte counts (`wc -c`, and `wc -m` on Windows Git Bash, which degrades to
    bytes) read ~300 higher than the character count -- the exact confusion
@@ -46,14 +46,21 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-CLAUDE_MD_CHAR_CAP = 40_000
+CLAUDE_MD_CHAR_CAP = 48_000
 
 # Budget sits below the hard cap so the next approach is caught with runway to
 # plan an extraction, not at the wall. Both prior breaches were discovered with
 # nothing left to give -- the second at 39,996 of 40,000 bytes -- and both were
 # resolved by splitting, which is now exhausted. See
 # docs/instruction-file-standard.md.
-INSTRUCTION_FILE_BUDGET = 32_000
+#
+# 2026-09-14: raised 32,000 -> 40,000 (Alex: "we keep needing to do this") --
+# .claude/routed-concerns.md was already at 31,929/32,000 chars with new rows
+# owed from Wave 7b and Wave 8 plugin work, each breach costing a scramble PR.
+# The hard cap moved 40,000 -> 48,000 in the same change specifically so this
+# budget keeps the same 8,000-char runway it always had, rather than becoming
+# the wall itself.
+INSTRUCTION_FILE_BUDGET = 40_000
 
 # Every file here loads into an agent session before any work starts: CLAUDE.md
 # and AGENTS.md directly, the two routed-concern tables via CLAUDE.md's
