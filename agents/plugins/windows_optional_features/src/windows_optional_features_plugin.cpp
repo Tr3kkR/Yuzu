@@ -332,6 +332,17 @@ public:
      * draining past this quiesce is running agent-core code, never
      * this plugin's, regardless of how this loop resolves. On non-Windows
      * the slot doesn't exist and there is nothing to wait on.
+     *
+     * This 34s worst case sits inside agent.cpp's final-teardown block,
+     * which neither shutdown watchdog (W1/W2, agent.cpp:~100-152) currently
+     * covers -- a pre-existing gap tracked as #3756 item 5, not introduced
+     * here, but this plugin is one of the larger named contributors to it
+     * (governance Gate 6 sre review, Wave 9 PR9.2). On SERVICE_CONTROL_STOP
+     * this only delays a clean exit (service_win.cpp reports one
+     * SERVICE_STOP_PENDING with a 30s hint and no checkpoint-bumping
+     * thread); on SERVICE_CONTROL_SHUTDOWN (reboot) the OS's own
+     * WaitToKillServiceTimeout applies instead and is outside this
+     * process's control.
      */
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
 #ifdef _WIN32
