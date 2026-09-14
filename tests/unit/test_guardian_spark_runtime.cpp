@@ -8,6 +8,7 @@
 
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_convergence_scheduler.hpp" // up-5 (#4221): scheduler integration test
 #include "guardian_lifecycle_journal.hpp"
 
 #include <yuzu/agent/kv_store.hpp>
@@ -7155,4 +7156,200 @@ TEST_CASE("rung 9c PR-2 Unit 4: begin_stop() while a compensating disarm is stil
     CHECK(b->arm_entries.load() == 1); // r2 never dispatched - dropped before the barrier cleared
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// rung 9c PR-5b (#4221): up-3 (compensating-disarm reservation), up-4 (terminal-
+// recovery maintenance pass), ch-1 (fill-in-allocation fault seams), up-5
+// (disarm_retained_ real lifecycle + convergence-lane redrive wiring).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("up-3 (#4221): the compensating-disarm reservation refuses at capacity, before "
+          "any backend arm runs - the accumulation-to-ceiling path is now unreachable",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    b->arm_park.park_every = 1; // every arm() call parks until pulse()
+
+    // File-class reservation capacity == GuardianIoExecutor::Config{}.file_quota == 4.
+    constexpr int kCapacity = 4;
+    std::vector<std::thread> threads;
+    std::vector<std::expected<std::uint64_t, std::string>> results(static_cast<std::size_t>(kCapacity));
+    for (int i = 0; i < kCapacity; ++i) {
+        threads.emplace_back([&, i] {
+            const auto rid = "r" + std::to_string(i);
+            results[static_cast<std::size_t>(i)] = rt->attach_rule(
+                rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true);
+        });
+    }
+    REQUIRE(yuzu::test::spin_until([&] { return b->arm_entries.load() == kCapacity; },
+                                   std::chrono::seconds(10)));
+
+    // A 5th, distinct-key File attach: capacity is fully reserved by the 4 parked
+    // arms above, so this must be refused BEFORE ever calling backend->arm().
+    const auto res5 = rt->attach_rule("r4", file_spec("/k4"), file_exists_rule("r4"), true);
+    REQUIRE_FALSE(res5.has_value());
+    CHECK(res5.error() == "compensating-disarm reservation exhausted");
+    CHECK(rt->compensation_reservation_refused() == 1);
+    CHECK(b->arm_entries.load() == kCapacity); // the 5th never entered arm()
+    CHECK(rt->io_executor_stats_for_test().counters[0].rejected_ceiling == 0); // never got that far
+
+    b->arm_park.pulse(); // release all 4 parked arms
+    for (auto& t : threads)
+        t.join();
+    for (int i = 0; i < kCapacity; ++i)
+        CHECK(results[static_cast<std::size_t>(i)].has_value());
+    CHECK(b->arm_park.watchdog_trips == 0);
+    b->arm_park.park_every = 0; // done parking - the 6th key below must arm normally
+
+    // Capacity has recovered: a 6th distinct key now succeeds.
+    const auto res6 = rt->attach_rule("r5", file_spec("/k5"), file_exists_rule("r5"), true);
+    REQUIRE(res6.has_value());
+}
+
+TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous submission "
+          "failure - repeated LaunchFailed refusals never exhaust the pool",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    rt->set_io_executor_fail_launch_for_test(true);
+    // File capacity is 4; drive well past it on DISTINCT keys - if the reservation
+    // ever leaked on this synchronous-failure path, a later attempt would fail with
+    // the reservation-exhausted reason instead of the expected LaunchFailed one.
+    for (int i = 0; i < 10; ++i) {
+        const auto rid = "r" + std::to_string(i);
+        const auto res =
+            rt->attach_rule(rid, file_spec("/k" + std::to_string(i)), file_exists_rule(rid), true);
+        REQUIRE_FALSE(res.has_value());
+        CHECK(res.error() == "arm worker launch failed");
+    }
+    rt->set_io_executor_fail_launch_for_test(false);
+    CHECK(rt->compensation_reservation_refused() == 0); // never once hit the reservation gate
+    const auto ok = rt->attach_rule("rok", file_spec("/kok"), file_exists_rule("rok"), true);
+    REQUIRE(ok.has_value());
+}
+
+TEST_CASE("up-4 (#4221): a Queued, withdrawn head with no outcome (a double-fault residue) "
+          "is reaped by expire_overdue_claims' new terminal-recovery pass - the CONFIRMED "
+          "real defect (Fable review), reached here via genuine allocation-failure seams, "
+          "not a fabricated state",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    // Construction: fault point 1 makes the initial staging throw before `finished`/
+    // `verdicts` are ever populated - firewalled=true with an EMPTY finished, which is
+    // the ONLY way publish_arm_verdicts_locked's firewall branch (not the ordinary
+    // fill-in loop) is reached. The drain gap hook fires exactly once, synchronously,
+    // between that catch and the (still-live) compensating-disarm continuation this
+    // key's real, successful arm now owes - re-arming fault point 7 there, timed so it
+    // fires inside the firewall loop AFTER release_claim_index_locked has already
+    // failed (index_remove_fault_for_test) and marked the claim withdrawn+Queued, but
+    // BEFORE its outcome is written. That exact window is the residue.
+    std::atomic<bool> hook_fired{false};
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(1);
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_drain_fault_point_for_test(7);
+        hook_fired.store(true, std::memory_order_release);
+    });
+
+    const auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                     file_exists_rule("r1"), true);
+    REQUIRE(res.has_value());
+    REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    // Do not clear the hook until it has actually fired (on_arm_complete runs
+    // asynchronously - this NonWaiting attach can return before it even starts).
+    // Clearing it prematurely would race the callback and silently skip re-arming
+    // fault point 7, letting this claim resolve normally instead of stranding.
+    REQUIRE(yuzu::test::spin_until([&] { return hook_fired.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    rt->set_drain_gap_hook_for_test({});
+
+    // The compensating disarm (the real arm succeeded; nobody adopted it) must still
+    // run - that part is unaffected by either fault seam.
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+
+    // The residue itself: still queued, no receipt resolution, no further sweep has
+    // touched it (neither expire_overdue_claims's own overdue-arm scan - this claim
+    // was never dispatched-and-abandoned - nor redrive_retained_disarms - this is an
+    // Arm claim, not a Disarm).
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+    CHECK(rt->claim_drain_failures() >= 1);
+
+    // The up-4 fix: the maintenance pass reaps it without any further same-key event.
+    rt->expire_overdue_claims();
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(rt->is_terminal(res->receipt));
+
+    // Runtime stays healthy: a fresh attach on the same key arms cleanly afterward.
+    const auto res2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+}
+
+TEST_CASE("up-5 (#4221): disarm_retained() is a real lifecycle count, not a monotonic "
+          "counter - it decrements on the retained claim's own successful completion, "
+          "and a repeated refusal on the SAME claim never inflates it",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+
+    rt->set_io_executor_fail_launch_for_test(true);
+    rt->detach_rule("r1");
+    rt->set_io_executor_fail_launch_for_test(false);
+    REQUIRE(rt->disarm_retained() == 1);
+
+    // A repeated refusal on the SAME retained claim must not inflate the count.
+    rt->set_io_executor_fail_launch_for_test(true);
+    CHECK(rt->redrive_retained_disarms() == 1); // attempted, refused again
+    rt->set_io_executor_fail_launch_for_test(false);
+    CHECK(rt->disarm_retained() == 1); // still 1, not 2
+
+    // Now let it succeed: the count must return to 0.
+    REQUIRE(rt->redrive_retained_disarms() == 1);
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->disarm_retained() == 0);
+    CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+}
+
+TEST_CASE("up-5 (#4221): the convergence lane's priority loop redrives a retained disarm "
+          "on its own, with no further attach/detach/direct-redrive call - proving the "
+          "scheduler wiring itself, not just the runtime function in isolation",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+
+    rt->set_io_executor_fail_launch_for_test(true);
+    rt->detach_rule("r1");
+    REQUIRE(rt->disarm_retained() == 1);
+    REQUIRE(rt->rule_count() == 0);
+    REQUIRE(rt->armed_key_count() == 0);
+
+    ConvergenceScheduler::Config cfg;
+    cfg.priority_poll_ms = 20; // fast, deterministic-enough polling for a unit test
+    cfg.jitter_pct = 0;
+    ConvergenceScheduler sched{*rt, cfg};
+    sched.start();
+
+    // Clear the refusal and make NO further attach/detach/direct-redrive calls -
+    // the scheduler alone must complete cleanup.
+    rt->set_io_executor_fail_launch_for_test(false);
+    REQUIRE(yuzu::test::spin_until([&] { return rt->disarm_retained() == 0; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 1);
+    sched.stop();
+    CHECK(sched.sweep_exception_count() == 0);
 }
