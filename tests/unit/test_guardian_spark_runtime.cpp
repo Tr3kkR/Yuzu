@@ -6198,6 +6198,120 @@ TEST_CASE("rung 9c PR-5a (#4221 up-101/ch-101): a same-rule_id re-attach behind 
     rt->begin_stop();
 }
 
+// EXPLORATORY (not yet reviewed - do not treat as settled coverage): investigating
+// whether publish_arm_verdicts_locked's ORDINARY (non-firewall) pop loop can leave a
+// permanent ghost SparkKeyRuleIndex entry when a withdrawn sibling's
+// release_claim_index_locked call fails exactly once and is never retried. Unlike the
+// firewall branch (guardian_spark_runtime.cpp:602-620, which explicitly re-checks
+// index_held and keeps a release-failed claim as a retained tombstone), the ordinary
+// pop loop at :580-601 pops every finished claim based solely on outcome presence and
+// fifo-front identity - it does not check whether that claim's index release actually
+// succeeded. If confirmed, this produces an index entry with NO corresponding fifo
+// residue at all (unlike up-101's tombstone), so no existing sweep can ever find it.
+TEST_CASE("EXPLORATORY: a release failure on a withdrawn sibling during the ORDINARY "
+          "(non-firewall) publish path - does the claim get popped while its index "
+          "mapping survives?",
+          "[spark][runtime][liveness][.exploratory]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    // r1 hangs as the head. r2 queues behind it via a genuinely concurrent attach
+    // (NOT the gap-hook trick - r2 must be live/queued, not withdrawn, at the moment
+    // r1's arm resolves is NOT what we want here; we want r2 ALREADY withdrawn with a
+    // FAILED release before r1 resolves, so r1's own "withdrawn siblings" loop is what
+    // attempts r2's release).
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    QueuedAttach a2;
+    a2.t = std::thread{[&] { a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true); }};
+    REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                   std::chrono::seconds(10)));
+
+    // Withdraw r2 (Case-0: still Queued, behind r1) with its OWN index release forced
+    // to fail. It should become a retained tombstone (matches up-101's own finding).
+    rt->set_index_remove_fault_for_test(true);
+    rt->detach_rule("r2");
+    a2.t.join();
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(a2.gen.error() == "withdrawn");
+    CHECK(rt->claim_index_release_failures() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 2); // r1 (head) + r2 (retained tombstone)
+
+    // Re-arm the SAME seam again, from the main thread, BEFORE releasing r1's hang -
+    // so that when r1's own on_arm_complete pass retries r2's release (in its
+    // "withdrawn siblings" loop), THAT attempt fails too.
+    rt->set_index_remove_fault_for_test(true);
+    b->release_hang();
+    a1.t.join();
+    REQUIRE(a1.gen); // r1 itself succeeds and commits normally
+
+    CHECK(rt->claim_index_release_failures() == 2); // r2's release failed a SECOND time
+    CHECK(rt->rule_count() == 1);                   // only r1 is a real, live rule
+    CHECK(rt->armed_key_count() == 1);
+
+    // THE QUESTION: did r2 get popped from the fifo anyway, despite its release
+    // failing? If the ordinary pop loop pops unconditionally (as read from source),
+    // this should be 0 - r2 is gone from claims_[key] entirely, with NOTHING left to
+    // sweep, even though its index entry was never actually released.
+    INFO("claim_queue_depth after r1 commits: " << rt->claim_queue_depth_for_test(key));
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+
+    // If the above is 0 (ghost with no fifo trace), r1's OWN eventual detach should
+    // find refcount(key) == 2 (r1 + the ghost "r2"), so remove_rule("r1") reports
+    // siblings remain and NEVER returns the ->0 edge - the real backend subscription
+    // for r1 should therefore NEVER get disarmed, even though r1 is the only rule
+    // left anywhere in rules_/keys_/claims_.
+    const auto arms_before_detach = b->arms.load();
+    const auto disarms_before_detach = b->disarms.load();
+    rt->detach_rule("r1");
+    CHECK(rt->rule_count() == 0);
+    // CORRECTED prediction (first run showed my original guess was wrong in the WORSE
+    // direction): armed_key_count() stays 1, not 0. keys_.erase() is gated on
+    // detach_rule_locked's own `disarm_key` (only set when index_->remove_rule reports
+    // the ->0 edge) - the ghost "r2" still counted in the index means remove_rule("r1")
+    // reports siblings remain, so keys_[key] (and its live PerKey/subscription) is
+    // NEVER erased, even though r1 was the only real rule left anywhere.
+    CHECK(rt->armed_key_count() == 1);
+    // Give any (unexpected) async disarm a moment to land, then check whether it did.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    INFO("arms before=" << arms_before_detach << " after=" << b->arms.load()
+                        << " disarms before=" << disarms_before_detach
+                        << " after=" << b->disarms.load());
+    CHECK(b->disarms.load() == disarms_before_detach); // PREDICTED: no new disarm fired -
+                                                       // the real subscription is leaked,
+                                                       // permanently armed on the backend,
+                                                       // because remove_rule("r1") still
+                                                       // sees the ghost "r2" as a sibling.
+
+    // Confirm the ghost is PERMANENT: a fresh attach for a NEW rule on the SAME spec
+    // (same key) - does it see the key as already "claimed" or "armed" and behave
+    // oddly, given keys_[key] never went away? And can the key EVER be torn down
+    // again, e.g. via begin_stop's own teardown sweep?
+    const auto arms_before_r4 = b->arms.load();
+    auto gen_r4 = rt->attach_rule("r4", file_spec("/a"), file_exists_rule("r4"), true);
+    INFO("r4 attach: has_value=" << gen_r4.has_value()
+                                 << (gen_r4.has_value() ? "" : (" error=" + gen_r4.error()))
+                                 << " arms before=" << arms_before_r4 << " after=" << b->arms.load()
+                                 << " rule_count=" << rt->rule_count()
+                                 << " armed_key_count=" << rt->armed_key_count());
+    CHECK(gen_r4.has_value()); // does it even succeed?
+    CHECK(rt->rule_count() == 1); // r1 was properly erased from rules_ regardless (the
+                                  // ghost is index-only) - only r4 should be tracked
+    CHECK(b->arms.load() == arms_before_r4); // PREDICTED: r4 silently reuses r1's OLD,
+                                             // still-armed-on-the-backend subscription
+                                             // via the stale keys_[key] entry, WITHOUT
+                                             // a new backend arm() call - r4 ends up
+                                             // sharing a subscription nobody re-verified
+                                             // is even still valid for r4's OWN spec.
+
+    rt->begin_stop();
+}
+
 // rung 9c PR-2 Unit 4 (adversarial review C1, PR #4318 fjarvis): on_arm_complete's
 // compensating branch built the ArmCompensation continuation (a heap allocation plus
 // a string copy) entirely OUTSIDE any try, while a live, un-disarmed backend
