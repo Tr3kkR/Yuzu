@@ -9879,6 +9879,63 @@ TEST_CASE("MCP execute_instruction: a fail-closed containment gate reports statu
     CHECK(ts.audit_details.back().find("containment_unreadable") != std::string::npos);
 }
 
+TEST_CASE("MCP execute_instruction: a degraded gateway routing-directory read reports status="
+          "route_unreadable, retryable after 5000ms (WS-4 4.2b Task D — the exact sibling of "
+          "containment_unreadable)",
+          "[mcp][integration][execute][3424][3511]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        return {.sent = 0, .command_id = "cmd-route-degraded", .route_unreadable = true};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":30,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "route_unreadable");
+    CHECK(sc["agents_reached"] == 0);
+    CHECK(sc["retry_after_ms"] == 5000);
+    REQUIRE_FALSE(ts.audit_details.empty());
+    CHECK(ts.audit_details.back().find("route_unreadable") != std::string::npos);
+}
+
+TEST_CASE("MCP execute_instruction: route_unreadable is checked BEFORE quarantined -- both a "
+          "degraded routing-directory read AND a quarantine denial are reported as the "
+          "systemic gate/directory cause, not the per-target policy denial (WS-4 4.2b Task D)",
+          "[mcp][integration][execute][3424][3511]") {
+    McpTestServer ts;
+    auto dispatch = [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                        const std::string&, const std::unordered_map<std::string, std::string>&,
+                        const std::string&, const yuzu::server::DispatchCaller&)
+        -> yuzu::server::ConfinedDispatchOutcome {
+        // Mutually exclusive in production for the SAME target (a
+        // locally-missing id resolved via the directory vs. a locally-known
+        // id denied by quarantine), but a mixed dispatch can genuinely hit
+        // both at once -- proves route_unreadable's priority over quarantined.
+        return {.sent = 0,
+               .denied_quarantined_count = 1,
+               .command_id = "cmd-route-and-quarantine",
+               .route_unreadable = true};
+    };
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":31,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    auto& sc = body["result"]["structuredContent"];
+    CHECK(sc["status"] == "route_unreadable");
+    CHECK(sc["retry_after_ms"] == 5000);
+    CHECK(sc["agents_quarantined"] == 1); // count still rides along, per every branch
+}
+
 TEST_CASE("MCP execute_instruction: a malformed scope expression reports status="
           "invalid_scope, non-retryable, checked BEFORE containment_unreadable "
           "(PR #3939 review, finding 5 -- scope_parse_error existed on "

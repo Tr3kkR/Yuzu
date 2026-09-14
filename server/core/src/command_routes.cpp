@@ -691,6 +691,10 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         // #3511: mirrors denied_quarantined_count for the plugin-presence
         // filter — see ArmDispatchResult::unknown_plugin_count.
         std::size_t unknown_plugin_count = 0;
+        // WS-4 4.2b Task D: mirrors the two counts above — ArmDispatchResult
+        // has no aggregation of its own (each arm branch below runs the walk
+        // once), so this is simply whatever the arm that ran reported.
+        bool route_unreadable = false;
         // `__all__` is the PUBLISHED ground scope kind, handled here as "no
         // scope expression" so the ordering matches the shared closure and
         // the MCP one exactly: an explicit agent_ids list still wins.
@@ -725,6 +729,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             denied_quarantined = result.denied_quarantined;
             denied_quarantined_count = result.denied_quarantined_count;
             unknown_plugin_count = result.unknown_plugin_count;
+            route_unreadable = result.route_unreadable;
         } else if (arm == yuzu::server::DispatchArm::Scope) {
             // Scope expression dispatch.
             //
@@ -790,6 +795,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                 denied_quarantined = result.denied_quarantined;
                 denied_quarantined_count = result.denied_quarantined_count;
                 unknown_plugin_count = result.unknown_plugin_count;
+                route_unreadable = result.route_unreadable;
             }
             // else: the ladder already audited the abort (db_degraded /
             // owner_check_failed / principal_unresolved) — sent stays 0.
@@ -807,6 +813,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             denied_quarantined = result.denied_quarantined;
             denied_quarantined_count = result.denied_quarantined_count;
             unknown_plugin_count = result.unknown_plugin_count;
+            route_unreadable = result.route_unreadable;
         } else if (arm == yuzu::server::DispatchArm::Broadcast) {
             // Explicitly asked for the fleet by its published name — #1788
             // still narrows delivery to the operator's visible set; the
@@ -817,6 +824,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             denied_quarantined = result.denied_quarantined;
             denied_quarantined_count = result.denied_quarantined_count;
             unknown_plugin_count = result.unknown_plugin_count;
+            route_unreadable = result.route_unreadable;
         } else {
             // Broadcast ONLY when the caller named no target at all (#2500).
             // The shape check above already refuses a supplied-but-empty
@@ -884,6 +892,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             // command to any agent" 503 instead of the specific
             // `plugin_not_found` one below.
             unknown_plugin_count = result.unknown_plugin_count;
+            route_unreadable = result.route_unreadable;
         }
 
         // #881: emitted BEFORE the sent==0 -> 503 branch below, so a
@@ -919,7 +928,7 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
                [&] { deps.forward_gateway_pending_fn(); });
 
         if (sent == 0) {
-            // #881/#3511: say WHICH kind of nothing. All four of these answered
+            // #881/#3511: say WHICH kind of nothing. All five of these answered
             // "failed to send command to any agent", which reads as an
             // agent-connectivity outage — so a fail-closed containment
             // gate, which denies EVERY agent on EVERY dispatch fleet-wide,
@@ -932,6 +941,16 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
             if (containment_gate.fail_closed) {
                 res.set_content(
                     R"({"error":{"code":503,"message":"containment state is unreadable — dispatch is failing closed and reaching no agent; check the quarantine store","reason":"containment_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
+                    "application/json");
+            } else if (route_unreadable) {
+                // WS-4 4.2b Task D: the exact sibling of the containment
+                // branch above — a degraded read of the gateway routing
+                // directory (not a per-target fact), so this must not be
+                // reported as the generic connectivity catch-all below.
+                // Checked right after containment_unreadable, same
+                // "gate/directory itself could not answer" tier.
+                res.set_content(
+                    R"({"error":{"code":503,"message":"the gateway routing directory could not be read for one or more targets — dispatch is failing closed rather than guessing where to route","reason":"route_unreadable","retry_after_ms":5000},"meta":{"api_version":"v1"}})",
                     "application/json");
             } else if (denied_quarantined_count > 0) {
                 res.set_content(

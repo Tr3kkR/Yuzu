@@ -1144,6 +1144,13 @@ void DashboardRoutes::register_routes(HttpRouteSink& sink,
                      } else if (dispatch_outcome.containment_unreadable) {
                          message = "Containment state is unreadable — dispatch is failing "
                                     "closed and reaching no agent; check the quarantine store.";
+                     } else if (dispatch_outcome.route_unreadable) {
+                         // WS-4 4.2b Task D: the exact sibling of the
+                         // containment branch above — a degraded gateway
+                         // routing-directory read, not a per-target fact.
+                         message = "The gateway routing directory could not be read for one "
+                                    "or more targets — dispatch is failing closed rather than "
+                                    "guessing where to route.";
                      } else if (dispatch_outcome.denied_quarantined_count > 0) {
                          message = "Every target is quarantined — dispatch was withheld, "
                                     "not attempted.";
