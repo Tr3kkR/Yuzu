@@ -11,6 +11,8 @@
 #include "autoruns_catalog.hpp"
 #include "autoruns_parsers.hpp"
 
+#include <constraint_accumulator.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
@@ -1150,7 +1152,7 @@ TEST_CASE("autoruns: every SourceDecl declares all three OSes and the three docu
 
 TEST_CASE("autoruns: ConstraintAccumulator starts with no failure and no reason",
           "[autoruns][parsers][constraint]") {
-    ConstraintAccumulator acc;
+    yuzu::shared::ConstraintAccumulator acc;
     CHECK_FALSE(acc.any_failure());
     CHECK_FALSE(acc.incomplete());
     CHECK(acc.reason().empty());
@@ -1164,7 +1166,7 @@ TEST_CASE("autoruns: ConstraintAccumulator dedups by EXACT string, not substring
           "since the former is a substring of the latter; this type must not repeat "
           "that defect)",
           "[autoruns][parsers][constraint]") {
-    ConstraintAccumulator acc;
+    yuzu::shared::ConstraintAccumulator acc;
     acc.add_failure("permission_denied");
     acc.add_failure("partial_permission_denied");
     CHECK(acc.any_failure());
@@ -1175,7 +1177,7 @@ TEST_CASE("autoruns: ConstraintAccumulator dedups by EXACT string, not substring
 TEST_CASE("autoruns: ConstraintAccumulator dedups a repeated identical token and "
           "preserves insertion order",
           "[autoruns][parsers][constraint]") {
-    ConstraintAccumulator acc;
+    yuzu::shared::ConstraintAccumulator acc;
     acc.add_failure("row_cap");
     acc.add_failure("eio");
     acc.add_failure("row_cap"); // repeat -- must not duplicate or reorder
@@ -1185,7 +1187,7 @@ TEST_CASE("autoruns: ConstraintAccumulator dedups a repeated identical token and
 TEST_CASE("autoruns: ConstraintAccumulator.reason_with appends a permanent token "
           "after every accumulated failure, and is a no-op when empty",
           "[autoruns][parsers][constraint]") {
-    ConstraintAccumulator acc;
+    yuzu::shared::ConstraintAccumulator acc;
     CHECK(acc.reason_with("narrow_search_path_coverage") == "narrow_search_path_coverage");
 
     acc.add_failure("eio");
@@ -1196,7 +1198,7 @@ TEST_CASE("autoruns: ConstraintAccumulator.reason_with appends a permanent token
 TEST_CASE("autoruns: ConstraintAccumulator.mark_incomplete is independent of "
           "add_failure -- a caller can flag incompleteness with no token of its own",
           "[autoruns][parsers][constraint]") {
-    ConstraintAccumulator acc;
+    yuzu::shared::ConstraintAccumulator acc;
     acc.mark_incomplete();
     CHECK(acc.incomplete());
     CHECK_FALSE(acc.any_failure());
