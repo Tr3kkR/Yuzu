@@ -127,7 +127,76 @@ Pipe-delimited rows, one discriminator-prefixed row per artefact entry (`shimcac
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-No captures yet — run `plugin-capture` on each supported OS (docs/plugin-readme-standard.md rule 5).
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash 421f7d82a099
+
+```
+== action=shimcache
+shimcache|00000009	03e865f424f10000	000a00007fff0000	8664	MicrosoftWindows.Client.CoreAI	cw5n1h2txyewy	|0|100|-
+shimcache|C:/Program Files/Git/usr/bin/file.exe|1776703804000|72|-
+shimcache|C:/Program Files/Git/usr/bin/sed.exe|1776703722000|72|-
+shimcache|C:/WINDOWS/system32/la57setup.exe|1771278093368|72|-
+shimcache|C:/WINDOWS/SoftwareDistribution/Download/Install/AM_Delta_Patch_1.459.111.0.exe|1788939517775|72|-
+shimcache|C:/WINDOWS/SysWOW64/regsvr32.exe|1788174299287|604|-
+shimcache|C:/WINDOWS/system32/regsvr32.exe|1788174299287|604|-
+shimcache|00000009	03e865f424e40000	000a00007fff0000	8664	MicrosoftWindows.Client.CoreAI	cw5n1h2txyewy	|0|36|-
+shimcache|C:/WINDOWS/system32/SbUpdateWorker.exe|1788888386924|148|-
+shimcache|C:/Program Files/Git/usr/bin/xxd.exe|1776703802000|72|-
+shimcache|D:/yuzu-dev/Yuzu-worktrees/feat-wave9-pr91a/build-windows/tools/plugin-capture/plugin-capture.exe|1788887960842|84|-
+shimcache|C:/WINDOWS/winsxs/amd64_microsoft-windows-servicingstack_31bf3856ad364e35_10.0.26100.9441_none_a5253a19774da03c/TiWorker.exe|1788438536000|148|-
+… 12 of 314 rows shown
+[result_status] OK / FULL
+
+== action=amcache
+amcache||69cb415403de1ae2d4af937c0d2b6927a24a7553||||||
+amcache||3a73d566a6bcd68518fe786ae33d25b2cb0b6473||||||
+amcache||c7dea815b5f548a7619f4811d01c0b8af7bd7bf1||||||
+amcache||c7dea815b5f548a7619f4811d01c0b8af7bd7bf1||||||
+amcache||c7dea815b5f548a7619f4811d01c0b8af7bd7bf1||||||
+amcache||c737866bf375bb9c5d0217f60680ea4c23f451d9||||||
+amcache||569002bb6b12556826aa49176beb972425ea53e8||||||
+amcache||afdfac7ba0bffa66a18477d2b80139d9797fad98||||||
+amcache||5b94a0c08e13cf31493be1ce239f1e4e9c42eefb||||||
+amcache||305ac3116e895257cd38673664e0750b82ef4789||||||
+amcache||f869ae2fc9db261dba1a6e79554266cb87d8168c||||||
+amcache||c6aa7959dadf274f066b9ee093665efc34df00c1||||||
+… 12 of 9891 rows shown
+[result_status] OK / FULL
+
+== action=prefetch
+prefetch|7Z.EXE|93D290DC|31|2|1789416093019,1789415981349|1|3
+prefetch|ACROBAT.EXE|4E1700B6|31|17|1782139503883,1782139502989,1781888840096,1781532567812,1781532568325,1778602224391,1778602225066,1775144109458|1|3
+prefetch|ACROBAT.EXE|4E1700B7|31|13|1782139503088,1781888840199,1781532877455,1781532606215,1781532603318,1781532577675,1781532579663,1781532567890|1|3
+prefetch|ADKSETUP.EXE|1B40BCAC|31|1|1788880619340|1|3
+prefetch|ADKSETUP.EXE|2486164C|31|1|1788880618838|2|3
+prefetch|ADKSETUP.EXE|A0AB3C35|31|1|1788880618939|2|3
+prefetch|ADOBEARM_UCB.EXE|699477AF|31|8|1781888881590,1781532923846,1781532763225,1781532746374,1781532732471,1781532722873,1781532714314,1781532691179|1|3
+prefetch|AM_DELTA.EXE|3A6EE7FD|31|1|1789413112184|1|3
+prefetch|AM_DELTA_PATCH_1.459.105.0.EX|CEED51DA|31|1|1788879982014|1|3
+prefetch|AM_DELTA_PATCH_1.459.111.0.EX|A193E773|31|1|1788939518280|1|3
+prefetch|AM_DELTA_PATCH_1.459.79.0.EXE|9CBD8D44|31|1|1788753615690|1|3
+prefetch|AM_DELTA_PATCH_1.459.88.0.EXE|F262D07C|31|1|1788793567814|1|3
+… 12 of 501 rows shown
+[result_status] OK / PARTIAL / truncated_header
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 421f7d82a099
+
+```
+== action=shimcache
+unsupported|windows_only_artefact
+[result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
+[rc] 1
+
+== action=amcache
+unsupported|windows_only_artefact
+[result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
+[rc] 1
+
+== action=prefetch
+unsupported|windows_only_artefact
+[result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
+[rc] 1
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
