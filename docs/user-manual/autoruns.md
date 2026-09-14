@@ -73,21 +73,34 @@ versus one that could not be read at all:
   returned a null interface pointer where a real one was expected, or a
   task action type this leg's schema doesn't decode -- reported as a
   constraint on that one task, never silently dropped or misread as "no
-  actions."
+  actions." `win_startup_folder_user`-specific (#4219, `resolve_profile_
+  shell_folder`): `startup_redirect_unresolved` (a `%TOKEN%` in the
+  redirect value isn't a recognized user- or machine-scoped name, or an
+  allowlisted machine token's lookup itself came back empty -- never a
+  guessed path), `startup_redirect_bad_type` (the value's registry type is
+  neither `REG_SZ` nor `REG_EXPAND_SZ`), `startup_redirect_key_unreadable`
+  (the `User Shell Folders` key itself failed to open for a reason other
+  than simple absence). A hive that can't be reached at all for a profile
+  whose Startup redirect resolution was in play reports the SAME
+  `<sid>:<reason>` shape the other three per-profile hive sources use (see
+  the next bullet) -- the non-redirected fallback path is an unverifiable
+  guess for a genuinely redirected profile once the hive itself can't be
+  opened to check.
 - **`unsupported|0|foreign_os`** -- this source belongs to an OS this build
   isn't running on (autoruns_legs.hpp's stub).
 - **`constrained|0|btm_private_database_no_public_api`** (`mac_login_items`)
   -- the mechanism exists but this leg deliberately does not exercise it: no
   public read API for the private BTM database.
-- **`constrained|<n>|<sid>:<reason>`** (`win_*_hku` sources, per profile) --
-  the hive couldn't be reached for that SID, with the specific constraint
-  named rather than folded into one bucket: `not_found` (no such profile
-  hive), `privilege_missing` (`SeBackupPrivilege`/`SeRestorePrivilege`
-  couldn't be enabled on the process token), or `mount_failed`
-  (`RegLoadKeyW` itself failed for the offline arm). A separate
-  `warning|hive_unload_failed|...` line is emitted if the trailing
-  `RegUnLoadKeyW` fails on the way out -- this is orthogonal to the
-  per-source `source|` line and never folded into it.
+- **`constrained|<n>|<sid>:<reason>`** (`win_*_hku` sources, per profile,
+  plus `win_startup_folder_user` when its redirect resolution was in play
+  for that profile -- #4219) -- the hive couldn't be reached for that SID,
+  with the specific constraint named rather than folded into one bucket:
+  `not_found` (no such profile hive), `privilege_missing`
+  (`SeBackupPrivilege`/`SeRestorePrivilege` couldn't be enabled on the
+  process token), or `mount_failed` (`RegLoadKeyW` itself failed for the
+  offline arm). A separate `warning|hive_unload_failed|...` line is
+  emitted if the trailing `RegUnLoadKeyW` fails on the way out -- this is
+  orthogonal to the per-source `source|` line and never folded into it.
 - **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`,
   `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `win_scheduled_tasks`,
   and any Windows registry-value source -- `win_run_hklm`/`_hkcu`,
@@ -107,7 +120,12 @@ versus one that could not be read at all:
   `ReadValueStatus::malformed`) -- distinct from the key/value simply not
   existing. Never silently folded into a `supported` status. `mac_emond`
   combines this with any directory-level constraint via a comma-joined
-  reason.
+  reason. On `win_scheduled_tasks`, a task's XML over `parse_task_xml`'s
+  1 MiB cap reports the distinct `oversized` token instead -- a different
+  failure shape (a runaway/corrupt `get_Xml()` BSTR) than an ordinary
+  syntax problem (#4184); a `<Task>` root outside the Task Scheduler
+  namespace, or a document nested deeper than libxml2's own ~256-level
+  parse ceiling, both still report plain `malformed`.
 - **`constrained|<n>|narrow_search_path_coverage`** (`lnx_systemd_timers_user`
   only) -- a permanent, catalog-declared exception (`autoruns_catalog.hpp`'s
   third documented exception, alongside `mac_login_items`/`lnx_init_d`):
@@ -118,16 +136,32 @@ versus one that could not be read at all:
   with any other reason on the same line -- it never reports `supported`.
 - **A real directory-enumeration I/O error, told apart from a clean
   end-of-directory** -- every directory-walking source (Linux and macOS
-  alike) now distinguishes this from "nothing more to read", but the
-  surfaced reason token varies by call site rather than being one uniform
-  string: most sources (built on the shared `list_dir`/`walk_plist_dir`
-  helpers) fold it into the SAME `row_cap` reason a capped listing already
-  uses -- both mean "this listing is incomplete", and threading a separate
-  token through every one of those helpers' many call sites wasn't worth
-  the churn. Two macOS sources (`mac_user_launchagents`'s per-home walk,
-  `mac_periodic`) instead surface a distinct **`constrained|<n>|readdir_error`**
-  reason. Either way, a partial listing is never reported as a complete
-  `supported` result.
+  alike) distinguishes this from "nothing more to read". Most sources
+  (built on the shared `list_dir`/`walk_plist_dir` helpers) still fold it
+  into the SAME `row_cap` reason a capped listing already uses -- both mean
+  "this listing is incomplete", and threading a separate token through
+  every one of those helpers' many call sites wasn't worth the churn. Three
+  macOS sources instead surface a distinct **`constrained|<n>|readdir_error`**
+  reason: `mac_periodic`'s directory walk, and `mac_user_launchagents`'s
+  own two nested walks -- the outer `/Users` enumeration and each user's
+  inner `LaunchAgents` walk, which as of #4186 are also disambiguated by
+  suffix so an operator can tell which one actually hit its cap/error
+  rather than both collapsing to the same ambiguous token once deduped:
+  `row_cap:users`/`readdir_error:users` (the outer walk) vs.
+  `row_cap:launchagents`/`readdir_error:launchagents` (a specific user's
+  inner walk); a source hit by only one of the two walks still uses the
+  plain, unsuffixed `row_cap`. Either way, a partial listing is never
+  reported as a complete `supported` result.
+- **A real per-entry metadata-read (`fstat`/`fstatat`) failure, distinct
+  from the entry simply having vanished between listing and reading**
+  (macOS `mac_periodic`'s directory walk and `mac_user_launchagents`'s
+  per-home check, #4241) -- previously silently skipped the entry with no
+  constraint at all, inconsistent with the adjacent `open()` failure
+  handling in the same functions, which already constrained correctly.
+  Now classified the same way: `permission_denied`, `symlink_refused`, or
+  the generic `stat_failed` for any other errno; a benign `ENOENT` race
+  (the entry vanished between `readdir()` and the stat call) is still not
+  a constraint.
 
 ### Typed result status (CC-07)
 
@@ -155,10 +189,10 @@ learns of a real acquisition failure:
   filter-gated at all -- it always emits its one constrained status line
   (there is no real read to skip; see below). Windows has no
   *catalog-declared permanent* constraint the way Linux/macOS do, so
-  structurally whether a given run degrades depends on live host state --
-  but see the caveat below: on a real LocalSystem-run agent,
-  `win_startup_folder_user` degrades on essentially every host too, for a
-  different (data-dependent, not catalog-permanent) reason.
+  whether a given run degrades depends entirely on live host state --
+  `win_startup_folder_user`'s redirect-resolution logic is fixed (#4219;
+  see its catalog row below), so a real LocalSystem-run agent now reads it
+  SUPPORTED on a host with no genuine resolution failure.
 - **`UNAVAILABLE` / `PARTIAL` / `autoruns:exception`** -- an exception
   escaped a leg (`execute()`'s catch clauses); the command itself aborted,
   `rc=1`.
@@ -167,12 +201,9 @@ Because this field is effectively constant on Linux and macOS (always
 `CONSTRAINED`/`PARTIAL`), it cannot by itself signal a *new* degradation on
 those platforms -- a fleet-scale consumer still needs to read the per-source
 `source|` text lines to detect a genuinely new failure there. Windows's
-field is *structurally* capable of varying with live host state, but in
-practice is ALSO likely to read constrained on most real hosts today,
-because of `win_startup_folder_user`'s known redirect-resolution bug (see
-its catalog row below and the "Known bug" note there) -- not because of a
-permanent catalog declaration, but the practical effect for a fleet-scale
-consumer is similar until that bug is fixed.
+field is *structurally* capable of varying with live host state, and in
+practice does -- a real host reads SUPPORTED unless a specific source hits a
+genuine acquisition failure.
 
 ## Versioned source catalog
 
@@ -194,7 +225,7 @@ stubs never special-case per-OS.
 | `win_appinit_dlls` | AppInit_DLLs | S | U | U | Reg\*W |
 | `win_ifeo_debugger` | Image File Execution Options Debugger | S | U | U | Reg\*W |
 | `win_startup_folder_common` | Startup folder (All Users) | S | U | U | file listing |
-| `win_startup_folder_user` | Startup folder (current user) | S | U | U | file listing, per profile -- reads the profile's own `User Shell Folders\Startup` registry value (from the same per-user hive the HKU sources already open) when present, falling back to the literal `AppData\Roaming\...\Startup` suffix when absent/unreadable (e.g. a logged-out profile whose offline mount fails). **Known bug, not yet fixed:** that value is populated on essentially every profile at creation, not only genuinely redirected ones, and its `%USERPROFILE%`-style tokens are expanded against the agent's own LocalSystem environment rather than the enumerated profile's. This usually resolves to a path that doesn't exist (LocalSystem's own Startup folder is normally empty), so the typical effect is the profile's real Startup entries going unreported, not a visibly-wrong location -- reported `constrained`/`startup_redirect_env_mismatch` whenever this branch is taken, never a silent `supported|0`. Tracked in #4219. |
+| `win_startup_folder_user` | Startup folder (current user) | S | U | U | file listing, per profile -- reads the profile's own `User Shell Folders\Startup` registry value (from the same per-user hive the HKU sources already open) when present, falling back to the literal `AppData\Roaming\...\Startup` suffix when absent/unreadable (e.g. a logged-out profile whose offline mount fails). `%USERPROFILE%`/`%AppData%`/`%LocalAppData%`/`%Username%` tokens in that value resolve against the ENUMERATED PROFILE's own path/name (`resolve_profile_shell_folder`, `autoruns_parsers.hpp`), never the agent's own LocalSystem environment (#4219). A small allowlist of genuinely machine-scoped tokens (`SystemDrive`, `ProgramData`, etc.) resolves via the agent's own environment, since those are identical for every user. Any other token, or an allowlisted one that can't be resolved, reports `constrained`/`startup_redirect_unresolved` rather than guessing. |
 | `win_scheduled_tasks` | Scheduled Tasks | S | U | U | ITaskService COM |
 | `win_wmi_subscriptions` | WMI permanent event subscriptions | S | U | U | bounded `root\subscription` query |
 | `lnx_etc_crontab` | `/etc/crontab` | U | S | U | file read; absent is CONSTRAINED (required) |
