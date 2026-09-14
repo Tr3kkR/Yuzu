@@ -114,7 +114,11 @@ spec:
     properties:
       feature:
         type: string
-        description: 'The DISM feature name (FeatureName), e.g. NetFx3.'
+        description: >
+          The DISM feature name (FeatureName), e.g. NetFx3. The plugin
+          additionally refuses any value containing a ".." substring
+          (path-traversal guard) even though every individual character in
+          such a value would otherwise match the pattern below.
         validation:
           pattern: "^[A-Za-z0-9._-]{1,256}$"
 
