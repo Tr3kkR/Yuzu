@@ -336,7 +336,7 @@ corrected #2012 row in §5's register for the full per-mechanism status, includi
 correction that Service never actually had the hazard this row originally described, and the
 re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
 
-**Ladder status, updated 2026-09-13** (this track's OWN PR-0 through PR-6, not to be
+**Ladder status, updated 2026-09-14** (this track's OWN PR-0 through PR-6, not to be
 confused with the 7.7b-split's own "PR-2 (thin cutover)" a few sections up in this same
 doc - two different PRs share the name; see "Why it doesn't gate on #2233" above):
 **PR-0 (done, #4130)
@@ -349,14 +349,17 @@ remaining shutdown decoupling + legacy-note. #4322 fixed: `guardian_spark_runtim
 bounded backend wait - PR-2 removed the only production caller of that (see the R5.5
 stamp below). R5.5's own "as implemented" stamp added to
 `docs/spark-stage2-guardian-consumer-design.md` (its ack-ledger-retirement half already
-shipped in PR-2 Unit 6, per the correction below). **Ruled, not left open**: `stop()`
+shipped in PR-2 Unit 6 - the `retire()` call at `guardian_engine.cpp:650` carries that
+label). **Ruled, not left open**: `stop()`
 (`guardian_engine.cpp:613`) taking `mtx_` unconditionally before calling `begin_stop()`
 is correct as-is - `persist_lifecycle_journal_locked`, `ack_ledger_->retire()`, and
 `stop_all_guards_locked()` all need it, and PR-2 already removed the one thing that
 could make that hold backend-arm-bounded (a hung device/OS call); what remains under
-the lock is `apply_rules()`'s own synchronous, rule-count-scaled local work (a
-full_sync's KV sweep + `detach_all()`, the per-rule reconcile loop, an unbounded
-journal persist on scope exit), which this design was never meant to make instant.
+the lock is synchronous, rule-count-scaled local work - `apply_rules()`'s full_sync KV
+sweep + `detach_all()` + per-rule reconcile loop + unbounded journal persist on scope
+exit, but also `journal_maintenance_tick()`'s own periodic drain+persist and the
+boot-time `start_local()`/`wire_spark_engine()` calls - which this design was never
+meant to make instant.
 Also corrected R5.4's own "as implemented" stamp: "no data is ever lost" was an
 overclaim - `stage_pending_locked()` drops the oldest staged record past
 `kMaxPendingJournalRecords` under sustained persist failure, counted via

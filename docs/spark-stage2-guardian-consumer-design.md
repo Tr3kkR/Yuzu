@@ -786,12 +786,12 @@ ack-observation - a delay this section's own multi-tick tolerance for a large
 outstanding batch already covers, and one the test suite accounts for directly
 (`SparkReconcileFixture::apply()`'s settle loop runs one extra
 `journal_maintenance_tick()` after observing ack settlement, specifically for this
-reason). **Correction (rung 9c PR-4)**: "no data is ever lost" above overstated it -
-the one exception is sustained persist failure. `stage_pending_locked()`
-(`guardian_spark_runtime.cpp:2419-2434`) caps staging at `kMaxPendingJournalRecords`
-and drops the OLDEST record once that ceiling is hit, counted via
-`journal_stage_dropped_` (not silently) - a real, if narrow, durability gap this
-section's "no data is ever lost" language did not disclose.
+reason). **Correction (rung 9c PR-4)**: this stamp previously read "no data is ever
+lost" - an overstatement. The one exception is sustained persist failure:
+`stage_pending_locked()` (`guardian_spark_runtime.cpp:2419-2434`) caps staging at
+`kMaxPendingJournalRecords` and drops the OLDEST record once that ceiling is hit,
+counted via `journal_stage_dropped_` (not silently) - a real, if narrow, durability
+gap the original wording did not disclose.
 
 **R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
 in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
@@ -825,7 +825,7 @@ walk and the walk never reaches the spark path at all in that fixture.
 (`guardian_spark_runtime.cpp:1258`) never calls `wait_for_claim()`. The blocking
 overload that does (`guardian_spark_runtime.cpp:1214`, via `wait_for_claim()` at
 `:272`) still exists but has no production caller left - PR-2 removed the last one,
-leaving only its own direct unit test. This closes the specific hazard this section
+leaving only test code. This closes the specific hazard this section
 originally described: `stop()` can no longer be delayed by a hung backend arm/OS
 call. It does NOT make `stop()` prompt in general - overstating that was #4322's own
 defect (see below). `GuardianEngine::stop()` (`guardian_engine.cpp:613`) and
@@ -834,23 +834,31 @@ synchronous work under that lock: a full_sync's KV sweep and
 `spark_runtime_->detach_all()` (`:1176`, scales with the rule count being torn down -
 `detach_all()` itself, `guardian_spark_runtime.cpp:1647`, reserves and iterates
 `rule_ids.size()`), the per-rule reconcile loop, and an unbounded lifecycle-journal
-persist via `GuardianRollback`'s destructor on every exit. `stop()` itself also
+persist via `GuardianRollback`'s destructor on every exit. `apply_rules()` is not the
+only holder that can delay `stop()` this way - `journal_maintenance_tick()`
+(`:766`, runs every heartbeat tick) and the boot-time `start_local()` (`:453`) /
+`wire_spark_engine()` (`:1996`) calls do their own synchronous work under the same
+lock, not just this PR's own scope, so `stop()`'s wait is bounded by whichever
+holder it happens to contend with, not by `apply_rules()` alone. `stop()` itself also
 persists the journal unbounded, once before `begin_stop()` and once after
 (`guardian_engine.cpp:639`/`:667`). `GuardianSparkRuntime::begin_stop()`
 (`guardian_spark_runtime.cpp:2806-2849`) drops every Queued claim with a counted
 total (`claims_dropped_at_stop_`), leaves Dispatching/Dispatched claims for their own
-completion callback, and disarms a late-arriving success rather than leaving it live.
+completion callback, and disarms a late-arriving success rather than leaving it live -
+a retained disarm dropped in the same sweep leaks its watcher exactly as the old
+silent Stopped drop did, now counted the same way (comment at
+`guardian_spark_runtime.cpp:2817-2818`), a known, counted gap rather than a silent one.
 `GuardianEngine::stop()`'s `ack_ledger_->retire()` call is bookkeeping only (resets
 what the ledger is watching), not resource cleanup - the disarm guarantee above is
 what actually tears down a live claim. One known caller of `begin_stop()` outside
 `stop()`: `rollback_spark_wiring_locked()` (`guardian_engine.cpp:2166`, single call
 site at `:2048`, a boot-time wiring-failure path) resets `spark_runtime_` without
 first waiting for `active_backend_op_workers()==0` - tracked as **#3811** (filed
-during the #2233 governance sweep, OPEN as of this writing; this doc's own §3 row 3
-in `docs/spark-flip-gate.md` already rules it does not gate the Spark flip, unlike
-its sibling #3816). Cited here, not re-investigated or re-fixed by this PR.
-`#4322` (the stale `begin_stop()` comment claiming `apply_rules()` could still park
-in a bounded backend wait) is fixed in the same PR that adds this stamp.
+during the #2233 governance sweep, OPEN as of this writing; `docs/spark-flip-gate.md`'s
+own §3 row 3 already rules it does not gate the Spark flip, unlike its sibling #3816).
+Cited here, not re-investigated or re-fixed by this PR. `#4322` (the stale
+`begin_stop()` comment claiming `apply_rules()` could still park in a bounded backend
+wait) is fixed in the same PR that adds this stamp.
 
 **R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,
