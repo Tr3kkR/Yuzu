@@ -100,6 +100,105 @@ TEST_CASE("pf: empty or error output is unknown — real non-root capture", "[fi
     CHECK(parse_pf_status("pfctl: /dev/pf: Permission denied") == FwState::unknown);
 }
 
+// Real capture: `socketfilterfw --listapps` run unprivileged on this Mac
+// (macOS 26, 2026-09-14) — 8 apps, all Allow. Trailing spaces after the
+// header, the index/path lines, and the indentation before each
+// parenthetical are verbatim from the capture, not tidied.
+constexpr std::string_view kAlfListappsCapture =
+    "Total number of apps = 8 \n"
+    "1 : /usr/local/libexec/remotepairingdeviced \n"
+    "             (Allow incoming connections)\n"
+    "2 : /usr/libexec/remoted \n"
+    "             (Allow incoming connections)\n"
+    "3 : /usr/bin/python3 \n"
+    "             (Allow incoming connections)\n"
+    "4 : /usr/bin/ruby \n"
+    "             (Allow incoming connections)\n"
+    "5 : /usr/sbin/cupsd \n"
+    "             (Allow incoming connections)\n"
+    "6 : /usr/libexec/sharingd \n"
+    "             (Allow incoming connections)\n"
+    "7 : /usr/libexec/sshd-keygen-wrapper \n"
+    "             (Allow incoming connections)\n"
+    "8 : /usr/sbin/smbd \n"
+    "             (Allow incoming connections)\n";
+
+TEST_CASE("alf listapps: real 8-app capture, all allow", "[firewall]") {
+    auto rows = parse_alf_listapps(kAlfListappsCapture);
+    REQUIRE(rows.size() == 8);
+    CHECK(rows[0].path == "/usr/local/libexec/remotepairingdeviced");
+    CHECK(rows[0].decision == AlfDecision::allow);
+    CHECK(rows[1].path == "/usr/libexec/remoted");
+    CHECK(rows[1].decision == AlfDecision::allow);
+    CHECK(rows[2].path == "/usr/bin/python3");
+    CHECK(rows[2].decision == AlfDecision::allow);
+    CHECK(rows[3].path == "/usr/bin/ruby");
+    CHECK(rows[3].decision == AlfDecision::allow);
+    CHECK(rows[4].path == "/usr/sbin/cupsd");
+    CHECK(rows[4].decision == AlfDecision::allow);
+    CHECK(rows[5].path == "/usr/libexec/sharingd");
+    CHECK(rows[5].decision == AlfDecision::allow);
+    CHECK(rows[6].path == "/usr/libexec/sshd-keygen-wrapper");
+    CHECK(rows[6].decision == AlfDecision::allow);
+    CHECK(rows[7].path == "/usr/sbin/smbd");
+    CHECK(rows[7].decision == AlfDecision::allow);
+}
+
+TEST_CASE("alf listapps: synthetic block line", "[firewall]") {
+    auto rows = parse_alf_listapps("1 : /usr/bin/synthetic \n"
+                                    "             (Block incoming connections)\n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].path == "/usr/bin/synthetic");
+    CHECK(rows[0].decision == AlfDecision::block);
+}
+
+TEST_CASE("alf listapps: unrecognised parenthetical is unknown, not dropped",
+          "[firewall]") {
+    // A real emitted state (e.g. a future macOS wording change) must still
+    // surface the row rather than silently disappearing it.
+    auto rows = parse_alf_listapps("1 : /usr/bin/mystery \n"
+                                    "             (Some future wording)\n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].path == "/usr/bin/mystery");
+    CHECK(rows[0].decision == AlfDecision::unknown);
+}
+
+TEST_CASE("alf listapps: empty input (unprivileged refusal) yields empty", "[firewall]") {
+    CHECK(parse_alf_listapps("").empty());
+}
+
+// Real capture: `pfctl -s Anchors` and `pfctl -s rules`, run as root
+// (~/pf-capture.txt, 2026-09-14) — only the anchor-name / rule lines
+// themselves, verbatim.
+constexpr std::string_view kPfAnchorsCapture = "  NordVPN\n"
+                                                "  com.apple\n";
+constexpr std::string_view kPfRulesCapture =
+    "scrub-anchor \"com.apple/*\" all fragment reassemble\n"
+    "anchor \"com.apple/*\" all\n";
+
+TEST_CASE("pf anchors: real capture, order preserved, whitespace trimmed", "[firewall]") {
+    auto anchors = parse_pf_anchors(kPfAnchorsCapture);
+    REQUIRE(anchors.size() == 2);
+    CHECK(anchors[0] == "NordVPN");
+    CHECK(anchors[1] == "com.apple");
+}
+
+TEST_CASE("pf anchors: empty/Permission-denied (empty stdout) yields empty",
+          "[firewall]") {
+    // Non-root read: "pfctl: /dev/pf: Permission denied" goes to stderr,
+    // which the shell discards, so the parser sees "".
+    CHECK(parse_pf_anchors("").empty());
+}
+
+TEST_CASE("pf rules: real capture line count", "[firewall]") {
+    CHECK(count_pf_rules(kPfRulesCapture) == 2);
+}
+
+TEST_CASE("pf rules: empty input is 0, never nullopt — refusal is the shell's call",
+          "[firewall]") {
+    CHECK(count_pf_rules("") == 0);
+}
+
 TEST_CASE("fw state to_string round-trip", "[firewall]") {
     CHECK(to_string(FwState::enabled) == "enabled");
     CHECK(to_string(FwState::disabled) == "disabled");
