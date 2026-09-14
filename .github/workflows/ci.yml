@@ -438,6 +438,22 @@ jobs:
           python3 scripts/ci/check-api-parity.py --selftest
           python3 scripts/ci/check-api-parity.py
 
+      # Portable-path gate (ws91 P91-7, Architect ruling 2026-09-08). Pure
+      # `git ls-files` scan -- no build deps -- so it belongs here beside the
+      # other preflight gates. Fails on any tracked path Windows/NTFS cannot
+      # represent (a ':' -- the recurring offender for sysfs/PCI/MAC-
+      # address-shaped fixture data -- or `* ? " < > |` or a trailing '.'/' '
+      # on any path component): P91-5's Linux sysfs fixture tree shipped 35
+      # such paths and broke `git checkout` on every Windows host, the-rig
+      # and the "Windows MSVC ${{ matrix.build_type }}" self-hosted CI
+      # checkout job (this file's build matrix, below) included. Selftest
+      # first (fixture-level proof the predicate still discriminates
+      # clean/seeded paths), then the real scan over the tree.
+      - name: Portable path gate (ws91 P91-7)
+        run: |
+          bash scripts/ci/check-portable-paths.sh --selftest
+          bash scripts/ci/check-portable-paths.sh
+
       # MCP retry_after_ms hard rule (A5, ADR-1005 exec-plan Decision 16 /
       # routed-concerns.md's A5 row): every NEW MCP tool's store/query-fault
       # error branch must carry a retry_after_ms hint or an inline
