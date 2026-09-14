@@ -5978,20 +5978,101 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     CHECK(WEXITSTATUS(status) == 0);
 }
 
-// rung 9c PR-5a (#4221 ch-102) coverage note: #4221's ch-102 asks for a runtime-level
-// test of "the refill-inside-catch admission-refusal arm... the refill-then-admission-
-// refused sub-path" - a queued claim behind a resolving head whose OWN admission then
-// gets refused, inside on_arm_complete's compensating-gap cleanup. #4221's cited line
-// numbers pre-date rung 9c PR-1 through PR-4's refactors and no longer resolve to a
-// distinct, separately-reachable branch. This EXACT scenario is already exercised
-// twice: the death test immediately above (`rung 9c R5.2 (adversarial re-review r3
-// C2)`, refilling "r2" behind r1's withdrawn head, then forcing r2's own admission to
-// fail via set_io_executor_fail_launch_for_test) and the up-101 test below (same
-// setup, same seam, before the same-rule re-attach it goes on to test). Both force the
-// refill's admission to be refused as part of their own required setup, not as an
-// afterthought - a third, separately-named test would duplicate this coverage rather
-// than add to it. No new test added for ch-102; flagging this explicitly per the
-// kickoff's own instruction rather than leaving the criterion silently unaddressed.
+// rung 9c PR-5a (#4221 ch-102): governance correction (2026-09-14) - the comment this
+// test replaces claimed the death test above and the up-101 test below already cover
+// ch-102's "refill-inside-catch admission-refusal arm". Two independent governance
+// reviewers (quality-engineer, consistency-auditor) traced the actual branches by grep
+// for set_drain_fault_point_for_test and found that claim wrong: both cited tests
+// exercise dispatch_arm_off_lock's OWN try/catch around io_executor_.submit() for a
+// FRESH refill (a claim never previously touched by any publish), reached from
+// on_arm_complete's "not compensating" inline path. ch-102's actual target is a
+// DIFFERENT branch: the "else refill = try_dispatch_head_locked(key)" arm inside
+// finalize_arm_compensation()'s own DOUBLE-FAULT catch handler (this file, the
+// `if (cont->claim->outcome || cont->claim->commit_exception) { ...; else refill = ...}`
+// block) - reached only when the DEFERRED/compensating publish_arm_verdicts_locked()
+// call itself throws (set_drain_fault_point_for_test(3), which fires inside that
+// function) WHILE a second claim is already queued behind the compensating head. That
+// branch had zero coverage; this test targets it directly.
+//
+// Mutation-verify: change the catch handler's `else refill = try_dispatch_head_locked(
+// cont->key);` to a no-op (drop the refill) and this goes RED - r2 is left Queued
+// forever behind the popped r1, never dispatched, and its attach_rule() call hangs
+// past its own deadline instead of resolving "arm worker launch failed".
+TEST_CASE("rung 9c PR-5a (#4221 ch-102): finalize_arm_compensation's double-fault catch "
+          "handler refills the next queued claim, and that refill's OWN admission "
+          "refusal is handled cleanly",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
+    const auto key = spark_key(file_spec("/a"));
+
+    // r1 hangs as the dispatched head, then is withdrawn while still parked - the
+    // same "nobody wants the late result" setup the compensating-disarm death test
+    // above uses, so on_arm_complete takes the `compensating` branch rather than
+    // committing the result. Its own claim stays at the fifo's head throughout: the
+    // compensating disarm is a separate io_executor_ submission (ArmCompensation),
+    // never a queued Disarm claim, until finalize_arm_compensation() actually pops it.
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->detach_rule("r1");
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+    CHECK(a1.gen.error() == "withdrawn");
+
+    // In the drain's compensating gap (r1's own on_arm_complete pass has already
+    // collected ITS finished/verdicts sets - queuing r2 here does not join them, it
+    // queues fresh behind r1's still-present head, exactly matching the "second
+    // queued claim" ch-102 needs): queue r2, then arm BOTH seams together. Governance
+    // B2: this hook runs on on_arm_complete's own noexcept, detached-worker call
+    // stack - no REQUIRE/CHECK in here, only recording/signalling; every assertion
+    // below runs on the main thread after a2.t.join().
+    QueuedAttach a2;
+    std::atomic<bool> r2_queued{false};
+    rt->set_drain_gap_hook_for_test([&] {
+        a2.t = std::thread{[&] {
+            a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+        }};
+        (void)yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 2; },
+                                     std::chrono::seconds(10));
+        r2_queued.store(true);
+        // Fires inside finalize_arm_compensation's deferred publish_arm_verdicts_locked()
+        // call (NOT here, and NOT during this on_arm_complete pass, which never calls
+        // it while `compensating` is set) - the double fault ch-102 needs.
+        rt->set_drain_fault_point_for_test(3);
+        // Persistent (not consumed-once): also refuses the compensating disarm's own
+        // submission below, which falls back to direct_disarm_fallback() - a
+        // different, already-covered recovery path (up-3/#4221 territory), harmless
+        // to this test. Left armed through finalize_arm_compensation's own refill
+        // dispatch, which is the actual refusal this test targets.
+        rt->set_io_executor_fail_launch_for_test(true);
+    });
+    b->release_hang(); // r1's arm lands late: drain -> gap hook -> compensation ->
+                       // (direct-disarm fallback) -> finalize_arm_compensation ->
+                       // fault 3 -> catch -> pop r1 -> refill r2 -> r2's own admission refused
+    REQUIRE(yuzu::test::spin_until([&] { return r2_queued.load(); }, std::chrono::seconds(30)));
+    a2.t.join();
+    rt->set_io_executor_fail_launch_for_test(false);
+
+    REQUIRE_FALSE(a2.gen.has_value()); // the refill's OWN admission was refused
+    CHECK(a2.gen.error() == "arm worker launch failed");
+    CHECK(rt->claim_drain_failures() >= 1); // fault 3's throw was contained and counted
+    CHECK(rt->claim_queue_depth_for_test(key) == 0); // r1 popped, r2 failed-and-cleaned -
+                                                     // no leftover tombstone from either
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->arms.load() == 1); // only r1's real (late) arm - r2 never reached the
+                                // backend at all (refused at admission)
+
+    // The key is not wedged: a fresh attach still succeeds cleanly.
+    auto gen_r3 = rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3"), true);
+    REQUIRE(gen_r3);
+    CHECK(rt->armed_key_count() == 1);
+    rt->detach_rule("r3");
+    rt->begin_stop();
+}
 //
 // rung 9c PR-5a (#4221 up-101/ch-101): the death test above proves recovery when a
 // DIFFERENT rule (r4) queues behind r2's tombstone. #4221's own up-101 criterion names
@@ -6012,37 +6093,49 @@ TEST_CASE("rung 9c PR-5a (#4221 up-101/ch-101): a same-rule_id re-attach behind 
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline = std::chrono::seconds(30)});
     const auto key = spark_key(file_spec("/a"));
 
-    std::expected<std::uint64_t, std::string> gen_r1;
-    std::thread t1{[&] { gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
+    // QueuedAttach (defined above, "rung 9c R5.2: per-key claim/queue" section) rather
+    // than a raw std::thread: its destructor joins if still joinable, so a REQUIRE
+    // failure between construction and the explicit .join() below unwinds safely
+    // instead of destructing a joinable thread (std::terminate) - governance B1.
+    QueuedAttach a1;
+    a1.t = std::thread{[&] { a1.gen = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true); }};
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
     rt->detach_rule("r1"); // Case-0 withdraw: the dispatched head stays as the key's marker
-    t1.join();
-    REQUIRE_FALSE(gen_r1.has_value());
-    CHECK(gen_r1.error() == "withdrawn");
+    a1.t.join();
+    REQUIRE_FALSE(a1.gen.has_value());
+    CHECK(a1.gen.error() == "withdrawn");
 
     // In the drain's compensating gap: queue "r2" behind the withdrawn r1 head, then
     // make its own admission fail AND its index release throw inside that failure's
     // cleanup - producing a genuine tombstone (withdrawn, index_held retained pending
     // retry), exactly the setup the r4-based death test above uses.
-    std::expected<std::uint64_t, std::string> gen_r2;
-    std::thread t2;
+    //
+    // governance B2: the hook below runs on_arm_complete's own call stack - noexcept,
+    // on the detached io_executor_ worker thread (this file's own doc comment on
+    // on_arm_complete says so explicitly). A REQUIRE/CHECK in there would be a
+    // concurrent call into Catch2's non-thread-safe assertion API from a second
+    // thread, and any exception crossing that noexcept boundary is std::terminate
+    // regardless. The hook only records/signals here (discards spin_until's return,
+    // exactly like the sibling death test above at its own set_drain_gap_hook_for_test
+    // call); every assertion runs on the MAIN thread after a2.t.join() instead.
+    QueuedAttach a2;
     std::atomic<bool> r2_done{false};
     rt->set_drain_gap_hook_for_test([&] {
-        t2 = std::thread{[&] {
-            gen_r2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+        a2.t = std::thread{[&] {
+            a2.gen = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
             r2_done.store(true);
         }};
-        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
-                                       std::chrono::seconds(10)));
+        (void)yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                     std::chrono::seconds(10));
         rt->set_io_executor_fail_launch_for_test(true); // the refill's submit() is refused
         rt->set_index_remove_fault_for_test(true);      // ...and its cleanup's release throws
     });
     b->release_hang(); // r1's arm lands: drain -> gap hook -> compensation -> pop -> refill r2
     REQUIRE(yuzu::test::spin_until([&] { return r2_done.load(); }, std::chrono::seconds(30)));
-    t2.join();
+    a2.t.join();
     rt->set_io_executor_fail_launch_for_test(false);
-    REQUIRE_FALSE(gen_r2.has_value());
-    CHECK(gen_r2.error() == "arm worker launch failed");
+    REQUIRE_FALSE(a2.gen.has_value());
+    CHECK(a2.gen.error() == "arm worker launch failed");
     CHECK(rt->claim_index_release_failures() == 1);
     CHECK(rt->claim_queue_depth_for_test(key) == 1); // r2's FIRST attempt is now a
                                                      // tombstone: withdrawn, its index
