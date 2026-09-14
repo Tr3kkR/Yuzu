@@ -112,8 +112,12 @@ private:
 /// supplies its own to simulate an EACCES/EIO mid-walk without needing a
 /// real unreadable file on disk.
 struct StatFns {
-    int (*fstat_)(int, struct stat*) = &::fstat;
-    int (*fstatat_)(int, const char*, struct stat*, int) = &::fstatat;
+    // No trailing underscore (docs/cpp-conventions.md reserves that for
+    // PRIVATE members; these fields are a plain public aggregate, matching
+    // posix_dir_walk.hpp's sibling seam ReadDirFn's plain `readdir_fn`
+    // naming) -- `_fn` instead, naming what each field IS.
+    int (*fstat_fn)(int, struct stat*) = &::fstat;
+    int (*fstatat_fn)(int, const char*, struct stat*, int) = &::fstatat;
 };
 
 /// Outcome of an O_NOFOLLOW directory open: the handle (invalid on any
@@ -379,7 +383,7 @@ DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry,
     const auto walk = yuzu::shared::walk_dir_capped(
         open.handle.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
             struct stat st{};
-            if (stat_fns.fstatat_(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+            if (stat_fns.fstatat_fn(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
                 // #4241: a real fstatat() failure (permission denied, a
                 // refused symlink, a genuine I/O error) must not be
                 // silently read as "this entry contributes nothing" -- only
@@ -562,7 +566,7 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx,
             }
             FdHandle home_handle(home_fd);
             struct stat st{};
-            if (stat_fns.fstat_(home_handle.get(), &st) != 0) {
+            if (stat_fns.fstat_fn(home_handle.get(), &st) != 0) {
                 // #4241, site 2: a real fstat() failure on an already-open fd
                 // is a genuine constraint (AC4), not "this home contributes
                 // nothing" -- only a benign ENOENT race is.

@@ -102,16 +102,21 @@ versus one that could not be read at all:
   emitted if the trailing `RegUnLoadKeyW` fails on the way out -- this is
   orthogonal to the per-source `source|` line and never folded into it.
 - **`constrained|<n>|malformed`** (launchd plist walk, `mac_emond`,
-  `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `win_scheduled_tasks`,
+  `lnx_etc_crontab`, `lnx_cron_d`, `lnx_user_crontabs`, `lnx_anacrontab`,
+  `lnx_xdg_autostart_system`, `lnx_xdg_autostart_user`, `win_scheduled_tasks`,
   and any Windows registry-value source -- `win_run_hklm`/`_hkcu`,
   `win_runonce*`, `win_startup_approved`, `win_winlogon_shell`/`_userinit`,
   `win_appinit_dlls` -- when a value's data fails `ReadValueStatus` decoding)
   -- a file or registry value was read but could not be fully parsed. On
   macOS a plist could not be parsed (corrupt, or a valid plist truncated by
-  `kMaxPlistBytes`). On the three Linux crontab-family sources, a crontab
-  file had at least one rejected line (`parse_crontab`'s `rejected_lines > 0`)
-  while every other valid entry in that file is still kept, never dropping
-  the whole file. On `win_scheduled_tasks`, a task's XML was read
+  `kMaxPlistBytes`). On the crontab-family sources, a crontab/anacrontab
+  file had at least one rejected line (`parse_crontab`/`parse_anacrontab`'s
+  `rejected_lines > 0`) while every other valid entry in that file is still
+  kept, never dropping the whole file. On the XDG autostart sources (system
+  and per-user), a `.desktop` file with no `[Desktop Entry]` group or an
+  empty/absent `Exec` key (`parse_desktop_entry`'s `malformed` field) is
+  skipped rather than reported as a real, runnable autostart entry with an
+  empty target. On `win_scheduled_tasks`, a task's XML was read
   successfully but `parse_task_xml` could not make sense of it
   (truncated/corrupt XML, a rejected DTD, an unexpected root) -- distinct
   from `get_Xml()` itself failing, which carries its own, more specific

@@ -387,7 +387,7 @@ TEST_CASE("autoruns macOS: walk_dir_names surfaces a real fstatat() failure as a
 
     SECTION("an injected EIO on the one entry is reported constrained, stat_failed") {
         StatFns failing;
-        failing.fstatat_ = [](int, const char*, struct stat*, int) -> int {
+        failing.fstatat_fn = [](int, const char*, struct stat*, int) -> int {
             errno = EIO;
             return -1;
         };
@@ -401,7 +401,7 @@ TEST_CASE("autoruns macOS: walk_dir_names surfaces a real fstatat() failure as a
 
     SECTION("an injected ENOENT (benign race) is NOT reported constrained") {
         StatFns benign;
-        benign.fstatat_ = [](int, const char*, struct stat*, int) -> int {
+        benign.fstatat_fn = [](int, const char*, struct stat*, int) -> int {
             errno = ENOENT;
             return -1;
         };
@@ -442,7 +442,7 @@ TEST_CASE("autoruns macOS: collect_user_launchagents surfaces a real fstat() "
 
     SECTION("an injected EACCES on the home fstat is reported permission_denied") {
         StatFns failing;
-        failing.fstat_ = [](int, struct stat*) -> int {
+        failing.fstat_fn = [](int, struct stat*) -> int {
             errno = EACCES;
             return -1;
         };
@@ -454,7 +454,7 @@ TEST_CASE("autoruns macOS: collect_user_launchagents surfaces a real fstat() "
 
     SECTION("an injected ENOENT (benign race) is NOT reported constrained") {
         StatFns benign;
-        benign.fstat_ = [](int, struct stat*) -> int {
+        benign.fstat_fn = [](int, struct stat*) -> int {
             errno = ENOENT;
             return -1;
         };
