@@ -341,7 +341,10 @@ confused with the 7.7b-split's own "PR-2 (thin cutover)" a few sections up in th
 doc - two different PRs share the name; see "Why it doesn't gate on #2233" above):
 **PR-0 (done, #4130)
 → PR-1 (done, #4224, 2026-09-10) → [#2012/#3840 series, done, see above] → PR-2 (done,
-#4318, 2026-09-13) → PR-3 (telemetry, not started) → PR-4 (audit + R5.5's remaining
+#4318, 2026-09-13) → PR-3 (telemetry, implemented in worktree, not yet merged -
+`~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md`; arm_pending/arm_failed
+re-statable gauges + the io-ceiling monitor-only counter, PR-3a/#3415 split out
+separately) → PR-4 (audit + R5.5's remaining
 shutdown decoupling + legacy-note, not started - **correction, 2026-09-13**: R5.5 is
 not entirely undone - `GuardianEngine::stop()` already calls `ack_ledger_->retire()`
 under a comment labeled "rung 9c PR-2 Unit 6 (§R5.5)" (`guardian_engine.cpp:644`),

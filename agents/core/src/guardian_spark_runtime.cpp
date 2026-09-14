@@ -2904,6 +2904,14 @@ std::uint64_t GuardianSparkRuntime::outbox_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return outbox_.backpressure_drops();
 }
+std::uint64_t GuardianSparkRuntime::io_ceiling_rejections() const {
+    // GuardianIoExecutor::stats() is self-locking (state_->mu) - no additional lock
+    // needed at this level, matching io_executor_stats_for_test()'s own shape.
+    std::uint64_t total = 0;
+    for (const auto& c : io_executor_.stats().counters)
+        total += c.rejected_ceiling;
+    return total;
+}
 std::uint64_t GuardianSparkRuntime::lifecycle_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return lifecycle_log_.backpressure_drops();
