@@ -71,11 +71,17 @@ struct Message {
 
 /// One operation-attribute this plugin encodes into a request, beyond the
 /// two mandatory attributes-charset/attributes-natural-language attributes
-/// encode_request() always sends first.
+/// encode_request() always sends first. `additional_values`, when non-empty,
+/// encodes a `1setOf` attribute (e.g. `requested-attributes`): RFC 8010
+/// §3.5.2's "additional value" continuation — `value` is written as a
+/// normal tag+name+value triple, then each entry of `additional_values` is
+/// written as tag + a zero-length name + value, exactly what decode()
+/// already expects on the way back in (see its empty-name handling).
 struct OperationAttr {
     uint8_t tag = 0;
     std::string name;
     std::string value;
+    std::vector<std::string> additional_values;
 };
 
 namespace detail {
@@ -131,8 +137,15 @@ inline void put_attr(std::string& out, uint8_t tag, std::string_view name, std::
     out.push_back(static_cast<char>(kTagOperationAttributes));
     detail::put_attr(out, kTagCharset, "attributes-charset", "utf-8");
     detail::put_attr(out, kTagNaturalLanguage, "attributes-natural-language", "en");
-    for (const auto& a : operation_attrs)
+    for (const auto& a : operation_attrs) {
         detail::put_attr(out, a.tag, a.name, a.value);
+        for (const auto& extra : a.additional_values) {
+            out.push_back(static_cast<char>(a.tag));
+            detail::put_u16(out, 0); // zero-length name -> additional-value continuation
+            detail::put_u16(out, static_cast<uint16_t>(extra.size()));
+            out.append(extra);
+        }
+    }
 
     out.push_back(static_cast<char>(kTagEndOfAttributes));
     return out;
