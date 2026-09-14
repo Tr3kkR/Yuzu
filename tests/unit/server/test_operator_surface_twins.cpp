@@ -528,6 +528,18 @@ constexpr TwinRow kExpectedTwins[] = {
     {"pin_result_set", "Infrastructure", "Write", false},
     {"unpin_result_set", "Infrastructure", "Write", false},
     {"delete_result_set", "Infrastructure", "Delete", false},
+    // #2146 Batch B3 (api-parity programme) — execution/fleet statistics +
+    // fleet visualization read twins. Pinned against rest_api_v1.cpp's
+    // GET /api/v1/execution-statistics{,/agents,/definitions} + GET
+    // /api/v1/statistics, and viz_routes.cpp's GET /api/v1/viz/fleet/topology
+    // + GET /api/v1/viz/host/{id}/topology — the SAME (securable, operation)
+    // each REST twin gates on.
+    {"get_execution_statistics", "Execution", "Read", true},
+    {"get_execution_statistics_by_agent", "Execution", "Read", true},
+    {"get_execution_statistics_by_definition", "Execution", "Read", true},
+    {"get_fleet_statistics", "Infrastructure", "Read", true},
+    {"get_fleet_topology", "Response", "Read", true},
+    {"get_host_topology", "Response", "Read", true},
 };
 
 } // namespace

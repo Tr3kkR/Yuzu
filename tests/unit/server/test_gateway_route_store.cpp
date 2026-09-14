@@ -500,8 +500,9 @@ TEST_CASE("GatewayRouteStore[pg]: renew_leases bumps lease_until only for named 
     REQUIRE(fx.store().announce_connected("agent-8", "session-c", "c1", "n1", 30).value().matched);
 
     // Renew only session-a and session-b, in ONE batched call.
+    std::vector<std::string> agents{"agent-6", "agent-7"};
     std::vector<std::string> ids{"session-a", "session-b"};
-    auto renewed = fx.store().renew_leases(ids, 3600);
+    auto renewed = fx.store().renew_leases(agents, ids, 3600);
     REQUIRE(renewed.has_value());
     CHECK(*renewed == 2);
 
@@ -535,14 +536,70 @@ TEST_CASE("GatewayRouteStore[pg]: renew_leases renews a session id containing a 
                 .value()
                 .matched);
 
+    std::vector<std::string> agents{"agent-tricky"};
     std::vector<std::string> ids{tricky_session};
-    auto renewed = fx.store().renew_leases(ids, 3600);
+    auto renewed = fx.store().renew_leases(agents, ids, 3600);
     REQUIRE(renewed.has_value());
     CHECK(*renewed == 1);
 
     auto route = fx.store().lookup_route("agent-tricky");
     REQUIRE(route.has_value());
     REQUIRE((*route)->lease_until_ms.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: renew_leases correlates agent_id AND session_id — a matching "
+          "session with a MISMATCHED agent_id renews zero rows",
+          "[gateway_route][pg][store]") {
+    // #4246 #10: renew_leases used to match on session_id alone. A caller
+    // (compromised/buggy gateway) that knows a session token but asserts the
+    // WRONG agent_id for it must not be able to renew that agent's lease.
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-correlate-1", "session-correlate-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-correlate-1", "session-correlate-1", "c1", "n1", 30)
+                .value()
+                .matched);
+    auto row_before = fx.store().lookup_route("agent-correlate-1");
+    REQUIRE(row_before.has_value());
+    REQUIRE(row_before->has_value());
+    const auto lease_before = (*row_before)->lease_until_ms;
+    REQUIRE(lease_before.has_value());
+
+    // Right session, WRONG agent_id: matches zero rows, and the row's lease
+    // is left completely untouched.
+    std::vector<std::string> wrong_agents{"agent-correlate-WRONG"};
+    std::vector<std::string> right_sessions{"session-correlate-1"};
+    auto mismatched = fx.store().renew_leases(wrong_agents, right_sessions, 3600);
+    REQUIRE(mismatched.has_value());
+    CHECK(*mismatched == 0);
+
+    auto row_after_mismatch = fx.store().lookup_route("agent-correlate-1");
+    REQUIRE(row_after_mismatch.has_value());
+    REQUIRE(row_after_mismatch->has_value());
+    CHECK((*row_after_mismatch)->lease_until_ms == lease_before); // untouched
+
+    // The CORRECT (agent_id, session_id) pair renews the row.
+    std::vector<std::string> right_agents{"agent-correlate-1"};
+    auto correct = fx.store().renew_leases(right_agents, right_sessions, 3600);
+    REQUIRE(correct.has_value());
+    CHECK(*correct == 1);
+
+    auto row_after_correct = fx.store().lookup_route("agent-correlate-1");
+    REQUIRE(row_after_correct.has_value());
+    REQUIRE(row_after_correct->has_value());
+    REQUIRE((*row_after_correct)->lease_until_ms.has_value());
+    CHECK(*(*row_after_correct)->lease_until_ms > *lease_before); // genuinely renewed
+}
+
+TEST_CASE("GatewayRouteStore[pg]: renew_leases refuses a length-mismatched agent_ids/session_ids "
+          "pair rather than silently misaligning them",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    std::vector<std::string> agents{"agent-a", "agent-b"};
+    std::vector<std::string> sessions{"session-a"};
+    auto result = fx.store().renew_leases(agents, sessions, 3600);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error() == GatewayRouteStoreError::db_error);
 }
 
 TEST_CASE("GatewayRouteStore[pg]: lookup_route reports is_stale for an expired lease",
@@ -566,6 +623,121 @@ TEST_CASE("GatewayRouteStore[pg]: lookup_route on an unknown agent returns nullo
     auto row = fx.store().lookup_route("no-such-agent");
     REQUIRE(row.has_value());
     CHECK_FALSE(row->has_value());
+}
+
+// --- 4.2b Task A: placement authority + lookup_routes -----------------------
+
+TEST_CASE("GatewayRouteStore[pg]: register_fresh NULLs placement on a winning re-register",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // Seed a live, fully-announced route: {S1, cluster=c1, node=n1}.
+    auto r1 = fx.store().register_fresh("agent-4.2b-1", "session-S1");
+    REQUIRE(r1.has_value());
+    REQUIRE(r1->won);
+    REQUIRE(
+        fx.store().announce_connected("agent-4.2b-1", "session-S1", "c1", "n1", 30).value().matched);
+    auto seeded = fx.store().lookup_route("agent-4.2b-1");
+    REQUIRE(seeded.has_value());
+    REQUIRE(seeded->has_value());
+    REQUIRE((*seeded)->cluster_id.has_value());
+    CHECK(*(*seeded)->cluster_id == "c1");
+
+    // A fresh registration (a reconnect) under a NEW session wins the epoch
+    // race. Pre-4.2b this COALESCE-preserved c1/n1 across the winning
+    // re-register; 4.2b instead drops placement — announce_connected is now
+    // the sole writer of it.
+    auto r2 = fx.store().register_fresh("agent-4.2b-1", "session-S2");
+    REQUIRE(r2.has_value());
+    CHECK(r2->won);
+    CHECK(r2->epoch > r1->epoch);
+
+    auto row = fx.store().lookup_route("agent-4.2b-1");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->session_id == "session-S2");
+    CHECK_FALSE((*row)->cluster_id.has_value());
+    CHECK_FALSE((*row)->gateway_node.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_routes computes the routable matrix in-SQL",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+
+    // (a) a live, fully-announced route -> routable.
+    REQUIRE(fx.store().register_fresh("agent-route-live", "s-live").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-route-live", "s-live", "c1", "n1", 3600)
+                .value()
+                .matched);
+
+    // (b) a tombstone (session_id IS NULL AND lease_until IS NULL) ->
+    // not routable.
+    REQUIRE(fx.store().register_fresh("agent-route-tomb", "s-tomb").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-route-tomb", "s-tomb", "c1", "n1", 30)
+                .value()
+                .matched);
+    REQUIRE(fx.store().deregister("agent-route-tomb", "s-tomb").value().removed);
+
+    // (c) an expired lease (still fully placed, but lease_until < now()) ->
+    // not routable.
+    REQUIRE(fx.store().register_fresh("agent-route-expired", "s-expired").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-route-expired", "s-expired", "c1", "n1", -3600)
+                .value()
+                .matched);
+
+    // (d) a null-cluster, live-session row: register_fresh only, no
+    // announce_connected yet -> not routable (placement unconfirmed).
+    REQUIRE(fx.store().register_fresh("agent-route-unannounced", "s-unannounced").value().won);
+
+    // (e) an absent agent — no row at all.
+    const std::string absent_agent = "agent-route-absent-does-not-exist";
+
+    std::vector<std::string> ids{"agent-route-live",         "agent-route-tomb",
+                                 "agent-route-expired",       "agent-route-unannounced",
+                                 absent_agent};
+    auto routes = fx.store().lookup_routes(ids);
+    REQUIRE(routes.has_value());
+    // The absent agent contributes no row; the other four do.
+    CHECK(routes->size() == 4);
+
+    auto find = [&](const std::string& agent_id) -> const RoutableRoute* {
+        for (const auto& rr : *routes)
+            if (rr.route.agent_id == agent_id)
+                return &rr;
+        return nullptr;
+    };
+
+    const RoutableRoute* live = find("agent-route-live");
+    REQUIRE(live != nullptr);
+    CHECK(live->routable);
+    CHECK_FALSE(live->route.is_stale);
+
+    const RoutableRoute* tomb = find("agent-route-tomb");
+    REQUIRE(tomb != nullptr);
+    CHECK_FALSE(tomb->routable);
+
+    const RoutableRoute* expired = find("agent-route-expired");
+    REQUIRE(expired != nullptr);
+    CHECK_FALSE(expired->routable);
+    CHECK(expired->route.is_stale);
+
+    const RoutableRoute* unannounced = find("agent-route-unannounced");
+    REQUIRE(unannounced != nullptr);
+    CHECK_FALSE(unannounced->routable);
+    CHECK_FALSE(unannounced->route.cluster_id.has_value());
+
+    CHECK(find(absent_agent) == nullptr);
+}
+
+TEST_CASE("GatewayRouteStore[pg]: lookup_routes on an empty span returns an empty result",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    std::vector<std::string> ids{};
+    auto routes = fx.store().lookup_routes(ids);
+    REQUIRE(routes.has_value());
+    CHECK(routes->empty());
 }
 
 // --- reap_stale_routes ------------------------------------------------------

@@ -36,9 +36,10 @@ constexpr const char* kStoreName = "gateway_route_store";
 // SYNCHRONOUSLY on a gRPC handler thread on the agent heartbeat/connect hot
 // path (agent_service_impl.cpp's BatchHeartbeat, gateway_service_impl.cpp's
 // ProxyRegister/ProxyStreamStatus) — a 2s stall under pool pressure pins that
-// thread for 2s per call, and these calls are already fail-open (a degraded
-// write here never fails the RPC — see record_route_store_failure in
-// gateway_service_impl.cpp). A short bound fails fast back to "log and
+// thread for 2s per call. Most of these writes are fail-open (a degraded write
+// is logged and the RPC proceeds — see record_route_store_failure in
+// gateway_service_impl.cpp; register_fresh is the one fail-CLOSED exception as
+// of 4.2b Task B, returning UNAVAILABLE). A short bound fails fast back to "log and
 // proceed" instead of holding the handler thread hostage; the expected
 // consequence is that yuzu_server_gateway_route_write_failed_total rises
 // under real pool pressure rather than every heartbeat blocking for 2s each.
@@ -160,11 +161,13 @@ const std::vector<pg::PgMigration>& GatewayRouteStore::migrations() {
     // announce_connected.
     //
     // The `session_id` index is load-bearing, not cosmetic: renew_leases() is
-    // the highest-frequency op (once per BatchHeartbeat batch) and filters
-    // `WHERE session_id = ANY($1)`, and deregister() filters on session_id too;
-    // without the index those are a seq scan of agent_routes per heartbeat tick,
-    // which grows with fleet size (governance perf/sre, WS-4 4.1). It ships in
-    // migration v1 because adding it later costs a second migration version.
+    // the highest-frequency op (once per BatchHeartbeat batch) and (#4246 #10)
+    // joins against it via `r.session_id = t.session_id` (correlated with
+    // `agent_id` too, but `agent_id` is already the primary key), and
+    // deregister() filters on session_id too; without the index those are a
+    // seq scan of agent_routes per heartbeat tick, which grows with fleet
+    // size (governance perf/sre, WS-4 4.1). It ships in migration v1 because
+    // adding it later costs a second migration version.
     static const std::vector<pg::PgMigration> kMigrations = {
         {1,
          R"(
@@ -237,8 +240,15 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
     // sequence is monotonic, but the whole point is that a DIFFERENT,
     // concurrently-racing register may have already advanced the row to a
     // higher epoch by the time this statement runs) loses: zero rows
-    // returned, existing row untouched. cluster_id/gateway_node are
-    // preserved via COALESCE across a winning re-register.
+    // returned, existing row untouched. cluster_id/gateway_node are NULLed
+    // (4.2b — see the file header "placement authority" note): a winning
+    // register_fresh is a NEW connection attempt whose eventual placement is
+    // not yet known, and announce_connected is the SOLE writer of placement
+    // once the connection is fully established. Preserving the old values
+    // here (the pre-4.2b COALESCE) let a stale placement survive a fresh
+    // registration + a bare lease renewal with no intervening CONNECTED — a
+    // trap for a dispatch reader that must never route on unconfirmed
+    // placement.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO gateway_route_store.agent_routes "
@@ -247,14 +257,14 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  connection_epoch = EXCLUDED.connection_epoch, "
         "  session_id = EXCLUDED.session_id, "
-        "  cluster_id = COALESCE(agent_routes.cluster_id, EXCLUDED.cluster_id), "
-        "  gateway_node = COALESCE(agent_routes.gateway_node, EXCLUDED.gateway_node), "
+        "  cluster_id = NULL, "
+        "  gateway_node = NULL, "
         // A winning re-register is a NEW connection — it must NOT inherit the
         // superseded session's lease. Reset to NULL here; the connection's own
         // announce_connected / first heartbeat renew establishes a fresh lease.
-        // (cluster_id/gateway_node ARE preserved via COALESCE above — they are
-        // connection-agnostic placement and are refreshed by announce_connected;
-        // the lease is connection-specific liveness and is not.)
+        // (cluster_id/gateway_node are ALSO reset to NULL above, for the same
+        // reason: both are connection-specific until announce_connected
+        // confirms them.)
         "  lease_until = NULL, "
         "  updated_at = now() "
         "WHERE EXCLUDED.connection_epoch > agent_routes.connection_epoch "
@@ -395,9 +405,20 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
 }
 
 std::expected<int, GatewayRouteStoreError>
-GatewayRouteStore::renew_leases(std::span<const std::string> session_ids, int lease_ttl_secs) {
+GatewayRouteStore::renew_leases(std::span<const std::string> agent_ids,
+                                std::span<const std::string> session_ids, int lease_ttl_secs) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    // #4246 #10: agent_ids and session_ids are PARALLEL arrays (index i is one
+    // (agent_id, session_id) pair) — a caller-side length mismatch would
+    // silently misalign the correlation below, so refuse rather than guess
+    // which element pairs with which.
+    if (agent_ids.size() != session_ids.size()) {
+        spdlog::error("GatewayRouteStore::renew_leases: agent_ids/session_ids length mismatch "
+                      "({} vs {})",
+                      agent_ids.size(), session_ids.size());
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
     if (session_ids.empty())
         return 0;
     auto lease = pool_.try_acquire_for(kWriteTimeout);
@@ -405,21 +426,33 @@ GatewayRouteStore::renew_leases(std::span<const std::string> session_ids, int le
         spdlog::warn("GatewayRouteStore::renew_leases: lease timeout — degraded");
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     }
-    // ONE batched statement over session_id = ANY($1) — a per-row renew would
-    // be one write per agent every lease interval at fleet scale (file
-    // header). Session ids go through the shared pg::to_text_array helper
-    // (pg/pg_array.hpp) rather than a hand-rolled literal, matching the
-    // established idiom (app_perf_group_reader.cpp, deployment_run_store.cpp).
-    std::vector<std::string_view> views;
-    views.reserve(session_ids.size());
+    // ONE batched statement, correlated on BOTH agent_id AND session_id via a
+    // parallel-array unnest() join (#4246 #10) — a per-row renew would be one
+    // write per agent every lease interval at fleet scale (file header), and
+    // matching on session_id alone let a compromised/buggy gateway renew a
+    // foreign agent's session merely by knowing its token, with no agent_id
+    // correlation (defense-in-depth gap; see the retired trust-rationale
+    // comment this replaces at the BatchHeartbeat call site). Both arrays go
+    // through the shared pg::to_text_array helper (pg/pg_array.hpp) rather
+    // than a hand-rolled literal, matching the established idiom
+    // (app_perf_group_reader.cpp, deployment_run_store.cpp).
+    std::vector<std::string_view> agent_views;
+    agent_views.reserve(agent_ids.size());
+    for (const std::string& a : agent_ids)
+        agent_views.emplace_back(a);
+    std::vector<std::string_view> session_views;
+    session_views.reserve(session_ids.size());
     for (const std::string& s : session_ids)
-        views.emplace_back(s);
+        session_views.emplace_back(s);
     pg::PgResult res = pg::exec_params(
         lease.get(),
-        "UPDATE gateway_route_store.agent_routes SET "
-        "  lease_until = now() + ($2 || ' seconds')::interval, updated_at = now() "
-        "WHERE session_id = ANY($1::text[]) RETURNING agent_id",
-        std::vector<std::string>{pg::to_text_array(views), std::to_string(lease_ttl_secs)});
+        "UPDATE gateway_route_store.agent_routes AS r SET "
+        "  lease_until = now() + ($3 || ' seconds')::interval, updated_at = now() "
+        "FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
+        "WHERE r.agent_id = t.agent_id AND r.session_id = t.session_id "
+        "RETURNING r.agent_id",
+        std::vector<std::string>{pg::to_text_array(agent_views), pg::to_text_array(session_views),
+                                 std::to_string(lease_ttl_secs)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("GatewayRouteStore::renew_leases: query failed: {}",
                       PQresultErrorMessage(res.get()));
@@ -468,6 +501,64 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
                               : parse_ms(PQgetvalue(res.get(), 0, 5));
     row.is_stale = std::string_view(PQgetvalue(res.get(), 0, 6)) == "t";
     return std::optional<RouteRow>(std::move(row));
+}
+
+std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    if (agent_ids.empty())
+        return std::vector<RoutableRoute>{};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::lookup_routes: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // ONE batched statement over agent_id = ANY($1) — mirrors renew_leases'
+    // array-param idiom (file header) so this read is bounded by a SINGLE
+    // kReadTimeout regardless of how many agent_ids are requested, never
+    // N-times that. `routable` is computed IN-SQL against Postgres now() —
+    // the DB-clock authority (#3715 rule), never a replica clock — matching
+    // is_stale's existing in-SQL computation above.
+    std::vector<std::string_view> views;
+    views.reserve(agent_ids.size());
+    for (const std::string& s : agent_ids)
+        views.emplace_back(s);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
+        "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
+        "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
+        "       (session_id IS NOT NULL AND lease_until >= now() AND cluster_id IS NOT NULL) "
+        "         AS routable "
+        "FROM gateway_route_store.agent_routes WHERE agent_id = ANY($1::text[])",
+        std::vector<std::string>{pg::to_text_array(views)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::lookup_routes: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    const int n = PQntuples(res.get());
+    std::vector<RoutableRoute> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        RoutableRoute rr;
+        rr.route.agent_id = PQgetvalue(res.get(), i, 0);
+        rr.route.cluster_id = col_opt(res.get(), i, 1);
+        rr.route.gateway_node = col_opt(res.get(), i, 2);
+        {
+            const char* v = PQgetvalue(res.get(), i, 3);
+            std::from_chars(v, v + std::char_traits<char>::length(v), rr.route.connection_epoch);
+        }
+        rr.route.session_id = col_opt(res.get(), i, 4);
+        rr.route.lease_until_ms = PQgetisnull(res.get(), i, 5)
+                                       ? std::nullopt
+                                       : parse_ms(PQgetvalue(res.get(), i, 5));
+        rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
+        rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
+        out.push_back(std::move(rr));
+    }
+    return out;
 }
 
 std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_stale_routes() {

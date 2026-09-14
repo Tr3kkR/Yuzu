@@ -120,6 +120,7 @@
 #include "authz_model.hpp" // #1788: per-arm visibility intersection (in_scope/filter_to_scope)
 #include "dispatch_confined_arms.hpp" // the ONE per-arm intersection, shared with /api/command
 #include "dispatch_destructive_gate.hpp" // #3685: the Destructive-class targeting verdict
+#include "dispatch_route_fallback.hpp" // WS-4 4.2b Task C: GatewayRouteFallback (fallback-only directory consult)
 #include "dispatch_scope_ladder.hpp" // A-3/QE-2: the shared scope-resolution ladder + caller wiring
 #include "json_extract.hpp" // #2557: shared JSON body-extraction helpers (was 7 ServerImpl statics)
 #include "command_routes.hpp" // #2557: POST /api/command, extracted onto the HttpRouteSink seam
@@ -11363,8 +11364,18 @@ private:
     /// reference: the returned sink must not outlive it.
     yuzu::server::ConfinedDispatchSink
     make_confined_dispatch_sink(const detail::ClassifiedCommand& cmd) {
+        // WS-4 4.2b Task C: same fallback-only wiring as
+        // wire_and_dispatch_confined (dispatch_scope_ladder.hpp) — see
+        // dispatch_route_fallback.hpp's file header. One instance per call
+        // (per dispatch), never a ServerImpl member.
+        auto route_fallback = std::make_shared<yuzu::server::GatewayRouteFallback>(
+            registry_, gateway_route_store_.get());
         return yuzu::server::ConfinedDispatchSink{
-            [this, &cmd](const std::string& aid) { return registry_.send_to(aid, cmd); },
+            [this, &cmd, route_fallback](const std::string& aid) {
+                if (auto cluster = route_fallback->cluster_for(aid))
+                    return registry_.send_via_directory(aid, cmd, *cluster);
+                return registry_.send_to(aid, cmd);
+            },
             [this, &cmd] { return registry_.send_to_all(cmd); },
             [this] {
                 // all_ids() copies only the ids under the registry lock — NOT
@@ -11373,6 +11384,9 @@ private:
                 // rationale recorded at the inventory site ~12706). A confined
                 // operator broadcasting `__all__` is the enterprise-normal case.
                 return registry_.all_ids();
+            },
+            [route_fallback](const std::vector<std::string>& candidates) {
+                return route_fallback->prepare(candidates);
             }};
     }
 
@@ -11703,7 +11717,11 @@ private:
             },
             command_id, execution_id, caller.principal_role, agent_ids, scope_expr,
             caller.exec_visible, broadcast_on_none, containment_gate, *classified, definition_id,
-            concurrency_mode);
+            concurrency_mode,
+            // WS-4 4.2b Task C: fallback-only gateway routing-directory
+            // consult. Null when the store failed to open at boot — a
+            // GatewayRouteFallback with a null store is a pure no-op.
+            gateway_route_store_.get());
 
         // #881: this seam serves the MAJORITY of dispatch (MCP, workflows,
         // schedules, REST v1) — without this, quarantine enforcement here
@@ -17949,6 +17967,22 @@ private:
             // (constructed well before this point) — no new construction
             // needed.
             mcp_server_->set_result_set_store(result_set_store_.get());
+            // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
+            // store/kill-switch/offline-store instances the REST VizRoutes
+            // registration below wires (viz_routes_->register_routes(...)), so
+            // the two surfaces cannot disagree about cache state, the
+            // yuzu_viz_disabled kill switch, or which hosts render stale.
+            // fleet_topology_store_/viz_disabled_ are both declared AFTER
+            // mcp_server_ (below), so on a raw member teardown this borrow
+            // would dangle for part of destruction. Safe anyway: the lifetime
+            // guarantee is stop(), not declaration order -- ~ServerImpl always
+            // runs stop(), which joins every httplib worker thread (MCP's
+            // included, since MCP is thread-per-connection like every other
+            // route) before any member destructs, so no handler runs past
+            // that join -- same discipline as gateway_route_store_/
+            // mgmt_group_store_ etc. (cpp-safety gov finding).
+            mcp_server_->set_viz_deps(fleet_topology_store_.get(), offline_endpoint_store_.get(),
+                                      &viz_disabled_);
             mcp_server_->set_upload_grant_ops(
                 upload_grant_store_.get(),
                 // SAME logic as the REST list_read_fn wired at the
@@ -18331,6 +18365,14 @@ private:
         }
 
         agent_service_.record_send_time(command_id);
+        // WS-4 4.2b Task D: this sink is deliberately left WITHOUT a fourth
+        // (`prepare_route_fallback`) field — this legacy forwarder is
+        // Broadcast-only (see this dispatch's own DispatchArm::Broadcast call
+        // just below), so `ArmDispatchResult::route_unreadable` can never be
+        // set here regardless; unlike the /api/command and MCP/dashboard/
+        // workflow sites (which DO wire the gateway routing-directory
+        // fallback and so DO need the `route_unreadable` cascade branch
+        // below), this site has no `route_unreadable` branch to add.
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
             [&] { return registry_.send_to_all(*classified); },
@@ -18373,7 +18415,10 @@ private:
             // #2557 — no longer "above" in this file) — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
-            // operator to the wrong subsystem.
+            // operator to the wrong subsystem. NO `route_unreadable` branch
+            // here (WS-4 4.2b Task D) — this Broadcast-only sink never wires
+            // `prepare_route_fallback` (see the sink's own comment above),
+            // so `result.route_unreadable` is always false at this site.
             res.status = 503;
             if (containment_gate.fail_closed) {
                 res.set_content(
