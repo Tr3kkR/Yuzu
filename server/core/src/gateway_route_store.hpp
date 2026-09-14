@@ -100,6 +100,20 @@
 /// is definitely not mid-handshake. See the header comment on
 /// `reap_stale_routes` for the clock-guarded-retention adoption record.
 ///
+/// SLICE 4.2b — TASK A: `announce_connected` is the SOLE writer of
+/// placement. `register_fresh`'s guarded UPSERT used to COALESCE-preserve a
+/// winning row's existing `cluster_id`/`gateway_node` across a fresh
+/// registration; it now NULLs both unconditionally. Without this, a
+/// `register_fresh(S2)` immediately followed by a bare `renew_leases`
+/// (no intervening CONNECTED) left the row reading `{session=S2, live
+/// lease, cluster=S1's old placement}` — a stale-placement trap for a
+/// dispatch reader that must never route to a placement its own session
+/// never confirmed. `lookup_routes` (also 4.2b Task A) exposes a
+/// `routable` bit computed from exactly this shape (`session_id IS NOT
+/// NULL AND lease_until >= now() AND cluster_id IS NOT NULL`), so a
+/// dispatch reader built against it never needs to reason about the trap
+/// directly.
+///
 /// Born-on-Postgres (ADR-0009 fresh-start): no legacy SQLite file, no
 /// backfill — this store never existed before WS-4.
 
@@ -244,6 +258,18 @@ struct RouteRow {
     bool is_stale{false}; ///< computed IN-SQL: lease_until IS NOT NULL AND lease_until < now()
 };
 
+/// A route paired with the `routable` verdict computed by `lookup_routes`.
+/// `routable` is IN-SQL, DB-clock-authoritative (never a replica clock, per
+/// the #3715 rule): `session_id IS NOT NULL AND lease_until >= now() AND
+/// cluster_id IS NOT NULL`. A tombstone (`session_id IS NULL AND lease_until
+/// IS NULL`), an expired lease, or a null-placement row (a winning
+/// `register_fresh` not yet followed by `announce_connected` — see the file
+/// header "SLICE 4.2b") are all `routable == false`.
+struct RoutableRoute {
+    RouteRow route;
+    bool routable{false};
+};
+
 class GatewayRouteStore {
 public:
     /// Borrows the shared pool; runs the `gateway_route_store` schema
@@ -262,8 +288,10 @@ public:
     /// previously stored (the CAS in the file header) — a caller whose
     /// `register_fresh` reports `won == false` lost to a newer connection
     /// and MUST NOT proceed to `announce_connected` with this epoch/session.
-    /// Existing `cluster_id`/`gateway_node` are preserved (COALESCE) across a
-    /// winning re-register — they are filled in later by `announce_connected`.
+    /// `cluster_id`/`gateway_node` are NULLed (4.2b) on a winning re-register
+    /// — `announce_connected` is the SOLE writer of placement, so a fresh
+    /// registration never carries forward a superseded connection's cluster/
+    /// node until its own CONNECTED confirms them.
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
     register_fresh(std::string_view agent_id, std::string_view session_id);
 
@@ -296,6 +324,15 @@ public:
     /// `RouteRow::is_stale` is computed in-SQL from `lease_until` vs. `now()`.
     [[nodiscard]] std::expected<std::optional<RouteRow>, GatewayRouteStoreError>
     lookup_route(std::string_view agent_id);
+
+    /// Batched routable-aware read (4.2b Task A): the current route for every
+    /// agent in `agent_ids` that has a row, in ONE query (`WHERE agent_id =
+    /// ANY($1)`, mirroring `renew_leases`' array-param idiom) bounded by a
+    /// SINGLE `kReadTimeout` — never N times that. An agent with no row is
+    /// simply absent from the result (no error, no placeholder entry). See
+    /// `RoutableRoute` for the `routable` computation.
+    [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+    lookup_routes(std::span<const std::string> agent_ids);
 
     /// Directory-hygiene reaper (4.2a, #7 in the ADR-2002 §7 "4.2 design
     /// obligations" list). CLOCK-GUARDED-RETENTION ADOPTION RECORD (routed

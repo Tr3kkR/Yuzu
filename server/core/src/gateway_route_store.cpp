@@ -237,8 +237,15 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
     // sequence is monotonic, but the whole point is that a DIFFERENT,
     // concurrently-racing register may have already advanced the row to a
     // higher epoch by the time this statement runs) loses: zero rows
-    // returned, existing row untouched. cluster_id/gateway_node are
-    // preserved via COALESCE across a winning re-register.
+    // returned, existing row untouched. cluster_id/gateway_node are NULLed
+    // (4.2b — see the file header "placement authority" note): a winning
+    // register_fresh is a NEW connection attempt whose eventual placement is
+    // not yet known, and announce_connected is the SOLE writer of placement
+    // once the connection is fully established. Preserving the old values
+    // here (the pre-4.2b COALESCE) let a stale placement survive a fresh
+    // registration + a bare lease renewal with no intervening CONNECTED — a
+    // trap for a dispatch reader that must never route on unconfirmed
+    // placement.
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO gateway_route_store.agent_routes "
@@ -247,14 +254,14 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  connection_epoch = EXCLUDED.connection_epoch, "
         "  session_id = EXCLUDED.session_id, "
-        "  cluster_id = COALESCE(agent_routes.cluster_id, EXCLUDED.cluster_id), "
-        "  gateway_node = COALESCE(agent_routes.gateway_node, EXCLUDED.gateway_node), "
+        "  cluster_id = NULL, "
+        "  gateway_node = NULL, "
         // A winning re-register is a NEW connection — it must NOT inherit the
         // superseded session's lease. Reset to NULL here; the connection's own
         // announce_connected / first heartbeat renew establishes a fresh lease.
-        // (cluster_id/gateway_node ARE preserved via COALESCE above — they are
-        // connection-agnostic placement and are refreshed by announce_connected;
-        // the lease is connection-specific liveness and is not.)
+        // (cluster_id/gateway_node are ALSO reset to NULL above, for the same
+        // reason: both are connection-specific until announce_connected
+        // confirms them.)
         "  lease_until = NULL, "
         "  updated_at = now() "
         "WHERE EXCLUDED.connection_epoch > agent_routes.connection_epoch "
@@ -468,6 +475,64 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
                               : parse_ms(PQgetvalue(res.get(), 0, 5));
     row.is_stale = std::string_view(PQgetvalue(res.get(), 0, 6)) == "t";
     return std::optional<RouteRow>(std::move(row));
+}
+
+std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    if (agent_ids.empty())
+        return std::vector<RoutableRoute>{};
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease) {
+        spdlog::warn("GatewayRouteStore::lookup_routes: lease timeout — degraded");
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    }
+    // ONE batched statement over agent_id = ANY($1) — mirrors renew_leases'
+    // array-param idiom (file header) so this read is bounded by a SINGLE
+    // kReadTimeout regardless of how many agent_ids are requested, never
+    // N-times that. `routable` is computed IN-SQL against Postgres now() —
+    // the DB-clock authority (#3715 rule), never a replica clock — matching
+    // is_stale's existing in-SQL computation above.
+    std::vector<std::string_view> views;
+    views.reserve(agent_ids.size());
+    for (const std::string& s : agent_ids)
+        views.emplace_back(s);
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
+        "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
+        "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
+        "       (session_id IS NOT NULL AND lease_until >= now() AND cluster_id IS NOT NULL) "
+        "         AS routable "
+        "FROM gateway_route_store.agent_routes WHERE agent_id = ANY($1::text[])",
+        std::vector<std::string>{pg::to_text_array(views)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        spdlog::error("GatewayRouteStore::lookup_routes: query failed: {}",
+                      PQresultErrorMessage(res.get()));
+        return std::unexpected(GatewayRouteStoreError::db_error);
+    }
+    const int n = PQntuples(res.get());
+    std::vector<RoutableRoute> out;
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        RoutableRoute rr;
+        rr.route.agent_id = PQgetvalue(res.get(), i, 0);
+        rr.route.cluster_id = col_opt(res.get(), i, 1);
+        rr.route.gateway_node = col_opt(res.get(), i, 2);
+        {
+            const char* v = PQgetvalue(res.get(), i, 3);
+            std::from_chars(v, v + std::char_traits<char>::length(v), rr.route.connection_epoch);
+        }
+        rr.route.session_id = col_opt(res.get(), i, 4);
+        rr.route.lease_until_ms = PQgetisnull(res.get(), i, 5)
+                                       ? std::nullopt
+                                       : parse_ms(PQgetvalue(res.get(), i, 5));
+        rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
+        rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
+        out.push_back(std::move(rr));
+    }
+    return out;
 }
 
 std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_stale_routes() {
