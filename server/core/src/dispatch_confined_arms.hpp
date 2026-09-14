@@ -233,12 +233,22 @@ struct ArmDispatchResult {
     /// opposed to a successful read that simply found no route for a
     /// locally-missing candidate — that is a definite no-route and shows up
     /// in `not_sent` exactly like any other undelivered id, nothing new.
-    /// Mirrors `ConfinedDispatchOutcome::containment_unreadable`'s shape:
-    /// "the gate/directory itself could not answer" is a distinct fact from
-    /// "answered and said no". This slice only DEFINES and PRODUCES the
-    /// flag — wiring its outbox-reschedule / #3424-style cascade
-    /// consumption is the next task (see the routed concern on dispatch
-    /// zero-reach cause discrimination).
+    /// Like `ConfinedDispatchOutcome::containment_unreadable`, it distinguishes
+    /// "the directory itself could not answer" from "answered and said no".
+    ///
+    /// CRITICAL — it is NOT interchangeable with `containment_unreadable`, on
+    /// the one axis that matters to an all-or-nothing consumer: a fail-closed
+    /// containment gate withholds every id BEFORE its `send_to`, forcing
+    /// `sent == 0`; a degraded directory read does NOT. The arm walk above
+    /// still runs under `route_unreadable`, so a locally-connected id is
+    /// genuinely sent (`++sent`) while a directory-only id lands in `not_sent`.
+    /// A consumer that whole-batch-reverts or reports whole-batch-undelivered
+    /// on `route_unreadable` (as it may on `containment_unreadable`) acts
+    /// against already-delivered devices — see the rationale in
+    /// deployment_engine's `settle_claimed_batch` and policy_evaluator's
+    /// `compute_delivered`. command_outbox_delivery CAN reschedule on it
+    /// because it re-drives the STABLE command_id (dedup-absorbed), not a
+    /// fresh one.
     bool route_unreadable = false;
 };
 

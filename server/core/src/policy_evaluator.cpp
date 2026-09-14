@@ -204,14 +204,23 @@ std::string make_check_result(const StoredResponse& r) {
 std::vector<std::string>
 compute_delivered(const std::vector<std::string>& claimed,
                   const yuzu::server::ConfinedDispatchOutcome& outcome) {
-    if (outcome.containment_unreadable || outcome.route_unreadable)
-        // The gate itself failed closed, OR the GatewayRouteStore directory
-        // read degraded (WS-4 4.2b Task D closing #3424/#3511's under-count
-        // -- `route_unreadable` mirrors `containment_unreadable`'s shape
-        // exactly, see `ConfinedDispatchOutcome::route_unreadable`'s own doc
-        // comment) — either way nothing in `claimed` was individually
-        // evaluated, so there is no per-device fact to act on, only a
-        // systemic one: treat the WHOLE batch as not delivered.
+    if (outcome.containment_unreadable)
+        // The gate itself failed closed: every id was withheld before its
+        // `send_to`, so none appear in `not_sent`/denied and the per-id
+        // accounting below cannot see them -- it would wrongly compute them as
+        // DELIVERED (claimed minus an empty not-delivered set). Treat the whole
+        // batch as not delivered.
+        //
+        // `route_unreadable` is DELIBERATELY NOT handled here (WS-4 4.2b Task
+        // D's first cut lumped it in). A degraded GatewayRouteStore read does
+        // NOT force `sent == 0` (see `ConfinedDispatchOutcome::route_unreadable`
+        // -- the arm walk still ran; directory-only devices land in `not_sent`,
+        // locally-connected ones were genuinely delivered). Returning `{}` here
+        // would report those genuinely-delivered devices as not-delivered,
+        // regressing the per-(policy,agent) delivered CAS and re-dispatching
+        // them next tick. The per-id accounting below already excludes the
+        // `not_sent` (directory-degraded) devices and reports the delivered
+        // ones correctly, so let it run.
         return {};
 
     std::unordered_set<std::string> not_delivered;

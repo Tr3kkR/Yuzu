@@ -1057,3 +1057,70 @@ TEST_CASE("wire_and_dispatch_confined: a DEGRADED directory read on a local-miss
     CHECK(outcome.route_unreadable);
     CHECK(registry.drain_gateway_pending().empty());
 }
+
+TEST_CASE("wire_and_dispatch_confined: a narrowed exec_visible excludes a local-miss agent "
+          "with a ROUTABLE directory row -- #1788 confinement runs BEFORE the directory "
+          "fallback, so the excluded agent is neither sent to nor queued via the directory "
+          "(security-guardian: the new fallback path must not resurrect a "
+          "confinement-excluded agent)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    // "dev-in-scope" has a real local session -- the caller's OWN visible set
+    // admits it, so it is reached via the existing local path.
+    (void)registry.register_agent(make_wiring_test_info("dev-in-scope"));
+    registry.set_gateway_route(
+        "dev-in-scope", "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+
+    // "dev-excluded" is a local MISS (no session on this replica) but DOES
+    // have a routable directory row -- the exact precondition for
+    // `send_via_directory` to fire, mirroring the "ROUTABLE directory row"
+    // case above. The only difference from that case: the caller's
+    // exec_visible does NOT include it, so it must never reach the directory
+    // send at all, regardless of what the directory knows about it.
+    auto fresh = store.register_fresh("dev-excluded", "sess-excluded-1");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->won);
+    auto announced = store.announce_connected("dev-excluded", "sess-excluded-1", "cluster-x",
+                                              "node-x", /*lease_ttl_secs=*/90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified =
+        ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-confinement"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-confinement", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-in-scope", "dev-excluded"}, /*scope_expr=*/"",
+        /*exec_visible=*/only({"dev-in-scope"}), /*broadcast_on_none=*/false, kNoContainment,
+        classified, /*definition_id=*/{}, /*concurrency_mode=*/{}, &store);
+
+    // Only the in-scope agent was reached -- the excluded one is dropped by
+    // the #1788 `filter_to_scope` intersection before the arm walk ever calls
+    // `send_to` on it, so it lands in NEITHER `sent` NOR `not_sent`: it never
+    // entered the per-id loop at all, exactly like an ordinary out-of-scope
+    // id on the local-only path (see the Ids-arm "an out-of-scope id is
+    // DROPPED" case near the top of this file).
+    CHECK(outcome.sent == 1);
+    CHECK(outcome.not_sent.empty());
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].agent_id == "dev-in-scope");
+    // The directory fallback never resurrects the excluded agent: no pending
+    // entry names it, and in particular none carries "cluster-x" -- the
+    // cluster_id `send_via_directory` would have stamped had "dev-excluded"
+    // ever reached the send step.
+    for (const auto& p : pending)
+        CHECK(p.agent_id != "dev-excluded");
+}

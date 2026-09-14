@@ -104,6 +104,15 @@ struct Harness {
     // compute_delivered's `route_unreadable` branch the same way
     // `containment_unreadable` is exercised in deployment_engine.cpp.
     bool route_unreadable_outcome{false};
+    // WS-4 4.2b Task D fix regression: agent ids the fake dispatch_fn marks
+    // `not_sent` while ALSO stamping `outcome.route_unreadable = true`,
+    // alongside genuinely-sent siblings in the SAME batch -- mirrors a real
+    // degraded directory read on a MIXED cohort (a locally-connected device
+    // is still delivered; a directory-only device lands in not_sent).
+    // Deliberately orthogonal to `route_unreadable_outcome` above, which
+    // short-circuits the WHOLE batch and must keep doing exactly that for
+    // its own (still-passing) test.
+    std::set<std::string> route_degraded_agents;
 
     std::string group_id;
 
@@ -163,6 +172,18 @@ struct Harness {
                 return outcome;
             }
             for (const auto& a : agents) {
+                if (route_degraded_agents.count(a)) {
+                    // The batched directory consult degraded for THIS id
+                    // specifically -- the arm walk still ran (unlike
+                    // route_unreadable_outcome's whole-batch short-circuit
+                    // above), so a sibling agent in the same call can still
+                    // land in `sent` below. Mirrors ArmDispatchResult's real
+                    // shape: `route_unreadable` is a flag on the outcome, not
+                    // a per-id gate.
+                    outcome.route_unreadable = true;
+                    outcome.not_sent.push_back(a);
+                    continue;
+                }
                 if (quarantined.count(a)) {
                     // Mirrors dispatch_confined_arms.hpp's real quarantine-gate
                     // denial: a claimed target the #881 gate refuses BEFORE the
@@ -781,6 +802,59 @@ TEST_CASE("policy evaluator: a route_unreadable outcome leaves the WHOLE remedia
     REQUIRE(rr2.ok);
     CHECK(rr2.agents == 1);
     CHECK(h.status_of(pid, "agentA") == "fixing");
+}
+
+TEST_CASE("policy evaluator: a MIXED route_unreadable remediate batch marks only the "
+          "route-degraded target for retry, leaving the genuinely-delivered sibling "
+          "'fixing' (WS-4 4.2b Task D fix regression, #3424/#3511 -- compute_delivered's "
+          "early return on `route_unreadable` was REMOVED because a degraded directory "
+          "read does NOT force outcome.sent == 0; the fix must not regress to reporting a "
+          "genuinely-delivered device as undelivered just because a sibling in the same "
+          "batch was route-degraded)",
+          "[pg][policy][evaluator][claim]") {
+    // Sibling of the WHOLE-batch route_unreadable case immediately above,
+    // but MIXED: unlike `containment_unreadable` (which withholds every id
+    // BEFORE any send, forcing sent == 0), a degraded GatewayRouteStore
+    // directory read does not stop the arm walk -- a locally-connected
+    // device in the same batch is still genuinely delivered while a
+    // directory-only device lands in `not_sent`. If compute_delivered ever
+    // regresses to its pre-fix `containment_unreadable || route_unreadable`
+    // early return, this whole batch would come back not-delivered and
+    // agentA -- ALREADY DELIVERED -- would be reported not-delivered,
+    // silently re-dispatching a fix instruction that already ran.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    // agentA is genuinely delivered (canned response); agentB is the
+    // directory-only device the SAME degraded directory read could not
+    // resolve for this batch.
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.route_degraded_agents.insert("agentB");
+
+    PolicyEvaluator ev(h.deps());
+    auto rr = ev.remediate(pid, {"agentA", "agentB"});
+    REQUIRE(rr.ok);
+    // Honest count: only agentA was actually delivered -- NOT zero (the
+    // pre-fix whole-batch-undelivered answer this test pins against).
+    CHECK(rr.agents == 1);
+
+    // Delivered target: marked 'fixing'.
+    CHECK(h.status_of(pid, "agentA") == "fixing");
+    // Route-degraded target: claimed, then released WITHOUT a status write
+    // or a burned retry attempt -- must NOT read 'fixing'.
+    CHECK(h.status_of(pid, "agentB") == "unknown");
+
+    // The route-degraded target's claim was actually released (not left
+    // dangling): re-remediating ONLY agentB, once the directory read
+    // recovers, re-claims and delivers it.
+    h.route_degraded_agents.erase("agentB");
+    h.canned["agentB|fixp"] = {1, "ok"};
+    auto rr2 = ev.remediate(pid, {"agentB"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentB") == "fixing");
 }
 
 TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {
