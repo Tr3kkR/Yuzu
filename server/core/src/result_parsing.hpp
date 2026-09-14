@@ -94,11 +94,17 @@ struct CellHint {
 
 inline const std::vector<CellHint>& cell_hints() {
     static const std::vector<CellHint> kHints{
+        // field_index 7 = the `enabled` column in autoruns' format_row
+        // (agents/plugins/autoruns/src/autoruns_parsers.hpp) -- keep this
+        // in sync with that function's own field-order comment if a column
+        // is ever inserted before `enabled`.
         {"autoruns", "autorun", 7, "unknown",
-         "unknown = enablement could not be determined (a directory scan this "
-         "reading depends on was capped or hit a read error, or the rung-2 "
-         "systemctl fallback text carries no enablement evidence) -- not the "
-         "same as disabled. See the autoruns user manual."},
+         "unknown = enablement could not be determined from the available "
+         "evidence (a directory scan was capped or hit a read error, the "
+         "rung-2 systemctl fallback text carries no enablement evidence, or "
+         "a Windows Scheduled Task's COM/XML read failed) -- not the same as "
+         "disabled. See the autoruns user manual and the source's own status "
+         "reason for the specific cause."},
     };
     return kHints;
 }

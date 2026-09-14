@@ -162,6 +162,10 @@ inline std::string sanitize_autorun_field(std::string_view value) {
 
 /// autorun|<source_id>|<catalog_version>|<location>|<entry>|<target>|<args>|
 ///        <enabled>|<scope>|<user>|<signed>|<mtime>
+/// Field index 7 (0-based, "autorun" itself at 0) is `enabled` --
+/// server/core/src/result_parsing.hpp's `cell_hints()` table hard-codes that
+/// index for the autoruns `enabled=unknown` dashboard hint (#4187); a column
+/// inserted before `enabled` here must update that table's index too.
 inline std::string format_row(const Row& row) {
     std::string out = "autorun|";
     out += source_id_string(row.source_id);
@@ -808,17 +812,30 @@ struct XmlDocGuard {
     XmlDocGuard& operator=(const XmlDocGuard&) = delete;
 };
 
-/// First direct-child element matching `local` by LOCAL NAME only. Task
-/// Scheduler XML uses exactly one default namespace
-/// (`xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task"`) for
-/// every element -- unlike SAML's multi-namespace documents (which need
-/// find_child_ns's namespace-URI check to disambiguate), there's nothing
-/// here for a namespace check to distinguish, so local-name matching alone
-/// is correct.
+inline constexpr const char* kTaskSchedulerNamespaceUri =
+    "http://schemas.microsoft.com/windows/2004/02/mit/task";
+
+/// True when `n` sits in the Task Scheduler namespace this parser accepts at
+/// the root. Genuine `IRegisteredTask::get_Xml()` output uses exactly one
+/// default namespace for every element, so this is always true for real
+/// input; the check exists as a hardening layer against a document whose
+/// root passes the namespace check but whose descendants redeclare a
+/// foreign default namespace (schema-garbage that merely happens to share
+/// child tag names like `<Settings>`/`<Actions>`) -- without it, such a
+/// descendant would be silently interpreted as a genuine task element.
+inline bool in_task_scheduler_ns(xmlNodePtr n) {
+    return n && n->ns && n->ns->href && xmlStrEqual(n->ns->href, BAD_CAST kTaskSchedulerNamespaceUri);
+}
+
+/// First direct-child element matching `local` by local name AND namespace
+/// (`in_task_scheduler_ns`) -- see that function's comment for why the
+/// namespace check matters despite genuine Task Scheduler XML using exactly
+/// one namespace throughout.
 inline xmlNodePtr xml_find_child(xmlNodePtr parent, const char* local) {
     if (!parent) return nullptr;
     for (xmlNodePtr n = xmlFirstElementChild(parent); n; n = xmlNextElementSibling(n)) {
-        if (n->type == XML_ELEMENT_NODE && n->name && xmlStrEqual(n->name, BAD_CAST local))
+        if (n->type == XML_ELEMENT_NODE && n->name && xmlStrEqual(n->name, BAD_CAST local) &&
+            in_task_scheduler_ns(n))
             return n;
     }
     return nullptr;
@@ -892,8 +909,6 @@ inline constexpr std::size_t kMaxTaskXmlBytes = 1 << 20; // 1 MiB, same cap
                                                           // and reasoning as
                                                           // saml_provider.cpp's
                                                           // XML size guard.
-inline constexpr const char* kTaskSchedulerNamespaceUri =
-    "http://schemas.microsoft.com/windows/2004/02/mit/task";
 
 inline TaskInfo parse_task_xml(std::string_view xml) {
     TaskInfo out;
@@ -931,8 +946,7 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         out.reject = TaskReject::wrong_root;
         return out;
     }
-    if (!root->ns || !root->ns->href ||
-        !xmlStrEqual(root->ns->href, BAD_CAST kTaskSchedulerNamespaceUri)) {
+    if (!detail::in_task_scheduler_ns(root)) {
         out.reject = TaskReject::wrong_root;
         return out;
     }
@@ -972,6 +986,7 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         for (xmlNodePtr child = xmlFirstElementChild(actions); child;
              child = xmlNextElementSibling(child)) {
             if (child->type != XML_ELEMENT_NODE || !child->name) continue;
+            if (!detail::in_task_scheduler_ns(child)) continue;
             if (xmlStrEqual(child->name, BAD_CAST "Exec")) {
                 TaskAction action;
                 action.command = detail::xml_get_text(detail::xml_find_child(child, "Command"));
@@ -1006,6 +1021,7 @@ inline TaskInfo parse_task_xml(std::string_view xml) {
         for (xmlNodePtr trigger = xmlFirstElementChild(triggers); trigger && !out.has_triggers;
              trigger = xmlNextElementSibling(trigger)) {
             if (trigger->type != XML_ELEMENT_NODE || !trigger->name) continue;
+            if (!detail::in_task_scheduler_ns(trigger)) continue;
             bool is_known_trigger_type = false;
             for (const char* tag : kTriggerTags) {
                 if (xmlStrEqual(trigger->name, BAD_CAST tag)) {
@@ -1501,11 +1517,16 @@ struct DesktopEntry {
     std::string not_show_in;
     bool gnome_autostart_enabled_present = false;
     bool gnome_autostart_enabled = true;
+    // `DBusActivatable=true` per the Desktop Entry spec: the launch
+    // mechanism is D-Bus service activation, not `Exec` -- the spec
+    // requires `Exec` only when this is NOT true.
+    bool dbus_activatable = false;
     Enabled enabled = Enabled::enabled;
     // True when this file has no `[Desktop Entry]` group at all, or that
-    // group has no (or an empty) `Exec` key -- there is nothing this leg
-    // can actually run, so a caller must not report a plain `enabled` row
-    // with an empty target as if it found a real autostart entry.
+    // group has no (or an empty) `Exec` key AND is not `DBusActivatable` --
+    // there is nothing this leg can actually run or name, so a caller must
+    // not report a plain `enabled` row with an empty target as if it found
+    // a real autostart entry.
     bool malformed = false;
 };
 
@@ -1541,6 +1562,7 @@ inline DesktopEntry parse_desktop_entry(std::string_view text) {
                     out.gnome_autostart_enabled_present = true;
                     out.gnome_autostart_enabled = (val == "true");
                 }
+                else if (key == "DBusActivatable") out.dbus_activatable = (val == "true");
             }
         }
         if (nl == std::string_view::npos) break;
@@ -1549,7 +1571,7 @@ inline DesktopEntry parse_desktop_entry(std::string_view text) {
     out.enabled = (out.hidden || (out.gnome_autostart_enabled_present && !out.gnome_autostart_enabled))
                      ? Enabled::disabled
                      : Enabled::enabled;
-    out.malformed = !group_seen || out.exec.empty();
+    out.malformed = !group_seen || (out.exec.empty() && !out.dbus_activatable);
     return out;
 }
 

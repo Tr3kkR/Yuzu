@@ -906,6 +906,34 @@ TEST_CASE("autoruns: parse_task_xml rejects a <Task>-named root that isn't in th
     }
 }
 
+TEST_CASE("autoruns: parse_task_xml ignores a descendant that redeclares a foreign "
+          "default namespace, even under a correctly-namespaced <Task> root -- the "
+          "namespace hardening at the root must not stop there, or schema-garbage "
+          "nested under a genuine root is silently read as real task content",
+          "[autoruns][parsers]") {
+    SECTION("the whole <Actions> element redeclares a foreign namespace") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions xmlns=\"urn:other\"><Exec><Command>C:\\foreign.exe</Command></Exec>"
+            "</Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK(info.parsed_ok); // the root itself is genuine -- not a reject case
+        CHECK(info.actions.empty()); // the foreign-namespace <Actions> subtree is not read
+        CHECK_FALSE(info.has_unmodelled_action);
+    }
+
+    SECTION("a genuine <Actions> element's own <Exec> child redeclares a foreign namespace") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions><Exec xmlns=\"urn:other\"><Command>C:\\foreign.exe</Command></Exec>"
+            "</Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK(info.parsed_ok);
+        CHECK(info.actions.empty()); // the foreign-namespace <Exec> itself is not read as one
+        CHECK_FALSE(info.has_unmodelled_action);
+    }
+}
+
 TEST_CASE("autoruns: parse_task_xml refuses an oversized document before xmlReadMemory "
           "ever sees it, distinct from an ordinary malformed rejection (#4184)",
           "[autoruns][parsers]") {
@@ -1404,6 +1432,32 @@ TEST_CASE("autoruns: parse_desktop_entry flags malformed when [Desktop Entry] is
     }
     SECTION("Exec key present but empty") {
         const std::string text = "[Desktop Entry]\nExec=\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+}
+
+TEST_CASE("autoruns: parse_desktop_entry does NOT flag malformed for a "
+          "DBusActivatable=true entry with no Exec -- the Desktop Entry spec "
+          "requires Exec only when DBusActivatable is not true, so this is a "
+          "real D-Bus-activated autostart entry, not a broken one",
+          "[autoruns][parsers]") {
+    const std::string text = "[Desktop Entry]\nDBusActivatable=true\n";
+    const auto entry = parse_desktop_entry(text);
+    CHECK_FALSE(entry.malformed);
+    CHECK(entry.dbus_activatable);
+    CHECK(entry.exec.empty());
+}
+
+TEST_CASE("autoruns: parse_desktop_entry still flags malformed when Exec is "
+          "empty and DBusActivatable is absent or false -- DBusActivatable "
+          "does not blanket-waive the target requirement",
+          "[autoruns][parsers]") {
+    SECTION("DBusActivatable absent") {
+        const std::string text = "[Desktop Entry]\nHidden=false\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+    SECTION("DBusActivatable=false") {
+        const std::string text = "[Desktop Entry]\nDBusActivatable=false\n";
         CHECK(parse_desktop_entry(text).malformed);
     }
 }

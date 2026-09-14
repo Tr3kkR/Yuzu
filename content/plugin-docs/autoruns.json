@@ -279,8 +279,8 @@
   },
   "privileges": [
     {
-      "grant": "**None today.** The per-profile `HKU` pass (`win_run_hku`/`win_runonce_hku`/`win_startup_approved`) shares the same `with_user_hive` ladder as `installed_apps.list_per_user`/`license_scan.list`: a loaded `HKEY_USERS\\<sid>` hive is read first with no privilege; the offline `RegLoadKeyW` mount for a logged-out profile rides `SeBackupPrivilege`+`SeRestorePrivilege`, already held by the agent account (`docs/agent-privilege-model.md`'s `autoruns.list`/`autoruns.catalog` row) — no new grant is introduced.",
-      "if_refused": "On a hardened install that strips `SeBackup`/`SeRestore`, machine-scope sources still report; only a logged-out profile's `win_run_hku`/`win_runonce_hku`/`win_startup_approved` rows degrade to a per-sid `privilege_missing` reason, never a dropped row or a false-empty read.",
+      "grant": "**None today.** The per-profile `HKU` pass (`win_run_hku`/`win_runonce_hku`/`win_startup_approved`/`win_startup_folder_user` — the last of these opens the same per-user hive only to resolve a possible Startup-folder redirect, `SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User Shell Folders`, #4219) shares the same `with_user_hive` ladder as `installed_apps.list_per_user`/`license_scan.list`: a loaded `HKEY_USERS\\<sid>` hive is read first with no privilege; the offline `RegLoadKeyW` mount for a logged-out profile rides `SeBackupPrivilege`+`SeRestorePrivilege`, already held by the agent account (`docs/agent-privilege-model.md`'s `autoruns.list`/`autoruns.catalog` row) — no new grant is introduced.",
+      "if_refused": "On a hardened install that strips `SeBackup`/`SeRestore`, machine-scope sources still report; only a logged-out profile's `win_run_hku`/`win_runonce_hku`/`win_startup_approved`/`win_startup_folder_user` rows degrade to a per-sid `privilege_missing` reason, never a dropped row or a false-empty read.",
       "measured": "A1's the-rig probe, LocalSystem session, 2026-09-06 (`tests/unit/fixtures/wave7/probes/the-rig-probe-findings.md`; `docs/wave7/rig-checklist-autoruns-win.md`'s 10-step checklist); real-hardware `list`/`catalog` capture pending (`docs/samples/windows.txt:1`).",
       "os": "Windows",
       "runs_as": "Agent service account — LocalSystem today (#1442). Every machine-scope read (`Run`/`RunOnce`/`RunOnceEx`, `Winlogon`, `AppInit_DLLs`, IFEO, Startup folders, `ITaskService` Scheduled Tasks, WMI permanent subscriptions) needs no privilege beyond the account's own registry/COM/file-read access."
@@ -534,7 +534,8 @@
       "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp"
     ],
     "changelog": [
-      "changelog.d/20260909-autoruns-plugin.added.md"
+      "changelog.d/20260909-autoruns-plugin.added.md",
+      "changelog.d/20260915-autoruns-hardening.fixed.md"
     ],
     "definitions": [
       "content/definitions/autoruns.yaml"

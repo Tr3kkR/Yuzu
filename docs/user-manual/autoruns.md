@@ -141,13 +141,16 @@ versus one that could not be read at all:
   with any other reason on the same line -- it never reports `supported`.
 - **A real directory-enumeration I/O error, told apart from a clean
   end-of-directory** -- every directory-walking source (Linux and macOS
-  alike) distinguishes this from "nothing more to read". Most sources
-  (built on the shared `list_dir`/`walk_plist_dir` helpers) still fold it
-  into the SAME `row_cap` reason a capped listing already uses -- both mean
-  "this listing is incomplete", and threading a separate token through
-  every one of those helpers' many call sites wasn't worth the churn. Three
-  macOS sources instead surface a distinct **`constrained|<n>|readdir_error`**
-  reason: `mac_periodic`'s directory walk, and `mac_user_launchagents`'s
+  alike) distinguishes this from "nothing more to read". Linux sources
+  (built on the shared `list_dir` helper) still fold it into the SAME
+  `row_cap` reason a capped listing already uses -- both mean "this listing
+  is incomplete", and threading a separate token through every one of that
+  helper's many call sites wasn't worth the churn. Every macOS
+  directory-walking source instead surfaces a distinct
+  **`constrained|<n>|readdir_error`** reason: `mac_system_launchdaemons`,
+  `mac_system_launchagents`, `mac_launchdaemons`, `mac_launchagents`, and
+  `mac_emond` (all built on the shared `walk_plist_dir`/`walk_plist_dir_handle`
+  helpers), `mac_periodic`'s own directory walk, and `mac_user_launchagents`'s
   own two nested walks -- the outer `/Users` enumeration and each user's
   inner `LaunchAgents` walk, which as of #4186 are also disambiguated by
   suffix so an operator can tell which one actually hit its cap/error

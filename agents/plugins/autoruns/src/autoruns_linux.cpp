@@ -665,8 +665,9 @@ CollectorScanResult scan_xdg_autostart_user(SourceId id, const std::string& home
             }
             auto entry = parse_desktop_entry(*content);
             if (entry.malformed) {
-                // No [Desktop Entry] group, or an empty/absent Exec -- there
-                // is nothing this leg could run, so this is a real
+                // No [Desktop Entry] group, or an empty/absent Exec with no
+                // DBusActivatable=true launch mechanism either -- there is
+                // nothing this leg could run or name, so this is a real
                 // constraint (AC4: never a plain `enabled` row with an
                 // empty target reported as a genuine autostart entry).
                 acc.add_failure("malformed");
@@ -677,7 +678,11 @@ CollectorScanResult scan_xdg_autostart_user(SourceId id, const std::string& home
             row.catalog_version = kAutorunSourceCatalogVersion;
             row.location = full;
             row.entry = name;
-            row.target = entry.exec;
+            // DBusActivatable=true with no Exec launches via D-Bus service
+            // activation, not a direct command -- name that mechanism
+            // instead of reporting an empty (and therefore misleading)
+            // target for a real persistence entry.
+            row.target = entry.exec.empty() ? "(dbus-activated, no Exec)" : entry.exec;
             row.enabled = entry.enabled;
             row.scope = Scope::user;
             row.user = uid;
@@ -1513,8 +1518,9 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 }
                 auto entry = parse_desktop_entry(*content);
                 if (entry.malformed) {
-                    // No [Desktop Entry] group, or an empty/absent Exec --
-                    // nothing this leg could run, so this is a real
+                    // No [Desktop Entry] group, or an empty/absent Exec with
+                    // no DBusActivatable=true launch mechanism either --
+                    // nothing this leg could run or name, so this is a real
                     // constraint (AC4), matching the per-user XDG
                     // autostart collector's identical handling above.
                     note_file_constraint(any_file_constrained, file_constrained_reason,
@@ -1526,7 +1532,10 @@ int collect_linux(yuzu::CommandContext& ctx, std::string_view filter) {
                 row.catalog_version = kAutorunSourceCatalogVersion;
                 row.location = full;
                 row.entry = name;
-                row.target = entry.exec;
+                // See the per-user collector above: D-Bus activation is a
+                // real launch mechanism, so name it instead of leaving the
+                // target empty.
+                row.target = entry.exec.empty() ? "(dbus-activated, no Exec)" : entry.exec;
                 row.enabled = entry.enabled;
                 row.scope = Scope::system;
                 row.user = "-";
