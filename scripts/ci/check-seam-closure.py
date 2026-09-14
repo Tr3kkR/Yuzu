@@ -162,8 +162,8 @@ FORBIDDEN_HEADER_PATTERNS = [
 ]
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Two families so far: `network` (WS-A4 item 1's pilot) and `verify` (WS-A4
-# #4250, the SECOND family through the seam). Each set covers the
+# Three families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# #4250, the SECOND family) and `compliance` (the THIRD). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
