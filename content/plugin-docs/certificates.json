@@ -81,7 +81,7 @@
   ],
   "caveats": [
     "**Windows store-open failures are silent.** `enumerate_store()` returns an empty vector when neither the LOCAL_MACHINE nor CURRENT_USER handle opens (`certificates_plugin.cpp:325-341`), and the Windows leg never calls `set_result_status` — a permission or missing-store failure looks identical to \"this store is empty,\" unlike the explicit `not_available`/`CONSTRAINED` sentinels the macOS and Linux legs use.",
-    "**The login keychain read is a registered exception, not a rung-1 promotion.** System.keychain/SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`; the login keychain stays on the `launchctl asuser` + `sudo -u` + `security find-certificate` subprocess (rung 2, #3406) because the LaunchDaemon has no login keychain of its own (`certificates_plugin.cpp:16-23,750-762`) — do not \"fix\" this to a direct API call.",
+    "**The login keychain read is a registered exception, not a rung-1 promotion.** System.keychain/SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain via agent-core's `read_keychain_bounded` and abandoned (not cancelled) on timeout (`certificates_plugin.cpp:708,792-806`); the login keychain stays on the `launchctl asuser` + `sudo -u` + `security find-certificate` subprocess (rung 2, #3406) because the LaunchDaemon has no login keychain of its own (`certificates_plugin.cpp:16-23`) — do not \"fix\" this to a direct API call. Immediately before that subprocess spawn the plugin re-reads `/dev/console`'s owner in-process and refuses to spawn on a mismatch, shrinking (not eliminating) the fast-user-switch race window from tens of seconds to microseconds (`certificates_plugin.cpp:1250-1261`). A System/root keychain whose `SecItemCopyMatching` answer comes back empty is classified `zero certificates` only when the keychain's own read-permission status bit is set (`keychain_read.cpp:116`); otherwise it is reported as `not_available|<keychain> not readable (no read permission)` (`certificates_plugin.cpp:1215-1216`) and the result is CONSTRAINED/PARTIAL — an unreadable keychain is never a silent empty inventory (#2318).",
     "**SystemRootCertificates.keychain delete is permanently rejected.** It is sealed under System Integrity Protection; `delete_cert_macos` rejects `store=root` outright before ever shelling out (`certificates_plugin.cpp:1761-1771`) — a hard OS limitation, not a bug to fix.",
     "**A macOS delete self-verifies before reporting success.** `delete_cert_macos` re-enumerates the target keychain after `security delete-certificate` exits 0 and only reports `status|deleted` on a positively-proven absence; a keychain that can't be re-read or still shows the certificate reports `error|...`, never a false `status|deleted` (`certificates_plugin.cpp:1863-1900`).",
     "**The macOS sample was captured unprivileged and shows the login-keychain leg degrading live.** At euid 501 with no console session reachable via `launchctl asuser` without root, `list`'s login-keychain read failed and the result carries `CONSTRAINED`/`PARTIAL`/`login-keychain` (`macos.txt:164-165`) — expected under the capture harness, but it means this sample never exercises a successful login-keychain read."
@@ -154,7 +154,7 @@
     }
   ],
   "description": "Certificate inventory and management for system stores",
-  "how_it_works": "`list` and `details` enumerate certificates in the OS's own stores and emit the same eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`), `details` returns the one row whose thumbprint matches (case-insensitive) or a `status|not_found`. `delete` is destructive: it hex-validates the thumbprint, then removes the certificate from the named store. On macOS `delete` additionally pre-checks presence before ever running the destructive command (so deleting an absent cert reports `status|not_found` instead of a command failure) and re-enumerates the keychain afterward to prove the certificate is actually gone before reporting `status|deleted` — a zero exit code alone is not trusted.\n\nWindows reads/writes CryptoAPI stores (MY, ROOT, CA, Trust) natively, in-process, no subprocess. Linux parses PEM files under `/etc/ssl/certs` via in-process libcrypto (`certificates_x509.hpp`) — the `openssl x509` subprocess this used to shell out to is gone. macOS is a genuine hybrid: System.keychain and SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, but the login keychain (the console user's own keychain, which the LaunchDaemon has none of itself) still reads through a `launchctl asuser`/`sudo -u`/`security find-certificate` subprocess hop, and `delete` always shells out to `/usr/bin/security delete-certificate`. Every macOS action runs under a shared 60-second wall-clock budget covering console-user resolution and every keychain read/parse it performs, so a wedged Directory Service or a pathological keychain degrades honestly (a `not_available|<reason>` row plus a `CONSTRAINED`/`PARTIAL` result status) instead of hanging or silently truncating.\n\nThis plugin deliberately does not validate a certificate's trust chain, check revocation (CRL/OCSP), import or renew certificates, or read anything beyond the fixed set of stores/keychains named above.",
+  "how_it_works": "`list` and `details` enumerate certificates in the OS's own stores and emit the same eight-field row per certificate; `list` returns every match (filtered by `store` and `expiring_within_days`), `details` returns the one row whose thumbprint matches (case-insensitive) or a `status|not_found`. `delete` is destructive: it hex-validates the thumbprint, then removes the certificate from the named store. On macOS `delete` additionally pre-checks presence before ever running the destructive command (so deleting an absent cert reports `status|not_found` instead of a command failure) and re-enumerates the keychain afterward to prove the certificate is actually gone before reporting `status|deleted` — a zero exit code alone is not trusted.\n\nWindows reads/writes CryptoAPI stores (MY, ROOT, CA, Trust) natively, in-process, no subprocess. Linux parses PEM files under `/etc/ssl/certs` via in-process libcrypto (`certificates_x509.hpp`) — the `openssl x509` subprocess this used to shell out to is gone. macOS is a genuine hybrid: System.keychain and SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain through agent-core's `read_keychain_bounded` seam and abandoned (not cancelled) if `securityd` wedges past that bound, but the login keychain (the console user's own keychain, which the LaunchDaemon has none of itself) still reads through a `launchctl asuser`/`sudo -u`/`security find-certificate` subprocess hop — immediately preceded by an in-process re-check of `/dev/console`'s owner, so a fast-user-switch between console-user resolution and the spawn is refused rather than read against the wrong session — and `delete` always shells out to `/usr/bin/security delete-certificate`. Every macOS action runs under a shared 60-second wall-clock budget covering console-user resolution and every keychain read/parse it performs, so a wedged Directory Service or a pathological keychain degrades honestly (a `not_available|<reason>` row plus a `CONSTRAINED`/`PARTIAL` result status) instead of hanging or silently truncating.\n\nThis plugin deliberately does not validate a certificate's trust chain, check revocation (CRL/OCSP), import or renew certificates, or read anything beyond the fixed set of stores/keychains named above.",
   "inputs": [
     {
       "constraints": null,
@@ -458,7 +458,7 @@
     },
     {
       "grant": "System/root keychain reads: none (in-process `SecItemCopyMatching`, no subprocess). Login keychain read: root, via `launchctl asuser` + `sudo -u` — live today only because the daemon runs as root; needs a dormant sudoers grant once #1455 narrows the agent off root. `delete` (System/MY only): a sudoers grant for `/usr/bin/security delete-certificate -t /Library/Keychains/System.keychain *` under the future non-root account; moot today.",
-      "if_refused": "System/root keychain failure emits `not_available|<keychain> read failed` + `CONSTRAINED`/`PARTIAL` (`certificates_plugin.cpp:1306,1333`); login-keychain failure emits `not_available|login keychain read failed` + `CONSTRAINED`/`PARTIAL` (`certificates_plugin.cpp:1394-1396`) — the macOS sample shows exactly this (`macos.txt:164-165`)",
+      "if_refused": "System/root keychain read failure emits `not_available|<keychain> not readable (no read permission)`, `not_available|<keychain> read timed out` (15 s per-keychain bound exceeded), `not_available|<keychain> read refused (bounded-call ceiling)`, or `not_available|<keychain> read failed` — each + `CONSTRAINED`/`PARTIAL` (`certificates_plugin.cpp:1216`); an in-process `/dev/console` owner recheck immediately before the login-keychain spawn emits `not_available|console user changed` (`certificates_plugin.cpp:1255`) or `not_available|console user recheck failed` (`certificates_plugin.cpp:1259`); a failed login-keychain spawn emits `not_available|login keychain read failed (<detail>)` naming the termination reason (`certificates_plugin.cpp:1558`) — the macOS sample shows a login-keychain degradation (`macos.txt:164-165`)",
       "measured": "2026-09-07, bare-metal macOS 26.6.2 arm64, euid 501 (jsmith) — unprivileged, captured via the test harness (`PluginHandle::load` + `LocalDispatcher::run`, no `init()`), not the production root LaunchDaemon",
       "os": "macOS",
       "runs_as": "agent daemon; the shipped LaunchDaemon has no `UserName` key, so it runs as root — but this sample was captured unprivileged (see Measured)"
@@ -483,19 +483,19 @@
       "completeness": "`PARTIAL`",
       "provenance": "`login-keychain`",
       "status": "`CONSTRAINED`",
-      "when": "macOS: console-user resolution or the login-keychain read/scan failed, degraded, or was capped (`certificates_plugin.cpp:1268,1358-1396`)"
+      "when": "macOS: console-user resolution failed, the console user changed or its owner recheck failed immediately before the login-keychain spawn, or the login-keychain read/scan failed, degraded, or was capped (`certificates_plugin.cpp:1255,1259,1309`)"
     },
     {
       "completeness": "`PARTIAL`",
       "provenance": "`secitem:System.keychain`",
       "status": "`CONSTRAINED`",
-      "when": "macOS: System.keychain read or scan failed or was capped (`certificates_plugin.cpp:1291,1303,1307`)"
+      "when": "macOS: System.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_plugin.cpp:1216,1222`)"
     },
     {
       "completeness": "`PARTIAL`",
       "provenance": "`secitem:SystemRootCertificates.keychain`",
       "status": "`CONSTRAINED`",
-      "when": "macOS: SystemRootCertificates.keychain read or scan failed or was capped (`certificates_plugin.cpp:1317,1330,1334`)"
+      "when": "macOS: SystemRootCertificates.keychain was not readable (no read permission), timed out, was refused at the bounded-call ceiling, failed to open, or its scan was capped (`certificates_plugin.cpp:1216,1226`)"
     }
   ],
   "samples": {
@@ -730,6 +730,8 @@
     ],
     "changelog": [
       "changelog.d/20260817-wave2-certificates-in-process-x509.changed.md",
+      "changelog.d/2318-certificates-keychain-honesty.fixed.md",
+      "changelog.d/3246-certificates-bounded-keychain-read.fixed.md",
       "changelog.d/3406-certificates-login-keychain-argv.changed.md"
     ],
     "definitions": [
