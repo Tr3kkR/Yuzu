@@ -100,9 +100,14 @@ public:
     /// method MUST apply BOTH: (1) the fleet-read gate
     /// (`FleetReadFn`/`require_fleet_read`) before calling, and (2) the
     /// `confined_policy_compliance` filter (`compliance_model.hpp`) on the
-    /// result, PLUS the fail-closed `compliance.agent_statuses.view` audit —
-    /// never serialize this method's return value directly to a confinable
-    /// caller. The seam itself is a store-free DATA PROVIDER only; auth,
+    /// result — never serialize this method's return value directly to a
+    /// confinable caller. Those two are UNIVERSAL MUSTs. The
+    /// `compliance.agent_statuses.view` audit is also required on every
+    /// consumer, but its failure-handling is PER-CHANNEL (rest_audit.hpp): the
+    /// REST route fails CLOSED (503 on audit-persist failure), the MCP tool
+    /// sets `audit_persisted:false` in its body and proceeds, and the dashboard
+    /// signals the gap via a response header — do not restate MCP/dashboard as
+    /// fail-closed. The seam itself is a store-free DATA PROVIDER only; auth,
     /// confinement and audit live in the consumer (route/MCP handler), not
     /// here.
     /// NOTE: two PRE-EXISTING consumers do not yet fully satisfy this contract

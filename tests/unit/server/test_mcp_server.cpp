@@ -5018,6 +5018,50 @@ TEST_CASE("MCP Integration: tools/call get_policy assembles the composite "
     CHECK(text["remediation_available"] == false);
 }
 
+// The resources/read yuzu://compliance/fleet resource shares the exact same
+// FleetCompliance seam call as the get_fleet_compliance tool above, but is a
+// SEPARATE handler body (mcp_server.cpp resources/read branch) with its own
+// JSON assembly — drive it independently so a resource-only regression there
+// is not masked by the tool coverage.
+TEST_CASE("MCP Integration: resources/read yuzu://compliance/fleet returns the "
+          "driven FnComplianceApi's fleet-wide aggregate",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 40;
+        fc.compliant = 25;
+        fc.non_compliant = 10;
+        fc.unknown = 5;
+        fc.fixing = 0;
+        fc.error = 0;
+        fc.compliance_pct = 62.5;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":308,)"
+        R"("params":{"uri":"yuzu://compliance/fleet"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() >= 1);
+    CHECK(contents[0]["uri"] == "yuzu://compliance/fleet");
+    auto fc = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(fc["total_checks"] == 40);
+    CHECK(fc["compliant"] == 25);
+    CHECK(fc["non_compliant"] == 10);
+    CHECK(fc["unknown"] == 5);
+    CHECK(fc["compliance_pct"].get<double>() == 62.5);
+}
+
 // get_policy_agent_statuses's SOLE authorization gate is fleet_read_fn_
 // (never perm_fn/tier_allows — see the handler's own comment); this mirrors
 // "MCP get_agent_details: out-of-scope agent collapses to not-found"'s
@@ -5114,6 +5158,56 @@ TEST_CASE("MCP Integration: tools/call get_fleet_compliance surfaces the seam's 
     CHECK(body["error"]["message"].get<std::string>().find("degraded") != std::string::npos);
     REQUIRE(body["error"]["data"].contains("retry_after_ms"));
     CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 5000);
+}
+
+// get_fleet_posture_fast's compliance sub-object: every case above and in the
+// agentic-demo suite leaves compliance_api_for_test at its nullptr default,
+// so they only ever exercise the "policy_obj.add(\"available\", false)"
+// degrade branch. Wire a driven FnComplianceApi so the success-path
+// aggregate projection (mcp_server.cpp's get_fleet_posture_fast handler,
+// the fc_res-true arm) actually runs and lands in the tool response.
+TEST_CASE("MCP Integration: tools/call get_fleet_posture_fast projects the "
+          "driven FnComplianceApi's fleet-wide aggregate (success path, not "
+          "the degrade branch)",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 18;
+        fc.compliant = 12;
+        fc.non_compliant = 4;
+        fc.unknown = 2;
+        fc.fixing = 0;
+        fc.error = 0;
+        fc.compliance_pct = 66.7;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":309,)"
+        R"("params":{"name":"get_fleet_posture_fast","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("compliance"));
+    // Success-path aggregate, not the degrade branch's {"available": false}.
+    CHECK_FALSE(sc["compliance"].contains("available"));
+    CHECK(sc["compliance"]["total_checks"] == 18);
+    CHECK(sc["compliance"]["compliant"] == 12);
+    CHECK(sc["compliance"]["non_compliant"] == 4);
+    CHECK(sc["compliance"]["unknown"] == 2);
+    CHECK(sc["compliance"]["compliance_pct"].get<double>() == 66.7);
+    // "policy/compliance store" must not be listed as a missing source once
+    // the seam is driven.
+    for (const auto& m : sc["missing_sources"])
+        CHECK(m.get<std::string>() != "policy/compliance store");
 }
 
 // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────────────────
