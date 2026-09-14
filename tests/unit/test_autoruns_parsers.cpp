@@ -329,6 +329,122 @@ TEST_CASE("autoruns: parse_ifeo_debugger with a Debugger value reports it",
     CHECK(entry.debugger == "C:\\evil.exe");
 }
 
+// ── 6b. resolve_profile_shell_folder ─────────────────────────────────────
+
+TEST_CASE("autoruns: resolve_profile_shell_folder expands %USERPROFILE% against "
+          "the ENUMERATED PROFILE's own path, never a process environment lookup "
+          "(#4219 -- this is the fix for the bug that resolved against the agent's "
+          "own LocalSystem environment instead)",
+          "[autoruns][parsers]") {
+    auto no_machine_lookup = [](std::string_view) -> std::optional<std::string> {
+        FAIL("machine_var should not be consulted for a user-scoped token");
+        return std::nullopt;
+    };
+    const auto result = resolve_profile_shell_folder(
+        "%USERPROFILE%\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+        "REG_EXPAND_SZ", "C:\\Users\\alice", "alice", no_machine_lookup);
+    REQUIRE(result.path.has_value());
+    CHECK(*result.path ==
+         "C:\\Users\\alice\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+    CHECK(result.constraint.empty());
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder's token match is case-insensitive "
+          "(%AppData% not just %APPDATA%) and shorthand tokens resolve against the "
+          "profile path, not a lookup",
+          "[autoruns][parsers]") {
+    auto no_machine_lookup = [](std::string_view) -> std::optional<std::string> {
+        FAIL("machine_var should not be consulted for a user-scoped token");
+        return std::nullopt;
+    };
+    const auto appdata = resolve_profile_shell_folder("%AppData%\\CorpStartup", "REG_EXPAND_SZ",
+                                                      "C:\\Users\\alice", "alice",
+                                                      no_machine_lookup);
+    REQUIRE(appdata.path.has_value());
+    CHECK(*appdata.path == "C:\\Users\\alice\\AppData\\Roaming\\CorpStartup");
+
+    const auto localappdata = resolve_profile_shell_folder(
+        "%LOCALAPPDATA%\\CorpStartup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        no_machine_lookup);
+    REQUIRE(localappdata.path.has_value());
+    CHECK(*localappdata.path == "C:\\Users\\alice\\AppData\\Local\\CorpStartup");
+
+    const auto username = resolve_profile_shell_folder("C:\\Corp\\%USERNAME%\\Startup",
+                                                        "REG_EXPAND_SZ", "C:\\Users\\alice",
+                                                        "alice", no_machine_lookup);
+    REQUIRE(username.path.has_value());
+    CHECK(*username.path == "C:\\Corp\\alice\\Startup");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder resolves a machine-scoped token "
+          "(identical for every user on this host) via the injected lookup",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%SystemDrive%\\CorpStartup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view name) -> std::optional<std::string> {
+            CHECK(name == "SystemDrive");
+            return std::string{"C:"};
+        });
+    REQUIRE(result.path.has_value());
+    CHECK(*result.path == "C:\\CorpStartup");
+    CHECK(result.constraint.empty());
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved, "
+          "never a guess, for a token it doesn't recognize",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%OneDrive%\\Startup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> {
+            FAIL("OneDrive is not in the machine-scoped allowlist");
+            return std::nullopt;
+        });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved "
+          "when an allowlisted machine token's lookup itself comes back empty, never "
+          "a partial/guessed path",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%ProgramData%\\CorpStartup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> { return std::nullopt; });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder treats REG_SZ as a literal path, "
+          "no token expansion -- a stray '%' is kept verbatim",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder("C:\\CorpStartup\\100%done", "REG_SZ",
+                                                      "C:\\Users\\alice", "alice",
+                                                      [](std::string_view) { return std::nullopt; });
+    REQUIRE(result.path.has_value());
+    CHECK(*result.path == "C:\\CorpStartup\\100%done");
+    CHECK(result.constraint.empty());
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_bad_type "
+          "for a value type that isn't REG_SZ/REG_EXPAND_SZ",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder("1", "REG_DWORD", "C:\\Users\\alice",
+                                                      "alice",
+                                                      [](std::string_view) { return std::nullopt; });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_bad_type");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports \"not configured\", not a "
+          "failure, for an empty value",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder("", "REG_EXPAND_SZ", "C:\\Users\\alice",
+                                                      "alice",
+                                                      [](std::string_view) { return std::nullopt; });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint.empty()); // empty constraint == "not configured", not a failure
+}
+
 // ── 7. parse_task_xml ──────────────────────────────────────────────────────
 
 TEST_CASE("autoruns: parse_task_xml reads command, disabled state, principal and empty "

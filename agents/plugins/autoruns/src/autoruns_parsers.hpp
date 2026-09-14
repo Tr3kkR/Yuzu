@@ -49,6 +49,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <limits>
 #include <map>
 #include <memory>
@@ -531,6 +532,109 @@ inline IfeoEntry parse_ifeo_debugger(std::string_view exe_name, std::string_view
         out.has_debugger = true;
     }
     return out;
+}
+
+// ── 6b. resolve_profile_shell_folder (win_startup_folder_user redirect) ──
+
+/// Outcome of resolving a `User Shell Folders\Startup` registry value
+/// against a SPECIFIC enumerated profile -- `path` is the resolved
+/// directory, or nullopt when the value could not be turned into a usable
+/// path; `constraint` is a stable reason token for the caller's
+/// `constrained` status whenever `path` is nullopt AND the value wasn't
+/// simply absent (empty `value` in, empty `constraint` out, is the "not
+/// configured" case -- not a failure).
+struct ShellFolderResolution {
+    std::optional<std::string> path;
+    std::string_view constraint{};
+};
+
+namespace detail {
+inline bool ieq_ascii(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i])))
+            return false;
+    }
+    return true;
+}
+} // namespace detail
+
+/// Resolves a `User Shell Folders\Startup` registry value against the
+/// ENUMERATED PROFILE's own identity, never the calling process's
+/// environment (#4219: the agent runs as LocalSystem, and Windows
+/// populates this value with `%USERPROFILE%`-style tokens on essentially
+/// every profile at creation -- expanding those against LocalSystem's own
+/// environment resolves to a path that normally doesn't exist, silently
+/// under-reporting the profile's real Startup entries).
+///
+/// `REG_SZ` is used as a literal path, no expansion. `REG_EXPAND_SZ` is
+/// scanned for `%NAME%` tokens by this function itself -- never handed to
+/// `ExpandEnvironmentStringsW`, which has no notion of "a different user's
+/// profile" to expand against -- with two token classes:
+///   - User-scoped (resolved from `profile_path`/`profile_name`, no lookup
+///     needed): `USERPROFILE`, `APPDATA` (`profile_path\AppData\Roaming`),
+///     `LOCALAPPDATA` (`profile_path\AppData\Local`), `USERNAME`.
+///   - Machine-scoped (identical for every user on this host, so reading
+///     the agent's OWN environment is correct for these specifically --
+///     `SystemDrive`, `SystemRoot`, `windir`, `ProgramData`,
+///     `ALLUSERSPROFILE`, `PUBLIC`, `ProgramFiles`, `ProgramFiles(x86)`):
+///     resolved via the caller-supplied `machine_var` lookup.
+/// Any other token name, an unterminated `%`, an empty `%%` token, or an
+/// allowlisted machine token `machine_var` can't supply is
+/// `startup_redirect_unresolved` -- never a silent guess. Any `type_name`
+/// other than `REG_SZ`/`REG_EXPAND_SZ` is `startup_redirect_bad_type`. An
+/// empty `value` is "not configured" (nullopt path, empty constraint) --
+/// the overwhelmingly common case for a profile with no real redirect.
+inline ShellFolderResolution resolve_profile_shell_folder(
+    std::string_view value, std::string_view type_name, std::string_view profile_path,
+    std::string_view profile_name,
+    const std::function<std::optional<std::string>(std::string_view)>& machine_var) {
+    if (value.empty()) return {};
+    if (type_name != "REG_SZ" && type_name != "REG_EXPAND_SZ")
+        return {std::nullopt, "startup_redirect_bad_type"};
+    if (type_name == "REG_SZ") return {std::string{value}, {}};
+
+    static constexpr std::array<const char*, 8> kMachineAllowlist{
+        "SystemDrive",     "SystemRoot", "windir",       "ProgramData",
+        "ALLUSERSPROFILE", "PUBLIC",     "ProgramFiles", "ProgramFiles(x86)"};
+
+    std::string out;
+    out.reserve(value.size());
+    std::size_t i = 0;
+    while (i < value.size()) {
+        if (value[i] != '%') {
+            out += value[i];
+            ++i;
+            continue;
+        }
+        const std::size_t close = value.find('%', i + 1);
+        if (close == std::string_view::npos) return {std::nullopt, "startup_redirect_unresolved"};
+        const std::string_view name = value.substr(i + 1, close - i - 1);
+        if (name.empty()) return {std::nullopt, "startup_redirect_unresolved"};
+
+        std::optional<std::string> resolved;
+        if (detail::ieq_ascii(name, "USERPROFILE")) {
+            resolved = std::string{profile_path};
+        } else if (detail::ieq_ascii(name, "APPDATA")) {
+            resolved = std::string{profile_path} + "\\AppData\\Roaming";
+        } else if (detail::ieq_ascii(name, "LOCALAPPDATA")) {
+            resolved = std::string{profile_path} + "\\AppData\\Local";
+        } else if (detail::ieq_ascii(name, "USERNAME")) {
+            resolved = std::string{profile_name};
+        } else {
+            for (const char* m : kMachineAllowlist) {
+                if (detail::ieq_ascii(name, m)) {
+                    resolved = machine_var(name);
+                    break;
+                }
+            }
+        }
+        if (!resolved.has_value()) return {std::nullopt, "startup_redirect_unresolved"};
+        out += *resolved;
+        i = close + 1;
+    }
+    return {out, {}};
 }
 
 // ── 7. parse_task_xml (libxml2-based Task Scheduler XML parser) ──────────

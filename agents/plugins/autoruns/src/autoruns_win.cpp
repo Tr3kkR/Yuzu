@@ -70,6 +70,8 @@
 
 #include "autoruns_win_wmi_join.hpp"
 
+#include <constraint_accumulator.hpp>
+
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -116,6 +118,32 @@ std::string_view read_status_token(ReadValueStatus st) {
     case ReadValueStatus::ok:                   return "ok";
     }
     return "ok";
+}
+
+/// Reads a MACHINE-scoped environment variable (identical for every user on
+/// this host -- SystemDrive/SystemRoot/windir/ProgramData/etc., the
+/// resolve_profile_shell_folder allowlist) from the agent's own process
+/// environment via the wide API + yuzu::win::from_wide, matching
+/// script_exec_plugin.cpp's identical two-pass GetEnvironmentVariableW
+/// idiom. nullopt on "not set" OR any other failure -- resolve_
+/// profile_shell_folder already treats a nullopt lookup result as
+/// "startup_redirect_unresolved", so there is no separate error case for
+/// this helper to distinguish.
+std::optional<std::string> win_machine_env_var(std::string_view name) {
+    const std::wstring wname = yuzu::win::to_wide(name);
+    wchar_t stack_buf[256];
+    DWORD len =
+        GetEnvironmentVariableW(wname.c_str(), stack_buf, static_cast<DWORD>(std::size(stack_buf)));
+    if (len == 0) return std::nullopt;
+    if (len < std::size(stack_buf)) return yuzu::win::from_wide(stack_buf, static_cast<int>(len));
+
+    // Value longer than the stack buffer: len is the required size
+    // INCLUDING the terminating NUL on this branch (GetEnvironmentVariableW's
+    // contract), so a len-sized buffer holds it exactly.
+    std::wstring buf(len, L'\0');
+    const DWORD len2 = GetEnvironmentVariableW(wname.c_str(), buf.data(), len);
+    if (len2 == 0 || len2 >= len) return std::nullopt; // shrank or failed between the two calls
+    return yuzu::win::from_wide(buf.c_str(), static_cast<int>(len2));
 }
 
 std::string_view hive_status_token(yuzu::win::HiveAccessStatus st) {
@@ -253,25 +281,21 @@ std::wstring last_path_component(const std::wstring& path) {
 
 struct SourceOutcome {
     std::vector<Row> rows;
-    bool constrained = false;
-    std::string reason; // first non-ok token seen; joined with ',' across profiles where relevant
+    yuzu::shared::ConstraintAccumulator acc;
 };
 
 void note_constraint(SourceOutcome& outcome, std::string_view token) {
-    outcome.constrained = true;
-    // Dedup by exact-substring match, matching autoruns_macos.cpp's
-    // note_dir_constraint: an unqualified token (e.g. "enumeration_
-    // incomplete", "row_cap") repeating identically across many profiles/
-    // iterations must not grow the reason string once per occurrence
-    // (governance Gate 4 unhappy-path: an enterprise host with hundreds of
-    // affected profiles could otherwise produce a reason string hundreds
-    // of tokens long). A SID-qualified token (e.g. "<sid>:privilege_
-    // missing") is unique per profile by construction, so this dedup never
-    // collapses genuinely distinct per-profile failures -- only literal
-    // repeats.
-    if (outcome.reason.find(token) != std::string::npos) return;
-    if (!outcome.reason.empty()) outcome.reason += ',';
-    outcome.reason += token;
+    // Exact-string dedup (yuzu::shared::ConstraintAccumulator): an
+    // unqualified token (e.g. "row_cap") repeating identically across many
+    // profiles/iterations must not grow the reason string once per
+    // occurrence (governance Gate 4 unhappy-path: an enterprise host with
+    // hundreds of affected profiles could otherwise produce a reason
+    // string hundreds of tokens long). A SID-qualified token (e.g.
+    // "<sid>:privilege_missing") is unique per profile by construction, so
+    // this dedup never collapses genuinely distinct per-profile failures --
+    // only literal repeats. Matches autoruns_macos.cpp's identical
+    // migration off the former substring-matching accumulation.
+    outcome.acc.add_failure(token);
 }
 
 /// Returns true iff this source's own status resolved to CONSTRAINED -- lets
@@ -279,10 +303,12 @@ void note_constraint(SourceOutcome& outcome, std::string_view token) {
 /// the constrained/supported decision at every call site.
 bool finish_source(yuzu::CommandContext& ctx, SourceId id, const SourceOutcome& outcome) {
     for (const auto& r : outcome.rows) ctx.write_output(format_row(r));
+    const bool constrained = outcome.acc.any_failure();
+    const std::string reason = outcome.acc.reason();
     ctx.write_output(format_source_status(
-        id, outcome.constrained ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
-        outcome.rows.size(), outcome.constrained ? std::string_view{outcome.reason} : "ok"));
-    return outcome.constrained;
+        id, constrained ? YUZU_SUPPORT_CONSTRAINED : YUZU_SUPPORT_SUPPORTED,
+        outcome.rows.size(), constrained ? std::string_view{reason} : "ok"));
+    return constrained;
 }
 
 /// A `sources=` filter excluding `id` must still report a status row for
@@ -1236,57 +1262,46 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                             // unreadable, or empty leaves startup_dir at the
                             // fallback already computed above.
                             //
-                            // KNOWN BUG, not yet fixed: this value is a
-                            // REG_EXPAND_SZ containing %USERPROFILE%-style
-                            // tokens on essentially every profile at creation,
-                            // not only genuinely redirected ones -- so the
-                            // expand_env_strings() call below (which resolves
-                            // against THIS PROCESS's own environment, i.e.
-                            // LocalSystem, not the enumerated profile) takes
-                            // the wrong branch on most stock profiles, not a
-                            // narrow edge case. LocalSystem's own Startup
-                            // folder is normally absent/empty, so the usual
-                            // observable symptom is NOT a visibly-wrong
-                            // location -- collect_startup_folder() treats a
-                            // not-found path as benign-empty (see its own
-                            // comment below) -- it's the profile's real
-                            // Startup entries going completely unreported. The
-                            // note_constraint() call below exists precisely so
-                            // that silent zero-rows-and-SUPPORTED is not
-                            // mistaken for "genuinely nothing there." See
+                            // #4219 fix: resolution itself is now
+                            // resolve_profile_shell_folder (autoruns_parsers.hpp),
+                            // a pure, cross-platform-tested function that
+                            // expands %USERPROFILE%-style tokens against THIS
+                            // profile's own path/name -- never
+                            // ExpandEnvironmentStringsW, which has no notion of
+                            // "a different user's profile" and would resolve
+                            // against the agent's own LocalSystem environment
+                            // (the bug this fix closes; see
                             // changelog.d/20260909-autoruns-plugin.added.md's
-                            // "Known limitation" entry. Tracked in #4219.
+                            // former "Known limitation" entry, now removed).
                             RegKey folders_key;
-                            if (RegOpenKeyExW(
-                                    root,
-                                    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User "
-                                    L"Shell Folders",
-                                    0, KEY_READ, folders_key.put()) == ERROR_SUCCESS) {
+                            const LSTATUS open_st = RegOpenKeyExW(
+                                root,
+                                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\User "
+                                L"Shell Folders",
+                                0, KEY_READ, folders_key.put());
+                            if (open_st != ERROR_SUCCESS) {
+                                if (open_st != ERROR_FILE_NOT_FOUND)
+                                    note_constraint(startup_folder_user,
+                                                    "startup_redirect_key_unreadable");
+                            } else {
                                 std::string startup_value, type_name;
                                 const auto st = yuzu::win::read_reg_value(
                                     folders_key.get(), "Startup", startup_value, type_name);
-                                if (st == yuzu::win::ReadValueStatus::ok && !startup_value.empty()) {
-                                    if (type_name == "REG_EXPAND_SZ") {
-                                        startup_dir = yuzu::win::expand_env_strings(
-                                            yuzu::win::to_wide(startup_value));
-                                        // KNOWN BUG (see the banner above this
-                                        // block): expand_env_strings() resolves
-                                        // against the agent's own LocalSystem
-                                        // environment, not this profile's --
-                                        // usually resolving to a path that
-                                        // doesn't exist, which
-                                        // collect_startup_folder() below would
-                                        // otherwise silently treat as "nothing
-                                        // there." Report constrained instead,
-                                        // so the profile's real (unreported)
-                                        // Startup entries aren't mistaken for
-                                        // a genuine empty result -- the exact
-                                        // invariant every other collector in
-                                        // this plugin already holds to.
+                                if (st != yuzu::win::ReadValueStatus::not_found &&
+                                    st != yuzu::win::ReadValueStatus::ok)
+                                    note_constraint(startup_folder_user, read_status_token(st));
+                                if (st == yuzu::win::ReadValueStatus::ok) {
+                                    const auto resolution = resolve_profile_shell_folder(
+                                        startup_value, type_name, profile.profile_path,
+                                        std::string{user},
+                                        [](std::string_view name) -> std::optional<std::string> {
+                                            return win_machine_env_var(name);
+                                        });
+                                    if (resolution.path.has_value()) {
+                                        startup_dir = yuzu::win::to_wide(*resolution.path);
+                                    } else if (!resolution.constraint.empty()) {
                                         note_constraint(startup_folder_user,
-                                                        "startup_redirect_env_mismatch");
-                                    } else {
-                                        startup_dir = yuzu::win::to_wide(startup_value);
+                                                        resolution.constraint);
                                     }
                                 }
                             }
@@ -1321,11 +1336,18 @@ int collect_windows(yuzu::CommandContext& ctx, std::string_view filter) {
                         note_constraint(runonce_hku, token);
                     if (want(filter, SourceId::win_startup_approved))
                         note_constraint(startup_approved, token);
-                    // Deliberately no constraint noted on startup_folder_user
-                    // here: the listing below still runs against the
-                    // non-redirected fallback path, which is a complete,
-                    // honest answer for this profile -- just not
-                    // redirection-aware, not a failure.
+                    // #4219: the redirect-resolution block above lives INSIDE
+                    // this same with_user_hive callback -- when the hive is
+                    // unreachable, that block never runs at all, so
+                    // startup_dir stays at the non-redirected fallback
+                    // computed earlier. For a genuinely non-redirected
+                    // profile that's still a complete, honest answer; for a
+                    // genuinely REDIRECTED one it's an unverifiable guess
+                    // (the exact class of silent-wrong-answer #4219 fixes
+                    // when the hive IS reachable), so this source gets the
+                    // same per-profile constraint the other three hive-
+                    // dependent sources already do.
+                    if (startup_dir.has_value()) note_constraint(startup_folder_user, token);
                 }
 
                 if (startup_dir.has_value()) {
