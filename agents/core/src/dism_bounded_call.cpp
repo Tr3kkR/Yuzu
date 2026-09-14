@@ -55,7 +55,7 @@ BoundedOutcome run_info_bounded(const std::string&) { return {}; }
 // File-scope (not nested in yuzu::agent::dism) since it is used only from
 // this one translation unit -- unchanged from its original home in
 // windows_optional_features_plugin.cpp (Wave 9 PR9.2, pre-C1-fix).
-namespace dism {
+namespace dism_native {
 
 enum class LogLevel : int { Errors = 0 };
 enum class PackageIdentifier : int { None = 0 };
@@ -185,7 +185,7 @@ struct Api {
 // itself comes from <winerror.h> via <windows.h>.
 constexpr HRESULT kDismUnknownFeature = 0x800F080C; // DISMAPI_E_UNKNOWN_FEATURE
 
-} // namespace dism
+} // namespace dism_native
 
 // Layout cross-check against the real header, wherever it happens to be
 // present at compile time (mingw on the dev Mac; the ADK on the-rig; absent
@@ -203,15 +203,15 @@ constexpr HRESULT kDismUnknownFeature = 0x800F080C; // DISMAPI_E_UNKNOWN_FEATURE
 #if defined(__has_include)
 #if __has_include(<dismapi.h>)
 #include <dismapi.h> // after <windows.h>; mingw on the dev Mac, ADK on the-rig
-static_assert(sizeof(dism::Feature) == sizeof(::DismFeature));
-static_assert(offsetof(dism::Feature, FeatureName) == offsetof(::DismFeature, FeatureName));
-static_assert(offsetof(dism::Feature, State) == offsetof(::DismFeature, State));
-static_assert(sizeof(dism::FeatureInfo) == sizeof(::DismFeatureInfo));
-static_assert(offsetof(dism::FeatureInfo, CustomCount) ==
+static_assert(sizeof(dism_native::Feature) == sizeof(::DismFeature));
+static_assert(offsetof(dism_native::Feature, FeatureName) == offsetof(::DismFeature, FeatureName));
+static_assert(offsetof(dism_native::Feature, State) == offsetof(::DismFeature, State));
+static_assert(sizeof(dism_native::FeatureInfo) == sizeof(::DismFeatureInfo));
+static_assert(offsetof(dism_native::FeatureInfo, CustomCount) ==
              offsetof(::DismFeatureInfo, CustomPropertyCount));
-static_assert(offsetof(dism::FeatureInfo, RestartRequired) ==
+static_assert(offsetof(dism_native::FeatureInfo, RestartRequired) ==
              offsetof(::DismFeatureInfo, RestartRequired));
-static_assert(static_cast<int>(dism::FeatureState::PartiallyInstalled) ==
+static_assert(static_cast<int>(dism_native::FeatureState::PartiallyInstalled) ==
              DismStatePartiallyInstalled);
 #pragma message("dism_bounded_call: dismapi.h layout cross-check compiled")
 #endif
@@ -249,16 +249,16 @@ struct SlotRelease {
 struct DismSessionGuard {
     bool initialized = false;
     bool opened = false;
-    dism::Session session = 0;
+    dism_native::Session session = 0;
     HRESULT first_failure = S_OK;
     std::string_view failed_stage;
 
-    explicit DismSessionGuard(const dism::Api& api_table) noexcept : api_{api_table} {
+    explicit DismSessionGuard(const dism_native::Api& api_table) noexcept : api_{api_table} {
         // DISM reference-counts Initialize/Shutdown pairs: a second
         // Initialize returns S_FALSE (not a hard error) per the-rig's
         // measured error-path capture, so FAILED() alone is the right test
         // -- S_OK and S_FALSE both mean the API is usable.
-        HRESULT hr = api_.Initialize(dism::LogLevel::Errors, nullptr, nullptr);
+        HRESULT hr = api_.Initialize(dism_native::LogLevel::Errors, nullptr, nullptr);
         if (FAILED(hr)) {
             first_failure = hr;
             failed_stage = "initialize";
@@ -266,7 +266,7 @@ struct DismSessionGuard {
         }
         initialized = true;
 
-        hr = api_.OpenSession(dism::kOnlineImage, nullptr, nullptr, &session);
+        hr = api_.OpenSession(dism_native::kOnlineImage, nullptr, nullptr, &session);
         if (FAILED(hr)) {
             first_failure = hr;
             failed_stage = "open_session";
@@ -286,7 +286,7 @@ struct DismSessionGuard {
     }
 
 private:
-    const dism::Api& api_;
+    const dism_native::Api& api_;
 };
 
 /// RAII owner for a DISM-allocated buffer freed via Api::Delete
@@ -299,7 +299,7 @@ private:
 template <typename T>
 class DismResultGuard {
 public:
-    DismResultGuard(T* ptr, const dism::Api& api) noexcept : ptr_{ptr}, api_{&api} {}
+    DismResultGuard(T* ptr, const dism_native::Api& api) noexcept : ptr_{ptr}, api_{&api} {}
     DismResultGuard(const DismResultGuard&) = delete;
     DismResultGuard& operator=(const DismResultGuard&) = delete;
     ~DismResultGuard() {
@@ -311,18 +311,18 @@ public:
 
 private:
     T* ptr_;
-    const dism::Api* api_;
+    const dism_native::Api* api_;
 };
 
-std::string dism_last_error_text(const dism::Api& api_table) {
-    dism::String* raw_msg = nullptr;
+std::string dism_last_error_text(const dism_native::Api& api_table) {
+    dism_native::String* raw_msg = nullptr;
     if (FAILED(api_table.GetLastErrorMessage(&raw_msg)) || !raw_msg || !raw_msg->Value)
         return {};
-    const DismResultGuard<dism::String> msg{raw_msg, api_table};
+    const DismResultGuard<dism_native::String> msg{raw_msg, api_table};
     return yuzu::win::from_wide(msg->Value);
 }
 
-std::string format_hr_reason(HRESULT hr, const dism::Api& api_table) {
+std::string format_hr_reason(HRESULT hr, const dism_native::Api& api_table) {
     std::string reason = std::format("hr=0x{:08X}", static_cast<unsigned long>(hr));
     if (auto text = dism_last_error_text(api_table); !text.empty()) {
         reason += ' ';
@@ -337,7 +337,7 @@ std::string format_hr_reason(HRESULT hr, const dism::Api& api_table) {
 Outcome run_dism_list(const std::optional<std::unordered_set<yuzu::wof::FeatureState>>& filter) {
     try {
         SlotRelease slot_release; // constructed FIRST -- destroyed LAST
-        const auto& api_table = dism::api();
+        const auto& api_table = dism_native::api();
         DismSessionGuard guard(api_table); // constructed SECOND -- destroyed FIRST
         if (!guard.opened) {
             const auto reason = format_hr_reason(guard.first_failure, api_table);
@@ -349,10 +349,10 @@ Outcome run_dism_list(const std::optional<std::unordered_set<yuzu::wof::FeatureS
                     reason};
         }
 
-        dism::Feature* features = nullptr;
+        dism_native::Feature* features = nullptr;
         UINT count = 0;
         const HRESULT hr =
-            api_table.GetFeatures(guard.session, nullptr, dism::PackageIdentifier::None, &features, &count);
+            api_table.GetFeatures(guard.session, nullptr, dism_native::PackageIdentifier::None, &features, &count);
         if (FAILED(hr)) {
             const auto reason = format_hr_reason(hr, api_table);
             if (hr == E_ACCESSDENIED)
@@ -363,7 +363,7 @@ Outcome run_dism_list(const std::optional<std::unordered_set<yuzu::wof::FeatureS
         // Adopted immediately (docs/cpp-conventions.md resource-ownership
         // rule): from_wide() below can throw, and a trailing manual
         // Delete() would then never run.
-        const DismResultGuard<dism::Feature> features_guard{features, api_table};
+        const DismResultGuard<dism_native::Feature> features_guard{features, api_table};
 
         std::vector<std::string> rows;
         rows.reserve(count);
@@ -387,7 +387,7 @@ Outcome run_dism_list(const std::optional<std::unordered_set<yuzu::wof::FeatureS
 Outcome run_dism_info(const std::string& name) {
     try {
         SlotRelease slot_release; // constructed FIRST -- destroyed LAST
-        const auto& api_table = dism::api();
+        const auto& api_table = dism_native::api();
         DismSessionGuard guard(api_table); // constructed SECOND -- destroyed FIRST
         if (!guard.opened) {
             const auto reason = format_hr_reason(guard.first_failure, api_table);
@@ -400,12 +400,12 @@ Outcome run_dism_info(const std::string& name) {
         }
 
         const std::wstring wide_name = yuzu::win::to_wide(name);
-        dism::FeatureInfo* info = nullptr;
+        dism_native::FeatureInfo* info = nullptr;
         const HRESULT hr = api_table.GetFeatureInfo(guard.session, wide_name.c_str(), nullptr,
-                                                     dism::PackageIdentifier::None, &info);
+                                                     dism_native::PackageIdentifier::None, &info);
         if (FAILED(hr)) {
             const auto reason = format_hr_reason(hr, api_table);
-            if (hr == dism::kDismUnknownFeature)
+            if (hr == dism_native::kDismUnknownFeature)
                 return {Outcome::Kind::FeatureNotFound, {}, reason};
             if (hr == E_ACCESSDENIED)
                 return {Outcome::Kind::AccessDenied, {}, reason};
@@ -414,7 +414,7 @@ Outcome run_dism_info(const std::string& name) {
 
         // Adopted immediately, same reason as run_dism_list()'s
         // features_guard above -- from_wide()/format below can throw.
-        const DismResultGuard<dism::FeatureInfo> info_guard{info, api_table};
+        const DismResultGuard<dism_native::FeatureInfo> info_guard{info, api_table};
 
         const auto state = yuzu::wof::state_from_dism(static_cast<int>(info->State));
         std::string display_name =
@@ -431,7 +431,7 @@ Outcome run_dism_info(const std::string& name) {
 
 } // namespace
 
-bool api_available() noexcept { return dism::api().complete(); }
+bool api_available() noexcept { return dism_native::api().complete(); }
 
 yuzu::wof::DismSlot::Acquire try_acquire_slot() noexcept { return g_dism_slot.try_acquire(); }
 
