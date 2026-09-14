@@ -56,6 +56,7 @@ tus=(
     agents/plugins/power_health/src/power_health_plugin.cpp
     agents/plugins/autoruns/src/autoruns_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
+    agents/core/src/dism_bounded_call.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
