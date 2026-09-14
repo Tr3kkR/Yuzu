@@ -151,28 +151,36 @@ TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess c
 
     const auto lines = split_lines(result.captured);
 
-    // socketfilterfw --listapps IS unprivileged (unlike pfctl), so app|
-    // rows must be present on this host, and every row's decision field
-    // must be exactly allow|block|unknown -- never dropped, never a
-    // fabricated value (review R6). Value-checked, not presence-only: a
-    // find("app|") alone would still pass if the decision field were wrong
-    // or malformed.
-    bool saw_app_row = false;
+    // socketfilterfw --listapps IS unprivileged (unlike pfctl), so a
+    // cleanly-completed read never yields error| -- already checked above.
+    // Whether it yields ANY app| rows depends on this host's actual
+    // Application Firewall allow-list, which is real host state, not a
+    // fixture this test controls (BR-01: an earlier version of this test
+    // hard-required at least one row, which is only true on a host whose
+    // allow-list happens to be non-empty -- a genuinely empty list is a
+    // valid, honestly-reported outcome too, and the assertion must hold on
+    // both). What's pinned is the shape of whatever rows are present, not
+    // their count: every row's decision field must be exactly
+    // allow|block|unknown -- never dropped, never a fabricated value
+    // (review R6). Value-checked, not presence-only: a find("app|") alone
+    // would still pass if the decision field were wrong or malformed.
     for (const auto& line : lines) {
         if (line.rfind("app|", 0) != 0)
             continue;
-        saw_app_row = true;
         const auto last_sep = line.rfind('|');
         REQUIRE(last_sep != std::string::npos);
         const std::string decision = line.substr(last_sep + 1);
         CHECK((decision == "allow" || decision == "block" || decision == "unknown"));
     }
-    CHECK(saw_app_row);
 
-    // ruleset| must be either a non-negative integer (a cleanly-completed
-    // `pfctl -s rules` read) or exactly "unknown" (the completeness gate
-    // tripped) -- on this unprivileged Mac pf is refused, so ruleset|unknown
-    // is the expected, correct value.
+    // ruleset| must always appear, and be either a non-negative integer (a
+    // cleanly-completed `pfctl -s rules` read) or exactly "unknown" (the
+    // completeness gate tripped). Which of the two depends on whether THIS
+    // process can read pf -- root can, an unprivileged euid cannot -- so the
+    // test checks the shape, not a specific value hardcoded to one euid
+    // (BR-01, same fragility class as the app| row check above: a CI runner
+    // executing this test as root would otherwise fail a perfectly correct
+    // run).
     bool saw_ruleset_row = false;
     for (const auto& line : lines) {
         if (line.rfind("ruleset|", 0) != 0)
@@ -182,7 +190,6 @@ TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess c
         CHECK((value == "unknown" || is_non_negative_integer(value)));
     }
     CHECK(saw_ruleset_row);
-    CHECK(result.captured.find("ruleset|unknown") != std::string::npos);
 }
 
 #endif // __APPLE__

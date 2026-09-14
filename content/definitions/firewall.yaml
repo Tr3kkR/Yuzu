@@ -152,7 +152,10 @@ spec:
         type: string
         description: >-
           The row key, and the field after it for "rule" rows. Windows:
-          "rule" rows only, with the rule's display name. Linux: "rule" rows
+          "rule" rows with the rule's display name, plus a trailing
+          "ruleset" row (the count of rules actually emitted this call,
+          capped at 100) and "truncated" (present only past that cap).
+          Linux: "rule" rows
           only — backend literal "firewalld" (then zone, "service", service
           name) or "nftables" (then family, table, chain, hook and policy —
           or "handle" and the handle number); the numbered index for ufw; the
@@ -164,7 +167,7 @@ spec:
           when the pf read was refused or incomplete — anchor and ruleset are
           both root-only. The server clamps the row to two fields, so the
           remainder lands in the value column.
-        values: [rule, app, anchor, ruleset]
+        values: [rule, app, anchor, ruleset, truncated]
         example: Core Networking - DNS (UDP-Out)
       - name: enabled
         type: string

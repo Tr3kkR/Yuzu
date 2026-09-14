@@ -121,7 +121,7 @@
     {
       "columns": [
         {
-          "description": "The row key, and the field after it for \"rule\" rows. Windows: \"rule\" rows only, with the rule's display name. Linux: \"rule\" rows only — backend literal \"firewalld\" (then zone, \"service\", service name) or \"nftables\" (then family, table, chain, hook and policy — or \"handle\" and the handle number); the numbered index for ufw; the entry kind for iptables (policy, new_chain, append; then chain and rule spec). macOS: \"rule\" rows carry the raw pf rule line; \"app\" rows carry the per-app path and allow/block/unknown decision (unprivileged, from socketfilterfw --listapps); \"anchor\" rows carry one pf anchor name each; \"ruleset\" is the pf rule count, or unknown when the pf read was refused or incomplete — anchor and ruleset are both root-only. The server clamps the row to two fields, so the remainder lands in the value column.",
+          "description": "The row key, and the field after it for \"rule\" rows. Windows: \"rule\" rows with the rule's display name, plus a trailing \"ruleset\" row (the count of rules actually emitted this call, capped at 100) and \"truncated\" (present only past that cap). Linux: \"rule\" rows only — backend literal \"firewalld\" (then zone, \"service\", service name) or \"nftables\" (then family, table, chain, hook and policy — or \"handle\" and the handle number); the numbered index for ufw; the entry kind for iptables (policy, new_chain, append; then chain and rule spec). macOS: \"rule\" rows carry the raw pf rule line; \"app\" rows carry the per-app path and allow/block/unknown decision (unprivileged, from socketfilterfw --listapps); \"anchor\" rows carry one pf anchor name each; \"ruleset\" is the pf rule count, or unknown when the pf read was refused or incomplete — anchor and ruleset are both root-only. The server clamps the row to two fields, so the remainder lands in the value column.",
           "example": "Core Networking - DNS (UDP-Out)",
           "name": "rule_name",
           "platforms": null,
@@ -130,7 +130,8 @@
             "rule",
             "app",
             "anchor",
-            "ruleset"
+            "ruleset",
+            "truncated"
           ]
         },
         {
@@ -218,7 +219,7 @@
       "definition_id": "security.firewall.state"
     }
   ],
-  "outputs_note": "Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` plus `ruleset|<count>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all`, `pf|<value>`, optional `anchor|<name>` and `ruleset|<count|unknown>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rules and a trailing `ruleset|<count>`), and on macOS `app|<path>|<allow|block|unknown>` rows from `socketfilterfw --listapps`, `rule|<raw pf line>` rows, optional `anchor|<name>` rows and a trailing `ruleset|<count|unknown>`, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, `rule|<index>|<to>|<action>|<from>` for ufw, and `rule|<policy|new_chain|append>|<chain>|<spec>` for iptables — so on Linux the field after `rule` is the backend name for firewalld and nftables, a numeric index for ufw and the entry kind for iptables. On macOS the `app|` row's third field is the per-app decision, `allow`, `block` or `unknown`, never dropped or coerced. `ruleset|unknown` on macOS means the backing `pfctl -s rules` read was refused or incomplete (typically a permissions denial), not that the ruleset is empty; a cleanly-read empty ruleset reports `ruleset|0`. A backend that answers `backend|<name>` but whose rule dump is refused emits `rules|unknown`. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. Windows rules sharing a display name (one per profile, protocol or direction, e.g. six `ChatGPT` rows) are each real rules, not a capture defect. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.",
+  "outputs_note": "Pipe-delimited key rows; the first field is the row kind. `state` emits `profile|<Domain|Private|Public>|<enabled|disabled|unknown|error:0x…>` plus `ruleset|<count>` on Windows, and `backend|<name>`, `state|<value>`, optional `mode|block_all`, `pf|<value>`, optional `anchor|<name>` and `ruleset|<count|unknown>` rows on macOS and Linux. `rules` emits `rule|<name>|<enabled|disabled>|<in|out|unknown>|<allow|block|unknown>|<profile mask>` on Windows (plus `truncated|true` after 100 rules and a trailing `ruleset|<count>` counting the rules actually emitted this call, capped at 100 — distinct from `state`'s `ruleset|<count>`, which is the true policy total from `INetFwRules::get_Count`), and on macOS `app|<path>|<allow|block|unknown>` rows from `socketfilterfw --listapps`, `rule|<raw pf line>` rows, optional `anchor|<name>` rows and a trailing `ruleset|<count|unknown>`, and per backend on Linux: `rule|firewalld|<zone>|service|<service>`, `rule|nftables|<family>|<table>|<chain>|<hook>|<policy>` and `rule|nftables|<family>|<table>|<chain>|handle|<n>`, `rule|<index>|<to>|<action>|<from>` for ufw, and `rule|<policy|new_chain|append>|<chain>|<spec>` for iptables — so on Linux the field after `rule` is the backend name for firewalld and nftables, a numeric index for ufw and the entry kind for iptables. On macOS the `app|` row's third field is the per-app decision, `allow`, `block` or `unknown`, never dropped or coerced. `ruleset|unknown` on macOS means the backing `pfctl -s rules` read was refused or incomplete (typically a permissions denial), not that the ruleset is empty; a cleanly-read empty ruleset reports `ruleset|0`. A backend that answers `backend|<name>` but whose rule dump is refused emits `rules|unknown`. The server parses this plugin as key/value rows (`profile_or_backend`, `state`), so the value column carries the remainder of each row verbatim. Windows rules sharing a display name (one per profile, protocol or direction, e.g. six `ChatGPT` rows) are each real rules, not a capture defect. A run that reads nothing emits no `rule` rows and, for state, `unknown` values; it never fabricates a row.",
   "platforms": {
     "linux": "supported",
     "macos": "supported",
@@ -431,7 +432,8 @@
       "changelog.d/20260818-wave3-firewall-ufw-inactive-misreport.fixed.md",
       "changelog.d/20260823-firewall-nftables-netlink.added.md",
       "changelog.d/2237-guardian-reconcile-exception-firewall.fixed.md",
-      "changelog.d/2298-guardian-convergence-lane-firewall.fixed.md"
+      "changelog.d/2298-guardian-convergence-lane-firewall.fixed.md",
+      "changelog.d/979-firewall-parity-residual.added.md"
     ],
     "definitions": [
       "content/definitions/firewall.yaml"
