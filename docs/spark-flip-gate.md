@@ -393,7 +393,7 @@ flip, with a red-first test each:
 - **up-2, wedged-key re-apply cost** (`GuardianSparkRuntime::attach_rule`, the claim path and
   `wait_for_claim`): a re-push onto a wedged key queues behind the abandoned head and waits the
   full `backend_op_deadline` under engine `mtx_` on every re-apply; the base code fail-fasted via
-  the executor's `AlreadyRunning`. Criterion: a quarantined key refuses a new claim immediately.
+  the executor's `AlreadyRunning`. Criterion: a wedged key refuses a new claim immediately.
 - **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
   on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
   wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
@@ -1178,7 +1178,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   both point the same direction but neither confirms it; the issue's own words are the accurate
   ones - "root cause undetermined... not confirmed either way." Either way, not a reopening of the
   original hazard. **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
-  ruling 14(c)'s own rationale, since the K-bound/quarantine classification logic actually lives
+  ruling 14(c)'s own rationale, since the K-bound/wedge classification logic actually lives
   in PR-5, not PR-2, so the accepted cost this hold existed to protect against was never live at
   PR-2 in the first place. **PR-2 has since merged** (PR #4318, `a27ec4549baa`,
   2026-09-13T14:46:02Z) - see `docs/spark-legacy-delta-registry.md` row A3 for its "Verify at"
