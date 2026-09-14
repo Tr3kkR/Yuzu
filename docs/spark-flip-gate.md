@@ -364,11 +364,11 @@ today) - none of which this design was ever meant to make instant.
 Also corrected R5.4's own "as implemented" stamp: "no data is ever lost" was an
 overclaim - `stage_pending_locked()` drops the oldest staged record past
 `kMaxPendingJournalRecords` under sustained persist failure, counted via
-`journal_stage_dropped_` - see the design doc for the fix. **#3811** (a genuine but
-separate gap found while investigating this PR -
+`journal_stage_dropped_` - see the design doc for the fix. **#3811** (already filed
+during the #2233 item 3 governance sweep, re-surfaced while investigating this PR -
 `rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
-`active_backend_op_workers()==0`) was already filed and this doc's own §3 row 3 already
-rules it non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
+`active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
+non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
 PR-5 (fault/K-bound logic, not started - see acceptance criteria below,
 now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
 diagnostic's methodology against the full landed ladder, not started).** PR-2 settled

@@ -850,9 +850,13 @@ total (`claims_dropped_at_stop_`), leaves Dispatching/Dispatched claims for thei
 completion callback, and disarms a late-arriving success rather than leaving it live.
 `GuardianEngine::stop()`'s `ack_ledger_->retire()` call is bookkeeping only (resets
 what the ledger is watching), not resource cleanup - the disarm guarantee above is
-what actually tears down a live claim. One known caller of `begin_stop()` outside
-`stop()`: `rollback_spark_wiring_locked()` (`guardian_engine.cpp:2166`, single call
-site at `:2048`, a boot-time wiring-failure path) resets `spark_runtime_` without
+what actually tears down a live claim. Two known callers of `begin_stop()` outside
+`stop()`: `~GuardianSparkRuntime()` (`guardian_spark_runtime.cpp:92-97`) calls it too,
+but its own comment argues this is a defensive idempotent no-op - no in-flight pass
+can be running by the time the destructor runs, since a pass keeps the runtime alive
+through the handler's captured `shared_ptr`. The other,
+`rollback_spark_wiring_locked()` (`guardian_engine.cpp:2166`, single call
+site at `:2048`, a boot-time wiring-failure path), resets `spark_runtime_` without
 first waiting for `active_backend_op_workers()==0` - tracked as **#3811** (filed
 during the #2233 governance sweep, confirmed OPEN 2026-09-14 via `gh issue view 3811`;
 `docs/spark-flip-gate.md`'s own §3 row 3 already rules it does not gate the Spark

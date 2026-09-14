@@ -486,7 +486,8 @@ doc just makes sure they're findable rather than rediscovered from scratch.
     `apply_rules()`'s per-rule blocking wait, so this comment is stale NOW, not
     pending R5.5/PR-4. Filed as **#4322** (found during a doc-sweep governance pass).
     **RESOLVED by rung 9c PR-4**: comment rewritten in `b86154d37` to describe the
-    actual post-PR-2 behavior; #4322 closed.
+    actual post-PR-2 behavior; #4322 resolved in code, closes on merge (OPEN as of
+    this writing).
   - `agents/core/src/guardian_spark_runtime.cpp:419` (inside `attach_rule()`, **not**
     neighboring `:1615` above — corrected round 7, adversarial review Kimi/Codex both
     flagged the prior version's mislocation) — "up to 2x this deadline, not 1x"
