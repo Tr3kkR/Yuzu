@@ -199,6 +199,21 @@ FAMILIES = {
             "server/core/src/verify_api_local.hpp",
         ],
     },
+    # `compliance` (ADR-0031 WS-A4, the THIRD family through the seam). The
+    # read/presentation surface (`compliance_routes.cpp` + dashboard fragments,
+    # `compliance_ui.cpp`) consumes the store-free `ComplianceApi` seam; the
+    # policy/fragment MUTATORS (no public REST/MCP twin — INV-31-4) live in
+    # `policy_admin_routes.*`, deliberately OUTSIDE this enforced set (see that
+    # file's banner). `compliance_model.cpp` is the family's pure model TU.
+    "compliance": {
+        "tus": [
+            "server/core/src/compliance_routes.cpp",
+            "server/core/src/compliance_ui.cpp",
+            "server/core/src/compliance_model.cpp",
+            "server/core/src/compliance_api.hpp",
+            "server/core/src/compliance_api_local.hpp",
+        ],
+    },
 }
 
 _INCLUDE_RE = re.compile(r'^\s*#\s*include\s*(<[^>]+>|"[^"]+")')
