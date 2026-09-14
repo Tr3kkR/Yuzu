@@ -1878,8 +1878,9 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // WRONG. Deliberately not pushing the new Disarm claim here just leaves
                 // `claim_pushed` false and `inline_disarm` unset, so control falls
                 // through to the PRE-EXISTING (unrelated to this PR) `!claim_pushed`
-                // last-resort fallback further down this function (~line 1975): that
-                // fallback runs SYNCHRONOUSLY, in this SAME call, under this SAME lock -
+                // last-resort fallback in the `if (disarm_key)` block later in this
+                // function: that fallback runs SYNCHRONOUSLY, in this SAME call, under
+                // this SAME lock -
                 // it calls backend_->disarm() on the real subscription directly and then
                 // unconditionally erases keys_[key]. So the real disarm and the key's
                 // teardown both happen immediately, not deferred. The ONLY thing
@@ -1971,9 +1972,9 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // deliberately leaves `claim_pushed` false whenever the last-on-key sweep
                 // finds leftover fifo residue it can't safely reorder past, so THIS
                 // fallback is now the real, live disarm+cleanup path for that case, not
-                // just an unreachable last resort. It also still fires for whatever
-                // pre-existing edge originally motivated it. Either way this is the
-                // last-resort real disarm; counted so a subscription is NEVER stranded.
+                // just an unreachable last resort. It remains the defensive last resort
+                // for any other path that leaves `claim_pushed` false; this is the
+                // last-resort real disarm, counted so a subscription is NEVER stranded.
                 detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
                 try {
                     backend_->disarm(kit->second->subscription);
