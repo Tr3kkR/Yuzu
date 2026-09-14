@@ -25,7 +25,7 @@ That implication only breaks two ways, both ACKNOWLEDGED and NOT caught here:
      header - the closure walk never sees the real header because the code
      never asked for it, yet the call still resolves at link time.
 
-Neither shape exists in the family this script covers today; if one is ever
+Neither shape exists in any family this script covers today; if one is ever
 introduced, this check will pass while the seam is actually broken. That is a
 known, stated gap - not a silent one.
 
@@ -87,7 +87,7 @@ twin inside `mcp_server.cpp` - BOTH are
 multi-family translation units that legitimately hold real store access for
 ~20 OTHER families each. An include-closure check applied to either whole
 file would trivially fail (or be gamed by scoping) and would say nothing
-meaningful about the network family specifically. Those two files' network
+meaningful about a given family specifically. Those two files' per-family
 sections are therefore INSPECTED-NOT-ENFORCED - reviewed by hand today, not
 gated by this script - until a block-scoped or symbol-scoped successor
 exists. Do not read a clean run of this script as covering them.
