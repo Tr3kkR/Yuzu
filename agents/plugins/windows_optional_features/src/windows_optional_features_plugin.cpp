@@ -26,7 +26,9 @@
  * adversarial review C1 fix, Wave 9 PR9.2: a plugin-local detached worker
  * that outlives this plugin's own bounded shutdown quiesce would still be
  * executing plugin-resident code when the agent's teardown loop
- * FreeLibrary's this module (every reconnect, not only process exit).
+ * FreeLibrary's this module at final agent shutdown (SIGTERM, service
+ * stop, upgrade restart -- gated on stop_requested_, agent.cpp:3221; a
+ * plain reconnect leaves the plugin loaded and never calls shutdown()).
  * See that file's header comment for the full rationale and the
  * agents/core/include/yuzu/agent/passwd_lookup.hpp (#3406) precedent it
  * mirrors. This file keeps only: parameter parsing/validation, the two

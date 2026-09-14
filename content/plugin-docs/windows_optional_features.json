@@ -54,7 +54,7 @@
     }
   ],
   "caveats": [
-    "**DISM is process-global and single-session.** The Windows DISM API does not support concurrent sessions safely from the same process; this plugin serialises every `list`/`info` call through its own in-process `DismSlot` (at most one DISM call in flight), reporting `windows:dism:busy` to a second caller rather than risking undefined concurrent-session behaviour.",
+    "**DISM is process-global and single-session.** The Windows DISM API does not support concurrent sessions safely from the same process; every `list`/`info` call is serialised through agent-core's process-global `DismSlot` (at most one DISM call in flight), reporting `windows:dism:busy` to a second caller rather than risking undefined concurrent-session behaviour.",
     "**A timed-out call is `abandoned`, not cleared, until the worker returns.** If `DismGetFeatures`/`DismGetFeatureInfo` exceeds the 17s bounded timeout, the dispatching thread reports `windows:dism:timeout` and marks the slot abandoned; every subsequent call reports `windows:dism:abandoned` until the original worker thread actually finishes and releases the slot — permanently, if DISM itself never returns, cleared only by a service restart.",
     "**Pending states come from the feature enum, not a reboot-pending registry key.** `pending_enable`/`pending_disable` reflect `DismPackageFeatureState`'s `InstallPending`/`UninstallPending` values as reported by DISM itself, not an independent reboot-pending check.",
     "**Feature names are DISM's internal names, not Control Panel labels.** `NetFx3`, `SMB1Protocol`, `TelnetClient` etc. are the `FeatureName` DISM uses internally; the `info` action's `display_name` field carries the operator-visible label.",
@@ -101,7 +101,7 @@
     }
   ],
   "description": "Windows optional OS feature state (enabled/disabled/pending) via the DISM API",
-  "how_it_works": "Both actions run the same DISM session lifecycle, in order, entirely inside one bounded call on a worker thread: acquire the plugin's own in-process slot (`DismSlot`, at most one DISM call in flight at a time) → `DismInitialize` → `DismOpenSession(DISM_ONLINE_IMAGE)` → `DismGetFeatures` (`list`) or `DismGetFeatureInfo` (`info`) → map each `DismPackageFeatureState`/`DismRestartType` int to a named state → `DismCloseSession` → `DismShutdown` → release the slot. `DismApi.dll` is never linked; its eight exports are resolved once at runtime from `System32` (see the source header comment for why). The dispatching thread only ever tries to acquire the slot and waits on the bounded call — the DISM calls themselves always run on the worker.\n\n**What it is NOT.** No enable, disable, add, remove or commit — the eight resolved exports are the plugin's whole DISM surface, and none of them mutates. No `dism.exe` subprocess: everything is an in-process API call. No WMI: `Win32_OptionalFeature` is not used.",
+  "how_it_works": "Both actions run the same DISM session lifecycle, in order, entirely inside one bounded call on a worker thread: acquire agent-core's process-global slot (`DismSlot`, at most one DISM call in flight at a time) → `DismInitialize` → `DismOpenSession(DISM_ONLINE_IMAGE)` → `DismGetFeatures` (`list`) or `DismGetFeatureInfo` (`info`) → map each `DismPackageFeatureState`/`DismRestartType` int to a named state → `DismCloseSession` → `DismShutdown` → release the slot. `DismApi.dll` is never linked; its eight exports are resolved once at runtime from `System32` (see the source header comment for why). The dispatching thread only ever tries to acquire the slot and waits on the bounded call — the DISM session lifecycle, the slot, and the bounded-call wrapping itself all live in agent-core (never unloaded), not this plugin, so a worker that outlives this plugin's own shutdown quiesce never executes plugin-resident code.\n\n**What it is NOT.** No enable, disable, add, remove or commit — the eight resolved exports are the plugin's whole DISM surface, and none of them mutates. No `dism.exe` subprocess: everything is an in-process API call. No WMI: `Win32_OptionalFeature` is not used.",
   "inputs": [
     {
       "constraints": {
@@ -109,7 +109,7 @@
       },
       "default": null,
       "definition_id": "windows.features.info",
-      "description": "The DISM feature name (FeatureName), e.g. NetFx3.",
+      "description": "The DISM feature name (FeatureName), e.g. NetFx3. The plugin additionally refuses any value containing a \"..\" substring (path-traversal guard) even though every individual character in such a value would otherwise match the pattern below.\n",
       "name": "feature",
       "required": true,
       "type": "string"
@@ -401,7 +401,6 @@
       "content/definitions/windows_optional_features.yaml"
     ],
     "plugin": [
-      "agents/plugins/windows_optional_features/src/windows_optional_features_parsers.hpp",
       "agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp"
     ],
     "privilege_row": true,
