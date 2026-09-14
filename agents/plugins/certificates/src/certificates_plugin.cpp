@@ -14,9 +14,10 @@
  *   Windows — CryptoAPI (CertOpenStore, CertEnumCertificatesInStore, etc.)
  *   Linux   — PEM files in /etc/ssl/certs/ parsed in-process via libcrypto
  *             (certificates_x509.hpp) -- no subprocess.
- *   macOS   — System.keychain / SystemRootCertificates.keychain read
- *             in-process via SecItemCopyMatching (certificates_x509.hpp's
- *             DER parse backs the result); the login keychain still reads
+ *   macOS   — System.keychain / SystemRootCertificates.keychain read via a
+ *             bounded, in-process SecItem query in agent-core
+ *             (yuzu/agent/keychain_read.hpp; certificates_x509.hpp's DER
+ *             parse backs the result); the login keychain still reads
  *             via a `security find-certificate` subprocess routed through
  *             the per-user launchd/Aqua session, as a pre-split argv
  *             through the bounded runner (rung 2, #3406 -- see
@@ -70,14 +71,12 @@
 // `yuzu::` lookup in this file -- e.g. `yuzu::TempFile` below would then
 // fail to resolve, since the nested `(anonymous namespace)::yuzu` has no
 // TempFile member.
+#include <sys/stat.h>
 #include <unistd.h>
+#include <yuzu/agent/keychain_read.hpp>     // yuzu::agent::read_keychain_bounded -- agent-core bounded SecItem seam (#3246, #2318a)
 #include <yuzu/agent/passwd_lookup.hpp>    // bounded passwd resolution -- replaces the shell's `~username` expansion (#3406)
 #include <macos_console_user.hpp>          // shared console-user + store/keychain mapping (#2277)
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::run_bounded_subprocess (BR-03)
-#if defined(YUZU_HAVE_SECURITY_FRAMEWORK)
-#include <Security/Security.h>          // SecKeychainOpen/SecItemCopyMatching (WP-B rung-1 System/root read)
-#include <yuzu/agent/scoped_cfref.hpp>  // yuzu::agent::ScopedCFRef<T> (RAII for the CF objects above)
-#endif
 #endif
 
 // NOTE: the Linux leg deliberately includes NO subprocess header. WP-B removed
@@ -697,6 +696,16 @@ constexpr std::chrono::milliseconds kCertParseDeadline{5000};     // one openssl
 // WAN-latent AD lookup is the case that would justify raising THIS one.
 constexpr std::chrono::milliseconds kPasswdLookupDeadline{5000};
 constexpr std::chrono::milliseconds kKeychainReadDeadline{15000}; // one `security find-certificate` keychain read (incl. the login-keychain launchctl/sudo hop)
+// One bounded, in-process SecItem keychain read of System.keychain or
+// SystemRootCertificates.keychain (agents/core/include/yuzu/agent/
+// keychain_read.hpp's read_keychain_bounded). Its own constant rather than
+// reusing kKeychainReadDeadline: that one bounds a CHILD PROCESS the runner
+// can SIGKILL at the deadline, whereas this bounds a detached in-process
+// thread against a wedged securityd that can only be ABANDONED, never
+// killed -- a wall-clock-equal but mechanically different bound, and the
+// two must be able to move independently. Costs a process-global
+// bounded_call slot (see keychain_read.hpp's own comment on the ceiling).
+constexpr std::chrono::milliseconds kSecItemReadDeadline{15000};
 constexpr std::chrono::seconds kCertActionBudget{60};             // whole list/details/delete-verify action, across every keychain it reads
 constexpr std::size_t kMaxCertsPerKeychain = 2000;                // per-keychain parsed-certificate cap
 
@@ -722,217 +731,116 @@ struct CheckedCommandResult {
     // -1 when the child could not be spawned or did not exit normally
     // (signaled, killed at the deadline/cancel).
     int exit_code = -1;
+    // Human-readable reason the capture was not usable (is_usable_capture's
+    // negative case, via capture_failure_detail) -- empty iff `ok`. Lets a
+    // caller fold the runner's own diagnosis into its `not_available|<...>`
+    // row instead of a bare "read failed" that drops the "why".
+    std::string failure_detail;
 };
+
+/// TerminationReason -> the stable text name capture_failure_detail and the
+/// WARN log line below key on (subprocess_runner.hpp:61-72). A plain switch
+/// rather than reusing any enum-to-string elsewhere in the tree, since this
+/// name set (exited/signaled/deadline/cancelled/line_limit/spawn_error) is
+/// TerminationReason's own and nothing else's.
+const char* termination_reason_name(yuzu::agent::TerminationReason reason) {
+    switch (reason) {
+    case yuzu::agent::TerminationReason::exited:
+        return "exited";
+    case yuzu::agent::TerminationReason::signaled:
+        return "signaled";
+    case yuzu::agent::TerminationReason::deadline:
+        return "deadline";
+    case yuzu::agent::TerminationReason::cancelled:
+        return "cancelled";
+    case yuzu::agent::TerminationReason::line_limit:
+        return "line_limit";
+    case yuzu::agent::TerminationReason::spawn_error:
+        return "spawn_error";
+    }
+    return "unknown"; // unreachable -- exhaustive switch above
+}
 
 CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
                                          const yuzu::agent::SubprocessOptions& opts,
                                          std::string_view operation) {
     auto result = yuzu::agent::run_bounded_subprocess(argv, opts);
-    // SRE S1 observability: a deadline kill or capture-cap truncation still
-    // produces an honest sentinel row + rc downstream, but that is only
-    // visible by parsing the emitted output -- a degraded keychain read/parse
-    // would otherwise be silent in the agent log. Surface it, matching
-    // event_logs_plugin.cpp's `log show` WARN pattern.
-    if (result.timed_out || result.output_truncated) {
-        spdlog::warn("certificates: {} {} (timed_out={}, output_truncated={})", operation,
-                     result.timed_out ? "timed out" : "output truncated", result.timed_out,
-                     result.output_truncated);
-    }
     CheckedCommandResult out;
     out.output = std::move(result.output);
     if (result.tool_ran)
         out.exit_code = result.exit_code;
     out.ok = is_usable_capture(result.tool_ran, result.timed_out, result.output_truncated,
                                result.exit_code);
+    // SRE S1 observability: ANY non-ok result -- a deadline kill, capture-cap
+    // truncation, a nonzero exit, a spawn failure, ... -- still produces an
+    // honest sentinel row + rc downstream, but that is only visible by
+    // parsing the emitted output. Surface it, matching
+    // event_logs_plugin.cpp's `log show` WARN pattern; termination_reason
+    // (ADR-3002) is what lets an on-call engineer reading only the log tell
+    // "killed at deadline" (escalate) from "spawn error" (never retry) from
+    // a plain nonzero exit.
+    if (!out.ok) {
+        const char* name = termination_reason_name(result.termination_reason);
+        out.failure_detail = capture_failure_detail(
+            result.tool_ran, result.timed_out, result.output_truncated, result.exit_code, name);
+        spdlog::warn("certificates: {} failed: {} (termination_reason={}, exit_code={})",
+                     operation, out.failure_detail, name, result.exit_code);
+    }
     return out;
 }
 
-// ── System/root keychain read: rung-1 SecItem (WP-B) ────────────────────────
+// ── System/root keychain read: bounded SecItem via agent-core (#3246, #2318a) ──
 //
 // System.keychain and SystemRootCertificates.keychain ONLY -- the login
 // keychain stays on the `security find-certificate` subprocess path via
 // build_login_keychain_read_argv() below (rung-2 pre-split argv since
 // #3406, registered as sink `certificates/list_certs_macos#1` +
 // `certificates/details_cert_macos#1` in docs/agent-spawn-sink-manifest.md).
-// Gated on YUZU_HAVE_SECURITY_FRAMEWORK
-// (meson.build, required:false + -D flag -- same shape as
-// agents/plugins/users/meson.build's YUZU_HAVE_SYSTEMCONFIGURATION gate) so
-// a box without the Security framework still builds; the #else fallback
-// below compiles to an honest "could not read" result rather than reviving
-// a subprocess call, so zero-raw-spawn holds either way.
-#if defined(YUZU_HAVE_SECURITY_FRAMEWORK)
+// The actual bounded SecItem query and its bounded-call wrapping live in
+// agent-core (yuzu::agent::read_keychain_bounded,
+// agents/core/include/yuzu/agent/keychain_read.hpp), not here: bounding a
+// synchronous Security-framework call against a wedged securityd needs
+// bounded_call's detached-thread-plus-abandon pattern, and a plugin
+// .dylib/.so can be dlclose()'d while that detached thread is still
+// executing inside it -- see that header's own comment for the full
+// argument, which mirrors passwd_lookup.hpp's identical constraint.
 
 struct SecItemKeychainResult {
     std::vector<yuzu::certificates_x509::CertFields> certs;
-    bool ok = false;       // false: the keychain itself could not be opened/queried.
-    bool complete = false; // false: kMaxCertsPerKeychain capped the result --
-                            // there were MORE certificates than were parsed.
+    yuzu::agent::KeychainReadStatus status = yuzu::agent::KeychainReadStatus::OpenFailed;
 };
 
+static_assert(kMaxCertsPerKeychain == yuzu::agent::kMaxKeychainReadCerts);
+
 /**
- * Enumerate every certificate in the ONE keychain at `keychain_path` via
- * SecItemCopyMatching (kSecMatchSearchList restricted to just that keychain
- * via SecKeychainOpen, kSecMatchLimitAll, kSecReturnRef) and hand each
- * result's DER encoding (SecCertificateCopyData) to
- * yuzu::certificates_x509::parse_der_cert. test_certificates_x509.cpp is a
- * fixture-only unit suite and cannot exercise this function directly (it
- * needs a real keychain), so the mechanism's equivalence to the
- * `security find-certificate -a -p` subprocess it replaces was established
- * empirically instead, and the check is REPRODUCIBLE rather than anecdotal:
- * enumerate each keychain through this function's query and compare the
- * resulting uppercase SHA-1 thumbprint SET to the set obtained by piping
- * `security find-certificate -a -p <keychain>` through
- * `openssl x509 -noout -fingerprint -sha1` per PEM block. Measured
- * 2026-08-17 on macOS 26.5.2 arm64: System.keychain 3/3 and
- * SystemRootCertificates.keychain 158/158 thumbprints, both sets IDENTICAL
- * (zero diff either way). Re-run that comparison, not a re-read of this
- * comment, when changing the query below.
+ * Adapt agent-core's bounded raw-DER read into this file's own CertFields
+ * shape (to_cert_record/expires_within_days downstream expect
+ * certificates_x509::CertFields, not raw DER bytes). `budget` is the
+ * caller's clamp_to_action_budget(action_deadline, kSecItemReadDeadline)
+ * result -- this function never computes its own deadline.
  *
- * Every CoreFoundation object here is ScopedCFRef-owned (scoped_cfref.hpp)
- * -- read that header's reset()/same-identity contract before touching this
- * function. Every value handed to a ScopedCFRef below is a fresh
- * Create/Copy-rule +1 reference; `CFArrayGetValueAtIndex` results are
- * borrowed (Get-rule) references owned by the array and are never
- * ScopedCFRef-wrapped themselves, only passed to SecCertificateCopyData
- * (which DOES return an owned +1 CFDataRef, and IS wrapped).
- *
- * SecKeychainOpen/SecItemCopyMatching are synchronous CoreFoundation/
- * Security calls with no deadline or cancellation primitive of their own --
- * unlike the bounded subprocess runner they replace, there is no child
- * process here to SIGKILL against a wall clock. `action_deadline` is
- * therefore only ever consulted by the CALLER before invoking this function
- * (skip the call entirely once the action budget is already exhausted),
- * never during the call itself. kMaxCertsPerKeychain still caps how many
- * results are parsed from a single keychain (SecItemKeychainResult::complete
- * reports whether the cap was hit), same discipline as the PEM-block loop
- * (emit_keychain_rows_macos) this replaces for System/root.
- *
- * SecKeychainOpen is deprecated (macOS 10.10+) but remains the API this
- * package's spec calls for and is fully functional on every supported
- * host; the pragma below silences just that one, already-triaged warning.
+ * A DER blob Security.framework accepted but libcrypto's parse_der_cert
+ * rejects downgrades an otherwise-Completed read to Truncated: the read
+ * itself finished, but the result is no longer exhaustive (mirrors the
+ * per-item conversion-failure fold the previous in-plugin implementation
+ * performed at this same seam).
  */
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-SecItemKeychainResult read_keychain_secitem(const char* keychain_path) {
+SecItemKeychainResult read_keychain_secitem(const std::string& keychain_path,
+                                            std::chrono::milliseconds budget) {
+    auto raw = yuzu::agent::read_keychain_bounded(keychain_path, budget);
     SecItemKeychainResult out;
-
-    SecKeychainRef raw_keychain = nullptr;
-    if (SecKeychainOpen(keychain_path, &raw_keychain) != errSecSuccess || !raw_keychain)
-        return out;
-    yuzu::agent::ScopedCFRef<SecKeychainRef> keychain(raw_keychain);
-
-    // SecKeychainOpen DOES NOT VALIDATE THE PATH -- it returns errSecSuccess
-    // and a live SecKeychainRef for a path that does not exist, and for a
-    // file that is not a keychain at all. SecItemCopyMatching over such a
-    // reference then returns errSecItemNotFound, which is indistinguishable
-    // from a genuinely empty keychain -- so without this check a missing,
-    // deleted or corrupt System.keychain would be reported as "read fine,
-    // zero certificates" rather than as a read failure, silently dropping
-    // the entire trust store from a certificate inventory. That is exactly
-    // the class of silent failure the subprocess path's PLAN-12 checked-read
-    // discipline exists to prevent, and `security find-certificate -a -p`
-    // (the call this replaces) DID fail non-zero on both inputs.
-    //
-    // SecKeychainGetStatus is the cheap discriminator (measured on macOS
-    // 26.5.2, arm64): errSecSuccess for a real keychain,
-    // errSecNoSuchKeychain (-25294) for a non-existent path,
-    // errSecInvalidKeychain (-25295) for an existing non-keychain file.
-    SecKeychainStatus keychain_status = 0;
-    if (SecKeychainGetStatus(keychain.get(), &keychain_status) != errSecSuccess)
-        return out; // ok stays false -> the caller emits its read-failed sentinel
-
-    const void* keychain_values[] = {keychain.get()};
-    yuzu::agent::ScopedCFRef<CFArrayRef> search_list(
-        CFArrayCreate(nullptr, keychain_values, 1, &kCFTypeArrayCallBacks));
-    if (!search_list)
-        return out;
-
-    yuzu::agent::ScopedCFRef<CFMutableDictionaryRef> query(CFDictionaryCreateMutable(
-        nullptr, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks));
-    if (!query)
-        return out;
-    CFDictionarySetValue(query.get(), kSecClass, kSecClassCertificate);
-    CFDictionarySetValue(query.get(), kSecMatchSearchList, search_list.get());
-    CFDictionarySetValue(query.get(), kSecMatchLimit, kSecMatchLimitAll);
-    CFDictionarySetValue(query.get(), kSecReturnRef, kCFBooleanTrue);
-
-    CFTypeRef raw_result = nullptr;
-    OSStatus status = SecItemCopyMatching(query.get(), &raw_result);
-    if (status == errSecItemNotFound) {
-        // An empty keychain is a legitimate, successful result: zero
-        // certificates, not a failure.
-        out.ok = true;
-        out.complete = true;
-        return out;
-    }
-    if (status != errSecSuccess || !raw_result)
-        return out;
-    yuzu::agent::ScopedCFRef<CFTypeRef> result(raw_result);
-
-    // kSecMatchLimitAll documents a CFArrayRef result; defensively also
-    // accept a bare (non-array) single-item result, in case a future SDK's
-    // behaviour for a one-item match ever differs from what this header was
-    // verified against.
-    std::vector<CFTypeRef> items;
-    if (CFGetTypeID(result.get()) == CFArrayGetTypeID()) {
-        auto array = static_cast<CFArrayRef>(const_cast<void*>(result.get()));
-        CFIndex count = CFArrayGetCount(array);
-        for (CFIndex i = 0; i < count; ++i)
-            items.push_back(CFArrayGetValueAtIndex(array, i));
-    } else {
-        items.push_back(result.get());
-    }
-
-    out.ok = true;
-    out.complete = items.size() <= kMaxCertsPerKeychain;
-    std::size_t attempted = 0;
-    for (CFTypeRef item : items) {
-        if (attempted >= kMaxCertsPerKeychain)
-            break;
-        ++attempted;
-        auto cert_ref = static_cast<SecCertificateRef>(const_cast<void*>(item));
-        yuzu::agent::ScopedCFRef<CFDataRef> der(SecCertificateCopyData(cert_ref));
-        if (!der) {
-            out.complete = false; // conversion failure -- result is no longer exhaustive
-            continue;
-        }
-        const auto* bytes = CFDataGetBytePtr(der.get());
-        auto len = CFDataGetLength(der.get());
-        if (!bytes || len <= 0) {
-            out.complete = false;
-            continue;
-        }
+    out.status = raw.status;
+    for (const auto& der : raw.certs_der) {
         auto parsed = yuzu::certificates_x509::parse_der_cert(
-            std::span<const unsigned char>(bytes, static_cast<std::size_t>(len)));
+            std::span<const unsigned char>(der.data(), der.size()));
         if (parsed) {
             out.certs.push_back(std::move(*parsed));
-        } else {
-            out.complete = false; // libcrypto rejected a cert Security.framework accepted
+        } else if (out.status == yuzu::agent::KeychainReadStatus::Completed) {
+            out.status = yuzu::agent::KeychainReadStatus::Truncated;
         }
     }
     return out;
 }
-#pragma clang diagnostic pop
-
-#else // !YUZU_HAVE_SECURITY_FRAMEWORK
-
-struct SecItemKeychainResult {
-    std::vector<yuzu::certificates_x509::CertFields> certs;
-    bool ok = false;
-    bool complete = false;
-};
-
-// Honest no-op fallback for a box built without the Security framework --
-// same "genuinely-absent primitive" shape as macos_console_user.hpp's own
-// console_user() fallback. Never falls back to a subprocess call: the
-// caller reports SecItemKeychainResult::ok == false as the same
-// "not_available|<keychain> read failed" sentinel a real SecItem failure
-// would produce.
-SecItemKeychainResult read_keychain_secitem(const char* /*keychain_path*/) {
-    return {};
-}
-
-#endif // YUZU_HAVE_SECURITY_FRAMEWORK
 
 // clamp_to_action_budget, parse_openssl_native_date and strip_leading_blank
 // moved to certificates_macos_parsers.hpp (shared with the unit test).
@@ -1277,63 +1185,45 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         return;
     }
 
-    // System.keychain / SystemRootCertificates.keychain: rung-1 SecItem read
-    // (WP-B) via read_keychain_secitem -- no bounded-subprocess deadline
-    // applies to the call itself (see that function's own comment); the
-    // action_deadline check below only decides whether to even ATTEMPT it.
-    // A checked failure emits an honest sentinel row instead of silently
+    // System.keychain / SystemRootCertificates.keychain: bounded SecItem read
+    // via read_keychain_secitem (agent-core seam, #3246/#2318a) -- budget is
+    // whatever remains of the whole-action budget, clamped to
+    // kSecItemReadDeadline, exactly like the subprocess reads below. A
+    // checked failure emits an honest sentinel row instead of silently
     // contributing zero rows, same discipline PLAN-12 established for the
-    // subprocess path this replaces.
-    if (plan.want_system) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
-            ctx.write_output("not_available|System.keychain action deadline exceeded");
-            mark_result_partial(ctx, "secitem:System.keychain");
-        } else {
-            auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
-            if (sys_result.ok) {
-                for (const auto& cert : sys_result.certs) {
-                    auto rec = to_cert_record(cert, "System.keychain");
-                    if (expires_within_days(rec.not_after, expiring_days)) {
-                        ctx.write_output(rec.to_row());
-                    }
+    // subprocess path SecItem itself replaced.
+    auto emit_secitem_keychain = [&](std::string_view label, const std::string& path) {
+        auto budget = clamp_to_action_budget(action_deadline, kSecItemReadDeadline);
+        if (budget <= std::chrono::milliseconds::zero()) {
+            ctx.write_output(std::format("not_available|{} action deadline exceeded", label));
+            mark_result_partial(ctx, secitem_provenance(label));
+            return;
+        }
+        auto r = read_keychain_secitem(path, budget);
+        if (r.status == yuzu::agent::KeychainReadStatus::Completed ||
+            r.status == yuzu::agent::KeychainReadStatus::Truncated) {
+            for (const auto& cert : r.certs) {
+                auto rec = to_cert_record(cert, std::string(label));
+                if (expires_within_days(rec.not_after, expiring_days)) {
+                    ctx.write_output(rec.to_row());
                 }
-                if (!sys_result.complete) {
-                    ctx.write_output("not_available|System.keychain scan incomplete");
-                    mark_result_partial(ctx, "secitem:System.keychain");
-                }
-            } else {
-                ctx.write_output("not_available|System.keychain read failed");
-                mark_result_partial(ctx, "secitem:System.keychain");
             }
         }
+        if (r.status == yuzu::agent::KeychainReadStatus::TimedOut) {
+            spdlog::warn("certificates: {} secitem read timed out", label);
+        }
+        if (auto reason = secitem_failure_reason(r.status, label)) {
+            ctx.write_output(std::format("not_available|{}", *reason));
+            mark_result_partial(ctx, secitem_provenance(label), *reason);
+        }
+    };
+
+    if (plan.want_system) {
+        emit_secitem_keychain("System.keychain", yuzu::macos::system_keychain_path());
     }
 
     if (plan.want_root) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
-            ctx.write_output(
-                "not_available|SystemRootCertificates.keychain action deadline exceeded");
-            mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
-        } else {
-            auto root_result = read_keychain_secitem(yuzu::macos::root_keychain_path().c_str());
-            if (root_result.ok) {
-                for (const auto& cert : root_result.certs) {
-                    auto rec = to_cert_record(cert, "SystemRootCertificates.keychain");
-                    if (expires_within_days(rec.not_after, expiring_days)) {
-                        ctx.write_output(rec.to_row());
-                    }
-                }
-                if (!root_result.complete) {
-                    ctx.write_output(
-                        "not_available|SystemRootCertificates.keychain scan incomplete");
-                    mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
-                }
-            } else {
-                ctx.write_output("not_available|SystemRootCertificates.keychain read failed");
-                mark_result_partial(ctx, "secitem:SystemRootCertificates.keychain");
-            }
-        }
+        emit_secitem_keychain("SystemRootCertificates.keychain", yuzu::macos::root_keychain_path());
     }
 
     if (plan.want_login) {
@@ -1347,54 +1237,82 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         // uid/username resolve_console_user() had already validated: defensive
         // only, and a genuinely different (internal) fault. Reporting both as
         // "command construction failed" told the operator the wrong thing.
-        auto argv = console_user->home_dir.empty()
-                        ? std::vector<std::string>{}
-                        : yuzu::macos::build_login_keychain_read_argv(
-                              console_user->uid, console_user->username,
-                              console_user->home_dir, caller_is_root());
-        if (console_user->home_dir.empty()) {
-            ctx.write_output(
-                "not_available|login keychain home directory unresolved for console user");
-            mark_result_partial(ctx, "login-keychain");
-        } else if (argv.empty()) {
-            ctx.write_output("not_available|login keychain command construction failed");
-            mark_result_partial(ctx, "login-keychain");
-        } else {
-            auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
-            if (read_deadline <= std::chrono::milliseconds::zero()) {
-                ctx.write_output("not_available|login keychain action deadline exceeded");
+        // #2318b: re-confirm the console session owner immediately before
+        // this spawn. resolve_console_user() above ran a Directory Services
+        // lookup that can itself take seconds; the in-process
+        // ::stat("/dev/console") here needs none, so the window between
+        // "who is logged in" and "whose keychain are we about to read" -- a
+        // fast-user-switch could change it in between -- shrinks from tens
+        // of seconds to microseconds. Not eliminated: see
+        // classify_console_owner_recheck's own comment. No new spawn is
+        // added by this check, so it adds no sink-manifest row.
+        struct stat console_st {};
+        const bool console_stat_ok = ::stat("/dev/console", &console_st) == 0;
+        switch (classify_console_owner_recheck(
+            console_stat_ok, static_cast<unsigned long long>(console_st.st_uid),
+            console_user->uid)) {
+        case ConsoleOwnerRecheck::kChanged:
+            ctx.write_output("not_available|console user changed");
+            mark_result_partial(ctx, "login-keychain", "console user changed");
+            break;
+        case ConsoleOwnerRecheck::kUnknown:
+            ctx.write_output("not_available|console user recheck failed");
+            mark_result_partial(ctx, "login-keychain", "console user recheck failed");
+            break;
+        case ConsoleOwnerRecheck::kUnchanged: {
+            spdlog::info("certificates: login keychain read for console user {} (uid {})",
+                        console_user->username, console_user->uid);
+            auto argv = console_user->home_dir.empty()
+                            ? std::vector<std::string>{}
+                            : yuzu::macos::build_login_keychain_read_argv(
+                                  console_user->uid, console_user->username,
+                                  console_user->home_dir, caller_is_root());
+            if (console_user->home_dir.empty()) {
+                ctx.write_output(
+                    "not_available|login keychain home directory unresolved for console user");
+                mark_result_partial(ctx, "login-keychain");
+            } else if (argv.empty()) {
+                ctx.write_output("not_available|login keychain command construction failed");
                 mark_result_partial(ctx, "login-keychain");
             } else {
-                // Pre-split argv through the bounded runner -- no shell
-                // (#3406, rung 2). The former "/bin/sh -c" hop existed for
-                // exactly two shell features, both now provided without
-                // one: `~username` tilde expansion (resolve_passwd_entry's
-                // bounded passwd lookup above -- the same lookup the shell
-                // performed) and a `2>/dev/null` redirect (the runner's
-                // merge_stderr=false default already discards child
-                // stderr). The launchctl/sudo/security session hop itself
-                // never needed a shell -- it execs fine as plain argv.
-                // sink: certificates/list_certs_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
-                auto login_result = run_bounded_checked(
-                    argv,
-                    yuzu::agent::SubprocessOptions{.deadline = read_deadline},
-                    "login keychain read");
-                if (login_result.ok) {
-                    if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
-                                                  expiring_days, action_deadline)) {
-                        ctx.write_output("not_available|login keychain scan incomplete");
+                auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+                if (read_deadline <= std::chrono::milliseconds::zero()) {
+                    ctx.write_output("not_available|login keychain action deadline exceeded");
+                    mark_result_partial(ctx, "login-keychain");
+                } else {
+                    // Pre-split argv through the bounded runner -- no shell
+                    // (#3406, rung 2). The former "/bin/sh -c" hop existed for
+                    // exactly two shell features, both now provided without
+                    // one: `~username` tilde expansion (resolve_passwd_entry's
+                    // bounded passwd lookup above -- the same lookup the shell
+                    // performed) and a `2>/dev/null` redirect (the runner's
+                    // merge_stderr=false default already discards child
+                    // stderr). The launchctl/sudo/security session hop itself
+                    // never needed a shell -- it execs fine as plain argv.
+                    // sink: certificates/list_certs_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
+                    auto login_result = run_bounded_checked(
+                        argv,
+                        yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                        "login keychain read");
+                    if (login_result.ok) {
+                        if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
+                                                      expiring_days, action_deadline)) {
+                            ctx.write_output("not_available|login keychain scan incomplete");
+                            mark_result_partial(ctx, "login-keychain");
+                        }
+                    } else {
+                        // A missing sudoers grant, a launchctl/sudo failure, or an
+                        // inaccessible keychain path all land here. Report it
+                        // honestly instead of emitting zero rows, which would be
+                        // indistinguishable from "this keychain is genuinely
+                        // empty".
+                        ctx.write_output("not_available|login keychain read failed");
                         mark_result_partial(ctx, "login-keychain");
                     }
-                } else {
-                    // A missing sudoers grant, a launchctl/sudo failure, or an
-                    // inaccessible keychain path all land here. Report it
-                    // honestly instead of emitting zero rows, which would be
-                    // indistinguishable from "this keychain is genuinely
-                    // empty".
-                    ctx.write_output("not_available|login keychain read failed");
-                    mark_result_partial(ctx, "login-keychain");
                 }
             }
+            break;
+        }
         }
     }
 }
@@ -1479,9 +1397,10 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // (System/root, WP-B rung-1) instead of raw PEM blocks -- reuses the
     // SAME classify_block_identity decision `check` above uses, so the two
     // scans can never drift on what counts as a match/no-match/inconclusive
-    // identity. `result.complete == false` (kMaxCertsPerKeychain capped the
-    // read) folds into kIncomplete exactly like `check`'s own cap/deadline
-    // check does.
+    // identity. `result.status != Completed` (Truncated: kMaxCertsPerKeychain
+    // capped the read, or a DER blob failed to parse; anything worse never
+    // reaches here -- see scan_secitem_store) folds into kIncomplete exactly
+    // like `check`'s own cap/deadline check does.
     auto check_secitem = [&](const SecItemKeychainResult& result,
                              const std::string& store) -> ScanOutcome {
         for (const auto& cert : result.certs) {
@@ -1495,7 +1414,9 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                 break;
             }
         }
-        return result.complete ? ScanOutcome::kNotFound : ScanOutcome::kIncomplete;
+        return result.status == yuzu::agent::KeychainReadStatus::Completed
+                   ? ScanOutcome::kNotFound
+                   : ScanOutcome::kIncomplete;
     };
 
     // A checked read failure, an exhausted action budget, or an incomplete
@@ -1506,138 +1427,157 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // successfully is still reported normally, even if an earlier store
     // had already failed.
     bool read_failed = console_user_degraded;
-    std::string_view failure_reason = console_user_degraded ? cu.degrade_reason : std::string_view{};
+    // std::string rather than std::string_view (fix-round shape, B3): unlike
+    // the previous file-local literals, System/root failure text is now
+    // COMPUTED by secitem_failure_reason and would dangle as a view into a
+    // temporary.
+    std::string failure_reason =
+        console_user_degraded ? std::string(cu.degrade_reason) : std::string{};
     // Which half of the hybrid read failed, for the ABI4 result seam below --
     // set together with failure_reason at every site (first failure wins), so
     // the machine-visible provenance can never name a different keychain from
     // the operator-visible reason.
-    std::string_view failure_provenance = console_user_degraded ? "login-keychain" : std::string_view{};
+    std::string failure_provenance = console_user_degraded ? "login-keychain" : std::string{};
 
-    if (plan.want_system) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
+    // System.keychain / SystemRootCertificates.keychain: bounded SecItem read
+    // (agent-core seam, #3246/#2318a) -- same budget discipline and failure
+    // vocabulary as list_certs_macos's emit_secitem_keychain.
+    auto scan_secitem_store = [&](std::string_view label, const std::string& path) {
+        auto budget = clamp_to_action_budget(action_deadline, kSecItemReadDeadline);
+        if (budget <= std::chrono::milliseconds::zero()) {
             if (!read_failed) {
                 read_failed = true;
-                failure_reason = "System.keychain action deadline exceeded";
-                failure_provenance = "secitem:System.keychain";
+                failure_reason = std::format("{} action deadline exceeded", label);
+                failure_provenance = secitem_provenance(label);
             }
-        } else {
-            auto sys_result = read_keychain_secitem(yuzu::macos::system_keychain_path().c_str());
-            if (!sys_result.ok) {
-                if (!read_failed) {
-                    read_failed = true;
-                    failure_reason = "System.keychain read failed";
-                    failure_provenance = "secitem:System.keychain";
-                }
-            } else {
-                switch (check_secitem(sys_result, "System.keychain")) {
-                case ScanOutcome::kFound:
-                    return;
-                case ScanOutcome::kIncomplete:
-                    if (!read_failed) {
-                        read_failed = true;
-                        failure_reason = "System.keychain scan incomplete";
-                        failure_provenance = "secitem:System.keychain";
-                    }
-                    break;
-                case ScanOutcome::kNotFound:
-                    break;
-                }
-            }
+            return false; // not found -- caller should not return early
         }
+        auto result = read_keychain_secitem(path, budget);
+        const bool ok = result.status == yuzu::agent::KeychainReadStatus::Completed ||
+                        result.status == yuzu::agent::KeychainReadStatus::Truncated;
+        if (!ok) {
+            if (!read_failed) {
+                read_failed = true;
+                failure_reason = *secitem_failure_reason(result.status, label);
+                failure_provenance = secitem_provenance(label);
+            }
+            return false;
+        }
+        switch (check_secitem(result, std::string(label))) {
+        case ScanOutcome::kFound:
+            return true;
+        case ScanOutcome::kIncomplete:
+            if (!read_failed) {
+                read_failed = true;
+                auto reason = secitem_failure_reason(result.status, label);
+                failure_reason = reason ? *reason : std::format("{} scan incomplete", label);
+                failure_provenance = secitem_provenance(label);
+            }
+            return false;
+        case ScanOutcome::kNotFound:
+            return false;
+        }
+        return false; // unreachable -- exhaustive switch above
+    };
+
+    if (plan.want_system) {
+        if (scan_secitem_store("System.keychain", yuzu::macos::system_keychain_path()))
+            return;
     }
 
     if (plan.want_root) {
-        if (clamp_to_action_budget(action_deadline, kKeychainReadDeadline) <=
-            std::chrono::milliseconds::zero()) {
-            if (!read_failed) {
-                read_failed = true;
-                failure_reason = "SystemRootCertificates.keychain action deadline exceeded";
-                failure_provenance = "secitem:SystemRootCertificates.keychain";
-            }
-        } else {
-            auto root_result = read_keychain_secitem(yuzu::macos::root_keychain_path().c_str());
-            if (!root_result.ok) {
-                if (!read_failed) {
-                    read_failed = true;
-                    failure_reason = "SystemRootCertificates.keychain read failed";
-                    failure_provenance = "secitem:SystemRootCertificates.keychain";
-                }
-            } else {
-                switch (check_secitem(root_result, "SystemRootCertificates.keychain")) {
-                case ScanOutcome::kFound:
-                    return;
-                case ScanOutcome::kIncomplete:
-                    if (!read_failed) {
-                        read_failed = true;
-                        failure_reason = "SystemRootCertificates.keychain scan incomplete";
-                        failure_provenance = "secitem:SystemRootCertificates.keychain";
-                    }
-                    break;
-                case ScanOutcome::kNotFound:
-                    break;
-                }
-            }
-        }
+        if (scan_secitem_store("SystemRootCertificates.keychain", yuzu::macos::root_keychain_path()))
+            return;
     }
 
     if (plan.want_login) {
-        // See list_certs_macos's matching comment: home-resolution failure and
-        // a defensive argv-construction failure are distinct faults and are
-        // reported as such.
-        auto argv = console_user->home_dir.empty()
-                        ? std::vector<std::string>{}
-                        : yuzu::macos::build_login_keychain_read_argv(
-                              console_user->uid, console_user->username,
-                              console_user->home_dir, caller_is_root());
-        if (argv.empty()) {
+        // #2318b: re-confirm the console session owner immediately before
+        // this spawn -- see list_certs_macos's matching comment for the full
+        // rationale (resolve_console_user's DS lookup vs. this in-process
+        // stat, the shrunk-not-eliminated race window, no new sink row).
+        struct stat console_st {};
+        const bool console_stat_ok = ::stat("/dev/console", &console_st) == 0;
+        switch (classify_console_owner_recheck(
+            console_stat_ok, static_cast<unsigned long long>(console_st.st_uid),
+            console_user->uid)) {
+        case ConsoleOwnerRecheck::kChanged:
             if (!read_failed) {
                 read_failed = true;
-                failure_reason = console_user->home_dir.empty()
-                                     ? "login keychain home directory unresolved for console user"
-                                     : "login keychain command construction failed";
+                failure_reason = "console user changed";
                 failure_provenance = "login-keychain";
             }
-        } else {
-            auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
-            if (read_deadline <= std::chrono::milliseconds::zero()) {
+            break;
+        case ConsoleOwnerRecheck::kUnknown:
+            if (!read_failed) {
+                read_failed = true;
+                failure_reason = "console user recheck failed";
+                failure_provenance = "login-keychain";
+            }
+            break;
+        case ConsoleOwnerRecheck::kUnchanged: {
+            spdlog::info("certificates: login keychain read for console user {} (uid {})",
+                        console_user->username, console_user->uid);
+            // See list_certs_macos's matching comment: home-resolution failure
+            // and a defensive argv-construction failure are distinct faults
+            // and are reported as such.
+            auto argv = console_user->home_dir.empty()
+                            ? std::vector<std::string>{}
+                            : yuzu::macos::build_login_keychain_read_argv(
+                                  console_user->uid, console_user->username,
+                                  console_user->home_dir, caller_is_root());
+            if (argv.empty()) {
                 if (!read_failed) {
                     read_failed = true;
-                    failure_reason = "login keychain action deadline exceeded";
+                    failure_reason =
+                        console_user->home_dir.empty()
+                            ? "login keychain home directory unresolved for console user"
+                            : "login keychain command construction failed";
                     failure_provenance = "login-keychain";
                 }
             } else {
-                // See list_certs_macos's matching comment: pre-split argv
-                // through the bounded runner, no shell (#3406, rung 2) --
-                // tilde expansion is replaced by
-                // resolve_passwd_entry's bounded passwd lookup above.
-                // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
-                auto login_result = run_bounded_checked(
-                    argv,
-                    yuzu::agent::SubprocessOptions{.deadline = read_deadline},
-                    "login keychain read");
-                if (!login_result.ok) {
+                auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+                if (read_deadline <= std::chrono::milliseconds::zero()) {
                     if (!read_failed) {
                         read_failed = true;
-                        failure_reason = "login keychain read failed";
+                        failure_reason = "login keychain action deadline exceeded";
                         failure_provenance = "login-keychain";
                     }
                 } else {
-                    switch (check(login_result.output, "login.keychain-db")) {
-                    case ScanOutcome::kFound:
-                        return;
-                    case ScanOutcome::kIncomplete:
+                    // See list_certs_macos's matching comment: pre-split argv
+                    // through the bounded runner, no shell (#3406, rung 2) --
+                    // tilde expansion is replaced by
+                    // resolve_passwd_entry's bounded passwd lookup above.
+                    // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
+                    auto login_result = run_bounded_checked(
+                        argv,
+                        yuzu::agent::SubprocessOptions{.deadline = read_deadline},
+                        "login keychain read");
+                    if (!login_result.ok) {
                         if (!read_failed) {
                             read_failed = true;
-                            failure_reason = "login keychain scan incomplete";
+                            failure_reason = std::format("login keychain read failed ({})",
+                                                        login_result.failure_detail);
                             failure_provenance = "login-keychain";
                         }
-                        break;
-                    case ScanOutcome::kNotFound:
-                        break;
+                    } else {
+                        switch (check(login_result.output, "login.keychain-db")) {
+                        case ScanOutcome::kFound:
+                            return;
+                        case ScanOutcome::kIncomplete:
+                            if (!read_failed) {
+                                read_failed = true;
+                                failure_reason = "login keychain scan incomplete";
+                                failure_provenance = "login-keychain";
+                            }
+                            break;
+                        case ScanOutcome::kNotFound:
+                            break;
+                        }
                     }
                 }
             }
+            break;
+        }
         }
     }
 
