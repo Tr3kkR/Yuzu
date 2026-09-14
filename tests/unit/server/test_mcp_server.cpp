@@ -1001,6 +1001,20 @@ struct McpTestServer {
     /// pre-existing test on the "result-set store unavailable" path.
     yuzu::server::ResultSetStore* result_set_store_for_test{nullptr};
 
+    /// #2146 Batch B3 — optionally wire a real FleetTopologyStore (+ optional
+    /// OfflineEndpointStore + kill switch) so get_fleet_topology/
+    /// get_host_topology can be exercised end-to-end, same setter-idiom
+    /// pattern as preflight_run_store_for_test above. Default nullptr keeps
+    /// every pre-existing test on the "store unavailable" path.
+    /// offline_endpoint_store_for_test stays null even when
+    /// fleet_topology_store_for_test is set (matching production's
+    /// null-offline-store legacy behavior) unless a test opts in.
+    /// viz_kill_switch_for_test defaults to false (feature enabled) so an
+    /// opted-in viz test isn't silently 503'd.
+    yuzu::server::FleetTopologyStore* fleet_topology_store_for_test{nullptr};
+    yuzu::server::OfflineEndpointStore* offline_endpoint_store_for_test{nullptr};
+    std::atomic<bool> viz_kill_switch_for_test{false};
+
     /// ar-S1: optionally wire a GuaranteedStateStore so the DEX read tools
     /// (list_dex_signals / get_dex_signal_scope / get_dex_signal_detail) can be
     /// exercised. Default nullptr keeps every existing test on the no-store path
@@ -1415,6 +1429,11 @@ private:
         if (baseline_store_for_test)
             mcp.set_baseline_store(baseline_store_for_test);
         mcp.set_guardian_push_fn(guardian_push_fn_for_test);
+        // #2146 Batch B3: the viz store trio ALSO rides a setter, same
+        // pattern as the ones above — wire before the handlers are built.
+        if (fleet_topology_store_for_test)
+            mcp.set_viz_deps(fleet_topology_store_for_test, offline_endpoint_store_for_test,
+                             &viz_kill_switch_for_test);
 
         // 2f: build GET/DELETE handlers FIRST — they copy auth_fn/audit_fn, which
         // build_handler std::move()s below.
@@ -21187,6 +21206,593 @@ TEST_CASE("CH-5/CH-6: streamed POSTs debit the shared budget and leave the plain
         CHECK(quota.in_flight("engine:ch6") == 0);
         tls_quota_slot().reset();
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// #2146 Batch B3 (api-parity programme) — execution/fleet statistics +
+// fleet visualization REST+MCP twins. Round-trip proof that each MCP tool
+// actually reaches its store and returns rows built by the SAME shared
+// functions the REST twins call (execution_statistics_model.hpp /
+// fleet_topology_types.hpp's to_json ADL / merge_offline_topology), per
+// api-twin-recipe.md Rule 1 — plus one permission-denied test per tool
+// pinning the EXACT (securable, operation) gate against the REST route it
+// twins (viz_routes.cpp / rest_api_v1.cpp).
+// ═════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+Execution b3_make_exec(const std::string& def_id, const std::string& status, int targeted,
+                       int success, int failure, int64_t dispatched_at, int64_t completed_at) {
+    Execution e;
+    e.definition_id = def_id;
+    e.status = status;
+    e.scope_expression = "ostype = 'windows'";
+    e.dispatched_by = "admin";
+    e.agents_targeted = targeted;
+    e.agents_success = success;
+    e.agents_failure = failure;
+    e.dispatched_at = dispatched_at;
+    e.completed_at = completed_at;
+    return e;
+}
+
+void b3_insert_agent_status(ExecutionTracker& tracker, const std::string& exec_id,
+                            const std::string& agent_id, const std::string& status, int exit_code,
+                            int64_t dispatched_at, int64_t completed_at) {
+    AgentExecStatus s;
+    s.agent_id = agent_id;
+    s.status = status;
+    s.exit_code = exit_code;
+    s.dispatched_at = dispatched_at;
+    s.first_response_at = dispatched_at + 1;
+    s.completed_at = completed_at;
+    tracker.update_agent_status(exec_id, s);
+}
+
+RawAgentSnapshot b3_mk_agent(std::string id, std::string host) {
+    RawAgentSnapshot r;
+    r.agent_id = std::move(id);
+    r.hostname = std::move(host);
+    r.os = "linux";
+    r.ts = 1715299200;
+    return r;
+}
+
+FleetTopologyStore::Fetcher b3_fixed_fetcher(std::vector<RawAgentSnapshot> data) {
+    return [data = std::move(data)](std::chrono::milliseconds) { return data; };
+}
+
+} // namespace
+
+// ── get_execution_statistics ──────────────────────────────────────────────
+
+TEST_CASE("MCP get_execution_statistics: reads LIVE fleet summary, sharing "
+          "fleet_execution_summary_json with the REST twin",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-b3-1", "succeeded", 2, 2, 0, now - 100, now - 90);
+    REQUIRE(tracker.create_execution(e1).has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_execution_statistics",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["total_executions"] == 1);
+    CHECK(payload["overall_success_rate"] > 99.0);
+    CHECK(payload.contains("executions_today"));
+    CHECK(payload.contains("active_agents"));
+    CHECK(payload.contains("avg_duration_seconds"));
+
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.get_execution_statistics|success");
+}
+
+TEST_CASE("MCP get_execution_statistics: denies without Execution:Read",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Execution" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"get_execution_statistics",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── get_execution_statistics_by_agent ─────────────────────────────────────
+
+TEST_CASE("MCP get_execution_statistics_by_agent: reads LIVE per-agent rollup, sharing "
+          "agent_execution_stats_row_json with the REST twin",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-b3-agent", "succeeded", 1, 1, 0, now - 300, now - 290);
+    auto id1 = tracker.create_execution(e1);
+    REQUIRE(id1.has_value());
+    b3_insert_agent_status(tracker, *id1, "agent-b3-1", "success", 0, now - 300, now - 290);
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{"agent_id":"agent-b3-1"}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["data"].is_array());
+    REQUIRE(payload["data"].size() == 1);
+    CHECK(payload["data"][0]["agent_id"] == "agent-b3-1");
+    CHECK(payload["data"][0]["total_executions"] == 1);
+    CHECK(payload["data"][0]["success_count"] == 1);
+
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.get_execution_statistics_by_agent|success");
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: an invalid limit answers kInvalidParams, "
+          "not a silent default (retry-hint-exempt: malformed input)",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{"limit":"not-a-number"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: a too-long or control-character "
+          "agent_id is rejected, matching list_guardian_events' own floor",
+          "[pg][mcp][integration][operator_surface]") {
+    // Gate 8 security-guardian finding (#2146 Batch B3 review): the Gate 4/6
+    // fix round added this floor (auth::kMaxAgentIdLength + control-char
+    // rejection) but shipped with no dedicated test - closes that gap.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string with_control_char = std::string("agent-") + '\x01' + "id";
+    for (const std::string& bad_id : {too_long, with_control_char}) {
+        nlohmann::json req_json = {
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 4},
+            {"params",
+             {{"name", "get_execution_statistics_by_agent"},
+              {"arguments", {{"agent_id", bad_id}}}}}};
+        auto res = ts.call(req_json.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInvalidParams);
+    }
+}
+
+TEST_CASE("MCP get_execution_statistics_by_agent: denies without Execution:Read",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Execution" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":)"
+        R"("get_execution_statistics_by_agent","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── get_execution_statistics_by_definition ────────────────────────────────
+
+TEST_CASE("MCP get_execution_statistics_by_definition: reads LIVE per-definition rollup, "
+          "sharing definition_execution_stats_row_json with the REST twin",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-b3-def", "succeeded", 2, 2, 0, now - 100, now - 90);
+    REQUIRE(tracker.create_execution(e1).has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":)"
+        R"("get_execution_statistics_by_definition","arguments":{"definition_id":"def-b3-def"}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["data"].is_array());
+    REQUIRE(payload["data"].size() == 1);
+    CHECK(payload["data"][0]["definition_id"] == "def-b3-def");
+    CHECK(payload["data"][0]["total_executions"] == 1);
+    CHECK(payload["data"][0]["total_agents"] == 2);
+
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.get_execution_statistics_by_definition|success");
+}
+
+TEST_CASE("MCP get_execution_statistics_by_definition: a too-long or "
+          "control-character definition_id is rejected",
+          "[pg][mcp][integration][operator_surface]") {
+    // Gate 8 security-guardian finding (#2146 Batch B3 review): the Gate 4/6
+    // fix round added this floor (auth::kMaxAgentIdLength + control-char
+    // rejection, matching the schema's declared maxLength:256) but shipped
+    // with no dedicated test - closes that gap.
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string with_control_char = std::string("def-") + '\x01' + "id";
+    for (const std::string& bad_id : {too_long, with_control_char}) {
+        nlohmann::json req_json = {
+            {"jsonrpc", "2.0"},
+            {"method", "tools/call"},
+            {"id", 6},
+            {"params",
+             {{"name", "get_execution_statistics_by_definition"},
+              {"arguments", {{"definition_id", bad_id}}}}}};
+        auto res = ts.call(req_json.dump());
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == mcp::kInvalidParams);
+    }
+}
+
+TEST_CASE("MCP get_execution_statistics_by_definition: denies without Execution:Read",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Execution" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":)"
+        R"("get_execution_statistics_by_definition","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── get_fleet_statistics ───────────────────────────────────────────────────
+
+TEST_CASE("MCP get_fleet_statistics: reads LIVE fleet summary reshaped under executions, "
+          "sharing fleet_statistics_json with the REST twin",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto now = operator_surface_now();
+    auto e1 = b3_make_exec("def-b3-fleet", "succeeded", 4, 4, 0, now - 100, now - 90);
+    REQUIRE(tracker.create_execution(e1).has_value());
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"get_fleet_statistics",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload.contains("executions"));
+    CHECK(payload["executions"]["total"] == 1);
+    CHECK(payload["executions"]["success_rate"] > 99.0);
+    CHECK(payload.contains("active_agents"));
+
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "mcp.get_fleet_statistics|success");
+}
+
+TEST_CASE("MCP get_fleet_statistics: denies without Infrastructure:Read",
+          "[pg][mcp][integration][operator_surface]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = &tracker;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Infrastructure" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"get_fleet_statistics",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── get_fleet_topology ─────────────────────────────────────────────────────
+
+TEST_CASE("MCP get_fleet_topology: reads LIVE FleetTopologyStore snapshot, sharing the "
+          "fleet_topology.v1 wire shape with the REST twin",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1"),
+                                       b3_mk_agent("agent-viz-2", "host-viz-2")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
+                             /*ttl=*/std::chrono::seconds(60),
+                             /*fetch_deadline=*/std::chrono::milliseconds(50),
+                             /*max_snapshot_bytes=*/0};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["schema"] == "fleet_topology.v1");
+    REQUIRE(payload["machines"].is_array());
+    CHECK(payload["machines"].size() == 2);
+
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "viz.fleet_topology|success");
+}
+
+TEST_CASE("MCP get_fleet_topology: kill switch answers before Response:Read is even "
+          "consulted (DEP-1 tier-before-permission)",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    // Denies EVERY securable/operation -- if the kill switch didn't
+    // short-circuit before perm_fn, this would 403 instead of the kill
+    // switch's own error.
+    ts.perm_override_for_test = [](const std::string&, const std::string&) -> bool {
+        return false;
+    };
+    ts.viz_kill_switch_for_test.store(true, std::memory_order_release);
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":11,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("yuzu_viz_disabled") !=
+         std::string::npos);
+}
+
+TEST_CASE("MCP get_fleet_topology: machines_max rejects an oversize snapshot rather than "
+          "truncating it (M-1 DoS cap)",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1"),
+                                       b3_mk_agent("agent-viz-2", "host-viz-2")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":12,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{"machines_max":1}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("machines_max") != std::string::npos);
+}
+
+// gov cpp-safety finding (#2146 B3): fresh=true's cache-busting semantics
+// (invalidate() before get(), same as REST) had no MCP-level test.
+TEST_CASE("MCP get_fleet_topology: fresh=true busts the shared 60s cache before reading",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed)), /*nvd=*/nullptr,
+                             /*ttl=*/std::chrono::seconds(60),
+                             /*fetch_deadline=*/std::chrono::milliseconds(50),
+                             /*max_snapshot_bytes=*/0};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    // First call: cold cache -> a miss.
+    auto res1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res1);
+    const auto misses_after_first = store.cache_misses();
+    CHECK(misses_after_first >= 1);
+
+    // Second call, no fresh: warm cache -> no additional miss.
+    auto res2 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res2);
+    CHECK(store.cache_misses() == misses_after_first);
+
+    // Third call with fresh=true: must bust the cache -> another miss, even
+    // though the TTL has not elapsed.
+    auto res3 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":15,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{"fresh":true}}})");
+    REQUIRE(res3);
+    CHECK(store.cache_misses() > misses_after_first);
+
+    // The invalidate audit row precedes the read's own success row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "viz.fleet_topology.invalidate|success");
+    CHECK(ts.audit_log.back() == "viz.fleet_topology|success");
+}
+
+TEST_CASE("MCP get_fleet_topology: denies without Response:Read",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Response" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":13,"params":{"name":"get_fleet_topology",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── get_host_topology ──────────────────────────────────────────────────────
+
+TEST_CASE("MCP get_host_topology: reads LIVE FleetTopologyStore, sharing the "
+          "host_topology.v1 wire shape with the REST twin",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":14,"params":{"name":"get_host_topology",)"
+        R"("arguments":{"agent_id":"agent-viz-1"}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["schema"] == "host_topology.v1");
+    CHECK(payload["machine"]["agent_id"] == "agent-viz-1");
+    CHECK(payload["machine"]["hostname"] == "host-viz-1");
+
+    REQUIRE(ts.audit_log.size() == 1);
+    CHECK(ts.audit_log[0] == "viz.host_topology|success");
+}
+
+TEST_CASE("MCP get_host_topology: not-found for an agent absent from the live snapshot",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":15,"params":{"name":"get_host_topology",)"
+        R"("arguments":{"agent_id":"does-not-exist"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["message"].get<std::string>().find("host not found") != std::string::npos);
+}
+
+TEST_CASE("MCP get_host_topology: a too-long or control-character agent_id is "
+          "rejected before it reaches the audit trail",
+          "[mcp][integration][viz]") {
+    // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review):
+    // AuditStore's sanitizer scrubs invalid UTF-8/NUL but not other C0
+    // control bytes, so an unfloored agent_id let any Response:Read holder
+    // write raw control bytes/CR-LF into the audit trail's target_id. Pins
+    // the fix mirroring list_guardian_events/get_execution_statistics_by_agent's
+    // own floor.
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.start();
+
+    const std::string too_long(auth::kMaxAgentIdLength + 1, 'a');
+    const std::string with_control_char = std::string("agent-") + '\x01' + "id";
+    // Gate 8 (this same review round) caught a false-green in an earlier
+    // version of this test: get_host_topology's "not found" branch ALSO
+    // returns kInvalidParams for an agent_id absent from the seeded
+    // snapshot, which BOTH bad ids here are - asserting only the error code
+    // could not distinguish "floor caught it" from "floor absent, host
+    // merely doesn't exist." Asserting the specific message text, and that
+    // NO audit row was written (the floor returns before try_persist_audit
+    // is ever called; "not found" DOES audit), closes that gap.
+    for (const auto& [bad_id, expected_fragment] :
+         std::vector<std::pair<std::string, std::string>>{{too_long, "too long"},
+                                                           {with_control_char,
+                                                            "control characters"}}) {
+        nlohmann::json req_json = {{"jsonrpc", "2.0"},
+                                   {"method", "tools/call"},
+                                   {"id", 16},
+                                   {"params",
+                                    {{"name", "get_host_topology"},
+                                     {"arguments", {{"agent_id", bad_id}}}}}};
+        auto res = ts.call(req_json.dump());
+        REQUIRE(res);
+        INFO("expected_fragment: " << expected_fragment);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK(body["error"]["message"].get<std::string>().find(expected_fragment) !=
+              std::string::npos);
+    }
+    CHECK(ts.audit_log.empty());
+}
+
+TEST_CASE("MCP get_host_topology: denies without Response:Read",
+          "[mcp][integration][viz]") {
+    std::vector<RawAgentSnapshot> seed{b3_mk_agent("agent-viz-1", "host-viz-1")};
+    FleetTopologyStore store{b3_fixed_fetcher(std::move(seed))};
+
+    McpTestServer ts;
+    ts.fleet_topology_store_for_test = &store;
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "Response" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":16,"params":{"name":"get_host_topology",)"
+        R"("arguments":{"agent_id":"agent-viz-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
 }
 
 // ── #2146 Batch B2: result-set MCP twins ───────────────────────────────────

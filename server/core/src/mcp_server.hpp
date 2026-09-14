@@ -31,6 +31,9 @@
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
+#include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
+#include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
+#include "offline_endpoint_store.hpp" // #2146 Batch B3: OfflineEndpoint -- see set_viz_deps below
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
@@ -62,6 +65,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -513,6 +517,25 @@ public:
     /// clean "unavailable" 503 when unset, matching every other borrowed-store
     /// seam in this class.
     void set_baseline_store(BaselineStore* store) { baseline_store_ = store; }
+
+    /// #2146 Batch B3 — the fleet-visualization store trio backing
+    /// `get_fleet_topology`/`get_host_topology` (mirrors GET
+    /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
+    /// Same setter idiom as `set_preflight_run_store` above. `offline_store`
+    /// may be null (offline hosts are then not stale-flagged, matching
+    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// may be null (then the viz kill switch is never consulted on the MCP
+    /// path — production MUST wire the same `--viz-disable` /
+    /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or
+    /// disabling the feature would silently leave the MCP twins reachable).
+    /// Unset `fleet_topology_store` (`nullptr`, the default) ⇒ both tools
+    /// answer "unavailable" rather than crashing.
+    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineEndpointStore* offline_store,
+                      const std::atomic<bool>* kill_switch) {
+        fleet_topology_store_ = fleet_topology_store;
+        offline_endpoint_store_ = offline_store;
+        viz_kill_switch_ = kill_switch;
+    }
 
     /// #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
@@ -975,6 +998,10 @@ private:
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
+    // #2146 Batch B3 — see set_viz_deps above.
+    FleetTopologyStore* fleet_topology_store_{nullptr};
+    OfflineEndpointStore* offline_endpoint_store_{nullptr};
+    const std::atomic<bool>* viz_kill_switch_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
