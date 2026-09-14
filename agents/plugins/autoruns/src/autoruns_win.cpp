@@ -931,17 +931,12 @@ void walk_task_folder(ITaskFolder* folder, SourceOutcome& outcome, std::size_t c
             // Only flag "malformed" when get_Xml() actually succeeded and
             // handed back something parse_task_xml could not make sense of
             // -- a COM failure already has its own, more specific token.
-            if (!FAILED(xml_hr) && !info.parsed_ok) {
-                // #4184: oversized gets its own token (a runaway/corrupt
-                // get_Xml() BSTR is a different failure shape than a
-                // genuine XML syntax problem) -- every other TaskReject
-                // (empty/malformed/dtd/wrong_root) still collapses to the
-                // existing "malformed" token; a caller reading the wire
-                // reason doesn't need every rejection SHAPE distinguished,
-                // just this one different CAUSE.
-                note_constraint(outcome, info.reject == TaskReject::oversized ? "oversized"
-                                                                              : "malformed");
-            }
+            // task_reject_reason_token (autoruns_parsers.hpp) is a pure
+            // function specifically so the reject-reason mapping is unit-
+            // tested on every build host, not only reachable through this
+            // Windows-only COM call site.
+            if (!FAILED(xml_hr) && !info.parsed_ok)
+                note_constraint(outcome, task_reject_reason_token(info.reject));
 
             // <RegistrationInfo>/<Date> is read through the same libxml2
             // tree parse_task_xml already built -- no second raw-text scan

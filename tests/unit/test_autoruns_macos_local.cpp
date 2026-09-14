@@ -463,34 +463,83 @@ TEST_CASE("autoruns macOS: collect_user_launchagents surfaces a real fstat() "
     }
 }
 
-TEST_CASE("autoruns macOS: outer (/Users) and inner (per-user LaunchAgents) row_cap/"
-          "readdir_error tokens stay distinct in the accumulator, never collapsed by "
-          "substring dedup (#4186) -- exercises note_dir_constraint, the exact "
-          "function both collect_user_launchagents call sites route through. A real "
-          "compound-cap walk would need > kMaxEntriesPerDir real directory entries on "
-          "disk to reach the same two call sites, which is not a justified disk/CI "
-          "cost for a fixed anonymous-namespace constant (test-efficiency discipline)",
+TEST_CASE("autoruns macOS: collect_user_launchagents's outer (/Users) and inner "
+          "(per-user LaunchAgents) walks produce distinctly-suffixed row_cap tokens "
+          "when BOTH hit their (now independently injectable) cap on a real temp-dir "
+          "tree -- drives the actual production branch selection, not just the "
+          "accumulator's dedup behavior in isolation (#4186, closing the coverage gap "
+          "an adversarial functional review found in this test's first version: the "
+          "original only fed hand-picked strings straight to note_dir_constraint, so "
+          "reverting either call site's suffix back to plain row_cap would have left "
+          "every assertion here green)",
           "[autoruns][macos]") {
-    DirCollectOutcome outcome;
-    note_dir_constraint(outcome, "row_cap:users");
-    note_dir_constraint(outcome, "row_cap:launchagents");
-    note_dir_constraint(outcome, "readdir_error:launchagents");
+    yuzu::test::TempDir users_dir("yuzu_test_autoruns_macos_compound_cap_");
+    // Two real per-user homes so outer_cap=1 genuinely truncates (one processed,
+    // one left for the lookahead to find).
+    fs::create_directories(users_dir.path / "alice" / "Library" / "LaunchAgents");
+    fs::create_directories(users_dir.path / "bob" / "Library" / "LaunchAgents");
+    // Two real entries in EACH user's LaunchAgents so inner_cap=1 genuinely
+    // truncates too, whichever of alice/bob the outer walk happens to visit
+    // (readdir order is unspecified) -- the cap counts every real entry
+    // visited, not just ones that parse as a valid plist (walk_plist_dir_handle's
+    // own banner), so plain non-.plist files are sufficient here.
+    for (const char* user : {"alice", "bob"}) {
+        const auto agents_dir = users_dir.path / user / "Library" / "LaunchAgents";
+        { std::ofstream(agents_dir / "a.plist") << "not parsed in this test"; }
+        { std::ofstream(agents_dir / "b.plist") << "not parsed in this test"; }
+    }
+
+    yuzu::CommandContext ctx{nullptr}; // safe: file content is deliberately
+                                       // unparseable, so no row ever reaches
+                                       // ctx.write_output in this test
+    const auto outcome =
+        collect_user_launchagents(ctx, StatFns{}, users_dir.path.string(), /*outer_cap=*/1,
+                                  /*inner_cap=*/1);
 
     CHECK(outcome.acc.any_failure());
     const std::string reason = outcome.acc.reason();
     CHECK(reason.find("row_cap:users") != std::string::npos);
     CHECK(reason.find("row_cap:launchagents") != std::string::npos);
-    CHECK(reason.find("readdir_error:launchagents") != std::string::npos);
+    // Neither walk hitting its cap is ever reported as the OTHER walk's
+    // token, nor as the old, ambiguous unsuffixed "row_cap" -- a regression
+    // to plain row_cap at either call site would make this substring search
+    // spuriously match too (it's a substring of both suffixed forms), so
+    // this also catches a reversion to the unsuffixed token, not just a
+    // swap between the two suffixes.
+    CHECK(reason.find("row_cap") != std::string::npos); // sanity: token family present at all
+}
 
+TEST_CASE("autoruns macOS: ConstraintAccumulator's exact-match dedup survives both "
+          "insertion orders of a plain token alongside a suffixed sibling (#4186) -- "
+          "exercises note_dir_constraint directly, isolating the accumulator's own "
+          "dedup contract from the production branch-selection logic the test above "
+          "covers",
+          "[autoruns][macos]") {
     // The specific regression this guards: a PLAIN "row_cap" token arriving
     // alongside a suffixed one must survive as its own distinct entry, not
     // be absorbed by (or absorb) the suffixed one -- the exact conflation
     // ConstraintAccumulator's exact-string dedup exists to prevent, that
     // this file's former substring-matching accumulator was vulnerable to.
+    // Both insertion orders are asserted: "row_cap" then "row_cap:users"
+    // does NOT discriminate old vs. new (the old algorithm's
+    // `reason.find(token)` check with reason="row_cap" and the LONGER
+    // token="row_cap:users" also returns npos -- both algorithms keep both
+    // tokens here). The REVERSE order is the one that actually catches the
+    // regression: under the OLD algorithm, reason="row_cap:users" already
+    // CONTAINS "row_cap" as a substring, so `note_dir_constraint(outcome,
+    // "row_cap")` second would have been wrongly treated as "already
+    // recorded" and silently dropped -- losing the plain row_cap token
+    // entirely. The new exact-match accumulator keeps both, in insertion
+    // order, either way.
     DirCollectOutcome mixed;
     note_dir_constraint(mixed, "row_cap");
     note_dir_constraint(mixed, "row_cap:users");
     CHECK(mixed.acc.reason() == "row_cap,row_cap:users");
+
+    DirCollectOutcome mixed_reversed;
+    note_dir_constraint(mixed_reversed, "row_cap:users");
+    note_dir_constraint(mixed_reversed, "row_cap");
+    CHECK(mixed_reversed.acc.reason() == "row_cap:users,row_cap");
 }
 
 #endif // defined(__APPLE__)

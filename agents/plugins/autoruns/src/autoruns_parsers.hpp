@@ -717,6 +717,28 @@ struct TaskAction {
 /// own token for anyone triaging a fleet-wide reason breakdown (#4184).
 enum class TaskReject { none, empty, malformed, dtd, wrong_root, oversized };
 
+/// The `win_scheduled_tasks` wire-reason token for a parse rejection --
+/// pure, so the mapping (not just TaskReject itself) is unit-testable on
+/// every build host, not only reachable by reading the Windows-only COM
+/// call site that consumes it. `oversized` gets its own token (a runaway/
+/// corrupt `get_Xml()` BSTR is a different failure shape than a genuine
+/// XML syntax problem, #4184); every other non-`none` TaskReject
+/// (`empty`/`malformed`/`dtd`/`wrong_root`) collapses to the existing
+/// `"malformed"` token -- a caller reading the wire reason doesn't need
+/// every rejection SHAPE distinguished, just this one different CAUSE.
+/// `none` (a successful parse) has no reason to report and returns "".
+inline std::string_view task_reject_reason_token(TaskReject reject) noexcept {
+    switch (reject) {
+    case TaskReject::none: return "";
+    case TaskReject::oversized: return "oversized";
+    case TaskReject::empty:
+    case TaskReject::malformed:
+    case TaskReject::dtd:
+    case TaskReject::wrong_root: return "malformed";
+    }
+    return "malformed";
+}
+
 struct TaskInfo {
     std::vector<TaskAction> actions; // one per <Exec>, in document order
     bool has_unmodelled_action = false; // an <Actions> child this scanner

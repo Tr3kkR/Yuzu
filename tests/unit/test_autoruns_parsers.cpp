@@ -887,6 +887,21 @@ TEST_CASE("autoruns: parse_task_xml refuses an oversized document before xmlRead
     CHECK(info.reject == TaskReject::oversized);
 }
 
+TEST_CASE("autoruns: task_reject_reason_token maps TaskReject::oversized to its own "
+          "'oversized' wire token, and every other rejection shape to the existing "
+          "'malformed' token -- closes the coverage gap an adversarial functional "
+          "review found: the win.cpp COM call site's mapping (autoruns_win.cpp) was "
+          "previously an inline ternary reachable only through Windows-only code, so "
+          "no test on any build host actually exercised it (#4184)",
+          "[autoruns][parsers]") {
+    CHECK(task_reject_reason_token(TaskReject::oversized) == "oversized");
+    CHECK(task_reject_reason_token(TaskReject::malformed) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::empty) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::dtd) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::wrong_root) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::none).empty());
+}
+
 TEST_CASE("autoruns: parse_task_xml rejects a deeply-nested, DTD-free document cleanly "
           "-- a real error, not a crash or unbounded resource use (#4184 AC3). "
           "XML_PARSE_HUGE is deliberately never passed (see parse_task_xml's own "

@@ -294,7 +294,8 @@ struct DirWalkOutcome {
 /// refused) silently contributes zero rows and an empty outcome -- the
 /// same "absence is not an error" contract every rung-1 leg here follows.
 template <typename OnPlist>
-DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
+DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist,
+                                     std::size_t cap = kMaxEntriesPerDir) {
     DirWalkOutcome outcome;
     if (!dir.valid()) return outcome;
     const int dfd = dirfd(dir.get());
@@ -314,7 +315,7 @@ DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
     // `truncated` result as "more entries existed", never as "more `.plist`
     // entries existed".
     const auto walk = yuzu::shared::walk_dir_capped(
-        dir.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
+        dir.get(), cap, [&](const struct dirent* entry) {
             const std::string_view name(entry->d_name);
             if (!ends_with(name, ".plist")) return true;
             std::vector<uint8_t> bytes;
@@ -469,7 +470,8 @@ struct LaunchdDirOutcome {
 /// failure already is not.
 LaunchdDirOutcome collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId source_id,
                                              const DirHandle& dir, const std::string& location,
-                                             Scope scope, std::string_view user_override) {
+                                             Scope scope, std::string_view user_override,
+                                             std::size_t cap = kMaxEntriesPerDir) {
     std::size_t count = 0;
     bool parse_failed = false;
     const auto walk_outcome =
@@ -484,7 +486,8 @@ LaunchdDirOutcome collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId
             if (!user_override.empty()) row.user = std::string{user_override};
             ctx.write_output(format_row(row));
             ++count;
-        });
+        },
+        cap);
     LaunchdDirOutcome outcome{count, walk_outcome.truncated, walk_outcome.enumeration_error,
                               walk_outcome.file_constrained, walk_outcome.file_constrained_reason};
     if (parse_failed && !outcome.file_constrained) {
@@ -537,13 +540,15 @@ DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source
 /// Directory.
 DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx,
                                             const StatFns& stat_fns = {},
-                                            const std::string& users_dir = "/Users") {
+                                            const std::string& users_dir = "/Users",
+                                            std::size_t outer_cap = kMaxEntriesPerDir,
+                                            std::size_t inner_cap = kMaxEntriesPerDir) {
     DirCollectOutcome outcome;
     DirOpenOutcome users_open = open_dir_no_follow_checked(users_dir);
     if (users_open.constrained) note_dir_constraint(outcome, users_open.reason);
     if (!users_open.handle.valid()) return outcome;
     const auto walk = yuzu::shared::walk_dir_capped(
-        users_open.handle.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
+        users_open.handle.get(), outer_cap, [&](const struct dirent* entry) {
             const std::string_view name(entry->d_name);
             const std::string home = users_dir + "/" + entry->d_name;
             // O_NOFOLLOW on the home directory itself: a symlinked "user" entry
@@ -582,7 +587,7 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx,
             const auto result = collect_launchd_dir_handle(ctx, SourceId::mac_user_launchagents,
                                                             agents_open.handle,
                                                             home + "/Library/LaunchAgents",
-                                                            Scope::user, name);
+                                                            Scope::user, name, inner_cap);
             outcome.rows += result.rows;
             // #4186: this is the INNER (per-user LaunchAgents) walk -- suffixed
             // distinctly from the OUTER /Users walk below so an operator can
