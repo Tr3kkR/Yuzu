@@ -27,7 +27,7 @@
  * Deliberately conservative and pre-K-bound (rung 9c PR-2's own scope only):
  * a receipt that resolves to anything other than Committed holds its
  * application's generation FOREVER, exactly like today's synchronous
- * behavior - no quarantine, no K-bound retry-then-waive. §R5.2's ClaimEnd
+ * behavior - no wedge marking, no K-bound retry-then-waive. §R5.2's ClaimEnd
  * already preserves the finer split a later rung 9c PR needs to implement
  * that (queue-wait expiry vs. dispatched timeout vs. genuine refusal); this
  * ledger does not need it and does not re-derive it here.
