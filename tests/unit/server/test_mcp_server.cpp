@@ -8355,6 +8355,148 @@ TEST_CASE("MCP plugin-docs: yuzu://plugin-docs denies without Infrastructure:Rea
     }
 }
 
+// ── #4108: yuzu://plugin-docs/{name} resource template + resources/templates/list ──
+
+TEST_CASE("MCP resources/templates/list advertises the plugin-docs template (#4108)",
+          "[mcp][plugin_docs][integration]") {
+    McpTestServer ts;
+    ts.start();
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"resources/templates/list","id":40})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& result = body["result"];
+    REQUIRE(result.contains("resourceTemplates"));
+    auto& templates = result["resourceTemplates"];
+    REQUIRE(templates.is_array());
+    REQUIRE(templates.size() == 1);
+    CHECK(templates[0]["uriTemplate"] == "yuzu://plugin-docs/{name}");
+    CHECK(templates[0]["name"].is_string());
+    CHECK(templates[0]["description"].is_string());
+    CHECK(templates[0]["mimeType"] == "application/json");
+
+    // Unchanged: the plain resources/list count stays 12 — a template is not
+    // a resource.
+    auto list_res = ts.call(R"({"jsonrpc":"2.0","method":"resources/list","id":41})");
+    REQUIRE(list_res);
+    auto list_body = nlohmann::json::parse(list_res->body);
+    CHECK(list_body["result"]["resources"].size() == 12);
+}
+
+TEST_CASE("MCP plugin-docs/{name}: reading the template matches plugin_docs_manifest() (#4108)",
+          "[mcp][plugin_docs][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string name = catalog["plugins"][0]["name"].get<std::string>();
+    const std::string uri = "yuzu://plugin-docs/" + name;
+
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"resources/read","id":42,"params":{"uri":")" +
+                        uri + R"("}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() == 1);
+    CHECK(contents[0]["uri"] == uri);
+    CHECK(contents[0]["mimeType"] == "application/json");
+    auto got = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(got == catalog["plugins"][0]);
+
+    const auto* manifest = yuzu::server::plugin_docs_manifest(name);
+    REQUIRE(manifest != nullptr);
+    CHECK(contents[0]["text"].get<std::string>() == manifest->json);
+}
+
+TEST_CASE("MCP plugin-docs/{name}: every documented plugin resolves through the template, not "
+          "just the first (#4108)",
+          "[mcp][plugin_docs][integration]") {
+    // #4108 review: the single-name case above always picks plugins[0]; loop
+    // the whole catalog so an index-construction regression exposing only
+    // the first entry cannot hide behind it.
+    McpTestServer ts;
+    ts.start("readonly");
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    for (const auto& expected : catalog["plugins"]) {
+        const std::string name = expected["name"].get<std::string>();
+        const std::string uri = "yuzu://plugin-docs/" + name;
+        auto res =
+            ts.call(R"({"jsonrpc":"2.0","method":"resources/read","id":46,"params":{"uri":")" +
+                    uri + R"("}})");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto body = nlohmann::json::parse(res->body);
+        auto got = nlohmann::json::parse(body["result"]["contents"][0]["text"].get<std::string>());
+        CHECK(got == expected);
+    }
+}
+
+TEST_CASE("MCP plugin-docs/{name}: unknown name is Invalid params, not a 200 (#4108)",
+          "[mcp][plugin_docs][integration]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":43,)"
+        R"("params":{"uri":"yuzu://plugin-docs/no_such_plugin_for_docs"}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["data"]["remediation"].is_string());
+    CHECK_FALSE(body["error"]["data"]["remediation"].get<std::string>().empty());
+}
+
+TEST_CASE("MCP plugin-docs/{name}: gate precedes the name lookup, known and unknown alike (#4108)",
+          "[mcp][plugin_docs][integration]") {
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string known = catalog["plugins"][0]["name"].get<std::string>();
+    for (const std::string& name : {known, std::string{"no_such_plugin_for_docs"}}) {
+        {
+            McpTestServer ts;
+            ts.perm_override_for_test = [](const std::string& securable,
+                                            const std::string& operation) {
+                return !(securable == "Infrastructure" && operation == "Read");
+            };
+            ts.start("readonly");
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"resources/read","id":44,"params":{"uri":"yuzu://)"
+                "plugin-docs/" +
+                name + R"("}})");
+            REQUIRE(res);
+            CHECK(res->status != 200);
+            // #4108 review (F-8): assert no manifest content leaked alongside the
+            // denial, matching the REST twin's equivalent assertion — a future
+            // edit that emits content before the admit check would still flip
+            // status but must not pass this.
+            CHECK(res->body.find("\"actions\"") == std::string::npos);
+        }
+        {
+            McpTestServer ts;
+            ts.start("bogus-unrecognized-tier");
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"resources/read","id":45,"params":{"uri":"yuzu://)"
+                "plugin-docs/" +
+                name + R"("}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+        }
+    }
+}
+
 TEST_CASE("MCP plugin-docs: discover_plugins outputSchema types the per-plugin docs summary",
           "[mcp][plugin_docs][integration]") {
     // The #2986 completeness case guards top-level keys only; the item-level
