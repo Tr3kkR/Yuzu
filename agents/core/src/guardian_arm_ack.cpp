@@ -225,6 +225,15 @@ std::size_t GuardianArmAckLedger::pending_count_for_test() const {
     return current_ ? current_->pending.size() : 0;
 }
 
+std::optional<GuardianArmStats> GuardianArmAckLedger::arm_stats() const {
+    if (!current_)
+        return std::nullopt;
+    GuardianArmStats s;
+    s.pending = static_cast<std::uint64_t>(current_->pending.size());
+    s.failed = static_cast<std::uint64_t>(current_->resolved_failed);
+    return s;
+}
+
 void GuardianArmAckLedger::set_applied(std::size_t applied) {
     if (current_)
         current_->applied = applied;

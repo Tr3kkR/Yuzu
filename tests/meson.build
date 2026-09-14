@@ -255,6 +255,7 @@ agent_test_exe = executable(
     'unit/test_guardian_journal_format.cpp',
     'unit/test_guardian_lifecycle_journal.cpp',
     'unit/test_guardian_journal_heartbeat.cpp',
+    'unit/test_guardian_arm_heartbeat.cpp', # rung 9c PR-3
     'unit/test_guardian_health_heartbeat.cpp',
     'unit/test_guardian_backend_heartbeat.cpp',
     'unit/test_guardian_unsupported_heartbeat.cpp',
@@ -978,6 +979,7 @@ if build_server
       'unit/server/test_sqlite_raii.cpp',
       'unit/server/test_rest_audit_sample.cpp',
       'unit/server/test_rest_audit_helper.cpp',
+      'unit/server/test_rest_scope_v1_routes.cpp', # #2146 Batch B2: POST /api/v1/scope/validate + /preview
       'unit/server/test_tag_store.cpp',
       'unit/server/test_tag_routes.cpp', # #2542 PR-11: the 4-route Tags API, extracted onto the HttpRouteSink seam
       'unit/server/test_scope_engine.cpp',
@@ -1018,6 +1020,7 @@ if build_server
       'unit/server/test_command_outbox_store.cpp', # WS-3 3.3: transactional command outbox
       'unit/server/test_command_outbox_delivery.cpp', # WS-3 3.3: leader-gated delivery loop
       'unit/server/test_gateway_route_store.cpp', # HA WS-4 4.1: fenced agent->cluster routing directory
+      'unit/server/test_gateway_route_reap_rules.cpp', # HA WS-4 4.2a: PURE decide_reap decision set (PR #4299 round-3 decide/apply split)
       'unit/server/test_gateway_route_wiring.cpp', # HA WS-4 4.1: GatewayUpstreamServiceImpl wiring onto GatewayRouteStore (re-announce-vs-fresh, connect/disconnect/heartbeat, fail-open)
 
       'unit/server/test_execution_event_bus.cpp',
@@ -1130,6 +1133,7 @@ if build_server
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
+      'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
       'unit/server/test_guardian_health_fleet_tags.cpp', # #2298 gate 3 item 6d — M1 health-stream fleet rollup pin
       'unit/server/test_dex_alert_router.cpp',
       'unit/server/test_dex_blast_radius.cpp',
@@ -1283,9 +1287,11 @@ if build_server
       # Tag-key pins: test_spark_fleet_tags.cpp includes the agent's
       # spark_heartbeat.hpp (emit_spark_heartbeat_tags),
       # test_guardian_journal_fleet_tags.cpp includes guardian_journal_heartbeat.hpp
-      # (emit_guardian_journal_heartbeat_tags), and test_guardian_health_fleet_tags.cpp
+      # (emit_guardian_journal_heartbeat_tags), test_guardian_health_fleet_tags.cpp
       # includes guardian_health_heartbeat.hpp (emit_guardian_health_heartbeat_tags,
-      # #2298 gate 3 item 6d) - each asserting the agent's actual emitted keys equal the
+      # #2298 gate 3 item 6d), and test_guardian_arm_fleet_tags.cpp (rung 9c PR-3)
+      # includes guardian_arm_heartbeat.hpp + guardian_io_ceiling_heartbeat.hpp - each
+      # asserting the agent's actual emitted keys equal the
       # matching server-side *_fleet_tags.hpp table - a full writer↔reader compile/run
       # bind, no silent zero-reporting drift. Header-only templates - no link to
       # yuzu_agent_core, just the include path.
@@ -1348,6 +1354,21 @@ if build_server
                (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+    # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
+    # deliberately re-entrant tests (e.g. test_mcp_server.cpp's "duplicate id
+    # arriving MID-FLIGHT" SECTION, which calls back into the full streamed-POST
+    # handler stack from INSIDE a dispatch callback already on that same stack -
+    # two nested traversals of the JSON-RPC/session/stream-bridge/dispatch chain
+    # in one thread, in an unoptimized debug build). Growing this file's tool
+    # table (kTools[]) and test count over time has repeatedly pushed it closer
+    # to Windows-specific limits (see the C1128 COMDAT-section-count comment
+    # above) - a genuine EXCEPTION_STACK_OVERFLOW (0xC00000FD) here is a stack
+    # headroom problem, not a test-logic bug, so the fix is headroom, not
+    # touching the recursive test. 16 MiB is reserve only (Windows commits
+    # pages on demand), so this costs no real memory unless the recursion
+    # actually needs it. GCC/Clang are unaffected (larger default stacks,
+    # and no /STACK equivalent needed here).
+    link_args: (cxx.get_id() == 'msvc' ? ['/STACK:16777216'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here

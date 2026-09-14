@@ -2858,11 +2858,25 @@ void GuardianSparkRuntime::begin_stop() {
         reader->request_stop();
     // #2233 item 3: wake any attach_rule/detach_rule currently parked in a bounded
     // backend wait immediately, rather than making it ride out cfg_.backend_op_deadline.
-    // NOTE this does not make GuardianEngine::stop() itself instant: stop() takes
-    // GuardianEngine::mtx_ BEFORE calling begin_stop() (guardian_engine.cpp), so if
-    // apply_rules() is currently the one parked in a bounded wait, stop() cannot even
-    // reach this call until that wait resolves - bounded by cfg_.backend_op_deadline,
-    // same as apply_rules() itself, not instant. This DOES matter for a caller that
+    // rung 9c PR-2 Unit 6 removed the only production caller of that blocking wait:
+    // GuardianEngine::reconcile_rule_locked() now calls attach_rule(NonWaiting{}, ...)
+    // (guardian_engine.cpp), which never calls wait_for_claim(). The blocking
+    // attach_rule(rule_id, spec, deadline) overload above still exists and this wake
+    // still applies to it, but nothing in production calls it today - only test code
+    // does.
+    // NOTE this does NOT make GuardianEngine::stop() itself prompt (§R5.5): stop()
+    // takes GuardianEngine::mtx_ BEFORE calling begin_stop() (guardian_engine.cpp), and
+    // apply_rules() still does real synchronous work under that lock regardless of this
+    // change: a full_sync's KV sweep and detach_all() (scales with the rule count being
+    // torn down), the per-rule reconcile loop, and an unbounded lifecycle-journal persist
+    // on scope exit. It is not the only mtx_ holder that can delay stop() this way - the
+    // boot-time start_local()/wire_spark_engine() calls do their own synchronous work
+    // under the same lock unconditionally, and journal_maintenance_tick() (every
+    // heartbeat) does too, but ONLY when prefer_spark_ is true - it no-ops immediately
+    // after taking mtx_ otherwise (guardian_engine.cpp:767), which is production's
+    // default today. None of that is a *backend* wait this wake-up reaches - stop()
+    // is decoupled from backend-arm latency, not from any mtx_ holder's own
+    // duration. This DOES matter for a caller that
     // already holds mtx_ across a DIFFERENT blocking section calling begin_stop()
     // directly, and for the runtime's own destructor path.
     //
@@ -2894,6 +2908,14 @@ std::size_t GuardianSparkRuntime::outbox_size() const {
 std::uint64_t GuardianSparkRuntime::outbox_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};
     return outbox_.backpressure_drops();
+}
+std::uint64_t GuardianSparkRuntime::io_ceiling_rejections() const {
+    // GuardianIoExecutor::stats() is self-locking (state_->mu) - no additional lock
+    // needed at this level, matching io_executor_stats_for_test()'s own shape.
+    std::uint64_t total = 0;
+    for (const auto& c : io_executor_.stats().counters)
+        total += c.rejected_ceiling;
+    return total;
 }
 std::uint64_t GuardianSparkRuntime::lifecycle_backpressure_drops() const {
     std::lock_guard<std::mutex> ob{outbox_mu_};

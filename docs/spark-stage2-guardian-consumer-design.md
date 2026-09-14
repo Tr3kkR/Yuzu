@@ -688,6 +688,64 @@ folded silently into the same signal as ordinary contention
 (`IoFailure::CeilingExhausted` is the distinct outcome PR-1 gives it; PR-3 names the
 tag).
 
+**AS IMPLEMENTED (PR-3, 2026-09-13)** - three decisions this paragraph left open,
+settled via Astra (codex opine) + Fable (advisor) review, both checked against
+`origin/dev` code, then ruled by Dave (full history:
+`~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md`):
+
+1. **`yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` are re-statable gauges off
+   `GuardianArmAckLedger`'s CURRENT application** (`GuardianArmAckLedger::arm_stats()`,
+   `GuardianEngine::arm_stats()`) - NOT `GuardianEngine::arm_failures_`, which is
+   confirmed cumulative-forever and unsuitable (several `fetch_add` sites, never
+   decrements, and counts causes beyond a currently-failed rule). Absence is gated on
+   FOUR conditions, not one - governance fix, adversarial review CODEX-1/K1
+   (`bb9c643d3`): `GuardianEngine::arm_stats()` originally gated only on
+   `prefer_spark_`, which left `stopped_` and `spark_availability_ != Available`
+   (Unwired/SparkFailed/SparkDisabled) emitting a false-present-healthy `{0,0}` pair.
+   The corrected gate is `!prefer_spark_ || stopped_ || spark_availability_ !=
+   Available`, layered on `GuardianArmAckLedger::arm_stats()`'s own `nullopt` when
+   there is no current application at all - PR-2's `apply_rules()` calls
+   `begin_application()` unconditionally regardless of `prefer_spark_`, so a legacy
+   (non-spark) agent has a live, empty Application on every push - gating on the
+   Application's existence alone would make every non-spark agent in the fleet emit
+   `arm_pending=0`/`arm_failed=0`, read by a fleet consumer as "spark arming, healthy"
+   on agents not running spark at all. `arm_failed` does NOT
+   decrement in place within one application (`resolved_failed` is increment-only), but
+   it already resets to 0 whenever `decide_retry()` returns `Reapply` on a generation
+   that previously failed, which begins a FRESH application - that Reapply path is
+   driven by the existing ~25s `full_sync` retry cadence and is live TODAY, independent
+   of PR-5. So: "decreases on application replacement, which already happens on an
+   ordinary retry of a generation that saw a failure" - not "monotonic until PR-5".
+   Same-application late-success recovery (a still-pending receipt flipping from Failed
+   to Committed without a new application) remains PR-5's job.
+2. **The physical-orphan ceiling (R5.1) ships as a plain, monitor-only counter now**
+   (`yuzu.guardian_io_arm_disarm_rejected_ceiling`, off
+   `GuardianIoExecutor::Counters::rejected_ceiling`, summed across IO classes for the
+   arm/disarm executor instance via `GuardianSparkRuntime::io_ceiling_rejections()`) -
+   **not** the windowed "currently under repeated pressure" detector one reviewer
+   proposed. Dave ruled against baking an unmeasured threshold (a candidate 2-hits/
+   5-minute window was proposed and rejected) into shipped code before a later rung has
+   real fleet data to size it; that detector is explicitly deferred to rung 9c PR-6.
+3. **#3415** (`GuardianIoExecutor`'s general per-class fault-counter egress -
+   `timed_out`/`rejected_capacity`/`rejected_key`/`launch_failures`/
+   `worker_exceptions`/`abandoned`/`abandonment_cleanup_failures`/
+   `completed_after_stop`/`completion_failures`) stays a **separate follow-up**
+   ("PR-3a"), scheduled after PR-3 and before PR-5's fault-validation work - this PR's
+   `rejected_ceiling` counter is one narrow, separately-motivated signal (R5.1's own
+   ask), not the start of #3415's general wiring. See
+   `docs/spark-legacy-delta-registry.md` row D10.
+
+Fleet-side rollup: `server/core/src/guardian_arm_fleet_tags.hpp` (SUM of current
+values, unlabelled, its own reporting/tag_rejected meta pair) and
+`server/core/src/guardian_io_ceiling_fleet_tags.hpp` (SUM of a genuinely cumulative
+counter - the ordinary monitor-only shape, correct for THIS signal specifically).
+**Correction to this paragraph's own "C1/D1-style" shorthand above**: too broad -
+`docs/spark-legacy-delta-registry.md` row C1 already documents `unsupported` as a
+live, current-value gauge that can legally decrease, the SAME re-statable pattern PR-3
+needs, not the thing to avoid. The pattern to avoid is specifically the counter-rollup
+shape (monotonic per-sweep counters summed into a fleet gauge) - `rejected_ceiling`
+above is correctly that shape; the arm-ledger pair above is correctly not.
+
 **R5.4 - Audit and durability.** The "armed" audit record is still staged only on a
 real, confirmed backend commit — never on acceptance alone, matching today's contract
 exactly. What changes is timing, in three separate steps (corrected in the PR-1 doc
@@ -721,14 +779,19 @@ drain step FIRST observes a receipt as Committed may already have run ITS OWN
 persist attempt against a `pending_journal_` that still predated the staging.
 Durable persistence of that record is therefore not guaranteed within the SAME
 tick that resolves the ack - only within the next one, on the engine's existing
-cadence, exactly as this section already promises. No data is ever lost (each
-tick's persist re-snapshots `pending_journal_` fresh, and `persist()` erases only
-what it durably wrote), only delayed by up to one additional tick beyond
+cadence, exactly as this section already promises. No data is lost under ordinary
+operation (each tick's persist re-snapshots `pending_journal_` fresh, and `persist()`
+erases only what it durably wrote), only delayed by up to one additional tick beyond
 ack-observation - a delay this section's own multi-tick tolerance for a large
 outstanding batch already covers, and one the test suite accounts for directly
 (`SparkReconcileFixture::apply()`'s settle loop runs one extra
 `journal_maintenance_tick()` after observing ack settlement, specifically for this
-reason).
+reason). **Correction (rung 9c PR-4)**: this stamp previously read "no data is ever
+lost" - an overstatement. The one exception is sustained persist failure:
+`stage_pending_locked()` (`guardian_spark_runtime.cpp:2419-2434`) caps staging at
+`kMaxPendingJournalRecords` and drops the OLDEST record once that ceiling is hit,
+counted via `journal_stage_dropped_` (not silently) - a real, if narrow, durability
+gap the original wording did not disclose.
 
 **R5.5 - Shutdown.** `GuardianEngine::stop()` no longer parks under `mtx_` waiting on an
 in-flight arm, since `apply_rules()` itself no longer blocks there either — a hung
@@ -755,6 +818,58 @@ receipt accepted during that walk is tracked too - not exercised by
 `start_local()` BEFORE `wire_spark_engine()` (the reverse of production's
 `agent.cpp` order), so `spark_availability_` is still `Unwired` during its boot
 walk and the walk never reaches the spark path at all in that fixture.
+
+**R5.5 as implemented (rung 9c PR-4; existing mechanics from PR-1/PR-2).**
+`GuardianEngine::reconcile_rule_locked()` selects `GuardianSparkRuntime::attach_rule
+(NonWaiting{}, ...)` (`guardian_engine.cpp:1910`); that overload
+(`guardian_spark_runtime.cpp:1258`) never calls `wait_for_claim()`. The blocking
+overload that does (`guardian_spark_runtime.cpp:1214`, via `wait_for_claim()` at
+`:272`) still exists but has no production caller left - PR-2 removed the last one,
+leaving only test code. This closes the specific hazard this section
+originally described: `stop()` can no longer be delayed by a hung backend arm/OS
+call. It does NOT make `stop()` prompt in general - overstating that was #4322's own
+defect (see below). `GuardianEngine::stop()` (`guardian_engine.cpp:613`) and
+`apply_rules()` (`:1001`) share `mtx_`, and `apply_rules()` still does real
+synchronous work under that lock: a full_sync's KV sweep and
+`spark_runtime_->detach_all()` (`:1176`, scales with the rule count being torn down -
+`detach_all()` itself, `guardian_spark_runtime.cpp:1647`, reserves and iterates
+`rule_ids.size()`), the per-rule reconcile loop, and an unbounded lifecycle-journal
+persist via `GuardianRollback`'s destructor on every exit. `apply_rules()` is not the
+only holder that can delay `stop()` this way: the boot-time `start_local()` (`:453`) /
+`wire_spark_engine()` (`:1996`) calls do their own synchronous work under the same
+lock unconditionally. `journal_maintenance_tick()` (`:766`, every heartbeat tick) is a
+fourth holder but a different shape - bounded per tick
+(`kJournalPersistMaxBatchesPerTick`/`kAckDrainMaxPerTick`) and `prefer_spark_`-gated
+(`:767`): it no-ops immediately after taking `mtx_` while `prefer_spark_` is `false`,
+which is production's default today, so it is not currently a real contributor to
+`stop()`'s wait the way the other three unconditionally are. `stop()` itself also
+persists the journal unbounded, once before `begin_stop()` and once after
+(`guardian_engine.cpp:639`/`:667`). `GuardianSparkRuntime::begin_stop()`
+(`guardian_spark_runtime.cpp:2806-2849`) drops every Queued claim with a counted
+total (`claims_dropped_at_stop_`), leaves Dispatching/Dispatched claims for their own
+completion callback, and disarms a late-arriving success rather than leaving it live.
+`GuardianEngine::stop()`'s `ack_ledger_->retire()` call is bookkeeping only (resets
+what the ledger is watching), not resource cleanup - the disarm guarantee above is
+what actually tears down a live claim. Two known callers of `begin_stop()` outside
+`stop()`: `~GuardianSparkRuntime()` (`guardian_spark_runtime.cpp:92-97`) calls it too,
+but its own comment argues this is a defensive idempotent no-op - no in-flight pass
+can be running by the time the destructor runs, since a pass keeps the runtime alive
+through the handler's captured `shared_ptr`. The other,
+`rollback_spark_wiring_locked()` (`guardian_engine.cpp:2166`, single call
+site at `:2048`, a boot-time wiring-failure path), resets `spark_runtime_` without
+first waiting for `active_backend_op_workers()==0` - tracked as **#3811** (filed
+during the #2233 governance sweep, confirmed OPEN 2026-09-14 via `gh issue view 3811`;
+`docs/spark-flip-gate.md`'s own §3 row 3 already rules it does not gate the Spark
+flip, unlike its sibling #3816).
+**Detection signal: none today**, same as #3816's own entry notes for its gap -
+`GuardianEngine::active_io_workers()` (`:2199`) sums via `if (spark_runtime_)`
+(`:2214`), so any worker `active_backend_op_workers()` still counted at reset time
+drops out of that sum the instant `spark_runtime_.reset()` runs, not when the worker
+itself finishes - whether a worker can actually outlive the reset here is not
+established either way by this note. Cited here, not re-investigated or re-fixed by
+this PR. `#4322` (the stale
+`begin_stop()` comment claiming `apply_rules()` could still park in a bounded backend
+wait) is fixed in the same PR that adds this stamp.
 
 **R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,

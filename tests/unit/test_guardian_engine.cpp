@@ -25,6 +25,7 @@
 
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats complete type (rung 9c PR-3)
 
 #include "test_helpers.hpp"
 
@@ -1012,4 +1013,37 @@ TEST_CASE("GuardianEngine: stop() is sticky - a later start_local() does not res
     auto applied = f.engine->apply_rules(p);
     CHECK_FALSE(applied.has_value());
     CHECK(applied.error() == "guardian engine stopped");
+}
+
+// ---------------------------------------------------------------------------
+// rung 9c PR-3, Check A (~/.claude/plans/spark-rung9c-pr3-telemetry-KICKOFF-v2.md):
+// GuardianEngine::apply_rules() calls GuardianArmAckLedger::begin_application()
+// UNCONDITIONALLY, regardless of prefer_spark_ - so a naive arm_stats() gated
+// only on "is there a current application" would read every default
+// (prefer_spark_=false) agent as a live, empty {pending:0, failed:0} snapshot,
+// i.e. false-present-healthy on a fleet not running spark at all. This pins the
+// fix: GuardianEngine::arm_stats() must gate on prefer_spark_ explicitly.
+// ---------------------------------------------------------------------------
+TEST_CASE("GuardianEngine::arm_stats(): default prefer_spark_=false stays "
+          "ABSENT (nullopt) even after a real push opens an application",
+          "[guardian][engine][arm_stats]") {
+    GuardianFixture f; // GuardianFixture default-constructs prefer_spark_=false
+    REQUIRE_FALSE(f.engine->prefer_spark());
+
+    // BEFORE any push: no current application at all.
+    CHECK_FALSE(f.engine->arm_stats().has_value());
+
+    // A real push runs apply_rules(), which calls begin_application()
+    // unconditionally - the exact trap Check A names. If arm_stats() were
+    // gated on "current application exists" alone, this would now read
+    // present {0, 0} instead of nullopt.
+    REQUIRE(f.engine
+                ->apply_rules(GuardianFixture::make_push(
+                    {GuardianFixture::make_rule("r1", "r1")}, /*full_sync=*/true))
+                .has_value());
+    CHECK_FALSE(f.engine->arm_stats().has_value());
+
+    // The io-ceiling counter is unaffected by this trap (see its own doc
+    // comment for why) and reads a plain 0 either way.
+    CHECK(f.engine->io_ceiling_rejections() == 0);
 }

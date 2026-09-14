@@ -5708,8 +5708,10 @@ route had NO authorization check of any kind before this fix, CWE-862: any
 authenticated session could query up to 5000 fleet-wide inventory records
 with zero scoping. Unlike the async producers below, it is a synchronous
 read, not a dispatch, so it gates on the same securable as `GET
-/api/v1/inventory/software` rather than `Execution:Execute`; a
-service-scoped API token is denied by the same gate). The owner-scoped
+/api/v1/inventory/software` rather than `Execution:Execute`. **Unlike its
+result-set siblings, a service-scoped token is admitted and confined here,
+not denied outright** - see the "Result Sets" section below for the exact
+gate and the tracked cross-service-reach gap, `#4307`). The owner-scoped
 result-set row it creates is only readable/mutable by its own creator
 through the routes below, which — like their HTMX dashboard twins — also
 deny a service-scoped token outright: `session->username` is the *minting*
@@ -5919,6 +5921,8 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 ### Result Sets
 
 The result-set lifecycle routes (list/create/inspect/pin/delete). See [scope-walking-design.md](../scope-walking-design.md) for the full design and the four **producer** routes documented above under [Inventory](#inventory) (`POST /api/v1/result-sets/from-inventory-query`, `from-tar-query`, `from-instruction-result`, `{id}/re-eval`). `ResultSetStore` (ADR-0036) is always constructed in a running server (Postgres is mandatory; a construction failure halts startup rather than degrading serving, ADR-0012 §1) — these routes are always registered.
+
+**MCP twins (#2146 Batch B2):** every one of these 12 REST v1 operations has an MCP tool twin (`list_result_sets`, `create_result_set`, `create_result_set_from_inventory_query`, `create_result_set_from_tar_query`, `create_result_set_from_instruction_result`, `reevaluate_result_set`, `get_result_set`, `get_result_set_members`, `get_result_set_lineage`, `pin_result_set`, `unpin_result_set`, `delete_result_set`) — see [mcp-server.md](../mcp-server.md)'s "Result sets" tool family. The three async producer tools share the exact same `Execution:Execute` + per-device confined-dispatch gate (#1788) as their REST twins below; 8 of the remaining 9 are owner-scoped exactly like the REST routes (a service-scoped API token is denied outright). **`create_result_set_from_inventory_query`/`POST /api/v1/result-sets/from-inventory-query` are the one exception**: both gate via the admit-then-filter `fleet_read_fn` chokepoint, whose service-scope branch admits-and-confines a service-scoped token rather than hard-denying it - since the created result set is still owner-scoped to the minting token, a service token can mint a set the minter's other tokens/session can then read, a real cross-service-reach gap tracked in #4307.
 
 `ResultSet` is not a seeded RBAC securable; every route below is session-authenticated and **owner-scoped** instead (a result set is only readable/mutable by the principal that created it). A service-scoped API token is denied outright on every route (`403`): ownership keys on `session->username`, which for a service token is the **minting operator's** identity, not the token's own service tag — without this deny, any other service token the same operator holds could reach the same owner-scoped result sets.
 
@@ -7385,6 +7389,7 @@ The catalog of valid `spark` / `assertion` / `remediation` types and their `para
 - **Response:** `201` with `data.rule_id`.
 - **4xx:** `400` missing required fields, invalid JSON, or an **invalid resilience policy** (e.g. Bounded `max_attempts` < 1, `backoff_initial_ms` > `backoff_max_ms`) — returned as the A4 structured error envelope; `409` on duplicate `rule_id` or duplicate `name`; `403` if a service-scoped API token calls this route (same reasoning as the `GET` list above — no per-target shape to confine against).
 - **Audit:** `guaranteed_state.rule.create` (`success` / `denied`).
+- **MCP twin:** `create_guardian_rule` (#2146 Batch B1) — same store write and validation.
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}`
 
@@ -7395,6 +7400,7 @@ Fetch a single rule.
 - **4xx:** `404` if the rule does not exist; `403` if a service-scoped API token queries this route (same reasoning as `GET .../rules` above).
 - **5xx:** `503` if the store degrades (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.read` (`denied` only).
+- **MCP twin:** `get_guardian_rule` (#2146 Batch B1) — same store read.
 
 #### `PUT /api/v1/guaranteed-state/rules/{rule_id}`
 
@@ -7407,6 +7413,7 @@ Update a rule. Version is incremented on every successful update regardless of w
 - **4xx:** `400` invalid JSON, an invalid resilience policy (A4 envelope), or an `enforcement_mode` change; `404` rule not found; `409` on name conflict; `403` if a service-scoped API token calls this route (same reasoning as the create route above).
 - **5xx:** `503` if the pre-update rule lookup hits a degraded store (A4 envelope, `retry_after_ms: 5000`).
 - **Audit:** `guaranteed_state.rule.update`.
+- **MCP twin:** `update_guardian_rule` (#2146 Batch B1) — same validation and version-bump. No optimistic-concurrency check against concurrent writers on either transport (tracked in #4303).
 
 #### `DELETE /api/v1/guaranteed-state/rules/{rule_id}`
 
@@ -7415,6 +7422,7 @@ Delete a rule.
 - **Permission:** `GuaranteedState:Delete`
 - **4xx:** `404` if the rule does not exist; `403` if a service-scoped API token calls this route (same reasoning as create/update above).
 - **Audit:** `guaranteed_state.rule.delete`.
+- **MCP twin:** `delete_guardian_rule` (#2146 Batch B1). Does NOT automatically push an unarm to agents already enforcing the rule (tracked in #4304).
 
 #### `GET /api/v1/guaranteed-state/rules/{rule_id}/status`
 
@@ -7451,6 +7459,7 @@ Queue a push of the active rule set to scoped agents. Returns `202 Accepted` —
 - **4xx:** `400` if the JSON body is present but not an object, or if `scope` fails to parse as a Scope DSL expression; `403` if a service-scoped API token calls this route — the single most severe instance of this confinement-gap class on this branch, since a `full_sync` push mutates what every OTHER service's agents enforce, not merely reads it.
 - **5xx:** `503` if the Guaranteed-State rule store is degraded or unreachable (A4 envelope, `retry_after_ms: 5000`) — the push is refused rather than fanned out empty (ADR-0038). Retry once the store recovers; a `503` here means "cannot read the rules," never "zero rules configured." The heartbeat reconcile applies the same fail-closed rule (it declines to re-push rather than push an empty set).
 - **Audit:** `guaranteed_state.push` (`success` / `denied`). A server-initiated re-push to a lagging agent on heartbeat reconnect is audited separately under `guaranteed_state.reconcile` (principal `system`).
+- **MCP twin:** `push_guardian_rules` (#2146 Batch B1) — same gate, same scope-string push mechanism (not the shared `command_dispatch_fn`/`check_targeting_shape` chokepoint). Genuinely non-idempotent, annotated `idempotentHint:false`.
 
 #### `GET /api/v1/guaranteed-state/events`
 
@@ -7510,6 +7519,7 @@ if the audit row cannot persist.
 - **Permission:** `GuaranteedState:Read`, per-device scoped
 - **Response keys:** `agent_id`, `total_rules`, `compliant_rules`, `drifted_rules`, `errored_rules`.
 - **5xx:** `503` on an unwired scope gate/store, an audit-persistence failure, or a degraded store (A4 envelope, `retry_after_ms: 5000`) — never a silent `0`.
+- **MCP twin:** `get_guardian_agent_status` (#2146 Batch B1) — calls the SAME `guardian_agent_status_rollup` builder and the SAME `scoped_perm_fn` gate, so REST and MCP cannot observe a different admit decision or a different rollup for the same caller.
 
 #### `GET /api/v1/guaranteed-state/device-compliance?baseline={name}&agent_id={id}`
 
@@ -7518,6 +7528,7 @@ Name-anchored, device-applicable Guardian compliance — the machine-readable si
 - **Why name, not id.** An integration pins one stable constant (e.g. `ServiceNow Compliance`) once. Baseline names are unique and survive reseeds/rebuilds, where a `baseline_id` churns — so there is no per-environment id to reconfigure.
 - **Permission:** `GuaranteedState:Read`, **per-device scoped** — a global grant passes fleet-wide; otherwise the caller must hold `Read` via a management group the device is in (mirrors the dashboard Guardian device lens, so a group-scoped operator/service account is not locked out of in-scope devices). _Upgrade note:_ a previously **group-scoped** token now receives `403` for devices outside its group(s) — earlier builds gated this route on a flat global check that would have passed them. A **global** `GuaranteedState:Read` token (the documented ServiceNow service-account setup) is unaffected.
 - **Audit:** `guardian.device.view` (target type `Agent`) — same verb the dashboard per-device Guardian lens emits, so one SIEM filter catches both surfaces. (Behavioural per-device data.) A scoped-permission **denial** is audited separately at the auth layer as `auth.scoped_permission_required`.
+- **MCP twin:** `get_guardian_device_compliance` (#2146 Batch B1) — calls the SAME `guardian_device_compliance_rollup` builder and the SAME `scoped_perm_fn` gate; all four underlying reads complete before the access audit fires on either transport, so a degrade can never surface after an audited "success".
 - **Evidence integrity — fail-closed (CC7.2).** This is a behavioural-PII read, so if the `guardian.device.view` audit row cannot persist (locked store, disk-full, or a pipeline exception — including a throwing audit pipeline) the endpoint **refuses to serve**: it returns **`503` + `Sec-Audit-Failed: true`** with an A4 envelope carrying a `retry_after_ms` hint, and **withholds the compliance body** — parity with `GET /api/v1/dex/devices/{id}`. Serving audited per-device compliance while the evidence row is known-lost is exactly what audit-on-open prevents. The `503` is returned **before** the `404`, so an audit outage never reveals baseline existence without durable evidence. A CMDB integration should treat `Sec-Audit-Failed: true` as "retry after the audit subsystem recovers," not a permanent error; an audit-off deployment (no audit callback wired) serves normally. (The realistic failure modes also increment `yuzu_server_audit_emit_failed_total` and log to `spdlog`.) **Blast radius:** because this is the fleet-polled CMDB endpoint and there is no degraded-serve fallback, a *sustained* audit-store outage 503s **every** poll fleet-wide — size audit-store availability for the polling load, and expect a compliance-data blackout (not stale data) for the duration. (Per-route retry jitter to avoid synchronized retries across pollers is a tracked platform-wide hardening, #1647.)
 - **Query params:** `baseline` (the Baseline **name**, unique; URL-encode spaces, e.g. `ServiceNow%20Compliance`), `agent_id` (the device). Both required.
 - **`400`** if either param is missing, exceeds 256 chars (`auth::kMaxAgentIdLength` — the enrolled-agent-id ceiling, so a valid device id is never falsely rejected), or contains control characters (bytes `< 0x20`); **`403`** if the caller lacks `Read` on the device's scope (checked **before** the baseline lookup, so an out-of-scope caller gets `403` even for an unknown name — no name-existence oracle); **`404`** if no Baseline has that name; **`503`** if the route is misconfigured (its stores or scoped-permission function are unwired — non-transient, do not auto-retry, no `retry_after_ms`) **or if the baseline store or the guaranteed-state store itself faults** (DB locked/corrupt — *retryable*, A4 envelope with `retry_after_ms: 5000`; a transient store fault returns `503`, not the `404` a CMDB would otherwise read as "no such baseline → delete this CI"). The `400`/`404`/`503` bodies use the A4 envelope (`correlation_id`); the `403` is emitted by the shared auth/RBAC layer and carries that layer's denial body, not the A4 envelope (no `correlation_id`; exact shape varies by denial reason — RBAC vs service-scope). For a robust integration, branch on the HTTP `403` status and treat the body as opaque/diagnostic — do not structurally parse it (the `error` field may be a JSON string or an object depending on the denial reason).
@@ -8851,6 +8862,79 @@ Validate a scope expression without executing it.
   "expression": "os = 'windows' AND tag:environment = 'production'"
 }
 ```
+
+#### `POST /api/v1/scope/validate`
+
+Versioned twin of the legacy route above (#2146 Batch B2) — and of the MCP
+`validate_scope` tool. All three call the same `yuzu::scope::validate()`, so
+none of them can silently diverge on what counts as a valid expression.
+
+**Permission:** Session-authenticated only — no RBAC gate (a syntax-only
+check with no data disclosure), matching the legacy route and `validate_scope`
+exactly.
+
+**Request body:** same shape as the legacy route above.
+
+**Response:** `{"data": {"valid": true, "expression": "..."}, "meta": {"api_version": "v1"}}`, or
+`{"data": {"valid": false, "error": "..."}, "meta": {"api_version": "v1"}}` for a syntactically invalid
+expression (still a `200` — the *response* reports validity, the request itself is well-formed).
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `expression` missing or empty |
+
+#### `POST /api/v1/scope/preview`
+
+Versioned twin of the MCP `preview_scope_targets` tool (#2146 Batch B2) — no
+legacy unversioned twin exists (`POST /api/scope/estimate` below is a
+*different* capability: a matched/total **count** only, for the workflow
+builder's own confined `scope_fn`). Both this route and `preview_scope_targets`
+call the same `preview_scope_targets()` builder (`scope_preview.hpp`), so the
+matched-agent set cannot drift between transports. A `tag:<key>` atom in the
+expression resolves from the persistent tag store **only** — unlike a real
+dispatch, which also falls back to a connected agent's own live self-report —
+see [Tag source precedence](asset-tagging-guide.md). **`from_result_set:<id>`
+and `props.*` atoms are not resolved by this preview** - the resolver only
+populates `os`/`arch`/`hostname`/`agent_version`/`tag:*`, so any other atom
+(including `from_result_set:`, this feature's own headline scope-walking
+primitive) is treated as unset and never matches, silently returning
+`matched_count: 0` for a composed expression that uses one - a genuine
+dispatch resolves `from_result_set:` correctly (`agent_registry.cpp`). Do not
+rely on this preview for an expression containing `from_result_set:` or
+`props.`; tracked in `#4307`.
+
+**Permission:** `Infrastructure:Read`, via the admit-then-filter fleet-read
+chokepoint (ADR-0017) — this route discloses agent identities, unlike the
+syntax-only validate route above, so a management-group-confined caller's
+`matched_agents`/`matched_count` are narrowed to their own visible devices
+before the preview builder runs, never the whole fleet.
+
+**Request body:** `{"expression": "..."}`
+
+**Response:**
+
+```json
+{
+  "data": {
+    "expression": "os = 'windows'",
+    "matched_count": 42,
+    "matched_agents": ["agent-001", "agent-002"],
+    "warning": "scope matches 63 agents (>50). Phase 2 write operations targeting this scope will require approval."
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`warning` is present only above the 50-agent display threshold.
+
+**Errors:**
+
+| Status | Reason |
+|---|---|
+| 400 | `expression` missing/empty, or fails to parse/validate |
+| 503 | The expression references a `tag:<key>` atom and the bulk tag-store preload degraded (`retry_after_ms: 5000`) — never silently under-reports the match set |
 
 #### `POST /api/scope/estimate`
 

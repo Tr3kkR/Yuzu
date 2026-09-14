@@ -63,7 +63,9 @@
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
+#include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
+#include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_store.hpp"
@@ -2358,6 +2360,24 @@ public:
                           detail::kGuardianHealthReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianHealthTagRejectedGauge,
                           detail::kGuardianHealthTagRejectedHelp, "gauge");
+        // rung 9c PR-3 arm-ledger fleet rollup (Decision 1). Registered from the
+        // SAME table AgentHealthStore::recompute_metrics clears and publishes from
+        // (guardian_arm_fleet_tags.hpp). RE-STATABLE gauges, not cumulative
+        // counters - see that header's own shape note before writing an alert.
+        for (const auto& m : detail::kGuardianArmMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianArmReportingGauge,
+                          detail::kGuardianArmReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianArmTagRejectedGauge,
+                          detail::kGuardianArmTagRejectedHelp, "gauge");
+        // rung 9c PR-3 io-ceiling fleet rollup (Decision 3, Option B). MONITOR-ONLY
+        // cumulative counter - see guardian_io_ceiling_fleet_tags.hpp.
+        for (const auto& m : detail::kGuardianIoCeilingMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianIoCeilingReportingGauge,
+                          detail::kGuardianIoCeilingReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
+                          detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",
@@ -2842,6 +2862,52 @@ public:
                           "replica's in-memory SSE bus by the WS-2a-2 delivery poll",
                           "counter");
         metrics_.counter("yuzu_exec_outbox_poll_published_total");
+        // HA WS-4 4.2a governance fold: the reap-decline observability gap.
+        // gateway_route_store.hpp's clock-guarded-retention header previously
+        // claimed the parts-1/4 carve-out (no would-wipe probe, no fact-set
+        // anomaly dedup) was compensated by "Task C's metrics wiring" — but
+        // Task C's yuzu_server_gateway_route_desync_total/write_failed_total
+        // cover the WRITE path, not a reap pass's own outcome, so a declined
+        // or failed reap tick was spdlog::warn-only with no metric. THIS
+        // counter is the actual compensating signal: one increment per tick
+        // by outcome (ok = a clean accepted pass; declined = clock_anomaly;
+        // error = the store call itself failed). PR #4299 round 4: part 4
+        // (fact-set anomaly dedup) is now fully ADOPTED via the (anchor,
+        // direction, first_now_ms) reading-continuity recovery guard — so the
+        // "no fact-set anomaly dedup" phrasing above is historical; the guard
+        // and its ok_capped backlog signal are the live compensations.
+        metrics_.describe("yuzu_server_gateway_route_reap_total",
+                          "gateway_route_store reap_stale_routes() pass outcomes, by outcome "
+                          "(ok|ok_capped|recovered|declined|skipped|error). declined = the pass "
+                          "was skipped by the clock-guarded-retention anomaly guard (implausible "
+                          "or unparseable now()/anchor reading, or an anomaly that has not yet "
+                          "persisted across the recovery window at the SAME (anchor, direction)) "
+                          "and reaped nothing; recovered = an anomaly PERSISTED a real-time-"
+                          "plausible interval at the SAME (anchor, direction) and this pass "
+                          "drained the capped sweeps as genuine elapsed downtime (PR #4299 "
+                          "round-2 review) -- a sustained recovered rate means the reaper is "
+                          "recovering from a clock anomaly or a real gap and is worth an operator "
+                          "look; ok_capped = a clean accepted pass that hit kReapCap on a sweep "
+                          "AND a same-txn EXISTS probe confirmed a remaining backlog (PR #4299 "
+                          "round 4, observability-only -- NOT a cadence change) -- a sustained "
+                          "ok_capped rate means the reaper is chronically behind; skipped = "
+                          "another replica already held the gateway_route_store:reap advisory "
+                          "lock this tick (try-lock, not blocking, PR #4299 round-2 external "
+                          "review) -- routine on a multi-replica deployment, never a failure; "
+                          "error = the store call failed outright (pool/query degradation). This "
+                          "is the observable signal for the clock-guarded-retention part-1 "
+                          "carve-out and the decline-once/drain-on-repeat part-4 guard documented "
+                          "in gateway_route_store.hpp's reap_stale_routes header.",
+                          "counter");
+        // PR #4299 review (SHOULD 1, observability-conventions.md:12): seed
+        // every outcome this counter can emit — following the
+        // kQuarantineGateOutcomes/kSystemReservedPushes idiom above — so
+        // `absent()` on any one of them means "never happened", not "nobody
+        // has looked yet". Without this, a healthy server that never once
+        // declines/recovers/skips/errors reads identically to one whose reap
+        // job never runs at all.
+        for (const char* outcome : {"ok", "ok_capped", "recovered", "declined", "skipped", "error"})
+            metrics_.counter("yuzu_server_gateway_route_reap_total", {{"outcome", outcome}});
         // Distinct from the reap-only counter above: this fires on the
         // WRITE path (AgentServiceImpl::record_execution_id, dispatch-time),
         // not the retention sweep. Governance Gate 4/6 finding: previously
@@ -14869,6 +14935,14 @@ private:
             result_set_maint_thread_ = std::thread([this]() {
                 spdlog::info("Result-set/response/Guardian maintenance thread started "
                              "(cadence=2s, GC=5m, response/Guardian reap=60m)");
+                // Single source of truth for this loop's tick period (PR #4299
+                // adversarial-panel LOW, K1/CDX-P2-002): the loop below sleeps
+                // this many 1-second slices per tick, and the gateway-route reap
+                // cadence static_asserts multiply by it — so a future tick-period
+                // change moves the sleep AND the wedge-guarding asserts together
+                // instead of leaving a stale magic `2` behind. Every sibling
+                // "~N at 2s/tick" cadence comment below is relative to this.
+                constexpr int kMaintTickSecs = 2;
                 constexpr int kGcEveryNTicks = 150;            // ~5 minutes at 2s/tick
                 // Guardian retention reap (ADR-0038): matches the old SQLite cleanup
                 // thread's 60-minute default cadence (cleanup_interval_min). Piggybacks
@@ -14908,6 +14982,44 @@ private:
                 // is idempotent, advisory-lock-serialised across replicas, and
                 // a bounded index-scan DELETE, so the tighter cadence is cheap.
                 constexpr int kEventOutboxReapEveryNTicks = 30; // ~60s at 2s/tick
+                // HA WS-4 4.2a (#4246 item #7): gateway route directory
+                // hygiene reaper cadence. The directory is INERT (nothing
+                // reads it for dispatch yet), so this is background hygiene,
+                // not correctness-critical cleanup — a ~5m cadence (matching
+                // the concurrency-claim reconciler above) is plenty; the
+                // reaper's own clock-guard (advisory lock + persisted
+                // anchor) is what makes a slower or missed tick harmless.
+                constexpr int kGatewayRouteReapEveryNTicks = 150; // ~5 minutes at 2s/tick
+                // PR #4299 round 4/5: the inter-pass interval must land INSIDE the
+                // reap recovery window [kMinReapRecoveryGapMs, kMaxReapRecoveryGapMs].
+                // The two bounds guard against opposite cadence failures, and only
+                // the ceiling one is a true wedge:
+                //
+                //   FLOOR (below kMin): first_now_ms is frozen and PRESERVED across
+                //   declines, so a persistent skew's delta grows monotonically and
+                //   still recovers — just over multiple passes instead of on pass 2.
+                //   Staying above the floor makes that recovery prompt (pass 2), not
+                //   the drawn-out multi-pass one; it is a promptness guard, NOT a
+                //   wedge guard. 150 * 2s * 1000 = 300'000ms > 270'000ms floor; a
+                //   future cadence below ~135 ticks trips this at build time.
+                //
+                //   CEILING (above kMax): every pass-to-pass delta would exceed the
+                //   recovery ceiling, so each pass re-arms as a BRAND-NEW anomaly
+                //   (arm(now_ms) resets first_now_ms), and the next pass is a fresh
+                //   >ceiling delta again — a PERMANENT wedge, the exact failure this
+                //   whole mechanism exists to prevent, reintroduced via cadence.
+                //   300'000ms < 3'600'000ms ceiling; a future cadence above ~1800
+                //   ticks trips this at build time.
+                static_assert(kGatewayRouteReapEveryNTicks * kMaintTickSecs * 1000 >
+                                  kMinReapRecoveryGapMs,
+                              "gateway route reap cadence must exceed the recovery floor, or a "
+                              "single replica's persistent skew recovers slowly over many passes "
+                              "instead of promptly (kMinReapRecoveryGapMs, gateway_route_store.hpp)");
+                static_assert(kGatewayRouteReapEveryNTicks * kMaintTickSecs * 1000 <
+                                  kMaxReapRecoveryGapMs,
+                              "gateway route reap cadence must stay below the recovery ceiling, or "
+                              "every pass-to-pass delta exceeds it and re-arms as a new anomaly — a "
+                              "permanent wedge (kMaxReapRecoveryGapMs, gateway_route_store.hpp)");
                 // HA WS-1/1a DB-clock-integrity monitor (ADR-2002 §4 mitigation (a),
                 // adversarial-round #2 C1): each ~2s tick compares wall-clock
                 // advance against MONOTONIC (steady_clock) elapsed. A backward
@@ -14924,7 +15036,11 @@ private:
                 ClockDriftMonitor session_clock_monitor{/*tolerance_ms=*/3000};
                 int tick = 0;
                 while (!stop_requested_.load(std::memory_order_acquire)) {
-                    for (int i = 0; i < 2 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                    // kMaintTickSecs one-second slices per tick (interruptible),
+                    // so the tick period the reap-cadence static_asserts assume is
+                    // the same constant the sleep uses (PR #4299 K1/CDX-P2-002).
+                    for (int i = 0; i < kMaintTickSecs && !stop_requested_.load(std::memory_order_acquire);
+                         ++i)
                         std::this_thread::sleep_for(std::chrono::seconds{1});
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
@@ -15171,6 +15287,105 @@ private:
                                 spdlog::warn("event_outbox cross-replica poll failed: {}",
                                              published.error());
                                 metrics_.counter("yuzu_exec_outbox_store_degrade_total")
+                                    .increment();
+                            }
+                        }
+
+                        // 2i) HA WS-4 4.2a (#4246 item #7): gateway route
+                        // directory hygiene reap — sweeps expired-lease-past-
+                        // grace and NULL-lease tombstone rows. Best-effort:
+                        // the directory is still INERT (nothing reads it for
+                        // dispatch), so a degraded/failed pass is logged, not
+                        // escalated. WS-10 ReplicaSafe — its own advisory
+                        // lock + persisted clock anchor make a concurrent
+                        // per-replica tick safe (background_jobs.hpp).
+                        if (gateway_route_store_ && gateway_route_store_->is_open() &&
+                            tick % kGatewayRouteReapEveryNTicks == 0) {
+                            YUZU_ASSERT_BACKGROUND_JOB("gateway_route_store.reap_stale_routes");
+                            if (auto reaped = gateway_route_store_->reap_stale_routes()) {
+                                if (reaped->skipped) {
+                                    // PR #4299 round-2 external review (SHOULD):
+                                    // another replica already holds the
+                                    // gateway_route_store:reap advisory lock this
+                                    // tick (try-lock, not blocking) — the
+                                    // ReplicaSafe contract is "all but the holder
+                                    // skip" (background_jobs.hpp), so this is
+                                    // routine, not a failure. Every other field
+                                    // on `reaped` stays at its default (the store
+                                    // returned before reading now()/the anchor),
+                                    // so this MUST be checked before, and instead
+                                    // of, the clock_anomaly/recovered branches
+                                    // below.
+                                    metrics_
+                                        .counter("yuzu_server_gateway_route_reap_total",
+                                                 {{"outcome", "skipped"}})
+                                        .increment();
+                                } else {
+                                    if (reaped->expired_leases_reaped > 0 ||
+                                        reaped->tombstones_reaped > 0)
+                                        spdlog::info("gateway_route_store reap: {} expired "
+                                                     "lease(s), {} tombstone(s) reaped",
+                                                     reaped->expired_leases_reaped,
+                                                     reaped->tombstones_reaped);
+                                    if (reaped->clock_anomaly) {
+                                        spdlog::warn("gateway_route_store reap declined: "
+                                                     "clock anomaly detected");
+                                        metrics_
+                                            .counter("yuzu_server_gateway_route_reap_total",
+                                                     {{"outcome", "declined"}})
+                                            .increment();
+                                    } else if (reaped->recovered) {
+                                        // PR #4299 round-2 review (FIX B): a
+                                        // recovery pass ran the capped sweeps
+                                        // just like an "ok" pass, but it drained
+                                        // whatever accumulated behind a
+                                        // persisted clock anomaly -- distinct
+                                        // enough (can mass-reap a genuine gap)
+                                        // to warrant its own metric outcome
+                                        // rather than reading identically to a
+                                        // routine tick.
+                                        // PRECEDENCE (PR #4299 round-5 review,
+                                        // LOW): `recovered` deliberately outranks
+                                        // `cap_bound` below, so a pass that BOTH
+                                        // recovers AND caps emits only "recovered"
+                                        // this tick, never "ok_capped". Not a
+                                        // correctness gap -- is_stale is read-time,
+                                        // the backlog is not lost, and a persisting
+                                        // backlog surfaces "ok_capped" on the next
+                                        // ordinary capped tick. See clock-guarded-
+                                        // retention.md's GatewayRouteStore entry.
+                                        spdlog::info("gateway_route_store reap recovered: an "
+                                                     "anomaly persisted across a full decline "
+                                                     "pass and this pass drained the backlog");
+                                        metrics_
+                                            .counter("yuzu_server_gateway_route_reap_total",
+                                                     {{"outcome", "recovered"}})
+                                            .increment();
+                                    } else if (reaped->cap_bound) {
+                                        // PR #4299 round 4 (observability only):
+                                        // a clean accepted pass that hit kReapCap
+                                        // AND left a confirmed remainder behind.
+                                        // Distinct from "ok" so a chronically
+                                        // behind reaper is visible WITHOUT any
+                                        // cadence/re-arm change (the deliberate
+                                        // non-acceleration decision — see
+                                        // docs/clock-guarded-retention.md).
+                                        metrics_
+                                            .counter("yuzu_server_gateway_route_reap_total",
+                                                     {{"outcome", "ok_capped"}})
+                                            .increment();
+                                    } else {
+                                        metrics_
+                                            .counter("yuzu_server_gateway_route_reap_total",
+                                                     {{"outcome", "ok"}})
+                                            .increment();
+                                    }
+                                }
+                            } else {
+                                spdlog::warn("gateway_route_store reap failed (store error)");
+                                metrics_
+                                    .counter("yuzu_server_gateway_route_reap_total",
+                                             {{"outcome", "error"}})
                                     .increment();
                             }
                         }
@@ -17668,6 +17883,17 @@ private:
             // cannot observe a different admit decision for the same caller
             // (same conversion, same underlying require_list_read call).
             mcp_server_->set_list_read_fn(list_read_fn);
+            // #2146 Batch B1 — the SAME guardian_push_fn_ closure wired into the
+            // REST registration's trailing guardian_push_fn param above (assigned
+            // during that same call, just above), so REST POST
+            // /guaranteed-state/push and MCP push_guardian_rules fan out through
+            // the IDENTICAL scope-to-agents dispatch — they cannot drift on what
+            // gets pushed or to whom.
+            mcp_server_->set_guardian_push_fn(guardian_push_fn_);
+            // #2146 Batch B1 — the SAME BaselineStore GET
+            // /guaranteed-state/device-compliance already reads, backing MCP
+            // get_guardian_device_compliance's identical baseline lookup.
+            mcp_server_->set_baseline_store(baseline_store_.get());
             // #4027 fix round (CDX-P1-01/K4): the RBAC/management-group AXIS
             // for these three tools is the fleet_read_fn_ already wired above
             // (the SAME instance query_installed_software uses).
@@ -17718,6 +17944,11 @@ private:
             // DeploymentRoutes already hold (constructed well before this
             // point, server.cpp:4041) — no new construction needed.
             mcp_server_->set_preflight_run_store(preflight_run_store_.get());
+            // #2146 Batch B2 — backs the 12 result-set MCP tools. Same store
+            // ResultSetRoutes/rest_api_v1's result-set routes already hold
+            // (constructed well before this point) — no new construction
+            // needed.
+            mcp_server_->set_result_set_store(result_set_store_.get());
             // #2146 Batch B3 — backs get_fleet_topology/get_host_topology. SAME
             // store/kill-switch/offline-store instances the REST VizRoutes
             // registration below wires (viz_routes_->register_routes(...)), so
