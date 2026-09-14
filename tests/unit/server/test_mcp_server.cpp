@@ -21793,6 +21793,8 @@ TEST_CASE("MCP get_host_topology: denies without Response:Read",
         R"("arguments":{"agent_id":"agent-viz-1"}}})");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
 // ── #2146 Batch B2: result-set MCP twins ───────────────────────────────────
 //
 // REST's own test suite (test_rest_result_sets_async.cpp, test_result_set_
