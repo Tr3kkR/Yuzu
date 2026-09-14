@@ -1354,6 +1354,21 @@ if build_server
                (meson.project_source_root() / 'server' / 'core' / 'src').replace('\\', '/') +
                '"'] +
               (cxx.get_id() == 'msvc' ? ['/bigobj'] : []),
+    # MSVC's default 1 MiB thread stack reserve is marginal for this binary's
+    # deliberately re-entrant tests (e.g. test_mcp_server.cpp's "duplicate id
+    # arriving MID-FLIGHT" SECTION, which calls back into the full streamed-POST
+    # handler stack from INSIDE a dispatch callback already on that same stack -
+    # two nested traversals of the JSON-RPC/session/stream-bridge/dispatch chain
+    # in one thread, in an unoptimized debug build). Growing this file's tool
+    # table (kTools[]) and test count over time has repeatedly pushed it closer
+    # to Windows-specific limits (see the C1128 COMDAT-section-count comment
+    # above) - a genuine EXCEPTION_STACK_OVERFLOW (0xC00000FD) here is a stack
+    # headroom problem, not a test-logic bug, so the fix is headroom, not
+    # touching the recursive test. 16 MiB is reserve only (Windows commits
+    # pages on demand), so this costs no real memory unless the recursion
+    # actually needs it. GCC/Clang are unaffected (larger default stacks,
+    # and no /STACK equivalent needed here).
+    link_args: (cxx.get_id() == 'msvc' ? ['/STACK:16777216'] : []),
     # Server unit tests #include <openssl/...> directly (e.g.
     # test_plugin_signing_helpers.cpp). yuzu_server_core_dep does not
     # propagate the OpenSSL include path, so declare it explicitly here
