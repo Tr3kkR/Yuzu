@@ -29,8 +29,13 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <sstream>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include <yuzu/agent/plugin_loader.hpp>
@@ -43,6 +48,24 @@
 namespace {
 
 namespace fs = std::filesystem;
+
+// Splits captured output (newline-joined per LocalDispatcher::run) into
+// individual rows, dropping empty lines.
+std::vector<std::string> split_lines(std::string_view captured) {
+    std::vector<std::string> lines;
+    std::istringstream iss{std::string(captured)};
+    std::string line;
+    while (std::getline(iss, line)) {
+        if (!line.empty())
+            lines.push_back(line);
+    }
+    return lines;
+}
+
+bool is_non_negative_integer(std::string_view s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(),
+                                     [](unsigned char c) { return std::isdigit(c) != 0; });
+}
 
 // Mirrors test_new_plugins.cpp's load_plugin() search-dir list: the test
 // binary's CWD varies (direct invocation from the build dir vs. `meson
@@ -119,12 +142,47 @@ TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess c
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(ph->descriptor(), "rules");
 
-    // Unprivileged: pfctl -s rules needs root, so an empty capture is
-    // expected here (see file header) -- what this pins is that the call
-    // completes cleanly (rc==0, no error| line), not any particular row
-    // count.
+    // Unprivileged: pfctl -s rules needs root, so ruleset|unknown (not a
+    // count) is the expected, correct value here -- what this pins is that
+    // the call completes cleanly (rc==0, no error| line), not any
+    // particular rule-row count.
     CHECK(result.rc == 0);
     CHECK(result.captured.find("error|") == std::string::npos);
+
+    const auto lines = split_lines(result.captured);
+
+    // socketfilterfw --listapps IS unprivileged (unlike pfctl), so app|
+    // rows must be present on this host, and every row's decision field
+    // must be exactly allow|block|unknown -- never dropped, never a
+    // fabricated value (review R6). Value-checked, not presence-only: a
+    // find("app|") alone would still pass if the decision field were wrong
+    // or malformed.
+    bool saw_app_row = false;
+    for (const auto& line : lines) {
+        if (line.rfind("app|", 0) != 0)
+            continue;
+        saw_app_row = true;
+        const auto last_sep = line.rfind('|');
+        REQUIRE(last_sep != std::string::npos);
+        const std::string decision = line.substr(last_sep + 1);
+        CHECK((decision == "allow" || decision == "block" || decision == "unknown"));
+    }
+    CHECK(saw_app_row);
+
+    // ruleset| must be either a non-negative integer (a cleanly-completed
+    // `pfctl -s rules` read) or exactly "unknown" (the completeness gate
+    // tripped) -- on this unprivileged Mac pf is refused, so ruleset|unknown
+    // is the expected, correct value.
+    bool saw_ruleset_row = false;
+    for (const auto& line : lines) {
+        if (line.rfind("ruleset|", 0) != 0)
+            continue;
+        saw_ruleset_row = true;
+        const std::string value = line.substr(std::string_view("ruleset|").size());
+        CHECK((value == "unknown" || is_non_negative_integer(value)));
+    }
+    CHECK(saw_ruleset_row);
+    CHECK(result.captured.find("ruleset|unknown") != std::string::npos);
 }
 
 #endif // __APPLE__
