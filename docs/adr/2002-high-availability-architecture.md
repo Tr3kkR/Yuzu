@@ -372,13 +372,22 @@ deliberately deferred the fail-closed flip to **4.2b**. **4.2b Task B landed tha
 contract, not a uniform one**: `register_fresh` (the row-CREATING write) is fail-closed, the other five
 writes stay fail-open (see the design-obligations bullets below for the full rationale). **4.2b Task D**
 consumed the degraded-read case Task C defined (`ConfinedDispatchOutcome::route_unreadable`): the
-command-outbox delivery loop now RESCHEDULES on it (mirrors `containment_unreadable` exactly, a new
+command-outbox delivery loop now RESCHEDULES on it (a new
 `yuzu_server_command_outbox_deliver_retry_cause_total{cause}` counter separates the two causes), and it
 is discriminated at all five operator-facing zero-reach cascade sites (#3424/#3511:
 `mcp_server.cpp`/`command_routes.cpp`/`server.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`) plus two
 additional `ConfinedDispatchOutcome` consumers a grep of every `containment_unreadable` site caught
-(`deployment_engine.cpp`, `policy_evaluator.cpp`), each reverting/retrying the same way its
-`containment_unreadable` branch already did. `YuzuGatewayRouteWriteFailed` (#4246 #1's alert-rule half)
+(`deployment_engine.cpp`, `policy_evaluator.cpp`). **`route_unreadable` is deliberately NOT
+interchangeable with `containment_unreadable`** (Gate-8 finding UP-1): a fail-closed containment gate
+withholds every id BEFORE its send, forcing `sent == 0`, whereas a degraded directory read leaves the
+dispatch arm walk running — so a locally-connected device is genuinely sent while a directory-only
+device lands in `not_sent`. The command outbox can therefore reschedule the whole occurrence safely (it
+re-drives the STABLE `command_id`, so a re-send is absorbed by WS-0 receiver dedup and the terminal
+outcome replayed), but the two store consumers must NOT treat it all-or-nothing: `deployment_engine`
+lets a `route_unreadable` device revert INDIVIDUALLY via `not_sent` (a whole-batch revert would send an
+already-executing installer back a step and re-dispatch it next tick under a FRESH `command_id` that
+dedup cannot absorb — a double-execution), and `policy_evaluator` reports genuinely-delivered devices as
+delivered rather than whole-batch-undelivered. `YuzuGatewayRouteWriteFailed` (#4246 #1's alert-rule half)
 and `YuzuGatewayRouteUnreadable` (the closest available signal for #4246 #8's alert-rule half) both ship
 with this slice in `docs/prometheus/yuzu-alerts.yml`'s `yuzu-gateway` group — see the design-obligations
 bullets below. **What remains OUT of scope for 4.2b**: multi-cluster gateway fanout (4.3, today one
