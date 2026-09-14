@@ -427,6 +427,28 @@ flip, with a red-first test each:
   the flip. Test-side note: `tests/unit/test_guardian_spark_runtime.cpp`'s 200-key `detach_all` test
   (governance qe-303) now asserts `disarms + disarm_retained() == 200` rather than the false invariant
   `disarms == 200` this row's chaos reproduction disproved.
+- **up-3/up-4/ch-1/up-5 status (rung 9c PR-5b, #4221)**: up-3 fixed via a runtime-owned
+  compensating-disarm reservation reserved per claim BEFORE its arm dispatches (not routed through
+  `GuardianIoExecutor`'s own admission - it has no compensation-priority `IoClass` and rejects
+  everything once `Stopped`, which would have broken the Stopped-still-triggers-fallback
+  requirement R5.5 depends on); sized 1:1 with the executor's own per-class quotas. up-4 fixed for
+  the CONFIRMED real shape (a `Queued`, withdrawn/abandoned head with no outcome, left behind by
+  the same double-fault recovery paths, reachable via a genuine allocation failure) via a new
+  `expire_overdue_claims()` terminal-recovery pass; the kickoff's literal Dispatched-terminal-head
+  variant was investigated and NOT implemented - an attempt regressed a real, already-tested
+  scenario (a caller-timeout-abandoned claim whose async arm() is still genuinely in flight), and
+  no safe "the completion callback actually ran" signal was found to distinguish the two cases.
+  ch-1's fill-in-allocation seam added (both the ordinary and firewall-loop occurrences). up-5's
+  redrive is now wired onto the convergence lane's priority loop (elapsed-time-gated, its own
+  firewalled sweep); **this row's own "Missing telemetry" wording above is now WRONG** -
+  `disarm_retained()` is no longer "current (non-monotonic)" but a real lifecycle count
+  (`retained_counted` per claim, decremented on the claim's own successful completion or any other
+  terminal removal) - the fleet-gauge alternative this row offered was itself retracted on issue
+  #4221's own comment thread as insufficient (a monotonic counter cannot answer "is anything stuck
+  right now"), so the bounded redrive is the only closure this criterion accepts. `redrive_retained_
+  disarms()` walks `claims_` directly (never `keys_`), reaching a retained disarm even behind a
+  torn-down key - closes the #4221 follow-up comment (`ar-402`) that had worried a convergence-lane
+  trigger might enumerate the wrong registry and miss that case.
 - **NEW (added 2026-09-13, sre finding on the #2012/#3840 doc-sweep)**: #4279's lane-cap-overshoot
   observation (`SparkDetachedLane`'s shared admission primitive, `max_active=9 > cap=8` on a real
   storm-load test, 1-in-~10 hardware runs, root cause undetermined) has no PR-5 acceptance
