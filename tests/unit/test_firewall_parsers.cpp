@@ -14,6 +14,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cerrno>
+#include <cstring>
+
 using namespace yuzu::firewall;
 
 TEST_CASE("alf: disabled (State = 0) — real capture", "[firewall]") {
@@ -428,7 +431,7 @@ TEST_CASE("nft: an attribute length overrunning the buffer stops the walk safely
     push_u16(body, 100);
     push_u16(body, nft_raw::kNftaTableName);
     std::vector<std::byte> buf;
-    push_nlmsg(buf, 0, body);
+    push_nlmsg(buf, nft_raw::nft_msg_type(nft_raw::kNftMsgNewtable), body);
     CHECK(parse_nft_tables(buf).empty()); // name never decoded -> table dropped, not crashed
 }
 
@@ -517,4 +520,158 @@ TEST_CASE("nft: split_nlmsgs decodes NLM_F_DUMP_INTR on the terminating DONE mes
     auto clean_msgs = nft_raw::split_nlmsgs(clean);
     REQUIRE(clean_msgs.size() == 1);
     CHECK((clean_msgs[0].hdr.flags & nft_raw::kNlmFDumpIntr) == 0);
+}
+
+// ── nftables: nft_data_msgs exact-type filter (UP-11 #3461) ────────────────
+
+TEST_CASE("nft: nft_data_msgs -- a mixed buffer only keeps exactly-typed messages", "[firewall]") {
+    std::vector<std::byte> buf;
+    // NEWCHAIN-typed body (0x0A03) where a GETTABLE reply (0x0A00) is expected.
+    {
+        std::vector<std::byte> body = make_nfgenmsg(nft_raw::kNfprotoInet);
+        push_attr_str(body, nft_raw::kNftaChainName, "INPUT");
+        push_nlmsg(buf, nft_raw::nft_msg_type(nft_raw::kNftMsgNewchain), body);
+    }
+    // A random, unrecognised type.
+    {
+        std::vector<std::byte> body = make_nfgenmsg(nft_raw::kNfprotoInet);
+        push_attr_str(body, nft_raw::kNftaTableName, "filter");
+        push_nlmsg(buf, 0x7777, body);
+    }
+    // A DONE-typed message that happens to carry a body -- still not the
+    // expected data-message type.
+    push_nlmsg(buf, nft_raw::kNlmsgDone, std::vector<std::byte>(4, std::byte{0}));
+
+    CHECK(parse_nft_tables(buf).empty());
+}
+
+TEST_CASE("nft: nft_msg_type packs the nftables subsystem and message subtype", "[firewall]") {
+    CHECK(nft_raw::nft_msg_type(nft_raw::kNftMsgGettable) == 0x0A01);
+}
+
+// ── nftables: split_nlmsgs/walk_attrs subtraction-form bounds guard ────────
+
+TEST_CASE("nft: split_nlmsgs accepts an exactly-remaining-length message, rejects a +1 overrun",
+         "[firewall]") {
+    std::vector<std::byte> exact;
+    push_nlmsg(exact, nft_raw::kNlmsgDone, std::vector<std::byte>(4, std::byte{0}));
+    REQUIRE(exact.size() == 20); // 16-byte header + 4-byte payload, already 4-aligned
+    auto exact_msgs = nft_raw::split_nlmsgs(exact);
+    REQUIRE(exact_msgs.size() == 1);
+    CHECK(exact_msgs[0].payload.size() == 4);
+
+    // One byte short of the declared len -- must stop the walk, not read
+    // past the end.
+    std::vector<std::byte> overrun(exact.begin(), exact.end() - 1);
+    CHECK(nft_raw::split_nlmsgs(overrun).empty());
+}
+
+TEST_CASE("nft: walk_attrs accepts an exactly-remaining-length attribute, rejects a +1 overrun",
+         "[firewall]") {
+    std::vector<std::byte> exact;
+    push_attr_str(exact, nft_raw::kNftaTableName, "ab"); // len=7 (4 hdr + 3 value), padded to 8
+    exact.resize(7); // trim the pad byte: buffer now exactly hdr.len bytes
+    auto exact_attrs = nft_raw::walk_attrs(exact);
+    REQUIRE(exact_attrs.size() == 1);
+    CHECK(nft_raw::nla_string(exact_attrs[0].value) == "ab");
+
+    // One byte short of the declared len -- must stop the walk, not read
+    // past the end.
+    std::vector<std::byte> overrun(exact.begin(), exact.end() - 1);
+    CHECK(nft_raw::walk_attrs(overrun).empty());
+}
+
+// ── nftables: parse_nlmsgerr / parse_nft_done_errno ─────────────────────────
+
+TEST_CASE("nft: parse_nlmsgerr decodes -EPERM, rejects a short payload, rejects error==0",
+         "[firewall]") {
+    std::vector<std::byte> realistic(24, std::byte{0}); // int error + nlmsghdr + ext-ack padding
+    std::int32_t eperm = -EPERM;
+    std::memcpy(realistic.data(), &eperm, sizeof(eperm));
+    auto r = nft_raw::parse_nlmsgerr(realistic);
+    REQUIRE(r.has_value());
+    CHECK(*r == -EPERM);
+
+    std::vector<std::byte> short_payload(3, std::byte{0xff});
+    CHECK_FALSE(nft_raw::parse_nlmsgerr(short_payload).has_value());
+
+    std::vector<std::byte> ack(4, std::byte{0}); // error == 0: never requested, so anomalous
+    CHECK_FALSE(nft_raw::parse_nlmsgerr(ack).has_value());
+}
+
+TEST_CASE("nft: parse_nft_done_errno -- bare DONE is nullopt, zeroed is 0, nonzero is the exact "
+         "errno",
+         "[firewall]") {
+    CHECK_FALSE(nft_raw::parse_nft_done_errno({}).has_value());
+
+    std::vector<std::byte> zeroed(4, std::byte{0});
+    auto z = nft_raw::parse_nft_done_errno(zeroed);
+    REQUIRE(z.has_value());
+    CHECK(*z == 0);
+
+    std::vector<std::byte> errored(4, std::byte{0});
+    std::int32_t eintr = -EINTR;
+    std::memcpy(errored.data(), &eintr, sizeof(eintr));
+    auto e = nft_raw::parse_nft_done_errno(errored);
+    REQUIRE(e.has_value());
+    CHECK(*e == -EINTR);
+}
+
+// ── nftables: state decision layer (#3463-2, review R8) ────────────────────
+
+TEST_CASE("nft: nft_decide_state -- unknown whenever either dump is untrusted, else per "
+         "nft_has_content",
+         "[firewall]") {
+    NftChainInfo active_chain;
+    active_chain.is_base_chain = true;
+    active_chain.policy = nft_raw::kNftPolicyDrop;
+    std::vector<NftChainInfo> chains{active_chain};
+    std::vector<NftRuleInfo> rules;
+
+    CHECK(nft_decide_state(false, true, chains, rules) == NftVerdict::unknown);
+    CHECK(nft_decide_state(true, false, chains, rules) == NftVerdict::unknown);
+    CHECK(nft_decide_state(false, false, chains, rules) == NftVerdict::unknown);
+    CHECK(nft_decide_state(true, true, chains, rules) == NftVerdict::active);
+    CHECK(nft_decide_state(true, true, std::vector<NftChainInfo>{}, std::vector<NftRuleInfo>{}) ==
+          NftVerdict::inactive);
+}
+
+TEST_CASE("nft: nft_fallthrough_clamp -- full truth table", "[firewall]") {
+    CHECK(nft_fallthrough_clamp(true, FwState::disabled) == FwState::unknown);
+    CHECK(nft_fallthrough_clamp(true, FwState::enabled) == FwState::enabled);
+    CHECK(nft_fallthrough_clamp(true, FwState::unknown) == FwState::unknown);
+    CHECK(nft_fallthrough_clamp(false, FwState::disabled) == FwState::disabled);
+    CHECK(nft_fallthrough_clamp(false, FwState::enabled) == FwState::enabled);
+    CHECK(nft_fallthrough_clamp(false, FwState::unknown) == FwState::unknown);
+}
+
+// ── nftables: dump-outcome diagnostics (#3462-6) ────────────────────────────
+
+TEST_CASE("nft: nft_dump_reason maps every status to its exact token", "[firewall]") {
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::ok, 0}) == "ok");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::timeout, 0}) == "timeout");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::kernel_error, -EPERM}) == "eperm");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::kernel_error, -EINTR}) ==
+          "errno:" + std::to_string(EINTR));
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::foreign_flood, 0}) == "foreign_flood");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::truncated, 0}) == "truncated");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::oversized, 0}) == "oversized");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::io_error, 0}) == "io_error");
+}
+
+TEST_CASE("nft: nft_diag_row and nft_fallthrough_row produce the documented row shapes",
+         "[firewall]") {
+    NftDumpResult timed_out{NftDumpStatus::timeout, 0};
+    CHECK(nft_diag_row("chain", timed_out) == "error|nftables:chain:timeout");
+    CHECK(nft_fallthrough_row("table", timed_out) == "fallthrough|nftables:table:timeout");
+
+    NftDumpResult eperm{NftDumpStatus::kernel_error, -EPERM};
+    CHECK(nft_diag_row("rule", eperm) == "error|nftables:rule:eperm");
+}
+
+// ── sanitize_field (hoisted, #3465) ─────────────────────────────────────────
+
+TEST_CASE("nft: sanitize_field strips pipe/newline/CR", "[firewall]") {
+    CHECK(sanitize_field("a|b\nc\rd") == "a_b_c_d");
+    CHECK(sanitize_field("clean") == "clean");
 }
