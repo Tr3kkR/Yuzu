@@ -31,6 +31,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp"
 
 #include <cerrno>
 #include <cstdint>
@@ -327,3 +328,169 @@ TEST_CASE("autoruns plugin: macOS SourceIds report correctly for this build's ow
     CHECK(seen_macos_status.size() == macos_ids.size());
 #endif
 }
+
+
+// ── #4241/#4186 fault-injection tests (Apple-only: StatFns, walk_dir_names,
+// collect_user_launchagents, note_dir_constraint are all Apple-only symbols)
+// ────────────────────────────────────────────────────────────────────────
+#if defined(__APPLE__)
+
+// Direct source inclusion, macOS-only, mirroring autoruns_linux.cpp's
+// identical seam (see that file's own banner, and
+// YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY's definition comment in
+// autoruns_macos.cpp): StatFns, stat_constraint_token's callers,
+// DirCollectOutcome, walk_dir_names, note_dir_constraint, and
+// collect_user_launchagents all have internal (anonymous-namespace)
+// linkage, so there is no header seam to reach them through otherwise. This
+// TU never statically links the real plugin either way (the TEST_CASEs
+// above load it via PluginHandle::load/dlopen at runtime), so a second
+// compilation of the same free functions here creates no ODR/duplicate-
+// symbol conflict.
+// Excluding collect_macos leaves 5 of its helper functions
+// (source_in_filter/emit_status/parse_plist_root/emond_fields_from_dict/
+// collect_launchd_dir) with no caller in THIS compilation of the TU -- they
+// are all real, used call sites in the actual (non-test) build of this same
+// file, where collect_macos is present. -Wunused-function is non-fatal
+// project-wide (werror=false, root meson.build) but is silenced narrowly
+// here, scoped to just the include, rather than annotating five production
+// functions [[maybe_unused]] for a warning that only fires in this one
+// test-only re-inclusion.
+#define YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY 1
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#endif
+#include "../../agents/plugins/autoruns/src/autoruns_macos.cpp"
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#endif
+#undef YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY
+
+TEST_CASE("autoruns macOS: stat_constraint_token maps a stat/fstatat errno to a "
+          "reason token, ENOENT to nullopt (benign, matching is_benign_absent_errno)",
+          "[autoruns][macos]") {
+    CHECK_FALSE(stat_constraint_token(ENOENT).has_value());
+    REQUIRE(stat_constraint_token(EACCES).has_value());
+    CHECK(*stat_constraint_token(EACCES) == "permission_denied");
+    REQUIRE(stat_constraint_token(ELOOP).has_value());
+    CHECK(*stat_constraint_token(ELOOP) == "symlink_refused");
+    REQUIRE(stat_constraint_token(EIO).has_value());
+    CHECK(*stat_constraint_token(EIO) == "stat_failed");
+}
+
+TEST_CASE("autoruns macOS: walk_dir_names surfaces a real fstatat() failure as a "
+          "constraint instead of silently skipping the entry (#4241, site 1)",
+          "[autoruns][macos]") {
+    yuzu::test::TempDir dir("yuzu_test_autoruns_macos_walkdirnames_");
+    fs::create_directories(dir.path);
+    { std::ofstream(dir.path / "script.sh") << "#!/bin/sh\n"; }
+
+    SECTION("an injected EIO on the one entry is reported constrained, stat_failed") {
+        StatFns failing;
+        failing.fstatat_ = [](int, const char*, struct stat*, int) -> int {
+            errno = EIO;
+            return -1;
+        };
+        int seen = 0;
+        const auto result = walk_dir_names(
+            dir.path.string(), [&](const char*, std::int64_t) { ++seen; }, failing);
+        CHECK(seen == 0); // the failing entry never reaches on_entry
+        CHECK(result.constrained);
+        CHECK(result.reason == "stat_failed");
+    }
+
+    SECTION("an injected ENOENT (benign race) is NOT reported constrained") {
+        StatFns benign;
+        benign.fstatat_ = [](int, const char*, struct stat*, int) -> int {
+            errno = ENOENT;
+            return -1;
+        };
+        int seen = 0;
+        const auto result = walk_dir_names(
+            dir.path.string(), [&](const char*, std::int64_t) { ++seen; }, benign);
+        CHECK(seen == 0);
+        CHECK_FALSE(result.constrained);
+    }
+
+    SECTION("the real (uninjected) syscall still works against a real file") {
+        int seen = 0;
+        const auto result = walk_dir_names(dir.path.string(),
+                                           [&](const char*, std::int64_t) { ++seen; });
+        CHECK(seen == 1);
+        CHECK_FALSE(result.constrained);
+    }
+}
+
+TEST_CASE("autoruns macOS: collect_user_launchagents surfaces a real fstat() "
+          "failure on a user's home directory as a constraint instead of silently "
+          "skipping that user (#4241, site 2)",
+          "[autoruns][macos]") {
+    yuzu::test::TempDir users_dir("yuzu_test_autoruns_macos_users_");
+    fs::create_directories(users_dir.path / "alice" / "Library" / "LaunchAgents");
+    // chown isn't available to an unprivileged test process, so st_uid on a
+    // freshly-created temp dir is already this process's own uid -- >= 500
+    // on every real macOS account, satisfying the "real user home" filter
+    // without needing root.
+
+    // nullptr is safe here: both SECTIONs below inject an fstat() failure
+    // on the home directory itself, so the walk never reaches
+    // collect_launchd_dir_handle's ctx.write_output call -- ctx stays
+    // completely untouched (CommandContext's constructor is a noexcept
+    // pointer store, never dereferenced until write_output/report_progress/
+    // set_result_status is actually called).
+    yuzu::CommandContext ctx{nullptr};
+
+    SECTION("an injected EACCES on the home fstat is reported permission_denied") {
+        StatFns failing;
+        failing.fstat_ = [](int, struct stat*) -> int {
+            errno = EACCES;
+            return -1;
+        };
+        const auto outcome = collect_user_launchagents(ctx, failing, users_dir.path.string());
+        CHECK(outcome.acc.any_failure());
+        CHECK(outcome.acc.reason() == "permission_denied");
+        CHECK(outcome.rows == 0);
+    }
+
+    SECTION("an injected ENOENT (benign race) is NOT reported constrained") {
+        StatFns benign;
+        benign.fstat_ = [](int, struct stat*) -> int {
+            errno = ENOENT;
+            return -1;
+        };
+        const auto outcome = collect_user_launchagents(ctx, benign, users_dir.path.string());
+        CHECK_FALSE(outcome.acc.any_failure());
+    }
+}
+
+TEST_CASE("autoruns macOS: outer (/Users) and inner (per-user LaunchAgents) row_cap/"
+          "readdir_error tokens stay distinct in the accumulator, never collapsed by "
+          "substring dedup (#4186) -- exercises note_dir_constraint, the exact "
+          "function both collect_user_launchagents call sites route through. A real "
+          "compound-cap walk would need > kMaxEntriesPerDir real directory entries on "
+          "disk to reach the same two call sites, which is not a justified disk/CI "
+          "cost for a fixed anonymous-namespace constant (test-efficiency discipline)",
+          "[autoruns][macos]") {
+    DirCollectOutcome outcome;
+    note_dir_constraint(outcome, "row_cap:users");
+    note_dir_constraint(outcome, "row_cap:launchagents");
+    note_dir_constraint(outcome, "readdir_error:launchagents");
+
+    CHECK(outcome.acc.any_failure());
+    const std::string reason = outcome.acc.reason();
+    CHECK(reason.find("row_cap:users") != std::string::npos);
+    CHECK(reason.find("row_cap:launchagents") != std::string::npos);
+    CHECK(reason.find("readdir_error:launchagents") != std::string::npos);
+
+    // The specific regression this guards: a PLAIN "row_cap" token arriving
+    // alongside a suffixed one must survive as its own distinct entry, not
+    // be absorbed by (or absorb) the suffixed one -- the exact conflation
+    // ConstraintAccumulator's exact-string dedup exists to prevent, that
+    // this file's former substring-matching accumulator was vulnerable to.
+    DirCollectOutcome mixed;
+    note_dir_constraint(mixed, "row_cap");
+    note_dir_constraint(mixed, "row_cap:users");
+    CHECK(mixed.acc.reason() == "row_cap,row_cap:users");
+}
+
+#endif // defined(__APPLE__)

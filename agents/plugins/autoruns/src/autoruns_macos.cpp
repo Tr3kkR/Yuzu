@@ -41,6 +41,7 @@
 #include "autoruns_macos.hpp"
 #include "autoruns_parsers.hpp"
 
+#include <constraint_accumulator.hpp>
 #include <posix_dir_walk.hpp>
 #include <yuzu/agent/scoped_cfref.hpp>
 #include <yuzu/plugin.hpp>
@@ -103,6 +104,18 @@ private:
     int fd_;
 };
 
+/// Injectable metadata-read seam for `walk_dir_names` and
+/// `collect_user_launchagents` (issue #4241's fault-injection tests):
+/// defaults to the real syscalls on every production call site (never
+/// passed explicitly there); only test code, via the
+/// YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY TU-inclusion seam, ever
+/// supplies its own to simulate an EACCES/EIO mid-walk without needing a
+/// real unreadable file on disk.
+struct StatFns {
+    int (*fstat_)(int, struct stat*) = &::fstat;
+    int (*fstatat_)(int, const char*, struct stat*, int) = &::fstatat;
+};
+
 /// Outcome of an O_NOFOLLOW directory open: the handle (invalid on any
 /// failure), plus whether that failure is a real constraint (permission
 /// denied, a refused symlink, a path component that wasn't a directory —
@@ -114,16 +127,6 @@ struct DirOpenOutcome {
     bool constrained = false;
     std::string_view reason{};
 };
-
-/// `errno` -> a stable reason token for a `constrained` source status.
-std::string_view dir_open_constraint_token(int err) noexcept {
-    switch (err) {
-        case EACCES: return "permission_denied";
-        case ELOOP: return "symlink_refused";
-        case ENOTDIR: return "not_a_directory";
-        default: return "dir_open_failed";
-    }
-}
 
 /// Classifies an already-attempted `open`/`openat` result (`fd`, with
 /// `errno` still current from that call if `fd < 0`) into a DirOpenOutcome,
@@ -272,6 +275,7 @@ bool read_file_bounded(int dir_fd, const char* name, std::vector<uint8_t>& out,
 /// choose which one wins when combining with its own constraint state.
 struct DirWalkOutcome {
     bool truncated = false;
+    bool enumeration_error = false;
     bool file_constrained = false;
     std::string_view file_constrained_reason{};
 };
@@ -326,7 +330,8 @@ DirWalkOutcome walk_plist_dir_handle(const DirHandle& dir, OnPlist&& on_plist) {
             on_plist(entry->d_name, bytes, mtime);
             return true;
         });
-    outcome.truncated = walk.truncated || walk.enumeration_error;
+    outcome.truncated = walk.truncated;
+    outcome.enumeration_error = walk.enumeration_error;
     return outcome;
 }
 
@@ -351,6 +356,7 @@ DirConstraint walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
     DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
     const auto walk_outcome = walk_plist_dir_handle(open.handle, std::forward<OnPlist>(on_plist));
     if (walk_outcome.truncated) return DirConstraint{true, "row_cap"};
+    if (walk_outcome.enumeration_error) return DirConstraint{true, "readdir_error"};
     if (walk_outcome.file_constrained) return DirConstraint{true, walk_outcome.file_constrained_reason};
     return DirConstraint{open.constrained, open.reason};
 }
@@ -362,20 +368,37 @@ DirConstraint walk_plist_dir(const std::string& dir_path, OnPlist&& on_plist) {
 /// to `on_entry`. No content is read here — periodic scripts carry no
 /// structured metadata this plugin decodes, only their existence and mtime.
 template <typename OnEntry>
-DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry) {
+DirConstraint walk_dir_names(const std::string& dir_path, OnEntry&& on_entry,
+                             const StatFns& stat_fns = {}) {
     DirOpenOutcome open = open_dir_no_follow_checked(dir_path);
     if (!open.handle.valid()) return DirConstraint{open.constrained, open.reason};
     const int dfd = dirfd(open.handle.get());
+    bool stat_constrained = false;
+    std::string_view stat_reason{};
     const auto walk = yuzu::shared::walk_dir_capped(
         open.handle.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
             struct stat st{};
-            if (fstatat(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) return true;
+            if (stat_fns.fstatat_(dfd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+                // #4241: a real fstatat() failure (permission denied, a
+                // refused symlink, a genuine I/O error) must not be
+                // silently read as "this entry contributes nothing" -- only
+                // a benign ENOENT race (the entry vanished between readdir
+                // and stat) is. First non-benign failure wins, matching
+                // this file's other single-reason accumulation sites.
+                const int stat_err = errno;
+                if (const auto token = stat_constraint_token(stat_err); token && !stat_constrained) {
+                    stat_constrained = true;
+                    stat_reason = *token;
+                }
+                return true;
+            }
             if (!S_ISREG(st.st_mode) && !S_ISLNK(st.st_mode)) return true;
             on_entry(entry->d_name, static_cast<std::int64_t>(st.st_mtime));
             return true;
         });
     if (walk.truncated) return DirConstraint{true, "row_cap"};
     if (walk.enumeration_error) return DirConstraint{true, "readdir_error"};
+    if (stat_constrained) return DirConstraint{true, stat_reason};
     return DirConstraint{};
 }
 
@@ -433,6 +456,7 @@ EmondRuleFields emond_fields_from_dict(CFDictionaryRef dict) {
 struct LaunchdDirOutcome {
     std::size_t rows = 0;
     bool truncated = false;
+    bool enumeration_error = false;
     bool file_constrained = false;
     std::string_view file_constrained_reason{};
 };
@@ -461,8 +485,8 @@ LaunchdDirOutcome collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId
             ctx.write_output(format_row(row));
             ++count;
         });
-    LaunchdDirOutcome outcome{count, walk_outcome.truncated, walk_outcome.file_constrained,
-                              walk_outcome.file_constrained_reason};
+    LaunchdDirOutcome outcome{count, walk_outcome.truncated, walk_outcome.enumeration_error,
+                              walk_outcome.file_constrained, walk_outcome.file_constrained_reason};
     if (parse_failed && !outcome.file_constrained) {
         outcome.file_constrained = true;
         outcome.file_constrained_reason = "malformed";
@@ -471,22 +495,21 @@ LaunchdDirOutcome collect_launchd_dir_handle(yuzu::CommandContext& ctx, SourceId
 }
 
 /// A whole `collect_*` call's outcome: rows emitted, plus whether ANY
-/// directory it opened along the way hit a real constraint rather than a
-/// genuine absence (AC4) — `note_dir_constraint` accumulates every distinct
-/// token seen (a per-user walk can hit the same token, e.g.
-/// `permission_denied`, on several different users' homes; it is recorded
-/// once, not once per user).
+/// directory it opened along the way -- or any per-entry metadata read
+/// (#4241) -- hit a real constraint rather than a genuine absence (AC4).
+/// Backed by the shared yuzu::shared::ConstraintAccumulator (exact-string
+/// dedup, insertion order preserved) rather than this file's former
+/// substring-matching accumulation: #4186 introduces suffixed tokens
+/// (`row_cap:users`, `row_cap:launchagents`) that are genuine SUBSTRINGS of
+/// a plain `row_cap` a sibling call site could also record, which the old
+/// `reason.find(token) != npos` dedup would have silently conflated.
 struct DirCollectOutcome {
     std::size_t rows = 0;
-    bool constrained = false;
-    std::string reason{};
+    yuzu::shared::ConstraintAccumulator acc;
 };
 
 void note_dir_constraint(DirCollectOutcome& outcome, std::string_view token) {
-    outcome.constrained = true;
-    if (outcome.reason.find(token) != std::string::npos) return; // already recorded
-    if (!outcome.reason.empty()) outcome.reason += ',';
-    outcome.reason.append(token);
+    outcome.acc.add_failure(token);
 }
 
 DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source_id,
@@ -498,6 +521,7 @@ DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source
     outcome.rows = result.rows;
     if (open.constrained) note_dir_constraint(outcome, open.reason);
     if (result.truncated) note_dir_constraint(outcome, "row_cap");
+    if (result.enumeration_error) note_dir_constraint(outcome, "readdir_error");
     if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
     return outcome;
 }
@@ -511,16 +535,17 @@ DirCollectOutcome collect_launchd_dir(yuzu::CommandContext& ctx, SourceId source
 /// (the mac_user_launchagents scope's documented identity), not a
 /// getpwuid() lookup — this leg reads files, it does not call into Open
 /// Directory.
-DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
+DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx,
+                                            const StatFns& stat_fns = {},
+                                            const std::string& users_dir = "/Users") {
     DirCollectOutcome outcome;
-    constexpr const char* kUsersDir = "/Users";
-    DirOpenOutcome users_open = open_dir_no_follow_checked(kUsersDir);
+    DirOpenOutcome users_open = open_dir_no_follow_checked(users_dir);
     if (users_open.constrained) note_dir_constraint(outcome, users_open.reason);
     if (!users_open.handle.valid()) return outcome;
     const auto walk = yuzu::shared::walk_dir_capped(
         users_open.handle.get(), kMaxEntriesPerDir, [&](const struct dirent* entry) {
             const std::string_view name(entry->d_name);
-            const std::string home = std::string{kUsersDir} + "/" + entry->d_name;
+            const std::string home = users_dir + "/" + entry->d_name;
             // O_NOFOLLOW on the home directory itself: a symlinked "user" entry
             // under /Users is not a real per-user home this leg will read into.
             const int home_fd = open(home.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
@@ -532,7 +557,14 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
             }
             FdHandle home_handle(home_fd);
             struct stat st{};
-            if (fstat(home_handle.get(), &st) != 0) return true;
+            if (stat_fns.fstat_(home_handle.get(), &st) != 0) {
+                // #4241, site 2: a real fstat() failure on an already-open fd
+                // is a genuine constraint (AC4), not "this home contributes
+                // nothing" -- only a benign ENOENT race is.
+                const int stat_err = errno;
+                if (const auto token = stat_constraint_token(stat_err)) note_dir_constraint(outcome, *token);
+                return true;
+            }
             if (st.st_uid < 500) return true; // system/shared account, not a real user home
             // Walk "Library" then "LaunchAgents" as two openat() hops chained
             // from home_fd, each independently O_NOFOLLOW-checked — a single
@@ -552,16 +584,35 @@ DirCollectOutcome collect_user_launchagents(yuzu::CommandContext& ctx) {
                                                             home + "/Library/LaunchAgents",
                                                             Scope::user, name);
             outcome.rows += result.rows;
-            if (result.truncated) note_dir_constraint(outcome, "row_cap");
+            // #4186: this is the INNER (per-user LaunchAgents) walk -- suffixed
+            // distinctly from the OUTER /Users walk below so an operator can
+            // tell which one actually hit its cap/error, instead of both
+            // collapsing to the same ambiguous "row_cap" token once deduped.
+            if (result.truncated) note_dir_constraint(outcome, "row_cap:launchagents");
+            if (result.enumeration_error) note_dir_constraint(outcome, "readdir_error:launchagents");
             if (result.file_constrained) note_dir_constraint(outcome, result.file_constrained_reason);
             return true;
         });
-    if (walk.truncated) note_dir_constraint(outcome, "row_cap");
-    if (walk.enumeration_error) note_dir_constraint(outcome, "readdir_error");
+    if (walk.truncated) note_dir_constraint(outcome, "row_cap:users");
+    if (walk.enumeration_error) note_dir_constraint(outcome, "readdir_error:users");
     return outcome;
 }
 
 } // namespace
+
+// `collect_macos` itself (below) is excluded when
+// YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY is defined -- the seam
+// test_autoruns_macos_local.cpp uses to #include this TU directly and reach
+// the internal-linkage StatFns/stat_constraint_token/walk_dir_names/
+// collect_user_launchagents for a constructed-fixture unit test (#4241),
+// without pulling collect_macos's own symbol into a second definition. This
+// TU never statically links the real plugin either way (test_autoruns_
+// macos_local.cpp's other TEST_CASEs load it via PluginHandle::load/dlopen
+// at runtime), so a second compilation of the same free functions here
+// creates no ODR/duplicate-symbol conflict. Never defined by this TU's own
+// (real) build -- meson.build does not set it. Mirrors autoruns_linux.cpp's
+// identical seam for YUZU_AUTORUNS_LINUX_UNIT_TEST_INTERNALS_ONLY.
+#ifndef YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
     // Tracks whether ANY source this leg processed reported CONSTRAINED (not
@@ -590,9 +641,9 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
             continue;
         }
         const auto outcome = collect_launchd_dir(ctx, spec.id, spec.path, Scope::system, {});
-        if (outcome.constrained) {
+        if (outcome.acc.any_failure()) {
             any_constrained |=
-                emit_status(ctx, spec.id, YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.reason);
+                emit_status(ctx, spec.id, YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.acc.reason());
         } else {
             any_constrained |=
                 emit_status(ctx, spec.id, YUZU_SUPPORT_SUPPORTED, outcome.rows,
@@ -605,9 +656,9 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
                                        std::nullopt, "filtered");
     } else {
         const auto outcome = collect_user_launchagents(ctx);
-        if (outcome.constrained) {
+        if (outcome.acc.any_failure()) {
             any_constrained |= emit_status(ctx, SourceId::mac_user_launchagents,
-                                           YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.reason);
+                                           YUZU_SUPPORT_CONSTRAINED, outcome.rows, outcome.acc.reason());
         } else {
             any_constrained |= emit_status(ctx, SourceId::mac_user_launchagents,
                                            YUZU_SUPPORT_SUPPORTED, outcome.rows,
@@ -651,9 +702,9 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
                 });
             if (dir_outcome.constrained) note_dir_constraint(outcome, dir_outcome.reason);
         }
-        if (outcome.constrained) {
+        if (outcome.acc.any_failure()) {
             any_constrained |= emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_CONSTRAINED,
-                                           count, outcome.reason);
+                                           count, outcome.acc.reason());
         } else {
             any_constrained |= emit_status(ctx, SourceId::mac_periodic, YUZU_SUPPORT_SUPPORTED,
                                            count, "periodic_dir_walk");
@@ -719,6 +770,8 @@ int collect_macos(yuzu::CommandContext& ctx, std::string_view filter) {
     // exception (caught in execute()).
     return any_constrained ? 1 : 0;
 }
+
+#endif // !YUZU_AUTORUNS_MACOS_UNIT_TEST_INTERNALS_ONLY
 
 } // namespace yuzu::autoruns
 
