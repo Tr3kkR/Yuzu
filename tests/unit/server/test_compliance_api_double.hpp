@@ -3,7 +3,7 @@
 /// @file test_compliance_api_double.hpp
 /// FnComplianceApi — a test-only `ComplianceApi` adapter backed by
 /// `std::function` per method (mirrors `test_verify_api_double.hpp`'s
-/// `FnVerifyApi`, generalized to the compliance seam's five-method surface).
+/// `FnVerifyApi`, generalized to the compliance seam's six-method surface).
 /// A route/MCP handler test (Task B of this family's ladder) constructs one
 /// with only the methods it exercises wired; an unwired method returns the
 /// AUTHORITATIVE-degrade `PolicyReadError::kDegraded` rather than an empty

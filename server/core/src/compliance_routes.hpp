@@ -26,7 +26,6 @@
 
 namespace yuzu::server {
 
-class HttpRouteSink;
 
 /// Compliance READ routes — /compliance, /fragments/compliance/*,
 /// GET /api/policies*, GET /api/policy-fragments*, GET /api/compliance*

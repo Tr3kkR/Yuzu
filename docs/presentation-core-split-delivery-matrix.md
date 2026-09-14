@@ -104,7 +104,7 @@ The first draft asserted a falsified current state; a three-model adversarial pa
   `PolicyGroupBinding`, `PolicyAgentStatus`, `ComplianceSummary`, `FleetCompliance`, `PolicyQuery`,
   `FragmentQuery`, `PolicyReadError`, plus a NEW `PolicyDetail` composite) was relocated OUT of the
   pg-coupled `policy_store.hpp` into a new pure `compliance_types.hpp` — `policy_store.hpp`
-  re-`#include`s it so all 8 existing includers keep seeing the types transitively (ODR-safe pure
+  re-`#include`s it so all 9 existing includers keep seeing the types transitively (ODR-safe pure
   relocation, not a duplication; `class PolicyStore` and its mutator-only helpers stay in
   `policy_store.hpp`), and `compliance_model.hpp` was made pure by flipping its one store include to
   `compliance_types.hpp`. (b) `compliance` is the FIRST family whose routes file mixed seamed reads

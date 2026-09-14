@@ -6,7 +6,7 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers exactly one family, `network` (see FAMILIES below).
+covers three families — `network`, `verify`, `compliance` (see FAMILIES below).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
