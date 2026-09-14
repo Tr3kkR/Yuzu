@@ -17,7 +17,9 @@
 #include "reserved_definition_id.hpp" // kMcpDefinitionPrefix (#2442 — the ONE reserved-namespace rule)
 #include "rotation_confirm_state.hpp" // classify_confirm_state (#2443 confirm_engine_rotation precondition)
 #include "rotation_sweep_naming.hpp" // kApiTokenConfirmTotalMetric (shared REST/MCP metric symbol)
+#include "scope_preview.hpp" // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
+#include "inventory_eval.hpp" // #2146 Batch B2: InventoryEvalRequest/evaluate_inventory (create_result_set_from_inventory_query)
 #include "token_rotation_lookup.hpp" // shared REST/MCP human-token rotation successor lookup (P2 #11)
 
 #include "agent_registry.hpp"           // AgentRegistry (discover_plugins tool)
@@ -31,6 +33,7 @@
 #include "guardian_model.hpp"           // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "guardian_rule_spec.hpp"        // #2146 Batch B1: derive_rule_spec / dangerous_enforce_in_spec (create/update)
 #include "guardian_schema_registry.hpp" // guardian_schema_catalog (Guardian discovery surface)
+#include "result_set_store.hpp"          // #2146 Batch B2: ResultSetStore — result-set MCP twins
 #include "baseline_store.hpp"            // #2146 Batch B1: BaselineStore (get_guardian_device_compliance)
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
@@ -59,6 +62,7 @@
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "workflow_model.hpp"  // #4030: shared workflow/workflow-execution/schedule row builders
+#include "viz_routes.hpp" // #2146 Batch B3: VizRoutes::kDefaultMachinesMax/kMachinesMaxCeiling/kOfflineStaleWindowSecs
 #include "mcp_input_bounds.hpp"        // kExecInstr* / check_exec_instruction_shape (#2437)
 #include "access_review_model.hpp"      // Periodic Access Reviews (SOC 2 CC6.2) — read-model
 #include "access_review_store.hpp"      // Periodic Access Reviews — campaign persistence
@@ -713,14 +717,159 @@ static const ToolDef kTools[] = {
      R"j(]})j"},
 
     {"preview_scope_targets",
-     "Show which agents match a scope expression. NOTE: tag:<key> atoms resolve from the "
-     "persistent tag store ONLY (unlike an actual dispatch, which also falls back to a "
-     "connected agent's own live self-reported value when the store has no row for that "
-     "agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
+     "Show which agents match a scope expression. Confined by management group (ADR-0017): a "
+     "caller admitted through a management-group grant sees matched_agents/matched_count "
+     "narrowed to only their own visible devices, never the whole fleet. NOTE: tag:<key> atoms "
+     "resolve from the persistent tag store ONLY (unlike an actual dispatch, which also falls "
+     "back to a connected agent's own live self-reported value when the store has no row for "
+     "that agent) - a gateway-proxied or not-yet-synced agent whose only claim to a key is its "
      "own live report may be previewed as excluded here but still be targeted by the real "
-     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\".",
+     "dispatch. See docs/asset-tagging-guide.md \"Tag source precedence\". NOTE: "
+     "from_result_set:<id> and props.* atoms are NOT resolved by this preview (only "
+     "os/arch/hostname/agent_version/tag:* are) - an expression using from_result_set: always "
+     "previews as matched_count:0 here even though a real dispatch resolves it correctly; do "
+     "not rely on this tool for such an expression (tracked #4307). REST v1 twin: POST "
+     "/api/v1/scope/preview.",
      R"({"type":"object","properties":{"expression":{"type":"string","minLength":1,"description":"Scope expression"}},"required":["expression"]})",
      R"j({"type":"object","properties":{"expression":{"type":"string"},"matched_count":{"type":"integer"},"matched_agents":{"type":"array","items":{"type":"string"}},"warning":{"type":"string","description":"Present only when the match count exceeds the display threshold"}},"required":["expression","matched_count","matched_agents"]})j"},
+
+    // ── Result Sets (#2146 Batch B2) — scope-walking primitive: a named,
+    // TTL-bounded, lineage-tracked set of device ids produced by a query,
+    // action result, or manual curation (docs/scope-walking-design.md). REST
+    // v1 had a full 12-operation API with zero MCP tools before this batch.
+    // Every tool below shares the SAME `ResultSet` row shape (id/name/
+    // owner_principal/created_at/ttl_at/last_used_at/pinned/parent_id/
+    // source_kind/status/source_execution_id/device_count) as its REST v1
+    // twin — both surfaces call the SAME result_set_json() builder
+    // (result_set_model.hpp), so the shape cannot drift.
+
+    {"list_result_sets",
+     "List the caller's own result sets (scope-walking artifacts). Owner-scoped: only sets "
+     "owned by the calling principal are returned. REST v1 twin: GET /api/v1/result-sets. "
+     "Service-scoped API tokens are denied outright — owner-scoping keys on the minting "
+     "principal's username, which a sibling service token of the same minter would otherwise "
+     "share.",
+     R"j({"type":"object","properties":{"cursor":{"type":"string","description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
+     R"j({"type":"object","properties":{"result_sets":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
+
+    {"create_result_set",
+     "Create a result set directly from pre-computed device ids. Synchronous — lands "
+     "materialized immediately (e.g. \"I have a CSV of device ids\"), unlike the "
+     "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
+     "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
+     "Service-scoped API tokens are denied outright.",
+     R"j({"type":"object","properties":{"name":{"type":"string"},"source_kind":{"type":"string","default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string"},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"create_result_set_from_inventory_query",
+     "Create an owner-scoped result set from a SYNCHRONOUS inventory query — evaluates "
+     "conditions against every agent's stored inventory server-side; membership is every "
+     "match, optionally narrowed to an owned parent set's CURRENT members. Requires "
+     "Inventory:Read (a synchronous read against InventoryStore, not a dispatch — same "
+     "securable as query_installed_software). Unlike every other result-set tool in this "
+     "family, a service-scoped API token is admitted and confined here, not denied outright "
+     "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
+     "the minting token's username, so a service token can mint a set the minter's other "
+     "credentials can later read back. REST v1 twin: POST "
+     "/api/v1/result-sets/from-inventory-query.",
+     R"j({"type":"object","properties":{"name":{"type":"string"},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"field":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}}}},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"create_result_set_from_tar_query",
+     "Create a result set by DISPATCHING a read-only TAR SQL query to the fleet. ASYNC: "
+     "returns immediately with status=\"pending\" — poll get_result_set by the returned id, "
+     "or subscribe to /api/v1/events on source_execution_id, until status flips to "
+     "\"materialized\" (or \"failed\"). Requires Execution:Execute, confined to the caller's "
+     "derived visible device set — the ONLY per-device authorization on this dispatch "
+     "surface (not defense-in-depth). SQL is sandboxed AGENT-side by a read-only authorizer; "
+     "the server only length-checks (max 100000 bytes). Membership is every agent that "
+     "returned >=1 row (include_empty=true widens to every responder). Dispatches to "
+     "parent_id's CURRENT members when supplied, else broadcasts to every connected agent — "
+     "omitting parent_id is the only way to broadcast; a supplied parent_id that resolves to "
+     "nothing is refused (400), never silently widened. REST v1 twin: POST "
+     "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or error — it "
+     "dispatches a real command to the fleet; poll instead.",
+     R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string"}},"required":["sql"]})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"create_result_set_from_instruction_result",
+     "Create a result set by DISPATCHING an existing InstructionDefinition to the fleet. "
+     "ASYNC — same pending->materialize contract as create_result_set_from_tar_query: poll "
+     "get_result_set by id, or subscribe to /api/v1/events on source_execution_id. Requires "
+     "Execution:Execute, confined to the caller's derived visible device set — the ONLY "
+     "per-device authorization on this dispatch surface. Membership is the responders whose "
+     "output row satisfies the operator-supplied matcher (column/op/value); omitting matcher "
+     "accepts every responder. Dispatches to parent_id's CURRENT members when supplied, else "
+     "broadcasts — same omit-to-broadcast / refuse-if-resolves-to-nothing contract as "
+     "create_result_set_from_tar_query. Find valid instruction_id values via list_definitions "
+     "or discover_instructions — do not guess. REST v1 twin: POST "
+     "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
+     "error — it dispatches a real command to the fleet; poll instead.",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1},"params":{"type":"object","additionalProperties":{"type":"string"},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string"},"name":{"type":"string"}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"reevaluate_result_set",
+     "Re-run an existing result set's OWN source query, creating a NEW SIBLING set (same "
+     "parent_id as the original, NOT a child of it) — a fresh snapshot of a tar_query or "
+     "instruction_result set's original question against today's fleet. Requires "
+     "Execution:Execute (re-dispatches to the fleet, ASYNC, same pending->materialize "
+     "contract as the create_result_set_from_* producers) — confined to the caller's derived "
+     "visible device set. A manual_curate or inventory_query source set returns an error "
+     "(re-eval of those source kinds is not yet supported; sync sources are a tracked "
+     "follow-up). REST v1 twin: POST /api/v1/result-sets/{id}/re-eval. NEVER re-send this "
+     "call on a timeout or error.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"The result set to re-evaluate"}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"get_result_set",
+     "Get one result set's metadata by id. Owner-scoped — a non-owner gets the same "
+     "not-found error as a nonexistent id (existence-oracle-safe). REST v1 twin: GET "
+     "/api/v1/result-sets/{id}.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"get_result_set_members",
+     "List a result set's member device ids. Owner-scoped. REST v1 twin: GET "
+     "/api/v1/result-sets/{id}/members.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["id"]})",
+     R"j({"type":"object","properties":{"device_ids":{"type":"array","items":{"type":"string"}},"next_cursor":{"type":"string"}},"required":["device_ids","next_cursor"]})j"},
+
+    {"get_result_set_lineage",
+     "Walk a result set's parent chain, root to self — reconstructs the narrowing steps "
+     "(query -> refine -> refine) that produced it. Owner-scoped; the walk stops at the "
+     "first ancestor not owned by the caller, so a child parented onto another operator's "
+     "set cannot leak that set's metadata. REST v1 twin: GET /api/v1/result-sets/{id}/lineage.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{"chain":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"source_kind":{"type":"string"},"device_count":{"type":"integer"}},"required":["id","name","source_kind","device_count"]}}},"required":["chain"]})j"},
+
+    {"pin_result_set",
+     "Pin a result set, exempting it from TTL expiry. Idempotent — pinning an already-pinned "
+     "set is a no-op success, same end state. Owner-scoped; capped at 50 pinned sets per "
+     "owner. REST v1 twin: POST /api/v1/result-sets/{id}/pin.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"unpin_result_set",
+     "Unpin a result set, restoring its normal TTL. Idempotent — unpinning an already-unpinned "
+     "set is a no-op success. Owner-scoped. REST v1 twin: POST /api/v1/result-sets/{id}/unpin.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
+     R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
+
+    {"delete_result_set",
+     "Delete a result set. Owner-scoped. A pinned set must be unpinned first. REST v1 twin: "
+     "DELETE /api/v1/result-sets/{id}.",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"j({"type":"object","properties":{"deleted":{"type":"boolean"}},"required":["deleted"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
      R"({"type":"object","properties":{"status":{"type":"string","enum":["pending","approved","rejected"]},"submitted_by":{"type":"string"}}})",
@@ -2387,6 +2536,99 @@ static const ToolDef kTools[] = {
      "distinct from deployment.create). Requires SoftwareDeployment:Read.",
      R"j({"type":"object","properties":{"run_id":{"type":"string","minLength":1,"description":"The source pre-flight run id"}},"required":["run_id"]})j",
      R"j({"type":"object","properties":{"run_id":{"type":"string"},"name":{"type":"string"},"go":{"type":"integer"},"warn":{"type":"integer"}},"required":["run_id","name","go","warn"]})j"},
+
+    // ── #2146 Batch B3 (api-parity programme): fleet visualization + execution/
+    // fleet statistics REST+MCP twins. All 6 are confirmed pure reads with no
+    // dispatch -- both stats tools call the SAME ExecutionTracker aggregate
+    // queries their REST twins call (via the shared execution_statistics_model.hpp
+    // builders, Rule 1); the viz tools mirror VizRoutes::handle_topology /
+    // handle_host_topology's own gate/param/cap pipeline exactly (kill switch,
+    // then Response:Read, then the M-1 machines_max DoS cap) via the
+    // set_viz_deps() setter below, and share merge_offline_topology()
+    // (fleet_topology_store.hpp) with the REST handler for the offline-host
+    // merge rule.
+    {"get_execution_statistics",
+     "Fleet-wide execution success/failure rollup across every dispatched instruction "
+     "(capability 1.9): total executions, how many ran today, how many distinct agents have "
+     "executed anything, overall success rate (%), and average duration (seconds). Mirrors GET "
+     "/api/v1/execution-statistics. Use for a quick fleet execution health pulse; use "
+     "get_execution_statistics_by_agent or get_execution_statistics_by_definition for the same "
+     "rollup broken down by agent or instruction definition, or get_fleet_statistics for the "
+     "same data reshaped for a dashboard tile. All-zero values are the honest empty state for a "
+     "fleet with no completed executions yet, not an error. Requires Execution:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"total_executions":{"type":"integer"},"executions_today":{"type":"integer"},"active_agents":{"type":"integer"},"overall_success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["total_executions","executions_today","active_agents","overall_success_rate","avg_duration_seconds"]})j"},
+
+    {"get_execution_statistics_by_agent",
+     "Per-agent execution success/failure rollup, optionally filtered by agent_id and/or a "
+     "since timestamp, sorted by total executions descending, capped at 1000 rows. Mirrors GET "
+     "/api/v1/execution-statistics/agents. Use to find which agents are failing "
+     "disproportionately, or to see one agent's execution history at a glance (pass agent_id). "
+     "An empty data array means no agent has any completed execution matching the filter, not a "
+     "fault. NOT confined by the caller's own management-group scope -- like its REST twin, this "
+     "fleet-wide rollup returns rows for every agent regardless of the caller's visible-agent "
+     "set. Requires Execution:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","maxLength":256,"description":"Filter to one agent; omit for every agent"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"total_executions":{"type":"integer"},"success_count":{"type":"integer"},"failure_count":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"},"last_execution_at":{"type":"integer"}},"required":["agent_id","total_executions","success_count","failure_count","success_rate","avg_duration_seconds","last_execution_at"]}}},"required":["data"]})j"},
+
+    {"get_execution_statistics_by_definition",
+     "Per-instruction-definition execution success/failure rollup, optionally filtered by "
+     "definition_id and/or a since timestamp, sorted by total executions descending, capped at "
+     "1000 rows. Mirrors GET /api/v1/execution-statistics/definitions. Use to find which "
+     "instruction definitions fail disproportionately across the fleet, or to see one "
+     "definition's execution history at a glance (pass definition_id). An empty data array "
+     "means no definition has any completed execution matching the filter, not a fault. NOT "
+     "confined by the caller's own management-group scope -- like its REST twin, this "
+     "fleet-wide rollup returns rows regardless of the caller's visible-agent set. Requires "
+     "Execution:Read.",
+     R"j({"type":"object","properties":{"definition_id":{"type":"string","maxLength":256,"description":"Filter to one instruction definition; omit for every definition"},"since":{"type":"integer","minimum":0,"description":"Only count executions dispatched at/after this epoch-seconds timestamp"},"limit":{"type":"integer","minimum":1,"maximum":1000,"default":50,"description":"Max rows, highest total_executions first"}}})j",
+     R"j({"type":"object","properties":{"data":{"type":"array","items":{"type":"object","properties":{"definition_id":{"type":"string"},"total_executions":{"type":"integer"},"total_agents":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["definition_id","total_executions","total_agents","success_rate","avg_duration_seconds"]}}},"required":["data"]})j"},
+
+    {"get_fleet_statistics",
+     "Top-level fleet dashboard rollup: execution totals/today/success-rate/avg-duration nested "
+     "under executions, plus active_agents at the top level. Mirrors GET /api/v1/statistics. "
+     "Same underlying ExecutionTracker fleet summary as get_execution_statistics, reshaped for "
+     "a dashboard tile -- prefer get_execution_statistics if the flat shape is more convenient. "
+     "All-zero values are the honest empty state for a fleet with no completed executions yet, "
+     "not an error. Requires Infrastructure:Read.",
+     R"j({"type":"object","properties":{},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"executions":{"type":"object","properties":{"total":{"type":"integer"},"today":{"type":"integer"},"success_rate":{"type":"number","description":"Percent, 0-100"},"avg_duration_seconds":{"type":"number"}},"required":["total","today","success_rate","avg_duration_seconds"]},"active_agents":{"type":"integer"}},"required":["executions","active_agents"]})j"},
+
+    {"get_fleet_topology",
+     "Fleet-wide 3D-visualization topology snapshot: every connected agent as a machine node "
+     "with its processes, open connections, and listening sockets. Mirrors GET "
+     "/api/v1/viz/fleet/topology. Use for a point-in-time inventory of what's running/"
+     "listening/talking across the fleet, or before drilling into one host via "
+     "get_host_topology. Cached up to 60s server-side; pass fresh=true to force a live "
+     "re-fetch (this invalidates the shared cache for every caller, not only this one -- use "
+     "sparingly). A host that aged out of the live cache but was seen within the last 7 days "
+     "still appears, flagged stale=true with empty processes/connections/listeners and ts=0 -- "
+     "treat that shape as 'last known identity, no current detail', never as an error. "
+     "machines_max bounds the response size (DoS protection, default 5000, ceiling 100000): a "
+     "fleet larger than the cap is refused outright, never silently truncated, so a caller "
+     "never mistakes a partial view for the whole fleet -- raise machines_max or use "
+     "get_host_topology per agent instead. NOT confined by the caller's management-group "
+     "scope -- like its REST twin (#2146 Batch B3 review), a caller with Response:Read sees "
+     "every connected agent's process/connection/listener data fleet-wide, regardless of "
+     "management-group membership. Answers kInternalError when an operator has "
+     "disabled the visualization feature (yuzu_viz_disabled / --viz-disable). Requires "
+     "Response:Read.",
+     R"j({"type":"object","properties":{"include_vuln":{"type":"boolean","default":false,"description":"Join known-CVE severity onto each process by name (best-effort; often inert if the fleet has no version-bearing inventory match)"},"fresh":{"type":"boolean","default":false,"description":"Force a live re-fetch, invalidating the shared 60s cache for every caller"},"machines_max":{"type":"integer","minimum":1,"maximum":100000,"default":5000,"description":"Refuse (do not truncate) a snapshot with more machines than this"}}})j",
+     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"include_vuln":{"type":"boolean"},"machines":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["schema","schema_minor","generated_at","include_vuln","machines"]})j"},
+
+    {"get_host_topology",
+     "Per-host slice of the fleet topology -- one machine's processes, open connections, and "
+     "listening sockets, keyed by agent_id. Mirrors GET /api/v1/viz/host/{id}/topology. Use "
+     "after get_fleet_topology or list_agents to drill into a single host without paying for "
+     "the whole fleet's payload. Answers kInvalidParams 'host not found' when agent_id has no "
+     "entry in the CURRENT live topology snapshot -- unlike get_fleet_topology, this tool does "
+     "NOT fall back to a durable stale placeholder for a host that aged out of the cache, so "
+     "not-found here means 'not in the live snapshot right now', not 'never existed'. Answers "
+     "kInternalError when an operator has disabled the visualization feature "
+     "(yuzu_viz_disabled / --viz-disable). NOT confined by the caller's management-group "
+     "scope -- like its REST twin (#2146 Batch B3 review). Requires Response:Read.",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"The agent to slice out of the current fleet topology snapshot"}},"required":["agent_id"]})j",
+     R"j({"type":"object","properties":{"schema":{"type":"string"},"schema_minor":{"type":"integer"},"generated_at":{"type":"integer"},"stale":{"type":"boolean"},"machine":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":"string"},"os":{"type":"string"},"local_ips":{"type":"array","items":{"type":"string"}},"processes":{"type":"array","items":{"type":"object","properties":{"pid":{"type":"integer"},"ppid":{"type":"integer"},"name":{"type":"string"},"user":{"type":"string"},"category":{"type":"string"},"worst_severity":{"type":"string"},"cve_count":{"type":"integer"}},"required":["pid","ppid","name","user","category"]}},"connections":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"src_pid":{"type":"integer"},"src_addr":{"type":"string"},"src_port":{"type":"integer"},"dst_addr":{"type":"string"},"dst_port":{"type":"integer"},"scope":{"type":"string","enum":["local","internal_fleet","external"]},"state":{"type":"string"},"dst_agent_id":{"type":"string"},"dst_pid":{"type":"integer"}},"required":["proto","src_pid","src_addr","src_port","dst_addr","dst_port","scope","state"]}},"listeners":{"type":"array","items":{"type":"object","properties":{"proto":{"type":"string"},"port":{"type":"integer"},"pid":{"type":"integer"},"process_name":{"type":"string"},"local_addr":{"type":"string"}},"required":["proto","port"]}},"stale":{"type":"boolean"},"ts":{"type":"integer"},"truncated_processes":{"type":"boolean"},"truncated_connections":{"type":"boolean"}},"required":["agent_id","hostname","os","local_ips","processes","connections","listeners","stale","ts"]},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["schema","schema_minor","generated_at","stale","machine"]})j"},
 };
 
 static constexpr int kToolCount = sizeof(kTools) / sizeof(kTools[0]);
@@ -2436,6 +2678,18 @@ static const char* const kWriteToolsRaw[] = {
     // gate; the tool performs no mutation, but the write set is keyed on the
     // RBAC operation, not on whether a handler mutates state.
     "preview_management_group_agent_count",
+    // #2146 Batch B2 — result-set mutations/dispatches (non-Read operation):
+    // create_result_set (Write), create_result_set_from_inventory_query
+    // (Write — see its kToolSecurity row comment for why this is "Write"
+    // despite the handler's real RBAC gate being Inventory:Read), the three
+    // dispatch producers (Execute), pin/unpin (Write), delete (Delete).
+    // list_result_sets/get_result_set*'s exclusion above is because THEIR
+    // operation is "Read"; operation is the ONLY thing that decides
+    // membership here, not whether a handler mutates state.
+    "create_result_set", "create_result_set_from_inventory_query",
+    "create_result_set_from_tar_query",
+    "create_result_set_from_instruction_result", "reevaluate_result_set",
+    "pin_result_set", "unpin_result_set", "delete_result_set",
     // #2146 Batch B1 — Guardian rule CRUD + push. create/update: Write;
     // delete: Delete; push: Push. get_guardian_rule/get_guardian_agent_status/
     // get_guardian_device_compliance are Read and deliberately absent.
@@ -2587,6 +2841,61 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"get_workflow_execution", {"Workflow", "Read", ServiceScopeClass::confined}},
     {"validate_scope", {"Infrastructure", "Read"}},
     {"preview_scope_targets", {"Infrastructure", "Read"}},
+    // #2146 Batch B2 -- result-set tools. `ResultSet` is NOT a seeded RBAC
+    // securable (rest_api_v1.cpp's result-set routes doc comment): every
+    // REST twin except the 3 dispatch producers + from-inventory-query gates
+    // on auth-only + ownership, no perm_fn call at all. These 8 use the
+    // generic-only "Infrastructure" Read/Write/Delete pair SOLELY to drive
+    // the C8 tier gate (block mutation at readonly tier) -- no perm_fn call
+    // backs them either, matching the REST twins exactly (see each tool's
+    // handler). `denied` (the default 2-element form, NOT confined):
+    // owner-scoping by session->username is not a service-scope confinement
+    // mechanism (same reasoning as list_preflight_runs above) -- a service-
+    // scoped token is refused outright by the generic C8 gate, matching the
+    // REST twins' own deny_fleet_wide_service_scoped call.
+    {"list_result_sets", {"Infrastructure", "Read"}},
+    {"create_result_set", {"Infrastructure", "Write"}},
+    // from-inventory-query is a SYNCHRONOUS read (queries InventoryStore, no
+    // dispatch), gated via fleet_read_fn_/fleet_read_fn on both transports
+    // (Gate 2 BLOCKING fix, #2146 Batch B2 review) -- a REAL per-agent
+    // confinement mechanism (authz::in_scope narrows candidate inventory
+    // records before evaluation), matching its REST twin exactly. Still the
+    // default `denied` ServiceScopeClass, NOT `confined`: fleet_read_fn's
+    // own service-scope branch admits-and-confines a service-scoped caller
+    // rather than hard-denying it the way this tool's 8 non-dispatch
+    // siblings' deny_fleet_wide_service_scoped call does -- since the
+    // created result set is still owner-scoped to the minting token, that
+    // asymmetry is a real cross-service-reach gap, tracked in #4307, not
+    // resolved by this classification. The kToolSecurity OPERATION here is
+    // deliberately "Write", NOT "Read", even though the
+    // real RBAC gate the handler calls is Inventory:Read -- these are two
+    // independent things (kToolSecurity's operation feeds tier_allows/
+    // requires_approval/readOnlyHint-coherence; the handler's own perm_fn
+    // call is the actual RBAC enforcement, matching REST exactly regardless
+    // of this row). The tool CREATES a persisted result-set row -- a real
+    // side effect -- so `operation:"Read"` would force readOnlyHint:true via
+    // the 2g PR2 mechanical coherence test (test_mcp_server.cpp), which is
+    // exactly the false safe-direction hint A5 blocks on. "Write" also
+    // correctly excludes readonly-tier MCP tokens from this tool via
+    // tier_allows, which "Read" would not have.
+    {"create_result_set_from_inventory_query", {"Inventory", "Write"}},
+    // The three dispatch producers: `confined` -- a REAL per-device mechanism
+    // (the caller's derived exec_visible, threaded into dispatch_fn exactly
+    // like execute_instruction), matching their REST twins' perm_fn(
+    // Execution, Execute) gate + exec_visible_fn confinement exactly. This
+    // is the #1788/ADR-0017 confinement class -- get it right: the derived
+    // VisibleSet is the ONLY per-device authorization on this surface, not
+    // defense-in-depth.
+    {"create_result_set_from_tar_query", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"create_result_set_from_instruction_result",
+     {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"reevaluate_result_set", {"Execution", "Execute", ServiceScopeClass::confined}},
+    {"get_result_set", {"Infrastructure", "Read"}},
+    {"get_result_set_members", {"Infrastructure", "Read"}},
+    {"get_result_set_lineage", {"Infrastructure", "Read"}},
+    {"pin_result_set", {"Infrastructure", "Write"}},
+    {"unpin_result_set", {"Infrastructure", "Write"}},
+    {"delete_result_set", {"Infrastructure", "Delete"}},
     {"list_pending_approvals", {"Approval", "Read"}},
     {"list_directory_users", {"Directory", "Read"}},
     {"get_directory_status", {"Directory", "Read"}},
@@ -2778,6 +3087,19 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // would be a false claim per ServiceScopeClass's own doc comment.
     {"list_preflight_runs", {"Infrastructure", "Read"}},
     {"get_deployment_preview", {"SoftwareDeployment", "Read"}},
+
+    // #2146 Batch B3 — fleet visualization + execution/fleet statistics read
+    // twins. Default (2-element) form: none of these routes reason about
+    // service-scoped tokens on the REST side either (no
+    // deny_fleet_wide_service_scoped call, no per-agent confinement) — a
+    // service-scoped MCP token is structurally denied at the generic C8
+    // chokepoint here, matching the REST twins' own posture exactly.
+    {"get_execution_statistics", {"Execution", "Read"}},
+    {"get_execution_statistics_by_agent", {"Execution", "Read"}},
+    {"get_execution_statistics_by_definition", {"Execution", "Read"}},
+    {"get_fleet_statistics", {"Infrastructure", "Read"}},
+    {"get_fleet_topology", {"Response", "Read"}},
+    {"get_host_topology", {"Response", "Read"}},
 };
 
 // Lookup map DERIVED from the raw sequence; first-wins collapse here is safe
@@ -3184,6 +3506,38 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"get_workflow_execution", {ToolEffect::ReadOnly, true, "Get workflow execution"}},
     {"validate_scope", {ToolEffect::ReadOnly, true, "Validate scope"}},
     {"preview_scope_targets", {ToolEffect::ReadOnly, true, "Preview scope targets"}},
+    // #2146 Batch B2 -- result-set tools. The mechanical rule (readOnlyHint
+    // == operation=="Read") makes list/get/members/lineage ReadOnly. The
+    // three dispatch producers + reevaluate are Destructive, same posture as
+    // execute_instruction/execute_bundle/quarantine_device above -- an
+    // arbitrary dispatched plugin.action (or an existing InstructionDefinition
+    // resolved at call time) cannot be proven non-destructive statically, so
+    // this table's own "when in doubt, the stronger hint" rule applies; NOT
+    // idempotent (each call creates a genuinely new pending set + dispatches
+    // a real command -- re-sending is explicitly warned against in each
+    // tool's own description). create_result_set/create_result_set_from_
+    // inventory_query create a new distinct resource each call (Additive,
+    // not idempotent). pin/unpin are Additive + idempotent (the store
+    // documents pin as an explicit no-op on an already-pinned row; unpin's
+    // unconditional UPDATE is equally idempotent). delete_result_set is
+    // Destructive + NOT idempotent (matches revoke_upload_grant's identical
+    // shape above -- a second call 404s rather than repeating the same
+    // success).
+    {"list_result_sets", {ToolEffect::ReadOnly, true, "List result sets"}},
+    {"create_result_set", {ToolEffect::Additive, false, "Create result set"}},
+    {"create_result_set_from_inventory_query",
+     {ToolEffect::Additive, false, "Create result set from inventory query"}},
+    {"create_result_set_from_tar_query",
+     {ToolEffect::Destructive, false, "Create result set from TAR query"}},
+    {"create_result_set_from_instruction_result",
+     {ToolEffect::Destructive, false, "Create result set from instruction result"}},
+    {"reevaluate_result_set", {ToolEffect::Destructive, false, "Re-evaluate result set"}},
+    {"get_result_set", {ToolEffect::ReadOnly, true, "Get result set"}},
+    {"get_result_set_members", {ToolEffect::ReadOnly, true, "Get result set members"}},
+    {"get_result_set_lineage", {ToolEffect::ReadOnly, true, "Get result set lineage"}},
+    {"pin_result_set", {ToolEffect::Additive, true, "Pin result set"}},
+    {"unpin_result_set", {ToolEffect::Additive, true, "Unpin result set"}},
+    {"delete_result_set", {ToolEffect::Destructive, false, "Delete result set"}},
     {"list_pending_approvals", {ToolEffect::ReadOnly, true, "List pending approvals"}},
     {"list_directory_users", {ToolEffect::ReadOnly, true, "List directory users"}},
     {"get_directory_status", {ToolEffect::ReadOnly, true, "Get directory sync status"}},
@@ -3365,6 +3719,18 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // shape for unchanged server state.
     {"list_preflight_runs", {ToolEffect::ReadOnly, true, "List pre-flight runs"}},
     {"get_deployment_preview", {ToolEffect::ReadOnly, true, "Get deployment preview"}},
+    // #2146 Batch B3 — plain reads, repeat calls return the same shape for
+    // unchanged server state (get_fleet_topology's fresh=true param busts a
+    // shared cache but is still safe/repeatable -- it never mutates
+    // persisted state).
+    {"get_execution_statistics", {ToolEffect::ReadOnly, true, "Get execution statistics"}},
+    {"get_execution_statistics_by_agent",
+     {ToolEffect::ReadOnly, true, "Get execution statistics by agent"}},
+    {"get_execution_statistics_by_definition",
+     {ToolEffect::ReadOnly, true, "Get execution statistics by definition"}},
+    {"get_fleet_statistics", {ToolEffect::ReadOnly, true, "Get fleet statistics"}},
+    {"get_fleet_topology", {ToolEffect::ReadOnly, true, "Get fleet topology"}},
+    {"get_host_topology", {ToolEffect::ReadOnly, true, "Get host topology"}},
 };
 
 // Generate a tool's served MCP `annotations` object from its classification.
@@ -5118,6 +5484,58 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, action, "denied", target_type, target_id, audit_detail);
                 res.set_content(a4_error(kPermissionDenied, message), "application/json");
                 return true;
+            };
+
+            // #2146 Batch B2 — shared across the 12 result-set MCP tools.
+            //
+            // `rs_load_owned`: owner-scoped result-set fetch, matching
+            // rest_api_v1.cpp's `load_owned` exactly — a DbError on this
+            // ownership-check read is TYPE-DISTINGUISHABLE from a genuine
+            // not-found/not-owned row (ADR-0036 fail-closed contract): the
+            // former retries as a store fault, the latter is a permanent
+            // "not found" (existence-oracle-safe — a non-owner gets the
+            // identical response as a nonexistent id). Writes the response
+            // and returns nullopt on either failure; the caller just checks
+            // `if (!row) return;`.
+            auto rs_load_owned = [&](const std::string& rs_id) -> std::optional<ResultSet> {
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return std::nullopt;
+                }
+                auto row_result = result_set_store_->get(rs_id);
+                if (!row_result) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_STORE_UNAVAILABLE: could not verify result-set "
+                                 "ownership",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return std::nullopt;
+                }
+                const std::optional<ResultSet>& row = *row_result;
+                if (!row || row->owner_principal != session->username) {
+                    mcp_audit("denied", "id=" + rs_id + " reason=not found or not owned");
+                    // #2146 Batch B2 review fix: also emit the structured
+                    // result_set.access audit REST's own load_owned twin uses
+                    // (target_type=ResultSet, target_id=rs_id) - the generic
+                    // mcp_audit call above records this under target_type=
+                    // mcp_tool with the id only in free text, so an auditor
+                    // filtering by ResultSet target/id previously missed every
+                    // MCP-sourced ownership-probe denial across all 12 tools
+                    // that share this helper.
+                    (void)audit_fn(req, "result_set.access", "denied", "ResultSet", rs_id,
+                                   "not found or not owned");
+                    // retry-hint-exempt: not found/not owned, a permanent
+                    // outcome — existence-oracle-safe (matches REST's 404).
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_NOT_FOUND: result set not found"),
+                        "application/json");
+                    return std::nullopt;
+                }
+                return row;
             };
 
             // #3289 — MCP twin of the REST/legacy tag-mutation TOCTOU guard.
@@ -8760,95 +9178,1092 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                // #4143-class fix (found during #2146 Batch B2 review): this
+                // tool discloses per-agent identities (matched_agents), so it
+                // is a fan-out READ of per-agent data and MUST use the
+                // admit-then-filter fleet-read chokepoint — never a bare
+                // `perm_fn` (routed-concerns.md's authorize_list_read row).
+                // The old bare `perm_fn(req, res, "Infrastructure", "Read")`
+                // let a management-group-confined caller (or a global
+                // Infrastructure:Read holder narrower than the whole fleet)
+                // see every connected agent, not just their own visible set.
+                // `fleet_read_fn_` REPLACES the permission check (it already
+                // performs the RBAC check internally) rather than being
+                // paired with it — same pattern as list_tar_process_tree_devices.
+                if (!fleet_read_fn_) {
+                    spdlog::error("preview_scope_targets: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
                     return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Infrastructure", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
                 auto expression = param_str(args, "expression");
                 if (expression.empty()) {
                     res.set_content(error_response(id, kInvalidParams, "expression is required"),
                                     "application/json");
                     return;
                 }
-                // Validate first
-                auto valid = yuzu::scope::validate(expression);
-                if (!valid) {
+                // Narrow the candidate set to the caller's admitted scope
+                // BEFORE the preview builder runs — the unfiltered snapshot
+                // (get_agents()) is the SAME source list_agents' own agents_fn
+                // and GET /api/v1/devices use; gate.scope is the sole filter,
+                // mirroring GET /api/v1/devices' own in_scope-filter-then-render.
+                const auto& all_agents = get_agents();
+                nlohmann::json visible_agents = nlohmann::json::array();
+                for (const auto& a : all_agents) {
+                    if (authz::in_scope(gate.scope, a.value("agent_id", "")))
+                        visible_agents.push_back(a);
+                }
+                // #2146 Batch B2: delegates to the shared preview_scope_targets()
+                // builder (scope_preview.hpp) so this tool and its new REST v1
+                // twin (POST /api/v1/scope/preview) cannot silently diverge in
+                // which agents match (api-twin-recipe.md Rule 1).
+                auto outcome =
+                    yuzu::server::preview_scope_targets(expression, visible_agents, tag_store);
+                switch (outcome.kind) {
+                case yuzu::server::ScopePreviewOutcome::Kind::kInvalidExpression:
+                    res.set_content(error_response(id, kInvalidParams, outcome.detail),
+                                    "application/json");
+                    return;
+                case yuzu::server::ScopePreviewOutcome::Kind::kTagStoreDegraded:
+                    // Target = the expression being previewed — every sibling
+                    // failure audit here carries a target (governance cons-F2).
+                    mcp_audit("failure", expression);
                     res.set_content(
-                        error_response(id, kInvalidParams, "Invalid scope: " + valid.error()),
+                        a4_error(kInternalError, "Tag store unavailable",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                case yuzu::server::ScopePreviewOutcome::Kind::kOk:
+                    mcp_audit("success", expression);
+                    res.set_content(
+                        success_response(
+                            id, tool_result(outcome.payload.dump(), kObjectOutputSchema)),
                         "application/json");
                     return;
                 }
-                // Parse the expression into an AST
-                auto parsed_expr = yuzu::scope::parse(expression);
-                if (!parsed_expr) {
+                return;
+            }
+
+            // ── Result Sets (#2146 Batch B2) ──────────────────────────────
+            //
+            // Shared local helpers, used by the tool blocks below.
+            //
+            // `rs_resolve_owned_parent`: MCP twin of rest_api_v1.cpp's
+            // `resolve_owned_parent` — used ONLY by the 3 async dispatch
+            // producers (matching REST exactly: the synchronous creators
+            // below use `rs_load_owned` directly on a canonical id, no alias
+            // resolution). Resolves a per-operator alias OR a canonical
+            // "rs_"-prefixed id to a canonical id this session owns.
+            auto rs_resolve_owned_parent = [&](const std::string& raw) -> std::optional<std::string> {
+                std::string rs_id = raw;
+                if (!raw.starts_with("rs_")) {
+                    auto canon = result_set_store_->resolve_alias(session->username, raw);
+                    if (!canon) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: could not resolve alias",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return std::nullopt;
+                    }
+                    if (*canon)
+                        rs_id = **canon;
+                    // else: rs_id stays = raw; rs_load_owned() below 404s on the miss.
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return std::nullopt;
+                return rs_id;
+            };
+
+            // `rs_run_async`: MCP twin of rest_api_v1.cpp's `run_async` — the
+            // shared dispatch engine for the 3 async result-set producers
+            // (create_result_set_from_tar_query, create_result_set_from_
+            // instruction_result, reevaluate_result_set). `args_for_parent` is
+            // read ONLY for `parent_id` (everything else is passed explicitly
+            // so reevaluate_result_set can synthesise it) — mirrors REST's
+            // `run_async(..., body, name)` shape exactly, including the
+            // #2500-class parent_id type/emptiness guard. `perm_fn(Execution,
+            // Execute)` is the CALLER's job (checked before this runs); this
+            // closure's exec_visible derivation is the ONLY per-device
+            // authorization here — #1788, the primary gate, not
+            // defense-in-depth.
+            auto rs_run_async = [&](const std::string& plugin, const std::string& action,
+                                    const std::unordered_map<std::string, std::string>& params,
+                                    std::string_view src_kind, const std::string& source_payload,
+                                    const std::string& matcher,
+                                    const nlohmann::json& args_for_parent,
+                                    const std::string& name) {
+                if (!result_set_store_ || !execution_tracker) {
                     res.set_content(
-                        error_response(id, kInvalidParams, "Parse error: " + parsed_expr.error()),
+                        a4_error(kInternalError,
+                                 "RESULT_SET_DISPATCH_UNAVAILABLE: result-set store or execution "
+                                 "tracker not wired"),
                         "application/json");
                     return;
                 }
-                // Preload every tag:<key> the expression references in ONE
-                // bulk query before the agent loop (ADR-0050 — the
-                // pre-migration version called get_tag_map per agent, N
-                // network round-trips per preview against the Postgres
-                // substrate). Degrade fails the whole tool call: this tool
-                // PREVIEWS dispatch targeting, and a silently-tagless
-                // preview under/over-states the cohort exactly like a
-                // collapsed scope read (#2500 family).
-                std::unordered_map<std::string, std::unordered_map<std::string, std::string>>
-                    preview_tags;
-                {
-                    std::vector<std::string> tag_keys;
-                    yuzu::scope::collect_attribute_suffixes(*parsed_expr, "tag:", tag_keys);
-                    if (!tag_keys.empty() && tag_store) {
-                        auto preload = tag_store->get_values_for_keys(tag_keys);
-                        if (!preload) {
-                            // Target = the expression being previewed — every
-                            // sibling failure audit here carries a target
-                            // (governance cons-F2).
-                            mcp_audit("failure", expression);
+                if (!dispatch_fn) {
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_DISPATCH_UNAVAILABLE: command dispatch not wired",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Adversarial review (PR #4330, Codex + Kimi, confirmed against
+                // REST's identical check before accepting): an unwired caller_fn
+                // is the server's ONLY per-device authorization for these three
+                // producers (#1788, primary gate not defense-in-depth) - a
+                // silent deny_all() substitution here would read to the caller
+                // as an ordinary "no agents reached in scope" 503/empty result,
+                // hiding a broken authorization gate behind a legitimate-looking
+                // outcome. REST's run_async refuses loudly for the exact same
+                // reason (rest_api_v1.cpp, RESULT_SET_GATE_UNCONFIGURED) - mirror
+                // that here rather than substituting present-empty.
+                if (!caller_fn) {
+                    const bool audit_ok = audit_fn(
+                        req, "result_set.create", "denied", "ResultSet", "",
+                        "reason=caller_fn_unwired source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_GATE_UNCONFIGURED: dispatch visibility gate not "
+                                 "configured",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                auto caller = caller_fn(*session);
+                caller.approval_provenance = approval_ticket_just_consumed
+                                                 ? yuzu::server::ApprovalProvenance::Ticket
+                                                 : yuzu::server::ApprovalProvenance::None;
+
+                // Same rule as REST's run_async: OMIT parent_id to broadcast
+                // deliberately. A SUPPLIED parent_id must name a parent —
+                // including an explicit non-string/empty value, which is
+                // refused rather than read as "absent" (#2500 family).
+                if (args_for_parent.contains("parent_id") &&
+                    (!args_for_parent["parent_id"].is_string() ||
+                     args_for_parent["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason = args_for_parent["parent_id"].is_string()
+                                                        ? kReasonParentIdEmpty
+                                                        : kReasonParentIdType;
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
+                            .increment();
+                    }
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason) +
+                                       " source_kind=" + std::string(src_kind));
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to dispatch to all agents"),
+                        "application/json");
+                    return;
+                }
+                std::optional<std::string> parent_id;
+                std::string scope_expr;
+                if (args_for_parent.contains("parent_id") && args_for_parent["parent_id"].is_string() &&
+                    !args_for_parent["parent_id"].get<std::string>().empty()) {
+                    auto canon = rs_resolve_owned_parent(args_for_parent["parent_id"].get<std::string>());
+                    if (!canon)
+                        return; // rs_resolve_owned_parent already wrote the error
+                    parent_id = *canon;
+                    scope_expr = "from_result_set:" + *canon;
+                }
+
+                // Create-before-dispatch (UP2-4): the execution_id must be
+                // registered before any RPC so a fast loopback agent can't
+                // reply ahead of the mapping.
+                Execution exec;
+                exec.definition_id = std::string(src_kind);
+                exec.status = "running";
+                exec.scope_expression = scope_expr;
+                exec.parameter_values =
+                    nlohmann::json(redact_sensitive_instruction_params(params)).dump();
+                exec.dispatched_by = session->username;
+                std::string exec_id;
+                if (auto created = execution_tracker->create_execution(exec); created.has_value())
+                    exec_id = *created;
+                if (exec_id.empty()) {
+                    res.set_content(
+                        a4_error(kInternalError, "RESULT_SET_INTERNAL: failed to create execution row"),
+                        "application/json");
+                    return;
+                }
+
+                if (result_set_store_->count_for_owner(session->username) >=
+                    ResultSetStore::kMaxPerOwner) {
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    // retry-hint-exempt: owner is genuinely at the per-owner
+                    // quota, not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(to_string(ResultSetError::QuotaExceeded)) +
+                                           " execution_id=" + exec_id),
+                        "application/json");
+                    return;
+                }
+
+                std::string command_id;
+                int sent = 0;
+                const std::string dispatch_scope =
+                    scope_expr.empty() ? std::string(yuzu::server::kBroadcastScope) : scope_expr;
+                try {
+                    // #1788: `exec_visible` narrows whichever arm dispatch_scope
+                    // selects, inside dispatch_confined_arms — nothing is
+                    // pre-filtered here, matching REST's run_async exactly.
+                    const auto dispatch_outcome =
+                        dispatch_fn(plugin, action, {}, dispatch_scope, params, exec_id, caller);
+                    command_id = dispatch_outcome.command_id;
+                    sent = dispatch_outcome.sent;
+                } catch (const std::exception& e) {
+                    spdlog::error("result-set MCP async producer dispatch failed: {}", e.what());
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled also failed for execution_id={}",
+                                     exec_id);
+                    // No retry_after_ms: dispatch_fn may have already reached some
+                    // agents before throwing, and this producer's own tool
+                    // description says NEVER re-send on error - a positive retry
+                    // hint here would contradict that contract (Gate 6 compliance
+                    // fix). Poll executions to learn the real outcome instead.
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_DISPATCH_FAILED: dispatch raised - poll executions to "
+                                 "determine whether the command reached any agents before "
+                                 "retrying; do not blindly re-send"),
+                        "application/json");
+                    return;
+                }
+                if (sent == 0) {
+                    // Matches REST's run_async: a confinement drop (VisibleSet
+                    // admits none of the resolved targets) is answered
+                    // identically to a scope that genuinely matched nobody —
+                    // deliberate, so a distinct status never discloses devices
+                    // the caller cannot see.
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "RESULT_SET_NO_AGENTS: no agents reached in the target scope — "
+                                 "targets may be unreachable, quarantined, or withheld because "
+                                 "containment state could not be read",
+                                 "retry once devices reconnect",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!execution_tracker->set_agents_targeted(exec_id, sent))
+                    spdlog::error("result-set: set_agents_targeted failed for execution_id={}", exec_id);
+
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = name;
+                cr.parent_id = parent_id;
+                cr.source_kind = std::string(src_kind);
+                cr.source_payload = source_payload;
+                cr.matcher = matcher;
+                auto created = result_set_store_->create_pending(cr, exec_id);
+                if (!created) {
+                    if (metrics && created.error() == ResultSetError::QuotaExceeded)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    if (!execution_tracker->mark_cancelled(exec_id, session->username))
+                        spdlog::error("result-set: mark_cancelled failed for execution_id={}", exec_id);
+                    if (created.error() == ResultSetError::DbError) {
+                        // No retry_after_ms: dispatch already succeeded above
+                        // (sent > 0, set_agents_targeted already called) - only the
+                        // bookkeeping row failed to persist. A positive retry hint
+                        // here would tell an agentic caller to re-send a command
+                        // that already reached the fleet, directly contradicting
+                        // this tool's own "NEVER re-send" contract (Gate 6
+                        // compliance fix).
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable "
+                                     "after dispatch already succeeded - do not re-send; poll "
+                                     "executions for the dispatched command's outcome"),
+                            "application/json");
+                        return;
+                    }
+                    // retry-hint-exempt: business-rule outcome (quota), not a
+                    // transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(to_string(created.error())) +
+                                           " execution_id=" + exec_id),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_result_sets_total",
+                                  {{"source_kind", std::string(src_kind)}, {"result", "pending"}})
+                        .increment();
+                const bool audit_ok = audit_fn(
+                    req, "result_set.create", "success", "ResultSet", created->id,
+                    std::string(src_kind) + " execution_id=" + exec_id +
+                        " agents=" + std::to_string(sent));
+                nlohmann::json payload = result_set_json(*created);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", created->id);
+                // 202-equivalent (JSON-RPC has no status code): membership is
+                // not known yet; the client polls get_result_set by id, or
+                // subscribes to /api/v1/events on source_execution_id.
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+            };
+
+            if (tool_name == "list_result_sets") {
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                std::string cursor = param_str(args, "cursor");
+                int64_t limit = param_int(args, "limit", 50);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > 500)
+                    limit = 500;
+                std::string next;
+                auto sets = result_set_store_->list_by_owner(session->username, cursor,
+                                                              static_cast<int>(limit), next);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& s : sets)
+                    arr.push_back(result_set_json(s));
+                nlohmann::json payload = {{"result_sets", arr}, {"next_cursor", next}};
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_result_set") {
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = param_str(args, "name");
+                cr.source_kind = param_str(args, "source_kind", "manual_curate");
+                cr.source_payload =
+                    args.contains("source_payload") ? args["source_payload"].dump() : std::string("{}");
+                if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                    !args["parent_id"].get_ref<const std::string&>().empty()) {
+                    auto pid = args["parent_id"].get<std::string>();
+                    // Owner-check the parent before persisting the lineage
+                    // edge, else an operator could parent onto a victim's id
+                    // and read its metadata back via get_result_set_lineage.
+                    auto parent = rs_load_owned(pid);
+                    if (!parent)
+                        return; // rs_load_owned already wrote the error
+                    cr.parent_id = pid;
+                }
+                std::vector<std::string> members;
+                if (args.contains("device_ids") && args["device_ids"].is_array()) {
+                    for (const auto& d : args["device_ids"])
+                        if (d.is_string())
+                            members.push_back(d.get<std::string>());
+                }
+                if (members.size() > static_cast<size_t>(ResultSetStore::kMaxMembersPerSet)) {
+                    if (metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    // retry-hint-exempt: the per-set member cap, a client
+                    // error, not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       std::string(to_string(ResultSetError::TooManyMembers))),
+                        "application/json");
+                    return;
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    if (created.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (created.error() == ResultSetError::QuotaExceeded && metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    // retry-hint-exempt: business-rule outcome (quota), not a
+                    // transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(created.error()))),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_result_sets_total",
+                                  {{"source_kind", cr.source_kind}, {"result", "created"}})
+                        .increment();
+                const bool audit_ok =
+                    audit_fn(req, "result_set.create", "success", "ResultSet", created->id, cr.source_kind);
+                nlohmann::json payload = result_set_json(*created);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", created->id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "create_result_set_from_inventory_query") {
+                // Gate 2 BLOCKING fix (#2146 Batch B2 review): this tool evaluates
+                // an expression over EVERY agent's inventory records and
+                // materializes matching agent_ids into a result set the caller
+                // owns and can read back — a fan-out read of per-agent data that
+                // MUST use the admit-then-filter fleet-read chokepoint, never a
+                // bare `perm_fn` (routed-concerns.md's authorize_list_read row).
+                // The old bare `perm_fn(req, res, "Inventory", "Read")` let a
+                // management-group-confined caller (real but narrower
+                // Inventory:Read grant) enumerate fleet-wide device-identity +
+                // inventory-attribute correlation. Same fix shape as
+                // preview_scope_targets above; REST's twin needs the identical
+                // fix (tracked together, not two separate defects).
+                if (!fleet_read_fn_) {
+                    spdlog::error("create_result_set_from_inventory_query: fleet_read_fn_ "
+                                  "unwired — misconfigured call site; failing closed");
+                    res.set_content(a4_error(kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto gate = fleet_read_fn_(req, res, "Inventory", "Read");
+                if (!gate.admitted)
+                    return; // gate already wrote the A4 error body + status
+                // Gate 3 BLOCKING fix (#2146 Batch B2 review), reordered ahead of the store
+                // checks below (a malformed request is a client error regardless of backend
+                // availability, and this ordering makes the fix independently testable
+                // without needing a live inventory_store in the test fixture):
+                // `.value(key, default)` throws nlohmann::json::type_error on a type
+                // mismatch - it does not coerce. MCP input-schema validation is approval-
+                // gated only, so a non-object element or a non-string field reaches this
+                // loop directly from any caller and previously fell through to an uncaught
+                // exception (bare empty-body 500, no A4/JSON-RPC envelope). Validate
+                // explicitly and build the eval request before touching any store.
+                yuzu::server::InventoryEvalRequest eval_req;
+                eval_req.combine = param_str(args, "combine", "all");
+                if (args.contains("conditions") && args["conditions"].is_array()) {
+                    // Gate 6 sre BLOCKING fix: reject an oversized array before
+                    // building/evaluating it, not after - see
+                    // kMaxInventoryConditions' doc comment (inventory_eval.hpp).
+                    if (args["conditions"].size() > yuzu::server::kMaxInventoryConditions) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "conditions must not exceed " +
+                                               std::to_string(yuzu::server::kMaxInventoryConditions) +
+                                               " entries"),
+                            "application/json");
+                        return;
+                    }
+                    for (const auto& c : args["conditions"]) {
+                        if (!c.is_object()) {
                             res.set_content(
-                                error_response(id, kInternalError, "Tag store unavailable"),
+                                error_response(id, kInvalidParams,
+                                               "each condition must be a JSON object"),
                                 "application/json");
                             return;
                         }
-                        preview_tags = std::move(*preload);
+                        auto field_str = [&c](const char* key) -> std::string {
+                            return (c.contains(key) && c[key].is_string())
+                                       ? c[key].get<std::string>()
+                                       : "";
+                        };
+                        yuzu::server::InventoryCondition cond;
+                        cond.plugin = field_str("plugin");
+                        cond.field = field_str("field");
+                        cond.op = field_str("op");
+                        cond.value = field_str("value");
+                        eval_req.conditions.push_back(std::move(cond));
                     }
                 }
-                // Evaluate against all agents
-                const auto& agents = get_agents();
-                JArr matching;
-                for (const auto& a : agents) {
-                    auto agent_id = a.value("agent_id", "");
-                    std::unordered_map<std::string, std::string> attrs;
-                    attrs["os"] = a.value("os", "");
-                    attrs["arch"] = a.value("arch", "");
-                    attrs["hostname"] = a.value("hostname", "");
-                    attrs["agent_version"] = a.value("agent_version", "");
-                    if (auto it = preview_tags.find(agent_id); it != preview_tags.end()) {
-                        for (const auto& [k, v] : it->second)
-                            attrs["tag:" + k] = v;
+                // #2500-class guard, same shape as rs_run_async's own — a
+                // supplied parent_id must name a parent, never silently
+                // treated as absent. Ordered ahead of the store checks below
+                // (Gate 4 unhappy-path fix, matches REST's twin reorder): a
+                // malformed request is a client error regardless of backend
+                // availability.
+                if (args.contains("parent_id") &&
+                    (!args["parent_id"].is_string() ||
+                     args["parent_id"].get_ref<const std::string&>().empty())) {
+                    const std::string_view reason =
+                        args["parent_id"].is_string() ? kReasonParentIdEmpty : kReasonParentIdType;
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_parent"}, {"reason", std::string(reason)}})
+                            .increment();
                     }
-                    auto resolver = [&](std::string_view attr) -> std::string {
-                        auto it = attrs.find(std::string(attr));
-                        return it != attrs.end() ? it->second : "";
-                    };
-                    if (yuzu::scope::evaluate(*parsed_expr, resolver))
-                        matching.add(agent_id);
+                    (void)audit_fn(req, "result_set.create", "denied", "ResultSet", "",
+                                   std::string("reason=") + std::string(reason) +
+                                       " source_kind=inventory_query");
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_PARENT: parent_id was supplied but names "
+                                       "no parent set; omit it entirely to search all devices"),
+                        "application/json");
+                    return;
                 }
-                // Blast-radius guard: warn when scope matches many agents (G4-UHP-MCP-011)
-                constexpr size_t kMcpScopeWarnThreshold = 50;
-                bool scope_warning = matching.size() > kMcpScopeWarnThreshold;
+                if (!result_set_store_) {
+                    res.set_content(a4_error(kInternalError, "result-set store unavailable"),
+                                    "application/json");
+                    return;
+                }
+                if (!inventory_store || !inventory_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "inventory store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                std::optional<std::unordered_set<std::string>> parent_members;
+                CreateRequest cr;
+                cr.owner_principal = session->username;
+                cr.name = param_str(args, "name");
+                cr.source_kind = std::string(source_kind::kInventoryQuery);
+                cr.source_payload = args.dump();
+                if (args.contains("parent_id") && args["parent_id"].is_string() &&
+                    !args["parent_id"].get_ref<const std::string&>().empty()) {
+                    auto pid = args["parent_id"].get<std::string>();
+                    auto parent = rs_load_owned(pid);
+                    if (!parent)
+                        return;
+                    cr.parent_id = pid;
+                    std::unordered_set<std::string> ms;
+                    std::string cur;
+                    while (true) {
+                        std::string next;
+                        auto page = result_set_store_->members(pid, cur, 5000, next);
+                        ms.insert(page.begin(), page.end());
+                        if (next.empty())
+                            break;
+                        cur = std::move(next);
+                    }
+                    parent_members = std::move(ms);
+                }
+                InventoryQuery iq;
+                iq.limit = 5000;
+                bool inv_truncated = false;
+                auto records_raw = inventory_store->query(iq, &inv_truncated);
+                if (!records_raw) {
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=store_degraded source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError, "inventory store degraded",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (inv_truncated) {
+                    // Governance M1: a capped read must NEVER be materialised
+                    // as a targeting set — the missing tail silently changes
+                    // who gets acted on (#2500/#2492 dispatch-targeting
+                    // invariant class).
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=query_truncated source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "inventory query truncated at the row or byte cap — refusing to "
+                                 "materialise a partial result set",
+                                 "narrow the query, or wait for the row/byte cap to be raised"),
+                        "application/json");
+                    return;
+                }
+                // Narrow to the caller's admitted scope BEFORE evaluation - gate.scope
+                // is the sole filter, mirroring preview_scope_targets' own fix above.
+                std::vector<std::pair<std::string, std::string>> records;
+                records.reserve(records_raw->size());
+                for (const auto& r : *records_raw) {
+                    if (!authz::in_scope(gate.scope, r.agent_id))
+                        continue;
+                    records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                }
+                auto results = yuzu::server::evaluate_inventory(eval_req, records);
+                std::unordered_set<std::string> seen;
+                std::vector<std::string> members;
+                for (const auto& r : results) {
+                    if (!r.match)
+                        continue;
+                    if (parent_members && !parent_members->count(r.agent_id))
+                        continue;
+                    if (seen.insert(r.agent_id).second)
+                        members.push_back(r.agent_id);
+                }
+                auto created = result_set_store_->create_materialized(cr, members);
+                if (!created) {
+                    if (created.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    if (created.error() == ResultSetError::QuotaExceeded && metrics)
+                        metrics->counter("yuzu_result_set_quota_rejected").increment();
+                    // retry-hint-exempt: business-rule outcome (quota), not a
+                    // transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(created.error()))),
+                        "application/json");
+                    return;
+                }
+                if (metrics)
+                    metrics
+                        ->counter("yuzu_result_sets_total",
+                                  {{"source_kind", cr.source_kind}, {"result", "created"}})
+                        .increment();
+                const bool audit_ok =
+                    audit_fn(req, "result_set.create", "success", "ResultSet", created->id, cr.source_kind);
+                nlohmann::json payload = result_set_json(*created);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", created->id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
 
-                auto obj = JObj()
-                               .add("expression", expression)
-                               .add("matched_count", static_cast<int64_t>(matching.size()))
-                               .raw("matched_agents", matching.str());
-                if (scope_warning)
-                    obj.add("warning", "scope matches " + std::to_string(matching.size()) +
-                                           " agents (>" + std::to_string(kMcpScopeWarnThreshold) +
-                                           "). Phase 2 write operations targeting this scope will "
-                                           "require approval.");
-                mcp_audit("success", expression);
-                res.set_content(success_response(id, tool_result(obj.str(), kObjectOutputSchema)),
+            if (tool_name == "create_result_set_from_tar_query") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                std::string sql = param_str(args, "sql");
+                if (sql.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "RESULT_SET_BAD_REQUEST: 'sql' is required"),
+                        "application/json");
+                    return;
+                }
+                if (sql.size() > 100000) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                        "application/json");
+                    return;
+                }
+                // .value() throws nlohmann::json::type_error on a type mismatch
+                // rather than coercing (Gate 4 unhappy-path fix) - check the type
+                // explicitly so a non-boolean include_empty is a clean 400, not an
+                // uncaught exception (bare empty-body 500).
+                if (args.contains("include_empty") && !args["include_empty"].is_boolean()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "include_empty must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                const bool include_empty = args.value("include_empty", false);
+                nlohmann::json matcher = include_empty
+                                             ? nlohmann::json{{"kind", "any_response"}}
+                                             : nlohmann::json{{"kind", "tar_rows_ge"}, {"n", 1}};
+                // source_payload — design §3.2 tar_query shape (re-eval reads it).
+                nlohmann::json payload;
+                payload["sql"] = sql;
+                payload["include_empty"] = include_empty;
+                if (args.contains("parent_id") && args["parent_id"].is_string())
+                    payload["scope_input_id"] = args["parent_id"];
+                std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                rs_run_async("tar", "sql", params, source_kind::kTarQuery, payload.dump(),
+                            matcher.dump(), args, param_str(args, "name"));
+                return;
+            }
+
+            if (tool_name == "create_result_set_from_instruction_result") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                if (!instruction_store || !instruction_store->is_open()) {
+                    res.set_content(
+                        a4_error(kInternalError, "instruction store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                std::string instruction_id = param_str(args, "instruction_id");
+                if (instruction_id.empty()) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_REQUEST: 'instruction_id' is required"),
+                        "application/json");
+                    return;
+                }
+                auto def_result = instruction_store->get_definition(instruction_id);
+                if (!def_result) {
+                    res.set_content(
+                        a4_error(kInternalError, "instruction store not available",
+                                 "retry once the server reports ready",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                if (!*def_result) {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "INSTRUCTION_NOT_FOUND: unknown instruction_id"),
+                        "application/json");
+                    return;
+                }
+                const auto& def = **def_result;
+                std::unordered_map<std::string, std::string> params;
+                if (args.contains("params") && args["params"].is_object())
+                    for (auto& [k, v] : args["params"].items())
+                        params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                std::string matcher = (args.contains("matcher") && args["matcher"].is_object())
+                                          ? args["matcher"].dump()
+                                          : std::string();
+                // source_payload — design §3.2 instruction_result shape.
+                nlohmann::json payload;
+                payload["instruction_id"] = instruction_id;
+                payload["params"] = args.contains("params") ? args["params"] : nlohmann::json::object();
+                if (args.contains("matcher"))
+                    payload["matcher"] = args["matcher"];
+                if (args.contains("parent_id") && args["parent_id"].is_string())
+                    payload["scope_input_id"] = args["parent_id"];
+                rs_run_async(def.plugin, def.action, params, source_kind::kInstructionResult,
+                            payload.dump(), matcher, args, param_str(args, "name"));
+                return;
+            }
+
+            if (tool_name == "reevaluate_result_set") {
+                if (!perm_fn(req, res, "Execution", "Execute"))
+                    return;
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto orig = rs_load_owned(rs_id);
+                if (!orig)
+                    return;
+                auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
+                // Synthesise the parent so the sibling shares the original's
+                // parent (re-eval re-asks the same question against today's
+                // estate).
+                nlohmann::json synth = nlohmann::json::object();
+                if (orig->parent_id && !orig->parent_id->empty())
+                    synth["parent_id"] = *orig->parent_id;
+                // Skip the suffix if it's already there, else repeated
+                // re-evals of a sibling grow "foo (re-eval) (re-eval) ..."
+                // unboundedly.
+                const std::string reeval_name =
+                    orig->name.empty()                  ? std::string()
+                    : orig->name.ends_with(" (re-eval)") ? orig->name
+                                                         : (orig->name + " (re-eval)");
+                if (orig->source_kind == source_kind::kTarQuery) {
+                    // Adversarial review (PR #4330): sp.value("sql", "") throws
+                    // nlohmann::json::type_error on a type mismatch rather than
+                    // coercing - unlike create_result_set_from_tar_query's own
+                    // caller-facing "sql" arg, which gets an explicit type check.
+                    // orig->source_payload isn't caller-supplied on THIS call,
+                    // but a row minted via the generic (uncapped) create_result_set
+                    // constructor can carry an arbitrary source_payload with a
+                    // non-string "sql" - the same #2500-class row this SQL-size
+                    // cap two lines below exists to catch. Treat a non-string
+                    // sql the same as absent: the empty check just below already
+                    // has the right error for that.
+                    std::string sql =
+                        (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
+                            ? sp.value("sql", "")
+                            : "";
+                    if (sql.empty()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: original carries no SQL"),
+                            "application/json");
+                        return;
+                    }
+                    // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
+                    // create_result_set_from_tar_query enforces before dispatch.
+                    // `orig` may have been minted via the uncapped create_result_set
+                    // (source_kind labeled tar_query with no create-time SQL-length
+                    // check of its own) - without this, re-eval would smuggle an
+                    // oversized SQL payload past the 200 KiB pre-routing body cap
+                    // that exists specifically for this SQL size, then dispatch it
+                    // fleet-wide.
+                    if (sql.size() > 100000) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB"),
+                            "application/json");
+                        return;
+                    }
+                    std::unordered_map<std::string, std::string> params{{"sql", sql}};
+                    rs_run_async("tar", "sql", params, source_kind::kTarQuery, orig->source_payload,
+                                orig->matcher, synth, reeval_name);
+                } else if (orig->source_kind == source_kind::kInstructionResult) {
+                    // Same type-confusion guard as the sql field above.
+                    std::string instruction_id =
+                        (sp.is_object() && sp.contains("instruction_id") &&
+                         sp["instruction_id"].is_string())
+                            ? sp.value("instruction_id", "")
+                            : "";
+                    // Adversarial review (PR #4330): this used to fall through
+                    // an unwired/closed instruction_store into the same
+                    // non-retryable 400 as "the original row genuinely has no
+                    // instruction_id" - telling an agentic caller "gone" when
+                    // the real answer is "try again". create_result_set_from_
+                    // instruction_result's own identical check (a few lines
+                    // above) already gets this right; mirrored here.
+                    if (!instruction_store || !instruction_store->is_open()) {
+                        res.set_content(
+                            a4_error(kInternalError, "instruction store not available",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    std::optional<InstructionDefinition> def;
+                    if (!instruction_id.empty()) {
+                        auto def_result = instruction_store->get_definition(instruction_id);
+                        if (!def_result) {
+                            res.set_content(
+                                a4_error(kInternalError, "instruction store not available",
+                                         "retry once the server reports ready",
+                                         /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                 "application/json");
+                            return;
+                        }
+                        def = *def_result;
+                    }
+                    if (instruction_id.empty() || !def) {
+                        res.set_content(
+                            error_response(id, kInvalidParams,
+                                           "RESULT_SET_BAD_REQUEST: original instruction unavailable"),
+                            "application/json");
+                        return;
+                    }
+                    std::unordered_map<std::string, std::string> params;
+                    if (sp.contains("params") && sp["params"].is_object())
+                        for (auto& [k, v] : sp["params"].items())
+                            params[k] = v.is_string() ? v.get<std::string>() : v.dump();
+                    rs_run_async(def->plugin, def->action, params, source_kind::kInstructionResult,
+                                orig->source_payload, orig->matcher, synth, reeval_name);
+                } else {
+                    res.set_content(
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_REEVAL_UNSUPPORTED: re-eval of this source_kind "
+                                       "is not yet supported"),
+                        "application/json");
+                }
+                return;
+            }
+
+            if (tool_name == "get_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(result_set_json(*row).dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_result_set_members") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                std::string cursor = param_str(args, "cursor");
+                int64_t limit = param_int(args, "limit", 1000);
+                if (limit < 1)
+                    limit = 1;
+                if (limit > 10000)
+                    limit = 10000;
+                std::string next;
+                auto devs =
+                    result_set_store_->members(rs_id, cursor, static_cast<int>(limit), next);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& d : devs)
+                    arr.push_back(d);
+                nlohmann::json payload = {{"device_ids", arr}, {"next_cursor", next}};
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_result_set_lineage") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto chain = result_set_store_->lineage(rs_id, session->username);
+                nlohmann::json arr = nlohmann::json::array();
+                for (const auto& n : chain)
+                    arr.push_back({{"id", n.id},
+                                   {"name", n.name},
+                                   {"source_kind", n.source_kind},
+                                   {"device_count", n.device_count}});
+                nlohmann::json payload = {{"chain", arr}};
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "pin_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto pinned = result_set_store_->pin(rs_id);
+                if (!pinned) {
+                    if (pinned.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    mcp_audit(pinned.error() == ResultSetError::PinLimit ? "denied" : "failure", rs_id);
+                    // retry-hint-exempt: business-rule outcome (not found/
+                    // pin-limit), not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(pinned.error()))),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "result_set.pin", "success", "ResultSet", rs_id, "");
+                nlohmann::json payload = result_set_json(*pinned);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "unpin_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto unpinned = result_set_store_->unpin(rs_id);
+                if (!unpinned) {
+                    if (unpinned.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    mcp_audit("failure", rs_id);
+                    // retry-hint-exempt: business-rule outcome (not found),
+                    // not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(unpinned.error()))),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "result_set.unpin", "success", "ResultSet", rs_id, "");
+                nlohmann::json payload = result_set_json(*unpinned);
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "delete_result_set") {
+                auto rs_id = param_str(args, "id");
+                if (rs_id.empty()) {
+                    res.set_content(error_response(id, kInvalidParams, "id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto row = rs_load_owned(rs_id);
+                if (!row)
+                    return;
+                auto del = result_set_store_->delete_set(rs_id);
+                if (!del) {
+                    if (del.error() == ResultSetError::DbError) {
+                        res.set_content(
+                            a4_error(kInternalError,
+                                     "RESULT_SET_STORE_UNAVAILABLE: result-set store unavailable",
+                                     "retry once the server reports ready",
+                                     /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
+                        return;
+                    }
+                    // retry-hint-exempt: business-rule outcome (not found/
+                    // pinned), not a transient fault.
+                    res.set_content(
+                        error_response(id, kInvalidParams, std::string(to_string(del.error()))),
+                        "application/json");
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "result_set.delete", "success", "ResultSet", rs_id, "");
+                nlohmann::json payload = {{"deleted", true}};
+                if (!audit_ok)
+                    payload["audit_persisted"] = false;
+                mcp_audit("success", rs_id);
+                res.set_content(
+                    success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -15660,6 +17075,570 @@ McpServer::HandlerFn McpServer::build_handler(
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── #2146 Batch B3: execution/fleet statistics read twins ───────────
+            // Shared builders (execution_statistics_model.hpp) -- the REST twins
+            // (rest_api_v1.cpp) call the SAME functions, so the JSON shape cannot
+            // drift (api-twin-recipe.md Rule 1). ExecutionTracker's aggregate
+            // queries here (get_fleet_summary/get_agent_statistics/
+            // get_definition_statistics) return plain values, never
+            // std::optional/std::expected -- a pool/query fault degrades
+            // SILENTLY to zero/empty (matching every existing caller of these
+            // three methods, REST included -- see execution_tracker.cpp), so the
+            // only guardable failure mode here is the pointer itself being
+            // unwired. Unaudited on REST (no audit_fn call at either route); the
+            // generic mcp_audit("success") is still emitted, matching the
+            // dominant convention nearly every sibling read tool in this file
+            // uses regardless of the REST twin's own audit posture (see
+            // list_preflight_runs/get_deployment_preview's identical rationale
+            // above).
+            if (tool_name == "get_execution_statistics") {
+                if (!tier_allows(tier, "Execution", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Execution", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    // No retry_after_ms: execution_tracker is wired exactly once
+                    // at server construction, no runtime setter -- a null value
+                    // here is a permanent deployment-config condition, not one a
+                    // client can retry past.
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto summary = execution_tracker->get_fleet_summary();
+                mcp_audit("success");
+                res.set_content(success_response(id, tool_result(fleet_execution_summary_json(summary),
+                                                                  kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            if (tool_name == "get_execution_statistics_by_agent") {
+                if (!tier_allows(tier, "Execution", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Execution", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                ExecutionStatsQuery q;
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review):
+                // agent_id/since were the #2970B-class type-confusion bug --
+                // param_str silently returns "" and param_int silently
+                // returns the default on a JSON type mismatch, so a
+                // well-formed-but-mistyped call (a numeric agent_id, a
+                // string-encoded since) silently widened to "every
+                // agent"/"all time" and answered success with the wrong
+                // scope, indistinguishable from a correctly-scoped result.
+                if (args.contains("agent_id") && !args["agent_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                q.agent_id = param_str(args, "agent_id");
+                // Same floor + control-character rejection as REST GET
+                // /guaranteed-state/events (auth::kMaxAgentIdLength).
+                if (!q.agent_id.empty()) {
+                    if (q.agent_id.size() > auth::kMaxAgentIdLength) {
+                        res.set_content(a4_error(kInvalidParams, "agent_id is too long"),
+                                        "application/json");
+                        return;
+                    }
+                    bool has_control_char = false;
+                    for (unsigned char c : q.agent_id)
+                        if (c < 0x20) { has_control_char = true; break; }
+                    if (has_control_char) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "agent_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto since_opt = param_int_strict(args, "since", 0);
+                if (!since_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "since must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*since_opt < 0) {
+                    // retry-hint-exempt: schema declares minimum:0; param_int_strict
+                    // itself does not range-check.
+                    res.set_content(a4_error(kInvalidParams, "since must not be negative"),
+                                    "application/json");
+                    return;
+                }
+                q.since = *since_opt;
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                q.limit = static_cast<int>(*limit_opt);
+                if (q.limit > 1000)
+                    q.limit = 1000;
+                auto stats = execution_tracker->get_agent_statistics(q);
+                JArr arr;
+                for (const auto& s : stats)
+                    arr.add_raw(agent_execution_stats_row_json(s));
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().raw("data", arr.str()).str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_execution_statistics_by_definition") {
+                if (!tier_allows(tier, "Execution", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Execution", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                ExecutionStatsQuery q;
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): see
+                // get_execution_statistics_by_agent's identical fix above --
+                // definition_id/since were the same #2970B-class silent
+                // type-confusion.
+                if (args.contains("definition_id") && !args["definition_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "definition_id must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                q.definition_id = param_str(args, "definition_id");
+                if (!q.definition_id.empty()) {
+                    if (q.definition_id.size() > auth::kMaxAgentIdLength) {
+                        res.set_content(a4_error(kInvalidParams, "definition_id is too long"),
+                                        "application/json");
+                        return;
+                    }
+                    bool has_control_char = false;
+                    for (unsigned char c : q.definition_id)
+                        if (c < 0x20) { has_control_char = true; break; }
+                    if (has_control_char) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "definition_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
+                }
+                const auto since_opt = param_int_strict(args, "since", 0);
+                if (!since_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "since must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*since_opt < 0) {
+                    // retry-hint-exempt: schema declares minimum:0; param_int_strict
+                    // itself does not range-check.
+                    res.set_content(a4_error(kInvalidParams, "since must not be negative"),
+                                    "application/json");
+                    return;
+                }
+                q.since = *since_opt;
+                const auto limit_opt = param_int_strict(args, "limit", 50);
+                if (!limit_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "limit must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                q.limit = static_cast<int>(*limit_opt);
+                if (q.limit > 1000)
+                    q.limit = 1000;
+                auto stats = execution_tracker->get_definition_statistics(q);
+                JArr arr;
+                for (const auto& s : stats)
+                    arr.add_raw(definition_execution_stats_row_json(s));
+                mcp_audit("success");
+                res.set_content(
+                    success_response(
+                        id, tool_result(JObj().raw("data", arr.str()).str(), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_fleet_statistics") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Infrastructure", "Read"))
+                    return;
+                if (!execution_tracker) {
+                    res.set_content(a4_error(kInternalError, "Execution tracker unavailable"),
+                                    "application/json");
+                    return;
+                }
+                auto fleet = execution_tracker->get_fleet_summary();
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(fleet_statistics_json(fleet), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── #2146 Batch B3: fleet visualization read twins ───────────────────
+            // Gate 4 happy-path fix: this comment previously claimed "kill
+            // switch -> store availability -> Response:Read", which is REST's
+            // order but not this handler's -- MCP actually runs kill switch ->
+            // Response:Read (perm_fn) -> store availability (the stricter
+            // order: a caller lacking permission is denied before ever
+            // learning the store's health). Mirrors VizRoutes::handle_topology's
+            // / handle_host_topology's own pipeline for everything else:
+            // params -> fetch -> merge_offline_topology
+            // (SHARED with the REST handler, fleet_topology_store.hpp,
+            // api-twin-recipe.md Rule 1) -> the M-1 machines_max DoS cap ->
+            // serialize via the SAME nlohmann to_json ADL functions
+            // (fleet_topology_types.hpp) REST uses, so the wire shape cannot
+            // drift. tier_allows() runs first per every MCP tool's universal
+            // ordering; the viz kill switch is then consulted BEFORE perm_fn,
+            // matching REST's DEP-1 tier-before-permission posture
+            // (docs/fleet-viz-invariants.md). Audit reuses REST's own domain
+            // verbs (viz.fleet_topology / viz.fleet_topology.invalidate /
+            // viz.host_topology) rather than the generic mcp.<tool_name>
+            // (api-twin-recipe.md §4) so the audit trail reads the same
+            // regardless of transport.
+            if (tool_name == "get_fleet_topology") {
+                const auto viz_t_start = std::chrono::steady_clock::now();
+                if (!tier_allows(tier, "Response", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (viz_kill_switch_ && viz_kill_switch_->load(std::memory_order_acquire)) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                        "kill_switch via MCP");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "viz endpoint disabled by operator (yuzu_viz_disabled)", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Response", "Read"))
+                    return;
+                if (!fleet_topology_store_) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "failure", "FleetTopology", "",
+                        "store_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "fleet topology store not available", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review): a
+                // present-but-wrong-typed include_vuln/fresh used to be
+                // silently read as "off" instead of rejected -- the CVE join
+                // silently omitted, or the cache not busted, with the
+                // response looking identical to a correctly-scoped one.
+                if (args.contains("include_vuln") && !args["include_vuln"].is_boolean()) {
+                    res.set_content(a4_error(kInvalidParams, "include_vuln must be a JSON boolean"),
+                                    "application/json");
+                    return;
+                }
+                bool include_vuln = args.value("include_vuln", false);
+                if (args.contains("fresh") && !args["fresh"].is_boolean()) {
+                    res.set_content(a4_error(kInvalidParams, "fresh must be a JSON boolean"),
+                                    "application/json");
+                    return;
+                }
+                bool fresh = args.value("fresh", false);
+
+                const auto machines_max_opt = param_int_strict(
+                    args, "machines_max",
+                    static_cast<int64_t>(yuzu::server::VizRoutes::kDefaultMachinesMax));
+                if (!machines_max_opt) {
+                    // retry-hint-exempt: malformed client input (wrong JSON
+                    // type), not a store/query fault -- resending the same value
+                    // fails identically.
+                    res.set_content(a4_error(kInvalidParams, "machines_max must be a JSON integer"),
+                                    "application/json");
+                    return;
+                }
+                if (*machines_max_opt < 1 ||
+                    *machines_max_opt > yuzu::server::VizRoutes::kMachinesMaxCeiling) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                        "bad_machines_max via MCP");
+                    res.set_content(
+                        a4_error(kInvalidParams, "machines_max must be in [1, 100000]", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+                const int machines_max = static_cast<int>(*machines_max_opt);
+
+                if (fresh) {
+                    fleet_topology_store_->invalidate();
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology.invalidate", "success", "FleetTopology",
+                        "", "via MCP get_fleet_topology");
+                }
+
+                const auto viz_pre_hits = fleet_topology_store_->cache_hits();
+                const auto viz_pre_misses = fleet_topology_store_->cache_misses();
+                std::shared_ptr<const yuzu::server::TopologySnapshot> snap;
+                try {
+                    snap = fleet_topology_store_->get(include_vuln);
+                } catch (const std::exception& ex) {
+                    spdlog::error("MCP get_fleet_topology: store->get threw: {}", ex.what());
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "failure", "FleetTopology", "",
+                        "fetch_threw via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch failed", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!snap) {
+                    // Defensive belt only -- FleetTopologyStore::get() is
+                    // documented never to return null (PR 2 invariant UP-9);
+                    // mirrors the REST twin's identical belt (viz_routes.cpp).
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "failure", "FleetTopology", "",
+                        "snap_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch returned null", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                if (metrics) {
+                    if (fleet_topology_store_->cache_hits() > viz_pre_hits)
+                        metrics->counter("yuzu_viz_cache_hit_total").increment();
+                    if (fleet_topology_store_->cache_misses() > viz_pre_misses)
+                        metrics->counter("yuzu_viz_cache_miss_total").increment();
+                }
+
+                if (offline_endpoint_store_) {
+                    auto persisted = offline_endpoint_store_->query_stale_within(
+                        std::chrono::seconds(yuzu::server::VizRoutes::kOfflineStaleWindowSecs));
+                    const auto viz_before = snap->machines.size();
+                    snap = yuzu::server::merge_offline_topology(std::move(snap), persisted);
+                    const auto viz_merged_count = snap->machines.size() - viz_before;
+                    if (viz_merged_count > 0 && metrics)
+                        metrics->counter("yuzu_viz_offline_hosts_total")
+                            .increment(static_cast<double>(viz_merged_count));
+                }
+
+                if (static_cast<int>(snap->machines.size()) > machines_max) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.fleet_topology", "denied", "FleetTopology", "",
+                        "oversize machines=" + std::to_string(snap->machines.size()) +
+                            " cap=" + std::to_string(machines_max) + " via MCP");
+                    if (metrics)
+                        metrics->counter("yuzu_viz_oversize_response_total").increment();
+                    res.set_content(
+                        a4_error(kInvalidParams,
+                                 "fleet topology exceeds machines_max -- raise the cap or scope down",
+                                 {}, -1, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                nlohmann::json j = *snap;
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "viz.fleet_topology", "success", "FleetTopology", "",
+                    "machines=" + std::to_string(snap->machines.size()) +
+                        " include_vuln=" + (include_vuln ? "1" : "0") + " via MCP");
+                if (!audit_ok)
+                    j["audit_persisted"] = false;
+                if (metrics) {
+                    const auto viz_elapsed = std::chrono::steady_clock::now() - viz_t_start;
+                    metrics->histogram("yuzu_viz_topology_request_seconds")
+                        .observe(std::chrono::duration<double>(viz_elapsed).count());
+                }
+                // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review):
+                // dump_topology_safe() (fleet_topology_types.hpp) substitutes
+                // U+FFFD instead of throwing on a byte-clamped multi-byte
+                // codepoint - clamp_field() truncates by byte length with no
+                // UTF-8 boundary awareness, and strict dump()'s uncaught
+                // type_error.316 was a fleet-wide 500 (empty body, no A4
+                // envelope) triggerable by ordinary internationalized agent
+                // data, self-sustaining while the offending agent stays
+                // connected.
+                res.set_content(
+                    success_response(id, tool_result(dump_topology_safe(j), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            if (tool_name == "get_host_topology") {
+                const auto viz_host_t_start = std::chrono::steady_clock::now();
+                if (!tier_allows(tier, "Response", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (args.contains("agent_id") && !args["agent_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                const auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                // Gate 8 security-guardian BLOCKING fix (#2146 Batch B3 review):
+                // this agent_id flows unchecked into try_persist_audit's
+                // target_id below - AuditStore's sanitizer scrubs invalid
+                // UTF-8/NUL but not other C0 control bytes, so an unfloored
+                // agent_id let any Response:Read holder write raw control
+                // bytes/CR-LF into the audit trail. Same floor as REST GET
+                // /guaranteed-state/events and this file's own
+                // get_execution_statistics_by_agent (auth::kMaxAgentIdLength).
+                if (agent_id.size() > auth::kMaxAgentIdLength) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id is too long"),
+                                    "application/json");
+                    return;
+                }
+                for (unsigned char c : agent_id) {
+                    if (c < 0x20) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "agent_id contains control characters"),
+                            "application/json");
+                        return;
+                    }
+                }
+                if (viz_kill_switch_ && viz_kill_switch_->load(std::memory_order_acquire)) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "denied", "HostTopology", agent_id,
+                        "kill_switch via MCP");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "viz endpoint disabled by operator (yuzu_viz_disabled)", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "Response", "Read"))
+                    return;
+                if (!fleet_topology_store_) {
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                        "store_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "fleet topology store not available", {}, -1, {},
+                                 audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                const auto viz_host_pre_hits = fleet_topology_store_->cache_hits();
+                const auto viz_host_pre_misses = fleet_topology_store_->cache_misses();
+                std::shared_ptr<const yuzu::server::TopologySnapshot> snap;
+                try {
+                    snap = fleet_topology_store_->get(/*include_vuln=*/false);
+                } catch (const std::exception& ex) {
+                    spdlog::error("MCP get_host_topology: store->get threw: {}", ex.what());
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                        "fetch_threw via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch failed", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                if (!snap) {
+                    // Defensive belt only -- see get_fleet_topology's identical
+                    // comment above.
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                        "snap_null via MCP");
+                    res.set_content(
+                        a4_error(kInternalError, "topology fetch returned null", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+
+                if (metrics) {
+                    if (fleet_topology_store_->cache_hits() > viz_host_pre_hits)
+                        metrics->counter("yuzu_viz_cache_hit_total").increment();
+                    if (fleet_topology_store_->cache_misses() > viz_host_pre_misses)
+                        metrics->counter("yuzu_viz_cache_miss_total").increment();
+                }
+
+                for (const auto& m : snap->machines) {
+                    if (m.agent_id != agent_id)
+                        continue;
+                    yuzu::server::HostTopologySnapshot wrapper{snap->generated_at, m.stale, m};
+                    nlohmann::json j = wrapper;
+                    const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "viz.host_topology", "success", "HostTopology", agent_id,
+                        "via MCP");
+                    if (!audit_ok)
+                        j["audit_persisted"] = false;
+                    if (metrics) {
+                        const auto viz_host_elapsed =
+                            std::chrono::steady_clock::now() - viz_host_t_start;
+                        metrics->histogram("yuzu_viz_topology_request_seconds")
+                            .observe(std::chrono::duration<double>(viz_host_elapsed).count());
+                    }
+                    // Governance Gate 4 BLOCKING fix (#2146 Batch B3 review):
+                    // see get_fleet_topology's identical fix above -
+                    // dump_topology_safe() never throws on a byte-clamped
+                    // multi-byte codepoint from this host's own reported
+                    // fields.
+                    res.set_content(
+                        success_response(id,
+                                          tool_result(dump_topology_safe(j), kObjectOutputSchema)),
+                        "application/json");
+                    return;
+                }
+                // Not found -- unlike get_fleet_topology, this tool does not fall
+                // back to a durable stale placeholder (matches
+                // VizRoutes::handle_host_topology, which never consults
+                // offline_store_ at all).
+                (void)yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "viz.host_topology", "failure", "HostTopology", agent_id,
+                    "not_found via MCP");
+                res.set_content(a4_error(kInvalidParams, "host not found"), "application/json");
                 return;
             }
 

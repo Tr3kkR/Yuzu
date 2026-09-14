@@ -10,7 +10,7 @@
 /// sum. A nearby row in docs/spark-legacy-delta-registry.md (the counter-rollup
 /// families) uses the opposite shape - copying that by analogy would silently break
 /// the K-bound safety argument the whole mechanism rests on, since a cleared
-/// quarantine (PR-5) would never be reflected by a monotonic counter.
+/// wedge (PR-5) would never be reflected by a monotonic counter.
 ///
 /// GuardianArmStats is assembled by GuardianEngine::arm_stats() from
 /// GuardianArmAckLedger::arm_stats() (agents/core/src/guardian_arm_ack.hpp) - the

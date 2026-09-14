@@ -31,6 +31,9 @@
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
+#include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
+#include "fleet_topology_store.hpp" // #2146 Batch B3: FleetTopologyStore + merge_offline_topology
+#include "offline_endpoint_store.hpp" // #2146 Batch B3: OfflineEndpoint -- see set_viz_deps below
 #include "guaranteed_state_store.hpp"
 #include "instruction_store.hpp"
 #include "inventory_store.hpp"
@@ -49,6 +52,7 @@
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "result_set_model.hpp" // #2146 Batch B2: ResultSetStore (fwd-declared only otherwise) + shared JSON builder
 #include "schedule_engine.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
@@ -61,6 +65,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <expected>
 #include <functional>
 #include <optional>
@@ -113,6 +118,11 @@ class ProductPackStore;
 // set_dashboard_routes below); the .cpp includes dashboard_routes.hpp for the
 // full definition.
 class DashboardRoutes;
+// #2146 Batch B2 — backs the 12 result-set MCP twins (scope-walking,
+// docs/scope-walking-design.md). Forward-declared (pointer-only in
+// build_handler/register_routes); the .cpp includes result_set_store.hpp for
+// the full definition.
+class ResultSetStore;
 }
 
 namespace yuzu::server::detail {
@@ -487,6 +497,18 @@ public:
     /// both tools answer "unavailable" rather than crashing.
     void set_preflight_run_store(PreflightRunStore* store) { preflight_run_store_ = store; }
 
+    /// #2146 Batch B2 — the scope-walking result-set store, backing the 12
+    /// result-set MCP tools (`list_result_sets` through `delete_result_set`).
+    /// Same setter idiom as `set_preflight_run_store` above. Unset
+    /// (`nullptr`, the default) ⇒ every result-set tool answers
+    /// "unavailable" rather than crashing. Owner-scoped, not RBAC-gated
+    /// (matches the REST twins' `deny_fleet_wide_service_scoped`-only
+    /// posture — `ResultSet` is not a seeded RBAC securable, see
+    /// `rest_api_v1.cpp`'s result-set routes doc comment) — the three
+    /// dispatch-producer tools are the exception, gated on
+    /// `Execution:Execute` exactly like their REST twins.
+    void set_result_set_store(ResultSetStore* store) { result_set_store_ = store; }
+
     /// #2146 Batch B1 — backs `get_guardian_device_compliance`'s Baseline lookup
     /// (`get_baseline_by_name` / `deployed_member_rule_ids`), the SAME store
     /// `GET /api/v1/guaranteed-state/device-compliance` reads. Same setter idiom
@@ -495,6 +517,25 @@ public:
     /// clean "unavailable" 503 when unset, matching every other borrowed-store
     /// seam in this class.
     void set_baseline_store(BaselineStore* store) { baseline_store_ = store; }
+
+    /// #2146 Batch B3 — the fleet-visualization store trio backing
+    /// `get_fleet_topology`/`get_host_topology` (mirrors GET
+    /// /api/v1/viz/fleet/topology and GET /api/v1/viz/host/{id}/topology).
+    /// Same setter idiom as `set_preflight_run_store` above. `offline_store`
+    /// may be null (offline hosts are then not stale-flagged, matching
+    /// `VizRoutes`' own null-offline-store legacy behavior); `kill_switch`
+    /// may be null (then the viz kill switch is never consulted on the MCP
+    /// path — production MUST wire the same `--viz-disable` /
+    /// `yuzu_viz_disabled` atomic the REST `VizRoutes` registration uses, or
+    /// disabling the feature would silently leave the MCP twins reachable).
+    /// Unset `fleet_topology_store` (`nullptr`, the default) ⇒ both tools
+    /// answer "unavailable" rather than crashing.
+    void set_viz_deps(FleetTopologyStore* fleet_topology_store, OfflineEndpointStore* offline_store,
+                      const std::atomic<bool>* kill_switch) {
+        fleet_topology_store_ = fleet_topology_store;
+        offline_endpoint_store_ = offline_store;
+        viz_kill_switch_ = kill_switch;
+    }
 
     /// #3290 Phase 2 — the injected-callback twin of
     /// `AuthRoutes::require_fleet_read`, backing `query_installed_software`'s
@@ -951,10 +992,16 @@ private:
     ListReadFn list_read_fn_;
     // #4036 (api-parity Batch A) — see set_preflight_run_store above.
     PreflightRunStore* preflight_run_store_{nullptr};
+    // #2146 Batch B2 — see set_result_set_store above.
+    ResultSetStore* result_set_store_{nullptr};
     // #2146 Batch B1 — see set_baseline_store above.
     BaselineStore* baseline_store_{nullptr};
     // #2146 Batch B1 — see set_guardian_push_fn above.
     GuardianPushFn guardian_push_fn_;
+    // #2146 Batch B3 — see set_viz_deps above.
+    FleetTopologyStore* fleet_topology_store_{nullptr};
+    OfflineEndpointStore* offline_endpoint_store_{nullptr};
+    const std::atomic<bool>* viz_kill_switch_{nullptr};
     // #4143 review fix — see set_all_devices_fn above.
     AllDevicesFn all_devices_fn_;
     DashboardRoutes* dashboard_routes_{nullptr};
