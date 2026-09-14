@@ -63,7 +63,9 @@
 #include "execution_tracker.hpp"
 #include "gateway.grpc.pb.h"
 #include "grpc_on_behalf_interceptor.hpp"
+#include "guardian_arm_fleet_tags.hpp" // Guardian arm-ledger fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_health_fleet_tags.hpp" // Guardian M1 health-stream fleet gauge names + HELP (#2298 item 6d)
+#include "guardian_io_ceiling_fleet_tags.hpp" // Guardian io-ceiling fleet gauge names + HELP (rung 9c PR-3)
 #include "guardian_journal_fleet_tags.hpp" // Guardian journal fleet gauge names + HELP (#2298)
 #include "instruction_definition_model.hpp" // #4029: shared row/detail/export builders
 #include "instruction_store.hpp"
@@ -2358,6 +2360,24 @@ public:
                           detail::kGuardianHealthReportingHelp, "gauge");
         metrics_.describe(detail::kGuardianHealthTagRejectedGauge,
                           detail::kGuardianHealthTagRejectedHelp, "gauge");
+        // rung 9c PR-3 arm-ledger fleet rollup (Decision 1). Registered from the
+        // SAME table AgentHealthStore::recompute_metrics clears and publishes from
+        // (guardian_arm_fleet_tags.hpp). RE-STATABLE gauges, not cumulative
+        // counters - see that header's own shape note before writing an alert.
+        for (const auto& m : detail::kGuardianArmMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianArmReportingGauge,
+                          detail::kGuardianArmReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianArmTagRejectedGauge,
+                          detail::kGuardianArmTagRejectedHelp, "gauge");
+        // rung 9c PR-3 io-ceiling fleet rollup (Decision 3, Option B). MONITOR-ONLY
+        // cumulative counter - see guardian_io_ceiling_fleet_tags.hpp.
+        for (const auto& m : detail::kGuardianIoCeilingMetrics)
+            metrics_.describe(m.gauge, m.help, "gauge");
+        metrics_.describe(detail::kGuardianIoCeilingReportingGauge,
+                          detail::kGuardianIoCeilingReportingHelp, "gauge");
+        metrics_.describe(detail::kGuardianIoCeilingTagRejectedGauge,
+                          detail::kGuardianIoCeilingTagRejectedHelp, "gauge");
         metrics_.describe("yuzu_server_management_groups_total",
                           "Total number of management groups", "gauge");
         metrics_.describe("yuzu_server_group_members_total",

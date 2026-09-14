@@ -31,6 +31,7 @@
 
 // rung 7: the spark detection path GuardianEngine wires alongside legacy IGuard.
 #include "guardian_arm_ack.hpp" // rung 9c PR-2 Unit 5/6: GuardianArmAckLedger, guardian_push_content_id
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats (rung 9c PR-3)
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
@@ -940,6 +941,32 @@ std::optional<GuardianJournalAgeStats> GuardianEngine::journal_age_stats() const
 std::size_t GuardianEngine::ack_pending_count_for_test() const {
     std::lock_guard lock(mtx_);
     return ack_ledger_->pending_count_for_test();
+}
+
+std::optional<GuardianArmStats> GuardianEngine::arm_stats() const {
+    std::lock_guard lock(mtx_);
+    // Check A (rung 9c PR-3 KICKOFF-v2, see this accessor's own doc comment in
+    // guardian_engine.hpp): begin_application() runs unconditionally in
+    // apply_rules() regardless of prefer_spark_, so ack_ledger_->arm_stats() alone
+    // cannot distinguish "spark dormant" from "spark live, currently clean" - a
+    // legacy agent has a live, empty Application on every push. Gate on all three
+    // engine-level dormancy conditions explicitly (governance fix, adversarial
+    // review CODEX-1/K1: `prefer_spark_` alone left `stopped_` and
+    // `spark_availability_ != Available` - Unwired/SparkFailed/SparkDisabled -
+    // emitting a false-present {0,0} pair), mirroring journal_age_stats()'s own
+    // dormancy gate immediately above plus reconcile_rule_locked()'s own
+    // try_spark condition for the availability check, or a reachable agent state
+    // would read as "arming, healthy" while nothing is actually being observed.
+    // The ledger's own arm_stats() supplies the fourth, orthogonal "no current
+    // application yet" absence case.
+    if (!prefer_spark_ || stopped_ || spark_availability_ != SparkAvailability::Available)
+        return std::nullopt;
+    return ack_ledger_->arm_stats();
+}
+
+std::uint64_t GuardianEngine::io_ceiling_rejections() const {
+    std::lock_guard lock(mtx_);
+    return spark_runtime_ ? spark_runtime_->io_ceiling_rejections() : 0;
 }
 
 std::uint64_t GuardianEngine::unhealthy_suppressed() const {
