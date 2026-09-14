@@ -167,6 +167,13 @@ std::vector<InventoryEvalResult> evaluate_inventory(
     const std::vector<std::pair<std::string, std::string>>& records) {
 
     std::vector<InventoryEvalResult> results;
+    // Defense-in-depth backstop (Gate 6 sre BLOCKING fix): every caller MUST
+    // reject an oversized conditions[] array before reaching here (see
+    // kMaxInventoryConditions' doc comment) - this bounds the cost even if a
+    // future caller forgets to.
+    if (req.conditions.size() > kMaxInventoryConditions) {
+        return results;
+    }
     bool combine_all = (req.combine != "any");
 
     for (const auto& [key, data_json] : records) {

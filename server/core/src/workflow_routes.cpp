@@ -2688,6 +2688,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // closing brace, so the discriminator fields it carries must be copied out
         // to these outer locals if the sent==0 branch further down is to use them.
         bool containment_unreadable = false;
+        // WS-4 4.2b Task D: mirrors containment_unreadable exactly — copied
+        // out of dispatch_outcome for the same reason (the try block's own
+        // scope ends before the sent==0 branch below reads it).
+        bool route_unreadable = false;
         std::size_t denied_quarantined_count = 0;
         std::size_t unknown_plugin_count = 0;
         std::optional<std::string> scope_parse_error;
@@ -2720,6 +2724,7 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             command_id = dispatch_outcome.command_id;
             sent = dispatch_outcome.sent;
             containment_unreadable = dispatch_outcome.containment_unreadable;
+            route_unreadable = dispatch_outcome.route_unreadable;
             denied_quarantined_count = dispatch_outcome.denied_quarantined_count;
             unknown_plugin_count = dispatch_outcome.unknown_plugin_count;
             scope_parse_error = dispatch_outcome.scope_parse_error;
@@ -2804,6 +2809,23 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                                "failing closed and reaching no agent; check the "
                                                "quarantine store"},
                                    {"reason", "containment_unreadable"},
+                                   {"retry_after_ms", 5000},
+                                   {"correlation_id", detail::ensure_correlation_id(res)}}},
+                         {"meta", {{"api_version", "v1"}}}})
+                        .dump(),
+                    "application/json");
+            } else if (route_unreadable) {
+                // WS-4 4.2b Task D: the exact sibling of containment_unreadable
+                // above — a degraded gateway routing-directory read, not a
+                // per-target fact. Same priority tier, checked right after.
+                res.set_content(
+                    nlohmann::json(
+                        {{"error", {{"code", 503},
+                                   {"message", "the gateway routing directory could not be "
+                                               "read for one or more targets — dispatch is "
+                                               "failing closed rather than guessing where to "
+                                               "route"},
+                                   {"reason", "route_unreadable"},
                                    {"retry_after_ms", 5000},
                                    {"correlation_id", detail::ensure_correlation_id(res)}}},
                          {"meta", {{"api_version", "v1"}}}})

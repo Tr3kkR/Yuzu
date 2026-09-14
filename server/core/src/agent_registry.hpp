@@ -741,6 +741,23 @@ public:
     // never treated as an error for the other recipients.
     int send_to_all(const ClassifiedCommand& cmd);
 
+    // WS-4 4.2b Task C: fallback-ONLY queue for an agent this replica has NO
+    // local session for at all (the precondition every caller must have
+    // already established — this method does not itself check `agents_`).
+    // The caller (`GatewayRouteFallback`, dispatch_route_fallback.hpp) has
+    // already resolved `cluster_id` from a BATCHED GatewayRouteStore
+    // directory read. Mirrors `send_to`'s existing gateway_node branch: the
+    // same defensive `tag_is_valid` check, the same `gw_pending_` queue —
+    // just keyed off a directory-resolved cluster rather than a live
+    // session's advertised `gateway_node`. Returns false only on a
+    // malformed dispatch tag (the defensive check); queuing itself cannot
+    // fail. NEVER call this for an agent that DOES have a local session —
+    // `send_to` is the sole path for that (this method has no capability
+    // advertisement to check, because there is no session to have
+    // advertised one).
+    bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
+                            const std::string& cluster_id);
+
     struct GatewayPendingCmd {
         std::string agent_id;
         // Unwrapped to the raw wire type on purpose: by the time a command is
@@ -750,6 +767,14 @@ public:
         // only re-wraps this into a `SendCommandRequest`, never re-decides
         // classification or authorization.
         pb::CommandRequest cmd;
+        /// WS-4 4.2b Task C: the cluster this entry was routed via the
+        /// GatewayRouteStore directory FALLBACK path (`send_via_directory`),
+        /// as opposed to the pre-existing `gateway_node`-session path (`nullopt`
+        /// here — `forward_gateway_pending` has always had exactly one
+        /// `gw_mgmt_stub_` to forward to regardless of node/cluster, so the
+        /// pre-existing path never needed to carry one). Carried through for
+        /// 4.3 (multi-cluster fan-out); inert until then.
+        std::optional<std::string> cluster_id;
     };
 
     std::vector<GatewayPendingCmd> drain_gateway_pending();

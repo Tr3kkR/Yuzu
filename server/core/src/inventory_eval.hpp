@@ -20,6 +20,18 @@ struct InventoryEvalRequest {
     std::string combine = "all";  // "all" (AND) or "any" (OR)
 };
 
+/// Gate 6 sre BLOCKING fix (#2146 Batch B2 review): evaluate_inventory() is
+/// O(conditions x records) with the "any" combine mode's short-circuit
+/// trivially defeated by conditions that never match, so an uncapped
+/// conditions[] array lets a single request pin a worker thread on the
+/// shared httplib pool for an unbounded time - every caller (both
+/// create_result_set_from_inventory_query transports, plus the pre-existing
+/// POST /api/v1/inventory/evaluate) MUST reject a conditions[] array larger
+/// than this before calling evaluate_inventory(). A few hundred is generous
+/// for any real query; conditions are per-field predicates, not device IDs
+/// (device_ids' own 100000-item cap is the wrong analog).
+inline constexpr std::size_t kMaxInventoryConditions = 500;
+
 struct InventoryEvalResult {
     std::string agent_id;
     bool match;

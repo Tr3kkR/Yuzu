@@ -557,8 +557,18 @@ TEST_CASE("AuthRoutes::require_permission — operator MCP tier is BLOCKED from 
     CHECK(j["error"]["permission"].get<std::string>() == "ApiToken:Write");
 }
 
-TEST_CASE("AuthRoutes::require_permission — supervised MCP tier IS allowed ApiToken:Write "
-          "(control: the tier gate itself is untouched above operator)",
+// gov security-guardian fix round (#2146 B4): ApiToken:Write joined the
+// supervised-tier requires_approval() list (mcp_policy.hpp) to close a real
+// self-mint-a-fresh-untiered-token gap shared by REST and MCP. This test
+// used to assert the OLD (pre-fix) behavior -- tier_allows passing supervised
+// straight through with no approval check at all. tier_allows() itself is
+// STILL untouched (supervised still passes it, unlike operator -- see the
+// sibling test above); what changed is requires_approval() now also fires,
+// so a plain REST-transport require_permission() call correctly denies
+// pending a ticket, same shape as the Execution:Execute case below.
+TEST_CASE("AuthRoutes::require_permission - supervised MCP token blocked from approval-gated "
+          "ApiToken:Write on a REST transport (control: tier_allows itself is untouched, only "
+          "requires_approval changed)",
           "[pg][auth_routes][scope][mcp]") {
     AuthRoutesFixture fix;
     auto now = std::chrono::duration_cast<std::chrono::seconds>(
@@ -567,10 +577,40 @@ TEST_CASE("AuthRoutes::require_permission — supervised MCP tier IS allowed Api
                                             now + 3600, "", "supervised");
     REQUIRE(raw.has_value());
     auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/api/v1/tokens"; // a REST (non-MCP) transport
+    httplib::Response res;
+
+    // tier_allows("supervised", ApiToken, Write) -> true (unchanged)
+    // requires_approval("supervised", ApiToken, Write) -> true (this fix round)
+    // -> on a REST transport the approval gate is enforced here so a
+    //    supervised token cannot self-mint a fresh credential by calling
+    //    POST /api/v1/tokens directly, bypassing the MCP ticket flow (#520
+    //    class: a tier cannot be bypassed by switching endpoints).
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Write");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+    CHECK(res.body.find("approval") != std::string::npos);
+}
+
+// Complement of the above: on the MCP JSON-RPC transport the C8 gate in
+// mcp_server.cpp is the authoritative approval gate for create_api_token
+// (ticket-then-recall, #289), so require_permission must NOT re-deny it here.
+TEST_CASE("AuthRoutes::require_permission - ApiToken:Write approval gate is skipped on the "
+          "MCP transport (create_api_token's own C8 gate is authoritative)",
+          "[pg][auth_routes][scope][mcp]") {
+    AuthRoutesFixture fix;
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-atw-mcp", "test_user",
+                                            now + 3600, "", "supervised");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    req.path = "/mcp/v1/"; // the MCP transport -- C8 governs approval
     httplib::Response res;
 
     bool ok = fix.ar->require_permission(req, res, "ApiToken", "Write");
     CHECK(ok);
+    CHECK(res.body.find("approval") == std::string::npos); // the approval gate did not fire
 }
 
 // ---------------------------------------------------------------------------
