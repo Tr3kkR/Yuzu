@@ -6399,6 +6399,73 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 cs-1): a subscription reported dead c
     CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
 
+// rung 9c PR-5a (#4221 cs-103/ch-103): on_subscription_lost's rule-detach loop has no
+// catch around it. #4221 calls this "contained/self-healing today per the design's own
+// claim, but untested" - the real containment lives ONE LAYER UP, in SparkEngine's own
+// consumer-dispatch loop (spark_engine.cpp: `try { consumer->handler(ev); } catch
+// (...) { ...errors++... }`, verified directly against that source for this test), not
+// in GuardianSparkRuntime itself. This test emulates that real containment explicitly
+// (rather than requiring a full SparkEngine wiring just to prove GUARDIAN's own
+// post-exception state) and proves the self-heal half #4221 flags as unverified: a
+// repeat notification for the same dead subscription completes cleanly, and the key is
+// never left permanently wedged.
+//
+// Uses set_detach_fault_for_test's existing seam, which fires inside
+// detach_rule_locked() exactly at the LAST-rule-on-key case (refcount 1->0, right
+// before the Disarm claim is constructed - matching #4221's own "throwing LAST
+// detach" framing) - two rules share one key so the loop's first detach (not
+// last-on-key) succeeds and only the second (last-on-key) hits the seam.
+// Mutation-verify: this seam already exists and is exercised nowhere outside this
+// test - removing this test silently loses the only coverage that a throw here
+// neither corrupts state nor wedges the key permanently.
+TEST_CASE("rung 9c PR-5a (#4221 cs-103/ch-103): a throwing LAST detach inside a Lost "
+          "notification is contained one layer up and a repeat notification self-heals",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(rt->rule_count() == 2);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arms.load() == 1); // one shared watcher for both rules
+
+    const auto key = spark_key(file_spec("/a"));
+    const auto sub_id = b->armed_ids().at(0);
+
+    rt->set_detach_fault_for_test(true); // consumed once, on the second (last-on-key) detach
+    REQUIRE_THROWS_AS(
+        rt->on_event(SparkEvent{.key = key, .kind = SparkEventKind::Lost, .subscription_id = sub_id}),
+        std::bad_alloc);
+
+    // Contained state, mid-loop: "r1" (detached first, before the throw) is gone;
+    // "r2" (the throwing LAST detach) is UNTOUCHED - the seam fires before any of its
+    // rules_/index_/keys_ mutation runs, so it is exactly as live as before the Lost
+    // notification arrived. A real dead watch behind a still-"live" rule entry - the
+    // design's own documented residual (an errored rule un-enforced until the next
+    // recovery trigger), not a crash and not silent corruption.
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+
+    // Self-heal: a repeat Lost notification for the SAME (key, subscription_id) - the
+    // realistic retry shape (the mechanism re-firing, or the poll backstop
+    // revalidate_subscriptions() re-observing the same dead id) - completes cleanly now
+    // that the fault seam is spent.
+    REQUIRE_NOTHROW(rt->on_event(
+        SparkEvent{.key = key, .kind = SparkEventKind::Lost, .subscription_id = sub_id}));
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+
+    // The key is not permanently wedged: a fresh attach on it succeeds cleanly and
+    // does not touch a REPLACEMENT subscription (there isn't one yet - proving the
+    // contained throw didn't leave a stray claim or index entry behind either).
+    REQUIRE(rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    rt->detach_rule("r3");
+    rt->begin_stop();
+}
+
 // sg-3 / ar-4 / cs-5: a Dispatched head that already carries a published outcome is a
 // tombstone the drain must never leave behind. Seam 3 throws inside the deferred
 // publish AFTER the verdict write and BEFORE the pop, so step (3)'s catch sees a head
