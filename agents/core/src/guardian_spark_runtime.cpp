@@ -147,9 +147,17 @@ bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept 
     // `false`, and index_held stays true so the next release retries.
     try {
         index_remove_fault_here_for_test(); // seam: "the index removal threw"
-        index_->erase_rule(claim.rule_id);  // noexcept; idempotent; guarded by index_held
-                                            // so a stale claim never removes a
-                                            // replacement's mapping
+        // rung 9c PR-5a (#4221 up-101): pass claim.generation, not just claim.rule_id.
+        // `index_held` alone does NOT stop a stale, retried release from clobbering a
+        // replacement's mapping - it only stops THIS claim object calling erase twice.
+        // A DIFFERENT, older claim's legitimately-retried release (fail_all_claims_locked's
+        // "the next same-key event... retries the release" case) can fire after a
+        // same-rule re-attach has already installed a new mapping for this rule_id; the
+        // generation check inside erase_rule() is what makes that a safe no-op instead of
+        // an erroneous erase of the newer owner's entry. (An earlier version of this
+        // comment claimed index_held alone was sufficient - it was not; see the header
+        // doc comment on SparkKeyRuleIndex::erase_rule.)
+        index_->erase_rule(claim.rule_id, claim.generation); // noexcept; idempotent
     } catch (...) {
         claim_index_release_failures_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -1464,11 +1472,17 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // both remove the mapping.
         bool index_added = false;
         GuardianRollback index_add_rollback;
-        index_add_rollback.fn = [this, rule_id, &index_added] {
+        index_add_rollback.fn = [this, rule_id, gen, &index_added] {
             if (index_added)
-                index_->erase_rule(rule_id); // noexcept (adversarial r4 K2/C5): remove_rule's
-                                            // key copy could throw inside ~GuardianRollback,
-                                            // which swallows it and leaves a ghost mapping
+                // rung 9c PR-5a (#4221 up-101): pass `gen` - this rollback only ever
+                // fires within THIS same attach_core() call, before anything else could
+                // have transferred ownership elsewhere, so `gen` is always still the
+                // recorded owner here; passing it keeps this call symmetric with every
+                // other erase_rule() call site now that the parameter is required for
+                // safety elsewhere.
+                index_->erase_rule(rule_id, gen); // noexcept (adversarial r4 K2/C5): remove_rule's
+                                                  // key copy could throw inside ~GuardianRollback,
+                                                  // which swallows it and leaves a ghost mapping
         };
 
         // rung 9c R5.2: a key that already has a claim entry (an arm in flight with
@@ -1482,7 +1496,10 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         const auto cit = claims_.find(key);
         const bool key_claimed = io_class && cit != claims_.end() && !cit->second.fifo.empty();
 
-        const bool arm_edge = index_->add(key, rule_id); // may throw; index_added still false then
+        const bool arm_edge = index_->add(key, rule_id, gen); // may throw; index_added still false
+                                                              // then. rung 9c PR-5a (#4221 up-101):
+                                                              // `gen` is this attach's own incarnation
+                                                              // token - see erase_rule()'s doc comment.
         index_added = true;
         if (key_claimed || (arm_edge && io_class)) {
             // Claim path: mark and return to the caller below WITHOUT touching
@@ -1799,17 +1816,101 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // never writes keys_ until it commits, and commit erases the entry);
                 // a never-dispatched terminal tombstone may still sit here after a
                 // double fault, and is swept first (governance pass-3 sg-3/ar-4/cs-5).
+                //
+                // rung 9c PR-5a (#4221 cs-103) reachability note (corrected 2026-09-14,
+                // governance S2 - the original (a) below was wrong for a same-rule_id
+                // tombstone; see the correction inline): this sweep's ATTACH-path twin
+                // (try_dispatch_head_locked, this file's other
+                // sweep_terminal_queued_locked call site) has concrete, tested repros
+                // (the "adversarial re-review r3 C2" death test and PR-5a's own
+                // "up-101/ch-101" test both leave a real tombstone for this call to
+                // sweep). This DETACH-path call site does not, and an extensive trace
+                // of the actual call graph (attach_core, publish_arm_verdicts_locked,
+                // on_arm_complete, Case 0 in this function) did not turn up a
+                // producible sequence of public-API calls that reaches here with a
+                // non-empty fifo. Two cases, scoped by whose rule_id the tombstone
+                // holds - conflating them was the (a) defect:
+                // (a) a DIFFERENT rule sharing this key still holds its OWN
+                //     index_->add() mapping (its release having failed): by_key_ is a
+                //     std::set<rule_id>, so a SECOND, distinct rule_id inflates
+                //     index_->refcount() for this key past 1 and blocks `last_on_key`
+                //     above from ever gating entry into this branch while that
+                //     tombstone persists. This case does NOT apply to a same-rule_id
+                //     tombstone from an older generation: by_key_ counts the rule_id
+                //     string once regardless of which generation currently owns it in
+                //     by_rule_, so refcount stays 1 either way.
+                // (b) the SAME rule's own stale tombstone gets opportunistically swept
+                //     by try_dispatch_head_locked's OWN call as part of that rule's
+                //     next attach - see PR-5a's up-101 test, where the tombstone is
+                //     cleared before the new claim ever reaches commit, not left for a
+                //     later, separate detach to find. This is the case that actually
+                //     covers a same-rule_id tombstone; (a) never needs to.
+                // The overall unreachability conclusion rests on (b) alone for the
+                // same-rule case and on (a) for the different-rule case - independently
+                // traced by two reviewers with no counter-example found, but not
+                // exhaustively modeled against every background retry path. This
+                // matches the governance finding's own framing (sg-3/ar-4/cs-5 hardened
+                // BOTH sweep call sites symmetrically as defence-in-depth) rather than a
+                // distinctly reproduced defect at this specific site. Flagging rather
+                // than asserting impossibility: a future change to up-5's
+                // retained-disarm redrive (5b) or to the claim/index bookkeeping above
+                // could open a path this analysis didn't model - re-check this note
+                // rather than deleting it if either changes. Because this conclusion is
+                // call-graph reasoning, not a compile-time guarantee, the check right
+                // below is a REAL runtime guard (counted via
+                // detach_sweep_left_residue(), logged, safe fallback) rather than a bare
+                // debug-only assert - see its own comment for why.
                 sweep_terminal_queued_locked(eit->second);
+                // rung 9c PR-5a (#4221 cs-103): a bare assert() here would compile out
+                // entirely under NDEBUG, silently proceeding as if the sweep's
+                // precondition held even though this investigation only established it
+                // via call-graph reasoning, not a compile-time guarantee. Matches this
+                // file's own established precedent for a should-never-happen branch
+                // (dispatch_arm_off_lock's "not an Arm claim" guard): keep the debug
+                // assert for immediate local visibility, but pair it with a REAL,
+                // NDEBUG-surviving fallback that never risks inserting this Disarm claim
+                // behind (or ahead of) something whose state this code no longer
+                // understands.
+                //
+                // Gate 8 re-review correction (G2, both cpp-expert and cpp-safety):
+                // this comment and this commit's own message originally claimed the
+                // disarm itself is "deferred to the next same-key event" - that is
+                // WRONG. Deliberately not pushing the new Disarm claim here just leaves
+                // `claim_pushed` false and `inline_disarm` unset, so control falls
+                // through to the PRE-EXISTING (unrelated to this PR) `!claim_pushed`
+                // last-resort fallback in the `if (disarm_key)` block later in this
+                // function: that fallback runs SYNCHRONOUSLY, in this SAME call, under
+                // this SAME lock -
+                // it calls backend_->disarm() on the real subscription directly and then
+                // unconditionally erases keys_[key]. So the real disarm and the key's
+                // teardown both happen immediately, not deferred. The ONLY thing
+                // genuinely left for the next same-key event is the unexpected residue
+                // still sitting in claims_[key]'s own fifo (this rule's own
+                // rules_/index_ cleanup below also runs unconditionally regardless).
                 assert(eit->second.fifo.empty());
-                try {
-                    eit->second.fifo.push_back(c);
-                } catch (...) {
-                    if (inserted)
-                        claims_.erase(eit); // never leave an empty entry behind
-                    throw;
+                if (!eit->second.fifo.empty()) {
+                    detach_sweep_left_residue_.fetch_add(1, std::memory_order_relaxed);
+                    try {
+                        spdlog::error("Guardian spark: key '{}' still has {} queued claim(s) "
+                                     "after the last-on-key sweep for rule '{}' - the real "
+                                     "disarm still runs synchronously via the existing "
+                                     "last-resort fallback, but this leftover fifo residue "
+                                     "is left for the next same-key event to sweep (see "
+                                     "detach_sweep_left_residue())",
+                                     *key_opt, eit->second.fifo.size(), rule_id);
+                    } catch (...) {
+                    }
+                } else {
+                    try {
+                        eit->second.fifo.push_back(c);
+                    } catch (...) {
+                        if (inserted)
+                            claims_.erase(eit); // never leave an empty entry behind
+                        throw;
+                    }
+                    work = c;
+                    claim_pushed = true;
                 }
-                work = c;
-                claim_pushed = true;
             } else {
                 inline_disarm = kit->second->subscription;
             }
@@ -1865,8 +1966,15 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
             if (inline_disarm) {
                 backend_->disarm(*inline_disarm); // inline type: unchanged, synchronous
             } else if (!claim_pushed) {
-                // Cannot happen by construction (the prediction ran under this same
-                // lock); counted last resort so a subscription is NEVER stranded.
+                // Gate 8 re-review correction (G3): this used to read "cannot happen by
+                // construction" - that stopped being true the moment the residue-sweep
+                // branch above (rung 9c PR-5a, #4221 cs-103) was added. That branch
+                // deliberately leaves `claim_pushed` false whenever the last-on-key sweep
+                // finds leftover fifo residue it can't safely reorder past, so THIS
+                // fallback is now the real, live disarm+cleanup path for that case, not
+                // just an unreachable last resort. It remains the defensive last resort
+                // for any other path that leaves `claim_pushed` false; this is the
+                // last-resort real disarm, counted so a subscription is NEVER stranded.
                 detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
                 try {
                     backend_->disarm(kit->second->subscription);
