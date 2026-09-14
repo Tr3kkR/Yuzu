@@ -115,15 +115,20 @@ steadily.
 routing directory written on the gateway-upstream connect/disconnect/heartbeat
 paths (`register_fresh`/`announce_connected`/`deregister`/`renew_leases`). See
 `docs/postgres-migration-ladder.md`'s `GatewayRouteStore` row for the full
-epoch-fence design.
+epoch-fence design. The desync counter below was added in slice 4.2a; the
+reap-outcome counter was added alongside it in the same slice's governance
+fold.
 
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_gateway_route_write_failed_total` | counter | A `GatewayRouteStore` directory write that degraded instead of succeeding, labeled `op` (`register_fresh`\|`announce_connected`\|`deregister`\|`renew_leases`) and `reason` (`store_unavailable`\|`db_error`). **Fail-OPEN this slice** — the write is logged and the RPC proceeds regardless, since the directory is not yet dispatch-authoritative (4.1) — so this counter is the only signal a systemic Postgres write problem would otherwise leave invisible. |
+| `yuzu_server_gateway_route_desync_total` | counter | A directory session-guard that correctly REJECTED a write/lookup because the presented session doesn't own the row (`op` ∈ `renew_leases`\|`announce_connected`\|`deregister`\|`notify_stream_status`, `outcome` ∈ `shortfall`\|`session_mismatch`\|`unknown_session`). Distinct from the write-failed counter above — the call succeeded, the guard just refused to touch a row it doesn't own. A low background rate is expected (stale/superseded-session notifications); a sustained rise means the in-memory `gateway_sessions_` map and the durable directory have gone out of sync (HA WS-4 4.2a, `#4246` item #8). Deliberately excludes a benign `register_fresh` epoch-race loss. **Two benign contributors an SRE must not page on:** (a) a post-restart/failover baseline rise — a replica that just lost its in-memory `gateway_sessions_` emits `unknown_session`/`shortfall` until agents re-announce/reap; this is the dominant post-restart symptom, not an incident by itself; (b) a redelivered/duplicate `DISCONNECTED` notification, which counts as a `deregister`/`session_mismatch` the second time it arrives. |
+| `yuzu_server_gateway_route_reap_total{outcome}` | counter | `reap_stale_routes()` background-tick outcomes (HA WS-4 4.2a governance fold), `outcome` ∈ `ok`\|`ok_capped`\|`recovered`\|`declined`\|`skipped`\|`error`. `declined` means the pass was skipped by the clock-guarded-retention anomaly guard (an implausible or unparseable `now()`/persisted-anchor reading, an anomaly whose direction differs from the anchor's prior decline, or — PR #4299 round 4 — a same-direction anomaly that has not yet PERSISTED a real-time-plausible interval) and reaped nothing; `recovered` (PR #4299 round-2 review) means a clock anomaly PERSISTED a real-time-plausible interval at the SAME (anchor, direction) and this pass drained the resulting backlog under the usual caps, per the decline-once/drain-on-repeat guard — a sustained non-zero `recovered` rate is worth an operator look (a clock anomaly or a real gap), even though nothing failed; `ok_capped` (PR #4299 round 4) means a clean accepted pass hit `kReapCap` on a sweep AND a same-txn `EXISTS` probe confirmed a remaining backlog (observability only, NOT a cadence change) — a sustained `ok_capped` rate means the reaper is chronically behind; `skipped` (PR #4299 round-2 external review) means another replica already held the `gateway_route_store:reap` advisory lock this tick (`pg_try_advisory_xact_lock`, not blocking) — routine on a multi-replica deployment, never a failure; `error` means the store call itself failed (pool/query degradation). This is the compensating observable signal for the clock-guarded-retention part-1 carve-out and the decline-once/drain-on-repeat part-4 guard documented in `gateway_route_store.hpp`'s `reap_stale_routes` header — see `docs/clock-guarded-retention.md`'s `GatewayRouteStore` entry. |
 
-There is deliberately no success/rate counter and no alert rule for this
-family yet — both land with the WS-4 4.2 fail-closed flip, once a reader
-depends on the directory being fresh.
+There is deliberately no success/rate counter and no alert rule for the
+write-failed/desync pair yet — both land with the WS-4 4.2b fail-closed flip,
+once a reader depends on the directory being fresh (`#4246` item #1 and the
+alert-rule half of item #8).
 
 ## SSO login metrics
 
@@ -1447,6 +1452,40 @@ window later that is population churn, not a new incident.
 | `yuzu_fleet_guardian_journal_reporting` | gauge | Agents whose latest heartbeat carried at least one **parseable** journal tag - the coverage denominator the 32 counters lack. **Published every sweep including `0`**, unlike them. Read `0` carefully: the writer is sparse, so this counts agents with a **non-zero** counter, not agents whose journal works - `0` means either the telemetry path is dark **or** nothing has been journalled anywhere since restart (a live journal on a fleet with no deployed Guardian rules reads `0` legitimately). It narrows the overloaded absence of the 32; it does not resolve it. **Counts the 32 counter tags only - an agent reporting only the three `_seconds` age tags does not count here** |
 | `yuzu_fleet_guardian_journal_tag_rejected` | gauge | Journal tags **present** on a heartbeat this sweep but rejected by the forged-value parse (non-numeric, negative, over 10 digits, or above the plausibility ceiling). **Published every sweep including `0`**. Without it a rejected value is a silent drop - if the rejecting agent were the only reporter, its family goes absent and absent reads as clean. `> 0` means some agent is shipping malformed journal telemetry |
 
+### Guardian arm-ledger fleet gauges (rung 9c PR-3)
+
+Published on every fleet-health sweep, fed from `yuzu.guardian_arm_pending` /
+`yuzu.guardian_arm_failed`. Unlike the journal counters above, these are
+**re-statable gauges** - each agent reports its CURRENT ack-ledger state
+(`GuardianArmAckLedger::arm_stats()`), not a monotonic total - so the fleet gauge
+is a SUM of current values, and it can legally decrease. Absent means no agent
+reported this sweep, which today (`prefer_spark` off fleet-wide) means every
+agent, by construction - a non-spark agent never emits this pair at all.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_arm_pending` | gauge | Fleet **SUM** of accepted spark arms currently pending acknowledgment (still awaiting a Committed/terminal resolution), across every agent's CURRENT application. Re-statable, not cumulative - decreases as receipts resolve or an application is replaced |
+| `yuzu_fleet_guardian_arm_failed` | gauge | Fleet **SUM** of accepted spark arms whose CURRENT application resolved to a non-Committed terminal outcome (Failed/Expired/Withdrawn/Stopped), still unresolved for acknowledgment. Resets to `0` the moment an application that saw a failure is REPLACED - an ordinary retry of that generation, live today - regardless of whether that retry itself succeeds; a rule that fails again climbs back up over the following ticks. Does NOT yet reflect same-application late-success recovery (a still-pending receipt flipping from Failed to Committed without a new application); that lands in a later rung. Zero does not itself mean compliant or enforced. **Alerting**: a `for:`-duration rule keyed on this gauge alone can be reset by the ~25 s retry cadence - prefer `arm_pending + arm_failed > 0` sustained |
+| `yuzu_fleet_guardian_arm_reporting` | gauge | Agents whose latest heartbeat carried at least one parseable `yuzu.guardian_arm_*` tag - the coverage denominator for the two gauges above. **Published every sweep including `0`**. `0` means no agent currently has `prefer_spark` on AND live (not stopped, not Unwired/SparkFailed/SparkDisabled) AND a current application - the expected reading on every released fleet today, since `prefer_spark` is hardcoded false. **Do NOT cross-check `yuzu_fleet_spark_reporting`** to disambiguate "telemetry dark" - that gauge counts SparkEngine running observe-only, which is live fleet-wide independent of `prefer_spark`, so `spark_reporting > 0` with `arm_reporting == 0` is the NORMAL pre-cutover reading, not a dark-telemetry signal. If genuine dark-telemetry suspicion arises, check `yuzu.guardian_backend`/agent logs instead |
+| `yuzu_fleet_guardian_arm_tag_rejected` | gauge | `yuzu.guardian_arm_*` tags **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`**. `> 0` means some agent is shipping malformed arm-ledger telemetry |
+
+### Guardian io-ceiling fleet gauge (rung 9c PR-3, R5.1)
+
+`GuardianIoExecutor`'s physical-orphan alive-worker ceiling (R5.1's own flagged
+observability gap) gets one narrow, MONITOR-ONLY counter, scoped to the arm/disarm
+executor instance only - **not** #3415's general per-class executor-fault egress,
+which stays a separate, still-open follow-up (see the executor bulkhead docs in
+[guaranteed-state.md](guaranteed-state.md) and `docs/spark-legacy-delta-registry.md`
+row D10). A windowed "currently under repeated pressure" detector was considered for
+this signal and deliberately DEFERRED to a later rung rather than shipping an
+unmeasured threshold now - this counter names the fault class only.
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_guardian_io_arm_disarm_rejected_ceiling` | gauge | Fleet **SUM** of admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (workers still alive past `fn()` inside their completion callbacks while ordinary class quota was free). A genuinely cumulative per-agent counter - correctly MONITOR-ONLY: neither `increase()` nor a bare `> 0` is sound over a fleet sum of per-agent cumulative counters. Names the fault class; does not by itself say whether an endpoint is CURRENTLY wedged |
+| `yuzu_fleet_guardian_io_ceiling_reporting` | gauge | Agents whose latest heartbeat carried the ceiling tag - the coverage denominator. **Published every sweep including `0`**. The writer is sparse (a zero ceiling count ships no tag), so `0` here means no currently-retained agent has hit the ceiling since its own process last started (or none is running spark) - counters reset on agent restart and this reads only the latest retained heartbeats, not durable history; not that telemetry is dark |
+| `yuzu_fleet_guardian_io_ceiling_tag_rejected` | gauge | The ceiling tag **present** this sweep but rejected by the forged-value parse. **Published every sweep including `0`** |
+
 ### Guardian M1 health-stream fleet gauges
 
 The M1 flood-guard telemetry ([Guaranteed State](guaranteed-state.md)'s errored-view
@@ -1941,6 +1980,20 @@ age tags per their own posture above), so a tag absent from this table is not ne
 absent from the payload.
 
 Counters are cumulative for the agent process and reset on restart.
+
+### Guardian arm-ledger + io-ceiling health (heartbeat `status_tags`, rung 9c PR-3)
+
+> **Not yet active in a shipped release** - same caveat as the journal section above:
+> dormant until the Spark detection path becomes authoritative (`prefer_spark` off in
+> every released agent today).
+
+Two more Guardian heartbeat signals, both new in rung 9c PR-3, neither part of the
+journal family above:
+
+| Tag | Meaning | What to do |
+|---|---|---|
+| `yuzu.guardian_arm_pending` / `yuzu.guardian_arm_failed` | The ack ledger's CURRENT application snapshot - accepted-and-still-outstanding arms, and arms resolved to a non-Committed terminal outcome, respectively. **Re-statable gauges, emitted together, including a genuine `0`** - unlike the sparse journal counters above, absence here means dormant: `prefer_spark` off, the engine stopped, Spark itself unavailable (Unwired/SparkFailed/SparkDisabled), or no current application exists yet - not "nothing to report while live". A rule genuinely at zero pending/failed reads as `0`, not absent - an omitted tag would misreport as "dormant" rather than "checked, healthy". | Sustained nonzero `_pending` beyond a couple of heartbeat ticks (~30 s each) means arms are taking longer than expected to resolve - check backend/OS-call latency. A nonzero `_failed` means at least one rule failed to arm and its generation is held; find the failing rule (agent log) before assuming the fleet compliance view is complete. `_failed` resets to `0` the moment a NEW application begins - the server's ~25 s `full_sync` retry of a generation that previously failed - regardless of whether that retry itself then succeeds; if the retried rule fails again, `_failed` climbs back up over the following ticks rather than staying at `0`. **Alerting hazard**: because that reset fires on every retry attempt (not just a successful one), a naive `yuzu_fleet_guardian_arm_failed > 0 for: 5m` rule has its `for:` timer restarted by the ~25 s retry cadence and can mask a persistently-wedged rule indefinitely - alert on `arm_pending + arm_failed > 0` sustained instead, or on `yuzu.guardian_generation` lag. It does not yet reflect a same-application late recovery of one still-outstanding receipt. |
+| `yuzu.guardian_io_arm_disarm_rejected_ceiling` | Admissions refused at the arm/disarm executor's per-instance physical alive-worker ceiling (R5.1). **Sparse**: `0` omits the tag. Scoped to the arm/disarm executor instance only - the state reader's own executor instance cannot reach this ceiling (it uses only the bounded, quota-released-at-return form). | A nonzero, climbing value means completion callbacks on that instance are piling up (slow or wedged OS calls) faster than they retire - investigate backend latency on that endpoint. This tag names the fault class only; it does not say whether the endpoint is CURRENTLY wedged (no windowed detector ships yet). |
 
 ### How long Guardian audit evidence is retained ON the endpoint
 

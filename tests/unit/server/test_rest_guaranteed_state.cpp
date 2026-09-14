@@ -3646,6 +3646,62 @@ TEST_CASE("REST gs.device-compliance: unknown baseline name → 404 + not_found 
     CHECK(not_found_audited);
 }
 
+// #2146 Batch B1 review fix, REST-side symmetry - mirrors the two MCP
+// fault-injection tests pinning guardian_device_compliance_rollup's
+// pii_access_began split (test_mcp_server.cpp, "MCP Guardian:
+// get_guardian_device_compliance leaves NO audit row.../audits FAILURE...")
+// - this route calls the SAME shared model function, and a symmetric REST-
+// side regression test was missing (Gate 4/6 finding).
+
+TEST_CASE("REST gs.device-compliance: leaves NO audit row on a pre-PII "
+          "baseline-lookup degrade",
+          "[pg][rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    // Degrade BEFORE any lookup - the baseline itself can never be found.
+    {
+        auto lease = h.bl_pool->try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA baseline_store CASCADE", std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    auto res = h.sink.Get(
+        "/api/v1/guaranteed-state/device-compliance?baseline=ServiceNow%20Compliance&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(h.audit_log.empty()); // no PII was looked up - no audit row owed
+}
+
+TEST_CASE("REST gs.device-compliance: audits FAILURE on a post-baseline-found "
+          "degrade (PII already touched)",
+          "[pg][rest][guaranteed_state][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    h.seed_deployed_baseline("ServiceNow Compliance", {"r1"});
+
+    // Degrade AFTER the baseline is real and deployed - the baseline lookup
+    // and deployed_member_rule_ids (both BaselineStore) still succeed;
+    // rule_names_for/agent_rule_statuses_for_agent (GuaranteedStateStore) fail.
+    {
+        auto lease = h.gs_pool->try_acquire_for(std::chrono::seconds{5});
+        REQUIRE(lease);
+        yuzu::server::pg::PgResult drop = yuzu::server::pg::exec_params(
+            lease.get(), "DROP SCHEMA guaranteed_state_store CASCADE",
+            std::vector<std::string>{});
+        REQUIRE(drop.status() == PGRES_COMMAND_OK);
+    }
+    auto res = h.sink.Get(
+        "/api/v1/guaranteed-state/device-compliance?baseline=ServiceNow%20Compliance&agent_id=WS-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    bool failure_audited = false;
+    for (auto& a : h.audit_log)
+        if (a.action == "guardian.device.view" && a.target_id == "WS-1" &&
+            a.result == "failure")
+            failure_audited = true;
+    CHECK(failure_audited);
+}
+
 TEST_CASE("REST gs.device-compliance: deployed-but-empty baseline → deployed:true, no guards",
           "[pg][rest][guaranteed_state][baseline]") {
     RestGsHarness h;

@@ -51,8 +51,10 @@ __declspec(allocate(".CRT$XCB"))
 #include "net_quality_sampler.hpp" // slice 4a: heartbeat network-quality facts
 #include "guardian_spark_send.hpp" // rung 7.7a: OutboxEntry -> GuaranteedStateEvent send mapping
 #include "spark_engine.hpp"    // ADR-0021 Stage-2 rung 1: instantiate observe-only
+#include "guardian_arm_heartbeat.hpp"     // emit_guardian_arm_heartbeat_tags (rung 9c PR-3)
 #include "guardian_backend.hpp"           // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_health_heartbeat.hpp"  // emit_guardian_health_heartbeat_tags (M1)
+#include "guardian_io_ceiling_heartbeat.hpp" // emit_guardian_io_ceiling_heartbeat_tags (rung 9c PR-3)
 #include "guardian_journal_heartbeat.hpp" // emit_guardian_journal_heartbeat_tags (item 7 PR-Ag)
 #include "guardian_unsupported_heartbeat.hpp" // emit_guardian_unsupported_heartbeat_tags (F7)
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
@@ -2402,6 +2404,24 @@ public:
                                 // (prefer_spark off / worker not started), not a zero - so an
                                 // inert journal still adds no tags here.
                                 emit_guardian_journal_age_tags(tags, guardian_->journal_age_stats());
+                                // rung 9c PR-3: ack-ledger re-statable gauges
+                                // (yuzu.guardian_arm_pending / yuzu.guardian_arm_failed).
+                                // Dormancy is guardian_->arm_stats() returning nullopt:
+                                // prefer_spark_ off, the engine stopped, Spark itself
+                                // unavailable (Unwired/SparkFailed/SparkDisabled), or no
+                                // current application yet - see GuardianEngine::arm_stats()'s
+                                // own doc comment for why that four-way gate cannot be
+                                // inferred from the ledger alone.
+                                // A live application emits both tags including a genuine
+                                // zero, mirroring the journal age-gauge pair above.
+                                emit_guardian_arm_heartbeat_tags(tags, guardian_->arm_stats());
+                                // rung 9c PR-3 (Decision 3, Option B): R5.1's physical-
+                                // ceiling refusal count, a plain sparse monitor-only
+                                // counter (0 omits the tag) - not gated on prefer_spark_,
+                                // a zero count is equally truthful whether spark is
+                                // dormant or has simply never hit the ceiling.
+                                emit_guardian_io_ceiling_heartbeat_tags(
+                                    tags, guardian_->io_ceiling_rejections());
                                 // M1: a rule stuck Unknown re-evals every ~5s; guard.unhealthy is
                                 // edge-emitted, each suppressed repeat is counted (unhealthy_
                                 // suppressed), and each errored_refresh_ms-cadence re-emission is

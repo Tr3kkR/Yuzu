@@ -22,6 +22,7 @@
 #include "execution_event_scope.hpp"
 #include "guardian_model.hpp" // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
+#include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
 #include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
                                      // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
@@ -33,6 +34,9 @@
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "quarantine_reapply.hpp" // quarantine_whitelist_tokens_safe / kQuarantineWhitelistMaxLen (#3425 gate3-rest-whitelist-validation-gap)
+#include "result_set_model.hpp" // #2146 Batch B2: shared REST v1 + MCP result-set JSON builder
+#include "scope_engine.hpp"     // yuzu::scope::validate — POST /api/v1/scope/validate
+#include "scope_preview.hpp"    // #2146 Batch B2: shared REST v1 + MCP scope-preview builder
 #include "rest_a4_envelope.hpp"
 #include "sensitive_instruction_params.hpp" // redact_sensitive_instruction_params (#3136 blocker)
 #include "rest_a4_envelope_http.hpp" // detail::a4_error/a4_denial — #1470 error_json migration
@@ -1450,6 +1454,12 @@ const std::string& openapi_spec() {
     },
     "/result-sets/{id}/unpin": {
       "post": {"summary": "Unpin a result set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with pinned=false"}, "403": {"description": "Result-set unpin denied to a service-scoped token"}, "404": {"description": "Not found or not owned by the caller, OR the unpin write itself failed after ownership was confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership (read stage only)"}}}
+    },
+    "/scope/validate": {
+      "post": {"summary": "Validate a scope expression's syntax", "tags": ["Scope"], "description": "Versioned twin of the legacy POST /api/scope/validate and MCP validate_scope — all three call the SAME yuzu::scope::validate(). Auth-only, no RBAC gate (a syntax-only check with no data disclosure).", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{valid: true, expression} or {valid: false, error}"}, "400": {"description": "expression missing or empty"}}}
+    },
+    "/scope/preview": {
+      "post": {"summary": "Show which agents currently match a scope expression", "tags": ["Scope"], "description": "Versioned twin of MCP preview_scope_targets — both call the SAME preview_scope_targets() (scope_preview.hpp), so the matched-agent set cannot drift between transports. No legacy unversioned twin exists (POST /api/scope/estimate is a DIFFERENT, matched/total-count-only capability for the workflow builder). Gated on the admit-then-filter fleet-read chokepoint (Infrastructure:Read; ADR-0017) — a management-group-confined caller's matched_agents/matched_count are narrowed to their own visible devices, never the whole fleet. tag:<key> atoms resolve from the persistent tag store only (see docs/asset-tagging-guide.md \"Tag source precedence\").", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["expression"], "properties": {"expression": {"type": "string"}}}}}}, "responses": {"200": {"description": "{expression, matched_count, matched_agents: [agent_id, ...], warning?} — warning present only above the 50-agent display threshold"}, "400": {"description": "expression missing/empty, or fails to parse/validate"}, "503": {"description": "Tag store degraded while resolving a tag:<key> atom the expression references (Retry-After: 5)"}}}
     },
     "/software-packages": {
       "get": {"summary": "List registered software packages", "tags": ["Software Deployment"], "description": "Only available when SoftwareDeploymentStore is wired — the server does not construct it today (capability 7.6 deliberately shelved, ADR-0051); documented for when a future change re-wires it. Requires SoftwareDeployment:Read.", "responses": {"200": {"description": "{data: [{id, name, version, platform, installer_type, content_hash, size_bytes, created_at, created_by}]}"}, "503": {"description": "A genuine database read failure"}}},
@@ -7688,14 +7698,10 @@ void RestApiV1::register_routes(
                  if (!perm_fn(req, res, "Execution", "Read"))
                      return;
                  auto summary = execution_tracker->get_fleet_summary();
-                 auto data = JObj()
-                                 .add("total_executions", summary.total_executions)
-                                 .add("executions_today", summary.executions_today)
-                                 .add("active_agents", summary.active_agents)
-                                 .add("overall_success_rate", summary.overall_success_rate)
-                                 .add("avg_duration_seconds", summary.avg_duration_seconds)
-                                 .str();
-                 res.set_content(ok_json(data), "application/json");
+                 // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
+                 // the MCP twin get_execution_statistics calls the SAME function.
+                 res.set_content(ok_json(fleet_execution_summary_json(summary)),
+                                 "application/json");
              });
 
     sink.Get("/api/v1/execution-statistics/agents",
@@ -7717,16 +7723,10 @@ void RestApiV1::register_routes(
                      q.limit = 1000;
                  auto stats = execution_tracker->get_agent_statistics(q);
                  JArr arr;
-                 for (const auto& s : stats) {
-                     arr.add(JObj()
-                                 .add("agent_id", s.agent_id)
-                                 .add("total_executions", s.total_executions)
-                                 .add("success_count", s.success_count)
-                                 .add("failure_count", s.failure_count)
-                                 .add("success_rate", s.success_rate)
-                                 .add("avg_duration_seconds", s.avg_duration_seconds)
-                                 .add("last_execution_at", s.last_execution_at));
-                 }
+                 // #2146 Batch B3: shared builder -- the MCP twin
+                 // get_execution_statistics_by_agent calls the SAME function.
+                 for (const auto& s : stats)
+                     arr.add_raw(agent_execution_stats_row_json(s));
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
                                  "application/json");
              });
@@ -7750,14 +7750,10 @@ void RestApiV1::register_routes(
                      q.limit = 1000;
                  auto stats = execution_tracker->get_definition_statistics(q);
                  JArr arr;
-                 for (const auto& s : stats) {
-                     arr.add(JObj()
-                                 .add("definition_id", s.definition_id)
-                                 .add("total_executions", s.total_executions)
-                                 .add("total_agents", s.total_agents)
-                                 .add("success_rate", s.success_rate)
-                                 .add("avg_duration_seconds", s.avg_duration_seconds));
-                 }
+                 // #2146 Batch B3: shared builder -- the MCP twin
+                 // get_execution_statistics_by_definition calls the SAME function.
+                 for (const auto& s : stats)
+                     arr.add_raw(definition_execution_stats_row_json(s));
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(stats.size())),
                                  "application/json");
              });
@@ -8585,8 +8581,32 @@ void RestApiV1::register_routes(
 
     if (inventory_store) {
         sink.Post("/api/v1/inventory/evaluate",
-                  [perm_fn, inventory_store](const httplib::Request& req, httplib::Response& res) {
-                      if (!perm_fn(req, res, "Inventory", "Read"))
+                  [fleet_read_fn, inventory_store](const httplib::Request& req,
+                                                    httplib::Response& res) {
+                      // SECURITY (CWE-862, missing authorization) - Gate 8 BLOCKING
+                      // fix (#2146 Batch B2 review): this is the third caller of
+                      // evaluate_inventory() and was the ONE left on a bare
+                      // perm_fn(Inventory, Read) after the other two callers
+                      // (create_result_set_from_inventory_query, both transports)
+                      // were fixed in this same PR for the identical defect - a
+                      // management-group-confined caller (or any Inventory:Read
+                      // holder narrower than the whole fleet) could enumerate
+                      // fleet-wide device-identity + inventory-attribute
+                      // correlation. fleet_read_fn REPLACES the permission check
+                      // (it already performs the RBAC check internally) and the
+                      // candidate records are narrowed to gate.scope below -
+                      // same pattern as GET /api/v1/inventory/software and this
+                      // PR's own from-inventory-query fix.
+                      if (!fleet_read_fn) {
+                          spdlog::error("inventory.evaluate: fleet_read_fn unwired - "
+                                        "misconfigured call site; failing closed");
+                          res.status = 503;
+                          res.set_content(detail::a4_error(res, "service unavailable"),
+                                          "application/json");
+                          return;
+                      }
+                      auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+                      if (!gate.admitted)
                           return;
                       if (!inventory_store->is_open()) {
                           res.status = 503;
@@ -8601,22 +8621,63 @@ void RestApiV1::register_routes(
                           return;
                       }
 
+                      // Gate 8 fix (#2146 Batch B2 review): .get<std::string>()
+                      // throws nlohmann::json::type_error on a type mismatch -
+                      // it does not coerce. Validate explicitly, matching the
+                      // sibling routes' fix for the identical defect class.
+                      if (body.contains("agent_id") && !body["agent_id"].is_string()) {
+                          res.status = 400;
+                          res.set_content(detail::a4_error(res, "agent_id must be a JSON string"),
+                                          "application/json");
+                          return;
+                      }
+                      if (body.contains("combine") && !body["combine"].is_string()) {
+                          res.status = 400;
+                          res.set_content(detail::a4_error(res, "combine must be a JSON string"),
+                                          "application/json");
+                          return;
+                      }
                       InventoryEvalRequest eval_req;
-                      if (body.contains("agent_id"))
-                          eval_req.agent_id = body["agent_id"].get<std::string>();
-                      if (body.contains("combine"))
-                          eval_req.combine = body["combine"].get<std::string>();
+                      eval_req.agent_id = body.value("agent_id", "");
+                      eval_req.combine = body.value("combine", "all");
                       if (body.contains("conditions") && body["conditions"].is_array()) {
+                          // Gate 8 fix (#2146 Batch B2 follow-up): same
+                          // kMaxInventoryConditions pre-check as the result-set
+                          // twins below - this is the third caller of
+                          // evaluate_inventory() and was left unprotected by
+                          // the original review, relying only on the
+                          // defense-in-depth backstop inside evaluate_inventory()
+                          // itself, which silently returns an empty match set
+                          // rather than telling the caller their request was
+                          // rejected (a wrong-result-presented-as-correct regression
+                          // for this specific route).
+                          if (body["conditions"].size() > kMaxInventoryConditions) {
+                              res.status = 400;
+                              res.set_content(
+                                  detail::a4_error(res, "conditions must not exceed " +
+                                                            std::to_string(kMaxInventoryConditions) +
+                                                            " entries"),
+                                  "application/json");
+                              return;
+                          }
                           for (const auto& c : body["conditions"]) {
+                              if (!c.is_object()) {
+                                  res.status = 400;
+                                  res.set_content(
+                                      detail::a4_error(res, "each condition must be a JSON object"),
+                                      "application/json");
+                                  return;
+                              }
+                              auto field_str = [&c](const char* key) -> std::string {
+                                  return (c.contains(key) && c[key].is_string())
+                                             ? c[key].get<std::string>()
+                                             : "";
+                              };
                               InventoryCondition cond;
-                              if (c.contains("plugin"))
-                                  cond.plugin = c["plugin"].get<std::string>();
-                              if (c.contains("field"))
-                                  cond.field = c["field"].get<std::string>();
-                              if (c.contains("op"))
-                                  cond.op = c["op"].get<std::string>();
-                              if (c.contains("value"))
-                                  cond.value = c["value"].get<std::string>();
+                              cond.plugin = field_str("plugin");
+                              cond.field = field_str("field");
+                              cond.op = field_str("op");
+                              cond.value = field_str("value");
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
@@ -8634,8 +8695,14 @@ void RestApiV1::register_routes(
                                           "application/json");
                           return;
                       }
+                      // Narrow to the caller's admitted scope BEFORE evaluation -
+                      // gate.scope is the sole filter, mirroring
+                      // from-inventory-query's own identical fix above.
                       std::vector<std::pair<std::string, std::string>> records;
+                      records.reserve(records_raw->size());
                       for (const auto& r : *records_raw) {
+                          if (!authz::in_scope(gate.scope, r.agent_id))
+                              continue;
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
@@ -8686,22 +8753,10 @@ void RestApiV1::register_routes(
     // command-dispatch callback + ExecutionTracker; without them they 503.
     if (result_set_store) {
         // Serialise a ResultSet row to a JSON object string.
-        auto rs_to_json = [](const ResultSet& r) {
-            JObj o;
-            o.add("id", r.id);
-            o.add("name", r.name);
-            o.add("owner_principal", r.owner_principal);
-            o.add("created_at", r.created_at);
-            o.add("ttl_at", r.ttl_at);
-            o.add("last_used_at", r.last_used_at);
-            o.add("pinned", r.pinned);
-            o.add("parent_id", r.parent_id.value_or(""));
-            o.add("source_kind", r.source_kind);
-            o.add("status", to_string(r.status));
-            o.add("source_execution_id", r.source_execution_id);
-            o.add("device_count", r.device_count);
-            return o.str();
-        };
+        // #2146 Batch B2: delegates to the shared result_set_json() builder
+        // (result_set_model.hpp) so this REST shape and the MCP result-set
+        // tools' shape cannot drift (api-twin-recipe.md Rule 1).
+        auto rs_to_json = [](const ResultSet& r) { return result_set_json(r).dump(); };
 
         // Emit an A4 error with a fresh correlation id.
         auto rs_err = [](httplib::Response& res, int status, std::string_view msg) {
@@ -9150,27 +9205,33 @@ void RestApiV1::register_routes(
         // agent that matched. When parent_id is given, the candidate set is
         // narrowed to that set's current members.
         sink.Post("/api/v1/result-sets/from-inventory-query",
-                  [auth_fn, perm_fn, audit_fn, result_set_store, inventory_store,
+                  [auth_fn, fleet_read_fn, audit_fn, result_set_store, inventory_store,
                    metrics_registry, rs_to_json, rs_err,
                    load_owned](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
                       // SECURITY (CWE-862, missing authorization) — guardian-
-                      // confinement-2298 PR3 §3e residual sweep finding. This
-                      // producer is a SYNCHRONOUS READ (queries inventory_store
-                      // directly, no command dispatch), not one of the three
-                      // DISPATCH producers the e7b47ca3/#2500 fix already gated
-                      // just below (from-tar-query, from-instruction-result,
-                      // re-eval) — it was never covered by that fix and has been
-                      // reachable by ANY authenticated session (service-scoped or
-                      // not) with no authorization check at all: up to 5000
-                      // fleet-wide inventory records queried and evaluated with
-                      // zero scoping. Gated on Inventory:Read (the same
-                      // securable/operation GET /api/v1/inventory/software uses
-                      // for the identical data class), not Execution:Execute —
-                      // there is no dispatch here to authorize.
-                      if (!perm_fn(req, res, "Inventory", "Read"))
+                      // confinement-2298 PR3 §3e residual sweep finding, upgraded
+                      // (#2146 Batch B2 review): the prior fix gated this synchronous
+                      // fan-out READ on a bare `perm_fn(Inventory, Read)`, closing the
+                      // "reachable with no check at all" gap but leaving a
+                      // management-group-confined caller (or any Inventory:Read
+                      // holder narrower than the whole fleet) able to enumerate
+                      // fleet-wide device-identity + inventory-attribute correlation.
+                      // `fleet_read_fn` REPLACES the permission check (it already
+                      // performs the RBAC check internally) and narrows the candidate
+                      // records to `gate.scope` below — same pattern as
+                      // GET /api/v1/inventory/software and this PR's own
+                      // preview_scope_targets/scope-preview fix.
+                      if (!fleet_read_fn) {
+                          spdlog::error("from-inventory-query: fleet_read_fn unwired — "
+                                        "misconfigured call site; failing closed");
+                          rs_err(res, 503, "service unavailable");
+                          return;
+                      }
+                      auto gate = fleet_read_fn(req, res, "Inventory", "Read");
+                      if (!gate.admitted)
                           return;
                       const auto audit_failure = [&](std::string_view reason) {
                           bool ok = true;
@@ -9181,29 +9242,52 @@ void RestApiV1::register_routes(
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
-                      if (!inventory_store || !inventory_store->is_open()) {
-                          rs_err(res, 503, "inventory store not available");
-                          return;
-                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
 
+                      // Gate 3 BLOCKING fix (#2146 Batch B2 review), reordered ahead of the
+                      // store checks below (a malformed request is a client error regardless
+                      // of backend availability): `.value(key, default)` throws
+                      // nlohmann::json::type_error on a type mismatch - it does not coerce. A
+                      // non-object element or a non-string field previously fell through to
+                      // an uncaught exception. Validate explicitly.
+                      if (body.contains("combine") && !body["combine"].is_string()) {
+                          rs_err(res, 400, "combine must be a JSON string");
+                          return;
+                      }
                       InventoryEvalRequest eval_req;
                       eval_req.combine = body.value("combine", "all");
                       if (body.contains("conditions") && body["conditions"].is_array()) {
+                          // Gate 6 sre BLOCKING fix: reject an oversized array before
+                          // building/evaluating it - see kMaxInventoryConditions'
+                          // doc comment (inventory_eval.hpp).
+                          if (body["conditions"].size() > kMaxInventoryConditions) {
+                              rs_err(res, 400,
+                                     "conditions must not exceed " +
+                                         std::to_string(kMaxInventoryConditions) + " entries");
+                              return;
+                          }
                           for (const auto& c : body["conditions"]) {
+                              if (!c.is_object()) {
+                                  rs_err(res, 400, "each condition must be a JSON object");
+                                  return;
+                              }
+                              auto field_str = [&c](const char* key) -> std::string {
+                                  return (c.contains(key) && c[key].is_string())
+                                             ? c[key].get<std::string>()
+                                             : "";
+                              };
                               InventoryCondition cond;
-                              cond.plugin = c.value("plugin", "");
-                              cond.field = c.value("field", "");
-                              cond.op = c.value("op", "");
-                              cond.value = c.value("value", "");
+                              cond.plugin = field_str("plugin");
+                              cond.field = field_str("field");
+                              cond.op = field_str("op");
+                              cond.value = field_str("value");
                               eval_req.conditions.push_back(std::move(cond));
                           }
                       }
-
                       // Optional parent-scope narrowing.
                       //
                       // #2500, FOURTH instance — the one the original fix missed.
@@ -9238,6 +9322,19 @@ void RestApiV1::register_routes(
                           rs_err(res, 400,
                                  "RESULT_SET_BAD_PARENT: parent_id was supplied but names no "
                                  "parent set; omit it entirely to search all devices");
+                          return;
+                      }
+                      if (body.contains("name") && !body["name"].is_string()) {
+                          rs_err(res, 400, "name must be a JSON string");
+                          return;
+                      }
+                      // Gate 4 unhappy-path fix: moved below the client-input
+                      // validation above (combine/conditions/parent_id/name) - a
+                      // malformed request is a client error regardless of backend
+                      // availability, so a caller retrying a permanently-invalid
+                      // request on this 503's retry_after_ms would never succeed.
+                      if (!inventory_store || !inventory_store->is_open()) {
+                          rs_err(res, 503, "inventory store not available");
                           return;
                       }
                       std::optional<std::unordered_set<std::string>> parent_members;
@@ -9292,10 +9389,15 @@ void RestApiV1::register_routes(
                                  "materialise a partial result set");
                           return;
                       }
+                      // Narrow to the caller's admitted scope BEFORE evaluation -
+                      // gate.scope is the sole filter (see the SECURITY comment above).
                       std::vector<std::pair<std::string, std::string>> records;
                       records.reserve(records_raw->size());
-                      for (const auto& r : *records_raw)
+                      for (const auto& r : *records_raw) {
+                          if (!authz::in_scope(gate.scope, r.agent_id))
+                              continue;
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
+                      }
 
                       auto results = evaluate_inventory(eval_req, records);
                       std::unordered_set<std::string> seen;
@@ -9368,6 +9470,14 @@ void RestApiV1::register_routes(
                       }
                       if (sql.size() > 100000) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
+                          return;
+                      }
+                      // .value() throws nlohmann::json::type_error on a type mismatch
+                      // rather than coercing (Gate 4 unhappy-path fix, matches MCP's
+                      // identical fix) - check the type explicitly so a non-boolean
+                      // include_empty is a clean 400, not an uncaught exception.
+                      if (body.contains("include_empty") && !body["include_empty"].is_boolean()) {
+                          rs_err(res, 400, "include_empty must be a JSON boolean");
                           return;
                       }
                       const bool include_empty = body.value("include_empty", false);
@@ -9503,6 +9613,16 @@ void RestApiV1::register_routes(
                           std::string sql = sp.is_object() ? sp.value("sql", "") : "";
                           if (sql.empty()) {
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
+                              return;
+                          }
+                          // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME cap
+                          // create_result_set_from_tar_query enforces before dispatch
+                          // (matches its MCP twin's identical fix) - orig may have
+                          // been minted via the uncapped create_result_set, smuggling
+                          // an oversized SQL payload past the dedicated body cap that
+                          // exists specifically for this field.
+                          if (sql.size() > 100000) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' exceeds 100 KiB");
                               return;
                           }
                           std::unordered_map<std::string, std::string> params{{"sql", sql}};
@@ -9729,6 +9849,105 @@ void RestApiV1::register_routes(
                                         "application/json");
                     });
     }
+
+    // ── Scope validate/preview (#2146 Batch B2) ───────────────────────────
+    // Versioned REST v1 twins of MCP's validate_scope/preview_scope_targets.
+    // Both wrap the SAME underlying pure logic those tools use
+    // (yuzu::scope::validate / scope_preview.hpp's preview_scope_targets), so
+    // this route and its MCP twin cannot silently diverge in what they accept
+    // or match.
+
+    // POST /api/v1/scope/validate — versioned twin of the legacy POST
+    // /api/scope/validate (dashboard_api_routes.cpp) and MCP validate_scope.
+    // Auth-only, no RBAC gate — matches both existing siblings exactly (a
+    // syntax-only check with no data disclosure).
+    sink.Post("/api/v1/scope/validate", [auth_fn](const httplib::Request& req,
+                                                  httplib::Response& res) {
+        auto session = auth_fn(req, res);
+        if (!session)
+            return;
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        std::string expression = (!body.is_discarded() && body.is_object())
+                                     ? body.value("expression", std::string())
+                                     : std::string();
+        if (expression.empty()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "expression is required"), "application/json");
+            return;
+        }
+        auto valid = yuzu::scope::validate(expression);
+        if (valid) {
+            res.set_content(
+                ok_json(nlohmann::json({{"valid", true}, {"expression", expression}}).dump()),
+                "application/json");
+        } else {
+            res.set_content(
+                ok_json(nlohmann::json({{"valid", false}, {"error", valid.error()}}).dump()),
+                "application/json");
+        }
+    });
+
+    // POST /api/v1/scope/preview — versioned twin of MCP preview_scope_targets.
+    // No legacy unversioned twin exists — verified: `/api/scope/estimate`
+    // (workflow_routes.cpp) is a DIFFERENT capability (matched/total counts
+    // only, for the workflow builder's confined scope_fn).
+    //
+    // #4143-class fix (found during #2146 Batch B2 review): this route
+    // discloses per-agent identities (matched_agents), so it is a fan-out
+    // READ of per-agent data and MUST use the admit-then-filter fleet-read
+    // chokepoint — never a bare `perm_fn` (routed-concerns.md's
+    // authorize_list_read row / AuthRoutes::require_fleet_read doc comment).
+    // `fleet_read_fn` REPLACES the permission check (it already performs the
+    // RBAC check internally) rather than being paired with it — same pattern
+    // as GET /api/v1/devices above.
+    sink.Post("/api/v1/scope/preview", [fleet_read_fn, tag_store, agents_fn](
+                                            const httplib::Request& req, httplib::Response& res) {
+        if (!fleet_read_fn) {
+            spdlog::error("scope.preview: fleet_read_fn unwired — misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+            return;
+        }
+        auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
+        if (!gate.admitted)
+            return; // gate already wrote the A4 error body + status
+        auto body = nlohmann::json::parse(req.body, nullptr, false);
+        std::string expression = (!body.is_discarded() && body.is_object())
+                                     ? body.value("expression", std::string())
+                                     : std::string();
+        if (expression.empty()) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "expression is required"), "application/json");
+            return;
+        }
+        // Narrow to the caller's admitted scope BEFORE the preview builder
+        // runs — mirrors GET /api/v1/devices' own in_scope-filter-then-render.
+        nlohmann::json visible_agents = nlohmann::json::array();
+        if (agents_fn) {
+            for (const auto& a : agents_fn())
+                if (authz::in_scope(gate.scope, a.value("agent_id", "")))
+                    visible_agents.push_back(a);
+        }
+        auto outcome = preview_scope_targets(expression, visible_agents, tag_store);
+        switch (outcome.kind) {
+        case ScopePreviewOutcome::Kind::kInvalidExpression:
+            res.status = 400;
+            res.set_content(detail::a4_error(res, outcome.detail), "application/json");
+            return;
+        case ScopePreviewOutcome::Kind::kTagStoreDegraded:
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "tag store unavailable",
+                                             {.retry_after_ms = 5000,
+                                              .remediation = "retry once the server reports "
+                                                             "ready"}),
+                            "application/json");
+            return;
+        case ScopePreviewOutcome::Kind::kOk:
+            res.set_content(ok_json(outcome.payload.dump()), "application/json");
+            return;
+        }
+    });
 
     // ── Device Authorization Tokens (capability 18.8) ─────────────────────
 
@@ -10445,17 +10664,9 @@ void RestApiV1::register_routes(
                  if (!perm_fn(req, res, "Infrastructure", "Read"))
                      return;
                  auto fleet = execution_tracker->get_fleet_summary();
-                 auto data = JObj()
-                                 .raw("executions",
-                                      JObj()
-                                          .add("total", fleet.total_executions)
-                                          .add("today", fleet.executions_today)
-                                          .add("success_rate", fleet.overall_success_rate)
-                                          .add("avg_duration_seconds", fleet.avg_duration_seconds)
-                                          .str())
-                                 .add("active_agents", fleet.active_agents)
-                                 .str();
-                 res.set_content(ok_json(data), "application/json");
+                 // #2146 Batch B3: shared builder (execution_statistics_model.hpp) --
+                 // the MCP twin get_fleet_statistics calls the SAME function.
+                 res.set_content(ok_json(fleet_statistics_json(fleet)), "application/json");
              });
 
     // ── File Retrieval (capability 10.13) ────────────────────────────────
@@ -13383,8 +13594,9 @@ void RestApiV1::register_routes(
     // a real MCP twin, get_guardian_status (mcp_server.cpp), which calls the SAME
     // guardian_status_rollup() model function via the SAME McpServer::list_read_fn_
     // (require_list_read) gate wired from the identical server.cpp lambda — see
-    // guardian_model.hpp. The per-agent /status/{agent_id} route just below remains
-    // untwinned (out of #4037's scope; not named by its acceptance criteria).
+    // guardian_model.hpp. The per-agent /status/{agent_id} route just below was
+    // out of #4037's scope (not named by its acceptance criteria); it is now
+    // twinned too, via get_guardian_agent_status (#2146 Batch B1), same pattern.
     sink.Get(
         "/api/v1/guaranteed-state/status",
         [list_read_fn, guaranteed_state_store](const httplib::Request& req,
@@ -13514,23 +13726,35 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
+            // #2146 Batch B1: guardian_agent_status_rollup (guardian_model.hpp) is the
+            // SAME function the MCP get_guardian_agent_status twin calls — REST and MCP
+            // cannot drift on total_rules/errored_rules derivation by construction (same
+            // extraction precedent as guardian_status_rollup's #4037 header comment).
+            // Folds the former two-store-call sequence (agent_rule_statuses_for_agent +
+            // rule_names_for) into one; a degrade in EITHER underlying read now surfaces
+            // as a single `nullopt`.
+            auto rollup = guardian_agent_status_rollup(*guaranteed_state_store, agent_id);
             // Behavioral-PII access audit — FAIL-CLOSED via the shared #1647 kernel,
             // same HELPER as GET /guaranteed-state/device-compliance, but NOT identical
             // fault-handling: device-compliance has a separate PRE-audit baseline_store_ok
             // check that, on fault, emits no audit row at all ("no PII was looked up yet").
-            // This route has a single store call that IS the access attempt, so a degrade
-            // here is audited as result="failure" rather than left unaudited — over-audit
-            // rather than under-audit, consistent with the codebase-wide posture, but a
-            // SOC2/SIEM consumer correlating guardian.device.view rows across both routes
-            // should not assume identical fault-audit behavior from the "same shape" framing
-            // above. `result` otherwise records success/failure (this route has no "not
-            // found" branch of its own — an unrecognised agent_id simply has zero census
-            // rows, which is a legitimate empty result, not an error).
+            // This route's data comes from a single shared-builder call that IS the access
+            // attempt, so a degrade here is audited as result="failure" rather than left
+            // unaudited — over-audit rather than under-audit, consistent with the
+            // codebase-wide posture, but a SOC2/SIEM consumer correlating
+            // guardian.device.view rows across both routes should not assume identical
+            // fault-audit behavior from the "same shape" framing above. `result` otherwise
+            // records success/failure (this route has no "not found" branch of its own —
+            // an unrecognised agent_id simply has zero census rows, which is a legitimate
+            // empty result, not an error). #2146 Batch B1 note: pre-extraction, a degrade
+            // confined to the SECOND of the two store reads (rule_names_for) audited
+            // "success" here (only the first read's truthiness gated the audit) despite
+            // the request ultimately 503ing below — auditing on the single rollup's
+            // truthiness closes that gap; any degrade in either underlying read now
+            // audits "failure", never a "success" for a read that did not actually render.
             if (!detail::emit_behavioral_audit(
-                    audit_fn, req, res, "guardian.device.view",
-                    statuses_result ? "success" : "failure", "Agent", agent_id,
-                    "per-agent Guaranteed State status via REST")) {
+                    audit_fn, req, res, "guardian.device.view", rollup ? "success" : "failure",
+                    "Agent", agent_id, "per-agent Guaranteed State status via REST")) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
@@ -13542,7 +13766,7 @@ void RestApiV1::register_routes(
                              cid, agent_id);
                 return;
             }
-            if (!statuses_result) {
+            if (!rollup) {
                 res.status = 503;
                 res.set_content(
                     detail::error_json_a4(503, "guaranteed-state store degraded", cid,
@@ -13552,41 +13776,14 @@ void RestApiV1::register_routes(
                              "agent_id={}",
                              cid, agent_id);
                 return;
-            }
-            // Intersect against the live rule catalogue, bounded to just this agent's
-            // reported rule_ids (same shape as device-compliance's rule_names_for call).
-            std::vector<std::string> rule_ids;
-            rule_ids.reserve(statuses_result->size());
-            for (const auto& st : *statuses_result)
-                rule_ids.push_back(st.rule_id);
-            auto rule_names_result = guaranteed_state_store->rule_names_for(rule_ids);
-            if (!rule_names_result) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
-                                          {.retry_after_ms = 5000}),
-                    "application/json");
-                spdlog::warn("guaranteed-state.status.agent store degraded (503) cid={} "
-                             "agent_id={}",
-                             cid, agent_id);
-                return;
-            }
-            const auto& rule_names = *rule_names_result;
-            int64_t total_rules = 0, errored = 0;
-            for (const auto& st : *statuses_result) {
-                if (!rule_names.count(st.rule_id))
-                    continue; // orphan census row for a since-deleted rule
-                ++total_rules;
-                if (st.state == "errored")
-                    ++errored;
             }
             res.set_content(
                 ok_json(JObj()
                             .add("agent_id", agent_id)
-                            .add("total_rules", total_rules)
-                            .add("compliant_rules", 0)
-                            .add("drifted_rules", 0)
-                            .add("errored_rules", errored)
+                            .add("total_rules", rollup->total_rules)
+                            .add("compliant_rules", rollup->compliant_rules)
+                            .add("drifted_rules", rollup->drifted_rules)
+                            .add("errored_rules", rollup->errored_rules)
                             .add("note", "total_rules and errored_rules are both real (M1 "
                                         "census-derived, #2298 item 6d) and both intersected "
                                         "against the live rule catalogue; "
@@ -13808,21 +14005,55 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            bool baseline_store_ok = true;
-            const auto baseline =
-                baseline_store->get_baseline_by_name(baseline_name, &baseline_store_ok);
-            if (!baseline_store_ok) {
-                // Store FAULT (DB locked/corrupt), NOT a genuine miss — return a
-                // retryable 503, not the 404 a CMDB would read as "no such baseline →
-                // delete this CI" on a transient fault (UP-13/sre-2). Pre-audit, like
-                // the store-null/unwired 503s above: no PII was looked up, and a
-                // name-independent fault leaks no baseline existence (no enumeration).
+            // #2146 Batch B1 review fix: all four underlying reads (baseline
+            // lookup, deployed_member_rule_ids, rule_names_for,
+            // agent_rule_statuses_for_agent) now complete BEFORE the audit fires
+            // below - the prior inline version audited "success" right after the
+            // first read, so a degrade in any of the other three still surfaced a
+            // 503 the audit had already called successful.
+            bool store_degraded = false;
+            bool pii_access_began = false;
+            auto rollup = guardian_device_compliance_rollup(*baseline_store, *guaranteed_state_store,
+                                                             baseline_name, agent_id,
+                                                             &store_degraded, &pii_access_began);
+            if (store_degraded) {
+                // Store FAULT (DB locked/corrupt) in one of the four reads, NOT a
+                // genuine miss — return a retryable 503, not the 404 a CMDB would
+                // read as "no such baseline → delete this CI" on a transient fault
+                // (UP-13/sre-2). A fault confined to the baseline lookup itself is
+                // genuinely pre-audit (no PII was looked up, and a name-independent
+                // fault leaks no baseline existence — no enumeration). A fault in any
+                // of the other three reads happens only once this agent's per-baseline
+                // PII has already been touched, so it MUST still be audited as
+                // "failure" (scoped re-review fix — a completed PII read leaving zero
+                // audit trail is worse than the mislabeled-"success" bug this whole
+                // extraction fixed). Gate 6 compliance fix: routed through the SAME
+                // detail::emit_behavioral_audit kernel every behavioral-PII route on
+                // this page uses (device-pages routed concern - never a raw inline
+                // audit_fn call on a PII route), matching this route's own
+                // GET .../agents/{agent_id}/rules sibling exactly - a persist failure
+                // here fails closed with its OWN 503, superseding the store-degraded
+                // message, so an audit outage is never masked as an ordinary data fault.
+                if (pii_access_began &&
+                    !detail::emit_behavioral_audit(audit_fn, req, res, "guardian.device.view",
+                                                   "failure", "Agent", agent_id,
+                                                   "baseline '" + baseline_name +
+                                                       "' per-device guard status via REST - "
+                                                       "store degraded")) {
+                    res.status = 503;
+                    res.set_content(
+                        detail::error_json_a4(503, "audit subsystem unavailable; refusing to "
+                                                   "serve device data without durable evidence",
+                                              cid, 5000, "retry the request"),
+                        "application/json");
+                    return;
+                }
                 res.status = 503;
-                res.set_content(detail::error_json_a4(503, "baseline store unavailable", cid, 5000,
-                                                      "retry the request"),
+                res.set_content(detail::error_json_a4(503, "guaranteed-state store degraded", cid,
+                                                      {.retry_after_ms = 5000}),
                                 "application/json");
-                spdlog::warn("guardian.device.view baseline store fault (503) cid={} agent_id={}",
-                             cid, agent_id);
+                spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
+                             agent_id);
                 return;
             }
 
@@ -13833,7 +14064,9 @@ void RestApiV1::register_routes(
             // catch-arm log can never drift between surfaces again — the drift #1647
             // closed). Serving audited per-device compliance while the
             // guardian.device.view row is known-lost is exactly what audit-on-open
-            // exists to prevent (SOC 2 CC7.2 / works-council).
+            // exists to prevent (SOC 2 CC7.2 / works-council). Fires only once EVERY
+            // read above has genuinely succeeded or the baseline is genuinely absent
+            // - never before a read that could still fail.
             //
             // `result` keeps the found/not_found distinction (enumeration trail, same
             // verb the dashboard lens and the /events sibling emit). A persist failure
@@ -13845,7 +14078,7 @@ void RestApiV1::register_routes(
             // contract. The pre-auth rejections above (400, 503 unwired/store-null)
             // carry no authorized access and are intentionally not audited here.
             if (!detail::emit_behavioral_audit(
-                    audit_fn, req, res, "guardian.device.view", baseline ? "success" : "not_found",
+                    audit_fn, req, res, "guardian.device.view", rollup ? "success" : "not_found",
                     "Agent", agent_id,
                     "baseline '" + baseline_name + "' per-device guard status via REST")) {
                 res.status = 503;
@@ -13859,120 +14092,28 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            if (!baseline) {
+            if (!rollup) {
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "baseline not found", cid),
                                 "application/json");
                 return;
             }
 
-            const bool deployed = (baseline->lifecycle == kBaselineDeployed);
-            // ADR-0055 catastrophic-read set: a degraded deployed_member_rule_ids
-            // read must 503, never render an empty guard_ids that would flow
-            // through rule_names_for/the compliance tally below as a false-clean
-            // "0 guards, fully compliant" report for this baseline.
-            auto guard_ids_result = baseline_store->deployed_member_rule_ids(baseline->baseline_id);
-            if (!guard_ids_result) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "baseline store degraded", cid,
-                                          {.retry_after_ms = 5000}),
-                    "application/json");
-                spdlog::warn("guardian.device.view baseline store degraded (503) cid={} "
-                             "agent_id={}",
-                             cid, agent_id);
-                return;
-            }
-            const auto& guard_ids = *guard_ids_result;
-
-            // rule_id -> Guard name, resolved ONLY for this baseline's deployed
-            // members (name-only read; never materializes the rule body blobs).
-            // Bounded WHERE rule_id IN (guard_ids) rather than the full authored
-            // catalogue — this is per-request on the fleet-polled device-compliance
-            // path. Falls back to the rule_id when a snapshot member Guard has since
-            // been deleted (absent from the map).
-            // rule_names_for / agent_rule_statuses_for_agent are now type-distinguishable
-            // (ADR-0038 catastrophic-read set — this route's compliance counts are an
-            // enforce-gate/census consumer): a degrade must render 503, never a silent
-            // "0 guards reported" that would misreport the device as compliant.
-            auto rule_names_result = guaranteed_state_store->rule_names_for(guard_ids);
-            auto statuses_result = guaranteed_state_store->agent_rule_statuses_for_agent(agent_id);
-            if (!rule_names_result || !statuses_result) {
-                res.status = 503;
-                res.set_content(
-                    detail::error_json_a4(503, "guaranteed-state store degraded", cid,
-                                          {.retry_after_ms = 5000}),
-                    "application/json");
-                spdlog::warn("guardian.device.view store degraded (503) cid={} agent_id={}", cid,
-                             agent_id);
-                return;
-            }
-            const auto& rule_names = *rule_names_result;
-
-            // rule_id -> last reported verdict for THIS device.
-            std::unordered_map<std::string, GuardianAgentRuleStatus> dev;
-            for (auto& st : *statuses_result)
-                dev[st.rule_id] = std::move(st);
-
-            int64_t compliant = 0, drifted = 0, errored = 0;
-            // max reported updated_at; ISO-8601 sorts lexically (all stamps are UTC
-            // 'Z', written by the store's format_iso_utc, so the byte compare is correct).
-            std::string last_updated;
-            // Report-driven device-applicable subset: emit ONLY the deployed-snapshot
-            // members this device has actually reported a verdict for. A member that
-            // is out of scope for this device (its scope_expr excludes it → the push
-            // never armed it → it never reported) is correctly ABSENT, so each machine
-            // shows only its applicable Guards even though they share one Baseline.
-            // (Honest in-scope-but-unreported "pending" needs scope-engine evaluation
-            // per device — deferred; see the route header.) guard_ids is the snapshot
-            // order, so the emitted subset keeps a stable order.
             JArr guards;
-            int64_t total_guards = 0;
-            for (const auto& rid : guard_ids) {
-                const auto it = dev.find(rid);
-                if (it == dev.end())
-                    continue;  // not applicable to this device
-                ++total_guards;
-                std::string status = "pending";
-                const std::string& s = it->second.state;
-                if (s == "compliant") { status = s; ++compliant; }
-                else if (s == "drifted") { status = s; ++drifted; }
-                else if (s == "errored") { status = s; ++errored; }
-                // any unexpected stored state falls through to "pending" — the
-                // forward-compat path: a future verdict token this build doesn't
-                // recognize stays counted in total_guards as pending, never silently
-                // dropped from the denominator.
-                //
-                // The report row EXISTS here (we are past dev.find != end), so it
-                // carries a real timestamp regardless of whether the token is
-                // recognized. Capture updated_at for staleness INDEPENDENT of the
-                // status LABEL (hp-1): an unrecognized-token "pending" guard (e.g. a
-                // newer agent talking to an older server) DID report recently —
-                // suppressing its updated_at would conflate "reported, unknown token"
-                // with "never reported", and a consumer watching last_updated could
-                // not tell them apart.
-                const std::string& updated_at = it->second.updated_at;
-                if (!updated_at.empty() && updated_at > last_updated)
-                    last_updated = updated_at;
-                const auto nit = rule_names.find(rid);
-                JObj g;
-                g.add("rule_id", rid)
-                    .add("name",
-                         (nit != rule_names.end() && !nit->second.empty()) ? nit->second : rid)
-                    .add("status", status);
-                if (updated_at.empty())
-                    g.raw("updated_at", "null");
+            for (const auto& g : rollup->guards) {
+                JObj gj;
+                gj.add("rule_id", g.rule_id).add("name", g.name).add("status", g.status);
+                if (g.updated_at.empty())
+                    gj.raw("updated_at", "null");
                 else
-                    g.add("updated_at", updated_at);
-                guards.add(std::move(g));
+                    gj.add("updated_at", g.updated_at);
+                guards.add(std::move(gj));
             }
-
-            const int64_t pending = total_guards - (compliant + drifted + errored);
 
             JObj b;
-            b.add("baseline_id", baseline->baseline_id)
-                .add("name", baseline->name)
-                .add("lifecycle", baseline->lifecycle);
+            b.add("baseline_id", rollup->baseline_id)
+                .add("name", rollup->baseline_name)
+                .add("lifecycle", rollup->baseline_lifecycle);
 
             // assessable: a machine-readable go/no-go for a CMDB consumer (UP-2 /
             // comp-1 / er-1). FALSE when the response carries no compliance signal to
@@ -13988,19 +14129,19 @@ void RestApiV1::register_routes(
             // compliant/total_guards.
             JObj data;
             data.raw("baseline", b.str())
-                .add("deployed", deployed)
-                .add("assessable", deployed && total_guards > 0)
+                .add("deployed", rollup->deployed)
+                .add("assessable", rollup->deployed && rollup->total_guards > 0)
                 .add("agent_id", agent_id)
-                .add("total_guards", total_guards)
-                .add("snapshot_total", static_cast<int64_t>(guard_ids.size()))
-                .add("compliant", compliant)
-                .add("drifted", drifted)
-                .add("errored", errored)
-                .add("pending", pending);
-            if (last_updated.empty())
+                .add("total_guards", rollup->total_guards)
+                .add("snapshot_total", rollup->snapshot_total)
+                .add("compliant", rollup->compliant)
+                .add("drifted", rollup->drifted)
+                .add("errored", rollup->errored)
+                .add("pending", rollup->pending);
+            if (rollup->last_updated.empty())
                 data.raw("last_updated", "null");
             else
-                data.add("last_updated", last_updated);
+                data.add("last_updated", rollup->last_updated);
             data.raw("guards", guards.str());
 
             res.set_content(ok_json(data.str()), "application/json");

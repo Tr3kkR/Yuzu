@@ -27,7 +27,7 @@
  * Deliberately conservative and pre-K-bound (rung 9c PR-2's own scope only):
  * a receipt that resolves to anything other than Committed holds its
  * application's generation FOREVER, exactly like today's synchronous
- * behavior - no quarantine, no K-bound retry-then-waive. §R5.2's ClaimEnd
+ * behavior - no wedge marking, no K-bound retry-then-waive. §R5.2's ClaimEnd
  * already preserves the finer split a later rung 9c PR needs to implement
  * that (queue-wait expiry vs. dispatched timeout vs. genuine refusal); this
  * ledger does not need it and does not re-derive it here.
@@ -47,10 +47,12 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include <yuzu/plugin.h>
 
+#include "guardian_arm_heartbeat.hpp" // GuardianArmStats (rung 9c PR-3)
 #include "guardian_spark_runtime.hpp" // GuardianSparkRuntime::ArmReceipt (nested type - needs the complete class)
 
 namespace yuzu::guardian::v1 {
@@ -184,6 +186,21 @@ public:
     /// GuardianEngine::ack_pending_count_for_test() forwards to this. No production
     /// caller.
     std::size_t pending_count_for_test() const;
+
+    /// rung 9c PR-3: a re-statable snapshot of the current application's pending
+    /// and resolved-failed counts (see guardian_arm_heartbeat.hpp's
+    /// GuardianArmStats for the full field-by-field semantics). nullopt when there
+    /// is no current application (governance fix, adversarial review: the settled
+    /// KICKOFF-v2 Decision-1 interface signature, and the CALLER - GuardianEngine::
+    /// arm_stats() - still layers its OWN prefer_spark_/stopped_/spark_availability_
+    /// dormancy gate on top; this ledger still has no notion of prefer_spark_ and
+    /// must not gain one, it only reports whether IT has an application). A LIVE,
+    /// EMPTY application (begin_application() called, add_pending() never - every
+    /// accepted rule resolved synchronously) is a real, present {0, 0} - the common
+    /// case, not the same as no application at all. Production caller:
+    /// GuardianEngine::arm_stats(), called under mtx_ like every other
+    /// engine-owned accessor.
+    [[nodiscard]] std::optional<GuardianArmStats> arm_stats() const;
 
     /// rung 9c PR-2 Unit 6: apply_rules() calls begin_application() BEFORE its
     /// per-rule loop (so reconcile_rule_locked's add_pending() calls during

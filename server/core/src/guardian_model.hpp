@@ -34,6 +34,7 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
+class BaselineStore;
 
 /// Fleet Guardian status rollup — shared by `GET /api/v1/guaranteed-state/status`
 /// and MCP `get_guardian_status`. Re-derives EXACTLY the fields the REST route
@@ -58,6 +59,30 @@ struct GuardianStatusRollup {
 std::optional<GuardianStatusRollup>
 guardian_status_rollup(GuaranteedStateStore& store,
                        const std::optional<std::vector<std::string>>& agent_scope);
+
+/// Per-agent Guaranteed State status rollup — shared by
+/// `GET /api/v1/guaranteed-state/status/{agent_id}` and MCP
+/// `get_guardian_agent_status` (#2146 Batch B1). A DIFFERENT algorithm from
+/// `guardian_status_rollup` above, not a scoped call to it: `total_rules`
+/// here is "rules with ANY census entry for THIS agent, intersected against
+/// the live rule catalogue" (derived from `agent_rule_statuses_for_agent` +
+/// `rule_names_for`), never the global catalogue size the fleet rollup uses.
+/// `compliant_rules`/`drifted_rules` stay 0 for the same reason as the fleet
+/// rollup — full status ingest lands in a later rung.
+struct GuardianAgentStatusRollup {
+    std::int64_t total_rules{0};
+    std::int64_t compliant_rules{0};
+    std::int64_t drifted_rules{0};
+    std::int64_t errored_rules{0};
+};
+
+/// Returns `nullopt` on a degraded `agent_rule_statuses_for_agent()`/
+/// `rule_names_for()` read (ADR-0038 catastrophic-read set) — caller MUST
+/// refuse to render (503 on REST), never render a silent 0 that would
+/// misreport this device as compliant. An agent_id with no census rows is a
+/// legitimate empty result (all-zero rollup), not an error.
+std::optional<GuardianAgentStatusRollup>
+guardian_agent_status_rollup(GuaranteedStateStore& store, const std::string& agent_id);
 
 /// Per-guard fleet-wide agent-status drilldown row — one row per agent that
 /// has reported THIS rule's state — shared by the new
@@ -123,5 +148,71 @@ struct GuardianDeviceGuardRow {
 /// never render an empty list as "this device has no guards".
 std::optional<std::vector<GuardianDeviceGuardRow>>
 guardian_device_all_guards(GuaranteedStateStore& store, const std::string& agent_id);
+
+/// Per-baseline device-compliance rollup — shared by
+/// `GET /api/v1/guaranteed-state/device-compliance` and MCP
+/// `get_guardian_device_compliance` (#2146 Batch B1, extracted post-review).
+/// Both twins previously ran this same four-read sequence (baseline lookup,
+/// deployed_member_rule_ids, rule_names_for, agent_rule_statuses_for_agent)
+/// inline, and both audited "success"/"not_found" right after the FIRST read
+/// only — a degrade in any of the other three then produced a 503 the audit
+/// row had already called "success". Aggregating all four reads here, behind
+/// one nullopt/`store_degraded` contract, means a caller can only audit once
+/// every read has actually completed.
+struct GuardianDeviceComplianceGuardRow {
+    std::string rule_id;
+    std::string name;       // resolved rule name; falls back to rule_id if the
+                             // rule has since been deleted from the catalogue
+    std::string status;     // "compliant" | "drifted" | "errored" | "pending"
+    std::string updated_at; // ISO-8601 of the last reported verdict; empty if none
+};
+
+struct GuardianDeviceComplianceRollup {
+    std::string baseline_id;
+    std::string baseline_name;
+    std::string baseline_lifecycle;
+    bool deployed{false};
+    std::int64_t snapshot_total{0}; // deployed_member_rule_ids().size()
+    std::int64_t total_guards{0};   // snapshot members this device has reported ANY verdict for
+    std::int64_t compliant{0};
+    std::int64_t drifted{0};
+    std::int64_t errored{0};
+    std::int64_t pending{0};
+    std::string last_updated; // max reported updated_at across guards; empty if none
+    std::vector<GuardianDeviceComplianceGuardRow> guards;
+};
+
+/// `store_degraded` is a REQUIRED out-param, same contract as
+/// `BaselineStore::get_baseline_by_name`'s own `store_ok`: set true the
+/// moment ANY of the four underlying reads degrades, at which point the
+/// return is always `nullopt` and the caller MUST refuse to render (503),
+/// never treat it as "baseline not found". `nullopt` with `*store_degraded
+/// == false` means the named baseline genuinely does not exist (400/404) -
+/// a real miss, not a fault. A degraded read must never render as a silent
+/// 0/compliant result (ADR-0038/ADR-0055 catastrophic-read set) - this
+/// function's whole job is making that the only way to call these four
+/// reads.
+///
+/// `pii_access_began` is a SECOND required out-param distinguishing WHICH
+/// read degraded, because the audit obligation differs: the baseline lookup
+/// (read 1) is genuinely pre-audit (no per-agent PII has been touched yet,
+/// same "no PII was looked up yet" posture this route has always had), but
+/// the remaining three reads only run once a real baseline was found - the
+/// baseline itself being found already counts as having begun accessing
+/// this agent's per-baseline standing (`deployed_member_rule_ids`, read 2,
+/// derives the enforced set for it), and by the time reads 3/4 run,
+/// `agent_rule_statuses_for_agent` (the behavioral-PII read proper) has
+/// already executed too - so a degrade in ANY of reads 2/3/4 MUST still be
+/// audited as "failure" (matching `guardian_agent_status_rollup`'s sibling
+/// posture - over-audit rather than silently drop evidence of a completed
+/// PII access). Set false only when `*store_degraded` is also false, or when
+/// the degrade was the baseline lookup itself; true for any degrade in the
+/// remaining three reads. The caller must audit "failure" when
+/// `*store_degraded && *pii_access_began`, and skip the audit entirely only
+/// when `*store_degraded && !*pii_access_began`.
+std::optional<GuardianDeviceComplianceRollup>
+guardian_device_compliance_rollup(BaselineStore& baseline_store, GuaranteedStateStore& store,
+                                  const std::string& baseline_name, const std::string& agent_id,
+                                  bool* store_degraded, bool* pii_access_began);
 
 } // namespace yuzu::server

@@ -336,30 +336,47 @@ corrected #2012 row in §5's register for the full per-mechanism status, includi
 correction that Service never actually had the hazard this row originally described, and the
 re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
 
-**Ladder status, updated 2026-09-13** (this track's OWN PR-0 through PR-6, not to be
+**Ladder status, updated 2026-09-14** (this track's OWN PR-0 through PR-6, not to be
 confused with the 7.7b-split's own "PR-2 (thin cutover)" a few sections up in this same
 doc - two different PRs share the name; see "Why it doesn't gate on #2233" above):
 **PR-0 (done, #4130)
 → PR-1 (done, #4224, 2026-09-10) → [#2012/#3840 series, done, see above] → PR-2 (done,
-#4318, 2026-09-13) → PR-3 (telemetry, not started) → PR-4 (audit + R5.5's remaining
-shutdown decoupling + legacy-note, not started - **correction, 2026-09-13**: R5.5 is
-not entirely undone - `GuardianEngine::stop()` already calls `ack_ledger_->retire()`
-under a comment labeled "rung 9c PR-2 Unit 6 (§R5.5)" (`guardian_engine.cpp:644`),
-so R5.5's ack-ledger-retirement half shipped in PR-2. Still PR-4's job: `stop()`
-(`guardian_engine.cpp:612`) still takes `mtx_` unconditionally before calling
-`begin_stop()`, unchanged by PR-2 - **note, found during this doc-sweep's own
-governance, not yet fixed**: `guardian_spark_runtime.cpp`'s `begin_stop()` comment
-already describes a scenario PR-2 made impossible - it still reasons about
-`apply_rules()` "parked in a bounded wait," which PR-2 removed - a stale comment in
-shipped code, filed as **#4322**, not fixed in this docs-only pass) → PR-5 (fault/K-bound logic, not started - see acceptance criteria below,
+#4318, 2026-09-13) → PR-3 (telemetry, **done, #4329, merged 2026-09-14T08:06:02Z,
+`5d470322b`**; arm_pending/arm_failed re-statable gauges + the io-ceiling monitor-only
+counter, PR-3a/#3415 split out separately) → PR-4 (**done, this PR** - audit + R5.5's
+remaining shutdown decoupling + legacy-note. #4322 fixed: `guardian_spark_runtime.cpp`'s
+`begin_stop()` comment no longer describes `apply_rules()` as capable of parking in a
+bounded backend wait - PR-2 removed the only production caller of that (see the R5.5
+stamp below). R5.5's own "as implemented" stamp added to
+`docs/spark-stage2-guardian-consumer-design.md` (its ack-ledger-retirement half already
+shipped in PR-2 Unit 6 - the `retire()` call at `guardian_engine.cpp:650` carries that
+label). **Ruled, not left open**: `stop()`
+(`guardian_engine.cpp:613`) taking `mtx_` unconditionally before calling `begin_stop()`
+is correct as-is - `persist_lifecycle_journal_locked`, `ack_ledger_->retire()`, and
+`stop_all_guards_locked()` all need it, and PR-2 already removed the one thing that
+could make that hold backend-arm-bounded (a hung device/OS call); what remains under
+the lock is synchronous, rule-count-scaled local work - `apply_rules()`'s full_sync KV
+sweep + `detach_all()` + per-rule reconcile loop + unbounded journal persist on scope
+exit, and unconditionally the boot-time `start_local()`/`wire_spark_engine()` calls -
+plus `journal_maintenance_tick()`'s own periodic drain+persist when `prefer_spark_` is
+true (it no-ops immediately under the lock otherwise, which is production's default
+today) - none of which this design was ever meant to make instant.
+Also corrected R5.4's own "as implemented" stamp: "no data is ever lost" was an
+overclaim - `stage_pending_locked()` drops the oldest staged record past
+`kMaxPendingJournalRecords` under sustained persist failure, counted via
+`journal_stage_dropped_` - see the design doc for the fix. **#3811** (already filed
+during the #2233 item 3 governance sweep, re-surfaced while investigating this PR -
+`rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
+`active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
+non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
+PR-5 (fault/K-bound logic, not started - see acceptance criteria below,
 now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
 diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
 `docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.4 updated to describe the
-mechanism as implemented, not just designed. R5.5 carries no "as implemented" stamp
-of its own - its ack-ledger-retirement half already shipped in PR-2 Unit 6 (see the
-PR-4 note above), only its `stop()`/`begin_stop()` decoupling is still PR-4's.
+mechanism as implemented, not just designed. R5.5 now carries its own "as implemented"
+stamp (PR-4) alongside R5.2-R5.4's.
 **Sequencing note, not yet ruled**: since #3990's diagnostic and the CH-5-UAT
 evidence campaign (§4) both measure a latency this ladder is still actively changing,
 whether either should start before PR-3 through PR-6 land, or wait for the full ladder,
@@ -376,7 +393,7 @@ flip, with a red-first test each:
 - **up-2, wedged-key re-apply cost** (`GuardianSparkRuntime::attach_rule`, the claim path and
   `wait_for_claim`): a re-push onto a wedged key queues behind the abandoned head and waits the
   full `backend_op_deadline` under engine `mtx_` on every re-apply; the base code fail-fasted via
-  the executor's `AlreadyRunning`. Criterion: a quarantined key refuses a new claim immediately.
+  the executor's `AlreadyRunning`. Criterion: a wedged key refuses a new claim immediately.
 - **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
   on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
   wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
@@ -1161,7 +1178,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   both point the same direction but neither confirms it; the issue's own words are the accurate
   ones - "root cause undetermined... not confirmed either way." Either way, not a reopening of the
   original hazard. **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
-  ruling 14(c)'s own rationale, since the K-bound/quarantine classification logic actually lives
+  ruling 14(c)'s own rationale, since the K-bound/wedge classification logic actually lives
   in PR-5, not PR-2, so the accepted cost this hold existed to protect against was never live at
   PR-2 in the first place. **PR-2 has since merged** (PR #4318, `a27ec4549baa`,
   2026-09-13T14:46:02Z) - see `docs/spark-legacy-delta-registry.md` row A3 for its "Verify at"
