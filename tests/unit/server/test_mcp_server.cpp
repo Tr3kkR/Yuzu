@@ -69,6 +69,12 @@
 #include "plugin_config_store.hpp"
 #include "preflight_run_store.hpp" // #4036: PreflightRunStore for list_preflight_runs / get_deployment_preview
 #include "result_set_store.hpp" // #2146 Batch B2: ResultSetStore for the 12 result-set MCP tools
+// B5 (api-parity #2146) — offload-target / platform-license / software-
+// deployment MCP twins.
+#include "offload_target_store.hpp"
+#include "license_store.hpp"
+#include "software_deployment_store.hpp"
+#include "test_offload_target_store_pg_helper.hpp" // OffloadTargetStorePg — shared PG+SecretCodec fixture
 
 #include <yuzu/metrics.hpp>
 
@@ -957,6 +963,33 @@ struct McpTestServer {
     /// == nullptr degradation.
     yuzu::server::IssueCodeSigningFn issue_code_signing_fn_for_test{};
 
+    /// B5 (api-parity #2146): optionally wire a stub ExportCsrFn so
+    /// export_ca_root_csr can be exercised end-to-end, mirroring
+    /// issue_code_signing_fn_for_test immediately above. Default unset
+    /// (empty std::function) keeps every existing test on the "CA not
+    /// available" path — matches production's export_csr_fn == unset
+    /// degradation. export_csr_succeeds_ toggles a wired stub between a
+    /// fake CSR PEM and a generation failure (nullopt).
+    yuzu::server::CaRoutes::ExportCsrFn export_csr_fn_for_test{};
+    bool export_csr_succeeds_{true};
+
+    /// B5 (api-parity #2146 scope correction): optionally wire a stub
+    /// ImportChainFn so import_ca_chain can be exercised end-to-end, mirroring
+    /// export_csr_fn_for_test immediately above. Default unset (empty
+    /// std::function) keeps every existing test on the "CA not available"
+    /// path - matches production's import_chain_fn == unset degradation.
+    yuzu::server::CaRoutes::ImportChainFn import_chain_fn_for_test{};
+
+    /// B5 — optionally wire a real (Postgres-backed) OffloadTargetStore /
+    /// LicenseStore / SoftwareDeploymentStore so the offload-target /
+    /// platform-license / software-deployment MCP tools can be exercised
+    /// end-to-end. Default nullptr keeps every existing test on the
+    /// "store unavailable" path, mirroring every other *_for_test pointer
+    /// above (e.g. preflight_run_store_for_test).
+    yuzu::server::OffloadTargetStore* offload_target_store_for_test{nullptr};
+    yuzu::server::LicenseStore* license_store_for_test{nullptr};
+    yuzu::server::SoftwareDeploymentStore* sw_deploy_store_for_test{nullptr};
+
     /// #2384: optionally wire an ApiTokenStore as the engine-credential store so
     /// rotate_engine_credential / confirm_engine_rotation can be exercised
     /// end-to-end at the MCP surface. Default nullptr keeps every existing test
@@ -1531,7 +1564,12 @@ private:
             /*workflow_engine=*/workflow_engine_for_test,
             /*issue_code_signing_fn=*/issue_code_signing_fn_for_test,
             /*verify_api=*/verify_api_for_test,
-            /*lockout_clear_fn=*/lockout_clear_fn_for_test);
+            /*lockout_clear_fn=*/lockout_clear_fn_for_test,
+            /*offload_target_store=*/offload_target_store_for_test,
+            /*license_store=*/license_store_for_test,
+            /*sw_deploy_store=*/sw_deploy_store_for_test,
+            /*export_csr_fn=*/export_csr_fn_for_test,
+            /*import_chain_fn=*/import_chain_fn_for_test);
     }
 };
 
@@ -19083,6 +19121,10 @@ TEST_CASE("MCP 2405: every served schema compiles and the gated set is fully cov
         {"revoke_certificate", nlohmann::json::parse(R"({"serial_hex":"AB12"})")},
         {"issue_code_signing_cert",
          nlohmann::json::parse(R"({"csr_pem":"-----BEGIN CERTIFICATE REQUEST-----","label":"my-signer"})")},
+        // B5 scope correction (#2146): Security:Write, approval-gated like
+        // issue_code_signing_cert above.
+        {"import_ca_chain",
+         nlohmann::json::parse(R"({"intermediate_pem":"x","chain_pem":"y"})")},
         {"create_engine_principal",
          nlohmann::json::parse(
              R"({"principal_id":"engine:v","display_name":"d","owner_username":"o","justification":"j","classification":"internal"})")},
@@ -23796,4 +23838,1122 @@ TEST_CASE("MCP preview_scope_targets: a management-group-confined caller sees on
     REQUIRE(sc["matched_agents"].is_array());
     REQUIRE(sc["matched_agents"].size() == 1);
     CHECK(sc["matched_agents"][0] == "agent-001");
+}
+// ═══════════════════════════════════════════════════════════════════════════
+// B5 (api-parity #2146) — offload targets, CA root-CSR export, platform
+// license, software deployments. MCP twins of offload_routes.cpp's
+// /api/v1/offload-targets* surface, ca_routes.cpp's GET /api/v1/ca/root-csr
+// (distinct from the genuinely-public GET /ca/root and /ca/crl, which stay
+// REST-only), and rest_api_v1.cpp's /api/v1/license* + /api/v1/software-
+// deployments* surfaces.
+//
+// LicenseStore / SoftwareDeploymentStore are DELIBERATELY DORMANT on `dev`
+// (ADR-0048/0051) — server.cpp never constructs either (RestApiV1 itself is
+// wired with `/*license_store=*/nullptr` / `/*sw_deploy_store=*/nullptr`).
+// These tests wire a LIVE (Postgres-backed) store directly into the MCP
+// harness via the *_for_test seams, the same way test_license_store.cpp /
+// test_software_deployment_store.cpp exercise the stores' own public API
+// directly — proving the MCP twin's own logic against real store behaviour
+// without claiming either store is wired in production today.
+// ═══════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+yuzu::test::PgTestTemplate mcp_b5_license_tpl{
+    "licensestore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::LicenseStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("mcp b5 license template: store failed to migrate");
+    }};
+
+yuzu::test::PgTestTemplate mcp_b5_sw_deploy_tpl{
+    "swdeploystore", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::SoftwareDeploymentStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error(
+                "mcp b5 software-deployment template: store failed to migrate");
+    }};
+
+yuzu::server::SoftwarePackage mcp_b5_make_package() {
+    yuzu::server::SoftwarePackage pkg;
+    pkg.name = "Firefox";
+    pkg.version = "125.0";
+    pkg.platform = "windows";
+    pkg.installer_type = "msi";
+    pkg.content_hash = "abc123def456";
+    pkg.content_url = "https://content.example.com/firefox-125.msi";
+    pkg.created_by = "admin";
+    return pkg;
+}
+
+} // namespace
+
+TEST_CASE("MCP B5: all 14 new tools are advertised in tools/list", "[mcp][integration][b5]") {
+    McpTestServer ts;
+    ts.start("readonly");
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    std::set<std::string> names;
+    for (const auto& t : body["result"]["tools"])
+        names.insert(t["name"].get<std::string>());
+    for (const char* tool :
+         {"list_offload_targets", "create_offload_target", "get_offload_target",
+          "delete_offload_target", "list_offload_target_deliveries", "export_ca_root_csr",
+          "import_ca_chain", "get_platform_license", "activate_platform_license",
+          "list_license_alerts", "list_software_deployments", "create_software_deployment",
+          "rollback_software_deployment", "cancel_software_deployment"})
+        CHECK(names.count(tool) == 1);
+}
+
+// ── Offload targets ─────────────────────────────────────────────────────────
+
+TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
+          "list/create/get/list_offload_target_deliveries/delete",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto list0 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_offload_targets",)"
+        R"("arguments":{}}})");
+    REQUIRE(list0);
+    auto list0_payload = operator_surface_payload(list0);
+    REQUIRE(list0_payload["offload_targets"].is_array());
+    CHECK(list0_payload["offload_targets"].empty());
+
+    auto create_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"siem","url":"https://siem.example.com/ingest",)"
+        R"("auth_type":"bearer","auth_credential":"secret-token-1",)"
+        R"("event_types":"*","batch_size":1,"enabled":true}}})");
+    REQUIRE(create_res);
+    auto create_payload = operator_surface_payload(create_res);
+    REQUIRE(create_payload.contains("id"));
+    CHECK(create_payload["status"] == "created");
+    const int64_t target_id = create_payload["id"].get<int64_t>();
+    // Two audit rows per mutation: the domain verb (REST parity) THEN the
+    // generic mcp_audit("success") tool-layer row (#1240 L2 convention).
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "offload_target.create|success");
+    CHECK(ts.audit_log.back() == "mcp.create_offload_target|success");
+
+    auto list1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_offload_targets",)"
+        R"("arguments":{}}})");
+    auto list1_payload = operator_surface_payload(list1);
+    REQUIRE(list1_payload["offload_targets"].size() == 1);
+    CHECK(list1_payload["offload_targets"][0]["name"] == "siem");
+    CHECK(list1_payload["offload_targets"][0]["has_credential"] == true);
+    // The credential itself is NEVER echoed back, by any tool (ADR-0010).
+    CHECK_FALSE(list1_payload["offload_targets"][0].contains("auth_credential"));
+
+    auto get_call = [&](int64_t target) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{)"
+                       R"("name":"get_offload_target","arguments":{"id":)" +
+                       std::to_string(target) + "}}}");
+    };
+    auto get_res = get_call(target_id);
+    auto get_payload = operator_surface_payload(get_res);
+    CHECK(get_payload["id"] == target_id);
+    CHECK(get_payload["url"] == "https://siem.example.com/ingest");
+    CHECK_FALSE(get_payload.contains("auth_credential"));
+
+    auto deliveries_res =
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{)"
+               R"("name":"list_offload_target_deliveries","arguments":{"id":)" +
+               std::to_string(target_id) + "}}}");
+    auto deliveries_payload = operator_surface_payload(deliveries_res);
+    REQUIRE(deliveries_payload["deliveries"].is_array());
+    CHECK(deliveries_payload["deliveries"].empty()); // nothing fired yet
+
+    auto delete_res =
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{)"
+               R"("name":"delete_offload_target","arguments":{"id":)" +
+               std::to_string(target_id) + "}}}");
+    auto delete_payload = operator_surface_payload(delete_res);
+    CHECK(delete_payload["deleted"] == true);
+    CHECK(delete_payload["status"] == "deleted"); // matches REST's twin shape exactly
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "offload_target.delete|success");
+    CHECK(ts.audit_log.back() == "mcp.delete_offload_target|success");
+
+    // get after delete -> not found (business fact, not a crash).
+    auto missing_res = get_call(target_id);
+    auto missing_body = nlohmann::json::parse(missing_res->body);
+    REQUIRE(missing_body.contains("error"));
+    CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // delete again -> not found, NOT a silent success (delete is not idempotent).
+    auto redelete_res =
+        ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{)"
+               R"("name":"delete_offload_target","arguments":{"id":)" +
+               std::to_string(target_id) + "}}}");
+    auto redelete_body = nlohmann::json::parse(redelete_res->body);
+    REQUIRE(redelete_body.contains("error"));
+    CHECK(redelete_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(ts.audit_log.back() == "offload_target.delete|denied");
+}
+
+TEST_CASE("MCP B5: create_offload_target rejects a duplicate name and an unrecognized "
+          "auth_type",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto create = [&](int call_id, const std::string& name, const std::string& auth_type) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id) +
+                       R"(,"params":{"name":"create_offload_target","arguments":{"name":")" +
+                       name + R"(","url":"https://example.com/hook","auth_type":")" + auth_type +
+                       R"("}}})");
+    };
+
+    auto first = create(1, "dup-target", "none");
+    REQUIRE(operator_surface_payload(first).contains("id"));
+
+    auto second = create(2, "dup-target", "none");
+    auto second_body = nlohmann::json::parse(second->body);
+    REQUIRE(second_body.contains("error"));
+    CHECK(second_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(ts.audit_log.back() == "offload_target.create|denied");
+    CHECK(ts.audit_details.back() == "validation_failed");
+
+    auto bad_auth = create(3, "another-target", "bogus-type");
+    auto bad_auth_body = nlohmann::json::parse(bad_auth->body);
+    REQUIRE(bad_auth_body.contains("error"));
+    CHECK(bad_auth_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(ts.audit_details.back() == "invalid_auth_type");
+}
+
+// #2970B-class regression: a JSON-type-mismatched batch_size (e.g. the string
+// "10") must be REJECTED, not silently coerced to the default via param_int32.
+TEST_CASE("MCP B5: create_offload_target rejects a non-integer batch_size",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"strict-target","url":"https://example.com/hook",)"
+        R"("batch_size":"10"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("batch_size") != std::string::npos);
+}
+
+// Gate 8 fix (#2146 Batch B5 review): fail-OPEN type confusion - a
+// non-boolean enabled (e.g. the JSON string "false") previously silently
+// created an ENABLED target via args.contains()+is_boolean() short-circuit
+// leaving `enabled` at its `true` default, immediately flowing fleet events
+// to the caller-specified URL despite the caller's own request expressing
+// intent to leave it inactive. Must be REJECTED, never defaulted.
+TEST_CASE("MCP B5: create_offload_target rejects a non-boolean enabled rather "
+          "than silently defaulting to enabled=true",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"strict-target","url":"https://example.com/hook",)"
+        R"("enabled":"false"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("enabled") != std::string::npos);
+
+    auto listing = store.get()->list();
+    REQUIRE(listing.has_value());
+    CHECK(listing->empty()); // no target was created from the rejected call
+}
+
+// #2970B-class regression: a JSON-type-mismatched limit (e.g. the string
+// "10") must be REJECTED, not silently coerced to the default via param_int32.
+TEST_CASE("MCP B5: list_offload_target_deliveries rejects a non-integer limit",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+
+    auto create_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"limit-target","url":"https://example.com/hook"}}})");
+    auto target_id = operator_surface_payload(create_res)["id"].get<int64_t>();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"list_offload_target_deliveries",)"
+        R"("arguments":{"id":)" +
+        std::to_string(target_id) + R"(,"limit":"10"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("limit") != std::string::npos);
+}
+
+TEST_CASE("MCP B5: offload-target mutations are tier-denied below supervised "
+          "(Infrastructure:Write); reads are allowed at readonly",
+          "[mcp][integration][b5]") {
+    McpTestServer ts; // offload_target_store_for_test stays unset
+    ts.start("readonly");
+
+    auto create_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_offload_target",)"
+        R"("arguments":{"name":"x","url":"https://x.example.com"}}})");
+    auto create_body = nlohmann::json::parse(create_res->body);
+    REQUIRE(create_body.contains("error"));
+    CHECK(create_body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    auto delete_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"delete_offload_target",)"
+        R"("arguments":{"id":1}}})");
+    auto delete_body = nlohmann::json::parse(delete_res->body);
+    REQUIRE(delete_body.contains("error"));
+    CHECK(delete_body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    // Reads ARE allowed at readonly tier (Infrastructure:Read); the tool then
+    // hits the unwired-store branch (kInternalError), never kTierDenied —
+    // proves the tier gate, not the store, is what's under test above.
+    auto list_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"list_offload_targets",)"
+        R"("arguments":{}}})");
+    auto list_body = nlohmann::json::parse(list_res->body);
+    REQUIRE(list_body.contains("error"));
+    CHECK(list_body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP B5: offload-target tools respect perm_fn denial on Infrastructure",
+          "[pg][mcp][integration][b5]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.perm_override_for_test = [](const std::string& securable, const std::string&) {
+        return securable != "Infrastructure";
+    };
+    ts.start();
+
+    for (const auto& [tool, args] : std::vector<std::pair<std::string, std::string>>{
+             {"list_offload_targets", "{}"},
+             {"create_offload_target", R"({"name":"x","url":"https://x.example.com"})"},
+             {"get_offload_target", R"({"id":1})"},
+             {"delete_offload_target", R"({"id":1})"},
+             {"list_offload_target_deliveries", R"({"id":1})"},
+         }) {
+        auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":")" +
+                           tool + R"(","arguments":)" + args + "}}");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+}
+
+// ── CA root-CSR export ───────────────────────────────────────────────────────
+
+TEST_CASE("MCP B5: export_ca_root_csr returns the CSR PEM and audits "
+          "ca.root_csr.exported (Security:Read, allowed at readonly)",
+          "[pg][mcp][integration][pki][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.export_csr_fn_for_test = [&ts]() -> std::optional<std::string> {
+        return ts.export_csr_succeeds_
+                   ? std::make_optional<std::string>("-----BEGIN CERTIFICATE REQUEST-----\n"
+                                                      "fake\n"
+                                                      "-----END CERTIFICATE REQUEST-----\n")
+                   : std::nullopt;
+    };
+    ts.start("readonly"); // Security:Read is allowed at every tier, incl. readonly
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"export_ca_root_csr",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["csr_pem"].get<std::string>().find("CERTIFICATE REQUEST") != std::string::npos);
+    // Domain verb (REST parity) THEN the generic mcp_audit("success") row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "ca.root_csr.exported|success");
+    CHECK(ts.audit_log.back() == "mcp.export_ca_root_csr|success");
+}
+
+TEST_CASE("MCP B5: export_ca_root_csr without a CA answers unavailable, and a CSR-"
+          "generation failure answers an error, not a crash",
+          "[pg][mcp][integration][pki][b5]") {
+    McpTestServer ts_no_ca; // ca_store_for_test / export_csr_fn_for_test stay unset
+    ts_no_ca.start("readonly");
+    auto no_ca_res = ts_no_ca.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"export_ca_root_csr",)"
+        R"("arguments":{}}})");
+    auto no_ca_body = nlohmann::json::parse(no_ca_res->body);
+    REQUIRE(no_ca_body.contains("error"));
+    CHECK(no_ca_body["error"]["code"] == yuzu::server::mcp::kInternalError);
+
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts_fail;
+    ts_fail.ca_store_for_test = &store;
+    ts_fail.export_csr_succeeds_ = false;
+    ts_fail.export_csr_fn_for_test = [&ts_fail]() -> std::optional<std::string> {
+        return ts_fail.export_csr_succeeds_ ? std::make_optional<std::string>("x") : std::nullopt;
+    };
+    ts_fail.start("readonly");
+    auto fail_res = ts_fail.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"export_ca_root_csr",)"
+        R"("arguments":{}}})");
+    auto fail_body = nlohmann::json::parse(fail_res->body);
+    REQUIRE(fail_body.contains("error"));
+    CHECK(fail_body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(ts_fail.audit_log.back() == "ca.root_csr.exported|failure");
+}
+
+TEST_CASE("MCP B5: export_ca_root_csr respects perm_fn denial on Security:Read",
+          "[mcp][integration][pki][b5]") {
+    McpTestServer ts;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& op) {
+        return !(securable == "Security" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"export_ca_root_csr",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+}
+
+// ── CA subordinate-chain import (scope correction: gap-matrix #2146 B5) ──────
+// Mirrors POST /api/v1/ca/import-chain (ca_routes.cpp:799) exactly, same
+// import_chain_fn seam and publish_crl_fn CRL-republish follow-up. Security:Write
+// on the supervised tier is approval-gated (mcp_policy.hpp::requires_approval),
+// so these tests follow the revoke_certificate/issue_code_signing_cert
+// ticket-mint-then-recall pattern rather than export_ca_root_csr's direct-call one.
+
+TEST_CASE("MCP B5: import_ca_chain is tier-denied below supervised (Security:Write)",
+          "[mcp][integration][pki][security][b5]") {
+    int calls = 0;
+    McpTestServer ts;
+    ts.import_chain_fn_for_test = [&](const std::string&, const std::string&) {
+        ++calls;
+        return yuzu::server::CaRoutes::ImportOutcome::Ok;
+    };
+    ts.start("operator"); // operator cannot do Security:Write
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error")); // tier denied — the generic gate fired
+    CHECK(calls == 0);
+    CHECK(ts.crl_publish_calls_ == 0);
+}
+
+TEST_CASE("MCP B5: import_ca_chain supervised + approval manager mints a ticket",
+          "[mcp][integration][pki][security][approval][b5]") {
+    int calls = 0;
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [&](const std::string&, const std::string&) {
+        ++calls;
+        return yuzu::server::CaRoutes::ImportOutcome::Ok;
+    };
+    ts.start("supervised");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kApprovalRequired);
+    CHECK(body["error"]["data"].contains("approval_id"));
+    // Ticket minted only — the CA must not have been switched yet.
+    CHECK(calls == 0);
+    CHECK(ts.crl_publish_calls_ == 0);
+    CHECK(appr.pending_count() == 1);
+}
+
+TEST_CASE("MCP B5: import_ca_chain full approval-ticket round-trip reaches imported:true "
+          "and republishes the CRL",
+          "[mcp][integration][pki][security][approval][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    int calls = 0;
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [&](const std::string& intermediate,
+                                       const std::string& chain) {
+        ++calls;
+        CHECK(intermediate == "-----BEGIN CERTIFICATE-----int-----END CERTIFICATE-----");
+        CHECK(chain == "-----BEGIN CERTIFICATE-----parent-----END CERTIFICATE-----");
+        return yuzu::server::CaRoutes::ImportOutcome::Ok;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"-----BEGIN CERTIFICATE-----int-----END CERTIFICATE-----",)"
+        R"("chain_pem":"-----BEGIN CERTIFICATE-----parent-----END CERTIFICATE-----"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    REQUIRE(mint_body.contains("error"));
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+    CHECK(calls == 0); // not yet consumed
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"-----BEGIN CERTIFICATE-----int-----END CERTIFICATE-----",)"
+        R"("chain_pem":"-----BEGIN CERTIFICATE-----parent-----END CERTIFICATE-----","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result")); // SUCCESS
+    auto payload = nlohmann::json::parse(body["result"]["content"][0]["text"].get<std::string>());
+    CHECK(payload["imported"] == true);
+    CHECK(payload["mode"] == "subordinate");
+    CHECK(payload["crl_republished"] == true);
+    CHECK(calls == 1);
+    CHECK(ts.crl_publish_calls_ == 1);
+    CHECK(ts.audit_log.back() == "mcp.import_ca_chain|success");
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("ca.subordinate.imported|success")) != ts.audit_log.end());
+    REQUIRE(body["result"].contains("structuredContent"));
+    CHECK(body["result"]["structuredContent"] == payload);
+}
+
+TEST_CASE("MCP B5: import_ca_chain maps a BadIntermediate refusal to kInvalidParams, audits "
+          "denied, and never republishes the CRL (reject-without-state-change)",
+          "[mcp][integration][pki][security][approval][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [](const std::string&, const std::string&) {
+        return yuzu::server::CaRoutes::ImportOutcome::BadIntermediate;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"not-a-cert","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"not-a-cert","chain_pem":"y","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("not a valid certificate") !=
+          std::string::npos);
+    CHECK(ts.crl_publish_calls_ == 0);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("ca.subordinate.imported|denied")) != ts.audit_log.end());
+}
+
+TEST_CASE("MCP B5: import_ca_chain maps a StoreError to kInternalError with a retry hint, "
+          "distinct from a caller-input rejection, and audits failure",
+          "[mcp][integration][pki][security][approval][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [](const std::string&, const std::string&) {
+        return yuzu::server::CaRoutes::ImportOutcome::StoreError;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":5,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":6,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // A genuine store/persistence fault is NOT the same class as a caller-input
+    // rejection (BadIntermediate et al. above): kInternalError + a positive
+    // retry_after_ms, matching REST's 500 (ca_routes.cpp) and every sibling B5
+    // store-fault branch in this file.
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["retry_after_ms"].get<long>() > 0);
+    CHECK(ts.crl_publish_calls_ == 0);
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(),
+                     std::string("ca.subordinate.imported|failure")) != ts.audit_log.end());
+}
+
+TEST_CASE("MCP B5: import_ca_chain's StoreError branch surfaces audit_persisted:false "
+          "when the failure audit row itself cannot persist",
+          "[mcp][integration][pki][security][approval][b5]") {
+    // Gate 8 fix (#2146 Batch B5 follow-up): the StoreError test above proved
+    // audit_ok threads into kInternalError's envelope in the ok==true case;
+    // it never exercised audit_ok==false, which is the half
+    // consistency-auditor actually asked for - a dropped audit row on a
+    // genuine store fault must never be silent.
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_ca_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    yuzu::server::CaStore store{pool};
+    REQUIRE(store.is_open());
+
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.ca_store_for_test = &store;
+    ts.approval_manager_for_test = &appr;
+    ts.import_chain_fn_for_test = [](const std::string&, const std::string&) {
+        return yuzu::server::CaRoutes::ImportOutcome::StoreError;
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    ts.audit_succeeds_ = false; // the ca.subordinate.imported|failure row cannot persist
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" +
+        approval_id + R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["data"]["audit_persisted"] == false);
+}
+
+TEST_CASE("MCP B5: import_ca_chain without a CA store answers unavailable, not a crash",
+          "[mcp][integration][pki][security][approval][b5]") {
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts; // ca_store_for_test / import_chain_fn_for_test stay unset
+    ts.approval_manager_for_test = &appr;
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":7,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" + approval_id +
+        R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP B5: import_ca_chain denies without Security:Write, even after an approved "
+          "ticket (RBAC)",
+          "[mcp][integration][pki][security][approval][b5]") {
+        yuzu::test::ApprovalManagerPg appr_bundle;
+    yuzu::server::ApprovalManager& appr = *appr_bundle;
+
+    McpTestServer ts;
+    ts.approval_manager_for_test = &appr;
+    ts.perm_override_for_test = [](const std::string& securable, const std::string& operation) {
+        return !(securable == "Security" && operation == "Write");
+    };
+    ts.start("supervised");
+
+    auto mint = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y"}}})");
+    REQUIRE(mint);
+    auto mint_body = nlohmann::json::parse(mint->body);
+    const std::string approval_id = mint_body["error"]["data"]["approval_id"].get<std::string>();
+    REQUIRE(appr.approve(approval_id, "reviewer-bob", "ok"));
+
+    std::string recall =
+        R"({"jsonrpc":"2.0","method":"tools/call","id":10,"params":{"name":"import_ca_chain",)"
+        R"("arguments":{"intermediate_pem":"x","chain_pem":"y","approval_id":")" + approval_id +
+        R"("}}})";
+    auto res = ts.call(recall);
+    REQUIRE(res);
+    // perm_fn's own mock 403 — the RBAC denial fires inside the handler, after
+    // the ticket is consumed — not a JSON-RPC "result" envelope.
+    CHECK(res->status == 403);
+}
+
+// ── Platform license ─────────────────────────────────────────────────────────
+
+TEST_CASE("MCP B5: get_platform_license without a store answers unavailable, not a crash",
+          "[mcp][integration][b5]") {
+    McpTestServer ts; // license_store_for_test stays unset (dormant, ADR-0048)
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_platform_license",)"
+        R"("arguments":{}}})");
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+}
+
+TEST_CASE("MCP B5: get_platform_license reports status:none on an empty store, then the "
+          "full shape after activate_platform_license — reading LIVE store state",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_license_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.license_store_for_test = &store;
+    ts.start();
+
+    auto none_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_platform_license",)"
+        R"("arguments":{}}})");
+    auto none_payload = operator_surface_payload(none_res);
+    CHECK(none_payload["status"] == "none");
+
+    auto activate_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"activate_platform_license","arguments":{)"
+        R"("organization":"Acme Corp","license_key":"KEY-ACME-1",)"
+        R"("seat_count":50,"edition":"enterprise"}}})");
+    REQUIRE(activate_res);
+    auto activate_payload = operator_surface_payload(activate_res);
+    REQUIRE(activate_payload.contains("id"));
+    // Domain verb (REST parity) THEN the generic mcp_audit("success") row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "license.activate|success");
+    CHECK(ts.audit_log.back() == "mcp.activate_platform_license|success");
+
+    auto full_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"get_platform_license",)"
+        R"("arguments":{}}})");
+    auto full_payload = operator_surface_payload(full_res);
+    CHECK(full_payload["organization"] == "Acme Corp");
+    CHECK(full_payload["seat_count"] == 50);
+    CHECK(full_payload["edition"] == "enterprise");
+    CHECK(full_payload["status"] == "active");
+    REQUIRE(full_payload.contains("days_remaining"));
+    // license_key itself is NEVER echoed back by any tool (hashed at rest).
+    CHECK_FALSE(full_payload.contains("license_key"));
+}
+
+TEST_CASE("MCP B5: activate_platform_license surfaces business errors as kInvalidParams "
+          "(empty organization, duplicate license_key) — REST audits ONLY success, "
+          "mirrored here",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_license_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.license_store_for_test = &store;
+    ts.start();
+
+    auto empty_org_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"activate_platform_license",)"
+        R"("arguments":{"organization":"","license_key":"KEY-1"}}})");
+    auto empty_org_body = nlohmann::json::parse(empty_org_res->body);
+    REQUIRE(empty_org_body.contains("error"));
+    CHECK(empty_org_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(ts.audit_log.empty()); // REST audits ONLY success for this route
+
+    auto first_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"activate_platform_license",)"
+        R"("arguments":{"organization":"Org A","license_key":"DUP-KEY"}}})");
+    REQUIRE(operator_surface_payload(first_res).contains("id"));
+    // Two rows for the one success: the domain verb (REST parity) THEN the
+    // generic mcp_audit("success") tool-layer row (#1240 L2 convention).
+    REQUIRE(ts.audit_log.size() == 2);
+    CHECK(ts.audit_log[0] == "license.activate|success");
+    CHECK(ts.audit_log[1] == "mcp.activate_platform_license|success");
+
+    auto dup_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,)"
+        R"("params":{"name":"activate_platform_license",)"
+        R"("arguments":{"organization":"Org B","license_key":"DUP-KEY"}}})");
+    auto dup_body = nlohmann::json::parse(dup_res->body);
+    REQUIRE(dup_body.contains("error"));
+    CHECK(dup_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(dup_body["error"]["message"] == "license key already activated");
+    // Still only the two rows from the first activation — REST audits ONLY
+    // success for this route, mirrored here (no row for the failed retry).
+    CHECK(ts.audit_log.size() == 2);
+}
+
+// #2970B-class regression: a JSON-type-mismatched seat_count/expires_at (e.g.
+// the string "50") must be REJECTED, not silently coerced to the default via
+// param_int.
+TEST_CASE("MCP B5: activate_platform_license rejects a non-integer seat_count or "
+          "expires_at",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_license_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    McpTestServer ts;
+    ts.license_store_for_test = &store;
+    ts.start();
+
+    auto bad_seats = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"activate_platform_license",)"
+        R"("arguments":{"organization":"Org A","license_key":"KEY-1","seat_count":"50"}}})");
+    auto bad_seats_body = nlohmann::json::parse(bad_seats->body);
+    REQUIRE(bad_seats_body.contains("error"));
+    CHECK(bad_seats_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(bad_seats_body["error"]["message"].get<std::string>().find("seat_count") !=
+          std::string::npos);
+
+    auto bad_expires = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"activate_platform_license",)"
+        R"("arguments":{"organization":"Org A","license_key":"KEY-2","expires_at":"0"}}})");
+    auto bad_expires_body = nlohmann::json::parse(bad_expires->body);
+    REQUIRE(bad_expires_body.contains("error"));
+    CHECK(bad_expires_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(bad_expires_body["error"]["message"].get<std::string>().find("expires_at") !=
+          std::string::npos);
+    CHECK(ts.audit_log.empty()); // rejected before the store write; REST audits only success
+}
+
+TEST_CASE("MCP B5: list_license_alerts reads LIVE alerts generated by "
+          "LicenseStore::validate",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_license_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::LicenseStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::server::License lic;
+    lic.organization = "Small Org";
+    lic.seat_count = 10;
+    lic.expires_at = std::chrono::duration_cast<std::chrono::seconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count() +
+                      86400 * 365;
+    REQUIRE(store.activate_license(lic, "KEY-SEATS").has_value());
+    REQUIRE(store.validate(15).has_value()); // 15 agents exceed the 10-seat limit
+
+    McpTestServer ts;
+    ts.license_store_for_test = &store;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"list_license_alerts",)"
+        R"("arguments":{}}})");
+    REQUIRE(res);
+    auto payload = operator_surface_payload(res);
+    REQUIRE(payload["alerts"].is_array());
+    bool found_exceeded = false;
+    for (const auto& a : payload["alerts"])
+        if (a["alert_type"] == "exceeded")
+            found_exceeded = true;
+    CHECK(found_exceeded);
+    CHECK(ts.audit_log.back() == "mcp.list_license_alerts|success");
+}
+
+TEST_CASE("MCP B5: platform-license mutations are tier-denied below supervised "
+          "(License:Write); reads respect perm_fn denial (License:Read)",
+          "[mcp][integration][b5]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    auto activate_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"activate_platform_license",)"
+        R"("arguments":{"organization":"Org","license_key":"K"}}})");
+    auto activate_body = nlohmann::json::parse(activate_res->body);
+    REQUIRE(activate_body.contains("error"));
+    CHECK(activate_body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    McpTestServer ts2;
+    ts2.perm_override_for_test = [](const std::string& securable, const std::string&) {
+        return securable != "License";
+    };
+    ts2.start();
+    auto get_res = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"get_platform_license",)"
+        R"("arguments":{}}})");
+    REQUIRE(get_res);
+    CHECK(get_res->status == 403);
+
+    auto alerts_res = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,"params":{"name":"list_license_alerts",)"
+        R"("arguments":{}}})");
+    REQUIRE(alerts_res);
+    CHECK(alerts_res->status == 403);
+}
+
+// ── Software deployments ─────────────────────────────────────────────────────
+
+TEST_CASE("MCP B5: list/create_software_deployment over a LIVE store; create rejects a "
+          "non-existent package_id",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::SoftwareDeploymentStore store{pool};
+    REQUIRE(store.is_open());
+    auto pkg_id = store.create_package(mcp_b5_make_package());
+    REQUIRE(pkg_id.has_value());
+
+    McpTestServer ts;
+    ts.sw_deploy_store_for_test = &store;
+    ts.mock_username = "deploy-operator";
+    ts.start();
+
+    auto list0 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"list_software_deployments","arguments":{}}})");
+    auto list0_payload = operator_surface_payload(list0);
+    REQUIRE(list0_payload["deployments"].is_array());
+    CHECK(list0_payload["deployments"].empty());
+
+    auto bad_pkg_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"create_software_deployment",)"
+        R"("arguments":{"package_id":"does-not-exist"}}})");
+    auto bad_pkg_body = nlohmann::json::parse(bad_pkg_res->body);
+    REQUIRE(bad_pkg_body.contains("error"));
+    CHECK(bad_pkg_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(bad_pkg_body["error"]["message"] == "package_id does not exist");
+
+    auto create_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,)"
+        R"("params":{"name":"create_software_deployment","arguments":{"package_id":")" +
+        *pkg_id + R"(","scope_expression":"ostype = 'windows'"}}})");
+    REQUIRE(create_res);
+    auto create_payload = operator_surface_payload(create_res);
+    REQUIRE(create_payload.contains("id"));
+    // Domain verb (REST parity) THEN the generic mcp_audit("success") row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "software_deployment.create|success");
+    CHECK(ts.audit_log.back() == "mcp.create_software_deployment|success");
+
+    // The created row is attributed to the calling session, started as 'staged'.
+    auto dep = store.get_deployment(create_payload["id"].get<std::string>());
+    REQUIRE(dep.has_value());
+    REQUIRE(dep->has_value());
+    CHECK((*dep)->created_by == "deploy-operator");
+    CHECK((*dep)->status == "staged");
+
+    auto list1 = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":4,)"
+        R"("params":{"name":"list_software_deployments","arguments":{}}})");
+    auto list1_payload = operator_surface_payload(list1);
+    REQUIRE(list1_payload["deployments"].size() == 1);
+    CHECK(list1_payload["deployments"][0]["status"] == "staged");
+}
+
+TEST_CASE("MCP B5: rollback/cancel state-transition semantics — a never-started "
+          "(staged) deployment CANNOT be rolled back but CAN be cancelled; an "
+          "already-terminal deployment can be neither cancelled nor rolled back again",
+          "[pg][mcp][integration][b5]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_b5_sw_deploy_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::SoftwareDeploymentStore store{pool};
+    REQUIRE(store.is_open());
+    auto pkg_id = store.create_package(mcp_b5_make_package());
+    REQUIRE(pkg_id.has_value());
+
+    McpTestServer ts;
+    ts.sw_deploy_store_for_test = &store;
+    ts.start();
+
+    auto rollback = [&](int call_id, const std::string& dep_id) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id) +
+                       R"(,"params":{"name":"rollback_software_deployment",)"
+                       R"("arguments":{"id":")" +
+                       dep_id + R"("}}})");
+    };
+    auto cancel = [&](int call_id, const std::string& dep_id) {
+        return ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":)" +
+                       std::to_string(call_id) +
+                       R"(,"params":{"name":"cancel_software_deployment",)"
+                       R"("arguments":{"id":")" +
+                       dep_id + R"("}}})");
+    };
+
+    // Case A: a never-started (staged) deployment CANNOT be rolled back.
+    yuzu::server::SoftwareDeployment dep_a;
+    dep_a.package_id = *pkg_id;
+    dep_a.created_by = "admin";
+    auto dep_a_id = store.create_deployment(dep_a);
+    REQUIRE(dep_a_id.has_value());
+
+    auto rollback_staged = rollback(1, *dep_a_id);
+    auto rollback_staged_body = nlohmann::json::parse(rollback_staged->body);
+    REQUIRE(rollback_staged_body.contains("error"));
+    CHECK(rollback_staged_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(rollback_staged_body["error"]["message"] ==
+          "only deploying, verifying, or completed deployments can be rolled back");
+
+    // ...but it CAN be cancelled (staged is a valid cancel source).
+    auto cancel_staged = cancel(2, *dep_a_id);
+    auto cancel_staged_payload = operator_surface_payload(cancel_staged);
+    CHECK(cancel_staged_payload["cancelled"] == true);
+    // Domain verb (REST parity) THEN the generic mcp_audit("success") row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "software_deployment.cancel|success");
+    CHECK(ts.audit_log.back() == "mcp.cancel_software_deployment|success");
+
+    // Case B: an already-cancelled (terminal) deployment cannot be cancelled again.
+    auto recancel = cancel(3, *dep_a_id);
+    auto recancel_body = nlohmann::json::parse(recancel->body);
+    REQUIRE(recancel_body.contains("error"));
+    CHECK(recancel_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(recancel_body["error"]["message"] ==
+          "only staged or deploying deployments can be cancelled");
+
+    // Case C: a started (deploying) deployment CAN be rolled back. No MCP twin
+    // exists for "start" (MFA step-up) — drive it directly through the store,
+    // exactly as a real orchestration engine would after REST's own
+    // POST .../start.
+    yuzu::server::SoftwareDeployment dep_b;
+    dep_b.package_id = *pkg_id;
+    dep_b.created_by = "admin";
+    auto dep_b_id = store.create_deployment(dep_b);
+    REQUIRE(dep_b_id.has_value());
+    REQUIRE(store.start_deployment(*dep_b_id).has_value());
+
+    auto rollback_deploying = rollback(4, *dep_b_id);
+    auto rollback_deploying_payload = operator_surface_payload(rollback_deploying);
+    CHECK(rollback_deploying_payload["rolled_back"] == true);
+    // Domain verb (REST parity) THEN the generic mcp_audit("success") row.
+    REQUIRE(ts.audit_log.size() >= 2);
+    CHECK(ts.audit_log[ts.audit_log.size() - 2] == "software_deployment.rollback|success");
+    CHECK(ts.audit_log.back() == "mcp.rollback_software_deployment|success");
+
+    // Case D: an already-rolled-back (terminal) deployment cannot be rolled
+    // back again.
+    auto reroll = rollback(5, *dep_b_id);
+    auto reroll_body = nlohmann::json::parse(reroll->body);
+    REQUIRE(reroll_body.contains("error"));
+    CHECK(reroll_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // A never-created id answers "deployment not found" — the same
+    // kInvalidParams shape as a wrong-state rejection, never a crash.
+    auto missing = rollback(6, "does-not-exist");
+    auto missing_body = nlohmann::json::parse(missing->body);
+    REQUIRE(missing_body.contains("error"));
+    CHECK(missing_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(missing_body["error"]["message"] == "deployment not found");
+}
+
+TEST_CASE("MCP B5: software-deployment mutations are tier-denied below supervised "
+          "(SoftwareDeployment:Execute); reads respect perm_fn denial "
+          "(SoftwareDeployment:Read)",
+          "[mcp][integration][b5]") {
+    McpTestServer ts;
+    ts.start("readonly");
+
+    auto create_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"create_software_deployment",)"
+        R"("arguments":{"package_id":"pkg-1"}}})");
+    auto create_body = nlohmann::json::parse(create_res->body);
+    REQUIRE(create_body.contains("error"));
+    CHECK(create_body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    auto rollback_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":2,)"
+        R"("params":{"name":"rollback_software_deployment",)"
+        R"("arguments":{"id":"dep-1"}}})");
+    auto rollback_body = nlohmann::json::parse(rollback_res->body);
+    REQUIRE(rollback_body.contains("error"));
+    CHECK(rollback_body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    auto cancel_res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":3,)"
+        R"("params":{"name":"cancel_software_deployment",)"
+        R"("arguments":{"id":"dep-1"}}})");
+    auto cancel_body = nlohmann::json::parse(cancel_res->body);
+    REQUIRE(cancel_body.contains("error"));
+    CHECK(cancel_body["error"]["code"] == yuzu::server::mcp::kTierDenied);
+
+    McpTestServer ts2;
+    ts2.perm_override_for_test = [](const std::string& securable, const std::string&) {
+        return securable != "SoftwareDeployment";
+    };
+    ts2.start();
+    auto list_res = ts2.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,)"
+        R"("params":{"name":"list_software_deployments","arguments":{}}})");
+    REQUIRE(list_res);
+    CHECK(list_res->status == 403);
 }
