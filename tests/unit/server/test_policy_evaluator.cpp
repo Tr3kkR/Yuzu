@@ -97,6 +97,13 @@ struct Harness {
     // denied_quarantined) rather than delivered or not_sent -- a THIRD way a
     // claimed target can fail to be delivered, distinct from both.
     std::set<std::string> quarantined;
+    // WS-4 4.2b Task D (#3424/#3511 under-count): when set, the fake
+    // dispatch_fn returns `route_unreadable` for the WHOLE batch (mirroring
+    // ArmDispatchResult::route_unreadable's systemic-directory-read-failure
+    // shape) instead of walking `quarantined`/`canned` -- exercises
+    // compute_delivered's `route_unreadable` branch the same way
+    // `containment_unreadable` is exercised in deployment_engine.cpp.
+    bool route_unreadable_outcome{false};
 
     std::string group_id;
 
@@ -147,6 +154,14 @@ struct Harness {
             dispatched_plugins.push_back(plugin);
             yuzu::server::ConfinedDispatchOutcome outcome;
             outcome.command_id = "cmd-" + execid;
+            if (route_unreadable_outcome) {
+                // Mirrors the real chokepoint: a degraded GatewayRouteStore
+                // directory read means nothing in the batch was individually
+                // evaluated, so `sent` stays 0 and no per-id fields are
+                // populated -- only the systemic flag.
+                outcome.route_unreadable = true;
+                return outcome;
+            }
             for (const auto& a : agents) {
                 if (quarantined.count(a)) {
                     // Mirrors dispatch_confined_arms.hpp's real quarantine-gate
@@ -727,6 +742,45 @@ TEST_CASE("policy evaluator: a mixed delivered+quarantined remediate batch marks
     REQUIRE(rr2.ok);
     CHECK(rr2.agents == 1);
     CHECK(h.status_of(pid, "agentB") == "fixing");
+}
+
+TEST_CASE("policy evaluator: a route_unreadable outcome leaves the WHOLE remediate batch "
+          "undelivered and releases the claim for retry (WS-4 4.2b Task D, #3424/#3511 "
+          "under-count)",
+          "[pg][policy][evaluator][claim]") {
+    // compute_delivered's `route_unreadable` branch must mirror
+    // `containment_unreadable`'s exactly: nothing in the claimed batch was
+    // individually evaluated, so the WHOLE batch is treated as not
+    // delivered (agents == 0, no status write, no attempt burned, claim
+    // released for a later retry) -- never partially settled.
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")}; // non_compliant
+    h.canned["agentA|fixp"] = {1, "ok"};
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    h.route_unreadable_outcome = true;
+    auto rr = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr.ok); // dispatch itself succeeded -- a valid execution_id was minted
+    // Honest count: the directory read degraded, so nothing was DELIVERED.
+    CHECK(rr.agents == 0);
+    // Nothing was delivered -- no FixWait entry queued, no status write.
+    CHECK(h.status_of(pid, "agentA") == "non_compliant");
+
+    // The claim must have been released (not left dangling): a fresh
+    // remediate() with the directory read recovered re-claims and delivers.
+    h.route_unreadable_outcome = false;
+    auto rr2 = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr2.ok);
+    CHECK(rr2.agents == 1);
+    CHECK(h.status_of(pid, "agentA") == "fixing");
 }
 
 TEST_CASE("policy evaluator: verify dispatch failure -> error", "[pg][policy][evaluator]") {

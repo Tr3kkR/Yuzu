@@ -83,6 +83,13 @@ struct Harness {
             // engine must settle the claim on ANY zero-sent outcome.
             if (gate_unreadable)
                 return {.sent = 0, .command_id = "cmd", .containment_unreadable = true};
+            // WS-4 4.2b Task D (#3424/#3511 under-count): the SAME
+            // systemic-transient shape as gate_unreadable above, but for the
+            // GatewayRouteStore directory read degrading instead of the
+            // containment gate — settle_claimed_batch must treat the two
+            // identically (revert the whole claim for retry).
+            if (route_unreadable)
+                return {.sent = 0, .command_id = "cmd", .route_unreadable = true};
             // Mirrors dispatch_confined_arms.hpp's own `filter_to_scope`
             // pre-loop drop: an id outside the caller's exec_visible set
             // never enters the arm walk at all, so it lands in NONE of
@@ -125,6 +132,7 @@ struct Harness {
 
     bool deny_dispatch{false};
     bool gate_unreadable{false};
+    bool route_unreadable{false};
     std::unordered_set<std::string> unknown_plugin_agents;
     std::unordered_set<std::string> offline_agents;
     std::unordered_set<std::string> denied_quarantined_agents;
@@ -317,6 +325,48 @@ TEST_CASE("deployment engine retries after a transient containment-gate failure 
     // dispatch, since the first was never actually delivered) and this
     // time reaches the agent.
     h.gate_unreadable = false;
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 2);
+    CHECK(step_of(store, id, "a1") == "staging");
+}
+
+TEST_CASE("deployment engine retries after a transient GatewayRouteStore directory-read "
+          "failure instead of permanently failing the claim (WS-4 4.2b Task D, #3424/#3511 "
+          "under-count)",
+          "[pg][deployment][engine]") {
+    // Clone of the containment-gate-unreadable test immediately above:
+    // `route_unreadable` (WS-4 4.2b Task C) is the SAME systemic-transient
+    // class as `containment_unreadable` — the GatewayRouteStore directory
+    // read itself failed, not a fact about this device — so
+    // settle_claimed_batch must revert the claim for retry exactly the same
+    // way, never settle it to a permanent 'failed'.
+    YUZU_REQUIRE_PG_DB_TPL(db, deprun_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    DeploymentRunStore store{pool};
+    REQUIRE(store.is_open());
+
+    const std::string id = "e-route-unreadable";
+    REQUIRE(store.create_deployment(make_dep(id), {tgt("a1")}));
+
+    Harness h{store};
+    h.route_unreadable = true;
+    auto deps = h.deps();
+    DeploymentConfig cfg{"https://repo.lan/pkg.msi", "pkg.msi", std::string(64, 'a'), ""};
+    const std::unordered_set<std::string> authorized{"a1"};
+
+    // Tick 1: the device is claimed into 'staging', the route directory
+    // read itself is unreadable — a systemic, typically-transient
+    // condition, not a fact about this device — so the claim must be
+    // UNDONE (back to 'pending'), never settled to a permanent 'failed'.
+    advance(deps, id, cfg, authorized, test_caller());
+    CHECK(h.dispatch_count("stage", "a1") == 1);
+    CHECK(step_of(store, id, "a1") == "pending");
+
+    // Tick 2: the directory read recovers — the device is reclaimed (a
+    // SECOND stage dispatch, since the first was never actually delivered)
+    // and this time reaches the agent.
+    h.route_unreadable = false;
     advance(deps, id, cfg, authorized, test_caller());
     CHECK(h.dispatch_count("stage", "a1") == 2);
     CHECK(step_of(store, id, "a1") == "staging");

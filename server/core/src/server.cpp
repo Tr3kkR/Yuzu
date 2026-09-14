@@ -18344,6 +18344,14 @@ private:
         }
 
         agent_service_.record_send_time(command_id);
+        // WS-4 4.2b Task D: this sink is deliberately left WITHOUT a fourth
+        // (`prepare_route_fallback`) field — this legacy forwarder is
+        // Broadcast-only (see this dispatch's own DispatchArm::Broadcast call
+        // just below), so `ArmDispatchResult::route_unreadable` can never be
+        // set here regardless; unlike the /api/command and MCP/dashboard/
+        // workflow sites (which DO wire the gateway routing-directory
+        // fallback and so DO need the `route_unreadable` cascade branch
+        // below), this site has no `route_unreadable` branch to add.
         const yuzu::server::ConfinedDispatchSink sink{
             [&](const std::string& aid) { return registry_.send_to(aid, *classified); },
             [&] { return registry_.send_to_all(*classified); },
@@ -18386,7 +18394,10 @@ private:
             // #2557 — no longer "above" in this file) — see the comment
             // there. A fail-closed gate is a fleet-wide condition, not a
             // per-agent transport failure, and reporting it as one sends the
-            // operator to the wrong subsystem.
+            // operator to the wrong subsystem. NO `route_unreadable` branch
+            // here (WS-4 4.2b Task D) — this Broadcast-only sink never wires
+            // `prepare_route_fallback` (see the sink's own comment above),
+            // so `result.route_unreadable` is always false at this site.
             res.status = 503;
             if (containment_gate.fail_closed) {
                 res.set_content(

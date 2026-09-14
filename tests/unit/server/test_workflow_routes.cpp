@@ -186,6 +186,9 @@ struct ExecHarness {
     /// test can exercise each of the 4-way 503 split's branches instead of
     /// only the generic catch-all every prior test here left at defaults.
     bool dispatch_containment_unreadable_override{false};
+    // WS-4 4.2b Task D: mirrors dispatch_containment_unreadable_override --
+    // the exact sibling (a degraded gateway routing-directory read).
+    bool dispatch_route_unreadable_override{false};
     std::size_t dispatch_denied_quarantined_count_override{0};
     std::size_t dispatch_unknown_plugin_count_override{0};
     /// PR #3939 review fix round: exercises the new scope_parse_error ->
@@ -380,7 +383,8 @@ struct ExecHarness {
                    .denied_quarantined_count = dispatch_denied_quarantined_count_override,
                    .command_id = dispatch_cmd_override,
                    .containment_unreadable = dispatch_containment_unreadable_override,
-                   .unknown_plugin_count = dispatch_unknown_plugin_count_override};
+                   .unknown_plugin_count = dispatch_unknown_plugin_count_override,
+                   .route_unreadable = dispatch_route_unreadable_override};
         };
 
         // PR 2.5 (#670): deps-struct refactor. WorkflowRoutes::register_routes
@@ -1515,6 +1519,23 @@ TEST_CASE("instruction execute: a fail-closed containment gate reports "
     CHECK(res->status == 503);
     auto body = nlohmann::json::parse(res->body);
     CHECK(body["error"]["reason"] == "containment_unreadable");
+    CHECK(body["error"]["retry_after_ms"] == 5000);
+}
+
+TEST_CASE("instruction execute: a degraded gateway routing-directory read reports "
+          "reason=route_unreadable, retryable after 5000ms (WS-4 4.2b Task D — the exact "
+          "sibling of containment_unreadable)",
+          "[pg][workflow][executions][execute][3424][3511]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-RU", "RU");
+    h.dispatch_route_unreadable_override = true;
+    auto res = h.sink.Post("/api/instructions/def-RU/execute", R"({"agent_ids":["agent-1"]})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["reason"] == "route_unreadable");
     CHECK(body["error"]["retry_after_ms"] == 5000);
 }
 

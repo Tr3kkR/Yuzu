@@ -170,13 +170,27 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     const auto outcome = d_.dispatch_fn(c.plugin, c.action, agent_ids, c.scope_expr, params,
                                         c.execution_id, caller, c.command_id);
 
-    // 5. A systemic transient gate failure (a degraded containment read) is NOT
-    //    a delivered occurrence — retry with back-off, leave it pending.
-    if (outcome.containment_unreadable) {
+    // 5. A systemic transient gate/directory failure — a degraded containment
+    //    read, OR (WS-4 4.2b Task D) a degraded gateway routing-directory read
+    //    (`route_unreadable`, mirrors `containment_unreadable`'s shape exactly:
+    //    "the read itself could not answer", not "answered no") — is NOT a
+    //    delivered occurrence — retry with back-off, leave it pending.
+    if (outcome.containment_unreadable || outcome.route_unreadable) {
+        // The existing unlabeled retry counter keeps firing for EITHER cause
+        // (dashboards/alerts already key on it); the cause-labeled counter is
+        // additive so a route-store degradation is separately countable
+        // without redefining what the base counter means.
         count("yuzu_server_command_outbox_deliver_retry_total");
-        spdlog::warn("command_outbox_delivery: occurrence '{}' containment unreadable — "
-                     "rescheduling",
-                     c.occurrence_id);
+        if (d_.metrics)
+            d_.metrics
+                ->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                         {{"cause", outcome.containment_unreadable ? "containment_unreadable"
+                                                                  : "route_unreadable"}})
+                .increment();
+        spdlog::warn("command_outbox_delivery: occurrence '{}' {} — rescheduling",
+                     c.occurrence_id,
+                     outcome.containment_unreadable ? "containment unreadable"
+                                                    : "gateway route directory unreadable");
         (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff);
         return;
     }

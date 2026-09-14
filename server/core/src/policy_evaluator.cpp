@@ -204,10 +204,14 @@ std::string make_check_result(const StoredResponse& r) {
 std::vector<std::string>
 compute_delivered(const std::vector<std::string>& claimed,
                   const yuzu::server::ConfinedDispatchOutcome& outcome) {
-    if (outcome.containment_unreadable)
-        // The gate itself failed closed — nothing in `claimed` was
-        // individually evaluated, so there is no per-device fact to act on,
-        // only a systemic one: treat the WHOLE batch as not delivered.
+    if (outcome.containment_unreadable || outcome.route_unreadable)
+        // The gate itself failed closed, OR the GatewayRouteStore directory
+        // read degraded (WS-4 4.2b Task D closing #3424/#3511's under-count
+        // -- `route_unreadable` mirrors `containment_unreadable`'s shape
+        // exactly, see `ConfinedDispatchOutcome::route_unreadable`'s own doc
+        // comment) — either way nothing in `claimed` was individually
+        // evaluated, so there is no per-device fact to act on, only a
+        // systemic one: treat the WHOLE batch as not delivered.
         return {};
 
     std::unordered_set<std::string> not_delivered;

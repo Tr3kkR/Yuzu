@@ -48,13 +48,18 @@ void settle_claimed_batch(const EngineDeps& deps, const std::string& deployment_
     if (claimed.empty())
         return;
 
-    if (outcome.containment_unreadable) {
-        // The gate itself failed closed — nothing in `claimed` was
-        // individually evaluated against quarantine/plugin-presence, so
-        // there is no per-device fact to act on, only a systemic one. Undo
-        // the claim entirely rather than fail it: a fail-closed gate
-        // typically recovers within seconds (matching the retry_after_ms:
-        // 5000 every other zero-reach cascade in this PR already promises).
+    if (outcome.containment_unreadable || outcome.route_unreadable) {
+        // The gate itself failed closed, OR the GatewayRouteStore directory
+        // read degraded (WS-4 4.2b Task D closing #3424/#3511's under-count
+        // -- `route_unreadable` mirrors `containment_unreadable`'s shape
+        // exactly, see `ConfinedDispatchOutcome::route_unreadable`'s own doc
+        // comment) — either way nothing in `claimed` was individually
+        // evaluated against quarantine/plugin-presence/routing, so there is
+        // no per-device fact to act on, only a systemic one. Undo the claim
+        // entirely rather than fail it: a fail-closed gate or a degraded
+        // directory read both typically recover within seconds (matching
+        // the retry_after_ms: 5000 every other zero-reach cascade in this
+        // PR already promises).
         std::vector<DeviceTransition> revert;
         revert.reserve(claimed.size());
         for (const auto& aid : claimed)
