@@ -99,8 +99,8 @@
  *    a precise bounded Unknown string (it lands in guard.unhealthy detail).
  *  - Absolute deadline captured at run() ENTRY (per-class deadline chosen by the
  *    reader), so allocation + launch time counts against the caller's budget.
- *    submit() takes NO deadline: there is no waiter to time out, a wedged fn()
- *    holds its slot and key for as long as it stays wedged (the dead-target
+ *    submit() takes NO deadline: there is no waiter to time out, a non-returning
+ *    fn() holds its slot and key for as long as it stays stuck (the dead-target
  *    bulkhead is unchanged), and per-key deadlines/wedge marking are the consumer's
  *    (design doc R5.2/R5.3, rung 9c PR-5).
  *  - Exactly-once result delivery (#3816, run()): every result fn() returns normally

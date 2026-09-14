@@ -43,6 +43,23 @@ history:
     `docs/spark-legacy-delta-registry.md` (this doc's own R5.2-R5.4 "as implemented"
     stamps already reflected PR-2 from PR #4318's own commits, so only the two
     cross-referencing docs needed the update).
+  - 2026-09-14 - rung 9c PR-4.5 (no design change, terminology only): renamed R5.3's
+    dispatched-and-timed-out key state "quarantined" to "wedged" ("quarantine" to
+    "wedge"/"wedge marking") throughout this doc, `docs/spark-flip-gate.md`, registry
+    row A3, and five agent code comments (`guardian_arm_ack.{cpp,hpp}`,
+    `guardian_arm_heartbeat.hpp`, `guardian_io_executor.hpp`,
+    `guardian_spark_runtime.hpp`), resolving the collision with Guardian's real
+    operator-facing network-isolation quarantine (v1.1 §11.7), the shipped
+    `quarantine` plugin/`QuarantineStore`/`quarantine_device` MCP tool, and the
+    `mech_quarantined_total` SparkEngine fault counter - all three left unchanged.
+    Earlier entries above now read "wedged" for this state; they said "quarantined"
+    when written. Full `/governance` pass (commit 9256f6189): security-guardian,
+    docs-writer, cpp-expert, cpp-safety, architect, happy-path, unhappy-path,
+    consistency-auditor, chaos-injector, compliance-officer, sre,
+    enterprise-readiness - no BLOCKING findings; this history entry and a
+    `guardian_io_executor.hpp` reword (the sentence's physical-stuck clause moved
+    off the word "wedge", leaving "wedge marking" its only wedge-rooted term)
+    folded in directly as a same-round hardening commit.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
