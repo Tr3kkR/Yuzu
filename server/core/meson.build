@@ -495,6 +495,9 @@ yuzu_server_core_lib = static_library(
     'src/execution_statistics_model.cpp', # #2146 Batch B3 -- shared REST+MCP builder (Rule 1)
     'src/management_group_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
     'src/api_token_model.cpp', # #2146 Batch B4 -- shared REST+MCP builder (Rule 1)
+    'src/offload_target_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
+    'src/license_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
+    'src/software_deployment_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
     'src/dex_perf_model.cpp',
     'src/dex_app_perf_model.cpp',
     'src/dex_app_perf_ui.cpp',
