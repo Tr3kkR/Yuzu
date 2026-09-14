@@ -89,6 +89,36 @@ TEST_CASE("windows_optional_features parsers: real DISM capture -- every state i
     CHECK(saw_telnet);
 }
 
+TEST_CASE("windows_optional_features parsers: parse_probe_features_dump's documented resilience "
+          "-- a missing start marker returns empty, malformed/non-tab lines inside the body are "
+          "skipped rather than aborting the whole parse",
+          "[windows_optional_features][parsers]") {
+    // No start marker at all.
+    CHECK(yuzu::wof::parse_probe_features_dump("just some unrelated text\nno markers here\n")
+              .empty());
+    CHECK(yuzu::wof::parse_probe_features_dump("").empty());
+
+    // A well-formed body interleaved with lines this parser's own contract
+    // says to skip: no tab at all, an empty line, and a non-integer state
+    // field (std::from_chars fails, res.ec != std::errc{}).
+    constexpr std::string_view text =
+        "preamble\n"
+        "--- feature list (name<TAB>state_int) ---\n"
+        "GoodOne\t4\n"
+        "no_tab_on_this_line\n"
+        "\n"
+        "BadState\tnotanumber\n"
+        "GoodTwo\t0\n"
+        "--- end feature list ---\n"
+        "trailer, ignored\n";
+    const auto rows = yuzu::wof::parse_probe_features_dump(text);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].name == "GoodOne");
+    CHECK(rows[0].state_int == 4);
+    CHECK(rows[1].name == "GoodTwo");
+    CHECK(rows[1].state_int == 0);
+}
+
 TEST_CASE("windows_optional_features parsers: state_from_dism covers the full documented range, "
           "unknown never throws",
           "[windows_optional_features][parsers]") {
@@ -163,6 +193,13 @@ TEST_CASE("windows_optional_features parsers: validate_feature_name rejects trav
     CHECK_FALSE(yuzu::wof::validate_feature_name("back\\slash").has_value());
     CHECK_FALSE(yuzu::wof::validate_feature_name(std::string(257, 'a')).has_value());
     CHECK(yuzu::wof::validate_feature_name(std::string(256, 'a')).has_value());
+
+    // Boundary cases quality-engineer flagged as untested (governance Gate 3,
+    // Wave 9 PR9.2 C1-fix round): a single-character name (the 1-char end of
+    // the 1..256 range) and a LONE '.' -- legal per the character allowlist
+    // and not a ".." run, distinct from the traversal case above.
+    CHECK(yuzu::wof::validate_feature_name("A").has_value());
+    CHECK(yuzu::wof::validate_feature_name(".").has_value());
 }
 
 TEST_CASE("windows_optional_features parsers: parse_state_filter maps the three closed tokens",

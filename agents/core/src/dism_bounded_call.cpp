@@ -440,14 +440,16 @@ bool slot_in_flight() noexcept { return g_dism_slot.in_flight(); }
 /// SLOT PROTOCOL (peer H2, resolved): try_acquire_slot() runs BEFORE the
 /// bounded call, on the DISPATCHING thread (the plugin calls it directly).
 /// On `acquired`, the whole DISM sequence runs inside ONE bounded_call_ex
-/// here -- Completed reports the Outcome; TimedOut marks the slot
-/// timed-out (never clears in_use: the worker thread that is still running
-/// fn() owns that); Rejected means fn() never ran at all, so THIS function
-/// performs the ONE caller-side release the protocol allows.
+/// here -- Completed reports the Outcome; TimedOut CAS'es the slot
+/// Busy->TimedOut (a no-op if the worker already released it -- see
+/// DismSlot::mark_timed_out()'s own doc comment in
+/// agents/shared/windows_optional_features_parsers.hpp); Rejected means
+/// fn() never ran at all, so THIS function performs the ONE caller-side
+/// release the protocol allows.
 BoundedOutcome run_list_bounded(const std::optional<std::unordered_set<yuzu::wof::FeatureState>>& filter) {
     auto bounded = yuzu::shared::bounded_call_ex(kTimeout, [filter]() { return run_dism_list(filter); });
     if (bounded.status == yuzu::shared::BoundedCallStatus::TimedOut) {
-        g_dism_slot.mark_timed_out(); // DISPATCHING thread; never clears in_use
+        g_dism_slot.mark_timed_out(); // DISPATCHING thread; CAS Busy->TimedOut only
         return {BoundedStatus::TimedOut, {}};
     }
     if (bounded.status == yuzu::shared::BoundedCallStatus::Rejected) {
@@ -462,7 +464,7 @@ BoundedOutcome run_list_bounded(const std::optional<std::unordered_set<yuzu::wof
 BoundedOutcome run_info_bounded(const std::string& name) {
     auto bounded = yuzu::shared::bounded_call_ex(kTimeout, [name]() { return run_dism_info(name); });
     if (bounded.status == yuzu::shared::BoundedCallStatus::TimedOut) {
-        g_dism_slot.mark_timed_out(); // DISPATCHING thread; never clears in_use
+        g_dism_slot.mark_timed_out(); // DISPATCHING thread; CAS Busy->TimedOut only
         return {BoundedStatus::TimedOut, {}};
     }
     if (bounded.status == yuzu::shared::BoundedCallStatus::Rejected) {
