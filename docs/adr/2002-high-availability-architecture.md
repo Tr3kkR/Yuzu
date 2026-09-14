@@ -554,8 +554,10 @@ routing outcomes** because a direct-connected agent never has a directory row; c
 (`authz::in_scope`) is checked before every send regardless of where the routing information came from.
 **Task D consumed the resulting `route_unreadable` outcome** (a degraded directory READ, the systemic
 sibling of `containment_unreadable`): the outbox delivery loop RESCHEDULES on it instead of marking
-`no_agents_reached`, it is discriminated at the five zero-reach cascade sites (#3424/#3511) plus the
-`deployment_engine.cpp`/`policy_evaluator.cpp` consumers, and the `YuzuGatewayRouteWriteFailed` /
+`no_agents_reached`, it is discriminated at the FOUR operator-facing zero-reach cascade sites
+(#3424/#3511: `mcp_server.cpp`/`command_routes.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`;
+`server.cpp`'s legacy-forward is Broadcast-only, wires no route fallback, and correctly has no branch)
+plus the `deployment_engine.cpp`/`policy_evaluator.cpp` consumers, and the `YuzuGatewayRouteWriteFailed` /
 `YuzuGatewayRouteUnreadable` alert rules shipped (`docs/prometheus/yuzu-alerts.yml`). 4.2b's review also
 RE-VERIFIED the once-per-session property (#4324) before this wiring landed — see the design-obligations
 bullet above. **The directory is no longer literally inert, but it is still BEHAVIORALLY inert on the

@@ -2624,27 +2624,23 @@ tests:
   # sample at all before the jump, not a "0" one).
 
   # CASE — a single register_fresh failure (store_unavailable) reaches PENDING
-  # off pre-seeding, but NOT firing.
+  # off pre-seeding, then FIRES.
   #
-  # KNOWN GAP, not fixed by this follow-up (empirically verified against
-  # promtool 3.13.1, `docker run ... test rules`): `YuzuGatewayRouteWriteFailed`
-  # pairs `rate(...[5m]) > 0` with `for: 5m` — window size == for-duration. A
-  # rate() window only shows a positive value while it still straddles the
-  # 0->1 transition; with 1-minute-spaced samples that straddle lasts at most
-  # (window - step) = 4m, one minute short of the 5m `for:` needs to hold
-  # continuously — so a TRULY isolated single increment can reach `pending`
-  # (proven below) but can mathematically never reach `firing`, at ANY sample
-  # granularity (confirmed at both 1m and 30s spacing). This is a pre-existing
-  # window-vs-for mismatch in the shipped rule, independent of the counter
-  # pre-seed this follow-up adds — fixing it (e.g. widening the rate window
-  # past the `for:` duration, the standard Prometheus authoring pattern) is an
-  # alert-rule-only edit and routes to `sre`+`architect` per
-  # docs/observability-conventions.md; flagged here rather than changed
-  # silently. In real degraded-store operation this is far less severe than it
-  # sounds: `store_unavailable` persists for the DURATION of the outage, so a
-  # genuine incident keeps incrementing (not a single isolated sample) and
-  # comfortably satisfies `for: 5m` — see the companion "sustained" case below,
-  # which is the shape a real outage produces.
+  # WHY THE RULE USES A 10m WINDOW (closed in this follow-up, #4344 MEDIUM 2):
+  # the ORIGINAL rule paired `rate(...[5m]) > 0` with `for: 5m` — window size ==
+  # for-duration. A rate() window only shows a positive value while it still
+  # straddles the 0->1 transition; that straddle lasts at most (window - step),
+  # one step short of the 5m `for:` it must hold continuously — so a truly
+  # isolated single increment could reach `pending` but mathematically never
+  # `firing`, at any sample granularity (confirmed at 1m and 30s). This
+  # follow-up widened the rule to `rate(...[10m]) > 0` (still `for: 5m`) so the
+  # straddle (~10m) comfortably exceeds the `for:` and a lone genuine failure
+  # DOES fire, ~5m after onset — see the firing assertion below. The counter
+  # pre-seed (a 0 baseline before the incident) is the other half: rate() needs
+  # an earlier in-window sample to diff against, which lazy creation didn't give
+  # it. Both halves are necessary; this case pins both. (A sustained outage —
+  # the realistic `store_unavailable` shape, which keeps incrementing — is
+  # covered by the companion case below.)
   - interval: 1m
     name: gateway route write failed - a single isolated failure reaches pending then FIRES (pre-seed + 10m rate window past the 5m for; #4344 MEDIUM 2 fully closed)
     input_series:

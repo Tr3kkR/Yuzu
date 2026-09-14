@@ -697,8 +697,8 @@ gw_enrolled:
                 // write on this path fills in a first row for this agent), so
                 // an agent whose route cannot be durably recorded must be
                 // refused rather than allowed to connect unrouteable.
-                // Same STATUS shape as the #3401 register_agent refusal above
-                // (~line 538): UNAVAILABLE, not accepted=false, so the agent
+                // Same STATUS shape as the #3401 register_agent refusal earlier
+                // in this handler: UNAVAILABLE, not accepted=false, so the agent
                 // retries on its normal reconnect backoff. UNLIKE that
                 // refusal, though, THIS one runs AFTER register_agent has
                 // already installed the session (connected gauge, agent-online

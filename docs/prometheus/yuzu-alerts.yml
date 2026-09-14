@@ -197,7 +197,12 @@ groups:
             server (pg_stat_activity, pool-acquire wait); a register_fresh
             failure additionally refuses new ProxyRegister with UNAVAILABLE, so
             gateway-fronted agents may be unable to (re)enroll until the store
-            recovers. See ADR-2002 §7 "Ship the write-failure fail-closed
+            recovers. TRIAGE BY op: op="register_fresh" is the higher-urgency
+            label (it blocks new enrollment); the other ops
+            (announce_connected/deregister/renew_leases) are fail-OPEN and a lone
+            failure there self-heals within the 90s lease TTL, so it is an early
+            low-cost signal of the same shared-store root cause rather than an
+            outage by itself. See ADR-2002 §7 "Ship the write-failure fail-closed
             posture" and docs/user-manual/metrics.md's Gateway routing
             directory section. INITIAL threshold, not yet tuned against real
             fleet data.
