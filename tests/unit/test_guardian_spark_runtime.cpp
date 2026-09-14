@@ -7295,6 +7295,72 @@ TEST_CASE("up-4 (#4221): a Queued, withdrawn head with no outcome (a double-faul
     CHECK(rt->rule_count() == 1);
 }
 
+TEST_CASE("up-4/ch-1 (#4221, Gate 8 governance follow-up): fault point 9 - an allocation "
+          "failure INSIDE reap_stranded_claims_locked's own synthesize_fallback_outcome_locked "
+          "call degrades to retry-next-pass, never a terminate, now that its noexcept is "
+          "correctly dropped",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    // Identical construction to the up-4 test above: strand a Queued, withdrawn,
+    // no-outcome Arm claim via the same genuine double-fault window (fault point 1
+    // at initial staging, a gap-hook re-arming fault point 7 inside the firewall
+    // loop's own fill-in allocation) - see that test's own comment for the full
+    // mechanics. This claim's rule is NEVER committed to rules_ (the firewalled
+    // path never reaches the ordinary fill-in loop that would commit it), which is
+    // exactly what makes reap_stranded_claims_locked's later call to
+    // synthesize_fallback_outcome_locked take the FAILURE branch - the one guarded
+    // by fault point 9 - rather than the Armed branch.
+    std::atomic<bool> hook_fired{false};
+    rt->set_index_remove_fault_for_test(true);
+    rt->set_drain_fault_point_for_test(1);
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_drain_fault_point_for_test(7);
+        hook_fired.store(true, std::memory_order_release);
+    });
+
+    const auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                     file_exists_rule("r1"), true);
+    REQUIRE(res.has_value());
+    REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    REQUIRE(yuzu::test::spin_until([&] { return hook_fired.load(std::memory_order_acquire); },
+                                   std::chrono::seconds(10)));
+    rt->set_drain_gap_hook_for_test({});
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    REQUIRE(rt->claim_queue_depth_for_test(key) == 1);
+    const auto failures_before = rt->claim_drain_failures();
+
+    // Arm fault point 9 for exactly one throw, then call expire_overdue_claims():
+    // reap_stranded_claims_locked reaches the stranded head, calls
+    // synthesize_fallback_outcome_locked, which throws bad_alloc at the seam this
+    // governance run added. The now-genuinely-functional try/catch around that call
+    // (correctly contained ONLY because noexcept was dropped in the same fix - a
+    // throw escaping a noexcept function would std::terminate before this catch
+    // ever ran) must count the failure and leave the claim for the next pass,
+    // never crash the process and never half-write the claim's outcome.
+    rt->set_drain_fault_point_for_test(9);
+    rt->expire_overdue_claims();
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // NOT reaped this pass
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+    CHECK(rt->claim_drain_failures() > failures_before);
+
+    // A clean pass (fault cleared - the one-shot compare_exchange already consumed
+    // it, but be explicit) reaps it exactly as the up-4 test's own final step does.
+    rt->expire_overdue_claims();
+    CHECK(rt->claim_queue_depth_for_test(key) == 0);
+    CHECK(rt->is_terminal(res->receipt));
+
+    // Runtime stays healthy afterward.
+    const auto res2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    REQUIRE(res2.has_value());
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 1);
+}
+
 TEST_CASE("up-5 (#4221): disarm_retained() is a real lifecycle count, not a monotonic "
           "counter - it decrements on the retained claim's own successful completion, "
           "and a repeated refusal on the SAME claim never inflates it",
