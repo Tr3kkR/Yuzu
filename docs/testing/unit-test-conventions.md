@@ -23,6 +23,18 @@ For route-handler tests, `TestRouteSink` (`tests/unit/server/test_route_sink.hpp
 
 For server tests that need a live `ExecutionTracker` in `AgentServiceImpl`, use the `TrackerScope` RAII helper in `tests/unit/server/test_agent_service_impl.cpp` — takes a `pg::PgPool&` (ADR-0065; PG-backed, not `:memory:` SQLite), `set_execution_tracker`, nulls the borrowed pointer before the tracker destructs (the production shutdown contract, `agent_service_impl.hpp:113`). Promote to `test_helpers.hpp` once a second file needs it.
 
+## Exception-safe test cleanup — `ScopeExit`
+
+`yuzu::test::ScopeExit` (`tests/unit/test_helpers.hpp`) is a generic RAII cleanup
+that runs on ANY scope exit, including exception unwind from a failing
+`REQUIRE`/`CHECK` — declare it after whatever it releases/reads so it destructs
+FIRST (reverse declaration order); its callback must not throw, since it can run
+mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
+(releasing parked pool workers before `~ThreadPool` joins them) and
+`test_guardian_outbox_send_executor.cpp` (#4223 — releasing a detached worker
+parked on a test-owned gate pointer before the pointer's stack storage can be
+destroyed). Promoted from `test_thread_pool.cpp` once a second file needed it.
+
 ## Agent-side journal storage tests — `FakeJournalStore`
 
 For any Guardian journal concurrency checkpoint that needs a storage backend without real

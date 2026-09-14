@@ -20,6 +20,7 @@
 using namespace yuzu::agent;
 using namespace std::chrono_literals;
 
+using yuzu::test::ScopeExit;
 using yuzu::test::spin_until;
 
 namespace {
@@ -162,6 +163,67 @@ TEST_CASE("a throwing send is re-thrown by the next offer() call, not swallowed 
         }
     }));
     CHECK(threw);
+}
+
+TEST_CASE("#4223 regression: the worker relinquishes eptr before scope exit, so a "
+          "descheduled worker's cleanup never races the caller's already-finished read",
+          "[spark][guardian][send_executor][chaos][tsan]") {
+    // Reproduces the exact interleaving TSan caught under CPU starvation, deterministically,
+    // via the #4223 test seam rather than relying on OS scheduling luck: park the worker
+    // right after it publishes done=true+eptr and calls notify_all() - exactly where a
+    // starved worker would be descheduled - until the caller has already consumed the
+    // result, rethrown it, and finished reading e.what(). Pre-fix (a COPY into st->eptr at
+    // the worker's publish site), the worker still owns a live second reference to the
+    // shared exception control block at this point, and releasing the gate lets its local
+    // `eptr` destruct - potentially the reference that frees the exception object - with no
+    // happens-before edge to the caller's already-completed read (the gate itself is
+    // relaxed-only by design; see set_eptr_race_release_gate_for_test()). That is a real
+    // TSan-flagged race pre-fix; this test does not itself assert failure (TSan aborts the
+    // process on its own report), so it is a no-op assertion on a non-TSan build and a red
+    // TSan build is the actual pre-fix signal. Post-fix (std::exchange(eptr, nullptr) at
+    // the publish site - see the header's file-scope comment for why plain std::move is
+    // NOT sufficient here on every target toolchain), the worker's `eptr` is already
+    // empty by the time it reaches the gate, so this passes identically under TSan or not.
+    GuardianOutboxSendExecutor exec;
+    std::atomic<bool> release_gate{false};
+    exec.set_eptr_race_release_gate_for_test(&release_gate);
+    // Declared AFTER release_gate/exec so it destructs FIRST on any exit path,
+    // including a REQUIRE/CHECK unwind below (#4223 adversarial review, K1/C2-1):
+    // release_gate is a stack local the detached worker may still be spinning on
+    // (set_eptr_race_release_gate_for_test()'s own documented contract), so a fatal
+    // assertion must release + drain the worker before release_gate (or exec) can be
+    // destroyed - matches test_thread_pool.cpp's ScopeExit precedent for the same
+    // fatal-unwind-vs-parked-worker hazard. CHECK, not REQUIRE, inside it: this may
+    // run during unwind, where a second throw would terminate.
+    ScopeExit release_on_exit{[&] {
+        release_gate.store(true, std::memory_order_relaxed);
+        CHECK(spin_until([&] { return exec.active_worker_count() == 0; }));
+        exec.set_eptr_race_release_gate_for_test(nullptr);
+    }};
+    auto entry = lifecycle_entry("e1");
+    auto throwing = [](const OutboxEntry&) -> SendResult {
+        throw std::runtime_error("send boom #4223");
+    };
+    bool threw = false;
+    REQUIRE(spin_until([&] {
+        try {
+            auto r = exec.offer(entry, throwing, 20ms);
+            return r.has_value();
+        } catch (const std::runtime_error& e) {
+            threw = true;
+            CHECK(std::string(e.what()) == "send boom #4223");
+            return true;
+        }
+    }));
+    CHECK(threw);
+    // The seam's whole point is that the worker is STILL PARKED on the gate right here -
+    // assert that precondition directly (governance Gate 3 quality-engineer finding),
+    // not just the absence of a TSan report: without this, a future refactor that
+    // relocates or removes the gate check would leave the test silently exercising
+    // nothing, passing even under TSan for the wrong reason. Deterministic, no race
+    // window: the detached trampoline only decrements worker_count after the worker
+    // lambda body returns, which cannot happen while release_gate still reads false.
+    CHECK(exec.active_worker_count() == 1);
 }
 
 TEST_CASE("item 4 regression: stop() closes the offer()-to-launch() admission race "
