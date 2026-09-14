@@ -59,7 +59,30 @@ bool decode_payload(const OutboxCommand& c, std::vector<std::string>& agent_ids,
 
 } // namespace
 
-CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {}
+CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
+    // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
+    // pre-seed both `cause` values `yuzu_server_command_outbox_deliver_retry_cause_total` can
+    // actually emit (see the increment call site below). Lazy-created-on-first-increment means a
+    // single isolated incident never crosses `rate()>0`/`increase()>0` — the first sample IS the
+    // incident, with no second sample in the window to diff against — so the alert this counter
+    // backs (`YuzuGatewayRouteUnreadable`, docs/prometheus/yuzu-alerts.yml) would stay silent on
+    // exactly the lone-incident case it exists to catch. Mirrors the desync/write-failed counter
+    // pre-seed pattern in gateway_service_impl.cpp's constructor.
+    if (d_.metrics) {
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_retry_cause_total",
+            "HA WS-4 4.2b Task D: additive breakdown, by `cause`, of the command outbox "
+            "delivery loop's retry decision when a systemic per-tick gate degrades instead of "
+            "answering — `containment_unreadable` (quarantine/containment read) or "
+            "`route_unreadable` (GatewayRouteStore directory read). Either cause reschedules the "
+            "WHOLE occurrence with back-off, even when some sends already succeeded.",
+            "counter");
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                            {{"cause", "containment_unreadable"}});
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
+                            {{"cause", "route_unreadable"}});
+    }
+}
 
 void CommandOutboxDelivery::tick() {
     if (!d_.outbox || !d_.leader || !d_.dispatch_fn || !d_.resolve_caller)

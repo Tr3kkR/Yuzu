@@ -173,8 +173,17 @@ groups:
       # #913 OTA-bounds alert thresholds, the single largest source of
       # review findings on that PR); tighten once real data exists.
       - alert: YuzuGatewayRouteWriteFailed
+        # HA WS-4 4.2b follow-up (#4344 MEDIUM 2): the rate window is 10m,
+        # DELIBERATELY WIDER than the 5m `for:`. A window == for-duration can
+        # never reach `firing` from a single isolated 0->1 increment (the
+        # rate()>0 straddle lasts only window-step, one step short of the `for:`
+        # it must hold across) — so with the counter now pre-seeded to 0, a lone
+        # write failure would otherwise reach `pending` and silently expire. The
+        # wider window keeps the 5m dampening (an instantaneous blip does not
+        # page immediately) while ensuring a genuine failure DOES fire ~5m after
+        # onset. Paired with the constructor pre-seed of every (op,reason) combo.
         expr: |
-          rate(yuzu_server_gateway_route_write_failed_total[5m]) > 0
+          rate(yuzu_server_gateway_route_write_failed_total[10m]) > 0
         for: 5m
         labels:
           severity: warning
