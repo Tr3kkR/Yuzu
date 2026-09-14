@@ -446,7 +446,7 @@ flip, with a red-first test each:
   independently confirmed unreachable on the current call graph (every path that could produce it
   routes through a `noexcept`-only inner catch before the pop) by three independent passes (Astra,
   Fable, and this implementation attempt) - so the risk of leaving it unbuilt is assessed as near
-  nil in practice. Tracked as a P3 defense-in-depth follow-up (issue TBD), not flip-gating.
+  nil in practice. Tracked as **#4366** (P2, defense-in-depth), not flip-gating.
   ch-1's fill-in-allocation seam added (both the ordinary and firewall-loop occurrences). up-5's
   redrive is now wired onto the convergence lane's priority loop (elapsed-time-gated, its own
   firewalled sweep); **this row's own "Missing telemetry" wording above is now WRONG** -
