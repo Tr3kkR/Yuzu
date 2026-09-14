@@ -10,6 +10,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include <grpcpp/grpcpp.h>
@@ -180,6 +181,19 @@ private:
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;
     std::unordered_map<std::string, std::string> gateway_sessions_;
+
+    // HA WS-4 4.2a #8: sessions whose `register_fresh` lost the connection
+    // epoch race (RegisterFreshResult::won == false) at ProxyRegister time.
+    // The session still enrolls/connects normally (unchanged from before this
+    // slice — see the ProxyRegister "fresh" branch), but its directory row
+    // belongs to a NEWER connection, so the FOLLOW-UP NotifyStreamStatus
+    // CONNECTED for this session must not call announce_connected — doing so
+    // would report `matched=false` and pollute the desync counter with a
+    // benign, expected race loss (see record_directory_desync's header
+    // comment). Same lock (sessions_mu_) as gateway_sessions_, entries added
+    // at ProxyRegister time and removed together with gateway_sessions_'s
+    // entry on DISCONNECTED.
+    std::unordered_set<std::string> lost_race_sessions_;
 };
 
 // -- ManagementServiceImpl (placeholder) --------------------------------------
