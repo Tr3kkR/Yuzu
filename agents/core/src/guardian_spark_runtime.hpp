@@ -1652,15 +1652,22 @@ private:
         compensation_reserved_count_[idx].fetch_add(1, std::memory_order_relaxed);
         return CompensationPermit{&compensation_reserved_count_[idx]};
     }
-    /// registry_mu_ NOT required for correctness (the permit's own reset() is
-    /// atomic-backed and safe off-lock - see CompensationPermit's own doc comment)
-    /// but called under it at every existing call site for locality with the rest
-    /// of this claim's bookkeeping. Idempotent: a no-op if `claim` does not
+    /// Gate 8 re-review (this governance run, unhappy-path UP-8): registry_mu_ IS
+    /// required here, and the scope of the earlier "lock not required" claim was
+    /// too broad - correct it precisely. What's actually lock-independent is ONLY
+    /// the atomic decrement inside CompensationPermit::reset() (see that class's
+    /// own doc comment). Accessing `claim.compensation_permit` itself - the
+    /// std::optional wrapper on KeyClaim - has no synchronization of its own, so a
+    /// caller reading/writing it concurrently with another registry_mu_-holding
+    /// caller of the SAME claim is a data race regardless of the target atomic's
+    /// own thread-safety. Every real call site already takes registry_mu_ for
+    /// locality with the rest of this claim's bookkeeping - that requirement is
+    /// not merely a style choice. Idempotent: a no-op if `claim` does not
     /// currently hold a reservation (already released, or never took one - a
     /// Disarm claim, or an Arm claim that never reached dispatch_arm_off_lock).
-    /// Always call this (or KeyClaim::compensation_permit.reset() directly) rather
-    /// than touching compensation_reserved_count_ directly, so double-release and
-    /// leaks are both structurally impossible.
+    /// Always call this (or KeyClaim::compensation_permit.reset() directly, still
+    /// under registry_mu_) rather than touching compensation_reserved_count_
+    /// directly, so double-release and leaks are both structurally impossible.
     void release_compensation_locked(KeyClaim& claim) noexcept {
         claim.compensation_permit.reset();
     }
@@ -1677,12 +1684,15 @@ private:
         disarm_retained_.fetch_add(1, std::memory_order_relaxed);
         claim.retained_guard.emplace(&disarm_retained_);
     }
-    /// registry_mu_ NOT required for correctness (see RetainedGuard's own doc
-    /// comment) but called under it at every existing call site for locality.
-    /// Idempotent: a no-op if `claim` is not currently counted as retained. Call at
-    /// EVERY terminal removal of a Disarm claim (successful completion,
-    /// Stopped-drop, DeadSubscription shortcut) - never decrement disarm_retained_
-    /// directly.
+    /// Gate 8 re-review (this governance run, unhappy-path UP-8): registry_mu_ IS
+    /// required here, same correction as release_compensation_locked() above -
+    /// only RetainedGuard's own atomic decrement is lock-independent; the
+    /// `claim.retained_guard` optional wrapper itself is not synchronized and every
+    /// real call site already takes registry_mu_ for that reason, not merely for
+    /// locality. Idempotent: a no-op if `claim` is not currently counted as
+    /// retained. Call at EVERY terminal removal of a Disarm claim (successful
+    /// completion, Stopped-drop, DeadSubscription shortcut) - never decrement
+    /// disarm_retained_ directly.
     void clear_retained_locked(KeyClaim& claim) noexcept {
         claim.retained_guard.reset();
     }

@@ -477,9 +477,14 @@ flip, with a red-first test each:
   matching its own now-genuinely-functional catch path), and `fail_all_claims_locked` now also
   releases a compensation permit defensively (consistency-auditor finding, provably a no-op today,
   kept for future-caller safety). Two new isolated `[spark]` test cases pin the RAII types' own
-  engage/move/release contract directly. Full agent suite (3033/3034 cases, 1 platform-skipped,
-  122850 assertions) and targeted `[spark]` suite (587/587, 13998 assertions) both green after the
-  fix; Gate 8 re-review follows in the same run.
+  engage/move/release contract directly; a third (Gate 8 re-review follow-up, quality-engineer and
+  cpp-safety independently converging on the same gap) drives fault point 9 through a genuine
+  double-fault scenario and was red-first-validated - the noexcept bug was temporarily
+  reintroduced, confirmed the new test crashes with `terminate called after throwing std::bad_alloc`,
+  then reverted. Full agent suite (3034/3035 cases, 1 platform-skipped, 126244 assertions) and
+  targeted `[spark]` suite (588/588, 14012 assertions) both green after all three fix commits;
+  Gate 8 re-review (11 agents across the re-run Gate 2/3/4/6 set) found zero new BLOCKING findings
+  and confirmed the RAII-floor finding CLOSED (cpp-safety's own authoritative ruling).
 - **NEW (added 2026-09-13, sre finding on the #2012/#3840 doc-sweep)**: #4279's lane-cap-overshoot
   observation (`SparkDetachedLane`'s shared admission primitive, `max_active=9 > cap=8` on a real
   storm-load test, 1-in-~10 hardware runs, root cause undetermined) has no PR-5 acceptance
