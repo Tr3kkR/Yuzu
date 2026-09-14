@@ -7,7 +7,7 @@
       "method": "POST",
       "path": "/api/v1/management-groups"
     },
-    "mcp_twin": null,
+    "mcp_twin": "create_management_group",
     "status": "twinned"
   },
   {
