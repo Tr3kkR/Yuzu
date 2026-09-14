@@ -295,6 +295,59 @@ TEST_CASE("execute_user_query: software_live and software_daily are sandbox-read
     CHECK(daily->rows[0][0] == "3");
 }
 
+TEST_CASE("execute_user_query: usage tables are denied to generic tar.sql (#4260)",
+          "[tar][store][security][usage]") {
+    // usage/usage_daily/usage_daily_user are read ONLY through the
+    // Forensics-gated app_usage plugin reads (p2.1/p2.2), which never go
+    // through execute_user_query. A generic tar.sql query touching any of
+    // them -- direct name, $Usage_* placeholder, alias, or JOIN/subquery --
+    // must be rejected by the read-only connection's SQLite authorizer, not
+    // silently return rows or an empty success.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+        "(86400, 'a.exe', 1, 10, 1000, 1010, 1, 0, 0)"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES (86400, 'a.exe', 'alice')"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) VALUES "
+        "(1000, 0, 'open', 1, 'a.exe', 'alice', 1000)"));
+    REQUIRE(t.db.insert_process_events({[] {
+        ProcessEvent p;
+        p.ts = 1000;
+        p.snapshot_id = 1;
+        p.action = "started";
+        p.pid = 1;
+        p.name = "p.exe";
+        return p;
+    }()}));
+
+    CHECK_FALSE(t.db.execute_user_query("SELECT * FROM usage_daily").has_value());
+
+    // Translation stays intact ($Usage_Daily -> usage_daily resolves) -- the
+    // authorizer denies post-translation, not the translator pre-emptively.
+    auto translated = validate_and_translate_sql("SELECT * FROM $Usage_Daily");
+    REQUIRE(translated.has_value());
+    CHECK(translated->find("usage_daily") != std::string::npos);
+    CHECK_FALSE(t.db.execute_user_query(*translated).has_value());
+
+    CHECK_FALSE(t.db.execute_user_query("SELECT u.exe_key FROM usage_live u").has_value());
+    CHECK_FALSE(t.db
+                    .execute_user_query("SELECT p.name FROM process_live p JOIN usage_daily d "
+                                         "ON d.exe_key = p.name")
+                    .has_value());
+    CHECK_FALSE(
+        t.db.execute_user_query("SELECT (SELECT COUNT(*) FROM usage_daily_user)").has_value());
+
+    // Positive control: the authorizer isn't wedged shut -- a non-usage
+    // table via its dollar name still works.
+    auto ctrl = t.db.execute_user_query("SELECT COUNT(*) FROM $Process_Live");
+    REQUIRE(ctrl.has_value());
+    REQUIRE(ctrl->rows.size() == 1);
+    CHECK(ctrl->rows[0][0] == "1");
+}
+
 TEST_CASE("tar.export $Software summary projection references only existing columns",
           "[tar][store][software][export]") {
     // Regression guard (#1620): do_export's `software` UNION branch builds a summary

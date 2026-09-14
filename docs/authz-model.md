@@ -369,6 +369,18 @@ endpoint are planned, not yet designed in detail — there is no `seed_kill_swit
 equivalent) anywhere in this tree today. Until it lands, `Forensics` exists as authorization
 infrastructure only.
 
+**Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
+The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
+to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/
+`usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is reachable ONLY
+through that surface. It is deliberately unreachable through the generic `tar.sql` endpoint
+(`Infrastructure:Read`, `plugin_action_catalogue_a.hpp`): the three usage tables are excluded from
+`is_queryable_table()`'s allowlist in `tar_schema_registry.cpp`, so the read-only connection's
+SQLite authorizer denies every access path to them — direct name, `$Usage_*` placeholder, alias,
+JOIN, or subquery — with the same no-existence-oracle posture `tar_events` already gets (#760
+UP-8). #4260 tracked this gap; closed by this exclusion. #2744 (the app_usage measurand ADR) is
+superseded by the machine-scope decision above and closes without a code change.
+
 ## Testing
 
 `tests/unit/server/test_authz_model.cpp` covers:
