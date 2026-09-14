@@ -496,8 +496,10 @@ HiveAccessStatus with_user_hive(const std::string& sid, const std::string& profi
         return finish(HiveAccessStatus::not_found);
 
     // Everything below mutates process-token privilege state and takes an
-    // exclusive lock on the hive file -- see offline_hive_mutex().
-    const std::lock_guard<std::mutex> offline_lock(offline_hive_mutex());
+    // exclusive lock on the hive file -- see offline_hive_mutex(). The
+    // ScopedOfflineHiveLock wrapper logs wait/hold time -- see
+    // offline_hive_mutex.hpp's INSTRUMENTATION note.
+    const yuzu::agent::ScopedOfflineHiveLock offline_lock("with_user_hive");
 
     // R15: the offline-hive fallback rides SeBackupPrivilege/SeRestorePrivilege,
     // which the agent account already holds (docs/agent-privilege-model.md) --
