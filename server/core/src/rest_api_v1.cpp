@@ -25,6 +25,8 @@
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
 #include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
 #include "management_group_model.hpp" // #2146 Batch B4: shared REST+MCP management-group JSON builders
+#include "license_model.hpp" // #2146 Batch B5: shared REST+MCP platform-license JSON builders
+#include "software_deployment_model.hpp" // #2146 Batch B5: shared REST+MCP software-deployment JSON builder
 #include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
                                      // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
@@ -10353,20 +10355,12 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // Shared builder (software_deployment_model.hpp) - the MCP twin
+            // list_software_deployments calls the SAME per-row function
+            // (docs/api-twin-recipe.md §1 Rule 1 / §8 worked example).
             JArr arr;
-            for (const auto& d : *deps) {
-                arr.add(JObj()
-                            .add("id", d.id)
-                            .add("package_id", d.package_id)
-                            .add("status", d.status)
-                            .add("created_by", d.created_by)
-                            .add("created_at", d.created_at)
-                            .add("started_at", d.started_at)
-                            .add("completed_at", d.completed_at)
-                            .add("agents_targeted", static_cast<int64_t>(d.agents_targeted))
-                            .add("agents_success", static_cast<int64_t>(d.agents_success))
-                            .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
-            }
+            for (const auto& d : *deps)
+                arr.add_raw(software_deployment_row_json(d).dump());
             res.set_content(list_json(arr.str(), static_cast<int64_t>(deps->size())),
                             "application/json");
         });
@@ -10521,18 +10515,10 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, days.error()), "application/json");
                 return;
             }
-            auto data = JObj()
-                            .add("id", (*lic)->id)
-                            .add("organization", (*lic)->organization)
-                            .add("seat_count", (*lic)->seat_count)
-                            .add("seats_used", (*lic)->seats_used)
-                            .add("issued_at", (*lic)->issued_at)
-                            .add("expires_at", (*lic)->expires_at)
-                            .add("edition", (*lic)->edition)
-                            .add("status", (*lic)->status)
-                            .add("days_remaining", *days)
-                            .str();
-            res.set_content(ok_json(data), "application/json");
+            // Shared builder (license_model.hpp) - the MCP twin get_platform_license
+            // calls the SAME function (docs/api-twin-recipe.md §1 Rule 1).
+            res.set_content(ok_json(platform_license_json(**lic, *days).dump()),
+                            "application/json");
         });
 
         sink.Post("/api/v1/license", [auth_fn, perm_fn, audit_fn, license_store](
@@ -10598,16 +10584,12 @@ void RestApiV1::register_routes(
                                          "application/json");
                          return;
                      }
+                     // Shared builder (license_model.hpp) - the MCP twin
+                     // list_license_alerts calls the SAME per-alert function
+                     // (docs/api-twin-recipe.md §1 Rule 1).
                      JArr arr;
-                     for (const auto& a : *alerts) {
-                         arr.add(JObj()
-                                     .add("id", a.id)
-                                     .add("license_id", a.license_id)
-                                     .add("alert_type", a.alert_type)
-                                     .add("message", a.message)
-                                     .add("triggered_at", a.triggered_at)
-                                     .add("acknowledged", a.acknowledged));
-                     }
+                     for (const auto& a : *alerts)
+                         arr.add_raw(license_alert_json(a).dump());
                      res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts->size())),
                                      "application/json");
                  });

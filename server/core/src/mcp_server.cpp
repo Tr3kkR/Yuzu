@@ -85,6 +85,11 @@
 #include "offload_target_store.hpp"
 #include "license_store.hpp"
 #include "software_deployment_store.hpp"
+// Adversarial-review fix (#2146 Batch B5): shared REST+MCP JSON builders
+// (docs/api-twin-recipe.md §1 Rule 1) for the three families above.
+#include "offload_target_model.hpp"
+#include "license_model.hpp"
+#include "software_deployment_model.hpp"
 
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
@@ -18236,6 +18241,22 @@ McpServer::HandlerFn McpServer::build_handler(
                 return;
             }
 
+            // ── #2146 Batch B3: execution/fleet statistics read twins ───────────
+            // Shared builders (execution_statistics_model.hpp) -- the REST twins
+            // (rest_api_v1.cpp) call the SAME functions, so the JSON shape cannot
+            // drift (api-twin-recipe.md Rule 1). ExecutionTracker's aggregate
+            // queries here (get_fleet_summary/get_agent_statistics/
+            // get_definition_statistics) return plain values, never
+            // std::optional/std::expected -- a pool/query fault degrades
+            // SILENTLY to zero/empty (matching every existing caller of these
+            // three methods, REST included -- see execution_tracker.cpp), so the
+            // only guardable failure mode here is the pointer itself being
+            // unwired. Unaudited on REST (no audit_fn call at either route); the
+            // generic mcp_audit("success") is still emitted, matching the
+            // dominant convention nearly every sibling read tool in this file
+            // uses regardless of the REST twin's own audit posture (see
+            // list_preflight_runs/get_deployment_preview's identical rationale
+            // above).
             if (tool_name == "get_execution_statistics") {
                 if (!tier_allows(tier, "Execution", "Read")) {
                     res.set_content(
@@ -18815,18 +18836,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Shared builder (offload_target_model.hpp) - the REST twin
+                // GET /api/v1/offload-targets calls the SAME function, so the
+                // two JSON shapes cannot drift (docs/api-twin-recipe.md §1
+                // Rule 1).
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& t : *targets) {
-                    arr.push_back({{"id", t.id},
-                                   {"name", t.name},
-                                   {"url", t.url},
-                                   {"auth_type", offload_auth_type_to_string(t.auth_type)},
-                                   {"has_credential", t.has_credential},
-                                   {"event_types", t.event_types},
-                                   {"batch_size", t.batch_size},
-                                   {"enabled", t.enabled},
-                                   {"created_at", t.created_at}});
-                }
+                for (const auto& t : *targets)
+                    arr.push_back(offload_target_json(t));
                 nlohmann::json payload = {{"offload_targets", arr}};
                 mcp_audit("success");
                 res.set_content(
@@ -18972,15 +18988,10 @@ McpServer::HandlerFn McpServer::build_handler(
                     }
                     return;
                 }
-                nlohmann::json payload = {{"id", t->id},
-                                          {"name", t->name},
-                                          {"url", t->url},
-                                          {"auth_type", offload_auth_type_to_string(t->auth_type)},
-                                          {"has_credential", t->has_credential},
-                                          {"event_types", t->event_types},
-                                          {"batch_size", t->batch_size},
-                                          {"enabled", t->enabled},
-                                          {"created_at", t->created_at}};
+                // Shared builder (offload_target_model.hpp) - the REST twin
+                // GET /api/v1/offload-targets/{id} calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1).
+                nlohmann::json payload = offload_target_json(*t);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -19100,18 +19111,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 const int limit = std::clamp(static_cast<int>(*limit_opt), 1, 1000);
+                // Shared builder (offload_target_model.hpp) - the REST twin
+                // GET /api/v1/offload-targets/{id}/deliveries calls the SAME
+                // function (docs/api-twin-recipe.md §1 Rule 1).
                 auto deliveries = offload_target_store->get_deliveries(target_id, limit);
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : deliveries) {
-                    arr.push_back({{"id", d.id},
-                                   {"target_id", d.target_id},
-                                   {"event_type", d.event_type},
-                                   {"event_count", d.event_count},
-                                   {"payload", d.payload},
-                                   {"status_code", d.status_code},
-                                   {"delivered_at", d.delivered_at},
-                                   {"error", d.error}});
-                }
+                for (const auto& d : deliveries)
+                    arr.push_back(offload_delivery_json(d));
                 nlohmann::json payload = {{"deliveries", arr}};
                 mcp_audit("success");
                 res.set_content(
@@ -19322,15 +19328,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                nlohmann::json payload = {{"id", (*lic)->id},
-                                          {"organization", (*lic)->organization},
-                                          {"seat_count", (*lic)->seat_count},
-                                          {"seats_used", (*lic)->seats_used},
-                                          {"issued_at", (*lic)->issued_at},
-                                          {"expires_at", (*lic)->expires_at},
-                                          {"edition", (*lic)->edition},
-                                          {"status", (*lic)->status},
-                                          {"days_remaining", *days}};
+                // Shared builder (license_model.hpp) - the REST twin
+                // GET /api/v1/license calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1).
+                nlohmann::json payload = platform_license_json(**lic, *days);
                 mcp_audit("success");
                 res.set_content(
                     success_response(id, tool_result(payload.dump(), kObjectOutputSchema)),
@@ -19442,15 +19443,12 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Shared builder (license_model.hpp) - the REST twin
+                // GET /api/v1/license/alerts calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1).
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& a : *alerts) {
-                    arr.push_back({{"id", a.id},
-                                   {"license_id", a.license_id},
-                                   {"alert_type", a.alert_type},
-                                   {"message", a.message},
-                                   {"triggered_at", a.triggered_at},
-                                   {"acknowledged", a.acknowledged}});
-                }
+                for (const auto& a : *alerts)
+                    arr.push_back(license_alert_json(a));
                 nlohmann::json payload = {{"alerts", arr}};
                 mcp_audit("success");
                 res.set_content(
@@ -19492,19 +19490,13 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // Shared builder (software_deployment_model.hpp) - the REST
+                // twin GET /api/v1/software-deployments calls the SAME
+                // function (docs/api-twin-recipe.md §1 Rule 1 / §8 worked
+                // example).
                 nlohmann::json arr = nlohmann::json::array();
-                for (const auto& d : *deps) {
-                    arr.push_back({{"id", d.id},
-                                   {"package_id", d.package_id},
-                                   {"status", d.status},
-                                   {"created_by", d.created_by},
-                                   {"created_at", d.created_at},
-                                   {"started_at", d.started_at},
-                                   {"completed_at", d.completed_at},
-                                   {"agents_targeted", d.agents_targeted},
-                                   {"agents_success", d.agents_success},
-                                   {"agents_failure", d.agents_failure}});
-                }
+                for (const auto& d : *deps)
+                    arr.push_back(software_deployment_row_json(d));
                 nlohmann::json payload = {{"deployments", arr}};
                 mcp_audit("success");
                 res.set_content(
