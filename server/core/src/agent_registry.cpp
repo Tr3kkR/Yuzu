@@ -683,6 +683,18 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
     return count;
 }
 
+bool AgentRegistry::send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
+                                       const std::string& cluster_id) {
+    // Same defensive belt-and-braces check `send_to`/`send_to_all` apply —
+    // this path has no session to have already validated anything, so it is
+    // the ONLY check this method makes before queuing.
+    if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
+        return false;
+    std::lock_guard glock(gw_pending_mu_);
+    gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
+    return true;
+}
+
 std::vector<AgentRegistry::GatewayPendingCmd> AgentRegistry::drain_gateway_pending() {
     std::lock_guard lock(gw_pending_mu_);
     auto result = std::move(gw_pending_);

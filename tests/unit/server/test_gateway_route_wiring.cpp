@@ -726,15 +726,77 @@ TEST_CASE("BatchHeartbeat: a duplicate session id in one batch and a lost-epoch-
               .value() == 0);
 }
 
+TEST_CASE("BatchHeartbeat: a session this replica's gateway_sessions_ doesn't recognize is "
+          "excluded from the renew batch but counted as unknown_session, not silently dropped "
+          "(#4246 #3/#10)",
+          "[pg][gateway_route_wiring]") {
+    // #4246 #10's renew correlation resolves agent_id from the per-replica
+    // gateway_sessions_ map (the wire carries no agent_id) — a session this
+    // replica never registered has nothing to correlate against, so it's
+    // excluded from renew_leases entirely. That must still be OBSERVABLE via
+    // the desync counter (op="renew_leases", outcome="unknown_session"),
+    // never a silent drop — the exact regression this test pins.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // A genuinely live, locally-known session, to prove the unknown one
+    // doesn't disturb its renewal.
+    auto req_live = make_gw_register(auth_mgr, "agent-hb-unknown-1");
+    apb::RegisterResponse resp_live;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req_live, &resp_live).ok());
+    const std::string live_session = resp_live.session_id();
+
+    gw::BatchHeartbeatRequest batch;
+    batch.set_gateway_node("node-hb-unknown");
+    batch.add_heartbeats()->set_session_id(live_session);
+    // Never registered on this replica — this session_id is in no
+    // gateway_sessions_ entry at all.
+    batch.add_heartbeats()->set_session_id("gw-session-never-registered-here");
+    gw::BatchHeartbeatResponse batch_resp;
+    REQUIRE(gateway_svc.BatchHeartbeat(/*context=*/nullptr, &batch, &batch_resp).ok());
+
+    // The known session still renews normally.
+    auto row_live_after = store.lookup_route("agent-hb-unknown-1");
+    REQUIRE(row_live_after.has_value());
+    REQUIRE(row_live_after->has_value());
+    CHECK((*row_live_after)->lease_until_ms.has_value());
+
+    // No shortfall — the unknown session was never added to the renew batch
+    // in the first place, so it can't manifest as a SQL-level mismatch.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "shortfall"}})
+              .value() == 0);
+    // But it IS surfaced, distinctly, as unknown_session.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "renew_leases"}, {"outcome", "unknown_session"}})
+              .value() == 1);
+}
+
 // ── Fail-open posture ────────────────────────────────────────────────────────
 
-TEST_CASE("ProxyRegister/NotifyStreamStatus: a degraded GatewayRouteStore write does NOT "
-          "fail the RPC (fail-open) and is counted",
+TEST_CASE("ProxyRegister: a degraded GatewayRouteStore register_fresh write FAILS the RPC "
+          "(fail-CLOSED — Task B, 4.2b)",
           "[gateway_route_wiring]") {
+    // register_fresh is the ONE fail-CLOSED record_route_store_failure call
+    // site (Task B, 4.2b): it CREATES the row, so a missed create must refuse
+    // the registration rather than let the agent connect unrouteable.
+    //
     // A deliberately unparseable conninfo makes PgPool::valid() false, so
     // GatewayRouteStore's construction-time acquire() fails FAST — no network
     // I/O at all (pg_pool.cpp: `if (!valid_) return {};`) — and the store
-    // stays permanently open_==false. Every write below therefore degrades
+    // stays permanently open_==false. The write below therefore degrades
     // with store_unavailable without touching a real Postgres instance, so
     // this case runs even when YUZU_TEST_POSTGRES_DSN is unset.
     PgPool broken_pool{{.conninfo = "not a valid conninfo string ===", .size = 1}};
@@ -749,15 +811,48 @@ TEST_CASE("ProxyRegister/NotifyStreamStatus: a degraded GatewayRouteStore write 
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&broken_store);
 
-    auto req = make_gw_register(auth_mgr, "agent-failopen-1");
+    auto req = make_gw_register(auth_mgr, "agent-failclosed-1");
     apb::RegisterResponse resp;
     auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
-    CHECK(status.ok()); // fail-open: register_fresh degraded, RPC still succeeds
-    CHECK(resp.accepted());
+    CHECK_FALSE(status.ok()); // fail-CLOSED: register_fresh degraded, RPC refused
+    CHECK(status.error_code() == grpc::StatusCode::UNAVAILABLE);
     CHECK(metrics
               .counter("yuzu_server_gateway_route_write_failed_total",
                        {{"op", "register_fresh"}, {"reason", "store_unavailable"}})
               .value() == 1);
+}
+
+TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore announce_connected write does NOT "
+          "fail the RPC (fail-OPEN — Task B, 4.2b) and is counted",
+          "[pg][gateway_route_wiring]") {
+    // announce_connected stays fail-OPEN (Task B, 4.2b): the CONNECTED notify
+    // is a droppable gen_server:cast and registry_.set_gateway_route has
+    // already published the in-memory route by the time this write runs. A
+    // REAL store is needed first so ProxyRegister (now fail-CLOSED on
+    // register_fresh) succeeds and mints a session; the store is then SWAPPED
+    // for a broken one so only the FOLLOW-UP announce_connected write
+    // degrades.
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req = make_gw_register(auth_mgr, "agent-failopen-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+
+    PgPool broken_pool{{.conninfo = "not a valid conninfo string ===", .size = 1}};
+    GatewayRouteStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+    gateway_svc.set_gateway_route_store(&broken_store);
 
     gw::StreamStatusNotification notif;
     notif.set_agent_id("agent-failopen-1");
