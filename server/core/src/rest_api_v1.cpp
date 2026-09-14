@@ -23,6 +23,8 @@
 #include "guardian_model.hpp" // #4037 shared status-rollup / rule-agent-status / device-guards read models
 #include "execution_model.hpp" // #4030: shared execution list/agent/kpi/response row builders
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
+#include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
+#include "management_group_model.hpp" // #2146 Batch B4: shared REST+MCP management-group JSON builders
 #include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
                                      // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
@@ -2482,25 +2484,11 @@ void RestApiV1::register_routes(
                      return;
                  }
                  auto members = mgmt_store->get_members(id);
-                 JArr member_arr;
-                 for (const auto& m : members)
-                     member_arr.add(JObj()
-                                        .add("agent_id", m.agent_id)
-                                        .add("source", m.source)
-                                        .add("added_at", m.added_at));
-
-                 auto data = JObj()
-                                 .add("id", g->id)
-                                 .add("name", g->name)
-                                 .add("description", g->description)
-                                 .add("parent_id", g->parent_id)
-                                 .add("membership_type", g->membership_type)
-                                 .add("scope_expression", g->scope_expression)
-                                 .add("created_by", g->created_by)
-                                 .add("created_at", g->created_at)
-                                 .add("updated_at", g->updated_at)
-                                 .raw("members", member_arr.str());
-                 res.set_content(ok_json(data.str()), "application/json");
+                 // Shared builder (management_group_model.hpp) - the MCP twin
+                 // get_management_group calls the SAME function, so the two
+                 // JSON shapes cannot drift (docs/api-twin-recipe.md §1 Rule 1).
+                 res.set_content(ok_json(management_group_detail_json(*g, members)),
+                                 "application/json");
              });
 
     // Update group (rename, re-parent, change description/membership)
@@ -2588,7 +2576,11 @@ void RestApiV1::register_routes(
             return;
         }
         audit_fn(req, "management_group.update", "success", "ManagementGroup", id, updated.name);
-        res.set_content(ok_json(JObj().add("updated", true).str()), "application/json");
+        // Shared builder (management_group_model.hpp) - the MCP twin
+        // update_management_group calls the SAME function (docs/api-twin-recipe.md
+        // §1 Rule 1), passing its own audit_fn result where REST always passes
+        // true (REST has no audit_persisted body field for this route).
+        res.set_content(ok_json(management_group_update_ack_json()), "application/json");
     });
 
     sink.Delete(
@@ -3183,37 +3175,13 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
+                 // Shared builder (api_token_model.hpp) - the MCP twin
+                 // list_api_tokens calls the SAME per-token function, so the
+                 // two JSON shapes cannot drift (docs/api-twin-recipe.md §1
+                 // Rule 1).
                  JArr arr;
-                 for (const auto& t : *tokens) {
-                     JObj item;
-                     item.add("token_id", t.token_id)
-                         .add("name", t.name)
-                         .add("principal_id", t.principal_id)
-                         .add("created_at", t.created_at)
-                         .add("expires_at", t.expires_at)
-                         .add("last_used_at", t.last_used_at)
-                         .add("revoked", t.revoked);
-                     if (!t.scope_service.empty())
-                         item.add("scope_service", t.scope_service);
-                     // Echo the MCP tier so an operator can verify what they
-                     // minted (authdb Q3 / consistency #6 — the field is settable
-                     // now, so it must be readable back).
-                     if (!t.mcp_tier.empty())
-                         item.add("mcp_tier", t.mcp_tier);
-                     // P2 #11: surface an in-flight rotation so it isn't
-                     // invisible from this list — omitted entirely for a
-                     // token that has never participated in one (empty/0 is
-                     // the store's own "never rotated" sentinel).
-                     if (!t.rotation_group.empty())
-                         item.add("rotation_group", t.rotation_group);
-                     if (!t.supersedes_token_id.empty())
-                         item.add("supersedes_token_id", t.supersedes_token_id);
-                     if (t.overlap_expires_at != 0)
-                         item.add("overlap_expires_at", t.overlap_expires_at);
-                     if (t.confirmed_at != 0)
-                         item.add("confirmed_at", t.confirmed_at);
-                     arr.add(item);
-                 }
+                 for (const auto& t : *tokens)
+                     arr.add_raw(api_token_list_item_json(t));
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(tokens->size())),
                                  "application/json");
              });
@@ -3435,11 +3403,12 @@ void RestApiV1::register_routes(
         // increments and the operator-visible metric paths catch it.
         (void)audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
         res.status = 201;
-        JObj resp;
-        resp.add("token", *result).add("name", name);
-        if (!scope_service.empty())
-            resp.add("scope_service", scope_service);
-        res.set_content(ok_json(resp.str()), "application/json");
+        // Shared builder (api_token_model.hpp) - the MCP twin create_api_token
+        // calls the SAME function (docs/api-twin-recipe.md §1 Rule 1), passing
+        // its own audit_fn result where REST always passes true (REST has no
+        // audit_persisted body field for this route).
+        res.set_content(ok_json(api_token_create_ack_json(*result, name, scope_service)),
+                        "application/json");
     });
 
     sink.Delete(R"(/api/v1/tokens/(.+))", [auth_fn, perm_fn, audit_fn, step_up_fn, token_store](

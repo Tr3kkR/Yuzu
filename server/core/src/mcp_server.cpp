@@ -77,6 +77,7 @@
 #include "plugin_config_store.hpp"
 #include "plugin_config_parsers.hpp"
 #include "upload_grant_parsers.hpp"
+#include <yuzu/server/auth_db.hpp> // B4: is_valid_username (unlock_account, mirrors the REST route)
 
 #include <yuzu/version_string.hpp> // canon_version (VERIFY compare version match)
 
@@ -649,6 +650,97 @@ static const ToolDef kTools[] = {
      R"j("filters":{"type":"object","additionalProperties":{"type":"string"},"description":"Mangled column key -> exact-match value; empty/omitted means no filter (count is 0)"})j"
      R"j(},"required":["command_id","plugin"]})j",
      R"j({"type":"object","properties":{"agent_count":{"type":"integer","description":"Number of currently-visible agents matching filters; 0 when filters is empty"}},"required":["agent_count"]})j"},
+
+    // B4 (#2146 API-parity Batch B4) — six MCP twins of the remaining
+    // /api/v1/management-groups* CRUD/membership/role surface. list_management_groups
+    // and preview_management_group_agent_count above already have twins; there is NO
+    // delete-management-group tool here — the REST DELETE route exists on this branch
+    // but delete was deliberately left out of this batch's scope (see PR description).
+    {"create_management_group",
+     "Create a new management group (hierarchical device grouping used for access scoping). "
+     "Mirrors POST /api/v1/management-groups. Requires ManagementGroup:Write — approval-gated "
+     "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing.",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","minLength":1,"description":"Group display name"},)j"
+     R"j("description":{"type":"string","description":"Optional description"},)j"
+     R"j("parent_id":{"type":"string","description":"Optional parent group id; omit for a top-level group under root. Max hierarchy depth is 5."},)j"
+     R"j("membership_type":{"type":"string","enum":["static","dynamic"],"default":"static","description":"static = explicit member list via add_management_group_member; dynamic = scope_expression-evaluated"},)j"
+     R"j("scope_expression":{"type":"string","description":"Scope DSL expression for a dynamic group; ignored for static"})j"
+     R"j(},"required":["name"]})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
+
+    {"get_management_group",
+     "Get one management group's metadata plus its current member list. Mirrors GET "
+     "/api/v1/management-groups/{id}. Requires ManagementGroup:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"})j"
+     R"j(},"required":["group_id"]})j",
+     R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":"string"},"membership_type":{"type":"string"},"scope_expression":{"type":"string"},"created_by":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"members":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"source":{"type":"string"},"added_at":{"type":"integer"}}}}},"required":["id","name","parent_id","membership_type"]})j"},
+
+    {"update_management_group",
+     "Update a management group's name/description/parent/membership-type/scope-expression. "
+     "Only fields present in the call are changed. Re-parenting is rejected if it would create a "
+     "cycle or exceed the maximum hierarchy depth (5); the root group can never be re-parented. "
+     "Mirrors PUT /api/v1/management-groups/{id}. Requires ManagementGroup:Write — approval-gated "
+     "(supervised MCP tier maker-checker). Destructive: overwrites the group's existing fields.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"},)j"
+     R"j("name":{"type":"string","minLength":1},)j"
+     R"j("description":{"type":"string"},)j"
+     R"j("parent_id":{"type":"string"},)j"
+     R"j("membership_type":{"type":"string","enum":["static","dynamic"]},)j"
+     R"j("scope_expression":{"type":"string"})j"
+     R"j(},"required":["group_id"]})j",
+     R"j({"type":"object","properties":{"updated":{"type":"boolean"}},"required":["updated"]})j"},
+
+    {"add_management_group_member",
+     "Add a static member to a management group. Idempotent — adding an agent already in the "
+     "group is a no-op. Mirrors POST /api/v1/management-groups/{id}/members. Requires "
+     "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
+     "extends the member set, overwrites nothing.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"description":"Agent to add as a static member"})j"
+     R"j(},"required":["group_id","agent_id"]})j",
+     R"j({"type":"object","properties":{"added":{"type":"boolean"}},"required":["added"]})j"},
+
+    {"list_management_group_roles",
+     "List a management group's role-assignment grants (who holds ITServiceOwner/Operator/Viewer "
+     "on this group) — authorization TOPOLOGY, not group metadata. Mirrors GET "
+     "/api/v1/management-groups/{id}/roles exactly: requires ManagementGroup:Read as a LEADING "
+     "gate (the caller must be allowed to see the group at all), then EITHER the fleet-wide "
+     "UserManagement:Read permission OR the caller holding ITServiceOwner on THIS group (a "
+     "group-scoped admin can read the role grants of a group it administers even without the "
+     "fleet-wide permission) - the ITServiceOwner fallback is skipped for a service-scoped MCP "
+     "token, matching REST.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"})j"
+     R"j(},"required":["group_id"]})j",
+     R"j({"type":"object","properties":{"roles":{"type":"array","items":{"type":"object","properties":{"group_id":{"type":"string"},"principal_type":{"type":"string"},"principal_id":{"type":"string"},"role_name":{"type":"string"}},"required":["group_id","principal_type","principal_id","role_name"]}}},"required":["roles"]})j"},
+
+    {"assign_management_group_role",
+     "Delegate a group-scoped role (ITServiceOwner-of-this-group can only delegate Operator or "
+     "Viewer, never ITServiceOwner itself or any fleet-wide/admin role) to a user/group/engine "
+     "principal on this management group. Mirrors POST /api/v1/management-groups/{id}/roles. "
+     "Gate is compound, mirrored exactly: authorized by the fleet-wide ManagementGroup:Write "
+     "permission OR by the caller already holding ITServiceOwner on THIS group (skipped for a "
+     "service-scoped MCP token). role_name is restricted to \"Operator\" or \"Viewer\" only — no "
+     "other role, including ITServiceOwner itself, can be delegated via this route. The "
+     "underlying store ALSO runs RbacStore::validate_assignment (Gate 4 happy-path fix: the "
+     "protection that actually fires here is its F2 shadow-row guard against a user/group "
+     "principal_id spoofed with an \"engine:\" prefix - assign_role already rejects "
+     "principal_type==\"engine\" unconditionally before validate_assignment ever runs, so its own "
+     "engine-role-disallow branch is unreachable at this call site). "
+     "Idempotent — assigning a grant that already exists is a no-op. Approval-gated (supervised "
+     "MCP tier maker-checker) as ManagementGroup:Write. Additive: extends the grant set, "
+     "overwrites nothing.",
+     R"j({"type":"object","properties":{)j"
+     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"},)j"
+     R"j("principal_type":{"type":"string","enum":["user","group","engine"],"default":"user"},)j"
+     R"j("principal_id":{"type":"string","minLength":1},)j"
+     R"j("role_name":{"type":"string","enum":["Operator","Viewer"],"description":"Only Operator and Viewer can be delegated"})j"
+     R"j(},"required":["group_id","principal_id","role_name"]})j",
+     R"j({"type":"object","properties":{"assigned":{"type":"boolean"}},"required":["assigned"]})j"},
 
     {"get_execution_status",
      "Check status of a running or completed command execution. While status is "
@@ -1892,7 +1984,12 @@ static const ToolDef kTools[] = {
      "ALWAYS inherits the predecessor's expires_at verbatim — rotation is lifetime-neutral, "
      "never accepted as a caller argument. Requires ApiToken:Rotate (self-service, not an admin "
      "operation — unlike the engine credential arm's Security:Write, and deliberately distinct "
-     "from the create/list/revoke ApiToken:Write axis). The returned token_id is "
+     "from the create/list/revoke ApiToken:Write axis; deliberately NOT approval-gated - "
+     "rotation is lifetime-neutral and cannot move authority). An MCP-tier-less caller "
+     "(empty mcp_tier - a cookie session, a plain non-MCP-tiered API token, or an engine "
+     "token) is DENIED outright rather than falling through unenforced, matching REST's "
+     "mandatory step-up on every rotate call including a re-serve; closes the #4309 gap "
+     "for this tool specifically. The returned token_id is "
      "the SUCCESSOR's (scoped exactly to the predecessor rotated, never any other in-flight "
      "rotation of the caller's — a caller may have several at once); overlap_expires_at is the "
      "PREDECESSOR's own stamp (the successor row never carries one). Mirrors POST "
@@ -1921,7 +2018,9 @@ static const ToolDef kTools[] = {
      "binding is lost or in dispute), revoke the SPECIFIC untrusted credential via "
      "DELETE /api/v1/tokens/{token_id} — there is no engine-principal terminal route in play on "
      "this human-token arm, but the same per-credential (never per-principal) revoke discipline "
-     "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Mirrors "
+     "applies. Self-service ONLY, same owner-vs-nonexistent posture as rotate_api_token. Same "
+     "MCP-tier-less deny-outright as rotate_api_token above - closed for this tool "
+     "specifically (#4309). Mirrors "
      "POST /api/v1/tokens/{id}/confirm. Destructive — requires ApiToken:Rotate.",
      R"j({"type":"object","properties":{)j"
      R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Successor token_id returned by rotate_api_token (pins the exact rotation being confirmed) — must be owned by the calling principal"},)j"
@@ -1930,6 +2029,58 @@ static const ToolDef kTools[] = {
      R"j("secret":{"type":"string","minLength":1,"maxLength":512,"description":"The raw successor secret returned by rotate_api_token - proof that the caller actually received the new credential before this call revokes the predecessor"})j"
      R"j(},"required":["token_id","secret"]})j",
      R"j({"type":"object","properties":{"confirmed":{"type":"boolean"},"token_id":{"type":"string"}},"required":["confirmed","token_id"]})j"},
+
+    // B4 (#2146 API-parity) — the base API-token CRUD tools, distinct from the
+    // rotate/confirm pair above. Share the SAME ApiTokenStore instance
+    // (engine_credential_store_) rotate_api_token/confirm_api_token_rotation
+    // already use — not a parallel store.
+    {"list_api_tokens",
+     "List the CALLING PRINCIPAL'S OWN API tokens (raw secrets never returned). "
+     "UNCONDITIONALLY self-scoped — there is no admin/all-owners view on this route, on either "
+     "REST or MCP: GET /api/v1/tokens always filters to the caller's own username with no "
+     "elevated-session bypass. (A separate admin all-owner-token view exists only as the HTMX "
+     "dashboard fragment /fragments/settings/api-tokens, which has no REST v1 route yet and "
+     "therefore no MCP twin.) Mirrors GET /api/v1/tokens. Requires ApiToken:Read.",
+     R"j({"type":"object","properties":{}})j",
+     R"j({"type":"object","properties":{"tokens":{"type":"array","items":{"type":"object","properties":{"token_id":{"type":"string"},"name":{"type":"string"},"principal_id":{"type":"string"},"created_at":{"type":"integer"},"expires_at":{"type":"integer"},"last_used_at":{"type":"integer"},"revoked":{"type":"boolean"},"scope_service":{"type":"string"},"mcp_tier":{"type":"string"},"rotation_group":{"type":"string"},"supersedes_token_id":{"type":"string"},"overlap_expires_at":{"type":"integer"},"confirmed_at":{"type":"integer"}},"required":["token_id","name","principal_id","created_at","expires_at","last_used_at","revoked"]}}},"required":["tokens"]})j"},
+
+    {"create_api_token",
+     "Mint a new API token for the CALLING PRINCIPAL — always self-issued, like create_token's "
+     "REST twin (there is no operator-mints-for-another-user path on this route). An mcp_tier or "
+     "scope_service token MUST carry an expires_at (90-day cap for an mcp_tier token). A "
+     "scope_service token additionally requires the caller to hold ITServiceOwner on the "
+     "'Service: <scope_service>' management group (or the fleet-wide ManagementGroup:Write "
+     "permission) — the SAME multi-store check (rbac_store + mgmt_store) the REST route runs; "
+     "RBAC must be enabled for a scope_service token at all. The raw token is returned exactly "
+     "once - store it now. Mirrors POST /api/v1/tokens. Requires ApiToken:Write (approval-gated "
+     "at the supervised MCP tier - maker-checker for self-service credential minting). A caller "
+     "with an empty mcp_tier (a cookie session, a plain non-MCP-tiered API token, or an engine "
+     "token - not exclusively an interactive session) is DENIED outright rather than falling "
+     "through to RBAC-only enforcement (kPermissionDenied, 'requires an MCP-tier bearer token'); "
+     "closes the #4309 interactive-session gap for this tool specifically, still open for other "
+     "approval-gated MCP tools. "
+     "Additive: mints a new credential, overwrites nothing (not idempotent - each call mints a "
+     "distinct token).",
+     R"j({"type":"object","properties":{)j"
+     R"j("name":{"type":"string","maxLength":256,"description":"Human-readable label"},)j"
+     R"j("expires_at":{"type":"integer","description":"Unix seconds; required if mcp_tier or scope_service is set (90-day cap for mcp_tier); 0/omitted = never expires"},)j"
+     R"j("scope_service":{"type":"string","maxLength":256,"description":"Scope this token to one IT service (change-window token); requires RBAC on and ITServiceOwner authority for that service"},)j"
+     R"j("mcp_tier":{"type":"string","enum":["readonly","operator","supervised"],"description":"Mint this as an MCP token at the given tier; omit for an ordinary REST-only token"})j"
+     R"j(},"required":["name"]})j",
+     R"j({"type":"object","properties":{"token":{"type":"string","description":"The raw token secret — shown once, never retrievable again"},"name":{"type":"string"},"scope_service":{"type":"string"}},"required":["token","name"]})j"},
+
+    {"revoke_api_token",
+     "Revoke one of the CALLING PRINCIPAL'S OWN API tokens by token_id (or, for an elevated/admin "
+     "session, any token — same JIT-elevation allowance as DELETE /api/v1/tokens/{id}). A "
+     "not-owned token_id and a nonexistent one are INDISTINGUISHABLE (both report 'token not "
+     "found') — not an enumeration oracle. Mirrors DELETE /api/v1/tokens/{id}. Requires "
+     "ApiToken:Delete — approval-gated (supervised MCP tier maker-checker; Delete is always "
+     "destructive). Same interactive-session denial as create_api_token - closed for this tool "
+     "specifically (#4309). Destructive, idempotent per the store's own already-revoked handling.",
+     R"j({"type":"object","properties":{)j"
+     R"j("token_id":{"type":"string","minLength":1,"maxLength":64,"description":"Token id to revoke (from list_api_tokens/create_api_token)"})j"
+     R"j(},"required":["token_id"]})j",
+     R"j({"type":"object","properties":{"revoked":{"type":"boolean"}},"required":["revoked"]})j"},
 
     {"transfer_engine_principal_owner",
      "Reassign an engine principal's named responsible owner. Admin-forced — independent of the "
@@ -2176,6 +2327,51 @@ static const ToolDef kTools[] = {
      // "required" rather than forcing a stricter oneOf this codebase's
      // other optional-field schemas (e.g. get_kek_status) don't use either.
      R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"securable_types":{"type":"array","items":{"type":"string"}},"operations":{"type":"array","items":{"type":"string"}},"roles":{"type":"array","description":"Present only for a caller holding UserManagement:Read (#2376 floor); absent when roles_omitted is true","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"is_system":{"type":"boolean"},"permissions":{"type":"array","items":{"type":"object","properties":{"securable_type":{"type":"string"},"operation":{"type":"string"},"effect":{"type":"string"}},"required":["securable_type","operation","effect"]}}},"required":["name","description","is_system","permissions"]}},"roles_omitted":{"type":"boolean","description":"Present (true) only when the caller lacks UserManagement:Read — the grid above is withheld, stated explicitly rather than a silent empty array"},"roles_omitted_reason":{"type":"string","description":"Present in lockstep with roles_omitted"}},"required":["version","description","securable_types","operations"]})j"},
+
+    // B4 (#2146 API-parity) — self-check "can I do X" RBAC tool. Deliberately
+    // open to ANY authenticated caller, mirroring POST /api/v1/rbac/check
+    // EXACTLY: that REST route calls ONLY auth_fn (require a session) and NO
+    // perm_fn — verified by reading the full handler (rest_api_v1.cpp), not
+    // inferred from the route path or securable name. It answers a question
+    // about the CALLER'S OWN authority only (rbac_store->check_permission is
+    // always evaluated against session->username, never a caller-supplied
+    // principal), which is why no further RBAC gate is needed: the response
+    // discloses nothing beyond what the caller could otherwise infer by
+    // attempting the operation and observing whether it is denied. The
+    // {"Infrastructure","Read"} classification below drives ONLY the generic
+    // MCP tier gate (mandatory for every served tool) — it is universally
+    // allowed at every tier (Read is never denied), so it does not narrow
+    // REST's zero-RBAC-gate posture; there is no perm_fn call anywhere in
+    // this tool's own handler code, matching REST exactly.
+    {"check_permission",
+     "Check whether the CALLING PRINCIPAL holds a specific RBAC permission (securable_type + "
+     "operation) — a self-check, not a lookup of another principal's grants. Deliberately open "
+     "to any authenticated caller (no RBAC gate on the check itself, matching POST "
+     "/api/v1/rbac/check exactly); the answer can legitimately be false. If RBAC is not enabled "
+     "or the store is unavailable, mirrors RbacStore::check_permission's own fail-open/legacy "
+     "posture for that condition rather than erroring. Mirrors POST /api/v1/rbac/check.",
+     R"j({"type":"object","properties":{)j"
+     R"j("securable_type":{"type":"string","minLength":1,"description":"e.g. \"ManagementGroup\", \"ApiToken\" — see discover_permissions for the full catalog"},)j"
+     R"j("operation":{"type":"string","minLength":1,"description":"e.g. \"Read\", \"Write\", \"Delete\" — see discover_permissions for the full catalog"})j"
+     R"j(},"required":["securable_type","operation"]})j",
+     R"j({"type":"object","properties":{"allowed":{"type":"boolean"}},"required":["allowed"]})j"},
+
+    // B4 (#2146 API-parity) — no existing MCP tool family covers local-account
+    // lockout lifecycle; this is the first. New "Account lockout" family in
+    // mcp_orientation.cpp.
+    {"unlock_account",
+     "Clear a local account's failed-login lockout counter (SOC 2 CC6.3 operability path — the "
+     "lockout also auto-expires on its own after the lockout window). Self-target is permitted: "
+     "clearing your own lockout is recoverable. Requires the Postgres auth store (AuthDB) — "
+     "answers 'lockout subsystem unavailable' if it is not wired, same as the REST route. "
+     "Mirrors POST /api/v1/users/{username}/unlock. Requires UserManagement:Write — approval-"
+     "gated (supervised MCP tier maker-checker). Same interactive-session denial as "
+     "create_api_token - closed for this tool specifically (#4309). Destructive: overwrites the "
+     "account's existing lockout/failed-login state.",
+     R"j({"type":"object","properties":{)j"
+     R"j("username":{"type":"string","minLength":1,"description":"Local account username to unlock"})j"
+     R"j(},"required":["username"]})j",
+     R"j({"type":"object","properties":{"username":{"type":"string"},"unlocked":{"type":"boolean"},"audit_emitted":{"type":"boolean"}},"required":["username","unlocked","audit_emitted"]})j"},
     {"discover_instructions",
      "Published (enabled) InstructionDefinition catalog with parameter_schema — the "
      "commands this worker may dispatch via execute_instruction. Read-only catalog.",
@@ -2695,6 +2891,15 @@ static const char* const kWriteToolsRaw[] = {
     // get_guardian_device_compliance are Read and deliberately absent.
     "create_guardian_rule", "update_guardian_rule", "delete_guardian_rule",
     "push_guardian_rules",
+    // B4 (#2146 API-parity) — management-group mutations; get_management_group
+    // and list_management_group_roles are read-only and deliberately absent.
+    "create_management_group", "update_management_group",
+    "add_management_group_member", "assign_management_group_role",
+    // B4 — API-token mutations; list_api_tokens is read-only and check_permission
+    // performs no mutation, both deliberately absent.
+    "create_api_token", "revoke_api_token",
+    // B4 — account-lockout clear (SOC 2 CC6.3).
+    "unlock_account",
 };
 
 // Lookup set DERIVED from the raw sequence; collapse here is safe because the
@@ -2822,6 +3027,26 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // #4033 — matches /fragments/create-group-form's own gate exactly
     // (Write, not Read); see the kTools[] entry's comment for why.
     {"preview_management_group_agent_count", {"ManagementGroup", "Write"}},
+    // B4 (#2146 API-parity) — six twins of the remaining management-group REST
+    // surface. `denied` default (no per-agent confinement mechanism exists for
+    // any of these — a management group is not a single-agent resource).
+    {"create_management_group", {"ManagementGroup", "Write"}},
+    {"get_management_group", {"ManagementGroup", "Read"}},
+    {"update_management_group", {"ManagementGroup", "Write"}},
+    {"add_management_group_member", {"ManagementGroup", "Write"}},
+    // list_management_group_roles: mapped to the REST route's PRIMARY gate arm
+    // (UserManagement:Read) — the ITServiceOwner-of-this-group fallback is a
+    // DATA check the handler runs itself, not an RBAC op this generic C8 tier
+    // gate can see. UserManagement is in the "authorization-topology reads"
+    // category mcp_policy.hpp's tier_allows() explicitly keeps reachable at
+    // every MCP tier (never in the #520/#4031 server-administration deny list).
+    {"list_management_group_roles", {"UserManagement", "Read"}},
+    // assign_management_group_role: mapped to the REST route's PRIMARY gate arm
+    // (ManagementGroup:Write) — same reasoning as list_management_group_roles
+    // above; the handler's own perm_fn call mirrors the SAME compound gate the
+    // REST route runs (fleet-wide ManagementGroup:Write OR ITServiceOwner-of-
+    // this-group).
+    {"assign_management_group_role", {"ManagementGroup", "Write"}},
     // #1634 (adversarial-review K3/D3 follow-up) — both migrated onto
     // fleet_read_fn_ alongside the response tools above; same reclassification
     // rationale.
@@ -3024,6 +3249,16 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     // mcp_policy.hpp's tier_allows() operator-tier comment.
     {"rotate_api_token", {"ApiToken", "Rotate"}},
     {"confirm_api_token_rotation", {"ApiToken", "Rotate"}},
+    // B4 (#2146 API-parity) — the base API-token CRUD tools, matching their
+    // REST twins' own perm_fn ops exactly (ApiToken:Read/Write/Delete — none
+    // of these three is the Rotate axis above). `denied` default: list/create
+    // are self-scoped to the caller by the STORE, not by a per-agent
+    // confinement mechanism this table tracks; revoke's owner-or-admin check
+    // is likewise a handler-level ownership check, not `confined`/`global_safe`
+    // in this table's sense.
+    {"list_api_tokens", {"ApiToken", "Read"}},
+    {"create_api_token", {"ApiToken", "Write"}},
+    {"revoke_api_token", {"ApiToken", "Delete"}},
     // PR 4.2 (design §4.1) — engine-principal role-assignment MCP twins of
     // /api/v1/engine-principals/{id}/roles. Mutations map to Security:Write
     // (this mapping drives ONLY the C8 tier/approval gate; each handler
@@ -3038,6 +3273,15 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"classify_operational_question", {"Infrastructure", "Read"}},
     {"get_incident_playbook", {"Infrastructure", "Read"}},
     {"summarize_working_set", {"Infrastructure", "Read"}},
+    // B4 (#2146 API-parity) — check_permission's REST twin (POST
+    // /api/v1/rbac/check) calls NO perm_fn at all (auth_fn only) — verified by
+    // reading the full handler. {"Infrastructure","Read"} here drives ONLY the
+    // generic C8 tier gate (mandatory for every served tool); it is allowed at
+    // every tier, so it does not narrow REST's zero-RBAC-gate posture, and the
+    // tool's own handler makes no perm_fn call, matching REST exactly.
+    {"check_permission", {"Infrastructure", "Read"}},
+    // B4 (#2146 API-parity) — matches the REST route's own perm_fn op exactly.
+    {"unlock_account", {"UserManagement", "Write"}},
     // A2 discovery tools (mirrors of GET /api/v1/discover/*).
     {"discover_permissions", {"Infrastructure", "Read"}},
     {"discover_instructions", {"InstructionDefinition", "Read"}},
@@ -3498,6 +3742,12 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // assign_engine_role's Additive/idempotent:true pairing above).
     {"preview_management_group_agent_count",
      {ToolEffect::Additive, true, "Preview management group agent count"}},
+    // B4 (#2146 API-parity) — read-only twins.
+    {"get_management_group", {ToolEffect::ReadOnly, true, "Get management group"}},
+    {"list_management_group_roles",
+     {ToolEffect::ReadOnly, true, "List management group role grants"}},
+    {"list_api_tokens", {ToolEffect::ReadOnly, true, "List own API tokens"}},
+    {"check_permission", {ToolEffect::ReadOnly, true, "Check own RBAC permission"}},
     {"get_execution_status", {ToolEffect::ReadOnly, true, "Get execution status"}},
     {"list_executions", {ToolEffect::ReadOnly, true, "List executions"}},
     {"list_schedules", {ToolEffect::ReadOnly, true, "List schedules"}},
@@ -3671,6 +3921,42 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // confirms the pinned pair once or errors with no additional effect.
     {"confirm_api_token_rotation",
      {ToolEffect::Destructive, true, "Confirm API token rotation"}},
+    // B4 (#2146 API-parity) — management-group mutations.
+    // create_management_group: pure INSERT of a new group → Additive, matching
+    // create_engine_principal's reasoning above. Not idempotent — a repeat call
+    // with the same name mints a SECOND group (name is not unique).
+    {"create_management_group", {ToolEffect::Additive, false, "Create management group"}},
+    // update_management_group: UPDATE overwrites the group's existing fields
+    // (name/description/parent/membership_type/scope_expression) → Destructive.
+    // Idempotent — the same body applied twice reaches the same end state.
+    {"update_management_group", {ToolEffect::Destructive, true, "Update management group"}},
+    // add_management_group_member: INSERT ... ON CONFLICT DO NOTHING → Additive
+    // (extends the member set, overwrites nothing) and idempotent (re-adding an
+    // existing member is a no-op), same shape as assign_engine_role below.
+    {"add_management_group_member",
+     {ToolEffect::Additive, true, "Add management group member"}},
+    // assign_management_group_role: INSERT ... ON CONFLICT DO NOTHING → Additive
+    // and idempotent, same shape as assign_engine_role below (a distinct grant
+    // set, not an overwrite of an existing one — role_name is part of the
+    // conflict key, so assigning a DIFFERENT role adds a second grant row
+    // rather than replacing the first).
+    {"assign_management_group_role",
+     {ToolEffect::Additive, true, "Assign management group role"}},
+    // B4 — API-token mutations.
+    // create_api_token: pure INSERT of a new credential → Additive, same
+    // reasoning as create_engine_principal above. Not idempotent — each call
+    // mints a distinct token.
+    {"create_api_token", {ToolEffect::Additive, false, "Create API token"}},
+    // revoke_api_token: Delete operation → the 2g PR2 safe-direction floor
+    // requires destructiveHint true for every Delete/Execute tool. Idempotent
+    // per the store's own already-revoked handling (a repeat revoke of an
+    // already-revoked token is a genuine 404, not a second effect).
+    {"revoke_api_token", {ToolEffect::Destructive, true, "Revoke API token"}},
+    // B4 — unlock_account: UPDATE overwrites the account's existing lockout/
+    // failed-login counter state → Destructive, same reasoning as
+    // update_management_group above. Idempotent — clearing an already-clear
+    // lockout counter reaches the same end state.
+    {"unlock_account", {ToolEffect::Destructive, true, "Unlock account"}},
     // assign/unassign_engine_role: INSERT OR IGNORE (additive) vs DELETE grant
     // (destructive). Both reach a fixed end state on retry → idempotent.
     {"assign_engine_role", {ToolEffect::Additive, true, "Assign fleet-wide role to engine principal"}},
@@ -3907,6 +4193,40 @@ int mcp_error_for_store_msg(const std::string& msg) {
 // rather than letting it fall through to kInternalError.
 int mcp_error_for_access_review_msg(const std::string& msg) {
     return msg.starts_with("not_found:") ? kInvalidParams : kInternalError;
+}
+
+// B4 (#2146 API-parity) — ManagementGroupStore error → JSON-RPC code + retry
+// hint. Unlike EnginePrincipalStore/AccessReviewStore, ManagementGroupStore
+// has no dedicated error-class helper of its own (its REST twins just flat-400
+// every `!result`, rest_api_v1.cpp's create/update/add_member/assign_role
+// handlers) — this mirrors that REST posture for the client-error class while
+// still giving the MCP twins an HONEST retry_after_ms on the genuinely
+// transient subset, per A5 (docs/agentic-first-principle.md).
+//
+// Every store write failure the six mutating methods this PR twins
+// (create_group/update_group/add_member/assign_role) can return is either:
+//   - a store-open/pool/query fault: "database not open", "pool acquire timed
+//     out", "failed to resolve ancestor chain (store degraded)", or one of the
+//     "<verb> failed: <pg error>" writes (create/update/add_member/assign_role) —
+//     ALL and ONLY of these contain the substring "failed" somewhere (the
+//     verb-prefixed writes literally say "... failed: ..."; the two exact-match
+//     strings are covered explicitly). Genuinely transient — retryable.
+//   - a validation/business-rule rejection ("group name cannot be empty",
+//     "parent group not found", "maximum hierarchy depth (5) exceeded",
+//     "re-parenting would create a cycle", "engine principals cannot hold
+//     scoped role assignments in this release", or a
+//     RbacStore::validate_assignment message) — none of these contain
+//     "failed". Client error — not retryable, matches REST's 400.
+struct MgmtGroupErrorInfo {
+    int code;
+    long retry_after_ms; // -1 => no retry hint (not blindly retryable)
+};
+MgmtGroupErrorInfo classify_mgmt_group_error(const std::string& msg) {
+    if (msg == "database not open" || msg == "pool acquire timed out" ||
+        msg.find("failed") != std::string::npos) {
+        return {kInternalError, mcp::kMcpStoreFaultRetryMs};
+    }
+    return {kInvalidParams, -1};
 }
 
 // KekOpResult::Failure → JSON-RPC error (#2395 track C). Reuses
@@ -4355,7 +4675,7 @@ McpServer::HandlerFn McpServer::build_handler(
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, LockoutClearFn lockout_clear_fn) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -5326,6 +5646,15 @@ McpServer::HandlerFn McpServer::build_handler(
             constexpr std::string_view kTierRemediation =
                 "this MCP token's tier does not permit the operation; use a higher-tier "
                 "MCP token (operator or supervised), or the REST API / dashboard";
+            // #2146 Batch B4 Gate 8 (security-guardian Finding E): the three
+            // interactive-session deny-outright guards below (create_api_token,
+            // revoke_api_token, unlock_account) previously crammed their
+            // remediation into `message` and left a4_error's dedicated
+            // `remediation` field null; each call site below now passes its own
+            // REST-equivalent-route hint through this field instead.
+            constexpr std::string_view kInteractiveSessionRemediation =
+                "use the equivalent REST v1 route from an authenticated browser "
+                "session, or mint an MCP bearer token with an appropriate tier";
             // #3685: classify_fn_ unset (never wired, or the production wiring at
             // server.cpp regressed) — execute_instruction cannot determine whether
             // ANY plugin.action pair is Destructive, so it fails CLOSED at BOTH
@@ -8579,6 +8908,504 @@ McpServer::HandlerFn McpServer::build_handler(
                     success_response(
                         id, tool_result(JObj().add("agent_count", *count).str(), kObjectOutputSchema)),
                     "application/json");
+                return;
+            }
+
+            // ── create_management_group (B4, #2146 API-parity) ────────────
+            // Mirrors POST /api/v1/management-groups exactly: perm_fn(ManagementGroup,
+            // Write), no is_open() check (rest_api_v1.cpp only null-checks mgmt_store
+            // here, same as list_management_groups above), created_by = the caller.
+            if (tool_name == "create_management_group") {
+                if (!tier_allows(tier, "ManagementGroup", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                    return;
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto name = param_str(args, "name");
+                if (name.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "name is required"),
+                                    "application/json");
+                    return;
+                }
+                // Gate 4 unhappy-path BLOCKING fix (#2146 Batch B4 review):
+                // param_str silently returns "" on a JSON type mismatch,
+                // unlike update_management_group's own explicit is_string()
+                // checks four lines below - a caller sending e.g. a numeric
+                // parent_id got a top-level group created instead of the
+                // child they asked for, with no error. Matches the sibling
+                // handler's pattern exactly.
+                if (args.contains("description") && !args["description"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "description must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("parent_id") && !args["parent_id"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "parent_id must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("membership_type") && !args["membership_type"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "membership_type must be a string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("scope_expression") && !args["scope_expression"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
+                                    "application/json");
+                    return;
+                }
+                ManagementGroup g;
+                g.name = name;
+                g.description = param_str(args, "description");
+                g.parent_id = param_str(args, "parent_id");
+                g.membership_type = param_str(args, "membership_type", "static");
+                g.scope_expression = param_str(args, "scope_expression");
+                g.created_by = session->username;
+
+                auto result = mgmt_store->create_group(g);
+                if (!result) {
+                    const auto info = classify_mgmt_group_error(result.error());
+                    const bool audit_ok = audit_fn(req, "management_group.create", "failure",
+                                                   "ManagementGroup", name, result.error());
+                    res.set_content(
+                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
+                                 {}, audit_ok),
+                        "application/json");
+                    mcp_audit("failure", result.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "management_group.create", "success",
+                                               "ManagementGroup", *result, name);
+                JObj payload;
+                payload.add("id", *result);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", *result);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── get_management_group (B4, #2146 API-parity) ───────────────
+            // Mirrors GET /api/v1/management-groups/{id}. get_group's nullopt
+            // collapses "no such group" with "store degraded" (the store API's
+            // own limitation — REST reports both as a flat 404, mirrored here
+            // exactly rather than inventing a distinction REST does not make).
+            if (tool_name == "get_management_group") {
+                if (!tier_allows(tier, "ManagementGroup", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                    return;
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto group_id = param_str(args, "group_id");
+                if (group_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "group_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto g = mgmt_store->get_group(group_id);
+                if (!g) {
+                    // retry-hint-exempt: ManagementGroupStore::get_group's nullopt is a
+                    // genuine "no such group" (its own store-degrade case is
+                    // distinct and much rarer); REST reports the SAME flat 404 with no
+                    // retry hint, so this mirrors it rather than inventing one REST
+                    // does not have.
+                    mcp_audit("denied", "group not found");
+                    res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
+                    return;
+                }
+                auto members = mgmt_store->get_members(group_id);
+                mcp_audit("success", group_id);
+                // Shared builder (management_group_model.hpp) - the REST twin
+                // GET /api/v1/management-groups/{id} calls the SAME function,
+                // so the two JSON shapes cannot drift (docs/api-twin-recipe.md
+                // §1 Rule 1).
+                res.set_content(
+                    success_response(
+                        id, tool_result(management_group_detail_json(*g, members), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── update_management_group (B4, #2146 API-parity) ────────────
+            // Mirrors PUT /api/v1/management-groups/{id} exactly, including the
+            // root-group re-parent guard and the cycle/depth checks (which the
+            // store ALSO re-validates in update_group — belt-and-braces, same
+            // as REST relies on).
+            if (tool_name == "update_management_group") {
+                if (!tier_allows(tier, "ManagementGroup", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                    return;
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto group_id = param_str(args, "group_id");
+                if (group_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "group_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto existing = mgmt_store->get_group(group_id);
+                if (!existing) {
+                    // retry-hint-exempt: same collapsed not-found/degrade shape as
+                    // get_management_group above — mirrors REST's flat 404 exactly.
+                    mcp_audit("denied", "group not found");
+                    res.set_content(a4_error(kInvalidParams, "group not found"), "application/json");
+                    return;
+                }
+
+                auto updated = *existing;
+                if (args.contains("name")) {
+                    if (!args["name"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "name must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    updated.name = args["name"].get<std::string>();
+                }
+                if (args.contains("description")) {
+                    if (!args["description"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "description must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    updated.description = args["description"].get<std::string>();
+                }
+                if (args.contains("parent_id")) {
+                    if (!args["parent_id"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "parent_id must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    updated.parent_id = args["parent_id"].get<std::string>();
+                }
+                if (args.contains("membership_type")) {
+                    if (!args["membership_type"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "membership_type must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    updated.membership_type = args["membership_type"].get<std::string>();
+                }
+                if (args.contains("scope_expression")) {
+                    if (!args["scope_expression"].is_string()) {
+                        res.set_content(a4_error(kInvalidParams, "scope_expression must be a string"),
+                                        "application/json");
+                        return;
+                    }
+                    updated.scope_expression = args["scope_expression"].get<std::string>();
+                }
+
+                if (group_id == ManagementGroupStore::kRootGroupId && !updated.parent_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "cannot re-parent root group"),
+                                    "application/json");
+                    return;
+                }
+
+                if (!updated.parent_id.empty() && updated.parent_id != existing->parent_id) {
+                    // CONFINEMENT/hierarchy reads are degrade-distinguishable (ADR-0042,
+                    // matching the REST twin's own handling of these two calls exactly):
+                    // nullopt here means the mgmt-store degraded, a REAL transient fault
+                    // distinct from the collapsed get_group shape above.
+                    auto descendants = mgmt_store->get_descendant_ids(group_id);
+                    if (!descendants) {
+                        res.set_content(a4_error(kInternalError, "management group store unavailable",
+                                                 "retry the request",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    if (std::find(descendants->begin(), descendants->end(), updated.parent_id) !=
+                        descendants->end()) {
+                        res.set_content(a4_error(kInvalidParams, "re-parenting would create a cycle"),
+                                        "application/json");
+                        return;
+                    }
+                    auto ancestors = mgmt_store->get_ancestor_ids(updated.parent_id);
+                    if (!ancestors) {
+                        res.set_content(a4_error(kInternalError, "management group store unavailable",
+                                                 "retry the request",
+                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                        "application/json");
+                        return;
+                    }
+                    if (ancestors->size() >= 4) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "maximum hierarchy depth (5) exceeded"),
+                            "application/json");
+                        return;
+                    }
+                }
+
+                auto result = mgmt_store->update_group(updated);
+                if (!result) {
+                    const auto info = classify_mgmt_group_error(result.error());
+                    const bool audit_ok = audit_fn(req, "management_group.update", "failure",
+                                                   "ManagementGroup", group_id, result.error());
+                    res.set_content(
+                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
+                                 {}, audit_ok),
+                        "application/json");
+                    mcp_audit("failure", result.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "management_group.update", "success",
+                                               "ManagementGroup", group_id, updated.name);
+                mcp_audit("success", group_id);
+                // Shared builder (management_group_model.hpp) - the REST twin
+                // PUT /api/v1/management-groups/{id} calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1); MCP's real audit_ok
+                // surfaces a dropped audit row in the body, its only channel
+                // for it (REST instead uses Sec-Audit-Failed).
+                res.set_content(
+                    success_response(
+                        id, tool_result(management_group_update_ack_json(audit_ok), kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── add_management_group_member (B4, #2146 API-parity) ────────
+            // Mirrors POST /api/v1/management-groups/{id}/members. NOTE (out of
+            // scope for this PR, reported rather than silently fixed): the REST
+            // handler calls add_member() and ignores its std::expected result
+            // entirely, always reporting 201 — this tool DOES check it, since
+            // every other MCP write tool in this file does and check-mcp-retry-
+            // hints.py requires an honest outcome on a checked store call.
+            if (tool_name == "add_management_group_member") {
+                if (!tier_allows(tier, "ManagementGroup", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ManagementGroup", "Write"))
+                    return;
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto group_id = param_str(args, "group_id");
+                const auto agent_id = param_str(args, "agent_id");
+                if (group_id.empty() || agent_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "group_id and agent_id are required"),
+                                    "application/json");
+                    return;
+                }
+                auto result = mgmt_store->add_member(group_id, agent_id);
+                if (!result) {
+                    const auto info = classify_mgmt_group_error(result.error());
+                    const bool audit_ok = audit_fn(req, "management_group.add_member", "failure",
+                                                   "ManagementGroup", group_id, result.error());
+                    res.set_content(
+                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
+                                 {}, audit_ok),
+                        "application/json");
+                    mcp_audit("failure", result.error());
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "management_group.add_member", "success",
+                                               "ManagementGroup", group_id, agent_id);
+                JObj payload;
+                payload.add("added", true);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", group_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── list_management_group_roles (B4, #2146 API-parity) ────────
+            // Gate is COMPOUND, mirrored exactly from GET /api/v1/management-groups/
+            // {id}/roles: authorized by the fleet-wide UserManagement:Read
+            // permission OR by the caller holding ITServiceOwner on THIS group
+            // (skipped for a service-scoped token — same as the REST route's own
+            // guardian-confinement-2298 PR3 §3e fix). NOT ManagementGroup:Read —
+            // this response is authorization TOPOLOGY, not group metadata.
+            if (tool_name == "list_management_group_roles") {
+                if (!tier_allows(tier, "UserManagement", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                // #2376 (gov security-guardian finding, B4 fix round): the REST
+                // twin (GET /api/v1/management-groups/{id}/roles) requires
+                // ManagementGroup:Read as a LEADING gate, on top of the compound
+                // UserManagement:Read-OR-ITServiceOwner check below -- "the
+                // caller must be allowed to see the group AND allowed to see
+                // role assignments." This tool was missing that first gate,
+                // letting a caller with group-scoped ITServiceOwner but no
+                // ManagementGroup:Read/UserManagement:Read read the role graph
+                // via MCP where REST would 403 them.
+                if (!perm_fn(req, res, "ManagementGroup", "Read"))
+                    return;
+                if (!mgmt_store) {
+                    res.set_content(a4_error(kInternalError, "Management group store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto group_id = param_str(args, "group_id");
+                if (group_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "group_id is required"),
+                                    "application/json");
+                    return;
+                }
+                httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                bool authorized = perm_fn(req, probe, "UserManagement", "Read");
+                if (!authorized && session->token_scope_service.empty()) {
+                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                            gr.role_name == "ITServiceOwner") {
+                            authorized = true;
+                            break;
+                        }
+                    }
+                }
+                if (!authorized) {
+                    mcp_audit("denied", "forbidden");
+                    res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
+                    return;
+                }
+
+                auto roles = mgmt_store->get_group_roles(group_id);
+                JArr arr;
+                for (const auto& r : roles) {
+                    arr.add(JObj()
+                                .add("group_id", r.group_id)
+                                .add("principal_type", r.principal_type)
+                                .add("principal_id", r.principal_id)
+                                .add("role_name", r.role_name));
+                }
+                mcp_audit("success", group_id);
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("roles", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── assign_management_group_role (B4, #2146 API-parity) ───────
+            // Gate is COMPOUND, mirrored exactly from POST /api/v1/management-groups/
+            // {id}/roles: fleet-wide ManagementGroup:Write OR the caller already
+            // holding ITServiceOwner on THIS group (skipped for a service-scoped
+            // token). role_name restricted to Operator/Viewer ONLY, matching REST's
+            // own explicit check — no other role, including ITServiceOwner itself,
+            // can be delegated here. The store's assign_role() ALSO runs
+            // RbacStore::validate_assignment - Gate 4 happy-path fix: the protection
+            // that actually fires here is its F2 shadow-row guard against a
+            // user/group principal_id spoofed with an "engine:" prefix, NOT the
+            // engine-role-disallow branch (assign_role already rejects
+            // principal_type=="engine" unconditionally before validate_assignment
+            // ever runs, so that branch is unreachable at this call site).
+            if (tool_name == "assign_management_group_role") {
+                if (!tier_allows(tier, "ManagementGroup", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!mgmt_store || !rbac_store) {
+                    res.set_content(a4_error(kInternalError, "service unavailable", "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto group_id = param_str(args, "group_id");
+                const auto principal_type = param_str(args, "principal_type", "user");
+                const auto principal_id = param_str(args, "principal_id");
+                const auto role_name = param_str(args, "role_name");
+                if (group_id.empty() || principal_id.empty() || role_name.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "group_id, principal_id, and role_name are required"),
+                        "application/json");
+                    return;
+                }
+                if (role_name != "Operator" && role_name != "Viewer") {
+                    mcp_audit("denied", "only Operator and Viewer roles can be delegated");
+                    res.set_content(
+                        a4_error(kPermissionDenied, "only Operator and Viewer roles can be delegated"),
+                        "application/json");
+                    return;
+                }
+
+                httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+                if (!authorized && session->token_scope_service.empty()) {
+                    for (const auto& gr : mgmt_store->get_group_roles(group_id)) {
+                        if (gr.principal_type == "user" && gr.principal_id == session->username &&
+                            gr.role_name == "ITServiceOwner") {
+                            authorized = true;
+                            break;
+                        }
+                    }
+                }
+                if (!authorized) {
+                    mcp_audit("denied", "forbidden");
+                    res.set_content(a4_error(kPermissionDenied, "forbidden"), "application/json");
+                    return;
+                }
+
+                GroupRoleAssignment assignment;
+                assignment.group_id = group_id;
+                assignment.principal_type = principal_type;
+                assignment.principal_id = principal_id;
+                assignment.role_name = role_name;
+
+                auto result = mgmt_store->assign_role(assignment);
+                if (!result) {
+                    const auto info = classify_mgmt_group_error(result.error());
+                    const bool audit_ok =
+                        audit_fn(req, "management_group.assign_role", "failure", "ManagementGroup",
+                                 group_id, result.error());
+                    res.set_content(
+                        a4_error(info.code, result.error(), {}, /*retry_after_ms=*/info.retry_after_ms,
+                                 {}, audit_ok),
+                        "application/json");
+                    mcp_audit("failure", result.error());
+                    return;
+                }
+                const bool audit_ok =
+                    audit_fn(req, "management_group.assign_role", "success", "ManagementGroup",
+                             group_id, principal_id + ":" + role_name);
+                JObj payload;
+                payload.add("assigned", true);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", group_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
                 return;
             }
 
@@ -18699,6 +19526,37 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ApiToken", "Rotate"))
                     return;
+                // Gate 8 fix (#2146 Batch B4, follow-up review round; user
+                // directive): rotate_api_token/confirm_api_token_rotation
+                // shared the identical missing-step-up gap create_api_token/
+                // revoke_api_token/unlock_account were fixed for above -
+                // ApiToken:Rotate is deliberately NOT in requires_approval()
+                // (self-service, authority-inheriting, lifetime-neutral; see
+                // mcp_policy.hpp's own comment on that), so an empty mcp_tier
+                // reached this handler with NEITHER REST's step_up_fn (no MCP
+                // tool calls it) NOR an approval ticket (there was never one
+                // to bypass here - this is not the same gap shape as the
+                // three approval-gated tools above, but the SAME missing
+                // control: REST requires step-up on every rotate/confirm
+                // call, MCP required nothing). Denying here does not add an
+                // approval requirement (ApiToken:Rotate's no-approval design
+                // is preserved) and does not change deny_if_engine_session()'s
+                // separate check below - it only closes the empty-tier gap.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "rotate_api_token requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has no MFA step-up REST's route "
+                                 "requires on every rotate call, including a re-serve; "
+                                 "use POST /api/v1/tokens/{id}/rotate instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
                 if (deny_if_engine_session())
                     return;
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
@@ -18835,11 +19693,11 @@ McpServer::HandlerFn McpServer::build_handler(
                     // the secret in the response body. Mirrors the REST
                     // twin's 503 + Retry-After:2 posture — A5: retry_after_ms
                     // is machine metadata here, not prose-only, matching
-                    // REST's Retry-After:2 header (2000ms). There is no MCP
-                    // `list_tokens` tool (ADR-1005 parity gap, recorded in
-                    // docs/mcp-server.md) — point at the REST route that
-                    // actually exists, matching the REST twin's own
-                    // remediation text exactly.
+                    // REST's Retry-After:2 header (2000ms). B4 (#2146
+                    // API-parity) added the MCP `list_api_tokens` twin — the
+                    // remediation below now names both surfaces rather than
+                    // only the REST route this comment used to point at
+                    // exclusively.
                     //
                     // UP-11: the audit outcome is "partial", never "failure"
                     // — rotate_token above already succeeded and committed.
@@ -18856,17 +19714,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     const bool audit_ok = audit_fn(
                         req, "api_token.rotate", "partial", "ApiToken", token_id,
                         "successor minted but its secret could not be read back for delivery "
-                        "— retry, or check GET /api/v1/tokens");
+                        "— retry, or check GET /api/v1/tokens or list_api_tokens");
                     JObj err_data;
                     err_data.add("correlation_id", yuzu::server::detail::make_correlation_id())
                         .add("retry_after_ms", mcp::kMcpStoreFaultShortRetryMs)
-                        .add("remediation", "retry, or check GET /api/v1/tokens");
+                        .add("remediation", "retry, or check GET /api/v1/tokens or list_api_tokens");
                     if (!audit_ok)
                         err_data.add("audit_persisted", false);
                     res.set_content(
                         error_response(id, kInternalError,
                                        "rotation succeeded but the successor could not be read "
-                                       "back — retry, or check GET /api/v1/tokens",
+                                       "back — retry, or check GET /api/v1/tokens or list_api_tokens",
                                        err_data.str()),
                         "application/json");
                     mcp_audit("partial", "successor minted but secret could not be read back "
@@ -18940,6 +19798,27 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "ApiToken", "Rotate"))
                     return;
+                // Gate 8 fix (#2146 Batch B4, follow-up review round; user
+                // directive) - see rotate_api_token's identical guard above
+                // for the full rationale. Not counted via confirm_metric():
+                // matches this function's own stated contract that the
+                // metric is store-reaching-calls-only, never a tier/
+                // permission/ownership early-out.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "confirm_api_token_rotation requires an MCP-tier bearer token - "
+                                 "an MCP-tier-less caller (a cookie session, a plain "
+                                 "non-MCP-tiered API token, or an engine token) has no MFA "
+                                 "step-up REST's route requires; "
+                                 "use POST /api/v1/tokens/{id}/confirm instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
                 if (deny_if_engine_session())
                     return;
                 if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
@@ -19022,6 +19901,393 @@ McpServer::HandlerFn McpServer::build_handler(
                                                token_id, "confirmed");
                 JObj payload;
                 payload.add("confirmed", true).add("token_id", token_id);
+                if (!audit_ok)
+                    payload.add("audit_persisted", false);
+                mcp_audit("success", token_id);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
+            // ── list_api_tokens (B4, #2146 API-parity) ────────────────────
+            // Mirrors GET /api/v1/tokens EXACTLY: unconditionally self-scoped to
+            // session->username, no admin/all-owners branch on this route at all
+            // (a separate admin all-owner view exists only as the HTMX fragment
+            // /fragments/settings/api-tokens — no REST v1 route, so no MCP twin;
+            // out of scope for this PR). Reuses engine_credential_store_, the
+            // SAME ApiTokenStore instance rotate_api_token/confirm_api_token_rotation
+            // already use.
+            if (tool_name == "list_api_tokens") {
+                if (!tier_allows(tier, "ApiToken", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ApiToken", "Read"))
+                    return;
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "api token store unavailable");
+                    res.set_content(a4_error(kInternalError, "api token store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto tokens = engine_credential_store_->list_tokens(session->username);
+                if (!tokens.has_value()) {
+                    // Authoritative store (ADR-0012 §1): a read failure is retryable,
+                    // never an empty "you have no tokens" list — mirrors the REST
+                    // twin's 503 + Retry-After:2 posture exactly.
+                    mcp_audit("failure", "token store unavailable");
+                    res.set_content(a4_error(kInternalError, "token store unavailable — try again",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Shared builder (api_token_model.hpp) - the REST twin
+                // GET /api/v1/tokens calls the SAME per-token function, so the
+                // two JSON shapes cannot drift (docs/api-twin-recipe.md §1
+                // Rule 1).
+                JArr arr;
+                for (const auto& t : *tokens)
+                    arr.add_raw(api_token_list_item_json(t));
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id,
+                                      tool_result_split(arr.str(),
+                                                         JObj().raw("tokens", arr.str()).str(),
+                                                         kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── create_api_token (B4, #2146 API-parity) ───────────────────
+            // Mirrors POST /api/v1/tokens: always self-issued (create_token's
+            // principal_id argument is ALWAYS session->username, never caller-
+            // supplied), the mcp_tier/scope_service expiry rules, the 90-day
+            // MCP-tier TTL cap, the length caps, and the multi-store
+            // (rbac_store + mgmt_store) ITServiceOwner-of-service-group check for
+            // a scope_service token. Does NOT mirror the REST route's MFA
+            // step-up gate -- no MCP tool in this file calls step_up_fn. Unlike
+            // that gap, this one IS closed by a compensating control: ApiToken:Write
+            // is approval-gated at the supervised MCP tier (mcp_policy.hpp's
+            // requires_approval(), gov security-guardian finding, B4 fix round) --
+            // a supervised token cannot self-mint a fresh credential without a
+            // human four-eyes approval, closing the self-mint-then-persist risk
+            // step-up exists to prevent. This is a DIFFERENT posture from
+            // rotate_api_token/unlock_account below: rotate_api_token stays
+            // deliberately ungated for the three structural reasons documented at
+            // mcp_policy.hpp's ApiToken:Rotate comment (self-service,
+            // authority-inheriting, lifetime-neutral -- none of which hold for a
+            // freshly-minted token), and unlock_account IS approval-gated via the
+            // generic UserManagement:Write rule, same mechanism as here.
+            if (tool_name == "create_api_token") {
+                if (!tier_allows(tier, "ApiToken", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ApiToken", "Write"))
+                    return;
+                // Gate 6 enterprise-readiness/compliance BLOCKING fix (#2146
+                // Batch B4 review, user directive): an empty session->mcp_tier
+                // means this call bypassed BOTH REST's step_up_fn (MCP never
+                // calls it) AND the supervised-tier approval gate (requires_
+                // approval() itself no-ops on an empty tier) - mcp_policy.hpp's
+                // documented "not an MCP token -> allow everything, defer to
+                // RBAC" premise assumed that caller class is non-interactive,
+                // which #4309 disproves (an ordinary cookie session reaches
+                // this same MCP endpoint). Denying here restores that premise
+                // for exactly the two operations (self-mint a persistent
+                // credential; the sibling revoke_api_token/unlock_account
+                // below) where REST has a control this transport otherwise
+                // lacks entirely. Session::auth_source is a secondary
+                // safety net documented, not required, here: RBAC-scoped
+                // per-call denial is on mcp_tier alone, matching the exact
+                // condition tier_allows()/requires_approval() themselves key
+                // on, so this can never diverge from what those functions
+                // already decided was "not really an MCP token."
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "create_api_token requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "use POST /api/v1/tokens instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "api token store unavailable");
+                    res.set_content(a4_error(kInternalError, "api token store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Gate 4 unhappy-path BLOCKING fix (#2146 Batch B4 review):
+                // param_str silently returns "" on a JSON type mismatch. For
+                // mcp_tier specifically this is not merely a wrong-scope bug
+                // like create_management_group's - an empty mcp_tier is the
+                // MOST PERMISSIVE token shape this store can mint (no tier
+                // restriction, no 90-day TTL cap, no expires_at requirement),
+                // per mcp_policy.hpp's own documented contract ("an empty
+                // tier string means 'not an MCP token' -> allow everything").
+                // A type-mismatched mcp_tier must be REJECTED, never
+                // defaulted, or a caller's constrained-credential request
+                // silently mints the least-constrained one instead. In
+                // today's reachable set this is defense-in-depth, not the
+                // only backstop: ApiToken:Write is approval-gated, so the
+                // #2405 C8 pre-mint schema gate already rejects a non-string
+                // name/scope_service/mcp_tier (all three are typed "string"
+                // in this tool's schema) before a ticket is ever minted, and
+                // an empty (non-approval-gated) tier never reaches this code
+                // at all - it is denied outright above, before this block.
+                if (args.contains("name") && !args["name"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "name must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("scope_service") && !args["scope_service"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "scope_service must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                if (args.contains("mcp_tier") && !args["mcp_tier"].is_string()) {
+                    res.set_content(a4_error(kInvalidParams, "mcp_tier must be a JSON string"),
+                                    "application/json");
+                    return;
+                }
+                const auto name = param_str(args, "name");
+                const auto expires_at_opt = param_int_strict(args, "expires_at", 0);
+                if (!expires_at_opt) {
+                    // retry-hint-exempt: a present-but-wrong-JSON-type input (a float or
+                    // string where an integer is required) is a client-side input-parse
+                    // failure, not a store/query fault — same terminal, non-retryable
+                    // class as rotate_api_token's overlap_days type check above.
+                    res.set_content(a4_error(kInvalidParams, "expires_at must be a JSON integer (unix seconds)"),
+                                    "application/json");
+                    return;
+                }
+                const int64_t expires_at = *expires_at_opt;
+                const auto scope_service = param_str(args, "scope_service");
+                const auto mcp_tier_arg = param_str(args, "mcp_tier");
+                if (!mcp_tier_arg.empty() && !mcp::is_valid_tier(mcp_tier_arg)) {
+                    res.set_content(a4_error(kInvalidParams, "invalid mcp_tier: must be one of readonly, "
+                                                            "operator, supervised (or omitted)"),
+                                    "application/json");
+                    return;
+                }
+                if (!mcp_tier_arg.empty() || !scope_service.empty()) {
+                    if (expires_at <= 0) {
+                        res.set_content(a4_error(kInvalidParams,
+                                                 "expires_at is required for an MCP-tier or "
+                                                 "service-scoped token"),
+                                        "application/json");
+                        return;
+                    }
+                    if (!mcp_tier_arg.empty()) {
+                        const int64_t now = static_cast<int64_t>(std::time(nullptr));
+                        if (expires_at - now > 90LL * 24 * 3600) {
+                            res.set_content(
+                                a4_error(kInvalidParams, "MCP token TTL cannot exceed 90 days"),
+                                "application/json");
+                            return;
+                        }
+                    }
+                }
+                if (name.size() > 256) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "invalid_input_length: name exceeds 256 chars"),
+                        "application/json");
+                    return;
+                }
+                if (scope_service.size() > 256) {
+                    res.set_content(a4_error(kInvalidParams,
+                                             "invalid_input_length: scope_service exceeds 256 chars"),
+                                    "application/json");
+                    return;
+                }
+
+                if (!scope_service.empty()) {
+                    if (!rbac_store || !rbac_store->is_rbac_enabled()) {
+                        res.set_content(
+                            a4_error(kInvalidParams, "service-scoped tokens require RBAC to be enabled"),
+                            "application/json");
+                        return;
+                    }
+                    // Same multi-store (rbac_store + mgmt_store) authority check as
+                    // the REST route: fleet-wide ManagementGroup:Write OR the caller
+                    // already holding ITServiceOwner on the 'Service: <scope_service>'
+                    // management group (skipped for a service-scoped MCP token).
+                    httplib::Response probe; // throwaway: the fleet-wide arm, never sent
+                    bool authorized = perm_fn(req, probe, "ManagementGroup", "Write");
+                    if (!authorized && mgmt_store && session->token_scope_service.empty()) {
+                        auto svc_group = mgmt_store->find_group_by_name("Service: " + scope_service);
+                        if (svc_group) {
+                            for (const auto& gr : mgmt_store->get_group_roles(svc_group->id)) {
+                                if (gr.principal_type == "user" &&
+                                    gr.principal_id == session->username &&
+                                    gr.role_name == "ITServiceOwner") {
+                                    authorized = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (!authorized) {
+                        mcp_audit("denied", "ITServiceOwner authority required");
+                        res.set_content(
+                            a4_error(kPermissionDenied, "ITServiceOwner authority required for service '" +
+                                                       scope_service + "'"),
+                            "application/json");
+                        return;
+                    }
+                }
+
+                auto result = engine_credential_store_->create_token(name, session->username,
+                                                                      expires_at, scope_service,
+                                                                      mcp_tier_arg);
+                if (!result) {
+                    // create_token's only documented failure mode is CSPRNG entropy
+                    // exhaustion (transient) — same 503 + retry posture as the REST
+                    // twin's Retry-After:5.
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_secure_random_failure_total",
+                                     {{"reason", "prng_failure"}, {"site", "api_token"}})
+                            .increment();
+                    }
+                    const bool audit_ok = audit_fn(req, "api_token.create", "failure", "ApiToken", name,
+                                                   "csprng_unavailable: " + result.error());
+                    res.set_content(
+                        a4_error(kInternalError, "CSPRNG unavailable: " + result.error(),
+                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {},
+                                 audit_ok),
+                        "application/json");
+                    mcp_audit("failure", result.error());
+                    return;
+                }
+                std::string detail = "mcp_tier=" + (mcp_tier_arg.empty() ? std::string("none") : mcp_tier_arg);
+                if (!scope_service.empty())
+                    detail += "; scope_service=" + scope_service;
+                const bool audit_ok =
+                    audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
+                mcp_audit("success", name);
+                // G5 (secret hygiene) — the response body carries a raw one-time
+                // credential, same no-store contract as rotate_api_token above.
+                res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
+                res.set_header("Pragma", "no-cache");
+                // Shared builder (api_token_model.hpp) - the REST twin
+                // POST /api/v1/tokens calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1); MCP's real audit_ok
+                // surfaces a dropped audit row in the body, its only channel
+                // for it (REST instead uses Sec-Audit-Failed).
+                res.set_content(
+                    success_response(
+                        id, tool_result(api_token_create_ack_json(*result, name, scope_service, audit_ok),
+                                        kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── revoke_api_token (B4, #2146 API-parity) ───────────────────
+            // Mirrors DELETE /api/v1/tokens/{id}: owner-scoped OR elevated/admin
+            // session (auth::effective_role), and the SAME owner-vs-nonexistent
+            // 404 belt as rotate_api_token above (not an enumeration oracle).
+            if (tool_name == "revoke_api_token") {
+                if (!tier_allows(tier, "ApiToken", "Delete")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "ApiToken", "Delete"))
+                    return;
+                // Gate 6 enterprise-readiness/compliance BLOCKING fix (#2146
+                // Batch B4 review, user directive): see create_api_token's
+                // identical guard above - an empty session->mcp_tier means
+                // this call bypassed both REST's step_up_fn and the
+                // supervised-tier approval gate.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "revoke_api_token requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "use DELETE /api/v1/tokens/{id} instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!engine_credential_store_ || !engine_credential_store_->is_open()) {
+                    mcp_audit("failure", "api token store unavailable");
+                    res.set_content(a4_error(kInternalError, "api token store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto token_id = param_str(args, "token_id");
+                if (token_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "token_id is required"),
+                                    "application/json");
+                    return;
+                }
+                auto existing = engine_credential_store_->get_token(token_id);
+                if (!existing.has_value()) {
+                    mcp_audit("failure", "token store unavailable");
+                    res.set_content(a4_error(kInternalError, "token store unavailable — try again",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto& tok = *existing; // std::optional<ApiToken>
+                const bool denied = tok.has_value() && tok->principal_id != session->username &&
+                                    auth::effective_role(*session) != auth::Role::admin;
+                if (!tok.has_value() || denied) {
+                    if (denied) {
+                        audit_fn(req, "api_token.revoke", "denied", "ApiToken", token_id,
+                                 "owner=" + tok->principal_id);
+                    }
+                    mcp_audit("denied", "token not found");
+                    res.set_content(a4_error(kInvalidParams, "token not found"), "application/json");
+                    return;
+                }
+
+                auto revoked = engine_credential_store_->revoke_token(token_id);
+                if (!revoked.has_value()) {
+                    // The revoke did NOT persist — retryable, distinct from "not found"
+                    // (ADR-0030 §Posture), same 503 + Retry-After:2 posture as REST.
+                    const bool audit_ok = audit_fn(req, "api_token.revoke", "failure", "ApiToken",
+                                                   token_id, "owner=" + tok->principal_id + " db_error=true");
+                    res.set_content(
+                        a4_error(kInternalError, "token revoke did not persist — retry",
+                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs,
+                                 {}, audit_ok),
+                        "application/json");
+                    mcp_audit("failure", "revoke did not persist");
+                    return;
+                }
+                if (!*revoked) {
+                    // DB write succeeded but no row matched — a concurrent
+                    // revoke/delete raced this call. A genuine not-found.
+                    mcp_audit("denied", "token not found");
+                    res.set_content(a4_error(kInvalidParams, "token not found"), "application/json");
+                    return;
+                }
+                const bool audit_ok = audit_fn(req, "api_token.revoke", "success", "ApiToken", token_id,
+                                               "owner=" + tok->principal_id);
+                JObj payload;
+                payload.add("revoked", true);
                 if (!audit_ok)
                     payload.add("audit_persisted", false);
                 mcp_audit("success", token_id);
@@ -19652,6 +20918,141 @@ McpServer::HandlerFn McpServer::build_handler(
             // identical catalog, so they cannot drift from each other by
             // construction (A2: "no side-channel doc fetch").
 
+            // ── check_permission (B4, #2146 API-parity) ───────────────────
+            // Mirrors POST /api/v1/rbac/check EXACTLY: that REST handler calls
+            // ONLY auth_fn (a session must exist — already true by the time this
+            // dispatch reaches here) and NO perm_fn — verified by reading the
+            // full handler, not inferred from the route path. There is
+            // deliberately NO perm_fn call anywhere below; {"Infrastructure",
+            // "Read"} in kToolSecurity drives only the generic MCP tier gate
+            // (mandatory for every served tool) and is allowed at every tier, so
+            // it does not narrow REST's zero-RBAC-gate posture.
+            if (tool_name == "check_permission") {
+                if (!tier_allows(tier, "Infrastructure", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!rbac_store) {
+                    res.set_content(a4_error(kInternalError, "service unavailable", "retry the request",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto securable_type = param_str(args, "securable_type");
+                const auto operation = param_str(args, "operation");
+                if (securable_type.empty() || operation.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "securable_type and operation are required"),
+                        "application/json");
+                    return;
+                }
+                const bool allowed =
+                    rbac_store->check_permission(session->username, securable_type, operation);
+                mcp_audit("success");
+                res.set_content(
+                    success_response(id, tool_result(JObj().add("allowed", allowed).str(),
+                                                     kObjectOutputSchema)),
+                    "application/json");
+                return;
+            }
+
+            // ── unlock_account (B4, #2146 API-parity) ─────────────────────
+            // Mirrors POST /api/v1/users/{username}/unlock: self-target is
+            // permitted, requires the Postgres auth store (lockout_clear_fn
+            // unwired ⇒ "lockout subsystem unavailable"), audits
+            // auth.lockout.cleared. Does NOT mirror the REST route's MFA
+            // step-up gate — no MCP tool in this file calls step_up_fn (see
+            // create_api_token's comment above for the same, established
+            // asymmetry); the approval gate at supervised MCP tier substitutes.
+            if (tool_name == "unlock_account") {
+                if (!tier_allows(tier, "UserManagement", "Write")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (!perm_fn(req, res, "UserManagement", "Write"))
+                    return;
+                // Gate 6 enterprise-readiness/compliance BLOCKING fix (#2146
+                // Batch B4 review, user directive): see create_api_token's
+                // identical guard above - an empty session->mcp_tier means
+                // this call bypassed both REST's step_up_fn and the
+                // supervised-tier approval gate.
+                if (session->mcp_tier.empty()) {
+                    mcp_audit("denied",
+                              "empty mcp_tier, denied outright (auth_source=" +
+                                  session->auth_source + ")");
+                    res.set_content(
+                        a4_error(kPermissionDenied,
+                                 "unlock_account requires an MCP-tier bearer token - an "
+                                 "MCP-tier-less caller (a cookie session, a plain non-MCP-tiered "
+                                 "API token, or an engine token) has neither the MFA step-up "
+                                 "REST's route applies nor a maker-checker approval ticket; "
+                                 "use POST /api/v1/users/{username}/unlock instead",
+                                 kInteractiveSessionRemediation),
+                        "application/json");
+                    return;
+                }
+                if (session->username.empty()) {
+                    // sec-M1 parity: an empty caller username would mis-attribute
+                    // the audit row.
+                    mcp_audit("failure", "session has empty username");
+                    res.set_content(a4_error(kInternalError, "session has empty username"),
+                                    "application/json");
+                    return;
+                }
+                if (!lockout_clear_fn) {
+                    mcp_audit("failure", "lockout subsystem unavailable");
+                    res.set_content(a4_error(kInternalError, "lockout subsystem unavailable",
+                                             "account lockout requires the Postgres auth store; "
+                                             "start the server with --postgres-dsn",
+                                             /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                const auto username = param_str(args, "username");
+                if (username.empty() || !is_valid_username(username)) {
+                    res.set_content(a4_error(kInvalidParams, "invalid username format",
+                                             "username must match the allowed format"),
+                                    "application/json");
+                    return;
+                }
+                const auto try_audit = [&audit_fn, &req, &username](const std::string& result,
+                                                                    const std::string& detail) -> bool {
+                    try {
+                        return audit_fn(req, "auth.lockout.cleared", result, "User", username, detail);
+                    } catch (const std::exception& e) {
+                        spdlog::error("audit_fn threw on auth.lockout.cleared target={}: {}", username,
+                                      e.what());
+                        return false;
+                    } catch (...) {
+                        spdlog::error("audit_fn threw unknown on auth.lockout.cleared target={}",
+                                      username);
+                        return false;
+                    }
+                };
+                const bool ok = lockout_clear_fn(username);
+                if (!ok) {
+                    const bool audit_ok = try_audit("error", "admin_unlock");
+                    mcp_audit("failure", "failed to clear lockout");
+                    res.set_content(
+                        a4_error(kInternalError, "failed to clear lockout", "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs, {}, audit_ok),
+                        "application/json");
+                    return;
+                }
+                const bool audit_emitted = try_audit("ok", "admin_unlock");
+                JObj payload;
+                payload.add("username", username).add("unlocked", true).add("audit_emitted",
+                                                                             audit_emitted);
+                mcp_audit("success", username);
+                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
+                                "application/json");
+                return;
+            }
+
             if (tool_name == "discover_permissions") {
                 if (!tier_allows(tier, "Infrastructure", "Read")) {
                     res.set_content(
@@ -20024,7 +21425,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
                                 IssueCodeSigningFn issue_code_signing_fn,
-                                std::shared_ptr<const VerifyApi> verify_api) {
+                                std::shared_ptr<const VerifyApi> verify_api,
+                                LockoutClearFn lockout_clear_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -20040,7 +21442,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
                     std::move(caller_fn), product_pack_store, workflow_engine,
-                    std::move(issue_code_signing_fn), std::move(verify_api));
+                    std::move(issue_code_signing_fn), std::move(verify_api),
+                    std::move(lockout_clear_fn));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -20077,7 +21480,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
                                 IssueCodeSigningFn issue_code_signing_fn,
-                                std::shared_ptr<const VerifyApi> verify_api) {
+                                std::shared_ptr<const VerifyApi> verify_api,
+                                LockoutClearFn lockout_clear_fn) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -20109,7 +21513,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             // held-open worker, whichever verb pinned it.
                             stream_budget, std::move(revalidate_fn),
                             std::move(principal_audit_fn), product_pack_store, workflow_engine,
-                            std::move(issue_code_signing_fn), std::move(verify_api)));
+                            std::move(issue_code_signing_fn), std::move(verify_api),
+                            std::move(lockout_clear_fn)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
