@@ -2603,3 +2603,139 @@ tests:
       - expr: 'ALERTS{alertname="YuzuExecCorrelationReapClockAnomaly"}'
         eval_time: 90m
         exp_samples: []
+
+  # ── YuzuGatewayRouteWriteFailed / YuzuGatewayRouteUnreadable (HA WS-4 4.2b
+  #    follow-up, post-merge review #4344 MEDIUM finding 2) ──────────────────
+  #
+  # Both counters are created lazily -- `.counter()` is called only inside the
+  # failure branch that increments it -- so before the follow-up's pre-seed
+  # (gateway_service_impl.cpp's constructor for the write-failed counter,
+  # CommandOutboxDelivery's constructor for the retry-cause counter) a single
+  # isolated incident never crossed `rate()>0` / `increase()>0`: the failure's
+  # own increment IS the series' first-ever sample, and rate()/increase() need
+  # a SECOND sample in the window to compute a delta from. Pre-seeding at 0
+  # gives the series a baseline BEFORE the incident, which is what lets a lone
+  # 0->1 transition register. These cases pin exactly that shape (zero-seeded,
+  # then one isolated increment, then flat) -- mirroring
+  # YuzuSessionReapClockAnomaly's own "0x5 1x120" case above -- and go RED if
+  # the pre-seed is dropped from either constructor (the corresponding
+  # promtool test.rule assumption doesn't change, but production would no
+  # longer match it: a real single-incident series in prod would start with NO
+  # sample at all before the jump, not a "0" one).
+
+  # CASE — a single register_fresh failure (store_unavailable) reaches PENDING
+  # off pre-seeding, then FIRES.
+  #
+  # WHY THE RULE USES A 10m WINDOW (closed in this follow-up, #4344 MEDIUM 2):
+  # the ORIGINAL rule paired `rate(...[5m]) > 0` with `for: 5m` — window size ==
+  # for-duration. A rate() window only shows a positive value while it still
+  # straddles the 0->1 transition; that straddle lasts at most (window - step),
+  # one step short of the 5m `for:` it must hold continuously — so a truly
+  # isolated single increment could reach `pending` but mathematically never
+  # `firing`, at any sample granularity (confirmed at 1m and 30s). This
+  # follow-up widened the rule to `rate(...[10m]) > 0` (still `for: 5m`) so the
+  # straddle (~10m) comfortably exceeds the `for:` and a lone genuine failure
+  # DOES fire, ~5m after onset — see the firing assertion below. The counter
+  # pre-seed (a 0 baseline before the incident) is the other half: rate() needs
+  # an earlier in-window sample to diff against, which lazy creation didn't give
+  # it. Both halves are necessary; this case pins both. (A sustained outage —
+  # the realistic `store_unavailable` shape, which keeps incrementing — is
+  # covered by the companion case below.)
+  - interval: 1m
+    name: gateway route write failed - a single isolated failure reaches pending then FIRES (pre-seed + 10m rate window past the 5m for; #4344 MEDIUM 2 fully closed)
+    input_series:
+      - series: 'yuzu_server_gateway_route_write_failed_total{job="yuzu",instance="s1",op="register_fresh",reason="store_unavailable"}'
+        values: "0x5 1x60"
+    promql_expr_test:
+      # 0->1 at t=5m: rate(...[10m])>0 holds for t in [5,15); `for: 5m` -> pending
+      # at t=5m, FIRING at t=10m through ~t=15m. The wider-than-`for:` window is
+      # what lets a lone increment cross firing (a [5m] window == for could only
+      # reach pending). Pre-seed is what gives rate() a 0 baseline to diff against.
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="pending"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="pending", instance="s1", job="yuzu", op="register_fresh", reason="store_unavailable", severity="warning"}'
+            value: 1
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="firing", instance="s1", job="yuzu", op="register_fresh", reason="store_unavailable", severity="warning"}'
+            value: 1
+      # long after the lone increment has aged out of the 10m window: resolved.
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE — WITHOUT the pre-seed (no "0" sample ever precedes the jump — the
+  # lazy-creation shape this follow-up fixes), the single incident never even
+  # reaches `pending`: rate() has no earlier sample in any window to diff
+  # against. RED (a false pass) if this were written with a pre-seeded series
+  # instead — this is the case that actually pins "pre-seeding is necessary",
+  # since the case above alone doesn't distinguish "reached pending because of
+  # the pre-seed" from "reached pending some other way".
+  - interval: 1m
+    name: gateway route write failed - WITHOUT pre-seeding, a single isolated failure never reaches even pending
+    input_series:
+      - series: 'yuzu_server_gateway_route_write_failed_total{job="yuzu",instance="s1",op="register_fresh",reason="store_unavailable"}'
+        values: "_x5 1x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed"}'
+        eval_time: 6m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed"}'
+        eval_time: 8m
+        exp_samples: []
+
+  # CASE — the realistic sustained-outage shape: `store_unavailable` persists
+  # so registrations keep failing every minute for several minutes (not one
+  # isolated sample) — this DOES reach firing, comfortably clearing the 5m
+  # `for:` once the condition is genuinely sustained rather than a single
+  # instant.
+  - interval: 1m
+    name: gateway route write failed - a sustained run of failures (real outage shape) fires
+    input_series:
+      - series: 'yuzu_server_gateway_route_write_failed_total{job="yuzu",instance="s1",op="register_fresh",reason="store_unavailable"}'
+        values: "0x5 0+1x10 10x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="firing"}'
+        eval_time: 13m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="firing", instance="s1", job="yuzu", op="register_fresh", reason="store_unavailable", severity="warning"}'
+            value: 1
+
+  # CASE — a flat (never-failing) counter stays quiet: RED against dropping the
+  # `> 0` (an `>= 0` form would fire on the healthy zero-seeded series).
+  - interval: 1m
+    name: gateway route write failed - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_server_gateway_route_write_failed_total{job="yuzu",instance="s1",op="register_fresh",reason="store_unavailable"}'
+        values: "0x60"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteWriteFailed", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples: []
+
+  # CASE — a single route_unreadable-caused retry fires (no `for:` on this
+  # alert — it fires the instant increase()>0 is true).
+  - interval: 1m
+    name: gateway route unreadable - a single isolated retry fires immediately
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_retry_cause_total{job="yuzu",instance="s1",cause="route_unreadable"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteUnreadable", alertstate="firing"}'
+        eval_time: 6m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuGatewayRouteUnreadable", alertstate="firing", instance="s1", job="yuzu", cause="route_unreadable", severity="warning"}'
+            value: 1
+
+  # CASE — a flat (never-degraded) counter stays quiet.
+  - interval: 1m
+    name: gateway route unreadable - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_server_command_outbox_deliver_retry_cause_total{job="yuzu",instance="s1",cause="route_unreadable"}'
+        values: "0x20"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuGatewayRouteUnreadable", alertstate="firing"}'
+        eval_time: 15m
+        exp_samples: []
