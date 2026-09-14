@@ -77,12 +77,13 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks exactly the `network` family's dashboard
-(`network_ui.cpp`), REST-route (`network_routes.cpp`), and model
-(`network_perf_model.cpp`) translation units, plus the in-process API header
-(`network_api.hpp`) the sibling INV-31-4 change is introducing beside them.
-The network family's REST-handler TWIN registrations live inside
-`rest_api_v1.cpp`, and its MCP-tool twin inside `mcp_server.cpp` - BOTH are
+FAMILY COVERAGE: today this checks three families — `network`, `verify` and
+`compliance` — each contributing its dashboard/UI, REST-route (or seamed routes)
+and model translation units, plus the abstract in-process API header and (since
+#4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
+set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
+live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
+twin inside `mcp_server.cpp` - BOTH are
 multi-family translation units that legitimately hold real store access for
 ~20 OTHER families each. An include-closure check applied to either whole
 file would trivially fail (or be gamed by scoping) and would say nothing
