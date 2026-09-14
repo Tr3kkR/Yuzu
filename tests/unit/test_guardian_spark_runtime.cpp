@@ -5978,6 +5978,21 @@ TEST_CASE("rung 9c R5.2 (adversarial re-review r3 C2): a throwing index release 
     CHECK(WEXITSTATUS(status) == 0);
 }
 
+// rung 9c PR-5a (#4221 ch-102) coverage note: #4221's ch-102 asks for a runtime-level
+// test of "the refill-inside-catch admission-refusal arm... the refill-then-admission-
+// refused sub-path" - a queued claim behind a resolving head whose OWN admission then
+// gets refused, inside on_arm_complete's compensating-gap cleanup. #4221's cited line
+// numbers pre-date rung 9c PR-1 through PR-4's refactors and no longer resolve to a
+// distinct, separately-reachable branch. This EXACT scenario is already exercised
+// twice: the death test immediately above (`rung 9c R5.2 (adversarial re-review r3
+// C2)`, refilling "r2" behind r1's withdrawn head, then forcing r2's own admission to
+// fail via set_io_executor_fail_launch_for_test) and the up-101 test below (same
+// setup, same seam, before the same-rule re-attach it goes on to test). Both force the
+// refill's admission to be refused as part of their own required setup, not as an
+// afterthought - a third, separately-named test would duplicate this coverage rather
+// than add to it. No new test added for ch-102; flagging this explicitly per the
+// kickoff's own instruction rather than leaving the criterion silently unaddressed.
+//
 // rung 9c PR-5a (#4221 up-101/ch-101): the death test above proves recovery when a
 // DIFFERENT rule (r4) queues behind r2's tombstone. #4221's own up-101 criterion names
 // the harder, untested case: the SAME rule_id ("r2") re-attaching behind ITS OWN

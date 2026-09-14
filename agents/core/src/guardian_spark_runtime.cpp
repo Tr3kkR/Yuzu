@@ -1816,6 +1816,32 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // never writes keys_ until it commits, and commit erases the entry);
                 // a never-dispatched terminal tombstone may still sit here after a
                 // double fault, and is swept first (governance pass-3 sg-3/ar-4/cs-5).
+                //
+                // rung 9c PR-5a (#4221 cs-103) reachability note: this sweep's ATTACH-
+                // path twin (try_dispatch_head_locked, this file's other
+                // sweep_terminal_queued_locked call site) has concrete, tested repros
+                // (the "adversarial re-review r3 C2" death test and PR-5a's own
+                // "up-101/ch-101" test both leave a real tombstone for this call to
+                // sweep). This DETACH-path call site does not, and an extensive trace
+                // of the actual call graph (attach_core, publish_arm_verdicts_locked,
+                // on_arm_complete, Case 0 in this function) did not turn up a
+                // producible sequence of public-API calls that reaches here with a
+                // non-empty fifo: any candidate same-key tombstone either (a) still
+                // holds its OWN index_->add() mapping (its release having failed),
+                // which inflates index_->refcount() for this key past 1 and blocks
+                // `last_on_key` above from ever gating entry into this branch while
+                // that tombstone persists, or (b) gets opportunistically swept by
+                // try_dispatch_head_locked's OWN call as part of the SAME rule's own
+                // next attach - see PR-5a's up-101 test, where the tombstone is
+                // cleared before the new claim ever reaches commit, not left for a
+                // later, separate detach to find. This matches the governance
+                // finding's own framing (sg-3/ar-4/cs-5 hardened BOTH sweep call
+                // sites symmetrically as defence-in-depth) rather than a distinctly
+                // reproduced defect at this specific site. Flagging rather than
+                // asserting impossibility: a future change to up-5's retained-disarm
+                // redrive (5b) or to the claim/index bookkeeping above could open a
+                // path this analysis didn't model - re-check this note rather than
+                // deleting it if either changes.
                 sweep_terminal_queued_locked(eit->second);
                 assert(eit->second.fifo.empty());
                 try {
