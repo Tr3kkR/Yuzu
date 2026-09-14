@@ -1517,7 +1517,6 @@ private:
             /*mcp_streamed_post_enabled=*/&streamed_post_enabled_,
             /*allowed_origins=*/allowed_origins_for_test,
             /*software_licensing_store=*/software_licensing_store_for_test,
-            /*app_usage_store=*/app_usage_store_for_test,
             // Spelled out only because the streamed-POST params after them are
             // what this call actually needs; nullptr is the pre-existing default.
             /*engine_principal_store=*/nullptr,
@@ -1534,7 +1533,10 @@ private:
             /*product_pack_store=*/product_pack_store_for_test,
             /*workflow_engine=*/workflow_engine_for_test,
             /*issue_code_signing_fn=*/issue_code_signing_fn_for_test,
-            /*verify_api=*/verify_api_for_test);
+            /*verify_api=*/verify_api_for_test,
+            // wave 7 PR7.2: true last parameter, positioned after verify_api
+            // (not after software_licensing_store) to match the .hpp order.
+            /*app_usage_store=*/app_usage_store_for_test);
     }
 };
 

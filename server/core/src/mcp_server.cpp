@@ -4362,13 +4362,16 @@ McpServer::HandlerFn McpServer::build_handler(
     McpSessionRegistry* sessions, const bool* mcp_streaming_disabled,
     const bool* mcp_streamed_post_enabled,
     std::vector<std::string> allowed_origins, SoftwareLicensingStore* software_licensing_store,
-    AppUsageStore* app_usage_store,
     EnginePrincipalStore* engine_principal_store, AccessReviewStore* access_review_store,
     AuthDB* auth_db, DirectorySync* directory_sync, CallerFn caller_fn,
     yuzu::server::detail::StreamBudget* stream_budget, StreamRevalidateFn revalidate_fn,
     StreamPrincipalAuditFn principal_audit_fn, ProductPackStore* product_pack_store,
     WorkflowEngine* workflow_engine, IssueCodeSigningFn issue_code_signing_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api,
+    // wave 7 PR7.2: backs get_agent_app_usage. True last parameter (after
+    // verify_api, matching the .hpp order) so every existing caller that
+    // terminates its positional args at verify_api keeps compiling unchanged.
+    AppUsageStore* app_usage_store) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -20128,7 +20131,6 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 const bool* mcp_streamed_post_enabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
-                                AppUsageStore* app_usage_store,
                                 EnginePrincipalStore* engine_principal_store,
                                 AccessReviewStore* access_review_store, AuthDB* auth_db,
                                 DirectorySync* directory_sync,
@@ -20139,7 +20141,9 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
                                 IssueCodeSigningFn issue_code_signing_fn,
-                                std::shared_ptr<const VerifyApi> verify_api) {
+                                std::shared_ptr<const VerifyApi> verify_api,
+                                // wave 7 PR7.2: true last parameter (after verify_api).
+                                AppUsageStore* app_usage_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -20151,12 +20155,12 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
                     mcp_streamed_post_enabled, std::move(allowed_origins),
-                    software_licensing_store, app_usage_store, engine_principal_store,
+                    software_licensing_store, engine_principal_store,
                     access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
                     std::move(caller_fn), product_pack_store, workflow_engine,
-                    std::move(issue_code_signing_fn), std::move(verify_api));
+                    std::move(issue_code_signing_fn), std::move(verify_api), app_usage_store);
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -20183,7 +20187,6 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 const bool* mcp_streamed_post_enabled,
                                 std::vector<std::string> allowed_origins,
                                 SoftwareLicensingStore* software_licensing_store,
-                                AppUsageStore* app_usage_store,
                                 EnginePrincipalStore* engine_principal_store,
                                 AccessReviewStore* access_review_store, AuthDB* auth_db,
                                 DirectorySync* directory_sync,
@@ -20194,7 +20197,9 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 CallerFn caller_fn, ProductPackStore* product_pack_store,
                                 WorkflowEngine* workflow_engine,
                                 IssueCodeSigningFn issue_code_signing_fn,
-                                std::shared_ptr<const VerifyApi> verify_api) {
+                                std::shared_ptr<const VerifyApi> verify_api,
+                                // wave 7 PR7.2: true last parameter (after verify_api).
+                                AppUsageStore* app_usage_store) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -20218,7 +20223,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                             sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                             std::move(allowed_origins),
-                            software_licensing_store, app_usage_store, engine_principal_store,
+                            software_licensing_store, engine_principal_store,
                             access_review_store,
                             auth_db, directory_sync, std::move(caller_fn),
                             // 2f PR 3b: the streamed-POST arm leases from the SAME
@@ -20227,7 +20232,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             // held-open worker, whichever verb pinned it.
                             stream_budget, std::move(revalidate_fn),
                             std::move(principal_audit_fn), product_pack_store, workflow_engine,
-                            std::move(issue_code_signing_fn), std::move(verify_api)));
+                            std::move(issue_code_signing_fn), std::move(verify_api),
+                            app_usage_store));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
