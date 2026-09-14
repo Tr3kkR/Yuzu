@@ -853,3 +853,207 @@ TEST_CASE("the shared confined-dispatch seam does not refuse a Destructive fan-o
     // that belongs in a route handler instead.
     CHECK(outcome.sent == 3);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WS-4 4.2b Task C — GatewayRouteStore reader wiring (fallback-only). These
+// bind `wire_and_dispatch_confined`'s new `gateway_route_store` parameter
+// against a REAL `GatewayRouteStore` + REAL `AgentRegistry`, mirroring the
+// K-1 section above. See dispatch_route_fallback.hpp's file header for the
+// fallback-only contract this pins: a candidate WITH a local `AgentRegistry`
+// session is NEVER routed via the directory, regardless of what row (if any)
+// the directory holds for it — the acceptance property is that this changes
+// ZERO monolith routing outcomes.
+// ═══════════════════════════════════════════════════════════════════════════
+
+#include "gateway_route_store.hpp"
+#include "pg/pg_pool.hpp"
+
+#include "../test_helpers.hpp"
+
+namespace {
+using yuzu::server::GatewayRouteStore;
+namespace pg = yuzu::server::pg;
+
+// Separate template key ("dispatchroutefallback") so this file's clone
+// lineage never shares with test_gateway_route_store.cpp's "gatewayroute" or
+// test_gateway_route_wiring.cpp's "gwroutewiring" fixtures.
+yuzu::test::PgTestTemplate dispatch_route_fallback_tpl{
+    "dispatchroutefallback", [](const std::string& dsn) {
+        pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        GatewayRouteStore store{pool};
+        if (!store.is_open())
+            throw std::runtime_error("dispatchroutefallback template: store failed to migrate");
+    }};
+
+agent_pb::CommandRequest make_route_fallback_cmd(const std::string& command_id) {
+    agent_pb::CommandRequest cmd;
+    cmd.set_command_id(command_id);
+    cmd.set_plugin("os_info");
+    cmd.set_action("version");
+    cmd.set_dispatch_tag("v1|ro|none|0123456789abcdef0123456789abcdef");
+    return cmd;
+}
+} // namespace
+
+TEST_CASE("wire_and_dispatch_confined: a locally-known agent routes via the EXISTING path "
+          "and the directory store is never queried, even with a routable row present for "
+          "the same id (WS-4 4.2b Task C — fallback-only)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    (void)registry.register_agent(make_wiring_test_info("dev-local"));
+    registry.set_gateway_route(
+        "dev-local", "test-gateway",
+        {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)});
+
+    // A directory row for the SAME agent id — deliberately present AND
+    // routable even though the agent has a local session. If the local path
+    // were bypassed, this dispatch would come out carrying "cluster-decoy"'s
+    // cluster_id via the directory fallback instead of the existing local
+    // gateway_node queue.
+    auto fresh = store.register_fresh("dev-local", "sess-local-1");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->won);
+    auto announced = store.announce_connected("dev-local", "sess-local-1", "cluster-decoy",
+                                              "node-decoy", /*lease_ttl_secs=*/90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-local"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-local", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-local"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 1);
+    CHECK_FALSE(outcome.route_unreadable);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].agent_id == "dev-local");
+    // Routed via the EXISTING local gateway_node path: no cluster_id carried
+    // on the pending entry — `send_via_directory` (the only path that ever
+    // sets it) was never called, proving the directory row was ignored.
+    CHECK_FALSE(pending[0].cluster_id.has_value());
+}
+
+TEST_CASE("wire_and_dispatch_confined: a local-miss agent with a ROUTABLE directory row is "
+          "queued via the directory fallback, carrying its cluster_id (WS-4 4.2b Task C)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    // Deliberately NEVER registered locally — this replica has no session
+    // for "dev-remote" at all, the precondition for the fallback to fire.
+
+    auto fresh = store.register_fresh("dev-remote", "sess-remote-1");
+    REQUIRE(fresh.has_value());
+    REQUIRE(fresh->won);
+    auto announced =
+        store.announce_connected("dev-remote", "sess-remote-1", "cluster-b", "node-b", 90);
+    REQUIRE(announced.has_value());
+    REQUIRE(announced->matched);
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-remote"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-remote", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-remote"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 1);
+    CHECK_FALSE(outcome.route_unreadable);
+    auto pending = registry.drain_gateway_pending();
+    REQUIRE(pending.size() == 1);
+    CHECK(pending[0].agent_id == "dev-remote");
+    REQUIRE(pending[0].cluster_id.has_value());
+    CHECK(*pending[0].cluster_id == "cluster-b");
+}
+
+TEST_CASE("wire_and_dispatch_confined: a local-miss agent ABSENT from the directory is a "
+          "definite no-route — not queued via the directory, not sent (WS-4 4.2b Task C)",
+          "[pg][server][dispatch][scope][gateway_route_dispatch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dispatch_route_fallback_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    // Never registered locally AND no directory row at all for this id.
+
+    auto classified = ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-absent"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-absent", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-ghost"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &store);
+
+    CHECK(outcome.sent == 0);
+    CHECK_FALSE(outcome.route_unreadable);
+    CHECK(outcome.not_sent == std::vector<std::string>{"dev-ghost"});
+    CHECK(registry.drain_gateway_pending().empty());
+}
+
+TEST_CASE("wire_and_dispatch_confined: a DEGRADED directory read on a local-miss candidate "
+          "surfaces route_unreadable (WS-4 4.2b Task C)",
+          "[server][dispatch][scope][gateway_route_dispatch]") {
+    // Mirrors test_gateway_route_wiring.cpp's fail-open/fail-closed cases: a
+    // deliberately unparseable conninfo makes PgPool::valid() false, so the
+    // store's construction-time acquire() fails fast and `open_` stays
+    // false — no real Postgres instance needed, this case runs even when
+    // YUZU_TEST_POSTGRES_DSN is unset.
+    pg::PgPool broken_pool{{.conninfo = "not a valid conninfo string ===", .size = 1}};
+    GatewayRouteStore broken_store{broken_pool};
+    REQUIRE_FALSE(broken_store.is_open());
+
+    EventBus bus;
+    yuzu::MetricsRegistry metrics;
+    AgentRegistry registry(bus, metrics);
+    // Never registered locally — a local miss, so the batched read fires
+    // (and immediately degrades, since the store never opened).
+
+    auto classified =
+        ClassifiedCommandTestAccess::make(make_route_fallback_cmd("route-fb-degraded"));
+    auto noop_audit = [](const std::string&, const std::string&, const std::string&,
+                         const std::string&) {};
+    const auto outcome = yuzu::server::wire_and_dispatch_confined(
+        registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
+        /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
+        /*execution_tracker=*/nullptr, noop_audit, noop_audit,
+        /*command_id=*/"route-fb-degraded", /*execution_id=*/"", /*principal_role=*/"",
+        /*agent_ids=*/{"dev-degraded"}, /*scope_expr=*/"", /*exec_visible=*/unfiltered(),
+        /*broadcast_on_none=*/false, kNoContainment, classified, /*definition_id=*/{},
+        /*concurrency_mode=*/{}, &broken_store);
+
+    CHECK(outcome.sent == 0);
+    CHECK(outcome.route_unreadable);
+    CHECK(registry.drain_gateway_pending().empty());
+}

@@ -73,6 +73,21 @@ struct ConfinedDispatchSink {
     /// Every currently-known agent id, used to narrow a broadcast when the
     /// caller IS filtered.
     std::function<std::vector<std::string>()> known_agent_ids;
+    /// WS-4 4.2b Task C (fallback-only gateway routing-directory consult,
+    /// #4246). Called ONCE per arm — Group/Scope/Ids only, never
+    /// Broadcast/None, whose candidates come from `known_agent_ids()` and are
+    /// therefore by construction always locally known — with the arm's FULL
+    /// candidate list, BEFORE any `send_to` call for that arm. Default
+    /// (unset — every dispatch before this slice, and every dispatch with no
+    /// directory wired, e.g. `forward_legacy_command`'s Broadcast-only sink)
+    /// is a pure no-op: `send_to` alone decides delivery, unchanged. Returns
+    /// true iff the batched directory read itself degraded
+    /// (store_unavailable/db_error) — surfaced as
+    /// `ArmDispatchResult::route_unreadable` /
+    /// `ConfinedDispatchOutcome::route_unreadable` (see that field's own doc
+    /// comment: this slice only DEFINES and PRODUCES the flag; wiring its
+    /// outbox-reschedule / cascade consumption is the next task).
+    std::function<bool(const std::vector<std::string>& candidates)> prepare_route_fallback;
 };
 
 /// Targets the CALLER has already resolved. Each arm reads only its own field;
@@ -212,6 +227,19 @@ struct ArmDispatchResult {
     /// kept as a separate field anyway so every consumer of this struct reads
     /// counts the same way regardless of which reason produced them.
     std::size_t unknown_plugin_count = 0;
+    /// WS-4 4.2b Task C: true iff a `sink.prepare_route_fallback` call for
+    /// this arm's candidate list reported a DEGRADED directory read (the
+    /// batched `GatewayRouteStore::lookup_routes` call itself failed), as
+    /// opposed to a successful read that simply found no route for a
+    /// locally-missing candidate — that is a definite no-route and shows up
+    /// in `not_sent` exactly like any other undelivered id, nothing new.
+    /// Mirrors `ConfinedDispatchOutcome::containment_unreadable`'s shape:
+    /// "the gate/directory itself could not answer" is a distinct fact from
+    /// "answered and said no". This slice only DEFINES and PRODUCES the
+    /// flag — wiring its outbox-reschedule / #3424-style cascade
+    /// consumption is the next task (see the routed concern on dispatch
+    /// zero-reach cause discrimination).
+    bool route_unreadable = false;
 };
 
 /// Outcome of `resolve_and_dispatch_confined` (dispatch_scope_ladder.hpp) --
@@ -282,6 +310,12 @@ struct ConfinedDispatchOutcome {
     /// `denied_quarantined_count` exactly; see `ArmDispatchResult::unknown_plugin`.
     std::vector<std::string> unknown_plugin;
     std::size_t unknown_plugin_count = 0;
+    /// WS-4 4.2b Task C -- mirrors `ArmDispatchResult::route_unreadable`,
+    /// threaded out here the same way `containment_unreadable` already is.
+    /// See that field's doc comment; only ever set for the Group/Scope/Ids
+    /// branches below (`dispatch_confined_arms` never calls
+    /// `prepare_route_fallback` for Broadcast/None).
+    bool route_unreadable = false;
 };
 
 /// #881: case-insensitive predicate for the quarantine control-channel
@@ -698,7 +732,11 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
     case DispatchArm::Group:
         // A management group is a targeting mechanism, not an authz
         // exemption — and, per #881, not a containment exemption either.
-        if (targets.group_members)
+        if (targets.group_members) {
+            // WS-4 4.2b Task C: ONE batched directory consult for the arm's
+            // FULL candidate list, before any per-id send — never per-id.
+            if (sink.prepare_route_fallback)
+                result.route_unreadable = sink.prepare_route_fallback(*targets.group_members);
             for (const auto& aid : *targets.group_members) {
                 if (!authz::in_scope(exec_visible, aid) || contained(aid) || plugin_absent(aid))
                     continue;
@@ -707,10 +745,20 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
                 else
                     result.not_sent.push_back(aid);
             }
+        }
         break;
     case DispatchArm::Scope:
         // Null == the caller aborted resolution and already audited it.
-        if (targets.scope_matched)
+        if (targets.scope_matched) {
+            // WS-4 4.2b Task C: same batched-before-the-walk shape as Group
+            // above. The candidate list handed to the directory is the
+            // PRE-INTERSECTION `*targets.scope_matched` (a superset of what
+            // will actually be sent to once `filter_to_scope` below narrows
+            // it) — a lookup for an id later dropped by authz costs nothing
+            // beyond an unused map entry, and keeps this call symmetric with
+            // Group/Ids rather than needing its own post-intersection list.
+            if (sink.prepare_route_fallback)
+                result.route_unreadable = sink.prepare_route_fallback(*targets.scope_matched);
             for (const auto& aid : authz::filter_to_scope(*targets.scope_matched, exec_visible)) {
                 if (contained(aid) || plugin_absent(aid))
                     continue;
@@ -719,9 +767,13 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
                 else
                     result.not_sent.push_back(aid);
             }
+        }
         break;
     case DispatchArm::Ids:
-        if (targets.agent_ids)
+        if (targets.agent_ids) {
+            // WS-4 4.2b Task C: same shape as Group/Scope above.
+            if (sink.prepare_route_fallback)
+                result.route_unreadable = sink.prepare_route_fallback(*targets.agent_ids);
             for (const auto& aid : authz::filter_to_scope(*targets.agent_ids, exec_visible)) {
                 if (contained(aid) || plugin_absent(aid))
                     continue;
@@ -730,6 +782,7 @@ dispatch_confined_arms(DispatchArm arm, const ConfinedDispatchTargets& targets,
                 else
                     result.not_sent.push_back(aid);
             }
+        }
         break;
     case DispatchArm::Broadcast:
         // Asked for by its published name (`__all__`) — still narrowed, and
