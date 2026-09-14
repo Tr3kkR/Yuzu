@@ -9026,26 +9026,15 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
                 auto members = mgmt_store->get_members(group_id);
-                JArr member_arr;
-                for (const auto& m : members)
-                    member_arr.add(JObj()
-                                       .add("agent_id", m.agent_id)
-                                       .add("source", m.source)
-                                       .add("added_at", m.added_at));
-                JObj payload;
-                payload.add("id", g->id)
-                    .add("name", g->name)
-                    .add("description", g->description)
-                    .add("parent_id", g->parent_id)
-                    .add("membership_type", g->membership_type)
-                    .add("scope_expression", g->scope_expression)
-                    .add("created_by", g->created_by)
-                    .add("created_at", g->created_at)
-                    .add("updated_at", g->updated_at)
-                    .raw("members", member_arr.str());
                 mcp_audit("success", group_id);
-                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
-                                "application/json");
+                // Shared builder (management_group_model.hpp) - the REST twin
+                // GET /api/v1/management-groups/{id} calls the SAME function,
+                // so the two JSON shapes cannot drift (docs/api-twin-recipe.md
+                // §1 Rule 1).
+                res.set_content(
+                    success_response(
+                        id, tool_result(management_group_detail_json(*g, members), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -9181,13 +9170,16 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 const bool audit_ok = audit_fn(req, "management_group.update", "success",
                                                "ManagementGroup", group_id, updated.name);
-                JObj payload;
-                payload.add("updated", true);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", group_id);
-                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
-                                "application/json");
+                // Shared builder (management_group_model.hpp) - the REST twin
+                // PUT /api/v1/management-groups/{id} calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1); MCP's real audit_ok
+                // surfaces a dropped audit row in the body, its only channel
+                // for it (REST instead uses Sec-Audit-Failed).
+                res.set_content(
+                    success_response(
+                        id, tool_result(management_group_update_ack_json(audit_ok), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -19921,30 +19913,13 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
+                // Shared builder (api_token_model.hpp) - the REST twin
+                // GET /api/v1/tokens calls the SAME per-token function, so the
+                // two JSON shapes cannot drift (docs/api-twin-recipe.md §1
+                // Rule 1).
                 JArr arr;
-                for (const auto& t : *tokens) {
-                    JObj item;
-                    item.add("token_id", t.token_id)
-                        .add("name", t.name)
-                        .add("principal_id", t.principal_id)
-                        .add("created_at", t.created_at)
-                        .add("expires_at", t.expires_at)
-                        .add("last_used_at", t.last_used_at)
-                        .add("revoked", t.revoked);
-                    if (!t.scope_service.empty())
-                        item.add("scope_service", t.scope_service);
-                    if (!t.mcp_tier.empty())
-                        item.add("mcp_tier", t.mcp_tier);
-                    if (!t.rotation_group.empty())
-                        item.add("rotation_group", t.rotation_group);
-                    if (!t.supersedes_token_id.empty())
-                        item.add("supersedes_token_id", t.supersedes_token_id);
-                    if (t.overlap_expires_at != 0)
-                        item.add("overlap_expires_at", t.overlap_expires_at);
-                    if (t.confirmed_at != 0)
-                        item.add("confirmed_at", t.confirmed_at);
-                    arr.add(item);
-                }
+                for (const auto& t : *tokens)
+                    arr.add_raw(api_token_list_item_json(t));
                 mcp_audit("success");
                 res.set_content(
                     success_response(id,
@@ -20172,19 +20147,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     detail += "; scope_service=" + scope_service;
                 const bool audit_ok =
                     audit_fn(req, "api_token.create", "success", "ApiToken", name, detail);
-                JObj payload;
-                payload.add("token", *result).add("name", name);
-                if (!scope_service.empty())
-                    payload.add("scope_service", scope_service);
-                if (!audit_ok)
-                    payload.add("audit_persisted", false);
                 mcp_audit("success", name);
                 // G5 (secret hygiene) — the response body carries a raw one-time
                 // credential, same no-store contract as rotate_api_token above.
                 res.set_header("Cache-Control", "no-store, no-cache, must-revalidate");
                 res.set_header("Pragma", "no-cache");
-                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
-                                "application/json");
+                // Shared builder (api_token_model.hpp) - the REST twin
+                // POST /api/v1/tokens calls the SAME function
+                // (docs/api-twin-recipe.md §1 Rule 1); MCP's real audit_ok
+                // surfaces a dropped audit row in the body, its only channel
+                // for it (REST instead uses Sec-Audit-Failed).
+                res.set_content(
+                    success_response(
+                        id, tool_result(api_token_create_ack_json(*result, name, scope_service, audit_ok),
+                                        kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 

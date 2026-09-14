@@ -5,6 +5,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "agent_registry.hpp" // #3687: DispatchDenial / DispatchDenialReason — AuthorizeDispatchFn's error type
+#include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
 #include "api_token_store.hpp"
 #include "approval_manager.hpp"
 #include "audit_store.hpp"
@@ -44,6 +45,7 @@
 // MCP twin (list_upload_grants) cannot drift — same reuse discipline as
 // kek_routes.hpp above.
 #include "file_retrieval_routes.hpp"
+#include "management_group_model.hpp" // #2146 Batch B4: shared REST+MCP management-group JSON builders
 #include "management_group_store.hpp"
 #include "mcp_retry.hpp"  // named retry_after_ms floors + poll counter name (#3344)
 #include "mcp_session.hpp"
