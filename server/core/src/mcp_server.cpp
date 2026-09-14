@@ -8173,14 +8173,20 @@ McpServer::HandlerFn McpServer::build_handler(
                     audit_fn, req, "app_usage.agent.view", "success", "Agent", agent_id, "");
                 const bool audit_ok = mcp_audit("success", agent_id);
                 if (!domain_audit_ok || !audit_ok) {
+                    // Deliberately NOT passing audit_ok=false here: that flag makes
+                    // a4_error append "audit_persisted":false, the set-and-proceed
+                    // shape used elsewhere in this file when data IS still served.
+                    // This path withholds the data entirely (see the block comment
+                    // above), so the error body must carry no audit_persisted field
+                    // at all — passing false would silently reintroduce the
+                    // flagged-serve shape this gate exists to prevent.
                     res.set_content(
                         a4_error(kInternalError,
                                  "the app-usage read succeeded but its access-audit record could "
                                  "not be persisted; refusing to serve behavioural data without "
                                  "durable evidence",
                                  "retry the request",
-                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs,
-                                 /*cid_override=*/{}, /*audit_ok=*/false),
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                         "application/json");
                     return;
                 }
