@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash 34e7430c1da8
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash f85a83ef6582
 == action=list
 feature|Printing-XPSServices-Features|enabled|0
 feature|TelnetClient|disabled|0

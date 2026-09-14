@@ -7,7 +7,7 @@
 | **Version** | 1.0.0 |
 | **Kind** | Collector · read-only · gathered (windows.features.list, windows.features.info) |
 | **Platforms** | Windows ✅ · macOS ⛔ unsupported · Linux ⛔ unsupported |
-| **Actions** | `list` (definition `windows.features.list`) · `info` (definition `windows.features.info`) |
+| **Actions** | `info` (definition `windows.features.info`) · `list` (definition `windows.features.list`) |
 | **Security** | securable `Inventory` · operation Read · risk Low · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: endpoint-admin, endpoint-operator · author: content-author |
 <!-- END GENERATED -->
@@ -34,8 +34,17 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `list` | ✅ supported · rung 1 · DISM API DismOpenSession(DISM_ONLINE_IMAGE) + DismGetFeatures/DismGetFeatureInfo | ⛔ unsupported | ⛔ unsupported |
 | `info` | ✅ supported · rung 1 · DISM API DismOpenSession(DISM_ONLINE_IMAGE) + DismGetFeatures/DismGetFeatureInfo | ⛔ unsupported | ⛔ unsupported |
+| `list` | ✅ supported · rung 1 · DISM API DismOpenSession(DISM_ONLINE_IMAGE) + DismGetFeatures/DismGetFeatureInfo | ⛔ unsupported | ⛔ unsupported |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`info` / Windows** — verified live on the-rig under NT AUTHORITY\\SYSTEM, 2026-09-08
+- **`info` / macOS** — Windows-only: DISM has no Linux/macOS equivalent
+- **`info` / Linux** — Windows-only: DISM has no Linux/macOS equivalent
+- **`list` / Windows** — verified live on the-rig under NT AUTHORITY\\SYSTEM, 2026-09-08
+- **`list` / macOS** — Windows-only: DISM has no Linux/macOS equivalent
+- **`list` / Linux** — Windows-only: DISM has no Linux/macOS equivalent
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -53,17 +62,10 @@ No subprocesses and no network access. `DismApi.dll` is resolved once at process
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
-**`windows.features.list`**
-
-| Parameter | Type | Required | Default | Constraints | Description |
-|---|---|---|---|---|---|
-| `state` | string | No | - | enum: enabled, disabled, pending | Optional filter narrowing the result to one state bucket. |
-
-**`windows.features.info`**
-
-| Parameter | Type | Required | Default | Constraints | Description |
-|---|---|---|---|---|---|
-| `feature` | string | Yes | - | pattern: `^[A-Za-z0-9._-]{1,256}$` | The DISM feature name (FeatureName), e.g. NetFx3. |
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `windows.features.info` | `feature` | string | yes | - | pattern: ^[A-Za-z0-9._-]{1,256}$ | The DISM feature name (FeatureName), e.g. NetFx3. |
+| `windows.features.list` | `state` | string | no | - | enum: enabled, disabled, pending | Optional filter narrowing the result to one state bucket. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -71,14 +73,6 @@ No subprocesses and no network access. `DismApi.dll` is resolved once at process
 Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per feature (or per matching feature when `state` filters); `info` writes exactly one `feature_info|` row. On an unsupported or unavailable leg, both actions instead write a single sentinel row: `feature|unsupported|<os>:dism:unsupported` / `feature|unavailable|windows:dism:<token>` (or the `feature_info` equivalent for `info`) — never a blank or omitted row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
-**`windows.features.list` — `name|state|restart_required`**
-
-| Field | Type | Values | Available | Example | Description |
-|---|---|---|---|---|---|
-| `name` | string | - | Windows | `NetFx3` | DISM feature name (FeatureName), e.g. NetFx3. |
-| `state` | string | - | Windows | `enabled` | Feature state. Values: enabled, disabled, pending_enable, pending_disable, superseded, partially_installed, unknown. |
-| `restart_required` | boolean | - | Windows | `0` | Whether a restart is needed to complete a pending enable/disable. Values: 1 (pending state), 0 (not pending) — a digit, never true/false. |
-
 **`windows.features.info` — `name|display_name|state|restart_type|description`**
 
 | Field | Type | Values | Available | Example | Description |
@@ -88,6 +82,14 @@ Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per f
 | `state` | string | - | Windows | `enabled` | Feature state. Values: enabled, disabled, pending_enable, pending_disable, superseded, partially_installed, unknown. |
 | `restart_type` | string | - | Windows | `possible` | Restart requirement for a pending change (DismFeatureInfo.RestartRequired). Values: no, possible, required, unknown. |
 | `description` | string | - | Windows | `.NET Framework 3.5 (includes .NET 2.0 and 3.0)` | Feature description (DismFeatureInfo.Description). |
+
+**`windows.features.list` — `name|state|restart_required`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `name` | string | - | Windows | `NetFx3` | DISM feature name (FeatureName), e.g. NetFx3. |
+| `state` | string | - | Windows | `enabled` | Feature state. Values: enabled, disabled, pending_enable, pending_disable, superseded, partially_installed, unknown. |
+| `restart_required` | boolean | - | Windows | `0` | Whether a restart is needed to complete a pending enable/disable. Values: 1 (pending state), 0 (not pending) — a digit, never true/false. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -116,7 +118,7 @@ Pipe-delimited rows via `write_output()`. `list` writes one `feature|` row per f
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash 34e7430c1da8
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-08 · LocalSystem (elevated) · leg-hash f85a83ef6582
 
 ```
 == action=list
@@ -128,11 +130,11 @@ feature|VirtualMachinePlatform|enabled|0
 feature|Client-ProjFS|disabled|0
 feature|SimpleTCP|disabled|0
 feature|WorkFolders-Client|enabled|0
-feature|Windows-Defender-ApplicationGuard|disabled|0
-feature|MicrosoftWindowsPowerShellV2|enabled|0
-feature|MicrosoftWindowsPowerShellV2Root|enabled|0
-feature|MSRDC-Infrastructure|enabled|0
-... (137 rows total, trimmed to 12 for this page — full capture in agents/plugins/windows_optional_features/docs/samples/windows.txt)
+feature|NetFx3|enabled|0
+feature|WCF-HTTP-Activation|disabled|0
+feature|WCF-NonHTTP-Activation|disabled|0
+feature|IIS-WebServerRole|disabled|0
+… 12 of 137 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=info feature=NetFx3
@@ -157,5 +159,4 @@ feature_info|NetFx3|.NET Framework 3.5 (includes .NET 2.0 and 3.0)|enabled|possi
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp`
 - Tests: `tests/unit/test_windows_optional_features_local_dispatcher.cpp` · `tests/unit/test_windows_optional_features_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
-- Changelog: `changelog.d/wave9-pr92-windows-optional-features.added.md`
 <!-- END GENERATED -->
