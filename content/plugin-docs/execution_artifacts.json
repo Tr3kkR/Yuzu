@@ -400,7 +400,7 @@
     },
     {
       "completeness": "partial",
-      "provenance": "`file_oversized` · `read_failed` · `ntdll_symbol_missing` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` (comma-joined when several fire)",
+      "provenance": "`file_oversized` · `read_failed` · `ntdll_symbol_missing` · `ntstatus_<hex>` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` (comma-joined when several fire)",
       "status": "`OK`",
       "when": "`prefetch` only: the directory enumeration completed in full but one or more individual `.pf` files failed to open, read, decompress or parse; each failed file is already on the stream as its own `prefetch_error|<file>|<reason>` row, so the run is reported as a degraded success rather than a failure — one truncated file must never fail every other good row."
     },

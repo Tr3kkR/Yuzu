@@ -1,21 +1,28 @@
 # execution_artifacts — Windows-only ShimCache / Amcache / Prefetch plugin.
-# Multi-TU shape follows disk_actions/meson.build: one portable plugin TU
-# (execute()/descriptors, this package/P31) plus a Windows-only leg TU
-# (execution_artifacts_win.cpp, P32) that is listed only when building for
-# Windows — a single-OS non-Windows build simply omits the leg source, since
-# every action on those platforms is the fixed unsupported|windows_only_
-# artefact outcome the portable TU already handles with no OS call at all.
+# Multi-TU shape follows autoruns/meson.build: one portable plugin TU
+# (execute()/descriptors, this package/P31) plus a single Windows-only leg TU
+# (execution_artifacts_win.cpp, P32) that is CONDITIONALLY appended only when
+# building for Windows — a single-OS non-Windows build simply omits the leg
+# source, since every action on those platforms is the fixed unsupported|
+# windows_only_artefact outcome the portable TU already handles with no OS
+# call at all. (disk_actions/meson.build's shape differs: it lists every
+# per-OS leg TU unconditionally, internally #ifdef-gated — not this plugin's
+# pattern.)
 execution_artifacts_deps = [yuzu_sdk_dep, yuzu_agent_core_dep, spdlog_dep]
 execution_artifacts_sources = files('src/execution_artifacts_plugin.cpp')
 
 if host_machine.system() == 'windows'
   # advapi32: RegQueryValueExW (ShimCache) + RegLoadAppKeyW/AdjustTokenPrivileges
-  # (Amcache). ntdll: RtlGetCompressionWorkSpaceSize/RtlDecompressBufferEx
-  # (Prefetch MAM decompression) — not a normal import-library dependency,
-  # hence cxx.find_library rather than a plain link_with.
+  # (Amcache) — linked normally via cxx.find_library since these are ordinary
+  # import-library symbols. ntdll's RtlGetCompressionWorkSpaceSize/
+  # RtlDecompressBufferEx (Prefetch MAM decompression) are deliberately NOT
+  # link-time dependencies: execution_artifacts_win.cpp resolves both via
+  # GetProcAddress(GetModuleHandleW(L"ntdll.dll"), ...) at runtime (file
+  # banner: "no #ifdef around the symbol... absence is a runtime outcome"),
+  # matching confined_fs_win.cpp's precedent — so no `cxx.find_library('ntdll')`
+  # here.
   execution_artifacts_deps += [
     cxx.find_library('advapi32'),
-    cxx.find_library('ntdll'),
   ]
   execution_artifacts_sources += files('src/execution_artifacts_win.cpp')
 endif
