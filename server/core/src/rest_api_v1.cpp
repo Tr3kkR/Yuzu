@@ -16,6 +16,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -1448,7 +1449,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Delete a result set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403). A pinned set must be unpinned first.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "{deleted: true}"}, "403": {"description": "Result-set delete denied to a service-scoped token"}, "404": {"description": "Not found or not owned by the caller, OR the delete itself failed after ownership was confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found"}, "409": {"description": "RESULT_SET_PINNED — unpin the set first"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership (read stage only)"}}}
     },
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Original carries no re-runnable source (e.g. sql/instruction_id missing), or the source_kind is not yet supported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the creation-time bounds (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -9587,7 +9588,19 @@ void RestApiV1::register_routes(
                           : orig->name.ends_with(" (re-eval)") ? orig->name
                                                                : (orig->name + " (re-eval)");
                       if (orig->source_kind == source_kind::kTarQuery) {
-                          std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                          // #4373 fix: sp.value("sql", "") throws nlohmann::json::type_error
+                          // on a type mismatch rather than coercing - orig->source_payload
+                          // isn't caller-supplied on THIS call, but a row minted via the
+                          // generic (uncapped) create_result_set constructor can carry an
+                          // arbitrary source_payload with a non-string "sql", the same
+                          // #2500-class row the SQL-size cap two lines below exists to
+                          // catch. Treat a non-string sql the same as absent: the empty
+                          // check just below already has the right error for that. Mirrors
+                          // the identical guard on reevaluate_result_set (mcp_server.cpp).
+                          std::string sql =
+                              (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
+                                  ? sp.value("sql", "")
+                                  : "";
                           if (sql.empty()) {
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
                               return;
@@ -9607,8 +9620,62 @@ void RestApiV1::register_routes(
                                     source_kind::kTarQuery, orig->source_payload, orig->matcher,
                                     synth, reeval_name);
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
+                          // Same type-confusion guard as the sql field above.
                           std::string instruction_id =
-                              sp.is_object() ? sp.value("instruction_id", "") : "";
+                              (sp.is_object() && sp.contains("instruction_id") &&
+                               sp["instruction_id"].is_string())
+                                  ? sp.value("instruction_id", "")
+                                  : "";
+                          // #4373 fix: re-apply the SAME caps create_result_set_from_
+                          // instruction_result's REST twin enforces at creation time, and
+                          // the SAME fix MCP's reevaluate_result_set already got (PR #4394)
+                          // - checked here ahead of the instruction_store gate below, since
+                          // a malformed/oversized field is a permanent client error
+                          // regardless of backend availability. `orig` may have been minted
+                          // via the uncapped POST /api/v1/result-sets (no source_kind
+                          // allowlist there) - without this, re-eval would smuggle an
+                          // over-keyed or oversized params object, or an oversized
+                          // instruction_id, past those caps, then dispatch it fleet-wide.
+                          if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
+                              rs_err(res, 400,
+                                     std::format(
+                                         "RESULT_SET_BAD_REQUEST: instruction_id must be at "
+                                         "most {} bytes",
+                                         yuzu::server::mcp::kInstructionIdMaxLen));
+                              return;
+                          }
+                          if (sp.contains("params") && sp["params"].is_object()) {
+                              const auto& p = sp["params"];
+                              if (p.size() > yuzu::server::mcp::kExecInstrParamCountMax) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: params must have at most "
+                                             "{} keys",
+                                             yuzu::server::mcp::kExecInstrParamCountMax));
+                                  return;
+                              }
+                              for (const auto& [k, v] : p.items()) {
+                                  if (k.size() > yuzu::server::mcp::kExecInstrParamKeyMaxLen) {
+                                      rs_err(res, 400,
+                                             std::format(
+                                                 "RESULT_SET_BAD_REQUEST: a params key exceeds "
+                                                 "{} bytes",
+                                                 yuzu::server::mcp::kExecInstrParamKeyMaxLen));
+                                      return;
+                                  }
+                                  const std::size_t vlen =
+                                      v.is_string() ? v.get_ref<const std::string&>().size()
+                                                    : v.dump().size();
+                                  if (vlen > yuzu::server::mcp::kExecInstrParamValueMaxLen) {
+                                      rs_err(res, 400,
+                                             std::format(
+                                                 "RESULT_SET_BAD_REQUEST: a params value "
+                                                 "exceeds {} bytes",
+                                                 yuzu::server::mcp::kExecInstrParamValueMaxLen));
+                                      return;
+                                  }
+                              }
+                          }
                           // ADR-0058: get_definition now returns std::expected — a genuine DB
                           // error 503s distinctly; a not-found/store-unavailable/empty-id
                           // condition keeps the pre-migration 400 collapse.
