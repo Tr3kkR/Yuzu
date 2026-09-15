@@ -107,7 +107,7 @@ TEST_CASE("bitlocker plugin: state executes via LocalDispatcher against real WMI
           "[bitlocker][windows][local_dispatcher]") {
     auto plugin_path = find_bitlocker_plugin();
     if (plugin_path.empty()) {
-        WARN("bitlocker.dll not found (build_examples=false?) -- skipping "
+        WARN("bitlocker.dll not found (build_agent=false?) -- skipping "
              "LocalDispatcher execute-path test");
         return;
     }
