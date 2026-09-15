@@ -87,8 +87,10 @@ std::vector<std::string_view> split_pipe(std::string_view line, std::size_t max_
 std::int64_t parse_i64(std::string_view s) {
     std::int64_t v = 0;
     const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    (void)p;
-    return ec == std::errc{} ? v : 0;
+    // Require the WHOLE field to parse -- "123abc" must not silently become
+    // 123 (governance Gate 7, cpp-expert finding; mirrors the fix already
+    // applied to the sibling ws-7b2 branch's app_usage_ingestion.cpp).
+    return (ec == std::errc{} && p == s.data() + s.size()) ? v : 0;
 }
 
 } // namespace

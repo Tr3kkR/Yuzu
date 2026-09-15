@@ -84,10 +84,13 @@ Source: "{#BuildDir}\agents\plugins\msi_packages\msi_packages.dll"; DestDir: "{a
 Source: "{#BuildDir}\agents\plugins\asset_tags\asset_tags.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\power_health\power_health.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\autoruns\autoruns.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-; app_usage's only data source is tar.dll (reads tar.db directly) -- Components
-; is a boolean expression here, not a plain list, so a custom install that
-; deselects Advanced never ships a permanently non-functional app_usage.dll.
-Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\plugins"; Components: plugins\system and plugins\advanced; Flags: ignoreversion
+; app_usage's only data source is tar.dll (reads tar.db directly), which is
+; itself gated on plugins\advanced alone (see that Source line below) --
+; app_usage.dll must be gated on the SAME single component, not a narrower
+; "and" of two: a custom install selecting Advanced without System has a
+; working tar.dll but would otherwise silently skip app_usage.dll despite
+; its dependency being present (governance Gate 7, cross-platform finding).
+Source: "{#BuildDir}\agents\plugins\app_usage\app_usage.dll"; DestDir: "{app}\plugins"; Components: plugins\advanced; Flags: ignoreversion
 
 ; --- Plugins: network ---
 Source: "{#BuildDir}\agents\plugins\network_config\network_config.dll"; DestDir: "{app}\plugins"; Components: plugins\network; Flags: ignoreversion

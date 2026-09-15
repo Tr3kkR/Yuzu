@@ -306,3 +306,130 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
 
     plugin->descriptor->shutdown(ctx.get());
 }
+
+// ── regression: tar_config PREPARE failure must map to Errored, never ──────
+// silently to Enabled (governance Gate 7 finding — b88c3b690's fix had zero
+// regression coverage; every existing test only exercised the "value
+// present but malformed" and "key absent" cases, never a genuine SQL
+// prepare failure).
+
+TEST_CASE("app_usage plugin: a tar_config PREPARE failure (table missing) maps to "
+         "usage_source_errored, never silently to Enabled -- regression for b88c3b690",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_tarcfg_fail_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t today_ts = now - (now % kSecondsPerDay);
+
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    // usage_daily exists (so the schema-missing branch is not what fires),
+    // but tar_config is deliberately NEVER created -- get_tar_config's
+    // sqlite3_prepare_v2 genuinely FAILS (SQLITE_ERROR, "no such table"),
+    // distinct from a well-formed query returning zero rows for an absent
+    // key. check_usage_source_state must map this to SourceState::Errored,
+    // not fall through to source_state_from_config's nullopt->Enabled path.
+    seed::exec_or_fail(writer,
+                       "CREATE TABLE usage_daily (day_ts INTEGER, exe_key TEXT, "
+                       "run_count INTEGER, total_seconds INTEGER, first_seen INTEGER, "
+                       "last_seen INTEGER, superseded_runs INTEGER, expired_runs INTEGER)");
+    seed::insert_usage_daily(writer, today_ts, "regression.exe", /*run_count=*/1,
+                             /*total_seconds=*/60, /*first_seen=*/now, /*last_seen=*/now,
+                             /*superseded_runs=*/0, /*expired_runs=*/0);
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto summary = dispatcher.run(plugin->descriptor, "summary");
+    // check_usage_source_state's Errored branch reports CONSTRAINED, rc 0 --
+    // never a silent Enabled that falls through to run_summary/read_meta as
+    // if the tar_config read had simply found nothing.
+    CHECK(summary.rc == 0);
+    const auto summary_rows = captured_rows(summary.captured);
+    REQUIRE(summary_rows.size() == 1);
+    CHECK(summary_rows.front().rfind("constrained|usage_source_errored|", 0) == 0);
+
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 0);
+    const auto last_used_rows = captured_rows(last_used.captured);
+    REQUIRE(last_used_rows.size() == 1);
+    CHECK(last_used_rows.front().rfind("constrained|usage_source_errored|", 0) == 0);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+// ── regression: exe="" behaves as OMITTED, never as a literal-key filter ───
+// (governance Gate 7 round 2, consistency-auditor F1). Before this fix, an
+// empty exe value normalised to the "(unknown)" sentinel and filtered on
+// THAT literal key -- silently returning near-zero rows instead of "every
+// executable", contradicting content/definitions/app_usage.yaml's own
+// "omit to return every executable" framing.
+
+TEST_CASE("app_usage plugin: last_used with exe=\"\" returns every executable, matching "
+         "omitted-exe semantics -- regression for the (unknown)-sentinel trap",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_exe_blank_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t today_ts = now - (now % kSecondsPerDay);
+
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer);
+    // Two distinct executables -- an unfiltered "last_used" must return
+    // both; a filter on the "(unknown)" sentinel would return neither.
+    seed::insert_usage_daily(writer, today_ts, "blank_a.exe", 1, 60, now, now, 0, 0);
+    seed::insert_usage_daily(writer, today_ts, "blank_b.exe", 1, 60, now, now, 0, 0);
+    seed::insert_tar_config(writer, "usage_enabled", "true");
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const YuzuParam params[] = {{"exe", ""}};
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used", params);
+    CHECK(last_used.rc == 0);
+    const auto rows = captured_rows(last_used.captured);
+    bool saw_a = false, saw_b = false;
+    for (const auto& row : rows) {
+        if (row.rfind("last_used|blank_a.exe|", 0) == 0)
+            saw_a = true;
+        if (row.rfind("last_used|blank_b.exe|", 0) == 0)
+            saw_b = true;
+    }
+    CHECK(saw_a);
+    CHECK(saw_b);
+
+    plugin->descriptor->shutdown(ctx.get());
+}

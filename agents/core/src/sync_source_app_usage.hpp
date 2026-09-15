@@ -45,8 +45,12 @@ namespace yuzu::agent {
 /// AppUsageStore row; kept agent-side so this module needs no server headers).
 struct AppUsageRow {
     std::string exe_key;
-    std::int64_t first_seen{0};       ///< all-time first-seen epoch seconds
-    std::int64_t last_seen{0};        ///< all-time last-seen epoch seconds
+    std::int64_t first_seen{0};       ///< first-seen epoch seconds, within TAR's retained usage
+                                       ///< window (never all-time — see app_usage_parsers.hpp
+                                       ///< RETENTION, adjudication P3)
+    std::int64_t last_seen{0};        ///< last-seen epoch seconds, within TAR's retained usage
+                                       ///< window (never all-time — see app_usage_parsers.hpp
+                                       ///< RETENTION, adjudication P3)
     std::int64_t run_count_30d{0};    ///< trailing-30-day run count
     std::int64_t total_seconds_30d{0}; ///< trailing-30-day total run seconds
 };

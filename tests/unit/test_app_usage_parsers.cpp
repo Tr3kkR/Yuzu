@@ -401,12 +401,40 @@ TEST_CASE("run_last_used: RECONSTRUCTION — unknown exe filter returns zero row
 
 TEST_CASE("usage_daily_table_exists: true with the table, false without", "[app_usage][schema]") {
     RealFixture fx;
-    CHECK(usage_daily_table_exists(fx.db()));
+    const auto with_table = usage_daily_table_exists(fx.db());
+    REQUIRE(with_table.has_value());
+    CHECK(*with_table);
 
     sqlite3* empty_db = nullptr;
     REQUIRE(sqlite3_open(":memory:", &empty_db) == SQLITE_OK);
-    CHECK_FALSE(usage_daily_table_exists(empty_db));
+    const auto without_table = usage_daily_table_exists(empty_db);
+    REQUIRE(without_table.has_value()); // legitimately absent, not a read failure
+    CHECK_FALSE(*without_table);
     sqlite3_close(empty_db);
+}
+
+// Governance Gate 7 round 2 (unhappy-path UP-1): a GENUINE read failure
+// (here, a corrupt/not-a-database file) must be distinguished from the
+// legitimate "no such table" case above -- the old bool-returning version
+// conflated both into `false`, which app_usage_plugin.cpp's caller read as
+// "older TAR schema". Same bug class as check_usage_source_state's
+// tar_config tri-state (b88c3b690), now closed for the schema check too.
+TEST_CASE("usage_daily_table_exists: a genuine read failure (corrupt db) is distinguished "
+         "from a legitimately-absent table, never silently mapped to false",
+          "[app_usage][schema]") {
+    yuzu::test::TempDbFile fixture_db{"yuzu_test_app_usage_corrupt-"};
+    {
+        std::ofstream f(fixture_db.path, std::ios::binary | std::ios::trunc);
+        f << "not a valid sqlite database file -- forces a genuine prepare/step failure "
+             "rather than a legitimate absent-table result";
+    }
+    sqlite3* db = nullptr;
+    // sqlite3_open() succeeds lazily -- the file header is only parsed on
+    // first real access, which is exactly what usage_daily_table_exists does.
+    REQUIRE(sqlite3_open(fixture_db.path.string().c_str(), &db) == SQLITE_OK);
+    const auto result = usage_daily_table_exists(db);
+    CHECK_FALSE(result.has_value()); // a genuine failure, never a silent `false`
+    sqlite3_close(db);
 }
 
 // ──────────────────────────────────────────── RO+WAL open, on-disk temp db ─
@@ -429,7 +457,9 @@ TEST_CASE("plugin's exact open flags (RO|NOMUTEX) succeed against a WAL-mode on-
     sqlite3_busy_timeout(reader, 2000);
     REQUIRE(sqlite3_exec(reader, "PRAGMA query_only=1", nullptr, nullptr, nullptr) == SQLITE_OK);
 
-    CHECK(usage_daily_table_exists(reader));
+    const auto reader_table_exists = usage_daily_table_exists(reader);
+    REQUIRE(reader_table_exists.has_value());
+    CHECK(*reader_table_exists);
     const auto rows = run_last_used(reader, std::nullopt, 0);
     REQUIRE(rows.has_value());
     REQUIRE(rows->size() == 1);

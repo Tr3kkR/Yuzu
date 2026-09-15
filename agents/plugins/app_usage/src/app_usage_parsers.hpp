@@ -468,13 +468,26 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 
 // ───────────────────────────────────────────────────────── schema check ───
 
-[[nodiscard]] inline bool usage_daily_table_exists(sqlite3* db) {
+// Governance Gate 7 round 2 (unhappy-path UP-1): distinguishes a GENUINE read
+// failure (busy/locked/corrupt -- prepare fails, or step returns anything
+// other than SQLITE_ROW/SQLITE_DONE) from the legitimate "no such table"
+// case (step returns SQLITE_DONE, zero rows). The old bool-returning version
+// conflated both into `false`, which the caller read as "older TAR schema" --
+// exactly the same bug class check_usage_source_state's tri-state already
+// guards against for tar_config reads. `std::unexpected` on a genuine
+// failure; `false` inside the expected on legitimate absence.
+[[nodiscard]] inline std::expected<bool, QueryError> usage_daily_table_exists(sqlite3* db) {
     if (!db)
-        return false;
+        return std::unexpected(QueryError{"usage_daily_table_exists: null db"});
     detail::Stmt stmt{db, kUsageDailyExistsSql};
     if (!stmt)
+        return std::unexpected(QueryError{sqlite3_errmsg(db)});
+    const int rc = sqlite3_step(stmt.get());
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc == SQLITE_DONE)
         return false;
-    return sqlite3_step(stmt.get()) == SQLITE_ROW;
+    return std::unexpected(QueryError{sqlite3_errmsg(db)});
 }
 
 // ─────────────────────────────────────────────────────────── formatting ───

@@ -41,6 +41,8 @@
 #include <yuzu/plugin.hpp>
 #include <yuzu/string_utils.hpp>
 
+#include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
@@ -142,16 +144,22 @@ struct ConfigReadResult {
 };
 
 ConfigReadResult get_tar_config(sqlite3* db, std::string_view key) {
-    sqlite3_stmt* stmt = nullptr;
     static constexpr std::string_view kSql = "SELECT value FROM tar_config WHERE key = ?";
-    if (sqlite3_prepare_v2(db, kSql.data(), static_cast<int>(kSql.size()), &stmt, nullptr) !=
-        SQLITE_OK)
+    // RAII via app_usage_parsers.hpp's detail::Stmt (governance Gate 7,
+    // #app_usage-policy-floor) — a hand-rolled sqlite3_stmt* with a manual
+    // sqlite3_finalize() here was leak-free by inspection (single path,
+    // no early return between prepare and finalize) but was still a policy
+    // floor: new C++ manual cleanup with no documented-impossible exception,
+    // trivially wrappable since this file already transitively includes the
+    // wrapper. Mirrors read_meta()'s get_config lambda in app_usage_parsers.hpp.
+    yuzu::app_usage::detail::Stmt stmt{db, kSql};
+    if (!stmt)
         return {ConfigReadOutcome::kReadError, {}};
-    sqlite3_bind_text(stmt, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt.get(), 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
     ConfigReadResult out;
-    const int rc = sqlite3_step(stmt);
+    const int rc = sqlite3_step(stmt.get());
     if (rc == SQLITE_ROW) {
-        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
         out.outcome = ConfigReadOutcome::kPresent;
         out.value = text ? std::string{text} : std::string{};
     } else if (rc == SQLITE_DONE) {
@@ -159,7 +167,6 @@ ConfigReadResult get_tar_config(sqlite3* db, std::string_view key) {
     } else {
         out.outcome = ConfigReadOutcome::kReadError;
     }
-    sqlite3_finalize(stmt);
     return out;
 }
 
@@ -320,7 +327,19 @@ private:
             ctx.write_output("constrained|usage_source_errored|" + check.reason);
             return 0;
         }
-        if (!yuzu::app_usage::usage_daily_table_exists(db)) {
+        // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
+        // distinguishes a genuine read failure (busy/corrupt) from the
+        // legitimate "no such table" case -- a failure must not be
+        // misreported as "older TAR schema" (same fail-closed shape as the
+        // tar_config Errored branch just above).
+        const auto table_exists = yuzu::app_usage::usage_daily_table_exists(db);
+        if (!table_exists) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, table_exists.error().detail);
+            ctx.write_output("unavailable|query_failed|" + table_exists.error().detail);
+            return 1;
+        }
+        if (!*table_exists) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "usage_daily table absent (older TAR schema)");
@@ -398,7 +417,19 @@ private:
             ctx.write_output("constrained|usage_source_errored|" + check.reason);
             return 0;
         }
-        if (!yuzu::app_usage::usage_daily_table_exists(db)) {
+        // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
+        // distinguishes a genuine read failure (busy/corrupt) from the
+        // legitimate "no such table" case -- a failure must not be
+        // misreported as "older TAR schema" (same fail-closed shape as the
+        // tar_config Errored branch just above).
+        const auto table_exists = yuzu::app_usage::usage_daily_table_exists(db);
+        if (!table_exists) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, table_exists.error().detail);
+            ctx.write_output("unavailable|query_failed|" + table_exists.error().detail);
+            return 1;
+        }
+        if (!*table_exists) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "usage_daily table absent (older TAR schema)");
@@ -407,8 +438,22 @@ private:
         }
 
         std::optional<std::string_view> exe;
-        if (params.has("exe"))
-            exe = params.get("exe");
+        if (params.has("exe")) {
+            const auto raw_exe = params.get("exe");
+            // Governance Gate 7 round 2 (consistency-auditor F1): a present
+            // but blank `exe` (exe= or whitespace-only) is treated as
+            // OMITTED, matching this action's own documented contract
+            // (content/definitions/app_usage.yaml: "omit to return every
+            // executable"). Without this, an empty string normalises via
+            // normalise_exe_key to the "(unknown)" sentinel and filters on
+            // that literal key -- silently returning near-zero rows instead
+            // of everything, which a caller could misread as "no data"
+            // rather than "I passed an empty filter".
+            const bool blank = std::all_of(raw_exe.begin(), raw_exe.end(),
+                                           [](unsigned char c) { return std::isspace(c) != 0; });
+            if (!blank)
+                exe = raw_exe;
+        }
 
         const int64_t now = static_cast<int64_t>(std::time(nullptr));
         const int64_t since_30d_ts = align_to_day(now) - 29 * kSecondsPerDay;

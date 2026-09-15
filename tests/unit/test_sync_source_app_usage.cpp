@@ -156,6 +156,22 @@ TEST_CASE("parse: negative numeric fields clamp to 0", "[app_usage_sync][parse]"
     CHECK(p.rows[0].total_seconds_30d == 0);
 }
 
+// Governance Gate 8 (quality-engineer): regression for parse_i64's trailing-
+// garbage fix (Gate 7 round 2) -- a valid numeric PREFIX followed by
+// non-digit trailing bytes must parse to 0, not silently to the prefix's
+// value. std::from_chars alone reports success for "1700000500x" (ec ==
+// std::errc{}), so the fix requires checking the end pointer too.
+TEST_CASE("parse: a valid-prefix-then-garbage numeric field parses to 0, not the prefix value",
+          "[app_usage_sync][parse]") {
+    const std::string captured = "last_used|chrome.exe|1700000500x|1699000000|12|43200\n";
+    AppUsageParse p = parse_app_usage_last_used_output(captured);
+    REQUIRE(p.rows.size() == 1);
+    CHECK(p.rows[0].last_seen == 0); // not 1700000500
+    CHECK(p.rows[0].first_seen == 1699000000);
+    CHECK(p.rows[0].run_count_30d == 12);
+    CHECK(p.rows[0].total_seconds_30d == 43200);
+}
+
 TEST_CASE("parse: unknown line kinds are skipped without error (forward-compat)",
           "[app_usage_sync][parse]") {
     const std::string captured = "meta|window_days|30|coverage_since|-\n"
