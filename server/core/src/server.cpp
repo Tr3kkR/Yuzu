@@ -161,7 +161,9 @@
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
+#include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
+#include "policy_admin_routes.hpp" // ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin)
 #include "guardian_routes.hpp"
 #include "dex_alert_router.hpp"
 #include "dex_blast_radius.hpp"
@@ -15426,18 +15428,38 @@ private:
             });
         }
 
-        // ComplianceRoutes — /compliance, /fragments/compliance/*, /api/policies/*,
-        // /api/compliance/*
+        // ADR-0031 WS-A4: the compliance/policy READ surface's store-reaching
+        // assembly (list/get/summary/fleet/agent-statuses, incl. the
+        // get_policy composite) moved verbatim behind the ComplianceApi seam
+        // (compliance_api.{hpp,cpp}) — ONE instance, shared by the dashboard
+        // fragments, the REST /api/v1/compliance*+/api/v1/polic* twins, and
+        // the MCP compliance tools below, so all three can never disagree
+        // (same pattern as network_api/verify_api above). policy_store_ fails
+        // startup CLOSED (see its construction above) so it is always live
+        // here.
+        auto compliance_api = make_local_compliance_api(*policy_store_);
+
+        // ComplianceRoutes — /compliance, /fragments/compliance/*, the
+        // read-only GET /api/policies*, /api/policy-fragments*,
+        // /api/compliance* (legacy + v1) twins.
         compliance_routes_ = std::make_unique<ComplianceRoutes>();
         compliance_routes_->register_routes(
+            *web_server_, auth_fn, perm_fn, audit_fn, compliance_api,
+            [this]() -> std::string { return registry_.to_json(); },
+            fleet_read_fn); // #4034 — GET /api/v1/compliance/{id}'s sole gate
+
+        // PolicyAdminRoutes — POST/DELETE /api/policy-fragments*, POST/DELETE/
+        // enable/disable/invalidate(-all)/evaluate/remediate /api/policies*.
+        // No public REST v1/MCP twin (INV-31-4) — deliberately OUTSIDE the
+        // compliance seam; see policy_admin_routes.hpp's file banner.
+        policy_admin_routes_ = std::make_unique<PolicyAdminRoutes>();
+        policy_admin_routes_->register_routes(
             *web_server_, auth_fn, perm_fn, audit_fn,
             [this](const std::string& event_type, const httplib::Request& req,
                    const nlohmann::json& attrs, const nlohmann::json& payload_data) {
                 emit_event(event_type, req, attrs, payload_data);
             },
-            policy_store_.get(), [this]() -> std::string { return registry_.to_json(); },
-            policy_evaluator_.get(), &metrics_, // #2500 targeting-refusal counter
-            fleet_read_fn); // #4034 — GET /api/v1/compliance/{id}'s sole gate
+            policy_store_.get(), policy_evaluator_.get(), &metrics_); // #2500 targeting-refusal counter
 
         // GuardianRoutes — /guardian + /fragments/guardian/* (Guaranteed State
         // dashboard; docs/guardian-mvp-contract.md §8). Fragment renderers are
@@ -18225,7 +18247,12 @@ private:
                 [this](const std::string& intermediate_pem,
                        const std::string& parent_chain_pem) -> CaRoutes::ImportOutcome {
                     return import_subordinate_chain(intermediate_pem, parent_chain_pem);
-                });
+                },
+                // ADR-0031 WS-A4: the SAME ComplianceApi instance ComplianceRoutes
+                // and the REST /api/v1/compliance*+/api/v1/polic* twins use, so
+                // the six read tools + the yuzu://compliance/fleet resource +
+                // get_fleet_posture_fast never disagree with those siblings.
+                compliance_api);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -18789,6 +18816,7 @@ private:
     // as [BUS-BEFORE-TRACKER]; grep both tags before touching this block.
     std::unique_ptr<mcp::McpStreamBridge> mcp_stream_bridge_;
     std::unique_ptr<ComplianceRoutes> compliance_routes_;
+    std::unique_ptr<PolicyAdminRoutes> policy_admin_routes_;
     std::unique_ptr<GuardianRoutes> guardian_routes_;
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;

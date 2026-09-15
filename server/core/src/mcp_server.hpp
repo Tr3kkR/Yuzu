@@ -29,6 +29,7 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
+#include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -872,7 +873,15 @@ public:
                             // revoke_certificate) rather than adding a second one.
                             // Trailing optional dep; unset leaves the tool answering
                             // "CA not available".
-                            CaRoutes::ImportChainFn import_chain_fn = {});
+                            CaRoutes::ImportChainFn import_chain_fn = {},
+                            // ADR-0031 WS-A4: the public in-process compliance/policy
+                            // API seam (replaces direct PolicyStore access for the six
+                            // twinned read tools) — the SAME instance the /compliance
+                            // dashboard fragments and REST /api/v1/compliance*, /api/v1/
+                            // polic* routes use, so all three surfaces can never
+                            // disagree. Trailing optional dep; nullptr leaves those
+                            // tools on the pre-seam "Policy store unavailable" degrade.
+                            std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -982,7 +991,9 @@ public:
                          LicenseStore* license_store = nullptr,
                          SoftwareDeploymentStore* sw_deploy_store = nullptr,
                          CaRoutes::ExportCsrFn export_csr_fn = {},
-                         CaRoutes::ImportChainFn import_chain_fn = {});
+                         CaRoutes::ImportChainFn import_chain_fn = {},
+                         // ADR-0031 WS-A4: see build_handler's doc comment above.
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -1041,7 +1052,9 @@ public:
                          LicenseStore* license_store = nullptr,
                          SoftwareDeploymentStore* sw_deploy_store = nullptr,
                          CaRoutes::ExportCsrFn export_csr_fn = {},
-                         CaRoutes::ImportChainFn import_chain_fn = {});
+                         CaRoutes::ImportChainFn import_chain_fn = {},
+                         // ADR-0031 WS-A4: see build_handler's doc comment above.
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

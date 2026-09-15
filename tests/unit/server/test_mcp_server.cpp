@@ -54,6 +54,7 @@
 #include "response_store.hpp"
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
+#include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
@@ -1167,6 +1168,15 @@ struct McpTestServer {
     /// purely as this test-only adapter's input shape.
     yuzu::server::AppPerfProviders app_perf_providers_for_test{};
 
+    /// ADR-0031 WS-A4: optionally wire a driven FnComplianceApi so the six
+    /// Policy:Read compliance tools (list_policy_fragments / list_policies /
+    /// get_policy / get_fleet_compliance / get_compliance_summary /
+    /// get_policy_agent_statuses) can be exercised end-to-end through the
+    /// seam, mirroring network_api_for_test/verify_api_for_test above.
+    /// Default nullptr keeps every pre-existing test on the "Policy store
+    /// unavailable" null-seam branch (build_handler's own default).
+    std::shared_ptr<const yuzu::server::ComplianceApi> compliance_api_for_test;
+
     /// #289 / Issue 13.5: optionally wire the write-tool stores so set_tag /
     /// delete_tag / approve_request / reject_request / quarantine_device — and the
     /// ticket-then-recall approval flow — can be exercised end-to-end. Default
@@ -1569,7 +1579,8 @@ private:
             /*license_store=*/license_store_for_test,
             /*sw_deploy_store=*/sw_deploy_store_for_test,
             /*export_csr_fn=*/export_csr_fn_for_test,
-            /*import_chain_fn=*/import_chain_fn_for_test);
+            /*import_chain_fn=*/import_chain_fn_for_test,
+            /*compliance_api=*/compliance_api_for_test);
     }
 };
 
@@ -5226,6 +5237,498 @@ TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses fails closed wh
     CHECK(body["error"]["code"].get<int>() == yuzu::server::mcp::kInternalError);
     CHECK(body["error"]["message"].get<std::string>().find("service unavailable") !=
           std::string::npos);
+}
+
+// ── Compliance API seam (ADR-0031 WS-A4) driven through FnComplianceApi ─────
+// The four "Policy store unavailable" cases above cover the null-seam path
+// (compliance_api_for_test left at its nullptr default). These cases wire
+// ts.compliance_api_for_test to a driven yuzu::server::test::FnComplianceApi
+// so the six Policy:Read handler bodies actually run their seam-result ->
+// JSON translation, mirroring how the merged network/verify families drive
+// FnNetworkApi/FnVerifyApi in this same file.
+
+TEST_CASE("MCP Integration: tools/call list_policy_fragments returns the driven "
+          "FnComplianceApi's fragments",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->list_fragments_fn =
+        [](const yuzu::server::FragmentQuery&)
+        -> std::expected<std::vector<yuzu::server::PolicyFragment>, yuzu::server::PolicyReadError> {
+        yuzu::server::PolicyFragment f;
+        f.id = "frag-1";
+        f.name = "Disk encryption";
+        f.description = "Checks disk encryption is on";
+        f.check_instruction = "check_disk_encryption";
+        f.check_compliance = "result.enabled == true";
+        f.fix_instruction = "enable_disk_encryption";
+        f.post_check_instruction = "check_disk_encryption";
+        f.created_at = 111;
+        f.updated_at = 222;
+        return std::vector<yuzu::server::PolicyFragment>{f};
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":300,)"
+        R"("params":{"name":"list_policy_fragments","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    REQUIRE(text.contains("fragments"));
+    REQUIRE(text["fragments"].is_array());
+    REQUIRE(text["fragments"].size() == 1);
+    const auto& row = text["fragments"][0];
+    CHECK(row["id"] == "frag-1");
+    CHECK(row["name"] == "Disk encryption");
+    CHECK(row["description"] == "Checks disk encryption is on");
+    CHECK(row["check_instruction"] == "check_disk_encryption");
+    CHECK(row["check_compliance"] == "result.enabled == true");
+    CHECK(row["fix_instruction"] == "enable_disk_encryption");
+    CHECK(row["post_check_instruction"] == "check_disk_encryption");
+    CHECK(row["created_at"] == 111);
+    CHECK(row["updated_at"] == 222);
+}
+
+TEST_CASE("MCP Integration: tools/call list_policies returns the driven "
+          "FnComplianceApi's policies",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->list_policies_fn =
+        [](const yuzu::server::PolicyQuery&)
+        -> std::expected<std::vector<yuzu::server::Policy>, yuzu::server::PolicyReadError> {
+        yuzu::server::Policy p;
+        p.id = "pol-1";
+        p.name = "Encryption baseline";
+        p.description = "Fleet-wide encryption baseline";
+        p.enabled = true;
+        p.scope_expression = "os == \"linux\"";
+        return std::vector<yuzu::server::Policy>{p};
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":301,)"
+        R"("params":{"name":"list_policies","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    // list_policies uses tool_result_split: content[0].text is the LEGACY
+    // bare array (pre-output-schema wire shape, kept byte-identical for
+    // existing consumers); the schema-conformant {"policies":[...]} object
+    // lives in structuredContent only (mcp_server.cpp's tool_result_split
+    // doc comment).
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    REQUIRE(text.is_array());
+    REQUIRE(text.size() == 1);
+    const auto& row = text[0];
+    CHECK(row["id"] == "pol-1");
+    CHECK(row["name"] == "Encryption baseline");
+    CHECK(row["description"] == "Fleet-wide encryption baseline");
+    CHECK(row["enabled"] == true);
+    CHECK(row["scope_expression"] == "os == \"linux\"");
+
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("policies"));
+    REQUIRE(sc["policies"].is_array());
+    REQUIRE(sc["policies"].size() == 1);
+    CHECK(sc["policies"][0]["id"] == "pol-1");
+}
+
+TEST_CASE("MCP Integration: tools/call get_fleet_compliance returns the driven "
+          "FnComplianceApi's fleet-wide percentages",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 10;
+        fc.compliant = 7;
+        fc.non_compliant = 2;
+        fc.unknown = 1;
+        fc.fixing = 0;
+        fc.error = 0;
+        fc.compliance_pct = 70.0;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":302,)"
+        R"("params":{"name":"get_fleet_compliance","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["total_checks"] == 10);
+    CHECK(text["compliant"] == 7);
+    CHECK(text["non_compliant"] == 2);
+    CHECK(text["unknown"] == 1);
+    CHECK(text["fixing"] == 0);
+    CHECK(text["error"] == 0);
+    CHECK(text["compliance_pct"].get<double>() == 70.0);
+}
+
+TEST_CASE("MCP Integration: tools/call get_compliance_summary returns the driven "
+          "FnComplianceApi's per-policy summary",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->compliance_summary_fn =
+        [](const std::string& policy_id)
+        -> std::expected<yuzu::server::ComplianceSummary, yuzu::server::PolicyReadError> {
+        yuzu::server::ComplianceSummary cs;
+        cs.policy_id = policy_id;
+        cs.compliant = 3;
+        cs.non_compliant = 1;
+        cs.unknown = 0;
+        cs.fixing = 0;
+        cs.error = 0;
+        cs.total = 4;
+        return cs;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":303,)"
+        R"("params":{"name":"get_compliance_summary","arguments":{"policy_id":"pol-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["policy_id"] == "pol-1");
+    CHECK(text["compliant"] == 3);
+    CHECK(text["non_compliant"] == 1);
+    CHECK(text["unknown"] == 0);
+    CHECK(text["fixing"] == 0);
+    CHECK(text["error"] == 0);
+    CHECK(text["total"] == 4);
+}
+
+// #4034/ADR-0031 WS-A4: get_policy's seam call is COMPOSITE — one
+// ComplianceApi::get_policy call replaces three separate store reads (policy,
+// compliance summary, fail-soft fragment lookup for remediation_available),
+// per compliance_api.hpp's file banner. This is the case with NO prior
+// driven coverage at all (the null-store test above only proves dispatch
+// reaches the handler) — assert all three composite parts land in the
+// tool's JSON, for BOTH remediation_available branches.
+TEST_CASE("MCP Integration: tools/call get_policy assembles the composite "
+          "PolicyDetail (policy + summary + remediation_available=true)",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->get_policy_fn =
+        [](const std::string& id)
+        -> std::expected<std::optional<yuzu::server::PolicyDetail>,
+                        yuzu::server::PolicyReadError> {
+        yuzu::server::PolicyDetail detail;
+        detail.policy.id = id;
+        detail.policy.name = "Encryption baseline";
+        detail.policy.description = "Fleet-wide encryption baseline";
+        detail.policy.yaml_source = "name: Encryption baseline\n";
+        detail.policy.fragment_id = "frag-1";
+        detail.policy.scope_expression = "os == \"linux\"";
+        detail.policy.enabled = true;
+        detail.policy.created_at = 1000;
+        detail.policy.updated_at = 2000;
+        detail.summary.policy_id = id;
+        detail.summary.compliant = 5;
+        detail.summary.non_compliant = 1;
+        detail.summary.unknown = 0;
+        detail.summary.fixing = 0;
+        detail.summary.error = 0;
+        detail.summary.total = 6;
+        detail.remediation_available = true;
+        return std::optional<yuzu::server::PolicyDetail>{detail};
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":304,)"
+        R"("params":{"name":"get_policy","arguments":{"policy_id":"pol-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+
+    // Part 1: the policy fields (single_policy_detail_json wraps
+    // policy_list_row_json + yaml_source).
+    CHECK(text["id"] == "pol-1");
+    CHECK(text["name"] == "Encryption baseline");
+    CHECK(text["description"] == "Fleet-wide encryption baseline");
+    CHECK(text["fragment_id"] == "frag-1");
+    CHECK(text["scope_expression"] == "os == \"linux\"");
+    CHECK(text["enabled"] == true);
+    CHECK(text["yaml_source"] == "name: Encryption baseline\n");
+
+    // Part 2: the composite's compliance summary sub-object.
+    REQUIRE(text.contains("compliance"));
+    CHECK(text["compliance"]["compliant"] == 5);
+    CHECK(text["compliance"]["non_compliant"] == 1);
+    CHECK(text["compliance"]["total"] == 6);
+
+    // Part 3: remediation_available (the fail-soft fragment-lookup half of
+    // the composite) — true branch.
+    CHECK(text["remediation_available"] == true);
+}
+
+TEST_CASE("MCP Integration: tools/call get_policy assembles the composite "
+          "PolicyDetail (remediation_available=false)",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->get_policy_fn =
+        [](const std::string& id)
+        -> std::expected<std::optional<yuzu::server::PolicyDetail>,
+                        yuzu::server::PolicyReadError> {
+        yuzu::server::PolicyDetail detail;
+        detail.policy.id = id;
+        detail.policy.name = "No-fragment policy";
+        detail.summary.policy_id = id;
+        detail.summary.total = 0;
+        detail.remediation_available = false;
+        return std::optional<yuzu::server::PolicyDetail>{detail};
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":305,)"
+        R"("params":{"name":"get_policy","arguments":{"policy_id":"pol-2"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+    CHECK(text["id"] == "pol-2");
+    CHECK(text["name"] == "No-fragment policy");
+    REQUIRE(text.contains("compliance"));
+    CHECK(text["compliance"]["total"] == 0);
+    CHECK(text["remediation_available"] == false);
+}
+
+// The resources/read yuzu://compliance/fleet resource shares the exact same
+// FleetCompliance seam call as the get_fleet_compliance tool above, but is a
+// SEPARATE handler body (mcp_server.cpp resources/read branch) with its own
+// JSON assembly — drive it independently so a resource-only regression there
+// is not masked by the tool coverage.
+TEST_CASE("MCP Integration: resources/read yuzu://compliance/fleet returns the "
+          "driven FnComplianceApi's fleet-wide aggregate",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 40;
+        fc.compliant = 25;
+        fc.non_compliant = 10;
+        fc.unknown = 5;
+        fc.fixing = 0;
+        fc.error = 0;
+        fc.compliance_pct = 62.5;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"resources/read","id":308,)"
+        R"("params":{"uri":"yuzu://compliance/fleet"}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& contents = body["result"]["contents"];
+    REQUIRE(contents.is_array());
+    REQUIRE(contents.size() >= 1);
+    CHECK(contents[0]["uri"] == "yuzu://compliance/fleet");
+    auto fc = nlohmann::json::parse(contents[0]["text"].get<std::string>());
+    CHECK(fc["total_checks"] == 40);
+    CHECK(fc["compliant"] == 25);
+    CHECK(fc["non_compliant"] == 10);
+    CHECK(fc["unknown"] == 5);
+    CHECK(fc["compliance_pct"].get<double>() == 62.5);
+}
+
+// get_policy_agent_statuses's SOLE authorization gate is fleet_read_fn_
+// (never perm_fn/tier_allows — see the handler's own comment); this mirrors
+// "MCP get_agent_details: out-of-scope agent collapses to not-found"'s
+// fake-gate pattern above. The FnComplianceApi double supplies the store's
+// UNFILTERED rows for both agents; confinement is asserted end-to-end via
+// confined_policy_compliance, not by the double filtering anything itself.
+TEST_CASE("MCP Integration: tools/call get_policy_agent_statuses confines the "
+          "driven FnComplianceApi's unfiltered rows to the caller's scope",
+          "[mcp][compliance][auth]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->policy_agent_statuses_fn =
+        [](const std::string& policy_id)
+        -> std::expected<std::vector<yuzu::server::PolicyAgentStatus>,
+                        yuzu::server::PolicyReadError> {
+        yuzu::server::PolicyAgentStatus in_scope;
+        in_scope.policy_id = policy_id;
+        in_scope.agent_id = "agent-001";
+        in_scope.status = "compliant";
+        in_scope.last_check_at = 10;
+        in_scope.last_fix_at = 0;
+        in_scope.check_result = "{}";
+
+        yuzu::server::PolicyAgentStatus out_of_scope;
+        out_of_scope.policy_id = policy_id;
+        out_of_scope.agent_id = "agent-002";
+        out_of_scope.status = "non_compliant";
+        out_of_scope.last_check_at = 20;
+        out_of_scope.last_fix_at = 0;
+        out_of_scope.check_result = "{}";
+
+        return std::vector<yuzu::server::PolicyAgentStatus>{in_scope, out_of_scope};
+    };
+    ts.compliance_api_for_test = capi;
+    // Caller may see agent-001 only (composed meet(mgmt,service) VisibleSet,
+    // same fake-gate shape as the get_agent_details confinement test above).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"agent-001"}};
+    };
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":306,)"
+        R"("params":{"name":"get_policy_agent_statuses","arguments":{"policy_id":"pol-1"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    auto& content = body["result"]["content"];
+    REQUIRE(content.is_array());
+    REQUIRE(content.size() >= 1);
+    auto text = nlohmann::json::parse(content[0]["text"].get<std::string>());
+
+    CHECK(text["policy_id"] == "pol-1");
+    REQUIRE(text.contains("agents"));
+    REQUIRE(text["agents"].is_array());
+    // Only the in-scope agent is visible — the out-of-scope row from the
+    // double's unfiltered result must not leak through.
+    REQUIRE(text["agents"].size() == 1);
+    CHECK(text["agents"][0]["agent_id"] == "agent-001");
+    CHECK(text["agents"][0]["status"] == "compliant");
+
+    // The confined tally (confined_policy_compliance), never the store's
+    // own unfiltered aggregate — total must be 1, not 2.
+    REQUIRE(text.contains("summary"));
+    CHECK(text["summary"]["total"] == 1);
+    CHECK(text["summary"]["compliant"] == 1);
+    CHECK(text["summary"]["non_compliant"] == 0);
+}
+
+// Degrade propagation through the seam (ADR-0036): an unwired
+// FnComplianceApi method returns PolicyReadError::kDegraded, which every
+// handler above translates into the same a4_error kInternalError "store
+// degraded" shape with retry_after_ms — never an empty/zeroed success body.
+TEST_CASE("MCP Integration: tools/call get_fleet_compliance surfaces the seam's "
+          "kDegraded as a4_error with retry_after_ms",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    // fleet_compliance_fn left unwired: FnComplianceApi::fleet_compliance()
+    // returns std::unexpected(PolicyReadError::kDegraded) by construction.
+    ts.compliance_api_for_test = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":307,)"
+        R"("params":{"name":"get_fleet_compliance","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    CHECK(body["error"]["message"].get<std::string>().find("degraded") != std::string::npos);
+    REQUIRE(body["error"]["data"].contains("retry_after_ms"));
+    CHECK(body["error"]["data"]["retry_after_ms"].get<int>() == 5000);
+}
+
+// get_fleet_posture_fast's compliance sub-object: every case above and in the
+// agentic-demo suite leaves compliance_api_for_test at its nullptr default,
+// so they only ever exercise the "policy_obj.add(\"available\", false)"
+// degrade branch. Wire a driven FnComplianceApi so the success-path
+// aggregate projection (mcp_server.cpp's get_fleet_posture_fast handler,
+// the fc_res-true arm) actually runs and lands in the tool response.
+TEST_CASE("MCP Integration: tools/call get_fleet_posture_fast projects the "
+          "driven FnComplianceApi's fleet-wide aggregate (success path, not "
+          "the degrade branch)",
+          "[mcp][compliance]") {
+    McpTestServer ts;
+    auto capi = std::make_shared<yuzu::server::test::FnComplianceApi>();
+    capi->fleet_compliance_fn =
+        []() -> std::expected<yuzu::server::FleetCompliance, yuzu::server::PolicyReadError> {
+        yuzu::server::FleetCompliance fc;
+        fc.total_checks = 18;
+        fc.compliant = 12;
+        fc.non_compliant = 4;
+        fc.unknown = 2;
+        fc.fixing = 0;
+        fc.error = 0;
+        fc.compliance_pct = 66.7;
+        return fc;
+    };
+    ts.compliance_api_for_test = capi;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":309,)"
+        R"("params":{"name":"get_fleet_posture_fast","arguments":{}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("result"));
+    REQUIRE(body["result"].contains("structuredContent"));
+    auto& sc = body["result"]["structuredContent"];
+    REQUIRE(sc.contains("compliance"));
+    // Success-path aggregate, not the degrade branch's {"available": false}.
+    CHECK_FALSE(sc["compliance"].contains("available"));
+    CHECK(sc["compliance"]["total_checks"] == 18);
+    CHECK(sc["compliance"]["compliant"] == 12);
+    CHECK(sc["compliance"]["non_compliant"] == 4);
+    CHECK(sc["compliance"]["unknown"] == 2);
+    CHECK(sc["compliance"]["compliance_pct"].get<double>() == 66.7);
+    // "policy/compliance store" must not be listed as a missing source once
+    // the seam is driven.
+    for (const auto& m : sc["missing_sources"])
+        CHECK(m.get<std::string>() != "policy/compliance store");
 }
 
 // ── A2 discovery tools (roadmap Issue 17.1) ─────────────────────────────────

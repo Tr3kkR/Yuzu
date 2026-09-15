@@ -5040,7 +5040,8 @@ McpServer::HandlerFn McpServer::build_handler(
     std::shared_ptr<const VerifyApi> verify_api, LockoutClearFn lockout_clear_fn,
     OffloadTargetStore* offload_target_store, LicenseStore* license_store,
     SoftwareDeploymentStore* sw_deploy_store, CaRoutes::ExportCsrFn export_csr_fn,
-    CaRoutes::ImportChainFn import_chain_fn) {
+    CaRoutes::ImportChainFn import_chain_fn,
+    std::shared_ptr<const ComplianceApi> compliance_api) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -5606,12 +5607,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                 return;
             }
-            if (uri == "yuzu://compliance/fleet" && policy_store) {
+            if (uri == "yuzu://compliance/fleet" && compliance_api) {
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
                 // ADR-0056: degrade-distinguishable read — surface an error,
                 // never a false 0%/empty fleet-compliance resource.
-                auto fc_res = policy_store->get_fleet_compliance();
+                auto fc_res = compliance_api->fleet_compliance();
                 if (!fc_res) {
                     res.set_content(error_response(id, kInternalError, "Policy store degraded"),
                                     "application/json");
@@ -8919,13 +8920,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                if (!policy_store) {
+                if (!compliance_api) {
                     res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
                                     "application/json");
                     return;
                 }
                 PolicyQuery pq;
-                auto policies_res = policy_store->query_policies(pq);
+                auto policies_res = compliance_api->list_policies(pq);
                 if (!policies_res) {
                     mcp_audit("failure", "store degraded; list_policies");
                     res.set_content(
@@ -8963,13 +8964,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                if (!policy_store) {
+                if (!compliance_api) {
                     res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
                                     "application/json");
                     return;
                 }
                 auto policy_id = param_str(args, "policy_id");
-                auto cs_res = policy_store->get_compliance_summary(policy_id);
+                auto cs_res = compliance_api->compliance_summary(policy_id);
                 if (!cs_res) {
                     mcp_audit("failure", "store degraded; " + policy_id);
                     res.set_content(
@@ -8999,12 +9000,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                if (!policy_store) {
+                if (!compliance_api) {
                     res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
                                     "application/json");
                     return;
                 }
-                auto fc_res = policy_store->get_fleet_compliance();
+                auto fc_res = compliance_api->fleet_compliance();
                 if (!fc_res) {
                     mcp_audit("failure", "store degraded; get_fleet_compliance");
                     res.set_content(
@@ -9037,13 +9038,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                if (!policy_store) {
+                if (!compliance_api) {
                     res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
                                     "application/json");
                     return;
                 }
                 auto policy_id = param_str(args, "policy_id");
-                auto policy_res = policy_store->get_policy(policy_id);
+                // ADR-0031 WS-A4: the seam's get_policy is COMPOSITE — one call
+                // replaces the three separate policy_store reads this handler
+                // used to make (get_policy, get_compliance_summary, a fail-soft
+                // get_fragment lookup for remediation_available). See
+                // compliance_api.hpp's file banner for why that composition
+                // lives behind the seam rather than as three seam methods.
+                auto policy_res = compliance_api->get_policy(policy_id);
                 if (!policy_res) {
                     mcp_audit("failure", "store degraded; " + policy_id);
                     res.set_content(
@@ -9063,25 +9070,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                const Policy& policy = **policy_res;
-                auto cs_res = policy_store->get_compliance_summary(policy_id);
-                if (!cs_res) {
-                    mcp_audit("failure", "store degraded (compliance); " + policy_id);
-                    res.set_content(
-                        a4_error(kInternalError, "Policy store degraded — query failed", {},
-                                 /*retry_after_ms=*/5000),
-                        "application/json");
-                    return;
-                }
-                // Same fail-soft posture as the REST twin: a degraded
-                // fragment read means "not offered", not a distinct error —
-                // this only gates a UI/agentic affordance, not a grant.
-                bool remediation_available = false;
-                auto frag_res = policy_store->get_fragment(policy.fragment_id);
-                if (frag_res && *frag_res)
-                    remediation_available = !(*frag_res)->fix_instruction.empty();
-                nlohmann::json obj =
-                    single_policy_detail_json(policy, *cs_res, remediation_available);
+                const PolicyDetail& detail = **policy_res;
+                nlohmann::json obj = single_policy_detail_json(detail.policy, detail.summary,
+                                                                detail.remediation_available);
                 mcp_audit("success", policy_id);
                 res.set_content(success_response(id, tool_result(obj.dump(), kObjectOutputSchema)),
                                 "application/json");
@@ -9099,7 +9090,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Policy", "Read"))
                     return;
-                if (!policy_store) {
+                if (!compliance_api) {
                     res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
                                     "application/json");
                     return;
@@ -9114,7 +9105,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 // has no such floor; this is deliberate MCP-side hardening).
                 q.limit = static_cast<int>(
                     std::clamp<std::int64_t>(param_int(args, "limit", 100), 1, 1000));
-                auto frags_res = policy_store->query_fragments(q);
+                auto frags_res = compliance_api->list_fragments(q);
                 if (!frags_res) {
                     mcp_audit("failure", "store degraded; list_policy_fragments");
                     res.set_content(
@@ -9152,13 +9143,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto gate = fleet_read_fn_(req, res, "Policy", "Read");
                 if (!gate.admitted)
                     return; // gate already wrote the A4 error body + status.
-                if (!policy_store) {
+                if (!compliance_api) {
                     res.set_content(error_response(id, kInternalError, "Policy store unavailable"),
                                     "application/json");
                     return;
                 }
                 auto policy_id = param_str(args, "policy_id");
-                auto statuses_res = policy_store->get_policy_agent_statuses(policy_id);
+                auto statuses_res = compliance_api->policy_agent_statuses(policy_id);
                 if (!statuses_res) {
                     mcp_audit("failure", "store degraded; " + policy_id);
                     res.set_content(
@@ -16717,7 +16708,7 @@ McpServer::HandlerFn McpServer::build_handler(
             if (tool_name == "get_fleet_posture_fast") {
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                if (policy_store && !perm_fn(req, res, "Policy", "Read"))
+                if (compliance_api && !perm_fn(req, res, "Policy", "Read"))
                     return;
                 const int ttl = std::clamp(param_int32(args, "ttl_seconds", 30), 5, 300);
                 const auto now = std::chrono::steady_clock::now();
@@ -16752,7 +16743,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     os_mix.add(os, count);
                 JArr missing;
                 missing.add("offline inventory store not wired into MCP posture v1");
-                if (!policy_store)
+                if (!compliance_api)
                     missing.add("policy/compliance store");
                 if (!guaranteed_state_store)
                     missing.add("DEX signal store");
@@ -16778,8 +16769,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 JObj policy_obj;
                 std::expected<FleetCompliance, PolicyReadError> fc_res =
                     std::unexpected(PolicyReadError::kDegraded);
-                if (policy_store)
-                    fc_res = policy_store->get_fleet_compliance();
+                if (compliance_api)
+                    fc_res = compliance_api->fleet_compliance();
                 if (fc_res) {
                     const auto& fc = *fc_res;
                     policy_obj.add("total_checks", fc.total_checks)
@@ -22707,7 +22698,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 LicenseStore* license_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 CaRoutes::ExportCsrFn export_csr_fn,
-                                CaRoutes::ImportChainFn import_chain_fn) {
+                                CaRoutes::ImportChainFn import_chain_fn,
+                                std::shared_ptr<const ComplianceApi> compliance_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -22726,7 +22718,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(issue_code_signing_fn), std::move(verify_api),
                     std::move(lockout_clear_fn), offload_target_store,
                     license_store, sw_deploy_store, std::move(export_csr_fn),
-                    std::move(import_chain_fn));
+                    std::move(import_chain_fn),
+                    std::move(compliance_api));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -22769,7 +22762,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 LicenseStore* license_store,
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 CaRoutes::ExportCsrFn export_csr_fn,
-                                CaRoutes::ImportChainFn import_chain_fn) {
+                                CaRoutes::ImportChainFn import_chain_fn,
+                                std::shared_ptr<const ComplianceApi> compliance_api) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -22804,7 +22798,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(issue_code_signing_fn), std::move(verify_api),
                             std::move(lockout_clear_fn),
                             offload_target_store, license_store, sw_deploy_store,
-                            std::move(export_csr_fn), std::move(import_chain_fn)));
+                            std::move(export_csr_fn), std::move(import_chain_fn),
+                            std::move(compliance_api)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
