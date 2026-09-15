@@ -11,10 +11,9 @@
  * every host, incl. MSVC.
  *
  * is_cert_entry_name is the Linux directory filter used by a readdir(3)
- * d_name enumeration (peer review F4/F5); it must match
- * std::filesystem::path::extension() byte-for-byte for every vector below --
- * that parity was cross-checked against a scratch program using the real
- * std::filesystem API, not assumed.
+ * d_name enumeration (peer review F4/F5); its accept/reject boundary must
+ * match std::filesystem::path::extension() exactly -- the parity test below
+ * runs both against the real std::filesystem API, not merely by inspection.
  *
  * classify_delete_recheck's vectors close #3245 (TOCTOU: the match was
  * established on one inode, the unlink must act on the same one) and peer
@@ -28,8 +27,10 @@
 #include <certificates_macos_parsers.hpp> // the SHARED pure helpers (no hand copy)
 
 #include <cerrno>
+#include <filesystem>
 #include <optional>
 #include <string>
+#include <string_view>
 
 using namespace yuzu::certificates_macos;
 
@@ -71,6 +72,18 @@ TEST_CASE("is_cert_entry_name rejects dot-files, wrong-case, and dotless names",
     CHECK_FALSE(is_cert_entry_name(".."));
     CHECK_FALSE(is_cert_entry_name(""));
     CHECK_FALSE(is_cert_entry_name("pem"));
+}
+
+TEST_CASE("is_cert_entry_name parity with std::filesystem::path::extension()",
+          "[certificates][honesty]") {
+    auto extension_says_cert = [](std::string_view name) {
+        auto ext = std::filesystem::path(name).extension().string();
+        return ext == ".pem" || ext == ".crt";
+    };
+    for (std::string_view name : {"a.pem", "ca-certificates.crt", "x.y.pem", ".pem", "a.PEM",
+                                   "a.pem.bak", "a.crt~", ".", "..", "", "pem"}) {
+        CHECK(is_cert_entry_name(name) == extension_says_cert(name));
+    }
 }
 
 // ── classify_cert_dir_open ───────────────────────────────────────────────────

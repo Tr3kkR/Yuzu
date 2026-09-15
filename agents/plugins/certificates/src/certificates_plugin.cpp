@@ -592,7 +592,14 @@ CertDir open_cert_dir() {
     // block) but is included unconditionally per the "no open in this block
     // without O_NONBLOCK" rule below, so every open/openat call site is
     // uniform and the lexical gate has no exception to special-case.
-    int fd = ::open("/etc/ssl/certs", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK);
+    //
+    // O_NOFOLLOW refuses a symlinked root, matching confined_fs.hpp's
+    // open_root contract: without it, a swapped /etc/ssl/certs would be
+    // silently followed before the held-dirfd protection above ever
+    // engages. A symlink root fails ELOOP, which classify_cert_dir_open
+    // folds into kUnreadable like any other open failure.
+    int fd = ::open("/etc/ssl/certs",
+                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
     int err = fd < 0 ? errno : 0;
     return CertDir{yuzu::agent::ScopedFd(fd), classify_cert_dir_open(fd >= 0, err), err};
 }
@@ -701,7 +708,7 @@ CertEntryRead read_cert_entry(int dirfd, const std::string& name) {
         }
         link_target.assign(buf, static_cast<std::size_t>(n));
 
-        int target_fd = link_target.front() == '/'
+        int target_fd = !link_target.empty() && link_target.front() == '/'
                             ? ::open(link_target.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)
                             : ::openat(dirfd, link_target.c_str(),
                                        O_RDONLY | O_CLOEXEC | O_NONBLOCK);
