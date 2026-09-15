@@ -148,6 +148,25 @@ class PackagingStructureTests(unittest.TestCase):
             with self.assertRaisesRegex(bundle.BundleError, "rebuild with meson/native"):
                 bundle.require_macos_deployment_target([Path("binary")])
 
+    def test_builder_requires_all_machos_to_match_agent_architectures(self) -> None:
+        def lipo(argv: list[str]) -> str:
+            return "arm64\n" if argv[-1] == "agent" else "x86_64\n"
+
+        with mock.patch.object(bundle, "run", side_effect=lipo):
+            with self.assertRaisesRegex(bundle.BundleError, "architectures x86_64, expected arm64"):
+                bundle.require_matching_architectures(Path("agent"), [Path("plugin")])
+
+    def test_builder_requires_the_exact_tar_plugin_basename(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
+            plugin_dir = Path(temporary) / "plugins"
+            plugin_dir.mkdir()
+            (plugin_dir / "not_tar.dylib").touch()
+            with self.assertRaisesRegex(bundle.BundleError, "TAR plugin"):
+                bundle.find_plugins(Path(temporary))
+            (plugin_dir / "tar.dylib").touch()
+            self.assertEqual({plugin.name for plugin in bundle.find_plugins(Path(temporary))},
+                             {"not_tar.dylib", "tar.dylib"})
+
     def test_payload_is_staged_before_postinstall_promotes_it(self) -> None:
         preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
         postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
@@ -158,7 +177,10 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('recover_interrupted_promotion', preinstall)
         self.assertNotIn('launchctl bootout',
                          preinstall[:preinstall.index('recover_interrupted_promotion')])
-        self.assertIn('secure_payload_parent "$DATA_DIR" 750', preinstall)
+        self.assertIn('secure_payload_parent "$APP_ROOT" 755', preinstall)
+        self.assertIn('non-package owner', preinstall)
+        self.assertNotIn('secure_payload_parent "$DATA_DIR"', preinstall)
+        self.assertNotIn('chown root:wheel "$DATA_DIR"', postinstall)
         self.assertIn('secure_payload_parent "$YUZU_LIB" 755', preinstall)
         self.assertIn('root-owned and not group/world writable', preinstall)
         self.assertIn('secure_payload_parent "$parent" 755', preinstall)
@@ -172,6 +194,7 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('rm -rf "$recovery"', postinstall)
 
     def test_recovery_clears_both_lanes_and_uninstall_removes_transition_paths(self) -> None:
+        preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
         postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
         uninstall = (ROOT / "deploy/packaging/macos/uninstall.sh").read_text()
         self.assertIn('rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib', postinstall)
@@ -179,6 +202,26 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('harden_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('collides with an unmanaged third-party plugin', postinstall)
         self.assertIn('remove_managed_plugins "$INCOMING_MANIFEST"', postinstall)
+        self.assertIn('LEGACY_APP="$DATA_DIR/YuzuAgent.app"', preinstall)
+        self.assertIn('legacy_app_is_managed()', preinstall)
+        self.assertIn('if legacy_app_is_managed; then', preinstall)
+        self.assertIn('LEGACY_TEAM_ID="7RLSYL2JM7"', preinstall)
+        self.assertIn('LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"', preinstall)
+        self.assertIn('LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"', preinstall)
+        self.assertIn('codesign -dvv "$candidate"', preinstall)
+        self.assertIn('legacy-retired.app', postinstall)
+        self.assertIn('retire_legacy_app', postinstall)
+        self.assertIn('preserved but not bootstrapped from non-package-owned data', preinstall)
+        self.assertIn('preserved but not bootstrapped from non-package-owned data', postinstall)
+        self.assertIn('retained legacy app in root-owned recovery; service was not bootstrapped', preinstall)
+        self.assertIn('retained legacy app in root-owned recovery; service was not bootstrapped', postinstall)
+        self.assertIn('copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"', preinstall)
+        self.assertIn('retire_legacy_app', postinstall)
+        self.assertNotIn('recovery/legacy/YuzuAgent.app', postinstall)
+        self.assertIn('retire_legacy_app', uninstall)
+        self.assertIn('"/Library/Application Support/Yuzu/YuzuAgent.app"', uninstall)
+        self.assertIn('/usr/local/lib/yuzu/merge-launchd-plist.py', uninstall)
+        self.assertIn('/usr/local/lib/yuzu/plugin-signing-policy.json', uninstall)
         self.assertIn('sync', postinstall)
         self.assertNotIn('rm -rf "$APP" "$PLUGIN_DIR"', postinstall)
         self.assertIn('.YuzuAgent.incoming.app', uninstall)

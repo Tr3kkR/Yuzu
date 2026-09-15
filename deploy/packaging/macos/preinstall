@@ -6,6 +6,12 @@ set -eu
 PLIST="/Library/LaunchDaemons/com.yuzu.agent.plist"
 STATE_DIR="/var/db/yuzu-agent"
 DATA_DIR="/Library/Application Support/Yuzu"
+APP_ROOT="/Library/Application Support/YuzuAgent"
+LEGACY_APP="$DATA_DIR/YuzuAgent.app"
+LEGACY_TEAM_ID="7RLSYL2JM7"
+LEGACY_APP_ID="7RLSYL2JM7.co.uk.devnullsecurity.yuzu-agent"
+LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
+LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 YUZU_LIB="/usr/local/lib/yuzu"
 RECOVERY_FILE="$STATE_DIR/current-recovery"
 mkdir -p "$STATE_DIR"
@@ -43,7 +49,9 @@ write_recovery_phase() {
 
 # These locations receive Installer payload before postinstall can run. Establish
 # their ownership without accepting a symlink before the privileged extraction.
-secure_payload_parent "$DATA_DIR" 750
+# The Yuzu data directory may be provisioned by EDR/FDA policy with a
+# non-package owner. Never change it: stage sealed code in its own trusted root.
+secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
 
 remove_managed_plugins() {
@@ -65,16 +73,31 @@ copy_if_present() {
     ditto "$source" "$destination"
 }
 
+legacy_app_is_managed() {
+    local candidate="${1:-$LEGACY_APP}"
+    [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" \
+        == "${LEGACY_APP_ID#*.}" ]] || return 1
+    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1
+    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" \
+        == "$LEGACY_TEAM_ID" ]] || return 1
+    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" \
+        == "$LEGACY_SIGNING_AUTHORITY" ]] || return 1
+    [[ -f "$candidate/Contents/embedded.provisionprofile" ]] || return 1
+    [[ "$(shasum -a 256 "$candidate/Contents/embedded.provisionprofile" | awk '{print $1}')" \
+        == "$LEGACY_PROFILE_SHA256" ]]
+}
+
 recover_interrupted_promotion() {
     local recovery="$1"
     launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
     remove_managed_plugins "$YUZU_LIB/package-files.list"
     rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list"
-    rm -rf "$DATA_DIR/YuzuAgent.app"
+    rm -rf "$APP_ROOT/YuzuAgent.app"
     rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
     [[ ! -e "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]] || \
         ditto "$recovery/LaunchDaemons/com.yuzu.agent.plist" "$PLIST"
-    [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$DATA_DIR/YuzuAgent.app"
+    [[ ! -d "$recovery/YuzuAgent.app" ]] || ditto "$recovery/YuzuAgent.app" "$APP_ROOT/YuzuAgent.app"
     [[ ! -e "$recovery/loose/yuzu-agent" ]] || ditto "$recovery/loose/yuzu-agent" /usr/local/bin/yuzu-agent
     [[ ! -e "$recovery/loose/libyuzu_agent_core.dylib" ]] || \
         ditto "$recovery/loose/libyuzu_agent_core.dylib" /usr/local/lib/libyuzu_agent_core.dylib
@@ -83,7 +106,18 @@ recover_interrupted_promotion() {
         ditto "$recovery/package-files.list" "$YUZU_LIB/package-files.list"
     [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$YUZU_LIB/plugins"
     [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$YUZU_LIB/plugins"
-    [[ ! -e "$PLIST" ]] || launchctl bootstrap system "$PLIST"
+    if [[ -d "$recovery/legacy-retired.app" ]]; then
+        echo "ERROR: retained legacy app in root-owned recovery; service was not bootstrapped" >&2
+        return 1
+    fi
+    if [[ -e "$PLIST" ]]; then
+        if /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" 2>/dev/null | \
+           grep -Fq -- "$LEGACY_APP/Contents/MacOS/yuzu-agent"; then
+            echo "ERROR: recovered legacy service was preserved but not bootstrapped from non-package-owned data" >&2
+            return 1
+        fi
+        launchctl bootstrap system "$PLIST"
+    fi
 }
 
 if [[ -f "$RECOVERY_FILE" ]]; then
@@ -113,7 +147,13 @@ fi
 RECOVERY="$(mktemp -d "${STATE_DIR}/install-recovery.XXXXXX")"
 
 copy_if_present "$PLIST" "$RECOVERY/LaunchDaemons/com.yuzu.agent.plist"
-copy_if_present "/Library/Application Support/Yuzu/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
+copy_if_present "$APP_ROOT/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
+# Keep the old code tree out of the new data-root policy. The old app remains
+# live until postinstall has started the new daemon, but this copy permits
+# recovery if the final legacy cleanup is interrupted.
+if legacy_app_is_managed; then
+    copy_if_present "$LEGACY_APP" "$RECOVERY/legacy/YuzuAgent.app"
+fi
 copy_if_present "/usr/local/bin/yuzu-agent" "$RECOVERY/loose/yuzu-agent"
 copy_if_present "/usr/local/lib/libyuzu_agent_core.dylib" "$RECOVERY/loose/libyuzu_agent_core.dylib"
 copy_if_present "/usr/local/lib/yuzu/package-mode" "$RECOVERY/package-mode"
@@ -128,7 +168,7 @@ fi
 
 # A failed payload phase leaves only ignored incoming paths. A fault before
 # postinstall therefore retains a complete active installation and this copy.
-rm -rf "/Library/Application Support/Yuzu/.YuzuAgent.incoming.app" \
+rm -rf "$APP_ROOT/.YuzuAgent.incoming.app" \
        "/usr/local/lib/yuzu/.plugins.incoming"
 rm -f "/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
       "/usr/local/bin/.yuzu-agent.incoming" \

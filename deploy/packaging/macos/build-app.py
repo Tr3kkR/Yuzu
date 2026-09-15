@@ -197,7 +197,7 @@ def find_plugins(bin_dir: Path) -> list[Path]:
             if prior != plugin:
                 raise BundleError(f"duplicate plugin output basename: {plugin.name}")
     plugins = list(found.values())
-    if not plugins or not any("tar" in plugin.stem.lower() for plugin in plugins):
+    if not any(plugin.name == "tar.dylib" for plugin in plugins):
         raise BundleError("TAR plugin is required in the development bundle")
     return plugins
 
@@ -210,6 +210,25 @@ _DYLIB_DEPENDENCY_COMMANDS = frozenset({
     "LC_LAZY_LOAD_DYLIB",
 })
 _MACOS_DEPLOYMENT_TARGET = "13.3"
+
+
+def macho_architectures(path: Path) -> frozenset[str]:
+    """Return the complete Mach-O slice set, without inferring it from a host."""
+    architectures = frozenset(run(["lipo", "-archs", str(path)]).split())
+    if not architectures:
+        raise BundleError(f"Mach-O {path.name} has no architectures")
+    return architectures
+
+
+def require_matching_architectures(reference: Path, paths: Iterable[Path]) -> None:
+    """Require every distributable Mach-O to have the agent's exact slice set."""
+    expected = macho_architectures(reference)
+    for path in paths:
+        actual = macho_architectures(path)
+        if actual != expected:
+            raise BundleError(
+                f"{path.name} architectures {', '.join(sorted(actual))}, expected "
+                f"{', '.join(sorted(expected))} to match {reference.name}")
 
 
 def macho_deployment_targets(path: Path) -> list[str]:
@@ -385,6 +404,7 @@ def build(args: argparse.Namespace) -> Path:
     agent = find_first([bin_dir / "yuzu-agent", bin_dir / "agents/core/yuzu-agent"])
     core = find_first([bin_dir / "libyuzu_agent_core.dylib", bin_dir / "agents/core/libyuzu_agent_core.dylib"])
     plugins = find_plugins(bin_dir)
+    require_matching_architectures(agent, [core, *plugins])
     require_macos_deployment_target([agent, core, *plugins])
     signed_sources = [plugin for plugin in plugins if Path(str(plugin) + ".sig").is_file()]
     trust_bundle = Path(args.plugin_trust_bundle) if args.plugin_trust_bundle else None
@@ -433,8 +453,9 @@ def build(args: argparse.Namespace) -> Path:
                 if not final_sidecar.is_file():
                     raise BundleError(f"{sidecar.name} covers pre-signing bytes; provide a final-byte sidecar")
                 shutil.copy2(final_sidecar, plugin_dir / sidecar.name)
-        require_macos_deployment_target([macos / "yuzu-agent", *frameworks.iterdir(),
-                                         *plugin_dir.glob("*.dylib")])
+        staged_machos = [*frameworks.iterdir(), *plugin_dir.glob("*.dylib")]
+        require_matching_architectures(macos / "yuzu-agent", staged_machos)
+        require_macos_deployment_target([macos / "yuzu-agent", *staged_machos])
         for library in frameworks.iterdir():
             sign(library, identity)
         sign(app, identity, entitlements=entitlements)

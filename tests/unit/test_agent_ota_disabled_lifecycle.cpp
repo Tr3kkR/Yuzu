@@ -23,8 +23,10 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include <fcntl.h>
@@ -174,6 +176,25 @@ struct AgentStopGuard {
     ~AgentStopGuard() { agent.stop(); }
 };
 
+std::vector<char> read_bytes(const fs::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw std::runtime_error{"could not open test sidecar for reading: " + path.string()};
+    std::vector<char> contents{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    if (input.bad())
+        throw std::runtime_error{"could not read test sidecar completely: " + path.string()};
+    return contents;
+}
+
+void write_bytes(const fs::path& path, const std::vector<char>& contents) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output)
+        throw std::runtime_error{"could not open test sidecar for writing: " + path.string()};
+    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    if (!output)
+        throw std::runtime_error{"could not write test sidecar completely: " + path.string()};
+}
+
 struct FileBackup {
     fs::path path;
     bool existed{false};
@@ -182,17 +203,28 @@ struct FileBackup {
     explicit FileBackup(fs::path input) : path(std::move(input)), existed(fs::exists(path)) {
         if (!existed)
             return;
-        std::ifstream input_file(path, std::ios::binary);
-        contents.assign(std::istreambuf_iterator<char>{input_file}, std::istreambuf_iterator<char>{});
+        contents = read_bytes(path);
+    }
+
+    FileBackup(const FileBackup&) = delete;
+    FileBackup& operator=(const FileBackup&) = delete;
+
+    void restore() const {
+        if (existed) {
+            write_bytes(path, contents);
+            return;
+        }
+        std::error_code error;
+        fs::remove(path, error);
+        if (error)
+            throw std::runtime_error{"could not remove test sidecar: " + path.string()};
     }
 
     ~FileBackup() {
-        std::error_code error;
-        if (existed) {
-            std::ofstream output_file(path, std::ios::binary | std::ios::trunc);
-            output_file.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        } else {
-            fs::remove(path, error);
+        try {
+            restore();
+        } catch (...) {
+            std::terminate();
         }
     }
 };
@@ -209,6 +241,9 @@ struct ExecutableSidecarLock {
         }
     }
 
+    ExecutableSidecarLock(const ExecutableSidecarLock&) = delete;
+    ExecutableSidecarLock& operator=(const ExecutableSidecarLock&) = delete;
+
     ~ExecutableSidecarLock() {
         if (fd >= 0) {
             (void)::flock(fd, LOCK_UN);
@@ -219,15 +254,8 @@ struct ExecutableSidecarLock {
     [[nodiscard]] bool locked() const noexcept { return fd >= 0; }
 };
 
-std::vector<char> read_bytes(const fs::path& path) {
-    std::ifstream input(path, std::ios::binary);
-    return {std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
-}
-
-void write_bytes(const fs::path& path, const std::vector<char>& contents) {
-    std::ofstream output(path, std::ios::binary | std::ios::trunc);
-    output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-}
+static_assert(!std::is_copy_constructible_v<FileBackup>);
+static_assert(!std::is_copy_constructible_v<ExecutableSidecarLock>);
 
 } // namespace
 
@@ -286,6 +314,8 @@ TEST_CASE("disabled OTA survives registration, first command, and reconnect with
     CHECK(harness.service.update_check_count() == 0);
     CHECK(read_bytes(old_binary) == old_sentinel);
     CHECK(read_bytes(verified_marker) == marker_sentinel);
+    old_backup.restore();
+    marker_backup.restore();
 }
 
 #endif

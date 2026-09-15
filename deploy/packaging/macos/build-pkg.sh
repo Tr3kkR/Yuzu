@@ -48,9 +48,9 @@ if [[ -n "$BUNDLE_DIR" ]]; then
     ACTUAL_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
     [[ "$ACTUAL_VERSION" == "$VERSION" ]] || { echo "ERROR: bundle version does not match --version" >&2; exit 1; }
     codesign --verify --deep --strict --verbose=2 "$APP"
-    install -d "${STAGING}/Library/Application Support/Yuzu"
+    install -d "${STAGING}/Library/Application Support/YuzuAgent"
     install -d "${STAGING}/Library/LaunchDaemons"
-    cp -R "$APP" "${STAGING}/Library/Application Support/Yuzu/.YuzuAgent.incoming.app"
+    cp -R "$APP" "${STAGING}/Library/Application Support/YuzuAgent/.YuzuAgent.incoming.app"
     POLICY_ARGS=()
     if [[ -f "$PLUGINS/plugin-signing-policy.json" ]]; then
         POLICY_ARGS=(--plugin-signing-policy "$PLUGINS/plugin-signing-policy.json")
@@ -59,7 +59,7 @@ if [[ -n "$BUNDLE_DIR" ]]; then
     fi
     python3 "$SCRIPT_DIR/generate-launchd-plist.py" --source "$SCRIPT_DIR/com.yuzu.agent.plist" \
         --output "${STAGING}/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
-        --bundle-executable "/Library/Application Support/Yuzu/YuzuAgent.app/Contents/MacOS/yuzu-agent" \
+        --bundle-executable "/Library/Application Support/YuzuAgent/YuzuAgent.app/Contents/MacOS/yuzu-agent" \
         "${POLICY_ARGS[@]}"
     for plugin in "$PLUGINS"/*.dylib; do
         [[ -f "$plugin" ]] || continue
@@ -98,7 +98,7 @@ else
     install -m 644 "$SCRIPT_DIR/com.yuzu.agent.plist" "${STAGING}/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist"
 fi
 
-install -d "${STAGING}/Library/LaunchDaemons" "${STAGING}/Library/Application Support/Yuzu" "${STAGING}/Library/Logs/Yuzu"
+install -d "${STAGING}/Library/LaunchDaemons" "${STAGING}/Library/Application Support/YuzuAgent" "${STAGING}/Library/Logs/Yuzu"
 install -m 755 "$SCRIPT_DIR/uninstall.sh" "${STAGING}/usr/local/lib/yuzu/uninstall.sh"
 printf '%s\n' "$PACKAGE_MODE" > "${STAGING}/usr/local/lib/yuzu/.package-mode.incoming"
 

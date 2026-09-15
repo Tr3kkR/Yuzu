@@ -24,13 +24,44 @@ and this Mac's **Provisioning UDID**. Apple silicon registration uses
 `system_profiler SPHardwareDataType`'s `Provisioning UDID`; never substitute
 `IOPlatformUUID`. Run `scripts/macos-device-registration.zsh` to obtain it.
 
-Build this lane with `meson/native/macos-appleclang.ini`. The helper inspects
-every staged Mach-O `LC_BUILD_VERSION` and refuses anything other than the
-project's macOS 13.3 deployment target; `Info.plist` and installer metadata
-cannot make a newer binary compatible.
+Build this lane with `meson/native/macos-appleclang.ini`. Before configuring or
+rebuilding, rebuild the **target** dependencies with the repository's
+`arm64-osx` triplet and bypass all binary caches so pre-13.3-incompatible
+archives cannot be reused:
+
+```sh
+vcpkg install --triplet arm64-osx --x-manifest-root=. --binarysource=clear
+```
+
+The repository-local triplet is found automatically by vcpkg. It sets
+`VCPKG_OSX_DEPLOYMENT_TARGET=13.3` only for target dependencies; it does not
+change host tools or Linux/Windows triplets. The helper inspects every staged
+Mach-O `LC_BUILD_VERSION` and refuses anything other than the project's macOS
+13.3 deployment target; `Info.plist` and installer metadata cannot make a
+newer binary compatible.
+
+The agent, core library, copied framework closure, and every external plugin
+must have the same complete Mach-O architecture slice set; the helper rejects a
+mixed closure. The required process collector is the exact output `tar.dylib`,
+not a similarly named plugin.
 
 The bundle LaunchDaemon runs as root, retains external plugins, and always passes
-`--no-auto-update`. Data, logs, and trust anchors remain outside the sealed app.
+`--no-auto-update`. The sealed app is in the package-owned, root-owned
+`/Library/Application Support/YuzuAgent/YuzuAgent.app`; data stays in
+`/Library/Application Support/Yuzu` and is never ownership-reset or removed by
+this lane. Logs and trust anchors also remain outside the sealed app.
+When upgrading an earlier development build that placed `YuzuAgent.app` below
+the data directory, the installer snapshots that package-owned child for
+recovery and removes it only after the new daemon is healthy; it never changes
+the containing data directory's ownership, mode, or unrelated contents. A
+legacy child is removed only if its exact application identifier, team,
+developer-signing authority, embedded-profile SHA-256, and strict code-signature
+verification all match the development bundle. Any other legacy child is retained
+under the root-owned recovery directory for operator inspection, and the service
+is deliberately left stopped rather than bootstrapping code from the mutable data
+directory. This migration is narrowly limited to the original profile hash,
+expected Yuzu team, signed application identifier, and signer; a renewed or
+otherwise different profile is intentionally retained.
 Package transitions preserve them and retain package-owned code/configuration for
 recovery. The package first writes its code and LaunchDaemon plist to package-owned
 incoming paths; postinstall validates them, then promotes them and removes the

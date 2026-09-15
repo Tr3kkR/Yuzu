@@ -4,6 +4,12 @@
 set -eu
 
 DATA_DIR="/Library/Application Support/Yuzu"
+APP_ROOT="/Library/Application Support/YuzuAgent"
+LEGACY_APP="$DATA_DIR/YuzuAgent.app"
+LEGACY_TEAM_ID="7RLSYL2JM7"
+LEGACY_APP_ID="7RLSYL2JM7.co.uk.devnullsecurity.yuzu-agent"
+LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
+LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 LOG_DIR="/Library/Logs/Yuzu"
 CONFIG_DIR="/etc/yuzu-agent"
 CERT_DIR="$CONFIG_DIR/certs"
@@ -18,11 +24,31 @@ MODE_FILE="$YUZU_LIB/package-mode"
 INCOMING_MODE_FILE="$YUZU_LIB/.package-mode.incoming"
 MANIFEST="$YUZU_LIB/package-files.list"
 INCOMING_MANIFEST="$YUZU_LIB/.package-files.incoming"
-APP="$DATA_DIR/YuzuAgent.app"
-INCOMING_APP="$DATA_DIR/.YuzuAgent.incoming.app"
+APP="$APP_ROOT/YuzuAgent.app"
+INCOMING_APP="$APP_ROOT/.YuzuAgent.incoming.app"
 
 recovery_path() {
     cat "$RECOVERY_FILE" 2>/dev/null || true
+}
+
+legacy_app_is_managed() {
+    local candidate="$1"
+    [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
+    [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" == "${LEGACY_APP_ID#*.}" ]] || return 1
+    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1
+    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" == "$LEGACY_TEAM_ID" ]] || return 1
+    [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" == "$LEGACY_SIGNING_AUTHORITY" ]] || return 1
+    [[ -f "$candidate/Contents/embedded.provisionprofile" ]]
+    [[ "$(shasum -a 256 "$candidate/Contents/embedded.provisionprofile" | awk '{print $1}')" == "$LEGACY_PROFILE_SHA256" ]]
+}
+
+retire_legacy_app() {
+    local retired="$recovery/legacy-retired.app"
+    [[ ! -e "$LEGACY_APP" && ! -L "$LEGACY_APP" ]] && return 0
+    [[ ! -e "$retired" ]] || return 1
+    mv "$LEGACY_APP" "$retired"
+    legacy_app_is_managed "$retired" || { echo "ERROR: retained unrecognized legacy app in $retired" >&2; return 1; }
+    rm -rf "$retired"
 }
 
 remove_managed_plugins() {
@@ -109,13 +135,24 @@ restore_previous() {
         ditto "$recovery/package-files.list" "$MANIFEST"
     [[ ! -d "$recovery/yuzu/plugins" ]] || mkdir -p "$PLUGIN_DIR"
     [[ ! -d "$recovery/yuzu/plugins" ]] || ditto "$recovery/yuzu/plugins" "$PLUGIN_DIR"
-    [[ ! -e "$PLIST" ]] || launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+    if [[ -d "$recovery/legacy-retired.app" ]]; then
+        echo "ERROR: retained legacy app in root-owned recovery; service was not bootstrapped" >&2
+        return 1
+    fi
+    if [[ -e "$PLIST" ]]; then
+        if /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$PLIST" 2>/dev/null | \
+           grep -Fq -- "$LEGACY_APP/Contents/MacOS/yuzu-agent"; then
+            echo "ERROR: recovered legacy service was preserved but not bootstrapped from non-package-owned data" >&2
+            return 1
+        fi
+        launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+    fi
 }
 trap 'restore_previous' ERR
 
-mkdir -p "$DATA_DIR" "$LOG_DIR" "$CERT_DIR" "$YUZU_LIB"
-chown root:wheel "$DATA_DIR" "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
-chmod 750 "$DATA_DIR"
+mkdir -p "$APP_ROOT" "$LOG_DIR" "$CERT_DIR" "$YUZU_LIB"
+chown root:wheel "$APP_ROOT" "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
+chmod 755 "$APP_ROOT"
 chmod 755 "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
 
 [[ -f "$INCOMING_MODE_FILE" && -f "$INCOMING_PLIST" ]] || {
@@ -189,6 +226,10 @@ else
 fi
 launchctl bootstrap system "$PLIST"
 require_started
+# The previous development bundle lived below the EDR data root. Remove only
+# that package-owned child after the replacement daemon has passed health
+# observation; recovery retains a copy until this transition is fully durable.
+retire_legacy_app
 rm -f "$RECOVERY_FILE"
 [[ -z "$recovery" ]] || rm -rf "$recovery"
 echo "Yuzu Agent installed and started. Data, logs, and trust anchors were preserved."
