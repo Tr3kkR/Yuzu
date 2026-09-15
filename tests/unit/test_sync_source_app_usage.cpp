@@ -20,6 +20,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "app_usage_parsers.hpp" // format_last_used_row -- real plugin formatter, for the format+parse round trip
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
@@ -44,6 +45,8 @@ using yuzu::agent::render_app_usage_blob;
 using yuzu::agent::sha256_hex;
 using yuzu::agent::SyncScheduler;
 using yuzu::agent::SyncSource;
+using yuzu::app_usage::format_last_used_row;
+using yuzu::app_usage::LastUsedRow;
 
 namespace {
 
@@ -178,6 +181,43 @@ TEST_CASE("parse: an escaped pipe in exe_key round-trips to a literal pipe",
     CHECK(p.rows[0].first_seen == 1699000000);
     CHECK(p.rows[0].run_count_30d == 12);
     CHECK(p.rows[0].total_seconds_30d == 43200);
+}
+
+TEST_CASE("format -> parse: a >320-byte pipe-heavy exe_key round-trips intact — no "
+          "truncation, no row loss (fixed-buffer overflow regression)",
+          "[app_usage_sync][parse][P5]") {
+    // Real plugin formatter (app_usage_parsers.hpp), not a hand-built fixture:
+    // format_last_used_row used to snprintf into a fixed 320-byte stack buffer
+    // with no truncation check. Neither normalise_exe_key nor TAR's own writer
+    // caps executable-name length, and pipe-escaping roughly doubles a
+    // pipe-heavy name's length, so a real basename could silently overflow
+    // that buffer — and the daily-sync consumer below then DROPS (rather than
+    // errors on) a resulting malformed/short row (`tok.size() < 6` -> skip).
+    std::string long_exe_key;
+    for (int i = 0; i < 40; ++i)
+        long_exe_key += "abcdefghi|"; // 40 * 10 = 400 raw bytes, 40 literal pipes
+    REQUIRE(long_exe_key.size() == 400);
+
+    LastUsedRow row;
+    row.exe_key = long_exe_key;
+    row.last_seen = 1700000500;
+    row.first_seen = 1699000000;
+    row.run_count_30d = 12345;
+    row.total_seconds_30d = 999999999;
+
+    const std::string formatted = format_last_used_row(row);
+    // Escaping every '|' as "\|" adds 40 bytes on top of the 400-byte raw
+    // exe_key alone — well past the old 320-byte buffer once the
+    // "last_used|" prefix and four numeric fields are added too.
+    REQUIRE(formatted.size() > 320);
+
+    AppUsageParse p = parse_app_usage_last_used_output(formatted + "\n");
+    REQUIRE(p.rows.size() == 1); // not dropped as malformed
+    CHECK(p.rows[0].exe_key == long_exe_key); // recovered byte-for-byte, not truncated
+    CHECK(p.rows[0].last_seen == 1700000500);
+    CHECK(p.rows[0].first_seen == 1699000000);
+    CHECK(p.rows[0].run_count_30d == 12345);
+    CHECK(p.rows[0].total_seconds_30d == 999999999);
 }
 
 TEST_CASE("parse: raw framing bytes in exe_key are stripped before render — record "

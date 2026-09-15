@@ -51,6 +51,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <expected>
+#include <format>
 #include <map>
 #include <optional>
 #include <sqlite3.h>
@@ -496,28 +497,23 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 /// exe_key is untrusted, attacker/OS-controlled text — passed through
 /// `safe_output_field` (P5) before it ever reaches the pipe-delimited wire
 /// format, so a `|`, CR, or LF embedded in a real executable's basename can
-/// never inject a field or row boundary.
+/// never inject a field or row boundary. Built directly into a std::string
+/// (no fixed-size stack buffer) — neither normalise_exe_key nor TAR's own
+/// writer caps executable-name length, and pipe-escaping can roughly double a
+/// pipe-heavy name, so a fixed ceiling here would silently truncate a real
+/// row (the daily-sync consumer then drops a truncated row outright).
 [[nodiscard]] inline std::string format_usage_row(const UsageRow& r) {
     const std::string safe_exe_key = yuzu::util::safe_output_field(r.exe_key);
-    char buf[512];
-    std::snprintf(buf, sizeof buf, "usage|%s|%lld|%lld|%lld|%lld|%lld|%lld|%lld",
-                 safe_exe_key.c_str(), static_cast<long long>(r.run_count),
-                 static_cast<long long>(r.total_seconds), static_cast<long long>(r.first_seen),
-                 static_cast<long long>(r.last_seen), static_cast<long long>(r.distinct_users),
-                 static_cast<long long>(r.superseded_runs),
-                 static_cast<long long>(r.expired_runs));
-    return buf;
+    return std::format("usage|{}|{}|{}|{}|{}|{}|{}|{}", safe_exe_key, r.run_count,
+                       r.total_seconds, r.first_seen, r.last_seen, r.distinct_users,
+                       r.superseded_runs, r.expired_runs);
 }
 
-/// See format_usage_row's P5 note — identical treatment of exe_key.
+/// See format_usage_row's P5 / no-fixed-buffer note — identical treatment.
 [[nodiscard]] inline std::string format_last_used_row(const LastUsedRow& r) {
     const std::string safe_exe_key = yuzu::util::safe_output_field(r.exe_key);
-    char buf[320];
-    std::snprintf(buf, sizeof buf, "last_used|%s|%lld|%lld|%lld|%lld", safe_exe_key.c_str(),
-                 static_cast<long long>(r.last_seen), static_cast<long long>(r.first_seen),
-                 static_cast<long long>(r.run_count_30d),
-                 static_cast<long long>(r.total_seconds_30d));
-    return buf;
+    return std::format("last_used|{}|{}|{}|{}|{}", safe_exe_key, r.last_seen, r.first_seen,
+                       r.run_count_30d, r.total_seconds_30d);
 }
 
 } // namespace yuzu::app_usage
