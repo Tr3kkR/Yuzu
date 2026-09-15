@@ -233,6 +233,7 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
 
     int count = 0;
     bool truncated = false;
+    bool enum_failed = false;
     for (;;) {
         VARIANT v;
         VariantInit(&v);
@@ -241,8 +242,21 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
         // IEnumVARIANT::Next returns S_FALSE (SUCCEEDED, fetched==0) at
         // end-of-enumeration — checked via `fetched == 0`, never a bare
         // SUCCEEDED(hr), so end-of-list is never mistaken for "another rule".
+        //
+        // FAILED(hr) mid-loop is a DIFFERENT exit than clean end-of-
+        // enumeration -- distinguished so the trailing ruleset| row below
+        // never presents a partial `count` as though it were the whole
+        // list (governance Gate 4 consistency-auditor finding: the two
+        // cases used to share one break with no signal, and this diff's
+        // new ruleset| line is what first made that ambiguity user-
+        // visible and authoritative-looking).
         hr = enum_var->Next(1, &v, &fetched);
-        if (FAILED(hr) || fetched == 0) {
+        if (FAILED(hr)) {
+            VariantClear(&v);
+            enum_failed = true;
+            break;
+        }
+        if (fetched == 0) {
             VariantClear(&v);
             break;
         }
@@ -324,6 +338,16 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
                                      enabled != VARIANT_FALSE ? "enabled" : "disabled", dir_s,
                                      action_s, profiles_mask));
         ++count;
+    }
+    // A mid-enumeration COM failure means `count` is a PARTIAL tally, not
+    // the ruleset size -- report it as such (error| + ruleset|unknown)
+    // rather than presenting a truncated count as though it were complete.
+    // Every `rule|` row already emitted above stayed emitted; this only
+    // changes what the trailing summary claims about them.
+    if (enum_failed) {
+        ctx.write_output(std::format("error|enum_next:0x{:08x}", static_cast<uint32_t>(hr)));
+        ctx.write_output("ruleset|unknown");
+        return;
     }
     ctx.write_output(std::format("ruleset|{}", count));
     if (truncated)

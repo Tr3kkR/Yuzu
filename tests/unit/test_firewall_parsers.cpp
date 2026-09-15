@@ -209,7 +209,7 @@ TEST_CASE("pf anchors: real capture, order preserved, whitespace trimmed", "[fir
 TEST_CASE("pf anchors: empty/Permission-denied (empty stdout) yields empty",
           "[firewall]") {
     // Non-root read: "pfctl: /dev/pf: Permission denied" goes to stderr,
-    // which the shell discards, so the parser sees "".
+    // which the caller discards, so the parser sees "".
     CHECK(parse_pf_anchors("").empty());
 }
 

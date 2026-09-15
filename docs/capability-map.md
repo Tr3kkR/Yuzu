@@ -509,7 +509,10 @@ actions also read the unprivileged per-app allow/block list
 (`socketfilterfw --listapps`) on `rules`, and the root-only pf anchor list
 (`pfctl -s Anchors`) and rule count (`pfctl -s rules`) on both actions —
 each degrading to no anchor rows / `ruleset|unknown` rather than a false
-answer when the read is refused or incomplete.
+answer when the read is refused or incomplete. Windows adds a `ruleset|<n>`
+row on both actions via `INetFwRules::get_Count` — `state`'s is the true
+policy-wide total, `rules`' is the count of rows actually emitted that call
+(capped at 100), a distinct number from `state`'s.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
