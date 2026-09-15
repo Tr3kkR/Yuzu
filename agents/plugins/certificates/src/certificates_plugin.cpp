@@ -87,6 +87,32 @@
 // with the mechanism it served. Every remaining spawn site in this file is
 // inside the __APPLE__ region.
 
+#ifdef __linux__
+// confined_fs.hpp declares `namespace yuzu::agent::confined_fs` and
+// scoped_fd.hpp declares `namespace yuzu::agent` -- both MUST be included
+// here, at global scope, before the anonymous namespace below opens, for
+// the exact reason the __APPLE__ block above this one documents in full:
+// including them inside `namespace { ... }` would nest `yuzu::agent` under
+// `(anonymous namespace)::yuzu`, shadowing the global `::yuzu` namespace
+// (from <yuzu/plugin.hpp> above) for every unqualified `yuzu::` lookup in
+// this file, and would give `capture_identity`'s call sites below a
+// declaration in a different, TU-local namespace than the one agent-core
+// actually exports the symbol from (confirmed via a real compile: GCC 13
+// and Clang both reject or mis-resolve the resulting ambiguous/orphaned
+// `yuzu::agent::confined_fs::capture_identity` reference). The POSIX
+// headers alongside them declare nothing in `yuzu::`, but are kept here
+// too so every Linux-only include this file needs lives in one place.
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <climits>
+
+#include <yuzu/agent/confined_fs.hpp>
+#include <yuzu/agent/scoped_fd.hpp>
+#endif
+
 #if defined(__linux__) || defined(__APPLE__)
 // yuzu::certificates_x509 -- in-process libcrypto PEM/DER parsing (WP-B).
 // Backs the Linux PEM-file read entirely and the macOS System.keychain/
@@ -491,15 +517,10 @@ bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
 
 #ifdef __linux__
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include <climits>
-
-#include <yuzu/agent/confined_fs.hpp>
-#include <yuzu/agent/scoped_fd.hpp>
+// Every Linux-only include this file needs (dirent.h/fcntl.h/sys/stat.h/
+// unistd.h/climits, confined_fs.hpp, scoped_fd.hpp) is at global scope
+// above, before the anonymous namespace opens -- see the comment there for
+// why confined_fs.hpp/scoped_fd.hpp specifically cannot live inside it.
 
 // parity: `openssl x509 -in <file>` -- the subprocess call this file used to
 // shell out to for every field, replaced below by
