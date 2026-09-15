@@ -1,8 +1,23 @@
 # Enterprise Readiness Plan: SOC 2 Type II + First Large Enterprise Customer
 
+<!-- yuzu:anchor release=v0.13.0 -->
+
 **Version:** 1.0
 **Date:** 2026-04-04
 **Audience:** Engineering, Security, Product, Operations, GTM, Executive Leadership
+
+**Note on version scope:** this is a workstream-progress-tracking document,
+not a customer-facing spec, so most of its narrative is dated engineering
+status on `dev`-HEAD (each addendum below largely self-dates via its own
+PR/date citation). **The Workstream E data-inventory table is the
+exception and has been fully re-anchored to `v0.13.0`** (see that section)
+— it is the table a compliance reviewer is most likely to extract and
+quote directly, so it must describe what is actually installed, not
+`dev`-HEAD. Any other store/control/route claim presented without a date
+or PR citation should be independently verified against your installed
+tag before being treated as current; this pass did not re-verify every
+dated addendum in Workstreams B/C/F individually (most are self-dated,
+which the data-inventory table was not).
 
 ---
 
@@ -69,7 +84,7 @@ Yuzu has strong product depth (agent/server/gateway architecture, RBAC, policy e
 - Enforce OIDC SSO for production admin access.
 - Disable local-password fallback in hardened mode (or tightly constrain break-glass account policy).
 - Add **2FA/TOTP for high-risk approvals** (aligned with roadmap hardening).
-- Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. Inactivity timeout and explicit secure-cookie-attribute review remain open.
+- Session management controls: revocation **shipped** (`DELETE /api/v1/sessions` admin force-logout, `DELETE /api/v1/sessions/me` self-revoke including API tokens; audit actions `session.revoke_all` / `session.revoke_all.self`; Prometheus counter `yuzu_auth_sessions_revoked_total`). Expiration in place via the existing 8-hour cookie max-age. **Inactivity (idle) timeout — shipped** (`--session-inactivity-secs`, sliding idle anchor durably mirrored to the session store — `session_store.hpp` `last_activity_ms`, surviving restart/replica failover; `docs/security-reviews/inactivity-timeout-2026-06-30.md`). **Secure cookie attributes — shipped**: every session cookie is set with `HttpOnly; SameSite=Lax`, plus `Secure` whenever HTTPS is enabled (`AuthRoutes::session_cookie_attrs`, `server/core/src/auth_routes.cpp:1299-1305`) — verified directly in code (2026-09-07); no standalone dedicated security-review document exists for this specific attribute set the way one does for the inactivity timeout, so cite the code + `docs/auth-architecture.md` rather than a review doc that doesn't exist.
 - API token governance: scoped permissions, expiration defaults, rotation process, token inventory.
 - **Residual (#1836):** OIDC IdP-group→RBAC deprovisioning (#1832) propagates on the user's **next SSO login**, not immediately on IdP-side group removal — a live session/cookie or an already-issued token retains its prior roles until re-authentication. Session revocation (above) is the operator's manual mitigation in the interim; automatic mid-session role re-check is tracked in #1836.
 - **UCE surface (forward ref):** the use-case-engine host inherits SSO transitively through this server's OIDC (`docs/uce-host-requirements.md` §4.6/NF-9 — Yuzu-as-identity-provider). This **doubles #1836's blast surface**: a stale IdP group also gates UCE artifact-minting until the operator's Yuzu session is force-revoked or the ≤5-min artifact TTL / NF-9(d) liveness floor expires, and it adds a second login-event stream **outside** the server's audit perimeter (`uce-host-requirements.md` NF-6). An access-control reviewer working from this section must follow NF-9 for the second surface.
@@ -136,18 +151,24 @@ retired here. Full design: `docs/adr/1006-service-scope-default-deny.md`;
 closed route inventory:
 `docs/security-reviews/service-scope-flip-route-inventory-2026-08.md`.
 
-**Addendum — machine-identity resource-bounding (CC6.6, PR 4.4).** Engine
-principals (ADR-1005 class) are already least-privilege by construction —
-default-deny RBAC resolution, structurally barred from admin/built-in/
-wildcard roles (see the `engine_principal_store.*` row in `CLAUDE.md`) — and
-PR 4.4 adds the complementary resource-bounding control: a per-principal
-in-flight concurrency cap and request-rate cap enforced at the server's
-single pre-routing chokepoint, so a compromised or malfunctioning engine
+<!-- yuzu:claim id=readiness-engine-principal-store status=planned evidence=server/core/src/engine_principal_store.cpp -->
+**Addendum — machine-identity resource-bounding (CC6.6, PR 4.4). Not in
+`v0.13.0`** (confirmed: `engine_principal_store.*` does not exist at that
+tag, and ADR-1005 — which defines the engine-principal class this control
+depends on — was only accepted 2026-09-07, two months after the
+`v0.13.0` cut). **At `dev`-HEAD:** Engine principals (ADR-1005 class) are
+already least-privilege by construction — default-deny RBAC resolution,
+structurally barred from admin/built-in/wildcard roles (see the
+`engine_principal_store.*` row in `CLAUDE.md`) — and PR 4.4 adds the
+complementary resource-bounding control: a per-principal in-flight
+concurrency cap and request-rate cap enforced at the server's single
+pre-routing chokepoint, so a compromised or malfunctioning engine
 principal cannot exhaust server capacity via unbounded concurrent or
 high-rate requests. Credit this pairing (least-privilege identity +
 bounded-resource machine credential) as a CC6.6 control for any privileged/
-machine-identity access review. See `docs/user-manual/engine-principals.md`
-"Per-principal quota cap" for the operator-facing reference.
+machine-identity access review **once you are running a build that has
+it**. See `docs/user-manual/engine-principals.md` "Per-principal quota cap"
+for the operator-facing reference.
 
 **Addendum — engine-credential rotation confirm pinning (CC6.1/CC6.3, #2384).**
 The overlap-pair rotation's maker-checker confirm step is pinned to the exact
@@ -265,6 +286,15 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 
 - CI security scan logs, release signing attestations, config baselines, and change approvals.
 
+**Threat model status (2026-09-08, external review corrected):** No
+platform-level threat model exists in the repository; domain threat models
+exist for authentication/MFA (`docs/auth-mfa-design.md` §Threat model),
+secrets-at-rest (ADR-0010 §Threat model) and PKI
+(`docs/pki-architecture.md`). Do not state categorically that Yuzu has "no
+threat model" — that overstates the gap; the gap is the absence of a single
+platform-level document tying the domain-level ones together, not an
+absence of threat modeling altogether.
+
 ---
 
 ## 3.4 Workstream D — Reliability, Availability, and Operational Readiness
@@ -287,6 +317,108 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 
 - Monitoring dashboards, incident tickets/postmortems, backup logs, restore drill reports.
 
+**Status (2026-09-07, DR-procedure evidence relocated 2026-09-11).** SLO
+definitions for the five required signals (server-listener availability,
+command dispatch latency, agent heartbeat freshness, audit write success,
+PostgreSQL substrate degrade events) — each backed by a metric verified
+present in the codebase and, where one ships, the exact Prometheus alert
+that **fires** on it (not "pages" — no Alertmanager ships, see below):
+`docs/ops-runbooks/slo.md`. **The audit-write-success signal (§4 there) is
+a per-request fail-closed control, not a global one** — a failed audit
+emission withholds only the one request whose own write failed, not a
+standing outage of the audited routes — **and its "0 emit failures / 30d"
+target reads as trivially met on a deployment with zero audited traffic**;
+`slo.md` §4 states both caveats and the companion counter to check
+(`yuzu_server_audit_events_total{result="success"}`) before treating a
+clean window as evidence the control is exercising rather than idle. Cite
+`slo.md` §4 itself for this control, not a paraphrase here.
+
+**Backup/restore drills were executed (four attempts total, real
+containers, measured timings) against both the containerized
+`docker-compose.reference.yml` header procedure and the native
+`docs/operations/disaster-recovery.md` procedure — but the transcripts, the
+corrected DR procedure they validate, and the corrected
+`scripts/yuzu-backup.sh`/`yuzu-restore.sh` do not ship on this branch/PR.**
+Per PO decision, DR-procedure work (drills, the runbook, the corrected
+scripts and doc) is tracked separately from this branch in **issue #4135**,
+which is the full account of every defect found (backup manifest self-reference, `pg_restore`
+ownership pitfalls that can leave a database worse than before a restore,
+world-readable backup permissions exposing the CA root key, version-skew
+handling, and more), each one's fix, and the fix's own verification. This
+branch's copy of `docs/operations/disaster-recovery.md`,
+`scripts/yuzu-backup.sh`, and `scripts/yuzu-restore.sh` are the unmodified
+`origin/dev` (pre-fix) versions — do not treat any DR-procedure defect as
+fixed or verified in this checkout.
+
+**`docs/prometheus/yuzu-alerts.yml`'s 116 alert rules + 1 recording
+rule (117 total per `promtool check rules`, which counts both kinds as
+"rules" — counted at commit `c7f3a5bed`, this branch's merge-base with
+`origin/dev`, 2026-09-12; NOT the `v0.13.0` tag this document is otherwise
+anchored to, which ships 28 alert rules + 1 recording rule. Not CI-bound to
+either figure; re-derive at your own ref with `grep -cE '^\s*- alert:'
+docs/prometheus/yuzu-alerts.yml` and `grep -cE '^\s*- record:'
+docs/prometheus/yuzu-alerts.yml` rather than trusting this number — the file
+is actively churning and nothing gates this citation, `slo.md`, or the
+matrix to it) are evaluated
+by no shipped Prometheus stack on this branch — #2857 remains open here.**
+An attempt at wiring one (mount the file into a running UAT Prometheus),
+the real infrastructure defects that attempt turned up (a wrong `-f` merge
+order and a from-scratch startup path both silently produce a healthy
+Prometheus evaluating zero rules; the two most obvious verification
+commands, `docker compose ... config` and `promtool check config`, both
+pass in exactly that broken case; a rejected rules reload leaves a stale
+rule count that still looks fine; no self-scrape job existed to observe
+the process's own health; no retention flag existed, so a 30-day SLO
+window silently read a 15-day TSDB), and the fixes for all of them, are
+tracked separately from this branch (issue #2857). This branch's
+own assurance claims do not depend on that work having merged.
+
+**Also found while auditing #2857:** the now-deleted
+`deploy/grafana/yuzu-alerts.yml` (10 alerts, zero references anywhere in
+the repo, deleted in an earlier round of this change) was not a strict
+subset of the canonical `docs/prometheus/yuzu-alerts.yml` — 7 of its 10
+alerts have **no equivalent** in the canonical file and were retired with
+no shipped replacement when that legacy file was superseded:
+
+| Retired alert | What it covered | Canonical equivalent |
+|---|---|---|
+| `YuzuNoAgentsConnected` (`yuzu_agents_connected == 0`, 5m) | Zero agents connected fleet-wide | None |
+| `YuzuCommandProcessingStalled` (agents connected but `rate(yuzu_commands_dispatched_total[15m]) == 0`) | Dispatch pipeline stalled while agents are present | None |
+| `YuzuFleetUnhealthy` (`(connected − healthy) / connected > 0.1`) | >10% of the fleet unhealthy (percentage form; the canonical `YuzuAgentDisconnected` alerts on the raw count instead) | None (partial overlap in spirit with `YuzuAgentDisconnected`, not equivalent — that alert has no percentage/ratio form) |
+| `YuzuHeartbeatsStopped` (agents connected but `rate(yuzu_heartbeats_received_total[5m]) == 0`) | Heartbeat pipeline stalled while agents are present | None |
+| `YuzuGatewayUpstreamErrors` (`rate(yuzu_gw_upstream_rpc_errors_total[5m]) > 0.1`) | Gateway→server upstream RPC error rate | None |
+| `YuzuGatewayMemoryHigh` (`yuzu_gw_beam_memory_bytes{type="total"} > 4GiB`, 10m) | Erlang gateway BEAM memory pressure | None |
+| `YuzuGatewayHighChurn` (`rate(yuzu_gw_agents_disconnected_total[5m]) > 10`) | Gateway-side agent disconnect churn | None |
+
+Three of the ten (`YuzuAgentDisconnected`, `YuzuHighCommandFailureRate`,
+`YuzuHighCommandLatency`) do have canonical equivalents and were not lost.
+None of the seven retired rules is restored here — `docs/prometheus/yuzu-alerts.yml`
+is not an owned file of this change — this table exists so "116 alert
+rules ship" (at `c7f3a5bed`, above) is not read as "every alert this project has ever had still
+ships". Tracked: **issue #4231** (the coverage gap for these seven,
+confirmed by two independent measurements to affect no audit/auth/certificate-expiry
+signal and no shipped rig — the deleted file was never loaded by anything).
+**Risk-register entry (governance co6-1 — a disclosure and an issue number
+are not a risk acceptance; this is the acceptance record WS-A's own
+deliverable set requires):**
+
+| Field | Value |
+|---|---|
+| Risk | Detection coverage lost for 3 live-emitted signals (`YuzuGatewayUpstreamErrors`, `YuzuGatewayMemoryHigh`, `YuzuGatewayHighChurn` — confirmed by `architect` at Gate 3 to cover metrics the gateway still emits) plus 4 further conditions with no canonical successor (`YuzuNoAgentsConnected`, `YuzuCommandProcessingStalled`, `YuzuFleetUnhealthy`, `YuzuHeartbeatsStopped`) |
+| Likelihood | Low-to-medium — none of the seven conditions is observed to have fired historically in this project's operating history; the underlying metrics are real and could still breach |
+| Impact | Medium — none is an audit/auth/certificate-expiry signal (SOC 2 evidence-chain-critical), but three cover real gateway health degradation and four cover fleet-visibility failure modes an operator would otherwise want paged |
+| Mitigation (interim) | Tracked in issue #4231; the underlying metrics remain live and queryable ad hoc even without an alert rule |
+| Accepted by | Product Owner (Nathan Dornbrook), 2026-09-11, as part of this evidence-production round — accepting the gap as-is for this release rather than blocking on writing seven new alert rules first |
+| Review date | Next Workstream D quarterly control review, or before this branch's PR merges to `dev`, whichever is sooner |
+| Residual gap this acceptance does NOT cover | The acceptance is recorded here, in a GRC/governance document — **not yet propagated to operator-facing documentation.** Nothing in `docs/user-manual/` mentions this retirement, and no per-alert successor issue has been filed for any of the seven. That propagation (a `docs/user-manual/` note plus seven successor issues, if the coverage is still wanted) remains open work, distinct from — and not satisfied by — the risk acceptance above. |
+
+If the coverage they represented (gateway health, stalled-pipeline
+detection, zero-agents) is still wanted, filing those seven successor
+issues — and a user-manual mention, not only this table — is the
+remaining work. Incident
+response lifecycle and capacity plans for 1k/5k/10k+ agents remain
+undocumented — not addressed by this change, still open.
+
 ---
 
 ## 3.5 Workstream E — Data Governance and Privacy
@@ -307,7 +439,120 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 
 - Data flow diagrams, retention configs, deletion run records, and quarterly data governance reviews.
 
-### Data Inventory — server-side SQLite stores
+### Data Inventory — server-side stores at `v0.13.0`
+
+<!-- yuzu:claim id=readiness-audit-store-sqlite status=shipped evidence=server/core/src/audit_store.cpp#sqlite3_prepare_v2 -->
+<!-- yuzu:claim id=readiness-audit-store-postgres status=planned evidence=server/core/src/audit_store.cpp#PgPool -->
+<!-- yuzu:claim id=readiness-response-store-sqlite status=shipped evidence=server/core/src/response_store.cpp#sqlite3 -->
+<!-- yuzu:claim id=readiness-response-store-postgres status=planned evidence=server/core/src/response_store.cpp#PgPool -->
+<!-- yuzu:claim id=readiness-guaranteed-state-sqlite status=shipped evidence=server/core/src/guaranteed_state_store.cpp#sqlite3 -->
+<!-- yuzu:claim id=readiness-guaranteed-state-postgres status=planned evidence=server/core/src/guaranteed_state_store.cpp#PgPool -->
+<!-- yuzu:claim id=readiness-ca-store-sqlite status=shipped evidence=server/core/src/ca_store.cpp#sqlite3 -->
+<!-- yuzu:claim id=readiness-ca-store-postgres status=planned evidence=server/core/src/ca_store.cpp#PgPool -->
+<!-- yuzu:claim id=readiness-analytics-store-sqlite status=shipped evidence=server/core/src/analytics_event_store.cpp#sqlite3 -->
+<!-- yuzu:claim id=readiness-analytics-store-postgres status=planned evidence=server/core/src/analytics_event_store.cpp#PgPool -->
+
+**Every row below is verifiable at the `v0.13.0` tag** (`git show v0.13.0:<path>`,
+confirming a bare `sqlite3` implementation and the absence of `PgPool` in
+each store's `.cpp` file). Where `dev`-HEAD has since migrated a store to
+PostgreSQL, that is noted in the row and the full `dev`-HEAD detail —
+including alert coverage, capacity-ceiling figures, and the PostgreSQL
+schema layout — lives in the "Not in v0.13.0" section immediately below,
+unchanged from what this table previously presented as current.
+
+| Store | File | Data class | Retention | Deletion mechanism | Configurable via |
+|---|---|---|---|---|---|
+| Audit trail (SOC 2 evidence chain) | SQLite `audit.db` at `v0.13.0` (`audit_events` table) | Security-relevant activity: operator actions, plus agent enrolment, fleet-topology events and background schedule execution | 365 days default, TTL stamped at INSERT | `AuditStore::run_cleanup` on a background thread (`cleanup_interval_min`, default 60 min) deletes rows past their TTL — no clock guard, no cross-replica coordination (a single SQLite file has no replica to coordinate with). On the security-mutation surfaces that check it, a failed audit write is reported to the caller (`Sec-Audit-Failed`, e.g. `auth_routes.cpp:2919`, `ca_routes.cpp:450`). Reads do **not** deny-on-degrade at this release: `AuditStore::query` returns an empty result when the DB is unavailable or a prepare fails (`audit_store.cpp:179-180,261-262`), which reads as "no events". Deny-on-degrade reads are `dev`-HEAD-only (ADR-0040). **The clock-guarded, capped, single-sweeper-fleet-wide PostgreSQL mechanism (ADR-0040), its alert-coverage measurement, and the capacity-ceiling figures are `dev`-HEAD-only** — see "Not in v0.13.0" below. | `audit_retention_days` |
+| Response store | SQLite `response_store.db` at `v0.13.0` (`responses`, `response_facets`) | Agent command/instruction results | 90 days | `ResponseStore` cleanup thread (TTL at insert), not clock-guarded. **PostgreSQL migration (ADR-0039) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | `response_retention_days` |
+| Guaranteed-state rules | SQLite `guaranteed-state.db` at `v0.13.0` (`guaranteed_state_rules`) | Rule definitions (configuration) | Indefinite — lifecycle via explicit delete | REST DELETE / `delete_rule`. **PostgreSQL migration (ADR-0038) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | n/a |
+| Guaranteed-state events | SQLite `guaranteed-state.db` at `v0.13.0` (`guaranteed_state_events`) | Drift/remediation telemetry (high-volume operational) | **30 days default** | `GuaranteedStateStore::run_cleanup` thread — bare `DELETE … WHERE ttl_expires_at > 0 AND ttl_expires_at < now`, no clock guard. **PostgreSQL migration (ADR-0038) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | `guardian_event_retention_days` |
+| DEX observations (projection) | SQLite `guaranteed-state.db` at `v0.13.0` (`guardian_observations`) | **Behavioral telemetry / PII** — per-device reliability signals (114-type display catalogue — 110 Windows event-log types + 4 poll-derived; app crashes/hangs, boot/resume durations, service/network/identity/power/driver failures; authoritative count in `docs/dex-signal-catalog.md`). Keyed by `agent_id` → device → person; the per-device history reveals which applications a person runs. | **Lockstep with parent events** — the projection row carries the SAME `ttl_expires_at` as its source event and is reaped in the same cleanup pass; a projection can never outlive its source row | Same `GuaranteedStateStore::run_cleanup` pass — parallel bare `DELETE FROM guardian_observations WHERE ttl_expires_at > 0 AND ttl_expires_at < now`. **PostgreSQL migration (ADR-0038) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | `guardian_event_retention_days` (one knob governs both — by design, so event and projection retention cannot diverge) |
+| PKI cert inventory | SQLite `ca.db` at `v0.13.0` (`ca_root`, `ca_issued`, `ca_crl_versions`) | Internal-CA cert inventory + revocation/CRL state (security-relevant). CA root **private key is NOT stored here** — it is a 0600 file referenced by an opaque `key_ref`, unaffected by which database backs the metadata. | Indefinite — cert records must outlive the cert for audit | None by design (revocation flips `status`; no reaper). **PostgreSQL migration (ADR-0053) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | n/a |
+| Analytics events (sink-side) | ClickHouse / JSONL | Telemetry + usage, once drained | Customer-controlled (external sink) | Sink-side retention | `clickhouse_*`, `analytics_jsonl_path` |
+| Analytics events (server-side buffer) | Per-process SQLite `analytics.db` at `v0.13.0` | Telemetry + usage, pre-drain | n/a | Buffer/drain behaviour per `analytics_event_store.cpp` at this release. **PostgreSQL migration (ADR-0049) is `dev`-HEAD-only** — see "Not in v0.13.0" below. | `--no-analytics` |
+| Fleet visualization cache | `FleetTopologyStore` (in-memory) | Aggregated `tar.fleet_snapshot` topology — per-machine process records (pid, ppid, process name, OS user, category) and connection edges | **60 s TTL, LRU-of-2 cache slots** (one per `include_vuln` value) | Time-based eviction in-process; never persisted to disk | `--viz-disable` to disable entirely; `tar.configure process_enabled=false` per-agent to suppress process collection upstream |
+| Threat-graph recommendations *(proposed, capability §28.9)* | `recommendations.db` | Agentic-AI-produced hardening suggestions awaiting operator action; carries customer_id, generator id, target node/edge keys, rationale, status (open / accepted / dismissed / applied) | Indefinite while open; **90 days default** after dismissed/applied | `RecommendationStore::run_cleanup` thread (planned) — `DELETE … WHERE status IN ('dismissed','applied') AND closed_at < now - retention` | `recommendation_retention_days` |
+| VirusTotal hash cache *(proposed, capability §28.8)* | `virustotal_cache.db` | Rate-limited SHA-256 → verdict lookup cache; verdict, scanned_at, engine_hits JSON | **7 days default** | TTL at insert; opportunistic eviction on lookup | `virustotal_cache_ttl_days` |
+
+**Audit capacity at `v0.13.0`:** the retention sweep is a plain background
+thread on a `cleanup_interval_min` timer (default 60 min) deleting rows
+past their `ttl_expires_at` — no per-pass cap, no clock guard, no
+advisory-lease coordination (moot for a single SQLite file, no replicas to
+coordinate). No capacity-ceiling analysis has been derived for this
+release's simpler mechanism. **The two-cadence, capacity-ceiling analysis
+this document previously presented in this location is `dev`-HEAD-only**
+— it depends on the ADR-0040 PostgreSQL migration's own pacing design —
+see "Not in v0.13.0" below.
+
+---
+
+**Agent-side stores below are unaffected by the server's PostgreSQL migration program discussed above** — the agent has always been SQLite (`tar.db`, `kv_store.db`), on `v0.13.0` and on `dev`-HEAD alike, so this content is not part of the "Not in v0.13.0" appendix that follows. **This pass did not individually verify every capture source below (`$Power_Live`, `$Removable_Live`, `$NetQual_*`, `$NetConn_*`, `$DNS_*`, `$ARP_*`, and the Wave 6 sources) against the `v0.13.0` tag** — several are recent additions and may postdate it; verify a specific source against your agent version before citing it as shipped, the same way every other claim in this document should be checked.
+
+### Agent-side edge warehouse (`tar.db`, per device — federated, ADR-0004)
+
+Most device telemetry stays **on the endpoint** in the TAR edge warehouse and is queried on demand (operator SQL, the `/dex` device-perf panel) rather than centralised. The performance tiers added in this release:
+
+| Store / tier | Table | Data class | Default | Retention | Configurable via |
+|---|---|---|---|---|---|
+| Device performance | `$Perf_Live` / `$Perf_Hourly` | Device-level resource telemetry — CPU %, memory/commit %, disk latency/throughput, network B/s. **No per-application or per-user identity.** | **On** (`perf_enabled=true`) | 7 d raw / 31 d hourly | `perf_enabled`, `perf_interval_seconds` |
+| Per-application performance | `$ProcPerf_Live` / `$ProcPerf_Hourly` | **Usage-class telemetry** — top-N applications by CPU + working set, **by image name** (no command lines, no user attribution). Reveals which applications run on a device → works-council-relevant. | **Off (opt-in)** (`procperf_enabled=false`) | 7 d raw / 31 d hourly | `procperf_enabled`, `perf_interval_seconds` |
+| Process activity | `$Process_Live` / `$Process_Hourly` / `_Daily` / `_Monthly` | **Behavioral telemetry (PII)** — every process start/stop with image **name**, pid/ppid, exit code, and (live capture only) the owning **user**. **No command lines** (Windows ETW + the privacy posture). Reveals per-user process activity → works-council-relevant. | **On** (`process_enabled=true`) | 100 000-row raw cap (row-capped, **not** time-based — see note); count rollups carry the long tail (24 h / 31 d / 12 mo) | `process_enabled` (row cap not yet operator-tunable — tracked follow-up) |
+| Software install/uninstall | `$Software_Live` / `$Software_Daily` / `$Software_Monthly` | **Asset-management inventory — no PII.** Install/remove/upgrade *events* — app name, version, publisher. **Machine scope only** (HKLM Uninstall, 64-bit + WOW6432Node): an event is the host's installed software, never attributed to a Windows profile, so there is **no `user`/profile-name column and no personal data** (asset / vuln-inventory data, like `service`). The `_Daily`/`_Monthly` rollups aggregate per `name`. Names/versions/publisher only — no command lines, no usage/launch data. | **Off (opt-in)** (`software_enabled=false`) | 5 000-row raw cap / 31 d daily / 12 mo monthly | `software_enabled`, `software_interval` |
+| DNS resolver cache (ADR-0015) | `$DNS_Live` / `$DNS_Hourly` | **Usage-class telemetry** — device DNS resolver-cache state (resolved domain names + record type/data/TTL). **Device-level — no per-process / per-user attribution** (the cache carries no pid). Reveals which domains a host resolved → works-council-relevant. Cache-only reads (`DNS_QUERY_NO_WIRE_QUERY`), never a wire query. | **Off (opt-in)** (`dns_enabled=false`) | 5 000-row raw cap / 24 h hourly | `dns_enabled` (Windows-only today; Linux/macOS planned) |
+| ARP / neighbour table (ADR-0015) | `$ARP_Live` / `$ARP_Hourly` | Network topology — IP↔MAC bindings per interface (Layer-2 adjacency for ARP-spoofing forensics). **No per-user / per-process identity** — lower sensitivity than DNS. | **Off (opt-in)** (`arp_enabled=false`) | 5 000-row raw cap / 24 h hourly | `arp_enabled` (Windows-only today; Linux/macOS planned) |
+| Per-connection TCP quality (ADR-0020) | `$NetQual_Live` / `$NetQual_Boot` | **Usage-class telemetry** — per-ESTABLISHED-connection RTT/jitter/loss + lifetime retrans/segs context, joined to the owning process (image name only). **Only a coarse destination CLASS** (`remote_bucket`: loopback/private/public/unknown) is stored — the raw remote address/host is dropped at the collector edge and never persisted. Linux (`inetdiag`) + Windows (`estats`, **elevated-only**; non-elevated records nothing, `netqual_capture_method=none`). `$NetQual_Boot` adds one since-boot host-wide counter row per boot (no per-connection/per-process attribution). Reveals per-app connection quality → works-council-relevant, same class as `$ProcPerf_*`. | **Off (opt-in)** (`netqual_enabled=false`) | 100 000-row raw cap (Live) / 400-row cap (Boot) | `netqual_enabled` |
+| Connectivity transitions (ADR-0020) | `$NetConn_Live` | **Usage-class / behavioral-adjacent** — OS-logged network + Wi-Fi connect/disconnect and internet-capability changes, as **closed enum tokens + numeric reason codes only** (action/channel/category/capability/iface_kind/reason_code). **No SSID, BSSID, profile name, interface GUID, MAC, or address is ever extracted.** Device-level (no pid/user). The *timing* of connect/disconnect events is a presence/working-hours proxy → **works-council co-determination-relevant** (capability to monitor). Windows (`wevtapi`, EvtQuery over NetworkProfile/NCSI/WLAN-AutoConfig); the first read **retroactively** backfills OS-retained history from before enablement, bounded by `netconn_lookback_seconds` (default 7 days; **`0` = forward-only, no retrospective read**). | **Off (opt-in)** (`netconn_enabled=false`) | 20 000-row raw cap | `netconn_enabled`, `netconn_lookback_seconds` (retroactive reach / off) |
+| Power transitions (Wave 6) | `$Power_Live` | **Usage-class / behavioral-adjacent** — AC attach/detach + sleep/wake transitions (closed action enum + OS reason text; no user/pid). The *timing* of sleep/wake and AC events is a presence/working-hours proxy → **works-council co-determination-relevant** (same basis as `$NetConn_Live`). Retrospective reach is bounded by `power_lookback_seconds` (default 7 days; **`0` = forward-only**), and applies on **macOS only** — the Windows and Linux legs are live subscriptions with no history API, so they have no retrospective reach at all. The control **fails closed**: a lookback value that cannot be read is treated as `0`, never as the default. **The collector ships in this release**, so an empty table means no transitions occurred, not that collection has not started. | **On by default** (`power_enabled=true`) — the first **works-council-class** capture source to ship enabled. `process`, `tcp`, `service`, `user` and `perf` are already default-on as machine-scope operational telemetry — a works-council scoping exercise must count those too, not just these. The co-determination consideration therefore applies **at upgrade**, not at an operator's opt-in. | 20 000-row raw cap | `power_enabled`, `power_lookback_seconds` |
+| Removable media (Wave 6) | `$Removable_Live` | **Usage/identity-class** — removable/USB attach+detach with device identity (vendor/product/serial) plus executed-from-removable evidence (executable path + pid). Device serials and executed-binary paths are identity/usage-class data → **works-council co-determination-relevant**. Bounded by `removable_lookback_seconds` (default 7 days; **`0` = forward-only**). **The collector ships in this release**, so an empty table means nothing was attached, not that collection has not started. Windows reads the OS event log and has real retrospective reach (`removable_lookback_seconds`); Linux and macOS are live-only with no history API, so an attach/detach while the agent is stopped or disabled is unrecoverable there and is recorded as a `capture_gap`, never backfilled. | **On by default** (`removable_enabled=true`) — see the `$Power_Live` note; this source additionally records a per-process executable path and pid, so the consideration is stronger here. | 20 000-row raw cap | `removable_enabled`, `removable_lookback_seconds` |
+| App usage (Wave 7) | `$Usage_Live` / `$Usage_Daily` | **Usage-class / behavioral-adjacent telemetry** — per-executable run-count/duration derived from `process` start/stop pairing, plus a per-day `distinct_users` COUNT. **`usage_live` persists the owning `pid` and `user` for each open run, and `usage_daily_user` persists the raw username per (day, executable) — both queryable via `tar.sql` at `Infrastructure:Read` today** (the dedicated `Forensics`-gated reader this release's `Forensics` securable is built for is a tracked companion capability, not yet shipped — see the access-limitations note in `docs/user-manual/tar.md`). No command lines are ever captured. Reveals which applications run on a device, when, and by whom → **works-council co-determination-relevant**, same basis as `$Power_Live`/`$Removable_Live`. Forward-only: coverage begins once the source reaches its `Active` lifecycle state after enablement or upgrade, never a retrospective fold. | **On by default** (`usage_enabled=true`) — joining `power`/`removable` as works-council-class sources shipping enabled; `process`/`tcp`/`service`/`user`/`perf` are already default-on as machine-scope operational telemetry. | 31 d (`usage_daily`, mirrored by `usage_daily_user`; retention is frozen, not accelerated, while the source is paused or disabled — same as every other TAR source, #539); `usage_live` bounded by the fold's own 20 000-run open-run cap (`capped` closures accounted in `expired_runs`), not the table's generic row-count backstop | `usage_enabled` |
+| Boot-window process trace | `procboot.etl` (kernel AutoLogger file, Windows) | Boot-window process start/stop, **names-only, no user**. Source for the one-time boot backfill into `$Process_Live`. | Configured by the production installer (`advanced` component) and the dev install script | Circular 16 MB file (not `retention_days`-governed); removed on uninstall (installer `[UninstallRun]` + dev script), which also stops the running session | `process_enabled` gates the backfill insert; file lifecycle via the installer / `install-agent-user.ps1` |
+
+These tiers are device-local; raw rows never leave the endpoint except via an operator-initiated, permission-gated query (the `/dex` device-perf panel runs a live `$Perf_Hourly` query, Execute-gated and audited `dex.device.perf.query`). The perf tiers use `RetentionType::kTimeBased`; **`$Process_Live` uses `RetentionType::kRowCount` (100 000 rows)** — see the retention-control caveat below.
+
+Retention numbers are inline defaults; time-based stores expose a `retention_days` constructor argument so a customer can tighten them without a code change (`retention_days = 0` disables the reaper — intended for forensic freezes; requires a compensating manual-export process to avoid unbounded growth). **Exception: `$Process_Live` is row-capped, not time-based, and the cap is not yet operator-configurable** — on a busy endpoint 100 000 rows can be days of history; making the process raw cap (or its conversion to time-based retention) operator-tunable is a tracked follow-up so the per-category retention commitment holds for process data too. The **`$DNS_Live` / `$ARP_Live`** tiers (ADR-0015) are likewise row-capped (5 000) on the Live tier with a time-based 24 h Hourly tier; the DNS-cache PII erasure path today is **disable the source (`dns_enabled=false`) + ring-wrap / Hourly reaper** (no dedicated per-subject DELETE) — and since DNS rows are device-level with no pid, they are not subject-attributable, so a per-subject DSAR maps to the device, not an individual. A dedicated DSAR/erase path is the same tracked roadmap gap noted below.
+
+**Every retention number above is a floor, not a ceiling** (#2361). The reaper runs on the 900 s `tar.rollup` tick, and is now clock-guarded and paced:
+
+- **Time-based tiers are clock-guarded.** Before deleting, each table is probed for whether the cutoff would expire *every* datable row it holds. If it would, the pass declines that table once and records the decline, rather than emptying a forensic window in one statement because the endpoint's clock jumped. A reading persisted in `tar_config` (`retention_guard_last_pass`) makes the guard survive agent restarts; a stored reading that is ahead of the current clock AT ALL, or a jump of more than 30 days between passes, is itself treated as implausible; a pass that finds NO stored reading (the first after an agent upgrade or restore) also declines, once, and is the one trigger that does not spend the latch (the 24 h slack is a separate rule, and applies to row timestamps, not to the stored reading). **The guard paces deletion, it does not block it:** after the one declined pass the latch releases the table to the capped delete below, so a genuinely wrong clock still drains its backlog at 5 000 rows/table/tick. What the guard buys is a recorded decline and the time to notice, not indefinite preservation.
+- **Both tier kinds are paced.** A single pass deletes at most 5 000 rows per table, time-based and row-capped alike. A large backlog (a long-powered-off laptop, or an upgrade that lowers a retention setting) drains over successive rollup ticks instead of one multi-second write transaction. Rows therefore survive past their nominal window while the backlog drains - deliberately, and bounded by the tick rate.
+- **The evidence surface is the `tar status` action**, since the agent has no `/metrics` endpoint. It emits `retention_guard_declines_total|<n>` and `retention_guard_failures_total|<n>` on every call (including zeros, so an old agent is distinguishable from a healthy one) plus a `retention_guard|<table>|<n>` / `retention_guard_failed|<table>|<n>` line for each affected table. A non-zero *failures* total means retention has stopped for that table - a probe or delete is erroring - and must be read together with the declines total, not instead of it. **These counters are in-memory and reset on agent restart, and are not aggregated fleet-wide today**; reading them is a per-device query.
+- **Failure mode with a retention consequence:** if a retention transaction cannot be rolled back and the endpoint's database is left mid-transaction, the agent closes the `tar.db` write connection rather than reporting durable writes it will lose. TAR collection and retention both stop until the agent is restarted; historical rows stay readable through the separate read-only connection (`tar sql`), and `tar status` reports `error|...` followed by `storage_state|offline`. **While an endpoint is in that state its retention commitment is not being met** - nothing is deleted until it restarts. There is no automatic recovery today (tracked follow-up).
+
+### Agent-side `kv_store.db` namespaces
+
+`kv_store.db` is the agent's general-purpose key-value store (rule definitions, sync
+state, plugin data); one namespace carries security-relevant audit data rather than
+device telemetry and is inventoried here on that basis.
+
+| Namespace | Data class | Default | Retention | Deletion mechanism | Configurable via |
+|---|---|---|---|---|---|
+| Guardian lifecycle-audit journal (`__guardian_journal__`, ADR-0021 Stage 2 item 7) | Security-relevant activity — `guard.armed` / `guard.disarmed` events for spark-backed rules (plus `guard.errored` as of #2818, the subscription-death path only), durable across process crash/restart so they can be re-sent until delivery is evidenced or retention expires them. No behavioral/usage telemetry; carries rule identity + agent-generated event metadata, not device or user content. | **On** whenever `prefer_spark` is active (inert — zero writes, zero paging/pruning — while the flag is false) | Three bounds enforced together, oldest evicted first: **7 days**, **1000 batches**, **32 MiB** (`kJournalRetentionDays`/`kMaxJournalBatches`/`kMaxJournalBytes`). Every eviction is classified and counted (see `docs/yuzu-guardian-design-v1.1.md` §25) — retention and quarantine are the only deletion paths. | Automatic, time/count/byte-bounded pass on the journal maintenance tick; quarantine (corrupt/unparseable batches) is separately capped at 100 batches. No manual delete API — the namespace holds audit evidence, not subject data, so no DSAR path applies. | No operator-facing retention knob today (constants are compile-time; a tracked follow-up if a customer needs a shorter/longer window). |
+
+The fleet visualization cache (`FleetTopologyStore`) is the highest-resolution endpoint telemetry surfaced in the dashboard. It holds at most two snapshots in memory at any time (single-flight refill, no SQLite persistence) and each snapshot is invalidated 60 seconds after the agent dispatch completes; restarting the server purges all cached topology. Process-level fields (`name`, `user`, `category`) are agent-controlled strings rendered after HTML escape and length clamp; the `category` field is computed server-side from a typed enum (`process_category.hpp`) so agents cannot inject arbitrary palette keys. Privacy-sensitive customers can suppress process collection on specific agents via `tar.configure process_enabled=false` (the corresponding cubes in the visualization render with no interior dots) or disable the whole feature with `--viz-disable` / `YUZU_VIZ_DISABLE`.
+
+The Guardian events table is sized for **~10k events/s during a fleet-wide incident** (design doc §9.1), i.e. ~864M rows/day. The 30-day default is the retention/recovery trade-off: long enough to correlate an incident across the standard forensic window, short enough to keep steady-state disk under ~25GB per million endpoints at typical drift rates. Tenants with longer forensic SLAs should raise `guardian_event_retention_days` _and_ provision storage — the product does not auto-trim disk.
+
+
+
+### Agent-side, transient (no durable store)
+
+Read results that are never written to a database on either side — computed fresh per invocation and streamed to the caller. Listed here so a data-inventory pass finds them instead of assuming an omission.
+
+| Source | Data class | Where it lives | Retention | Deletion mechanism |
+|---|---|---|---|---|
+| `autoruns.list` (agent-side, transient) | Persistence-source metadata: file paths, registry key names/values, task/service names, command lines and arguments; user-scope rows carry a `user` field, but its content differs by source — Windows (`win_run_hku`/`win_runonce_hku`/`win_startup_approved`) and macOS (`~/Library/LaunchAgents`) carry the real profile/account name, `lnx_user_crontabs` carries the real username (the crontab filename), but `lnx_systemd_timers_user` and `lnx_xdg_autostart_user` carry a bare numeric uid (`owner_uid_string`, `autoruns_linux.cpp:244`) rather than a resolved username | Not stored on the agent between runs — computed fresh per invocation, streamed to the caller | None on the agent (nothing persisted). If the result transits the **response store** (an operator running this via the instruction engine), it is retained under the standard response retention (`response_retention_days`, default 90 d) — the same annotation pattern as the `$ProcPerf_Live` row above — because a `list` row can name a specific user's autorun entries, not just machine-wide facts. | Response-store rows follow that store's existing erasure path; no agent-side erasure needed since nothing is retained there. |
+
+### Not in v0.13.0 — planned (Workstream E data-store migrations)
+
+**Everything below describes `dev`-HEAD, not `v0.13.0`.** Re-verify
+against your own tag before relying on it
+(`git show <your-tag>:<path>`) — this section is not re-checked every
+time a new release cuts. This is the unmodified detail this document
+previously presented as `v0.13.0`'s current state; it is retained here in
+full, byte-identical, because it remains an accurate account of
+`dev`-HEAD — only its label has changed.
+
+#### Data Inventory — all server stores, `dev`-HEAD state (migration status per row)
 
 | Store | File | Data class | Retention | Deletion mechanism | Configurable via |
 |---|---|---|---|---|---|
@@ -326,7 +571,7 @@ gate. Credit affirmatively as a CC6.1/CC6.3 control now, citing
 
 **Audit capacity ceiling (Workstream D + G).** The audit trail's paced drain (see the PostgreSQL-stores table below) is now single-sweeper fleet-wide (advisory lease), so the cap is one drain rate, never `N replicas × 25,000`. It paces at TWO cadences, not one — do not quote only the first figure to a prospect, it understates real capacity by roughly three orders of magnitude: a quiet-operation threshold of **~6.9 audit events/second** (25,000 rows/hourly pass, ~600,000 rows/day, `yuzu_server_audit_retention_cap_reached_total` stays at 0 below this), and a backlog-recovery ceiling of **up to ~5,000 audit events/second** once that counter starts moving (the guard re-arms every 5 seconds instead of hourly while a backlog persists, still capped at 25,000 rows/pass). The audit store only grows WITHOUT BOUND above the second, much higher figure — a rising `cap_reached_total` alone means the guard is draining faster, not falling behind; sustained capping with `rows_deleted_total` not keeping pace is the actual signal. At the 365-day default the QUIET threshold alone is also a **storage** commitment on the order of 219M rows / ~44 GB. Both cadences are engineering constants, not configuration, so a prospect whose SUSTAINED audit rate exceeds the backlog-recovery ceiling needs a scoping conversation; one that merely exceeds the quiet threshold does not. The storage figure is an ESTIMATE built on an assumed ~200 bytes/row and varies with principal, action and detail length -- quote rates as limits, the size as an order of magnitude. Derivation, both cadences' full reasoning, and the caveats on every figure here: `docs/user-manual/audit-log.md` ("Capacity") — this paragraph is a summary, that section is the one home.
 
-### Data Inventory — server-side PostgreSQL stores (ADR-0006/0008)
+#### Data Inventory — server-side PostgreSQL stores (ADR-0006/0008)
 
 As of the Postgres substrate flip (ADR-0006), born-on-Postgres stores are the
 server's primary data home and carry the same data-classification obligations as
@@ -339,6 +584,21 @@ the SQLite table above. Each new server store registers here.
 | Guaranteed-state rules/events/DEX observations | `guaranteed_state_store` (`guaranteed_state_rules`, `guaranteed_state_events`, `guardian_observations`, `guardian_meta`, `guardian_agent_rule_status`, `gc_meta`) | Rules: configuration. Events: drift/remediation telemetry (high-volume operational, non-regenerable — the agent has already reported and moved on). DEX observations (projection): **behavioral telemetry / PII** — per-device reliability signals (114-type catalogue, `docs/dex-signal-catalog.md`), keyed `agent_id` → device → person. | Rules: indefinite, explicit delete. Events + DEX observations: **30 days default**, `guardian_event_retention_days` — the projection carries the SAME `ttl_expires_at` as its source event and is reaped in the same guarded pass (lockstep; a projection can never outlive its source row). | **Migrated from the SQLite `guaranteed-state.db` (ADR-0038): construction fails CLOSED with no SQLite fallback.** `migrate_from_sqlite` and its `sqlite_backfill` marker table were **RETIRED (2026-09-02, #3623, ADR-0038 Update)** — fresh-start-by-default (ADR-0009 amendment: no production fleet has ever run a pre-Postgres build), never backfilled; `server.cpp` now runs `legacy_sqlite_probe::warn_if_legacy_rows` over the legacy tables at boot instead, log-only, never blocking. **A legacy `guaranteed-state.db` with real rules is therefore only warned about, never enforced** — the same enforcement-class consequence `BaselineStore` (also in this retirement) carries for a legacy Baseline, and unlike the remaining 10 stores in the same retirement, where the warn-only fallback drops merely operational/cosmetic state, an unenforced Guardian rule is a policy-enforcement gap; see ADR-0038's Update for the full reasoning. `GuaranteedStateStore::reap_expired()` — clock-guarded and capped (`#2496`/`#2579`/`#2663`), single-sweeper via `pg_try_advisory_xact_lock('guaranteed_state_store:reap', 0)`, dedup state durable in `gc_meta` (survives restart/failover across replicas). The pass declines and warns when it would expire every datable row, when the persisted clock reading is unusable, or when no prior pass has ever reached a verdict on this database (the `#2579` missing-anchor trigger — the same answer as `AuditStore`: decline, since this is non-regenerable evidence, not `ResultSetStore`'s reproducible scratch data), and deletes at most `kReapCapPerPass` (10,000) events + observations per pass, oldest first, in lockstep. **Every retention decision reads PostgreSQL's own clock, never a replica's process clock** (`#2663`, fjarvis review — mirrors `AuditStore::cleanup_once`'s `#2360/1d` fix: a replica's own clock skew previously could poison the shared `gc_meta` anchor and misclassify a still-live row as expired, with zero anomaly recorded; a replica's process clock now feeds only a cheap pre-transaction plausibility check and cannot move a verdict). Series: `yuzu_server_guardian_reap_passes_total{result}` (`swept`/`noop`/`declined`/`declined_no_anchor`/`failed`/`skipped_lock`; `declined_no_anchor` is alerted via `YuzuGuardianReapAnchorNotSurviving` on a climbing count — **unlike `AuditStore`, this store ships no dedicated dead-reaper liveness pair** (`YuzuAuditRetentionNotRunning`/`..._MetricMissing`); a fully-stalled reaper emitting zero passes of any kind is not covered by the alert above, only `docs/user-manual/guaranteed-state.md`'s suggested operator-authored `absent_over_time` query), `yuzu_server_guardian_events_reaped_total` / `..._observations_reaped_total` (disposal evidence), `yuzu_server_guardian_events_ingest_errors_total`, and `yuzu_server_guardian_read_degrade_total{reason,source}` (deny-on-degrade DEX/Guardian reads). Full detail: `docs/user-manual/guaranteed-state.md` ("Retention"). | `guardian_event_retention_days` |
 | Per-application performance, centralized (B1) | `app_perf_daily_store` (`app_perf_daily`) | **Usage-class telemetry** — per-device daily app-performance summary: `(app image name, version, UTC day)` with CPU/working-set averages + peaks + a sample count. The centralized projection of the on-device `$ProcPerf_*` tiers (below), shipped by the `app_perf` daily-sync source. **Names-only — no command lines, no user attribution, no SID/username/user-path.** Same legal class as `$ProcPerf_*` and a step *more* exposing than installed-software (it reveals not just which apps are present but how heavily each runs over time, device-attributable via `agent_id`) → **works-council co-determination-relevant** (capability to monitor; BetrVG §87(1)(6)) and personal data under GDPR if treated as such on personally-assigned devices. Resource-significant (procperf top-N) app-versions only — not a complete usage census. | **31-day** rolling retention — `apply_daily` prunes rows older than 31 UTC days per agent on each sync (`AppPerfDailyStore::kRetentionDays`). A device that stops reporting retains ≤31 days, then ages out; `delete_agent` clears on removal. | Per-agent prune is automatic (time-based). **Whole-device decommission purge is WIRED** (ADR-0024) — `AppPerfDailyStore::delete_agent` is fanned by the `AgentDecommission` cascade behind the audited **`DELETE /api/v1/sle/agents/{id}`** route, so a decommissioned device's rows are durably erased and the store reports its committed delete status (a rolled-back delete is reported failed, never a false erasure). **Row-level / per-subject DSAR (Art. 17) erasure remains unwired** — the cascade is whole-device only; that residual gap is #1666. | **`procperf_enabled=false`** (per-app collection opt-in — no procperf data → no B1 data) **and** `--inventory-disable` / `YUZU_AGENT_INVENTORY_DISABLE` (the daily-sync master switch). Windows + Linux-fed today (Linux rows carry `version=''` and are kernel 15-char comms, which may include kernel-thread names — system infrastructure, not user-app usage); macOS planned. |
 | Per-application performance, fleet aggregate (B2) | `app_perf_fleet_store` (`app_perf_fleet`) | **Fleet-aggregate** app performance per `(app, version, UTC day)` — device count, CPU/working-set sums + maxima, and a per-bucket device-count histogram (the trend/regression substrate). **Carries NO `agent_id` — no per-device attribution.** It is a derived aggregate over the fleet, not individually-identifying, so it is materially LOWER sensitivity than B1 (above) and not individually works-council-relevant on its own. (Collection is still gated upstream: it is derived from B1, so `procperf_enabled=false` / `--inventory-disable` empties it.) | **180-day** retention — the roll-up thread prunes `day < now − 180d`. | Time-based prune (automatic). No per-device purge applies (no device dimension); a DSAR erase targets B1, not this aggregate. | Derived — gated upstream by B1's `procperf_enabled` + `--inventory-disable`. |
+
+> **Correction (external review, Codex Astra, verified against code) — the
+> two rows above, plus `preflight_run_store`/`deployment_run_store` below,
+> must not be read as lacking any retention/erasure mechanism; each has one,
+> just not the ADR-0024 decommission cascade.** Retention: per-agent
+> app-perf prune runs in the ingest transaction (`app_perf_daily_store.cpp:350-355`)
+> — only when that agent next reports, so an offline device's history
+> persists until `delete_agent`; fleet aggregate `prune()`
+> (`app_perf_fleet_store.cpp:273`); pre-flight (`preflight_runner.cpp:33-34`)
+> and deployment (`server.cpp:18254-18257`, 14 d) pruned on tick.
+> Decommission: `DELETE /api/v1/sle/agents/{id}` (`sle_routes.cpp:231`)
+> cascades five stores via `AgentDecommission` (`agent_decommission.cpp:28-40`);
+> this is not an all-store or subject-level erasure — platform-wide purge
+> remains a tracked follow-on (`docs/user-manual/inventory.md:208`).
+
 | Generic plugin inventory | `inventory_store` (`inventory_data`) | Device-attributable (`agent_id`) per-plugin JSON blobs for sources not promoted to a typed store. **Sensitivity is plugin-dependent**: custom plugins may collect identifiers, configuration, paths, or other customer-defined data, so this store must not be represented as categorically non-PII or secret-safe. Typed `installed_software`, `app_perf`, `device_ci`, and `software_licensing` sources are excluded and remain under their own securables. | **Current-state only** — each `(agent_id, plugin)` report replaces the prior blob; no time-based reaper, so a device that stops reporting retains its last state. | Whole-device purge is WIRED through `AgentDecommission`, but PostgreSQL-only: `InventoryStore::delete_agent` erases the agent's rows from `inventory_store.inventory_data` and reports failure unless that commits. No legacy-data migration path exists (#3623, ADR-0037's Update) — this store never had a "retained legacy copy" to also erase, so a legacy `inventory.db` file, if one exists at all, is never read and never scrubbed by decommission; an operator with a genuine compliance reason to remove one must delete it manually and record that as separate evidence. No row-level/per-subject DSAR API (#1666). | `--inventory-disable` / `YUZU_AGENT_INVENTORY_DISABLE` disables daily inventory collection; individual custom-plugin collection is governed by that plugin's own configuration. |
 | Installed-software inventory | `software_inventory_store` (`inventory_state`, `installed_software`) | Installed-software **asset inventory** per device — name, version, publisher, install date — collected by the agent daily-sync framework (ADR-0016). **Machine-scope; no end-user PII** — per-user enumeration is deliberately *not* used (ADR-0016 §8): no logged-in-user attribution, no usernames. **Lower behavioral sensitivity than the process-performance tiers** (no run-time, no CPU/memory attribution). **However:** the data is device-attributable (`agent_id`), and on **personally-assigned devices** installed-software enumeration may still be **works-council co-determination-relevant** under national law (e.g. BetrVG §87(1)(6)) — co-determination is triggered by the *capability to monitor*, not by username presence, the same basis on which `$ProcPerf_Live` (above) ships opt-in. Consult works-council counsel before deploying in EU collective-bargaining jurisdictions; an erasure obligation (GDPR Art. 17) attaches if the data is treated as personal in such a deployment. | **Current-state only** — each sync *replaces* the device's rows; there is **no time-based reaper**. Last-known state is retained after a device stops reporting (mirrors the offline-endpoint posture); `inventory_state.last_seen` marks activity. | **Per-device purge is WIRED** (ADR-0024). `SoftwareInventoryStore::delete_agent` is fanned by the `AgentDecommission` cascade behind the audited **`DELETE /api/v1/sle/agents/{id}`** route (scoped `Decommission:Delete` — a device-level erasure securable authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction (ADR-0024 Decision 9, amended Wave 7 PR7.2); audit-before-erase fail-closed), so a decommissioned device's rows are durably erased with truthful per-store committed status. Stale-device exclusion remains a query-time `last_seen` filter, not a delete — an *aged-out* device that was never decommissioned keeps its rows. **Row-level / per-subject DSAR (Art. 17) erasure is still unwired** — the cascade erases a whole device, not one subject's rows (tracked in #1666). | **`--inventory-disable` / `YUZU_AGENT_INVENTORY_DISABLE`** (agent deploy-time opt-out — collect nothing); no per-store retention knob yet (#1666) |
 | Device configuration-item (CI) inventory | `device_inventory_store` (`device_ci`) | Device hardware/OS identity — manufacturer, model, **serial number**, **system UUID**, BIOS, CPU/RAM, **primary + all MAC addresses**, NIC count, OS name/version/build, architecture. Collected by the agent daily-sync framework (ADR-0016 source #3), 1:1 per agent (current-state only). **Machine-scope** (no username/SID/user-path), but serial/system_uuid/primary_mac are **stable device-persistent identifiers** — personal data under GDPR when a device is person-assigned, and works-council co-determination-relevant on the *capability* to track a device (and by association its user) over time, regardless of per-user data (ADR-0016). **Operator-visible** via the `/inventory` Devices tab (list columns + per-device CI panel) — both reads gate on `Inventory:Read` and audit at the **behavioural-PII tier** (`emit_behavioral_audit`, `Sec-Audit-Failed` on persist failure): `inventory.devices` (fleet list, gated on the global `Inventory:Read`; per-device confinement is *designed for, not yet verified effective* — the ADR-0017 admit-then-filter gate hasn't landed for Inventory list reads (tracked under PR-D), the same inert-list-scoping class as the confinement caveat below) and `inventory.device.ci` (per-device drill, scoped at the gate, three-state found/absent/degraded). | **Current-state only** — each sync *replaces* the device's row; no time-based reaper. | **Per-device purge is WIRED** (ADR-0024) — `DeviceInventoryStore::delete_agent` is fanned by the same `AgentDecommission` cascade behind **`DELETE /api/v1/sle/agents/{id}`** as `software_inventory_store` above. **Row-level / per-subject DSAR (Art. 17) erasure remains unwired** (#1666). | **`--inventory-disable` / `YUZU_AGENT_INVENTORY_DISABLE`** (agent deploy-time opt-out); no per-store retention knob yet (#1666). |
@@ -410,58 +670,6 @@ stand it up; the only per-store knob is retention.
 > **Retention-guard coverage is partial, deliberately.** On the server, the audit trail (#2360), the **Guardian-event store** (`guaranteed_state_store`, ADR-0038/#2496/#2579/#2663), and the **response store** (ADR-0039, this PR — the #2508 treatment for that store) are clock-guarded and capped; on the agent, the TAR edge warehouse is (#2361 - see the retention note under the agent-side section below). The remaining stores queued for the same #2508 treatment (`app_perf_*`, `PreflightRunStore`, `DeploymentRunStore`) still issue a bare `DELETE ... WHERE ttl_expires_at < now` driven by the server's wall clock, so a forward clock step can empty one of them in one statement. They are lower-stakes than the evidence trail (operational telemetry, not the SOC 2 control record). An auditor reading this table should not infer that "clock-guarded" applies to every row in it. **Nor that "clock-guarded" means fully guarded in every state:** until #2579 the audit trail's own guard had no missing-anchor trigger, so a server upgraded to schema v3 while its clock was ALREADY skewed forward could delete expired rows with no decline and no counter. That is now closed - such a pass declines once and anchors the reading. The honest answer to "can the audit trail be silently truncated?" is therefore **not on a current build; yes on a build predating #2579, under a forward-skewed clock at upgrade** - and there is no reliable retrospective test to confirm whether a given database was affected, nor recovery without a backup predating the pass.
 
 
-#### Agent-side edge warehouse (`tar.db`, per device — federated, ADR-0004)
-
-Most device telemetry stays **on the endpoint** in the TAR edge warehouse and is queried on demand (operator SQL, the `/dex` device-perf panel) rather than centralised. The performance tiers added in this release:
-
-| Store / tier | Table | Data class | Default | Retention | Configurable via |
-|---|---|---|---|---|---|
-| Device performance | `$Perf_Live` / `$Perf_Hourly` | Device-level resource telemetry — CPU %, memory/commit %, disk latency/throughput, network B/s. **No per-application or per-user identity.** | **On** (`perf_enabled=true`) | 7 d raw / 31 d hourly | `perf_enabled`, `perf_interval_seconds` |
-| Per-application performance | `$ProcPerf_Live` / `$ProcPerf_Hourly` | **Usage-class telemetry** — top-N applications by CPU + working set, **by image name** (no command lines, no user attribution). Reveals which applications run on a device → works-council-relevant. | **Off (opt-in)** (`procperf_enabled=false`) | 7 d raw / 31 d hourly | `procperf_enabled`, `perf_interval_seconds` |
-| Process activity | `$Process_Live` / `$Process_Hourly` / `_Daily` / `_Monthly` | **Behavioral telemetry (PII)** — every process start/stop with image **name**, pid/ppid, exit code, and (live capture only) the owning **user**. **No command lines** (Windows ETW + the privacy posture). Reveals per-user process activity → works-council-relevant. | **On** (`process_enabled=true`) | 100 000-row raw cap (row-capped, **not** time-based — see note); count rollups carry the long tail (24 h / 31 d / 12 mo) | `process_enabled` (row cap not yet operator-tunable — tracked follow-up) |
-| Software install/uninstall | `$Software_Live` / `$Software_Daily` / `$Software_Monthly` | **Asset-management inventory — no PII.** Install/remove/upgrade *events* — app name, version, publisher. **Machine scope only** (HKLM Uninstall, 64-bit + WOW6432Node): an event is the host's installed software, never attributed to a Windows profile, so there is **no `user`/profile-name column and no personal data** (asset / vuln-inventory data, like `service`). The `_Daily`/`_Monthly` rollups aggregate per `name`. Names/versions/publisher only — no command lines, no usage/launch data. | **Off (opt-in)** (`software_enabled=false`) | 5 000-row raw cap / 31 d daily / 12 mo monthly | `software_enabled`, `software_interval` |
-| DNS resolver cache (ADR-0015) | `$DNS_Live` / `$DNS_Hourly` | **Usage-class telemetry** — device DNS resolver-cache state (resolved domain names + record type/data/TTL). **Device-level — no per-process / per-user attribution** (the cache carries no pid). Reveals which domains a host resolved → works-council-relevant. Cache-only reads (`DNS_QUERY_NO_WIRE_QUERY`), never a wire query. | **Off (opt-in)** (`dns_enabled=false`) | 5 000-row raw cap / 24 h hourly | `dns_enabled` (Windows-only today; Linux/macOS planned) |
-| ARP / neighbour table (ADR-0015) | `$ARP_Live` / `$ARP_Hourly` | Network topology — IP↔MAC bindings per interface (Layer-2 adjacency for ARP-spoofing forensics). **No per-user / per-process identity** — lower sensitivity than DNS. | **Off (opt-in)** (`arp_enabled=false`) | 5 000-row raw cap / 24 h hourly | `arp_enabled` (Windows-only today; Linux/macOS planned) |
-| Per-connection TCP quality (ADR-0020) | `$NetQual_Live` / `$NetQual_Boot` | **Usage-class telemetry** — per-ESTABLISHED-connection RTT/jitter/loss + lifetime retrans/segs context, joined to the owning process (image name only). **Only a coarse destination CLASS** (`remote_bucket`: loopback/private/public/unknown) is stored — the raw remote address/host is dropped at the collector edge and never persisted. Linux (`inetdiag`) + Windows (`estats`, **elevated-only**; non-elevated records nothing, `netqual_capture_method=none`). `$NetQual_Boot` adds one since-boot host-wide counter row per boot (no per-connection/per-process attribution). Reveals per-app connection quality → works-council-relevant, same class as `$ProcPerf_*`. | **Off (opt-in)** (`netqual_enabled=false`) | 100 000-row raw cap (Live) / 400-row cap (Boot) | `netqual_enabled` |
-| Connectivity transitions (ADR-0020) | `$NetConn_Live` | **Usage-class / behavioral-adjacent** — OS-logged network + Wi-Fi connect/disconnect and internet-capability changes, as **closed enum tokens + numeric reason codes only** (action/channel/category/capability/iface_kind/reason_code). **No SSID, BSSID, profile name, interface GUID, MAC, or address is ever extracted.** Device-level (no pid/user). The *timing* of connect/disconnect events is a presence/working-hours proxy → **works-council co-determination-relevant** (capability to monitor). Windows (`wevtapi`, EvtQuery over NetworkProfile/NCSI/WLAN-AutoConfig); the first read **retroactively** backfills OS-retained history from before enablement, bounded by `netconn_lookback_seconds` (default 7 days; **`0` = forward-only, no retrospective read**). | **Off (opt-in)** (`netconn_enabled=false`) | 20 000-row raw cap | `netconn_enabled`, `netconn_lookback_seconds` (retroactive reach / off) |
-| Power transitions (Wave 6) | `$Power_Live` | **Usage-class / behavioral-adjacent** — AC attach/detach + sleep/wake transitions (closed action enum + OS reason text; no user/pid). The *timing* of sleep/wake and AC events is a presence/working-hours proxy → **works-council co-determination-relevant** (same basis as `$NetConn_Live`). Retrospective reach is bounded by `power_lookback_seconds` (default 7 days; **`0` = forward-only**), and applies on **macOS only** — the Windows and Linux legs are live subscriptions with no history API, so they have no retrospective reach at all. The control **fails closed**: a lookback value that cannot be read is treated as `0`, never as the default. **The collector ships in this release**, so an empty table means no transitions occurred, not that collection has not started. | **On by default** (`power_enabled=true`) — the first **works-council-class** capture source to ship enabled. `process`, `tcp`, `service`, `user` and `perf` are already default-on as machine-scope operational telemetry — a works-council scoping exercise must count those too, not just these. The co-determination consideration therefore applies **at upgrade**, not at an operator's opt-in. | 20 000-row raw cap | `power_enabled`, `power_lookback_seconds` |
-| Removable media (Wave 6) | `$Removable_Live` | **Usage/identity-class** — removable/USB attach+detach with device identity (vendor/product/serial) plus executed-from-removable evidence (executable path + pid). Device serials and executed-binary paths are identity/usage-class data → **works-council co-determination-relevant**. Bounded by `removable_lookback_seconds` (default 7 days; **`0` = forward-only**). **The collector ships in this release**, so an empty table means nothing was attached, not that collection has not started. Windows reads the OS event log and has real retrospective reach (`removable_lookback_seconds`); Linux and macOS are live-only with no history API, so an attach/detach while the agent is stopped or disabled is unrecoverable there and is recorded as a `capture_gap`, never backfilled. | **On by default** (`removable_enabled=true`) — see the `$Power_Live` note; this source additionally records a per-process executable path and pid, so the consideration is stronger here. | 20 000-row raw cap | `removable_enabled`, `removable_lookback_seconds` |
-| App usage (Wave 7) | `$Usage_Live` / `$Usage_Daily` | **Usage-class / behavioral-adjacent telemetry** — per-executable run-count/duration derived from `process` start/stop pairing, plus a per-day `distinct_users` COUNT. **`usage_live` persists the owning `pid` and `user` for each open run, and `usage_daily_user` persists the raw username per (day, executable) — both queryable via `tar.sql` at `Infrastructure:Read` today** (the dedicated `Forensics`-gated reader this release's `Forensics` securable is built for is a tracked companion capability, not yet shipped — see the access-limitations note in `docs/user-manual/tar.md`). No command lines are ever captured. Reveals which applications run on a device, when, and by whom → **works-council co-determination-relevant**, same basis as `$Power_Live`/`$Removable_Live`. Forward-only: coverage begins once the source reaches its `Active` lifecycle state after enablement or upgrade, never a retrospective fold. | **On by default** (`usage_enabled=true`) — joining `power`/`removable` as works-council-class sources shipping enabled; `process`/`tcp`/`service`/`user`/`perf` are already default-on as machine-scope operational telemetry. | 31 d (`usage_daily`, mirrored by `usage_daily_user`; retention is frozen, not accelerated, while the source is paused or disabled — same as every other TAR source, #539); `usage_live` bounded by the fold's own 20 000-run open-run cap (`capped` closures accounted in `expired_runs`), not the table's generic row-count backstop | `usage_enabled` |
-| Boot-window process trace | `procboot.etl` (kernel AutoLogger file, Windows) | Boot-window process start/stop, **names-only, no user**. Source for the one-time boot backfill into `$Process_Live`. | Configured by the production installer (`advanced` component) and the dev install script | Circular 16 MB file (not `retention_days`-governed); removed on uninstall (installer `[UninstallRun]` + dev script), which also stops the running session | `process_enabled` gates the backfill insert; file lifecycle via the installer / `install-agent-user.ps1` |
-
-These tiers are device-local; raw rows never leave the endpoint except via an operator-initiated, permission-gated query (the `/dex` device-perf panel runs a live `$Perf_Hourly` query, Execute-gated and audited `dex.device.perf.query`). The perf tiers use `RetentionType::kTimeBased`; **`$Process_Live` uses `RetentionType::kRowCount` (100 000 rows)** — see the retention-control caveat below.
-
-Retention numbers are inline defaults; time-based stores expose a `retention_days` constructor argument so a customer can tighten them without a code change (`retention_days = 0` disables the reaper — intended for forensic freezes; requires a compensating manual-export process to avoid unbounded growth). **Exception: `$Process_Live` is row-capped, not time-based, and the cap is not yet operator-configurable** — on a busy endpoint 100 000 rows can be days of history; making the process raw cap (or its conversion to time-based retention) operator-tunable is a tracked follow-up so the per-category retention commitment holds for process data too. The **`$DNS_Live` / `$ARP_Live`** tiers (ADR-0015) are likewise row-capped (5 000) on the Live tier with a time-based 24 h Hourly tier; the DNS-cache PII erasure path today is **disable the source (`dns_enabled=false`) + ring-wrap / Hourly reaper** (no dedicated per-subject DELETE) — and since DNS rows are device-level with no pid, they are not subject-attributable, so a per-subject DSAR maps to the device, not an individual. A dedicated DSAR/erase path is the same tracked roadmap gap noted below.
-
-**Every retention number above is a floor, not a ceiling** (#2361). The reaper runs on the 900 s `tar.rollup` tick, and is now clock-guarded and paced:
-
-- **Time-based tiers are clock-guarded.** Before deleting, each table is probed for whether the cutoff would expire *every* datable row it holds. If it would, the pass declines that table once and records the decline, rather than emptying a forensic window in one statement because the endpoint's clock jumped. A reading persisted in `tar_config` (`retention_guard_last_pass`) makes the guard survive agent restarts; a stored reading that is ahead of the current clock AT ALL, or a jump of more than 30 days between passes, is itself treated as implausible; a pass that finds NO stored reading (the first after an agent upgrade or restore) also declines, once, and is the one trigger that does not spend the latch (the 24 h slack is a separate rule, and applies to row timestamps, not to the stored reading). **The guard paces deletion, it does not block it:** after the one declined pass the latch releases the table to the capped delete below, so a genuinely wrong clock still drains its backlog at 5 000 rows/table/tick. What the guard buys is a recorded decline and the time to notice, not indefinite preservation.
-- **Both tier kinds are paced.** A single pass deletes at most 5 000 rows per table, time-based and row-capped alike. A large backlog (a long-powered-off laptop, or an upgrade that lowers a retention setting) drains over successive rollup ticks instead of one multi-second write transaction. Rows therefore survive past their nominal window while the backlog drains - deliberately, and bounded by the tick rate.
-- **The evidence surface is the `tar status` action**, since the agent has no `/metrics` endpoint. It emits `retention_guard_declines_total|<n>` and `retention_guard_failures_total|<n>` on every call (including zeros, so an old agent is distinguishable from a healthy one) plus a `retention_guard|<table>|<n>` / `retention_guard_failed|<table>|<n>` line for each affected table. A non-zero *failures* total means retention has stopped for that table - a probe or delete is erroring - and must be read together with the declines total, not instead of it. **These counters are in-memory and reset on agent restart, and are not aggregated fleet-wide today**; reading them is a per-device query.
-- **Failure mode with a retention consequence:** if a retention transaction cannot be rolled back and the endpoint's database is left mid-transaction, the agent closes the `tar.db` write connection rather than reporting durable writes it will lose. TAR collection and retention both stop until the agent is restarted; historical rows stay readable through the separate read-only connection (`tar sql`), and `tar status` reports `error|...` followed by `storage_state|offline`. **While an endpoint is in that state its retention commitment is not being met** - nothing is deleted until it restarts. There is no automatic recovery today (tracked follow-up).
-
-#### Agent-side `kv_store.db` namespaces
-
-`kv_store.db` is the agent's general-purpose key-value store (rule definitions, sync
-state, plugin data); one namespace carries security-relevant audit data rather than
-device telemetry and is inventoried here on that basis.
-
-| Namespace | Data class | Default | Retention | Deletion mechanism | Configurable via |
-|---|---|---|---|---|---|
-| Guardian lifecycle-audit journal (`__guardian_journal__`, ADR-0021 Stage 2 item 7) | Security-relevant activity — `guard.armed` / `guard.disarmed` events for spark-backed rules (plus `guard.errored` as of #2818, the subscription-death path only), durable across process crash/restart so they can be re-sent until delivery is evidenced or retention expires them. No behavioral/usage telemetry; carries rule identity + agent-generated event metadata, not device or user content. | **On** whenever `prefer_spark` is active (inert — zero writes, zero paging/pruning — while the flag is false) | Three bounds enforced together, oldest evicted first: **7 days**, **1000 batches**, **32 MiB** (`kJournalRetentionDays`/`kMaxJournalBatches`/`kMaxJournalBytes`). Every eviction is classified and counted (see `docs/yuzu-guardian-design-v1.1.md` §25) — retention and quarantine are the only deletion paths. | Automatic, time/count/byte-bounded pass on the journal maintenance tick; quarantine (corrupt/unparseable batches) is separately capped at 100 batches. No manual delete API — the namespace holds audit evidence, not subject data, so no DSAR path applies. | No operator-facing retention knob today (constants are compile-time; a tracked follow-up if a customer needs a shorter/longer window). |
-
-The fleet visualization cache (`FleetTopologyStore`) is the highest-resolution endpoint telemetry surfaced in the dashboard. It holds at most two snapshots in memory at any time (single-flight refill, no SQLite persistence) and each snapshot is invalidated 60 seconds after the agent dispatch completes; restarting the server purges all cached topology. Process-level fields (`name`, `user`, `category`) are agent-controlled strings rendered after HTML escape and length clamp; the `category` field is computed server-side from a typed enum (`process_category.hpp`) so agents cannot inject arbitrary palette keys. Privacy-sensitive customers can suppress process collection on specific agents via `tar.configure process_enabled=false` (the corresponding cubes in the visualization render with no interior dots) or disable the whole feature with `--viz-disable` / `YUZU_VIZ_DISABLE`.
-
-The Guardian events table is sized for **~10k events/s during a fleet-wide incident** (design doc §9.1), i.e. ~864M rows/day. The 30-day default is the retention/recovery trade-off: long enough to correlate an incident across the standard forensic window, short enough to keep steady-state disk under ~25GB per million endpoints at typical drift rates. Tenants with longer forensic SLAs should raise `guardian_event_retention_days` _and_ provision storage — the product does not auto-trim disk.
-
-#### Agent-side, transient (no durable store)
-
-Read results that are never written to a database on either side — computed fresh per invocation and streamed to the caller. Listed here so a data-inventory pass finds them instead of assuming an omission.
-
-| Source | Data class | Where it lives | Retention | Deletion mechanism |
-|---|---|---|---|---|
-| `autoruns.list` (agent-side, transient) | Persistence-source metadata: file paths, registry key names/values, task/service names, command lines and arguments; user-scope rows carry a `user` field, but its content differs by source — Windows (`win_run_hku`/`win_runonce_hku`/`win_startup_approved`) and macOS (`~/Library/LaunchAgents`) carry the real profile/account name, `lnx_user_crontabs` carries the real username (the crontab filename), but `lnx_systemd_timers_user` and `lnx_xdg_autostart_user` carry a bare numeric uid (`owner_uid_string`, `autoruns_linux.cpp:244`) rather than a resolved username | Not stored on the agent between runs — computed fresh per invocation, streamed to the caller | None on the agent (nothing persisted). If the result transits the **response store** (an operator running this via the instruction engine), it is retained under the standard response retention (`response_retention_days`, default 90 d) — the same annotation pattern as the per-application-image-names row (`docs/enterprise-readiness-soc2-first-customer.md:477`) — because a `list` row can name a specific user's autorun entries, not just machine-wide facts. | Response-store rows follow that store's existing erasure path; no agent-side erasure needed since nothing is retained there. |
-
 ### Behavioral telemetry (DEX) — PII posture and works-council / co-determination
 
 The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first surface where Yuzu telemetry is **identifiably behavioral**: a device's signal history reveals which applications a person runs and when they fail. In jurisdictions with employee co-determination — Germany (§87(1)(6) BetrVG), Austria, the Netherlands (WOR), France (CSE), the Nordics — the works council's right is triggered by a system's **capability** to monitor behavior or performance, not by the operator's intent. The controls below are therefore deliberate design decisions, documented here as the evidence base for the DPA/security addendum (workstream G) and customer privacy review:
@@ -508,11 +716,29 @@ The DEX read model (`guardian_observations` + the `/dex` dashboard) is the first
 
 ### Deliverables
 
-- Security whitepaper and architecture overview.
-- Standard CAIQ-style questionnaire responses.
-- Pen-test executive summary and remediation statement.
-- DPA/security addendum templates.
-- Shared responsibility matrix (vendor vs customer responsibilities).
+- **Security whitepaper and architecture overview — shipped 2026-09-07:**
+  `docs/assurance/security-whitepaper.md`. Every section cites the doc it
+  summarises; sections 5, 8, and 9 explicitly flag the controls that are
+  planned rather than shipped (second-replica HA, direct `/readyz` probe,
+  scheduled backups, MCP session concept) rather than presenting them as
+  live.
+- **Standard CAIQ-style questionnaire responses — external input, not yet
+  started.** Requires a CSA CAIQ template and someone to answer it against
+  the whitepaper/matrix above; propose filing a tracking issue ("CAIQ
+  questionnaire response set") rather than treating this bullet as closed by
+  the whitepaper alone.
+- **Pen-test executive summary and remediation statement — external input,
+  not yet started.** Requires a contracted third-party penetration test;
+  propose filing a tracking issue ("Contract + execute first third-party
+  pen-test") — nothing in this repo substitutes for one.
+- **DPA/security addendum templates — external input, not yet started.**
+  Requires counsel; propose filing a tracking issue ("Draft DPA/security
+  addendum templates") rather than attempting a legal template from this
+  codebase.
+- **Shared responsibility matrix (vendor vs customer responsibilities) —
+  shipped 2026-09-07:** `docs/assurance/shared-responsibility-matrix.md`,
+  split three ways (Yuzu / operator / infrastructure provider), each row
+  cited.
 - Forward pointer: the MCP surface gains a session concept (in-memory only, principal-bound ≥128-bit ids, TTL/caps, revocation cuts live streams) via ADR-1005 execution-plan Decision 15 / track 2f — fold its security pre-commitments into the questionnaire/whitepaper once 2f ships.
 - Forward pointer: track 2g (ADR-1005 Decision 16, `docs/agentic-first-principle.md` A5) delivers a near-fully self-describing MCP tool/resource surface — typed schemas, truthful safety annotations, a handshake orientation blob, and OpenAPI/scope-DSL specs discoverable via `resources/list` rather than tool-by-tool, with one narrow tracked residual (streamed-final fallback envelope, #2990 — `retry_after_ms` closed 2026-08 by #3344). Cite this in the security whitepaper / CAIQ responses as evidence of a machine-verifiable, not merely documented, agentic contract — a differentiator against peers whose AI integrations (if any) are undocumented or prose-only; disclose the residuals rather than overclaiming completeness to a technical reviewer.
 - Forward pointer: the plugin README standard (`docs/plugin-readme-standard.md`) makes each agent plugin self-describing as data — its per-OS mechanism, the privilege it runs at with a measured date, its securable/operation/risk tier, output columns and where the rows land — served at `GET /api/v1/discover/plugin-docs` and the `yuzu://plugin-docs` resource. Cite it as the per-plugin answer to "what does the agent collect, at what privilege" (the `Sensitivity is plugin-dependent` rows above point here for the plugins that have adopted it); state the coverage honestly — two pilots today, the remaining plugins in the retrospective sweep, held by a README-existence ratchet in the `docs` test suite.

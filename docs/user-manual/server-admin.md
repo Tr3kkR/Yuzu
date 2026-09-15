@@ -160,16 +160,21 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 
 ## Configuration Files
 
-The server stores its configuration in files located in the **same directory as the `yuzu-server` binary**. These files are created automatically during first-run setup and updated through the Settings page.
+These files are **not** stored next to the `yuzu-server` binary:
+
+- **`yuzu-server.cfg`** is read from the `--config` path (env `YUZU_CONFIG`). The default is `/etc/yuzu/yuzu-server.cfg` on Linux, `C:\ProgramData\Yuzu\yuzu-server.cfg` on Windows, and `$HOME/Library/Application Support/Yuzu/yuzu-server.cfg` on macOS (`/Library/Application Support/Yuzu/yuzu-server.cfg` when `HOME` is unset). The shipped systemd unit passes no `--config`, so the Linux default applies. The Windows installer passes `--config "C:\ProgramData\Yuzu Server\yuzu-server.cfg"` and writes that file itself; otherwise it is created by [First-Run Setup](#first-run-setup).
+- **`auth.db`, `enrollment-tokens.cfg` and `pending-agents.cfg`** live in `--data-dir`: `/var/lib/yuzu` in the systemd unit, `C:\ProgramData\Yuzu Server\data` from the Windows installer. Without `--data-dir`, no `auth.db` is created and the two `.cfg` state files fall back to the directory that holds `yuzu-server.cfg`.
+
+With `--data-dir` set, users created or changed on the Settings page are written to `auth.db`, not back into `yuzu-server.cfg`.
 
 | File | Purpose |
 |---|---|
-| `yuzu-server.cfg` | First-boot seed for `auth.db`. Holds the initial admin credential as PBKDF2-SHA256 with a per-user salt. After first boot, `auth.db` is authoritative and this file is no longer read for live state — keep it as the seed for disaster-recovery (re-creating `auth.db` from scratch). |
-| `auth.db` | SQLite-backed authentication database. Holds user accounts, sessions, and enrollment tokens with PBKDF2-SHA256 hashed passwords. Created in `--data-dir` on first boot. Mode `0600` on Linux; restricted ACL on Windows. **This is the live source of truth for authentication state from v0.12.0 onwards.** |
-| `enrollment-tokens.cfg` | Legacy enrollment-token file (Tier 2). New deployments persist tokens inside `auth.db`; this file remains writable for backwards-compatibility on upgrades from pre-AuthDB releases. |
+| `yuzu-server.cfg` | First-boot seed for `auth.db`. Holds the initial accounts as PBKDF2-SHA256 hashes with a per-user salt. It is read at every start, but its accounts are copied into `auth.db` only when `auth.db` has no users. Keep it as the seed for disaster recovery (re-creating `auth.db` from scratch). |
+| `auth.db` | SQLite authentication database, created in `--data-dir`. Holds local user accounts (PBKDF2-SHA256 password hashes, roles), MFA enrollment — including the **plaintext TOTP seeds** and salted recovery-code hashes — failed-login lockout counters, break-glass arm state, and SSO identity fields. It does **not** hold live sessions or enrollment tokens: its `sessions`, `enrollment_tokens` and `pending_agents` tables exist, but no production code path loads from them. Sessions live only in server memory, so a restart signs every operator out. Mode `0600` (and its directory `0700`), re-applied on every open on Linux/macOS. On Windows the server applies no ACL of its own — verify with `icacls` that only SYSTEM and Administrators have access (see `docs/ops-runbooks/auth-db-recovery.md`). **This is the live source of truth for local accounts and MFA from v0.12.0 onwards.** |
+| `enrollment-tokens.cfg` | The live enrollment-token store (Tier 2): token hash, label, max uses, use count, expiry and revoked flag. It is rewritten on every token create, consume and revoke. Back it up with the rest of `--data-dir`. |
 | `pending-agents.cfg` | Queue of agents awaiting manual approval (Tier 1 enrollment). Contains agent ID, hostname, IP, and registration timestamp. |
 
-> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores, and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` requires re-running `--first-run-setup` to create a new admin. Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
+> **Backup recommendation:** Back up `auth.db` (use `sqlite3 auth.db ".backup ..."`, NEVER `cp` against a live WAL DB), `yuzu-server.cfg`, the rest of the `--data-dir` SQLite stores, and **the entire CA/cert directory `--ca-dir`** (`default-ca.key` especially — the per-install CA private key) on the same schedule. Use the SQLite online-backup API for every `.db` file, not `cp`. **Losing `default-ca.key` forces a full fleet re-enrollment** (every agent's cert chains to that root, and the server refuses to silently re-root — see below). Losing `auth.db` AND `yuzu-server.cfg` means creating a new admin through [First-Run Setup](#first-run-setup) — there is no `--first-run-setup` flag; setup runs automatically when the server starts and the `--config` file is missing or has no users, and it needs an interactive terminal (under systemd or the Windows service it fails and exits), so run `yuzu-server` by hand once with the service's arguments — see `docs/ops-runbooks/auth-db-recovery.md` "What you cannot recover from". Losing `auth.db` alone is recoverable — see `docs/ops-runbooks/auth-db-recovery.md`. As server stores migrate to PostgreSQL (ADR-0006), a complete backup also covers the Postgres database — see [PostgreSQL Substrate](#postgresql-substrate) for the `pg_dump`/`pg_restore` procedure and the ADR-0010 restore-pairing invariant. **The internal-CA inventory + CRL history (`ca_store` schema, ADR-0053) is one of the migrated Postgres stores** — back it up with `pg_dump`/`pg_restore`, not as a separate local file.
 
 > **Built-in default certificates — convenience, not production.** With no `--cert`/`--key`/`--https-cert` supplied (and without `--no-default-certs`), the server generates a per-install ECDSA CA + server leaves on first boot so a fresh install is encrypted with zero config. Operational caveats:
 > - **10-year, no auto-renewal.** The server leaves do not auto-renew; the `yuzu_server_cert_expiry_timestamp_seconds{cert="default-ca"}` gauge + the `YuzuCertificateExpiringSoon`/`…Critical` alerts (`docs/prometheus/yuzu-alerts.yml`) warn ahead of expiry. **Replace defaults before production rollout** with operator-provided certs (`--cert`/`--key`, `--https-cert`/`--https-key`) or, to rotate the built-in set, clear `--ca-dir` (after backing it up) and restart.
@@ -184,12 +189,16 @@ The server stores its configuration in files located in the **same directory as 
 
 ## First-Run Setup
 
-When the server starts for the first time and no `yuzu-server.cfg` exists, it enters **interactive setup mode** on the terminal. The setup prompts for:
+There is no flag for first-run setup. When the server starts and the `--config` file is missing, or exists but contains no users, it enters **interactive setup mode** on the terminal. The setup prompts for:
 
-1. **Admin username** -- the initial administrator account.
-2. **Admin password** -- entered twice for confirmation. Stored as a PBKDF2 hash.
+1. **Admin account name** -- the initial administrator account (default `admin`).
+2. **Admin password** -- at least 12 characters, entered twice for confirmation.
+3. **User account name** -- a second, non-admin account (default `user`); it must differ from the admin name.
+4. **User password** -- at least 12 characters, entered twice for confirmation.
 
-After setup completes, the server writes `yuzu-server.cfg` and starts normally. Subsequent restarts skip the setup prompt.
+Both passwords are stored as salted PBKDF2-SHA256 hashes. Any failed check (empty name, short password, mismatch, same name twice) aborts setup, and the server exits with `First-run setup failed — exiting`. On success the server writes `yuzu-server.cfg` and carries on starting in the same process. Later starts skip setup as long as that file has at least one user.
+
+> **Needs a terminal.** Setup reads from stdin. Under systemd or the Windows service there is no stdin, so setup fails and the service exits (systemd then hits its start limit). Run `yuzu-server` by hand once, with the service's arguments, to complete setup — see `docs/ops-runbooks/auth-db-recovery.md` "What you cannot recover from". On Linux and macOS the password prompts **echo what you type**, so clear the terminal scrollback afterwards.
 
 > **Headless deployment:** For automated or containerized deployments, pre-create `yuzu-server.cfg` with PBKDF2-hashed password entries before starting the server for the first time. A sample config with default credentials is provided below for quick evaluation.
 
@@ -207,6 +216,29 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 ---
 
 ## Upgrade Notes
+
+### vNEXT — emergency session revocation by restart reverses (breaking for operator muscle memory, #4283)
+
+**On `v0.13.0` and every earlier release, sessions are in-memory only, and
+restarting the server is the fastest fleet-wide emergency session
+revocation there is — no database access needed.** A future release adds
+a PostgreSQL-backed durable `SessionStore` (HA WS-1/1a, ADR-2002 §4):
+**once you are running a build that includes it, this reverses** — a
+restart no longer revokes anything (the durable session row survives and
+is live again the moment the server comes back up). An admin acting on
+pre-upgrade training believes a restart signed out a compromised session
+and it did not.
+
+**If you are reading this because you just upgraded:** check whether your
+build includes durable sessions before relying on restart as a revocation
+tool — see `docs/ops-runbooks/auth-db-recovery.md`'s "Not in v0.13.0"
+section for how to tell, and use the documented REST revocation call
+instead if you cannot confirm which behaviour your build has. That same
+section also discloses a known, unresolved gap in REST-based revocation
+during an actual Postgres outage (tracked **#4283**) — durable sessions
+do not yet have a fully reliable outage-time revocation path, so treat
+"restart" and "REST revocation" both as unreliable during a Postgres
+outage until #4283 closes.
 
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 

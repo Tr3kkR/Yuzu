@@ -25,6 +25,17 @@ bash scripts/start-UAT.sh status   # show running processes
 
 `scripts/start-demo.sh` stands up a three-tier **chiselled** Docker stack (server + gateway + N agent replicas) from release-pinned GHCR images. **Cannot run alongside `start-viz-uat.sh` or `start-UAT.sh`** — all three bind host ports 8080 and 50051 (the launcher pre-checks and refuses to start if they are busy). Clean-start by default (wipes `/tmp/yuzu-demo/` + compose volumes); `--keep` preserves state. Distinct from the viz-UAT rig. The **agent-bundle** delivery image (`docs/agent-bundle.md`, `scripts/build-agent-bundle.sh`) ships the agent for `linux-x64` / `windows-x64` / `macos-arm64` to design partners who can only `docker pull` — published + cosign-signed + SBOM'd by the `docker-publish-agent-bundle` release job. Full runbook: `docs/demo-environment.md`.
 
+## Observability overlay (alert rules wired into UAT) — moved
+
+The overlay wiring `docs/prometheus/yuzu-alerts.yml` into a running UAT
+Prometheus is infrastructure with its own executable failure modes
+(stickiness against the native startup scripts, false-positive checks,
+reload-staleness, missing self-scrape, missing retention config) and is tracked
+separately from this branch. See issue #2857 for status — including the
+startup-script stickiness gap that the overlay cannot close from inside
+itself (`win-start-UAT.sh`'s base-only `up -d` reproduces the 0-rules
+bug). This branch carries none of that overlay's files.
+
 ## Port assignments
 
 Server and gateway defaults do not conflict — all three components can run on the same box without overrides:
