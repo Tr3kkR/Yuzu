@@ -566,6 +566,53 @@ TEST_CASE("nft: split_nlmsgs accepts an exactly-remaining-length message, reject
     CHECK(nft_raw::split_nlmsgs(overrun).empty());
 }
 
+TEST_CASE("nft: nlmsghdr.len shorter than the header itself is rejected safely", "[firewall]") {
+    // The #3463 gap named exactly this: the existing "truncated buffer" test
+    // used a 10-byte buffer, which fails the OUTER loop guard
+    // (off + sizeof(hdr) <= buf.size()) and never reaches the hdr.len <
+    // sizeof(NlMsgHdr) branch's own body. This buffer is a full 20 bytes --
+    // large enough for the outer guard to pass and for split_nlmsgs to walk
+    // straight into the wire content -- but the header's own declared `len`
+    // field (8) is smaller than sizeof(NlMsgHdr) (16), so the inner guard
+    // must reject it before any subspan/offset arithmetic runs.
+    std::vector<std::byte> buf;
+    push_u32(buf, 8); // len -- shorter than the 16-byte header, the case under test
+    push_u16(buf, nft_raw::kNlmsgDone);
+    push_u16(buf, 0); // flags
+    push_u32(buf, 0); // seq
+    push_u32(buf, 0); // pid
+    buf.resize(20, std::byte{0}); // pad out to a full, plausible message size
+    REQUIRE(buf.size() == 20);
+
+    CHECK(nft_raw::split_nlmsgs(buf).empty());
+
+    // A well-formed message immediately after the malformed one is not
+    // reached either -- the walk stops at the first bad header rather than
+    // guessing where the next one might start.
+    std::vector<std::byte> then_good = buf;
+    push_nlmsg(then_good, nft_raw::kNlmsgDone, std::vector<std::byte>(4, std::byte{0}));
+    CHECK(nft_raw::split_nlmsgs(then_good).empty());
+}
+
+TEST_CASE("nft: nlattr.len shorter than the attribute header itself is rejected safely",
+         "[firewall]") {
+    // Same gap, the walk_attrs() half: a buffer large enough to clear the
+    // outer loop guard (off + sizeof(hdr) <= data.size()) but whose declared
+    // nla_len (2) is smaller than sizeof(NlAttr) (4).
+    std::vector<std::byte> buf;
+    push_u16(buf, 2); // nla_len -- shorter than the 4-byte attribute header
+    push_u16(buf, nft_raw::kNftaTableName);
+    buf.resize(8, std::byte{0}); // pad out to a full, plausible attribute-list size
+
+    CHECK(nft_raw::walk_attrs(buf).empty());
+
+    // A well-formed attribute right after the malformed one is not reached
+    // either.
+    std::vector<std::byte> then_good = buf;
+    push_attr_str(then_good, nft_raw::kNftaTableName, "ab");
+    CHECK(nft_raw::walk_attrs(then_good).empty());
+}
+
 TEST_CASE("nft: walk_attrs accepts an exactly-remaining-length attribute, rejects a +1 overrun",
          "[firewall]") {
     std::vector<std::byte> exact;
@@ -674,4 +721,27 @@ TEST_CASE("nft: nft_diag_row and nft_fallthrough_row produce the documented row 
 TEST_CASE("nft: sanitize_field strips pipe/newline/CR", "[firewall]") {
     CHECK(sanitize_field("a|b\nc\rd") == "a_b_c_d");
     CHECK(sanitize_field("clean") == "clean");
+}
+
+// ── subprocess_complete (hoisted from the Linux-only shell) ─────────────────
+
+TEST_CASE("nft: subprocess_complete requires every one of tool_ran/exit_code==0/"
+         "!timed_out/!output_truncated",
+         "[firewall]") {
+    yuzu::agent::SubprocessResult clean;
+    clean.tool_ran = true;
+    clean.exit_code = 0;
+    clean.timed_out = false;
+    clean.output_truncated = false;
+    CHECK(subprocess_complete(clean));
+
+    auto broken = [&](auto mutate) {
+        yuzu::agent::SubprocessResult r = clean;
+        mutate(r);
+        return subprocess_complete(r);
+    };
+    CHECK_FALSE(broken([](auto& r) { r.tool_ran = false; }));
+    CHECK_FALSE(broken([](auto& r) { r.exit_code = 1; }));
+    CHECK_FALSE(broken([](auto& r) { r.timed_out = true; }));
+    CHECK_FALSE(broken([](auto& r) { r.output_truncated = true; }));
 }

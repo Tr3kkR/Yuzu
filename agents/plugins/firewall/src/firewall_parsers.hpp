@@ -35,6 +35,8 @@
 #include <utility>
 #include <vector>
 
+#include <yuzu/agent/subprocess_runner.hpp>
+
 namespace yuzu::firewall {
 
 enum class FwState { enabled, disabled, unknown };
@@ -756,6 +758,24 @@ enum class NftVerdict { active, inactive, unknown };
     return nft_has_content(chains, rules) ? NftVerdict::active : NftVerdict::inactive;
 }
 
+/// The wire token for a verdict -- `try_nftables_state()` formats its
+/// `state|<token>` row through this rather than re-deriving the string
+/// inline, so the tested decision function (nft_decide_state, above) is the
+/// same code the production dispatch path actually runs (code-review
+/// finding, both Functional and Spec axes: nft_decide_state previously had
+/// zero production callers despite being unit-tested).
+[[nodiscard]] constexpr std::string_view nft_verdict_name(NftVerdict v) noexcept {
+    switch (v) {
+    case NftVerdict::active:
+        return "active";
+    case NftVerdict::inactive:
+        return "inactive";
+    case NftVerdict::unknown:
+        return "unknown";
+    }
+    return "unknown"; // unreachable -- exhaustive switch, -Wswitch flags enum drift
+}
+
 /// Reconciles the nftables backend's own verdict against the fact that a
 /// later probe stage already found nftables *tables* present (C4): a
 /// downstream `disabled` verdict is contradicted by tables existing at all
@@ -897,6 +917,18 @@ enum class NftVerdict { active, inactive, unknown };
     return std::format("rule|nftables|{}|{}|{}|handle|{}", nft_family_name(r.family),
                         sanitize_field(r.table), sanitize_field(r.chain),
                         r.handle ? std::to_string(*r.handle) : "unknown");
+}
+
+/// Whether a subprocess-backed acquisition genuinely completed: only under
+/// this gate may a backend report a real ruleset|<n> count -- anything short
+/// (didn't run, nonzero exit, killed by the deadline, or output clipped)
+/// must report ruleset|unknown instead of a fabricated/undercounted number.
+/// Hoisted out of the (previously Linux-only-compiled) shell so this
+/// completeness decision -- which every backend on every platform makes the
+/// same way -- is itself unit-tested rather than only exercised indirectly
+/// through platform-specific dispatch tests (code-review finding).
+[[nodiscard]] constexpr bool subprocess_complete(const yuzu::agent::SubprocessResult& res) noexcept {
+    return res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated;
 }
 
 } // namespace yuzu::firewall

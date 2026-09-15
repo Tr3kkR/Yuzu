@@ -100,6 +100,7 @@ constexpr std::chrono::milliseconds kAcqDeadline{5000};
 // platform this file builds for, so the hoisted symbol is reachable here
 // with no #ifdef needed.
 using yuzu::firewall::sanitize_field;
+using yuzu::firewall::subprocess_complete;
 
 #ifdef _WIN32
 
@@ -715,14 +716,6 @@ static_assert(nft::kNftPolicyAccept == static_cast<std::uint32_t>(NF_ACCEPT));
 static_assert(kNlmFRequest == static_cast<std::uint16_t>(NLM_F_REQUEST));
 static_assert(kNlmFDump == static_cast<std::uint16_t>(NLM_F_DUMP));
 
-/// Whether a subprocess-backed acquisition genuinely completed: only under
-/// this gate may a backend report a real ruleset|<n> count — anything short
-/// (didn't run, nonzero exit, killed by the deadline, or output clipped) must
-/// report ruleset|unknown instead of a fabricated/undercounted number.
-[[nodiscard]] bool subprocess_complete(const yuzu::agent::SubprocessResult& res) noexcept {
-    return res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated;
-}
-
 /// Remaining time until `deadline`, clamped to zero (never negative).
 [[nodiscard]] std::chrono::milliseconds
 remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
@@ -746,6 +739,15 @@ enum class OpenNftErrClass {
     if (err == EPROTONOSUPPORT || err == EAFNOSUPPORT)
         return OpenNftErrClass::unsupported;
     return OpenNftErrClass::other;
+}
+
+/// Emits `error|fd_exhausted` iff `sock_err` is a fd-exhaustion errno --
+/// shared by all three open_nft_socket() call sites in run_nft_probe() so
+/// the check-and-emit pair exists once (code-review finding: it was
+/// previously triplicated with only the surrounding control flow differing).
+void report_if_fd_exhausted(yuzu::CommandContext& ctx, int sock_err) {
+    if (classify_open_errno(sock_err) == OpenNftErrClass::fd_exhausted)
+        ctx.write_output("error|fd_exhausted");
 }
 
 /// Opens and binds a NETLINK_NETFILTER socket for one dump round-trip, with
@@ -777,7 +779,15 @@ open_nft_socket(std::chrono::milliseconds send_budget) {
         tv.tv_sec = send_budget.count() / 1000;
         tv.tv_usec = (send_budget.count() % 1000) * 1000;
     }
-    ::setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    // Checked: this call installs the ONLY thing bounding the send() this
+    // socket will do (the doc comment above's whole guarantee rests on it).
+    // An unchecked failure here would silently restore the default
+    // (blocking-forever) send timeout with nothing downstream able to tell
+    // the difference -- exactly the "bounded, never blocks past deadline"
+    // contract this function exists to uphold (review finding, both
+    // Standards and Functional axes).
+    if (::setsockopt(sock.get(), SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) < 0)
+        return std::unexpected(errno);
 
     sockaddr_nl addr{};
     addr.nl_family = AF_NETLINK;
@@ -927,7 +937,17 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
                 return {NftDumpStatus::kernel_error, err.value_or(0)};
             }
         }
-        parsed_off += consumed;
+        // Clamped the same way split_nlmsgs()'s own internal cursor is
+        // (`off = std::min(buf.size(), off + aligned)`): a message whose
+        // raw hdr.len fits the subspan but whose ALIGNED length would
+        // overshoot it (the recv boundary landing inside the alignment pad
+        // rather than mid-message) must not push parsed_off past out.size()
+        // -- an unclamped sum here would make the next iteration's
+        // subspan(parsed_off) a precondition violation (code-review
+        // finding). Unreachable with genuine kernel datagrams (real dumps
+        // are always alignment-consistent), defensive for new code
+        // regardless.
+        parsed_off += std::min(consumed, out.size() - parsed_off);
     }
 }
 
@@ -937,6 +957,16 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
 /// ruleset even if chain/rule content couldn't be trusted), and `dump`/
 /// `result` identify which follow-up dump failed and how, for the catch-all
 /// nft_diag_row() if no downstream backend answers either.
+///
+/// Passed by reference (not through std::expected/a return value) as a
+/// deliberate exception to this file's usual output-parameter avoidance
+/// (docs/cpp-conventions.md): it carries clamp bookkeeping ACROSS the
+/// existing `bool try_X(ctx) -> caller checks return, moves to next
+/// backend` chain that do_state_linux()/do_rules_linux() already use for
+/// every other backend, and that chain's shape predates this change --
+/// switching only the nftables leg's own signature to return a richer type
+/// would make it the one asymmetric link (code-review finding, noted rather
+/// than restructured).
 struct NftFallthroughInfo {
     bool tables_seen = false;
     std::string_view dump; // "chain" or "rule"
@@ -967,8 +997,7 @@ struct NftProbeResult {
 
     auto table_sock = open_nft_socket(remaining_ms(table_deadline));
     if (!table_sock) {
-        if (classify_open_errno(table_sock.error()) == OpenNftErrClass::fd_exhausted)
-            ctx.write_output("error|fd_exhausted");
+        report_if_fd_exhausted(ctx, table_sock.error());
         return std::nullopt; // unreachable -- fall through untouched
     }
     std::vector<std::byte> table_buf;
@@ -996,8 +1025,8 @@ struct NftProbeResult {
     // the errno classification the table-socket open already gives —
     // including fd_exhausted, the one that actually needs an operator's
     // attention. Surface it the same way here.
-    if (!chain_sock && classify_open_errno(chain_sock.error()) == OpenNftErrClass::fd_exhausted)
-        ctx.write_output("error|fd_exhausted");
+    if (!chain_sock)
+        report_if_fd_exhausted(ctx, chain_sock.error());
     const auto chain_res = chain_sock ? nft_dump(chain_sock->get(), nft::kNftMsgGetchain,
                                                  result.chain_buf, chain_deadline)
                                       : yuzu::firewall::NftDumpResult{};
@@ -1005,8 +1034,8 @@ struct NftProbeResult {
         chain_sock->reset();
 
     auto rule_sock = open_nft_socket(remaining_ms(rule_deadline));
-    if (!rule_sock && classify_open_errno(rule_sock.error()) == OpenNftErrClass::fd_exhausted)
-        ctx.write_output("error|fd_exhausted");
+    if (!rule_sock)
+        report_if_fd_exhausted(ctx, rule_sock.error());
     const auto rule_res = rule_sock ? nft_dump(rule_sock->get(), nft::kNftMsgGetrule,
                                                result.rule_buf, rule_deadline)
                                     : yuzu::firewall::NftDumpResult{};
@@ -1038,8 +1067,14 @@ bool try_nftables_state(yuzu::CommandContext& ctx, NftFallthroughInfo& info) {
     auto chains = yuzu::firewall::parse_nft_chains(probe->chain_buf);
     auto rules = yuzu::firewall::parse_nft_rules(probe->rule_buf);
     ctx.write_output("backend|nftables"); // commits: nftables IS the final answer
-    ctx.write_output(std::format(
-        "state|{}", yuzu::firewall::nft_has_content(chains, rules) ? "active" : "inactive"));
+    // probe->trusted is already true here (the early return above handles
+    // false), so nft_decide_state(true, true, ...) always resolves through
+    // its active/inactive branch -- called anyway so the unit-tested
+    // decision function is the one dispatch actually runs, not a
+    // hand-inlined equivalent (#3463-2).
+    const auto verdict = yuzu::firewall::nft_decide_state(/*chains_ok=*/true, /*rules_ok=*/true,
+                                                            chains, rules);
+    ctx.write_output(std::format("state|{}", yuzu::firewall::nft_verdict_name(verdict)));
     ctx.write_output(std::format("ruleset|{}", rules.size()));
     return true;
 }
