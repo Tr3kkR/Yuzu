@@ -203,6 +203,28 @@ TEST_CASE("CommandOutboxDelivery[pg]: containment_unreadable reschedules, never 
     CHECK(probe.calls == 1);
 }
 
+TEST_CASE("CommandOutboxDelivery[pg]: route_unreadable reschedules, never marks sent (WS-4 "
+          "4.2b Task D — mirrors containment_unreadable exactly)",
+          "[command_outbox][pg][delivery]") {
+    DeliveryPg fx;
+    REQUIRE(fx.store().claim_and_enqueue(fx.req("occ-route-retry", "cmd-rr"), fx.lock(),
+                                         fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.route_unreadable = true;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(probe.calls == 1);
+    // A degraded gateway routing-directory read is NOT a delivered
+    // occurrence -- same as containment_unreadable, the row stays pending
+    // rather than being marked sent/no_agents (which would silently drop a
+    // command that never actually reached the wire).
+    CHECK(fx.raw_state("occ-route-retry") == "pending"); // still owed, backed off
+    loop.tick();
+    CHECK(probe.calls == 1);
+}
+
 TEST_CASE("CommandOutboxDelivery[pg]: carries approval provenance from the row",
           "[command_outbox][pg][delivery]") {
     DeliveryPg fx;

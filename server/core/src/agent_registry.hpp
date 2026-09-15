@@ -560,7 +560,16 @@ public:
     /// yields rather than overwriting a live session with a stale one (its own revoke already
     /// committed, so nothing is lost by not installing). This restores the ordering the old
     /// single-locked implementation gave for free; it does not add a NEW guarantee beyond that.
-    [[nodiscard]] std::expected<void, std::string> register_agent(const pb::AgentInfo& info);
+    ///
+    /// Follow-up (HA WS-4 4.2b, post-merge review #4344, MEDIUM finding 1): on success, returns
+    /// the `shared_ptr<AgentSession>` this call just installed — pointer identity a caller can
+    /// hand to `remove_agent_if_same` for an identity-guarded rollback if a LATER step in its own
+    /// registration flow (e.g. `GatewayRouteStore::register_fresh`) fails after this call already
+    /// installed the session. session_id is still empty at this point (mapped later by
+    /// `map_session`), so identity — not session_id string equality — is the only safe key for
+    /// that rollback; see `remove_agent_if_same`.
+    [[nodiscard]] std::expected<std::shared_ptr<AgentSession>, std::string>
+    register_agent(const pb::AgentInfo& info);
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
@@ -596,6 +605,18 @@ public:
     /// Remove an agent only if its current session_id matches (prevents stale
     /// Subscribe cleanup from clobbering a newer reconnection).
     void remove_agent_if_session(const std::string& agent_id, const std::string& session_id);
+
+    /// HA WS-4 4.2b follow-up (post-merge review #4344, MEDIUM finding 1): remove an agent ONLY
+    /// if the CURRENTLY installed session is the exact object `install` returned — pointer
+    /// identity, not session_id (which is empty until `map_session` runs, so a string key cannot
+    /// discriminate here). Ghost-session rollback: a caller whose `register_agent` succeeded but
+    /// a LATER step in its own registration flow failed (e.g. gateway `register_fresh`) calls
+    /// this with the shared_ptr `register_agent` returned, tearing the just-installed session
+    /// back down. A concurrent `register_agent` for the same `agent_id` that has already
+    /// superseded `installed` by the time this runs is left alone — this call is a no-op, exactly
+    /// like `remove_agent_if_session`'s own supersede tolerance.
+    void remove_agent_if_same(const std::string& agent_id,
+                              const std::shared_ptr<AgentSession>& installed);
 
     /// Clear stream only if the session_id matches the current session.
     void clear_stream_if_session(const std::string& agent_id, const std::string& session_id);
@@ -741,6 +762,23 @@ public:
     // never treated as an error for the other recipients.
     int send_to_all(const ClassifiedCommand& cmd);
 
+    // WS-4 4.2b Task C: fallback-ONLY queue for an agent this replica has NO
+    // local session for at all (the precondition every caller must have
+    // already established — this method does not itself check `agents_`).
+    // The caller (`GatewayRouteFallback`, dispatch_route_fallback.hpp) has
+    // already resolved `cluster_id` from a BATCHED GatewayRouteStore
+    // directory read. Mirrors `send_to`'s existing gateway_node branch: the
+    // same defensive `tag_is_valid` check, the same `gw_pending_` queue —
+    // just keyed off a directory-resolved cluster rather than a live
+    // session's advertised `gateway_node`. Returns false only on a
+    // malformed dispatch tag (the defensive check); queuing itself cannot
+    // fail. NEVER call this for an agent that DOES have a local session —
+    // `send_to` is the sole path for that (this method has no capability
+    // advertisement to check, because there is no session to have
+    // advertised one).
+    bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
+                            const std::string& cluster_id);
+
     struct GatewayPendingCmd {
         std::string agent_id;
         // Unwrapped to the raw wire type on purpose: by the time a command is
@@ -750,6 +788,14 @@ public:
         // only re-wraps this into a `SendCommandRequest`, never re-decides
         // classification or authorization.
         pb::CommandRequest cmd;
+        /// WS-4 4.2b Task C: the cluster this entry was routed via the
+        /// GatewayRouteStore directory FALLBACK path (`send_via_directory`),
+        /// as opposed to the pre-existing `gateway_node`-session path (`nullopt`
+        /// here — `forward_gateway_pending` has always had exactly one
+        /// `gw_mgmt_stub_` to forward to regardless of node/cluster, so the
+        /// pre-existing path never needed to carry one). Carried through for
+        /// 4.3 (multi-cluster fan-out); inert until then.
+        std::optional<std::string> cluster_id;
     };
 
     std::vector<GatewayPendingCmd> drain_gateway_pending();

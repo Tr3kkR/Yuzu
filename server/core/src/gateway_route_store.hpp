@@ -47,16 +47,22 @@
 /// reused session id — NOT a 4.2a change. Invariant to preserve:
 /// `session_id` ≡ exactly one gateway stream placement.
 ///
-/// `renew_leases` is a single batched statement over `session_id = ANY($1)` —
+/// `renew_leases` is a single batched statement, correlated on BOTH
+/// `agent_id` AND `session_id` (a parallel-array unnest() join — #4246 #10) —
 /// at fleet scale a per-row renew would be one write per agent every lease
 /// interval; batching keeps the steady-state write rate flat regardless of
-/// fleet size.
+/// fleet size. The agent_id correlation is a defense-in-depth hardening: a
+/// caller that knows only a session token can no longer renew a route
+/// belonging to a DIFFERENT agent.
 ///
-/// Posture (ADR-0012 §1): this store is a coordination/liveness aid, not yet
-/// an authority anything depends on for correctness (nothing reads it). A
-/// degraded write here is logged and returned to the caller (never silently
-/// dropped), but has no fail-closed obligation beyond that until a reader
-/// exists.
+/// Posture (ADR-0012 §1): as of 4.2b this store is read for dispatch as a
+/// FALLBACK (only on a local-registry miss; it changes no routing outcome on a
+/// single-replica deployment, where every agent is locally known). Integrity
+/// lives at the reader's `routable` trust predicate, so most writes stay
+/// fail-open (a degraded write is logged and returned to the caller, never
+/// silently dropped); register_fresh — the row-CREATING write whose loss has no
+/// other writer to repair it — is the one fail-CLOSED exception (4.2b Task B,
+/// returns UNAVAILABLE).
 ///
 /// 4.2 OBLIGATIONS (latent while INERT, load-bearing once a dispatch reader
 /// exists — full list in ADR-2002 §7 "4.2 design obligations"): the "cannot
@@ -99,6 +105,20 @@
 /// tombstoned/never-announced row (`lease_until IS NULL`) old enough that it
 /// is definitely not mid-handshake. See the header comment on
 /// `reap_stale_routes` for the clock-guarded-retention adoption record.
+///
+/// SLICE 4.2b — TASK A: `announce_connected` is the SOLE writer of
+/// placement. `register_fresh`'s guarded UPSERT used to COALESCE-preserve a
+/// winning row's existing `cluster_id`/`gateway_node` across a fresh
+/// registration; it now NULLs both unconditionally. Without this, a
+/// `register_fresh(S2)` immediately followed by a bare `renew_leases`
+/// (no intervening CONNECTED) left the row reading `{session=S2, live
+/// lease, cluster=S1's old placement}` — a stale-placement trap for a
+/// dispatch reader that must never route to a placement its own session
+/// never confirmed. `lookup_routes` (also 4.2b Task A) exposes a
+/// `routable` bit computed from exactly this shape (`session_id IS NOT
+/// NULL AND lease_until >= now() AND cluster_id IS NOT NULL`), so a
+/// dispatch reader built against it never needs to reason about the trap
+/// directly.
 ///
 /// Born-on-Postgres (ADR-0009 fresh-start): no legacy SQLite file, no
 /// backfill — this store never existed before WS-4.
@@ -244,6 +264,18 @@ struct RouteRow {
     bool is_stale{false}; ///< computed IN-SQL: lease_until IS NOT NULL AND lease_until < now()
 };
 
+/// A route paired with the `routable` verdict computed by `lookup_routes`.
+/// `routable` is IN-SQL, DB-clock-authoritative (never a replica clock, per
+/// the #3715 rule): `session_id IS NOT NULL AND lease_until >= now() AND
+/// cluster_id IS NOT NULL`. A tombstone (`session_id IS NULL AND lease_until
+/// IS NULL`), an expired lease, or a null-placement row (a winning
+/// `register_fresh` not yet followed by `announce_connected` — see the file
+/// header "SLICE 4.2b") are all `routable == false`.
+struct RoutableRoute {
+    RouteRow route;
+    bool routable{false};
+};
+
 class GatewayRouteStore {
 public:
     /// Borrows the shared pool; runs the `gateway_route_store` schema
@@ -262,8 +294,10 @@ public:
     /// previously stored (the CAS in the file header) — a caller whose
     /// `register_fresh` reports `won == false` lost to a newer connection
     /// and MUST NOT proceed to `announce_connected` with this epoch/session.
-    /// Existing `cluster_id`/`gateway_node` are preserved (COALESCE) across a
-    /// winning re-register — they are filled in later by `announce_connected`.
+    /// `cluster_id`/`gateway_node` are NULLed (4.2b) on a winning re-register
+    /// — `announce_connected` is the SOLE writer of placement, so a fresh
+    /// registration never carries forward a superseded connection's cluster/
+    /// node until its own CONNECTED confirms them.
     [[nodiscard]] std::expected<RegisterFreshResult, GatewayRouteStoreError>
     register_fresh(std::string_view agent_id, std::string_view session_id);
 
@@ -287,15 +321,31 @@ public:
     deregister(std::string_view agent_id, std::string_view session_id);
 
     /// Batched lease renewal: bumps `lease_until` for every row whose
-    /// `session_id` is in `session_ids`, in ONE statement. Returns the number
-    /// of rows renewed.
+    /// `(agent_id, session_id)` matches a pair in the two PARALLEL arrays
+    /// `agent_ids`/`session_ids` (index i is one pair), in ONE statement.
+    /// #4246 #10 — correlating on BOTH columns (not `session_id` alone) closes
+    /// a defense-in-depth gap: a caller that only ever knows a session token
+    /// can no longer renew a DIFFERENT agent's route by presenting that token
+    /// against the wrong `agent_id`; such a call matches zero rows. A length
+    /// mismatch between the two arrays is refused (`db_error`) rather than
+    /// guessed at. Returns the number of rows renewed.
     [[nodiscard]] std::expected<int, GatewayRouteStoreError>
-    renew_leases(std::span<const std::string> session_ids, int lease_ttl_secs);
+    renew_leases(std::span<const std::string> agent_ids, std::span<const std::string> session_ids,
+                int lease_ttl_secs);
 
     /// The current route for `agent_id`, or `nullopt` if no row exists.
     /// `RouteRow::is_stale` is computed in-SQL from `lease_until` vs. `now()`.
     [[nodiscard]] std::expected<std::optional<RouteRow>, GatewayRouteStoreError>
     lookup_route(std::string_view agent_id);
+
+    /// Batched routable-aware read (4.2b Task A): the current route for every
+    /// agent in `agent_ids` that has a row, in ONE query (`WHERE agent_id =
+    /// ANY($1)`, mirroring `renew_leases`' array-param idiom) bounded by a
+    /// SINGLE `kReadTimeout` — never N times that. An agent with no row is
+    /// simply absent from the result (no error, no placeholder entry). See
+    /// `RoutableRoute` for the `routable` computation.
+    [[nodiscard]] std::expected<std::vector<RoutableRoute>, GatewayRouteStoreError>
+    lookup_routes(std::span<const std::string> agent_ids);
 
     /// Directory-hygiene reaper (4.2a, #7 in the ADR-2002 §7 "4.2 design
     /// obligations" list). CLOCK-GUARDED-RETENTION ADOPTION RECORD (routed

@@ -45,7 +45,8 @@ void AgentRegistry::set_register_agent_interleave_hook_for_test(std::function<vo
     register_agent_interleave_hook_for_test_ = std::move(hook);
 }
 
-std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentInfo& info) {
+std::expected<std::shared_ptr<AgentSession>, std::string>
+AgentRegistry::register_agent(const pb::AgentInfo& info) {
     auto session = std::make_shared<AgentSession>();
     session->agent_id = info.agent_id();
     session->hostname = info.hostname();
@@ -194,7 +195,7 @@ std::expected<void, std::string> AgentRegistry::register_agent(const pb::AgentIn
     bus_.publish("agent-online", info.agent_id());
     spdlog::info("Agent registered: id={}, hostname={}, plugins={}", info.agent_id(),
                  info.hostname(), info.plugins_size());
-    return {};
+    return session;
 }
 
 void AgentRegistry::set_stream(
@@ -371,6 +372,27 @@ void AgentRegistry::remove_agent_if_session(const std::string& agent_id,
     metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
     bus_.publish("agent-offline", agent_id);
     spdlog::info("Agent removed: id={} (session={})", agent_id, session_id);
+}
+
+void AgentRegistry::remove_agent_if_same(const std::string& agent_id,
+                                         const std::shared_ptr<AgentSession>& installed) {
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second != installed) {
+            // Superseded (a concurrent register_agent already installed a different session) or
+            // gone (already torn down some other way) — nothing of OURS to clean up; do not touch
+            // whatever is (or isn't) there now.
+            spdlog::debug("Rollback cleanup skipped: superseded/gone for agent {}", agent_id);
+            return;
+        }
+        if (!it->second->session_id.empty())
+            session_to_agent_.erase(it->second->session_id);
+        agents_.erase(it);
+    }
+    metrics_.gauge("yuzu_agents_connected").set(static_cast<double>(agent_count()));
+    bus_.publish("agent-offline", agent_id);
+    spdlog::info("Agent registration rolled back: id={}", agent_id);
 }
 
 void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
@@ -681,6 +703,18 @@ int AgentRegistry::send_to_all(const ClassifiedCommand& cmd) {
         }
     }
     return count;
+}
+
+bool AgentRegistry::send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
+                                       const std::string& cluster_id) {
+    // Same defensive belt-and-braces check `send_to`/`send_to_all` apply —
+    // this path has no session to have already validated anything, so it is
+    // the ONLY check this method makes before queuing.
+    if (!tag_is_valid(cmd.wire(), metrics_, agent_id))
+        return false;
+    std::lock_guard glock(gw_pending_mu_);
+    gw_pending_.push_back({agent_id, cmd.wire(), cluster_id});
+    return true;
 }
 
 std::vector<AgentRegistry::GatewayPendingCmd> AgentRegistry::drain_gateway_pending() {

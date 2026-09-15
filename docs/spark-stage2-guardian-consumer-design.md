@@ -25,7 +25,7 @@ history:
     recorded in R5.2/R5.3 as settled design (congestion-only outcomes excluded from K;
     late results apply by current desired state; #2012/#3840 pulled forward into rung
     9c's own ladder); "expired" split into three named outcomes (admission rejection /
-    queue-wait expiry / dispatched-operation timeout) with quarantined vs
+    queue-wait expiry / dispatched-operation timeout) with wedged vs
     congestion-expired stated side by side; F3's orphan-grace binding pinned to the
     PHYSICAL alive-worker count and the ceiling value pinned (#4147); R5.2(a)/R5.3/A3
     made mutually consistent (#4148); R5.4's timing split into staging /
@@ -43,6 +43,23 @@ history:
     `docs/spark-legacy-delta-registry.md` (this doc's own R5.2-R5.4 "as implemented"
     stamps already reflected PR-2 from PR #4318's own commits, so only the two
     cross-referencing docs needed the update).
+  - 2026-09-14 - rung 9c PR-4.5 (no design change, terminology only): renamed R5.3's
+    dispatched-and-timed-out key state "quarantined" to "wedged" ("quarantine" to
+    "wedge"/"wedge marking") throughout this doc, `docs/spark-flip-gate.md`, registry
+    row A3, and five agent code comments (`guardian_arm_ack.{cpp,hpp}`,
+    `guardian_arm_heartbeat.hpp`, `guardian_io_executor.hpp`,
+    `guardian_spark_runtime.hpp`), resolving the collision with Guardian's real
+    operator-facing network-isolation quarantine (v1.1 §11.7), the shipped
+    `quarantine` plugin/`QuarantineStore`/`quarantine_device` MCP tool, and the
+    `mech_quarantined_total` SparkEngine fault counter - all three left unchanged.
+    Earlier entries above now read "wedged" for this state; they said "quarantined"
+    when written. Full `/governance` pass (commit 9256f6189): security-guardian,
+    docs-writer, cpp-expert, cpp-safety, architect, happy-path, unhappy-path,
+    consistency-auditor, chaos-injector, compliance-officer, sre,
+    enterprise-readiness - no BLOCKING findings; this history entry and a
+    `guardian_io_executor.hpp` reword (the sentence's physical-stuck clause moved
+    off the word "wedge", leaving "wedge marking" its only wedge-rooted term)
+    folded in directly as a same-round hardening commit.
 ---
 
 # Spark Stage 2 — Guardian as the first SparkEngine consumer
@@ -367,7 +384,7 @@ itself dispatch (the compensating disarm, a refill), and when the executor refus
 nested dispatch the runtime falls back to a direct backend call on the same worker, which
 holds no quota and is bounded only by this ceiling; a wedged direct call therefore
 accumulates alive workers up to the per-instance ceiling, after which the instance refuses
-every admission until a worker exits. Until PR-5's deadline/quarantine, the ceiling is the
+every admission until a worker exits. Until PR-5's deadline/wedge mechanism, the ceiling is the
 only bound on that loop; it is recorded as a PR-5 acceptance criterion in
 `docs/spark-flip-gate.md` §3a. A
 new `GuardianDetachedWorkerRole` thread-local marker extends the existing
@@ -416,7 +433,7 @@ bulkhead, never a retained claim (`guardian_spark_runtime.cpp`, `on_arm_complete
 
 **R5.2 - Runtime: a per-key claim/queue state machine.** Each spark key gets a single
 entry tracking its current claim (an in-flight arm or disarm, or none) and a FIFO queue
-of siblings waiting behind it. A key that is already quarantined (see R5.3) rejects a
+of siblings waiting behind it. A key that is already wedged (see R5.3) rejects a
 new claim immediately, before any backend call is attempted. A second rule attaching to
 a key that is mid-arm queues behind the in-flight owner rather than issuing a redundant
 backend call; on the owner's success every queued sibling commits inline against the
@@ -428,7 +445,7 @@ makes "a key's disarm completes before its own rearm dispatches" true by constru
 rather than by a separately-maintained ordering rule. Each claim also records a
 facts-only `ClaimEnd` (how it ended: committed, backend refused, worker threw, admission
 rejected, withdrawn, waiter timed out while queued or while dispatched, stopped, commit
-threw, disarm done, or dead subscription: a Disarm whose subscription id was already reported dead, completed without a backend call, rung 9c PR-1) as the plug point PR-5's quarantine / K-bound / `arm_failed`
+threw, disarm done, or dead subscription: a Disarm whose subscription id was already reported dead, completed without a backend call, rung 9c PR-1) as the plug point PR-5's wedge / K-bound / `arm_failed`
 classification reads; PR-1 carries no classification logic on it - the only reads are
 bookkeeping guards (a committed claim is a `rules_` entry, never a pending one).
 
@@ -442,16 +459,16 @@ dispatched operation has not returned by its deadline, location unknown - it may
 inside the real OS call, or parked on `SparkEngine`'s per-type lock (`arm_impl()`
 takes `mech_ops_mu_by_type_` before `watch_guarded()`, `spark_engine.cpp`), and the
 runtime cannot tell which. Only (3) is bounded by a deadline and marks the key
-**quarantined**; every waiter on a quarantined key fails without a further backend
+**wedged**; every waiter on a wedged key fails without a further backend
 attempt until the original worker's call completes (if ever) and clears the marker.
-The two stuck states, side by side so they are never conflated: **quarantined** =
+The two stuck states, side by side so they are never conflated: **wedged** =
 dispatched, timed out, K-waivable (R5.3), recoverable when its late result arrives
 (ruling 14(b) below); **congestion-expired** = outcome (1) or (2), never dispatched,
 NOT K-waivable (ruling 14(a) below), recovers only on the next successful re-apply.
 This
-per-key quarantine marker is distinct from — and not wired to — the existing
+per-key wedge marker is distinct from — and not wired to — the existing
 per-mechanism `mech_quarantined_total` counter (a fleet-alerting signal expected to
-stay at 0); this design's quarantine is the ordinary, K-bounded, non-alerting outcome
+stay at 0); this design's wedge is the ordinary, K-bounded, non-alerting outcome
 of a single wedged key, not a mechanism-wide fault.
 
 **Resolved (ruling 14, 2026-09-08 - routed to Astra via `/codex opine`, then Fable as
@@ -528,7 +545,7 @@ stated explicitly (Gate 6 compliance-officer) — mirroring this codebase's own
 "flag ≠ revoke" precedent for a similarly-named-but-distinct signal** (Periodic Access
 Reviews, `docs/security-reviews/access-reviews-2026-07-21.md`): a K-waived
 acknowledgment (below) means the server stops re-pushing this generation, NOT that
-every rule in it is actually enforced — a quarantined rule inside an acknowledged
+every rule in it is actually enforced — a wedged rule inside an acknowledged
 generation is not armed, and `yuzu.guardian_arm_failed>0` (not the acknowledged
 generation number itself) is the only durable signal that distinction is visible on.
 "Accepted" means `reconcile_rule_locked()` returned `Accepted` specifically — the async-arm outcome, as
@@ -539,7 +556,7 @@ as it does not today — the ack predicate is structurally blind to it, so a pus
 rules are entirely `Inert` (all legacy) satisfies the predicate immediately, with
 nothing to wait on. `apply_rules()` tracks, per accepted
 rule, whether its arm has resolved. The policy generation advances (and is persisted)
-only once every rule accepted under it has either armed or been quarantined per the
+only once every rule accepted under it has either armed or been wedged per the
 K-bound below — never on acceptance alone. An **episode**, here, is one accepted
 rule's not-yet-resolved arm attempt under a given generation — a rule that has already
 armed has no episode left to be pending, so it does not count against the condition
@@ -550,12 +567,12 @@ push have already armed and the rest are still resolving, the common shape of a
 retry landing mid-drain (R5.3's own bounded drain, below, routinely spans several
 ticks) — and only triggers a full re-apply once something has actually failed,
 expired, or the push's content has changed underneath it.
-**A quarantined key is K-bounded, not held forever** (only a dispatched-and-timed-out
+**A wedged key is K-bounded, not held forever** (only a dispatched-and-timed-out
 key qualifies; a congestion-expired or admission-rejected rule never does, ruling
 14(a)): after three identical same-generation re-applies whose only unresolved rules
-are already-quarantined, the generation acknowledges anyway, leaving
+are already-wedged, the generation acknowledges anyway, leaving
 `yuzu.guardian_arm_failed>0` as the durable fleet signal — a wedged key stays
-quarantined until its own worker returns or the agent restarts (**restart is a
+wedged until its own worker returns or the agent restarts (**restart is a
 remediation only for a *transient* wedge — for a *permanently* wedged target, restart
 re-arms the same rule against the same dead target and re-wedges, matching this
 document's own F3 × `Restart=always` crash-loop finding above, "a security finding,
@@ -566,7 +583,7 @@ re-attempt the arm. A genuine refusal
 (a DISPATCHED call that returned a failure - backend refused or worker threw - or an
 admission rejection such as `CapacityExhausted`, where no call was attempted) or a
 queue-wait expiry is a different case and holds the acknowledgment indefinitely - K
-only bounds the quarantined case, never a live refusal and never a congestion-only
+only bounds the wedged case, never a live refusal and never a congestion-only
 outcome. **K is not a generation-wide liveness bound** (ruling 14(a)): a single wedged
 worker that exhausts its class quota pushes its siblings into non-K-qualifying
 `CapacityExhausted`, and those held rules keep the generation unacknowledged past the
@@ -578,7 +595,7 @@ admission-rejected rule counts as accepted-and-unresolved for the predicate.
 **Completion ownership survives K:** a K-waived rule's dispatched operation still has
 an owner (its retained per-key claim, R5.2), and its eventual result is applied under
 ruling 14(b); acknowledging the generation never discards or orphans that completion.
-**Three separate transitions, never collapsed:** quarantine-release (the wedged
+**Three separate transitions, never collapsed:** wedge-release (the wedged
 worker's call returns and clears the marker), arm-recovery (a still-wanted rule's late
 success commits and clears its `arm_failed` entry), and policy-acknowledgment (the
 generation advances) each have their own trigger; none implies another.
@@ -674,7 +691,7 @@ but this row's own table placement sits next to the C1/D1-style rows in
 pattern — monotonic per-sweep counters summed into a fleet gauge, `docs/
 observability-conventions.md`'s own stated "monitor-only: neither `>0` nor
 `increase()` is sound" shape. Copying that adjacent pattern by analogy would silently
-break the K-bound safety argument this whole mechanism rests on (a cleared quarantine
+break the K-bound safety argument this whole mechanism rests on (a cleared wedge
 would never be reflected). PR-3 must specify these as gauges matching the age-tag
 pattern (`observability-conventions.md`'s `emit_guardian_journal_age_tags`), not the
 counter-rollup pattern, and should carry the same five fields this doc's own
@@ -874,7 +891,7 @@ wait) is fixed in the same PR that adds this stamp.
 **R5.6 - Legacy asymmetry.** Legacy acknowledges synchronously and unconditionally,
 including a rule whose guard failed to start — that rule is silently stranded `Inert`,
 logged but not held against the generation. Spark's acknowledgment holds on a genuine
-refusal, and is K-bounded (never unconditional) on a quarantined key only - a
+refusal, and is K-bounded (never unconditional) on a wedged key only - a
 congestion-expired or admission-rejected rule holds it (ruling 14(a)). This is a
 deliberate, documented delta (`docs/spark-legacy-delta-registry.md` row A3), not an
 oversight to reconcile — spark's stricter acknowledgment is the point of this design,
@@ -2055,7 +2072,7 @@ Each rung is an independently-governed PR on `dev`, run through the full
      ar-8 / up-2):** with PR-1's claim queue and no deadline yet, a re-push onto a wedged key
      queues behind the abandoned head and waits the full `backend_op_deadline` under the
      engine's `mtx_` on every 25 s re-apply, where the base code fail-fasted through the
-     executor's `AlreadyRunning`; PR-5's quarantine restores an immediate refusal. Accepted
+     executor's `AlreadyRunning`; PR-5's wedge mechanism restores an immediate refusal. Accepted
      while dormant; it re-derives HIGH at the flip (or any `prefer_spark` knob PR) and is
      a named PR-5 acceptance criterion in `docs/spark-flip-gate.md` §3a.
 

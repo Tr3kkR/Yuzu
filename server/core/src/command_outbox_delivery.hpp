@@ -39,10 +39,13 @@
 ///  duplicate send it may already have made is absorbed by command_id dedup).
 ///
 /// OUTCOME discrimination (fire-and-advance, matching `ScheduleRunner`'s
-/// historical discipline): a systemic transient gate failure
-/// (`containment_unreadable`) → `reschedule` with back-off (retry, DON'T mark
-/// sent); authority revoked → `mark_failed`; every other outcome — including
-/// `sent == 0` because the targeted agents are offline right now — → `mark_sent`
+/// historical discipline): a systemic transient gate/directory failure
+/// (`containment_unreadable` OR, WS-4 4.2b Task D, `route_unreadable` — a
+/// degraded `GatewayRouteStore::lookup_routes` read; both mean "the read
+/// itself could not answer", never "answered no") → `reschedule` with
+/// back-off (retry, DON'T mark sent); authority revoked → `mark_failed`;
+/// every other outcome — including `sent == 0` because the targeted agents
+/// are offline right now — → `mark_sent`
 /// (a missed occurrence is recorded and skipped, never spun into a backlog).
 
 #include "dispatch_caller.hpp"          // DispatchCaller, ApprovalProvenance

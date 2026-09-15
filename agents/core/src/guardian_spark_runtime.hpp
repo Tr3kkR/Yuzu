@@ -661,6 +661,21 @@ public:
     [[nodiscard]] std::uint64_t claim_index_release_failures() const noexcept {
         return claim_index_release_failures_.load(std::memory_order_relaxed);
     }
+    /// rung 9c PR-5a (#4221 cs-103): detach_rule_locked's last-on-key branch sweeps
+    /// claims_[key] before constructing a new Disarm claim, on the belief (see the
+    /// reachability note at that call site) that nothing survives the sweep. This
+    /// counts every time that belief was WRONG - i.e. every time the debug-only
+    /// assert() next to this counter's increment site would have fired in a debug
+    /// build. Expected 0; unlike a bare assert() (compiled out under NDEBUG in a
+    /// release build), this counter and its accompanying log line survive into
+    /// release, matching this file's own established precedent at
+    /// dispatch_arm_off_lock's "not an Arm claim" guard for a should-never-happen
+    /// branch. A nonzero value here means the reachability note's call-graph
+    /// argument was incomplete somewhere - re-open the investigation rather than
+    /// assume it is safe to ignore.
+    [[nodiscard]] std::uint64_t detach_sweep_left_residue() const noexcept {
+        return detach_sweep_left_residue_.load(std::memory_order_relaxed);
+    }
 
     /// Phase 1 of shutdown: set the stopping flag and mark every generation
     /// inactive under the registry lock, so no in-flight or late eval commits.
@@ -870,7 +885,7 @@ private:
     /// replacement's mapping.
     ///
     /// `end` is a PR-5 plug point: a FACT about how the claim ended, recorded so the
-    /// fault-wiring rung (quarantine / K-bound / arm_failed reason) has something to
+    /// fault-wiring rung (wedge marking / K-bound / arm_failed reason) has something to
     /// classify. PR-1 carries NO classification logic on it; the only reads are the
     /// bookkeeping guards (a `Committed` claim is a rules_ entry, never "pending":
     /// detach_rule_locked's Case-0 skip, and the drain's publish fill-in).
@@ -1359,6 +1374,7 @@ private:
     std::atomic<std::uint64_t> detach_claim_failures_{0}; ///< R5.2: detach_rule_locked rollback / last resort fired
     std::atomic<std::uint64_t> dead_subscription_disarms_skipped_{0}; ///< cs-1: Disarm claims completed for an id already reported dead
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
+    std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (should never happen)
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter

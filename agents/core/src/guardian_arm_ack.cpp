@@ -64,7 +64,7 @@ bool is_sha256_hex(std::string_view s) {
 /// async-failure warn previously logged no reason at all, unlike the sync-refusal
 /// warn in reconcile_rule_locked() which always names one. Exhaustive switch, no
 /// `default`, mirroring GuardianSparkRuntime::receipt_status()'s own convention -
-/// a future ReceiptStatus addition (e.g. a K-bound Quarantined) fails to COMPILE
+/// a future ReceiptStatus addition (e.g. a K-bound Wedged) fails to COMPILE
 /// here rather than silently landing in a catch-all bucket.
 const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
     using S = GuardianSparkRuntime::ReceiptStatus;

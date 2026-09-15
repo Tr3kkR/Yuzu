@@ -393,7 +393,7 @@ flip, with a red-first test each:
 - **up-2, wedged-key re-apply cost** (`GuardianSparkRuntime::attach_rule`, the claim path and
   `wait_for_claim`): a re-push onto a wedged key queues behind the abandoned head and waits the
   full `backend_op_deadline` under engine `mtx_` on every re-apply; the base code fail-fasted via
-  the executor's `AlreadyRunning`. Criterion: a quarantined key refuses a new claim immediately.
+  the executor's `AlreadyRunning`. Criterion: a wedged key refuses a new claim immediately.
 - **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
   on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
   wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
@@ -435,6 +435,28 @@ flip, with a red-first test each:
   same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
   against the landed K-bound logic and records the outcome here, rather than leaving it to drift
   as an unrelated open issue.
+- **NEW (added 2026-09-14, discovered during rung 9c PR-5a's own cs-103 tombstone-reachability
+  investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary (non-firewall) pop loop
+  (`guardian_spark_runtime.cpp:580-601`) pops every claim in `finished` on outcome presence and
+  fifo-front identity alone - it never checks whether that claim's index release actually
+  succeeded. The one release attempt for a withdrawn sibling happens earlier, exactly once, in
+  `on_arm_complete`'s own "claims that were withdrawn/abandoned while their siblings adopted"
+  loop (`:911-913`); nothing retries it. A failure there (reproduced via a `[.exploratory]` test
+  in `tests/unit/test_guardian_spark_runtime.cpp`, PR-5a) leaves a permanent ghost
+  `SparkKeyRuleIndex` entry with no `claims_[key]` residue at all - unlike up-2/up-101's
+  tombstones, no existing sweep can ever find it. Consequence, confirmed empirically: the ghost
+  permanently blocks `keys_[key]`'s own erasure (even after the last real rule on that key is
+  properly detached, `detach_rule_locked`'s `index_->remove_rule` keeps reporting "siblings
+  remain"), leaking the real backend subscription; a LATER, unrelated rule attaching to the same
+  key then silently inherits that stale, never-reverified subscription via the "reuse existing
+  shared watcher" path, with no new `arm()` call. Same production-reachability status as every
+  other criterion in this list - `release_claim_index_locked`'s real `erase_rule` call is
+  internally noexcept/allocation-free, so this is reachable only via the
+  `set_index_remove_fault_for_test` seam today, not live - but structurally real, and worse in
+  consequence (a permanent leak plus silent stale-subscription reuse, not just delayed cleanup)
+  than anything else named here. Criterion: give the ordinary pop loop the same release-success
+  check the firewall branch already has (the cs-2 fix, `:602-620`), or an equivalent guarantee
+  that a release-failed sibling is retained rather than silently popped, before the flip.
 
 ## 4. #2340 scenario contract
 
@@ -1178,7 +1200,7 @@ since they're hardening ON TOP OF an already-correct #2818 fix, not a defect in 
   both point the same direction but neither confirms it; the issue's own words are the accurate
   ones - "root cause undetermined... not confirmed either way." Either way, not a reopening of the
   original hazard. **Ruling 16 (2026-09-12): rung 9c's PR-2 is unblocked** - also corrects
-  ruling 14(c)'s own rationale, since the K-bound/quarantine classification logic actually lives
+  ruling 14(c)'s own rationale, since the K-bound/wedge classification logic actually lives
   in PR-5, not PR-2, so the accepted cost this hold existed to protect against was never live at
   PR-2 in the first place. **PR-2 has since merged** (PR #4318, `a27ec4549baa`,
   2026-09-13T14:46:02Z) - see `docs/spark-legacy-delta-registry.md` row A3 for its "Verify at"
