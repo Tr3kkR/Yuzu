@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-15 · euid 0 · leg-hash pending
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-15 · euid 0 · leg-hash 21254047acbd
 == action=summary
 constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
 [result_status] UNAVAILABLE / PARTIAL / unable to open database file
