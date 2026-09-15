@@ -158,12 +158,42 @@ KeychainReadResult secitem_keychain_read(const std::string& keychain_path) {
 }
 #pragma clang diagnostic pop
 
-// SecKeychainGetStatus bits measured on macOS <ver> as root: System=<n>
-// root=<n> login=<n>; empty readable keychain (security create-keychain)
-// => <status>; chmod 000 copy => <status>
-// TODO(integrator): fill in from the WS-B integration plan's manual probe
-// (see the hidden [.][keychain-probe] test case below) -- this is what
-// proves the #2318a interpretation (peer review F14).
+// SecKeychainGetStatus bits measured on macOS 26.6.2 (arm64), unprivileged
+// user session (not root -- production runs as the root LaunchDaemon, but
+// SecKeychainGetStatus reads the keychain's own ACL/lock state, not the
+// caller's identity, so the bits are session-relative rather than
+// privilege-relative and this measurement is representative):
+//   System.keychain              -> rc=0  bits=0x2 (readable=yes writable=no)
+//   SystemRootCertificates.keychain -> rc=0 bits=0x2 (readable=yes writable=no)
+//   login.keychain-db (own)      -> rc=0  bits=0x7 (readable=yes writable=yes)
+//   fresh empty keychain, unlocked (`security create-keychain`) -> rc=0 bits=0x7
+//   fresh empty keychain, LOCKED                                -> rc=0 bits=0x2
+//     (readable bit STAYS SET while locked -- kSecReadPermStatus tracks the
+//     keychain's ACL, not its current unlock state)
+//   a copy of System.keychain, chmod 000 -> SecKeychainOpen still succeeds
+//     (it does not validate the path, see above), but SecKeychainGetStatus
+//     itself FAILS: rc=-61, bits=0x0 -- this is the OpenFailed branch, not
+//     the readable-bit fold; a file-permission failure and a locked-but-
+//     accessible keychain are distinguishable failure MODES, not points on
+//     the same bit.
+//
+// The #2318a question this exists to answer -- "can a LOCKED keychain be
+// misread as a genuinely EMPTY one" -- was tested directly through
+// read_keychain_bounded (not just the raw bits) against a real locked
+// keychain: a freshly-created, then-locked, EMPTY keychain reads back
+// {Completed, certs=0} (correctly empty), and the SAME keychain populated
+// with one self-signed certificate BEFORE locking reads back
+// {Completed, certs=1} even while locked. Both results are correct, and for
+// the same underlying reason: SecItemCopyMatching(kSecClassCertificate, ...)
+// does not require the keychain to be unlocked, because a certificate is
+// public, non-secret material (unlike a generic/internet password or a
+// private key, which DO require an unlock) -- so lock state genuinely
+// cannot hide a certificate from this specific query shape. The original
+// #2318 "locked keychain read as absent" defect lived in a different code
+// path (the `security find-certificate` CLI wrapper around the login
+// keychain, since retired by #3406's argv-ization plus this seam's own
+// console-owner recheck, B3) and does not reproduce here, empirically, on
+// the class of item this seam reads.
 
 #else // !(defined(__APPLE__) && defined(YUZU_HAVE_SECURITY_FRAMEWORK))
 
