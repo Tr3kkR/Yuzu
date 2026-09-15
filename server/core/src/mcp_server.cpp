@@ -724,11 +724,11 @@ static const ToolDef kTools[] = {
      "Mirrors POST /api/v1/management-groups. Requires ManagementGroup:Write — approval-gated "
      "(supervised MCP tier maker-checker). Additive: creates a new group, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("name":{"type":"string","minLength":1,"description":"Group display name"},)j"
-     R"j("description":{"type":"string","description":"Optional description"},)j"
-     R"j("parent_id":{"type":"string","description":"Optional parent group id; omit for a top-level group under root. Max hierarchy depth is 5."},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Group display name"},)j"
+     R"j("description":{"type":"string","maxLength":1024,"description":"Optional description"},)j"
+     R"j("parent_id":{"type":"string","maxLength":256,"description":"Optional parent group id; omit for a top-level group under root. Max hierarchy depth is 5."},)j"
      R"j("membership_type":{"type":"string","enum":["static","dynamic"],"default":"static","description":"static = explicit member list via add_management_group_member; dynamic = scope_expression-evaluated"},)j"
-     R"j("scope_expression":{"type":"string","description":"Scope DSL expression for a dynamic group; ignored for static"})j"
+     R"j("scope_expression":{"type":"string","maxLength":4096,"description":"Scope DSL expression for a dynamic group; ignored for static"})j"
      R"j(},"required":["name"]})j",
      R"j({"type":"object","properties":{"id":{"type":"string"}},"required":["id"]})j"},
 
@@ -736,7 +736,7 @@ static const ToolDef kTools[] = {
      "Get one management group's metadata plus its current member list. Mirrors GET "
      "/api/v1/management-groups/{id}. Requires ManagementGroup:Read.",
      R"j({"type":"object","properties":{)j"
-     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"})j"
+     R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"})j"
      R"j(},"required":["group_id"]})j",
      R"j({"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"description":{"type":"string"},"parent_id":{"type":"string"},"membership_type":{"type":"string"},"scope_expression":{"type":"string"},"created_by":{"type":"string"},"created_at":{"type":"integer"},"updated_at":{"type":"integer"},"members":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"source":{"type":"string"},"added_at":{"type":"integer"}}}}},"required":["id","name","parent_id","membership_type"]})j"},
 
@@ -747,12 +747,12 @@ static const ToolDef kTools[] = {
      "Mirrors PUT /api/v1/management-groups/{id}. Requires ManagementGroup:Write — approval-gated "
      "(supervised MCP tier maker-checker). Destructive: overwrites the group's existing fields.",
      R"j({"type":"object","properties":{)j"
-     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"},)j"
-     R"j("name":{"type":"string","minLength":1},)j"
-     R"j("description":{"type":"string"},)j"
-     R"j("parent_id":{"type":"string"},)j"
+     R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
+     R"j("name":{"type":"string","minLength":1,"maxLength":256},)j"
+     R"j("description":{"type":"string","maxLength":1024},)j"
+     R"j("parent_id":{"type":"string","maxLength":256},)j"
      R"j("membership_type":{"type":"string","enum":["static","dynamic"]},)j"
-     R"j("scope_expression":{"type":"string"})j"
+     R"j("scope_expression":{"type":"string","maxLength":4096})j"
      R"j(},"required":["group_id"]})j",
      R"j({"type":"object","properties":{"updated":{"type":"boolean"}},"required":["updated"]})j"},
 
@@ -762,8 +762,8 @@ static const ToolDef kTools[] = {
      "ManagementGroup:Write — approval-gated (supervised MCP tier maker-checker). Additive: "
      "extends the member set, overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"},)j"
-     R"j("agent_id":{"type":"string","minLength":1,"description":"Agent to add as a static member"})j"
+     R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Agent to add as a static member"})j"
      R"j(},"required":["group_id","agent_id"]})j",
      R"j({"type":"object","properties":{"added":{"type":"boolean"}},"required":["added"]})j"},
 
@@ -777,7 +777,7 @@ static const ToolDef kTools[] = {
      "fleet-wide permission) - the ITServiceOwner fallback is skipped for a service-scoped MCP "
      "token, matching REST.",
      R"j({"type":"object","properties":{)j"
-     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"})j"
+     R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"})j"
      R"j(},"required":["group_id"]})j",
      R"j({"type":"object","properties":{"roles":{"type":"array","items":{"type":"object","properties":{"group_id":{"type":"string"},"principal_type":{"type":"string"},"principal_id":{"type":"string"},"role_name":{"type":"string"}},"required":["group_id","principal_type","principal_id","role_name"]}}},"required":["roles"]})j"},
 
@@ -798,9 +798,9 @@ static const ToolDef kTools[] = {
      "MCP tier maker-checker) as ManagementGroup:Write. Additive: extends the grant set, "
      "overwrites nothing.",
      R"j({"type":"object","properties":{)j"
-     R"j("group_id":{"type":"string","minLength":1,"description":"Management group id"},)j"
+     R"j("group_id":{"type":"string","minLength":1,"maxLength":256,"description":"Management group id"},)j"
      R"j("principal_type":{"type":"string","enum":["user","group","engine"],"default":"user"},)j"
-     R"j("principal_id":{"type":"string","minLength":1},)j"
+     R"j("principal_id":{"type":"string","minLength":1,"maxLength":256},)j"
      R"j("role_name":{"type":"string","enum":["Operator","Viewer"],"description":"Only Operator and Viewer can be delegated"})j"
      R"j(},"required":["group_id","principal_id","role_name"]})j",
      R"j({"type":"object","properties":{"assigned":{"type":"boolean"}},"required":["assigned"]})j"},
@@ -904,7 +904,7 @@ static const ToolDef kTools[] = {
      "Service-scoped API tokens are denied outright — owner-scoping keys on the minting "
      "principal's username, which a sibling service token of the same minter would otherwise "
      "share.",
-     R"j({"type":"object","properties":{"cursor":{"type":"string","description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
+     R"j({"type":"object","properties":{"cursor":{"type":"string","maxLength":2048,"description":"Opaque pagination cursor from a prior response's next_cursor"},"limit":{"type":"integer","minimum":1,"maximum":500,"default":50}}})j",
      R"j({"type":"object","properties":{"result_sets":{"type":"array","items":{"type":"object","properties":{)j"
      R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]}},"next_cursor":{"type":"string"}},"required":["result_sets","next_cursor"]})j"},
@@ -915,7 +915,7 @@ static const ToolDef kTools[] = {
      "create_result_set_from_* dispatch producers below. An optional parent_id parents the "
      "new set onto an owned existing set. REST v1 twin: POST /api/v1/result-sets. "
      "Service-scoped API tokens are denied outright.",
-     R"j({"type":"object","properties":{"name":{"type":"string"},"source_kind":{"type":"string","default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string"},"maxItems":100000}}})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"source_kind":{"type":"string","maxLength":64,"default":"manual_curate"},"source_payload":{"type":"object","description":"Arbitrary JSON object, stored verbatim"},"parent_id":{"type":"string","maxLength":64,"description":"An existing set owned by the caller to parent this one onto"},"device_ids":{"type":"array","items":{"type":"string","maxLength":256},"maxItems":100000}}})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -930,7 +930,7 @@ static const ToolDef kTools[] = {
      "the minting token's username, so a service token can mint a set the minter's other "
      "credentials can later read back. REST v1 twin: POST "
      "/api/v1/result-sets/from-inventory-query.",
-     R"j({"type":"object","properties":{"name":{"type":"string"},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string"},"field":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}}}},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
+     R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -948,7 +948,7 @@ static const ToolDef kTools[] = {
      "nothing is refused (400), never silently widened. REST v1 twin: POST "
      "/api/v1/result-sets/from-tar-query. NEVER re-send this call on a timeout or error — it "
      "dispatches a real command to the fleet; poll instead.",
-     R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string"}},"required":["sql"]})j",
+     R"j({"type":"object","properties":{"sql":{"type":"string","minLength":1,"maxLength":100000},"include_empty":{"type":"boolean","default":false,"description":"Include responders with zero matching rows in membership"},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members are the dispatch scope; omit to broadcast to every connected agent"},"name":{"type":"string","maxLength":256}},"required":["sql"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -965,7 +965,7 @@ static const ToolDef kTools[] = {
      "or discover_instructions — do not guess. REST v1 twin: POST "
      "/api/v1/result-sets/from-instruction-result. NEVER re-send this call on a timeout or "
      "error — it dispatches a real command to the fleet; poll instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1},"params":{"type":"object","additionalProperties":{"type":"string"},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string"},"op":{"type":"string"},"value":{"type":"string"}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string"},"name":{"type":"string"}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string"},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -979,7 +979,7 @@ static const ToolDef kTools[] = {
      "(re-eval of those source kinds is not yet supported; sync sources are a tracked "
      "follow-up). REST v1 twin: POST /api/v1/result-sets/{id}/re-eval. NEVER re-send this "
      "call on a timeout or error.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"description":"The result set to re-evaluate"}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
@@ -987,14 +987,14 @@ static const ToolDef kTools[] = {
      "Get one result set's metadata by id. Owner-scoped — a non-owner gets the same "
      "not-found error as a nonexistent id (existence-oracle-safe). REST v1 twin: GET "
      "/api/v1/result-sets/{id}.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
     {"get_result_set_members",
      "List a result set's member device ids. Owner-scoped. REST v1 twin: GET "
      "/api/v1/result-sets/{id}/members.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1},"cursor":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64},"cursor":{"type":"string","maxLength":2048},"limit":{"type":"integer","minimum":1,"maximum":10000,"default":1000}},"required":["id"]})",
      R"j({"type":"object","properties":{"device_ids":{"type":"array","items":{"type":"string"}},"next_cursor":{"type":"string"}},"required":["device_ids","next_cursor"]})j"},
 
     {"get_result_set_lineage",
@@ -1002,28 +1002,28 @@ static const ToolDef kTools[] = {
      "(query -> refine -> refine) that produced it. Owner-scoped; the walk stops at the "
      "first ancestor not owned by the caller, so a child parented onto another operator's "
      "set cannot leak that set's metadata. REST v1 twin: GET /api/v1/result-sets/{id}/lineage.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{"chain":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"source_kind":{"type":"string"},"device_count":{"type":"integer"}},"required":["id","name","source_kind","device_count"]}}},"required":["chain"]})j"},
 
     {"pin_result_set",
      "Pin a result set, exempting it from TTL expiry. Idempotent — pinning an already-pinned "
      "set is a no-op success, same end state. Owner-scoped; capped at 50 pinned sets per "
      "owner. REST v1 twin: POST /api/v1/result-sets/{id}/pin.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
     {"unpin_result_set",
      "Unpin a result set, restoring its normal TTL. Idempotent — unpinning an already-unpinned "
      "set is a no-op success. Owner-scoped. REST v1 twin: POST /api/v1/result-sets/{id}/unpin.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
 
     {"delete_result_set",
      "Delete a result set. Owner-scoped. A pinned set must be unpinned first. REST v1 twin: "
      "DELETE /api/v1/result-sets/{id}.",
-     R"({"type":"object","properties":{"id":{"type":"string","minLength":1}},"required":["id"]})",
+     R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64}},"required":["id"]})",
      R"j({"type":"object","properties":{"deleted":{"type":"boolean"}},"required":["deleted"]})j"},
 
     {"list_pending_approvals", "List pending approval requests.",
@@ -2414,8 +2414,8 @@ static const ToolDef kTools[] = {
      "or the store is unavailable, mirrors RbacStore::check_permission's own fail-open/legacy "
      "posture for that condition rather than erroring. Mirrors POST /api/v1/rbac/check.",
      R"j({"type":"object","properties":{)j"
-     R"j("securable_type":{"type":"string","minLength":1,"description":"e.g. \"ManagementGroup\", \"ApiToken\" — see discover_permissions for the full catalog"},)j"
-     R"j("operation":{"type":"string","minLength":1,"description":"e.g. \"Read\", \"Write\", \"Delete\" — see discover_permissions for the full catalog"})j"
+     R"j("securable_type":{"type":"string","minLength":1,"maxLength":128,"description":"e.g. \"ManagementGroup\", \"ApiToken\" — see discover_permissions for the full catalog"},)j"
+     R"j("operation":{"type":"string","minLength":1,"maxLength":64,"description":"e.g. \"Read\", \"Write\", \"Delete\" — see discover_permissions for the full catalog"})j"
      R"j(},"required":["securable_type","operation"]})j",
      R"j({"type":"object","properties":{"allowed":{"type":"boolean"}},"required":["allowed"]})j"},
 
@@ -2432,7 +2432,7 @@ static const ToolDef kTools[] = {
      "create_api_token - closed for this tool specifically (#4309). Destructive: overwrites the "
      "account's existing lockout/failed-login state.",
      R"j({"type":"object","properties":{)j"
-     R"j("username":{"type":"string","minLength":1,"description":"Local account username to unlock"})j"
+     R"j("username":{"type":"string","minLength":1,"maxLength":64,"description":"Local account username to unlock"})j"
      R"j(},"required":["username"]})j",
      R"j({"type":"object","properties":{"username":{"type":"string"},"unlocked":{"type":"boolean"},"audit_emitted":{"type":"boolean"}},"required":["username","unlocked","audit_emitted"]})j"},
     {"discover_instructions",
