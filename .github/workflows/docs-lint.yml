@@ -85,6 +85,17 @@ jobs:
       - name: Seam-closure gate self-test
         run: python3 tests/test_seam_closure_selftest.py
 
+      # Governance-ledger linter self-test. NOTE: the linter itself
+      # (scripts/ci/check-governance-ledger.py) is DELIBERATELY NOT run as a CI
+      # gate over governance.d/ — calibration showed ~93% of historical
+      # fragments predate its strict self-consistency rules, so it is an
+      # ADVISORY author-side pre-push check (the /governance skill runs it on
+      # the current run's fragment). Only this self-test runs in CI, to keep the
+      # tool's own discrimination logic from silently rotting — deterministic,
+      # synthetic input, touches no real ledger. Stdlib only.
+      - name: Governance-ledger linter self-test
+        run: python3 tests/test_governance_ledger_check_selftest.py
+
   # Plugin README touch rule (docs/plugin-readme-standard.md rule 7): a change
   # under agents/plugins/<x>/src/** must also change agents/plugins/<x>/README.md
   # unless the PR body states `docs-unchanged: <section> — <reason>`. The

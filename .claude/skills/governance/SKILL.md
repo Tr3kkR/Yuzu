@@ -1848,6 +1848,30 @@ to close rather than a contradiction to adjudicate.
    omitted passes, which is the gaming vector the severity block already names — so
    spot-check parked rows' `impact` against their own `trigger` and `summary`.
 
+   **Then lint the whole fragment before you push.** The `jq` probe above sees
+   one park constraint; `scripts/ci/check-governance-ledger.py` is the mechanized
+   SUPERSET — an author-side self-check that previews the self-consistency
+   problems a strict reviewer will flag, so a ledger stops taking multiple review
+   rounds to converge (PR #4337 took seven rounds, every one a ledger-metadata
+   defect while the code was byte-identical from round 1; each rule below is one
+   of those rounds' lessons):
+
+   ```bash
+   python3 scripts/ci/check-governance-ledger.py --files "$LEDGER"
+   ```
+
+   It checks the LIVE VIEW (last row per `finding_id`, per the step-3 merge
+   rules) for: `severity_mapped` == the derived band (a floor gates separately in
+   `policy_floor`, it does not raise `severity_mapped`); `severity_native` and
+   `reviewed_at_sha` IMMUTABLE across supersessions; a `wording` row never
+   carrying `I7`; single-value `reporter`; `adjudicated_by` iff
+   `adjudication_rationale`; `source`/enum hygiene and the `policy_floor` key
+   present. It is **advisory, not a CI gate** — calibration found ~93% of the
+   historical `governance.d/` corpus predates these rules, so it is deliberately
+   NOT wired as a blocking check; only its self-test runs in CI. It judges
+   mechanical field-consistency, never whether a finding is true or a severity
+   right. Resolve or consciously accept each finding before pushing.
+
 ## Known patterns from prior runs
 
 **Pattern A: sibling IDOR.** When fixing an authorization gap on endpoint X, grep for every other endpoint in the same file/semantic and verify they have the same check. #222 closed the REST path but left the HTMX dashboard path open. The governance security-guardian caught it only when explicitly told to look for siblings.
