@@ -463,6 +463,8 @@ agent_test_exe = executable(
                                                 # driven end to end via LocalDispatcher (POSIX-only; a no-op
                                                 # TU on Windows via the file's own #ifndef _WIN32 guard)
     'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
+    'unit/test_windows_optional_features_parsers.cpp',           # Wave 9 PR9.2a: DismSlot CAS state machine +
+                                                # row/parameter parsers (agents/shared, agent-core primitive)
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -530,7 +532,8 @@ agent_test_exe = executable(
              (meson.project_source_root() / 'agents' / 'core' / 'src').replace('\\', '/') +
              '"',
              # Wave 7 PR7.1: committed fixture root; autoruns' REAL CAPTURE tests
-             # REQUIRE(exists), never skip.
+             # REQUIRE(exists), never skip. Wave 9 PR9.2a: test_windows_optional_features_parsers.cpp
+             # reads the-rig REAL CAPTURE fixtures via this same define.
              '-DYUZU_TEST_FIXTURE_DIR="' +
              (meson.project_source_root() / 'tests' / 'unit' / 'fixtures').replace('\\', '/') +
              '"'],
