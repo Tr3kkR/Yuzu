@@ -187,7 +187,7 @@ def run():
     # "should fix": a behavioral-instance-only self-test can't catch a future
     # one-character regex widening) and its rejections:
     expect(M._INSTANT_RE.pattern ==
-           r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+           r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt](?:[01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2}"
            r"(\.[0-9]+)?(Z|z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$",
            "pin _INSTANT_RE grammar")
 
@@ -263,9 +263,10 @@ def run():
     # 34 rows with 7-9 digits) - so two rows differing only PAST microsecond
     # precision parse to the IDENTICAL datetime, a false tie that falls
     # through to pass_ordinal (reserved for GENUINE ties) and can invert the
-    # rows' real order. _frac_key compares the value as an exact Decimal
-    # fraction (arbitrary precision, no width limit) to break the tie at the
-    # true precision before ever reaching pass_ordinal.
+    # rows' real order. _frac_key compares the raw fractional-digit string
+    # (trailing zeros stripped, then plain string comparison - see its own
+    # docstring for why this is exact at any digit count) to break the tie
+    # at the true precision before ever reaching pass_ordinal.
     expect(M._frac_key("2026-09-15T10:00:00.0000001Z") <
            M._frac_key("2026-09-15T10:00:00.0000002Z"),
            "_frac_key orders sub-microsecond fractions fromisoformat's own comparison would tie")
@@ -273,7 +274,7 @@ def run():
            "_frac_key treats '.1' and '.10' as the equal decimals they denote (0.1 == 0.10)")
     expect(M._frac_key("2026-09-15T10:00:00.09Z") < M._frac_key("2026-09-15T10:00:00.1Z"),
            "_frac_key orders '.09' before '.1' (0.09 < 0.1), not by raw digit-string comparison")
-    expect(M._frac_key("2026-09-15T10:00:00Z") == 0, "_frac_key is 0 for a fraction-less timestamp")
+    expect(M._frac_key("2026-09-15T10:00:00Z") == "", "_frac_key is empty for a fraction-less timestamp")
 
     # round-8 CONFIRMATION-pass finding (Fable + Sol, both independently
     # reproduced against THIS round's own fix, before push): the first
@@ -281,9 +282,7 @@ def run():
     # width (32 chars) and converted to int - a second instance of the
     # exact "validates one dimension, not the actual unbounded range" defect
     # this whole field's review cycle has chased, since _INSTANT_RE's
-    # fractional group is unbounded (`[0-9]+`). Two consequences, both fixed
-    # by comparing as a Decimal instead (arbitrary precision, no width, no
-    # int() call):
+    # fractional group is unbounded (`[0-9]+`). Two consequences:
     # (a) OVERFLOW: a 34-digit fraction padded to 32 chars is UNCHANGED
     #     (ljust only pads shorter strings), so it compares as a LARGER int
     #     than a 32-digit fraction even when its true decimal value is
@@ -299,7 +298,17 @@ def run():
     #     _INSTANT_RE's unbounded fractional group admits a longer digit
     #     string, so `int(...)` on it raises uncaught INSIDE sorted() - the
     #     same crash class round 7 fixed one function earlier in the call
-    #     chain. Decimal has no such limit.
+    #     chain. The round-8 fix replaced the padded int with Decimal, which
+    #     has no such limit ON THE STANDARD C-EXTENSION BUILD.
+    #
+    # round-9 review (Fable + Sol, independently converged) found that
+    # Decimal ITSELF reopens the same crash on any CPython built WITHOUT the
+    # C `_decimal` extension: the pure-Python `_pydecimal` fallback
+    # constructs a Decimal via `int()` internally, hitting the identical
+    # cap. The current fix drops Decimal entirely (see _frac_key's own
+    # docstring) - a fraction of any length is handled by pure string
+    # operations, with no int()/Decimal-based path to reopen on ANY
+    # interpreter build.
     huge_frac = "2026-09-15T10:00:00." + ("1" * 5000) + "Z"
     expect(M._instant(huge_frac) is not None,
            "a 5000-digit fraction (past int()'s 4300-digit string-conversion cap) still parses")
@@ -327,6 +336,28 @@ def run():
            "_instant rejects '-00:00' (RFC 3339's reserved 'unknown local offset' spelling)")
     expect(M._instant("2026-09-15T10:00:00+00:00") is not None,
            "_instant still accepts '+00:00' (genuinely UTC, not the unknown-offset marker)")
+
+    # round-9 review blocker (Fable + Sol, independently converged then
+    # cross-confirmed): the TIME-hour field was shape-only (`[0-9]{2}`),
+    # admitting hour 24. ISO-8601 permits hour 24 ONLY as "end of day"
+    # notation, legal exclusively when minute/second/EVERY fractional digit
+    # is zero - but fromisoformat's own hour-24 legality check runs against
+    # the SIX-DIGIT-TRUNCATED fractional value, not the real one this
+    # field's own exact-precision fix (_frac_key) separately preserves for
+    # ordering. A nonzero 7th fractional digit is silently accepted as
+    # midnight while still being ordered by its true nonzero value - the
+    # identical "validate the lossy value, order by the lossless value" seam
+    # that produced round 8's own blocker, one field over. Rejecting hour 24
+    # entirely (0 real corpus values use ANY hour-24 spelling) closes it.
+    expect(M._instant("2026-09-15T24:00:00.0000001Z") is None,
+           "_instant rejects hour-24 with a nonzero 7th fractional digit (the exact escalation-loss repro)")
+    expect(M._instant("2026-09-15T24:00:00.000001Z") is None,
+           "_instant rejects hour-24 with a genuinely nonzero (6-digit) fractional value")
+    expect(M._instant("2026-09-15T24:00:00Z") is None,
+           "_instant rejects hour-24 entirely, including the ISO-legal all-zeros 'end of day' spelling "
+           "(0 real corpus values use it; simpler than special-casing)")
+    expect(M._instant("2026-09-15T23:59:59Z") is not None,
+           "_instant still accepts the maximum valid hour (23)")
 
     with tempfile.TemporaryDirectory() as d:
         # -------- (2a) field-wise merge: a CONFORMING sparse supersession is clean --------
@@ -908,6 +939,65 @@ def run():
                "sub-microsecond fractional precision orders correctly even though fromisoformat's "
                "own comparison would tie the two instants (merged disposition=fixed)")
 
+        # round-9 review blocker (Fable + Sol): FortitudeEtc's exact
+        # reproduction - an hour-24 timestamp with a nonzero 7th fractional
+        # digit ("...T24:00:00.0000001Z") was wrongly accepted as valid
+        # midnight (fromisoformat's own hour-24 check runs against the
+        # truncated 6-digit fractional value, which IS all zeros), while the
+        # round-8 exact-precision fix separately restores and orders by the
+        # real nonzero remainder - producing the same "validate the lossy
+        # value, order by the lossless value" seam as round 8's own blocker.
+        c2_hour24_rows = [
+            _full(finding_id="c7", recorded_at="2026-09-16T00:00:00.0000002Z",
+                  severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"]),
+            _sparse(finding_id="c7", recorded_at="2026-09-15T24:00:00.0000001Z",
+                    severity_native="INFO", severity_mapped="BLOCKING", impact=["I1"], exposure=["E3"]),
+        ]
+        c2_hour24_findings = M.check_fragment(_write(d, "9-c2hour24.X", c2_hour24_rows))
+        expect("bad-recorded-at" in _rules(c2_hour24_findings),
+               f"an hour-24 timestamp with a nonzero 7th fractional digit is caught as "
+               f"bad-recorded-at, not silently accepted as valid midnight "
+               f"(got {_rules(c2_hour24_findings)})")
+
+        # round-9 review should-fix (Fable + Sol): json.loads()'s except
+        # clause caught only json.JSONDecodeError - a JSON integer literal
+        # past int()'s 4300-digit string-conversion cap raises a plain
+        # ValueError (JSONDecodeError's own superclass, NOT covered by the
+        # narrower except), and ~100,000-deep array nesting raises
+        # RecursionError. Both crashed check_fragment() uncaught - the same
+        # "narrower except than the input space allows" class as round 8's
+        # UnicodeDecodeError gap one function earlier in the call chain.
+        def _check_fragment_or_fail(path, label):
+            # a regression that lets check_fragment() raise uncaught would
+            # otherwise take down this WHOLE self-test process with an
+            # unnamed traceback (no FAIL line, no partial results) - Fable's
+            # round-9 mutation-test found exactly this shape for the EXC
+            # mutant. Convert any exception into a normal, named failure.
+            try:
+                return M.check_fragment(path)
+            except Exception as e:  # noqa: BLE001 - deliberately broad, see above
+                expect(False, f"{label} (check_fragment raised uncaught: "
+                               f"{type(e).__name__}: {e})")
+                return []
+
+        huge_int_path = Path(d) / "9-hugeint.X.jsonl"
+        huge_int_path.write_text("9" * 5000 + "\n", encoding="utf-8")
+        expect(any(f.rule == "invalid-json" for f in
+                    _check_fragment_or_fail(str(huge_int_path), "huge-int fixture")),
+               "a JSON integer literal past int()'s 4300-digit conversion cap is caught as "
+               "invalid-json, not an uncaught crash")
+        deepnest_path = Path(d) / "9-deepnest.X.jsonl"
+        deepnest_path.write_text("[" * 100_000 + "]" * 100_000 + "\n", encoding="utf-8")
+        expect(any(f.rule == "invalid-json" for f in
+                    _check_fragment_or_fail(str(deepnest_path), "deep-nesting fixture")),
+               "~100,000-deep JSON array nesting is caught as invalid-json, not an uncaught "
+               "RecursionError crash")
+        cli_deepnest = subprocess.run([sys.executable, str(_SCRIPT), "--files", str(deepnest_path)],
+                                       capture_output=True, text=True)
+        expect(cli_deepnest.returncode == 1 and "Traceback" not in cli_deepnest.stderr,
+               f"CLI on ~100,000-deep JSON nesting exits 1 with a finding, never a Python "
+               f"traceback (got exit={cli_deepnest.returncode}, stderr={cli_deepnest.stderr[:200]!r})")
+
         # Fable's round-5 follow-up: the per-row disposition CLOSED-ENUM check
         # must gate on THIS ROW's own versioned-ness, not the finding-level
         # `legacy` flag - a finding-wide flag is True the moment ANY row is
@@ -1102,6 +1192,30 @@ def run():
                      encoding="utf-8")
         expect(any(f.rule == "invalid-json" for f in M.check_fragment(str(p))),
                "invalid-json flagged without crashing")
+
+        # round-9 review should-fix (Fable): `.splitlines()` also splits on
+        # U+2028/U+2029/U+0085 and a few other Unicode line-boundary
+        # characters, which are LEGAL, unescaped inside a JSON string -
+        # `json.loads` (and ordinary file iteration) reads a row containing
+        # one of these raw as ONE object/line, but `.splitlines()` split it
+        # into TWO here, reporting two spurious invalid-json findings,
+        # silently dropping the real row from the merge, and shifting every
+        # later line number by one.
+        u2028_row = _full(finding_id="ls", run_id="9-u2028.X",
+                           adjudication_rationale="a b", adjudicated_by="x")
+        u2028_path = Path(d) / "9-u2028.X.jsonl"
+        # ensure_ascii=False is REQUIRED here: json.dumps's default escapes
+        # U+2028 as a six-character backslash-u escape sequence, which never
+        # exercises the bug (the escaped form has no literal line-boundary
+        # character in the file at all). Only a raw, unescaped U+2028 in the
+        # file reproduces what a hand-written or non-Python producer could
+        # legitimately emit.
+        u2028_path.write_text(json.dumps(u2028_row, ensure_ascii=False) + "\n", encoding="utf-8")
+        u2028_findings = M.check_fragment(str(u2028_path))
+        expect(not any(f.rule == "invalid-json" for f in u2028_findings),
+               f"a row containing a raw U+2028 inside a field value is read as ONE JSON object, "
+               f"not silently split into two spurious invalid-json findings "
+               f"(got {_rules(u2028_findings)})")
 
         # round-8 review should-fix (Fable + Sol): UnicodeDecodeError is a
         # ValueError subclass, NOT an OSError - a single non-UTF-8 byte

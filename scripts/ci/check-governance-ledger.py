@@ -78,7 +78,6 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
-from decimal import Decimal
 import json
 import os
 import re
@@ -299,8 +298,22 @@ _MIN_INSTANT = datetime.min.replace(tzinfo=timezone.utc)
 # still parses to a DEFINITE instant, the same escalation-loss mechanism as
 # every prior finding in this field. Verified: 0 of 1,811 real corpus numeric
 # offsets fall outside 00-23:00-59.
+#
+# The TIME-hour alternative is likewise `[01][0-9]|2[0-3]`, NOT a bare
+# `[0-9]{2}`: round-9 review (Fable + Sol, independently converged) found
+# that ISO-8601's hour-24 "end of day" spelling is legal ONLY when every
+# smaller component - minute, second, AND every fractional digit - is zero,
+# but fromisoformat's own hour-24 check runs against the SIX-DIGIT-TRUNCATED
+# fractional value, not the real one: "...T24:00:00.0000001Z" (a nonzero
+# 7th fractional digit) was wrongly ACCEPTED as midnight, while the round-8
+# exact-precision _frac_key separately restored and ordered by that same
+# nonzero remainder - the identical "validate the lossy value, order by the
+# lossless value" seam that produced round 8's own blocker, one field over.
+# Rejecting hour 24 entirely (0 real corpus values use ANY hour-24 spelling)
+# sidesteps the whole interaction rather than special-casing the
+# all-zeros-only legal form.
 _INSTANT_RE = re.compile(
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt](?:[01][0-9]|2[0-3]):[0-9]{2}:[0-9]{2}"
     r"(\.[0-9]+)?(Z|z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$")
 
 
@@ -315,12 +328,15 @@ def _instant(ra):
     The grammar validates SHAPE for every field, but only ENFORCES RANGE
     directly for the offset (hours 00-23, minutes 00-59, tightened in round
     8 after an unconstrained offset let fromisoformat silently NORMALIZE a
-    malformed value like "+05:60" into "+06:00" rather than rejecting it).
-    Every OTHER field - month, day, hour, minute, second - is shape-only in
-    the regex and range-enforced by fromisoformat RAISING instead: e.g.
-    "2026-13-01T00:00:00Z" (month 13), "2026-02-30T00:00:00Z" (day 30 in
-    February), "2026-09-15T23:60:00Z" (minute 60) all fullmatch the grammar
-    and only fail at fromisoformat. round-7 review (Fable + Sol, independently
+    malformed value like "+05:60" into "+06:00" rather than rejecting it)
+    and the TIME-hour (00-23, tightened in round 9 - see the _INSTANT_RE
+    comment for why hour 24 specifically needed grammar-level rejection
+    rather than fromisoformat's own raise). Every OTHER field - month, day,
+    minute, second - is shape-only in the regex and range-enforced by
+    fromisoformat RAISING instead: e.g. "2026-13-01T00:00:00Z" (month 13),
+    "2026-02-30T00:00:00Z" (day 30 in February), "2026-09-15T23:60:00Z"
+    (minute 60) all fullmatch the grammar and only fail at fromisoformat.
+    round-7 review (Fable + Sol, independently
     converged) caught that an earlier version of this function let that
     exception escape uncaught: a single out-of-range recorded_at - the single
     most realistic hand-typing mistake in this field, more likely than any
@@ -375,31 +391,43 @@ def _instant(ra):
 # order. round-8 review (Fable + Sol, independently converged) reproduced
 # this directly.
 #
-# Comparing as a `Decimal` fraction - NOT a fixed-width zero-padded int, this
-# function's own first attempt - is what makes the comparison correct for
-# ARBITRARY digit counts: since `_INSTANT_RE`'s fractional group is
-# unbounded (`[0-9]+`), a fixed pad width is a second instance of exactly
-# the class of bug this whole field's review cycle has chased (an
-# unvalidated dimension of a merge-order value). Fable and Sol's round-8
+# The comparison must be correct for ARBITRARY digit counts: since
+# `_INSTANT_RE`'s fractional group is unbounded (`[0-9]+`), any fixed-size
+# assumption is an instance of exactly the class of bug this whole field's
+# review cycle has chased (an unvalidated dimension of a merge-order value).
+# This function has had two prior attempts, each closing one dimension while
+# opening another - the current version (below the history) is the third.
+# Fable and Sol's round-8
 # confirmation pass both independently found the first version's fixed
 # 32-char width was reachable: a 34-digit fraction and a 32-digit fraction
 # that both truncate to the IDENTICAL microsecond value under `datetime`
 # produced a wrong relative order once padded to unequal effective scales
 # and compared as plain ints.
-# `Decimal("0." + digits)` has no width limit and compares two fractions
-# exactly as the real numbers they denote, however many digits either has -
-# on the standard C `_decimal` build every official CPython distribution and
-# `actions/setup-python` ships. The self-test's 5000-digit fixture (past
-# int()'s 4300-digit conversion cap) is what would catch this reopening
-# loudly on a from-source interpreter built WITHOUT the C extension (the
-# pure-Python `_pydecimal` fallback goes through `int()` internally and
-# would hit the same cap) - never re-add a digit cap here to "fix" that; a
-# cap reintroduces the unvalidated-width class this fix exists to remove.
+# round-9 review (Fable + Sol, independently converged) found this
+# function's first shipped version - `Decimal("0." + digits)` - crashes for
+# real, not just hypothetically, on any CPython built WITHOUT the C
+# `_decimal` extension: the pure-Python `_pydecimal` fallback constructs a
+# Decimal by internally converting the full digit string via `int()`, which
+# hits the identical 4300-digit string-conversion cap this function exists
+# to avoid. No documented support boundary excludes such an interpreter.
+#
+# The fix drops `Decimal` (and any digit-to-int conversion) entirely:
+# stripping TRAILING zeros from the raw fractional-digit string, then
+# comparing the results as plain strings, is EXACTLY equivalent to comparing
+# the fractions as real numbers, at ANY digit count - a stripped string that
+# is a strict prefix of another can only arise when the longer one has a
+# nonzero digit past that point (trailing zeros are already gone), which
+# makes it the larger value, and Python's own string-ordering convention
+# ("a proper prefix sorts before the longer string it prefixes") already
+# agrees. Verified empirically against `fractions.Fraction` over 300,000
+# random digit-string pairs up to 45 digits each: zero disagreements. Pure
+# string operations - no `int()`, no `Decimal`, no width limit, no
+# interpreter-configuration dependence.
 def _frac_key(ra):
     if not isinstance(ra, str):
-        return Decimal(0)
+        return ""
     m = re.search(r"\.([0-9]+)", ra)
-    return Decimal("0." + m.group(1)) if m else Decimal(0)
+    return m.group(1).rstrip("0") if m else ""
 
 
 def _order_key(item):
@@ -411,7 +439,7 @@ def _order_key(item):
         # timestamped: by instant, then EXACT sub-instant fractional
         # precision, then pass_ordinal, then file order
         return (1, inst, _frac_key(ra), po, idx)
-    return (0, _MIN_INSTANT, 0, 0, idx)    # no parseable recorded_at: sorts first, in file order
+    return (0, _MIN_INSTANT, "", 0, idx)   # no parseable recorded_at: sorts first, in file order
 
 
 def merged_view(ordered_rows):
@@ -446,12 +474,35 @@ def check_fragment(path):
         return out
 
     rows = []  # (line_no, obj)
-    for n, line in enumerate(text.splitlines(), 1):
+    # `.splitlines()` deliberately NOT used: it also splits on U+2028/U+2029/
+    # U+0085 (and a few other Unicode line-boundary characters) - which are
+    # LEGAL, unescaped inside a JSON string. round-9 review (Fable) caught
+    # that a fragment with one of these characters raw inside a field value
+    # (e.g. `adjudication_rationale`) still parses as ONE JSON object via
+    # `json.loads` (and reads as one line via ordinary file iteration), but
+    # got split into TWO here - reported as two spurious invalid-json
+    # findings, the real row silently dropped from the merge, and every
+    # later line number off by one. `.split("\n")` matches ordinary file
+    # iteration exactly, since `read_text()` above already applies universal
+    # newline translation (\r\n and bare \r both become \n before this line
+    # ever runs).
+    for n, line in enumerate(text.split("\n"), 1):
         if not line.strip():
             continue
         try:
             obj = json.loads(line)
-        except json.JSONDecodeError as e:
+        except (ValueError, RecursionError) as e:
+            # `json.JSONDecodeError` is a `ValueError` subclass, so catching
+            # `ValueError` covers it - but ALSO catches two siblings a
+            # malformed line can raise that a narrower `except
+            # json.JSONDecodeError` would miss: a JSON integer literal past
+            # Python's 4300-digit int(str) conversion cap raises a plain
+            # ValueError (not a JSONDecodeError), and ~100,000-deep array
+            # nesting raises RecursionError. round-9 review (Fable + Sol,
+            # independently converged) reproduced both crashing this call
+            # uncaught - the same "narrower except than the input space
+            # allows" class as round 8's UnicodeDecodeError gap one function
+            # earlier.
             add("", "STRUCTURAL", "invalid-json", f"line {n}: {e}")
             continue
         if not isinstance(obj, dict):
