@@ -22,7 +22,9 @@ Imports the hyphenated script via importlib. Stdlib only. Exit 0 = pass.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
+import inspect
 import json
 import subprocess
 import sys
@@ -323,6 +325,100 @@ def run():
         expect(cli_huge.returncode in (0, 1) and "Traceback" not in cli_huge.stderr,
                f"CLI on a 5000-digit fraction never crashes with a Python traceback "
                f"(got exit={cli_huge.returncode}, stderr={cli_huge.stderr[:200]!r})")
+
+    # round-10 review should-fix (Fable + Sol): the round-9 fix that removed
+    # Decimal from _frac_key (closing a real crash on Python's pure
+    # `_pydecimal` fallback) is NOT locked against reintroduction, because
+    # every self-test assertion above pins _frac_key's BEHAVIOR (the
+    # ordering it produces) rather than its IMPLEMENTATION - a Decimal-based
+    # reimplementation that happens to return byte-identical strings would
+    # pass every behavioral assertion while still crashing on the pure-
+    # Python fallback. This exact regression already occurred once in this
+    # PR's own history (round 8 introduced Decimal; round 9's pre-push
+    # review caught and removed it) - "ordinary missing coverage" language
+    # doesn't cover a defect shape that has already recurred once.
+    #
+    # Fable's OWN confirmation pass on the first version of these two locks
+    # (below) found they pinned the wrong boundary: leaving _frac_key
+    # BYTE-IDENTICAL and instead wrapping ITS RESULT with
+    # `Decimal("0." + _frac_key(ra))` one frame up, inside _order_key,
+    # defeated BOTH locks - lock (a) only walked _frac_key's own source, and
+    # lock (b) only called _frac_key directly, never the sort path that
+    # actually wraps its result. That mutant crashes real usage identically
+    # to round 8's shipped defect (verified: reintroducing it and blocking
+    # `_decimal` reproduces the exact `int(str)` 4300-digit ValueError,
+    # while the unwidened locks below both passed it clean). Two
+    # independent locks, now scoped to the WHOLE numeric-conversion surface
+    # rather than one function:
+    #
+    # (a) STRUCTURAL, MODULE-WIDE: an AST walk of the ENTIRE module - not
+    #     just _frac_key - asserting no `import decimal`/`from decimal
+    #     import ...`/`import fractions` and no call named
+    #     Decimal/Fraction/int/float ANYWHERE. Scoping to the whole module
+    #     (rather than one function) is what catches a Decimal-wrapping
+    #     mutation introduced at any call site, not just inside _frac_key
+    #     itself; nothing legitimate in this file needs any of these.
+    forbidden_imports = {"decimal", "fractions"}
+    forbidden_calls = {"Decimal", "Fraction", "int", "float"}
+    found = set()
+    module_tree = ast.parse(inspect.getsource(M))
+    for node in ast.walk(module_tree):
+        if isinstance(node, ast.Import):
+            found |= {f"import {a.name}" for a in node.names if a.name in forbidden_imports}
+        elif isinstance(node, ast.ImportFrom) and node.module in forbidden_imports:
+            found.add(f"from {node.module}")
+        elif isinstance(node, ast.Call):
+            fn = node.func
+            name = fn.id if isinstance(fn, ast.Name) else getattr(fn, "attr", None)
+            if name in forbidden_calls:
+                found.add(f"call {name}")
+    expect(not found,
+           f"the WHOLE module contains no decimal/fractions import and no "
+           f"Decimal/Fraction/int/float call anywhere - not just inside _frac_key - since a "
+           f"digit-count-capped conversion wrapped around _frac_key's result at its call "
+           f"site would reintroduce round 8's crash just as surely as inside the function "
+           f"itself (found: {found or 'none'})")
+    # (b) BEHAVIORAL, end-to-end, under the ACTUAL failure condition AND
+    #     through the ACTUAL call path: a fresh subprocess with the C
+    #     `_decimal` extension blocked BEFORE any import of `decimal`,
+    #     which imports this module fresh and runs a full two-row
+    #     SAME-finding_id fragment through `check_fragment()` (the real
+    #     sort path, via `_order_key` - NOT calling `_frac_key` directly,
+    #     which is exactly the frame Fable's mutant hid behind) with a
+    #     5000-digit fraction on each row.
+    decimal_block_probe = f"""
+import sys
+sys.modules['_decimal'] = None
+import importlib.util
+spec = importlib.util.spec_from_file_location('M', {str(_SCRIPT)!r})
+M = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(M)
+huge_a = "2026-09-15T10:00:00." + ("1" * 5000) + "Z"
+huge_b = "2026-09-15T10:00:00." + ("2" * 5000) + "Z"
+rows = [
+    {{"finding_id": "hf", "run_id": "hf", "pass_ordinal": 0,
+      "recorded_at": huge_a, "disposition": "open"}},
+    {{"finding_id": "hf", "run_id": "hf", "pass_ordinal": 0,
+      "recorded_at": huge_b, "disposition": "fixed"}},
+]
+import json, tempfile, os
+d = tempfile.mkdtemp()
+p = os.path.join(d, "hf.jsonl")
+with open(p, "w") as f:
+    for r in rows:
+        f.write(json.dumps(r) + chr(10))
+findings = M.check_fragment(p)
+print("OK", len(findings))
+"""
+    probe = subprocess.run([sys.executable, "-c", decimal_block_probe],
+                            capture_output=True, text=True)
+    expect(probe.returncode == 0 and probe.stdout.startswith("OK") and "Traceback" not in probe.stderr,
+           f"a two-row 5000-digit-fraction fragment runs through the REAL sort path "
+           f"(check_fragment -> _order_key) without crashing, with the C `_decimal` "
+           f"extension blocked (forcing the pure-Python fallback) - the exact condition "
+           f"round 8's shipped Decimal-based version crashed under, exercised through the "
+           f"actual call path rather than calling _frac_key directly "
+           f"(got exit={probe.returncode}, stdout={probe.stdout!r}, stderr={probe.stderr[:200]!r})")
 
     # round-8 CONFIRMATION-pass finding (Sol): "-00:00" is valid RFC 3339
     # syntax but its EXACT spelling is reserved (section 4.3) to mean "local
@@ -958,6 +1054,76 @@ def run():
                f"an hour-24 timestamp with a nonzero 7th fractional digit is caught as "
                f"bad-recorded-at, not silently accepted as valid midnight "
                f"(got {_rules(c2_hour24_findings)})")
+
+        # round-10 review BLOCKER (Fable + Sol, then Kimi withdrew her own
+        # PASS and independently reproduced it): this defect sits
+        # STRUCTURALLY BELOW every per-field grammar/range/precision check
+        # the prior nine rounds shipped. Python's `json.loads` (matching jq
+        # and JavaScript's JSON.parse) silently keeps only the LAST value
+        # for a repeated object member name, discarding earlier ones with NO
+        # diagnostic - so a row whose raw JSON states a merge-governing
+        # field TWICE has its first value vanish before any validator in
+        # this file ever runs. FortitudeEtc's exact reproduction: a NICE row
+        # at an earlier valid instant, and a BLOCKING row whose raw JSON
+        # states recorded_at twice (a LATER value first, then an EARLIER
+        # one) - the kept (earlier) value sorts before the NICE row, so the
+        # merge treats NICE as superseding and the escalation vanishes with
+        # zero findings. Built by hand (not via _full()/json.dumps, which
+        # can't express a duplicate key) to exactly match a raw hand-typed
+        # or externally-generated fragment.
+        dup_key_line = (
+            '{"schema_version": 1, "run_id": "9-dupkey.X", "finding_id": "dk1", '
+            '"recorded_by": "Claude", "reviewed_at_sha": "abc123", "pass_ordinal": 0, '
+            '"disposition": "open", "severity_native": "INFO", "severity_mapped": "BLOCKING", '
+            '"impact": ["I1"], "exposure": ["E3"], '
+            '"recorded_at": "2026-09-15T11:00:00Z", "recorded_at": "2026-09-15T09:00:00Z"}'
+        )
+        dup_key_path = Path(d) / "9-dupkey.X.jsonl"
+        dup_key_path.write_text(
+            json.dumps(_full(finding_id="dk1", recorded_at="2026-09-15T10:00:00Z",
+                              severity_native="INFO", severity_mapped="NICE",
+                              impact=["I9"], exposure=["E0"]))
+            + "\n" + dup_key_line + "\n", encoding="utf-8")
+        dup_key_findings = M.check_fragment(str(dup_key_path))
+        expect("invalid-json" in _rules(dup_key_findings),
+               f"a JSON line with a duplicate 'recorded_at' object member is caught as "
+               f"invalid-json, not silently resolved to its last value with the BLOCKING "
+               f"escalation discarded (got {_rules(dup_key_findings)})")
+
+        # Codex's independent variant: a Unicode-escaped duplicate key
+        # spelling ("recorded_at", which Python decodes identically to
+        # the literal name "recorded_at") - proving the defect isn't merely
+        # "don't hand-type the same key twice" but a genuine parser-level
+        # gap reachable by any two spellings that decode to the same string.
+        dup_key_unicode_line = (
+            '{"schema_version": 1, "run_id": "9-dupkeyuni.X", "finding_id": "dk2", '
+            '"recorded_by": "Claude", "reviewed_at_sha": "abc123", "pass_ordinal": 0, '
+            '"disposition": "open", "recorded_at": "2026-09-15T11:00:00Z", '
+            '"\\u0072ecorded_at": "2026-09-15T09:00:00Z"}'
+        )
+        dup_key_unicode_path = Path(d) / "9-dupkeyuni.X.jsonl"
+        dup_key_unicode_path.write_text(dup_key_unicode_line + "\n", encoding="utf-8")
+        dup_key_unicode_findings = M.check_fragment(str(dup_key_unicode_path))
+        expect("invalid-json" in _rules(dup_key_unicode_findings),
+               f"a Unicode-escaped duplicate key spelling that decodes to the same name is "
+               f"also caught as invalid-json (got {_rules(dup_key_unicode_findings)})")
+
+        # Kimi's independent variant: a duplicate finding_id silently
+        # re-homes what was meant as a supersession row into the WRONG merge
+        # group (the kept finding_id), leaving the intended group stale with
+        # no trace the row ever existed.
+        dup_fid_line = (
+            '{"schema_version": 1, "run_id": "9-dupfid.X", '
+            '"finding_id": "wrong-group", "finding_id": "dk3", '
+            '"recorded_by": "Claude", "reviewed_at_sha": "abc123", "pass_ordinal": 0, '
+            '"recorded_at": "2026-09-15T10:00:00Z", "disposition": "open"}'
+        )
+        dup_fid_path = Path(d) / "9-dupfid.X.jsonl"
+        dup_fid_path.write_text(dup_fid_line + "\n", encoding="utf-8")
+        dup_fid_findings = M.check_fragment(str(dup_fid_path))
+        expect("invalid-json" in _rules(dup_fid_findings),
+               f"a duplicate finding_id (silently re-homing a row to the wrong merge group) "
+               f"is also caught as invalid-json (got {_rules(dup_fid_findings)})")
 
         # round-9 review should-fix (Fable + Sol): json.loads()'s except
         # clause caught only json.JSONDecodeError - a JSON integer literal

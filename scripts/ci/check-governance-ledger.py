@@ -454,6 +454,39 @@ def merged_view(ordered_rows):
     return m
 
 
+def _reject_duplicate_keys(pairs):
+    """`json.loads`'s `object_pairs_hook`: raise ValueError on any object
+    member name repeated within the SAME JSON object, at ANY nesting depth
+    (this hook fires once per object as the parser closes it, bottom-up, so
+    a duplicate inside a nested object is caught before the outer object's
+    own pairs are even assembled).
+
+    round-10 review (Fable + Sol, independently converged, then Kimi
+    withdrew her own PASS after cross-examining Codex's finding and
+    reproduced it independently) found this defect sits STRUCTURALLY BELOW
+    every per-field grammar/range/precision fix the prior nine rounds
+    shipped: Python's default JSON parser (matching jq and JavaScript's
+    JSON.parse) silently keeps only the LAST value for a repeated key,
+    discarding earlier ones with NO diagnostic - so a row whose raw JSON
+    text states `recorded_at` (or `finding_id`, `pass_ordinal`,
+    `severity_mapped`, or any other merge-governing field) TWICE has its
+    first value vanish before any validator in this file ever runs. No
+    field-level check can see a value that was discarded before parsing
+    finished. Verified: a NICE row plus a BLOCKING row whose JSON states
+    recorded_at twice (a later value, then an earlier one) merges to NICE
+    with zero findings - the escalation silently gone.
+    """
+    result = {}
+    dups = []
+    for k, v in pairs:
+        if k in result:
+            dups.append(k)
+        result[k] = v
+    if dups:
+        raise ValueError(f"duplicate object member(s): {', '.join(sorted(set(dups)))}")
+    return result
+
+
 def check_fragment(path):
     out = []
 
@@ -490,7 +523,7 @@ def check_fragment(path):
         if not line.strip():
             continue
         try:
-            obj = json.loads(line)
+            obj = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
         except (ValueError, RecursionError) as e:
             # `json.JSONDecodeError` is a `ValueError` subclass, so catching
             # `ValueError` covers it - but ALSO catches two siblings a
