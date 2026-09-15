@@ -12,7 +12,7 @@
  *                  Optional `exe=<key>` param narrows to one executable
  *                  (normalised the same way tar_usage.hpp normalises
  *                  exe_key on write).
- *   "foreground" — always UNAVAILABLE/CONSTRAINED: per-session focus-time
+ *   "foreground" — always CONSTRAINED, rc 0: per-session focus-time
  *                  attribution is not captured by this source (see
  *                  app_usage_parsers.hpp and app_usage.yaml).
  *
@@ -126,24 +126,66 @@ int64_t align_to_day(int64_t ts) {
     return ts - (ts % kSecondsPerDay);
 }
 
-// nullopt when the key is absent or the query itself fails to prepare/step
-// (never conflated with a present-but-empty value) — source_state_from_config
-// treats absence the same as "true" (TAR's own default), so callers that
-// only need the tri-state never need to special-case a failed prepare.
-std::optional<std::string> get_tar_config_optional(sqlite3* db, std::string_view key) {
+// Distinguishes "the key is genuinely absent" (a well-formed query that
+// simply returned zero rows) from "the query itself failed to prepare/step"
+// (busy/locked/I-O error) — the two are NOT interchangeable: absence falls
+// through to TAR's own default (source_state_from_config(nullopt) ==
+// Enabled), while a read failure must map to SourceState::Errored and never
+// silently to Enabled (this plugin's routed concern, `.claude/routed-concerns.md`
+// row "`app_usage` agent plugin..." clause 3 — a `tar_config` read failure is
+// fail-closed, the opposite of fail-open).
+enum class ConfigReadOutcome { kPresent, kMissing, kReadError };
+
+struct ConfigReadResult {
+    ConfigReadOutcome outcome{ConfigReadOutcome::kMissing};
+    std::string value; // meaningful only when outcome == kPresent
+};
+
+ConfigReadResult get_tar_config(sqlite3* db, std::string_view key) {
     sqlite3_stmt* stmt = nullptr;
     static constexpr std::string_view kSql = "SELECT value FROM tar_config WHERE key = ?";
     if (sqlite3_prepare_v2(db, kSql.data(), static_cast<int>(kSql.size()), &stmt, nullptr) !=
         SQLITE_OK)
-        return std::nullopt;
+        return {ConfigReadOutcome::kReadError, {}};
     sqlite3_bind_text(stmt, 1, key.data(), static_cast<int>(key.size()), SQLITE_TRANSIENT);
-    std::optional<std::string> out;
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
+    ConfigReadResult out;
+    const int rc = sqlite3_step(stmt);
+    if (rc == SQLITE_ROW) {
         const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        out = text ? std::string{text} : std::string{};
+        out.outcome = ConfigReadOutcome::kPresent;
+        out.value = text ? std::string{text} : std::string{};
+    } else if (rc == SQLITE_DONE) {
+        out.outcome = ConfigReadOutcome::kMissing;
+    } else {
+        out.outcome = ConfigReadOutcome::kReadError;
     }
     sqlite3_finalize(stmt);
     return out;
+}
+
+// Resolves the `usage_enabled` tri-state for both do_summary_on/do_last_used_on
+// (previously duplicated verbatim in each) — a genuine read failure is mapped
+// to SourceState::Errored HERE, directly, before source_state_from_config
+// ever sees it, so its nullopt->Enabled default (reserved for a genuinely
+// absent key) can never be reached by a failed prepare/step.
+struct UsageSourceCheck {
+    yuzu::app_usage::SourceState state;
+    std::string reason; // populated only when state == Errored
+};
+
+UsageSourceCheck check_usage_source_state(sqlite3* db) {
+    const auto cfg = get_tar_config(db, yuzu::app_usage::kConfigUsageEnabled);
+    if (cfg.outcome == ConfigReadOutcome::kReadError)
+        return {yuzu::app_usage::SourceState::Errored, "usage_enabled=<read_error>"};
+
+    const std::optional<std::string_view> stored =
+        cfg.outcome == ConfigReadOutcome::kPresent ? std::optional<std::string_view>(cfg.value)
+                                                    : std::nullopt;
+    const auto state = yuzu::app_usage::source_state_from_config(stored);
+    UsageSourceCheck check{state, {}};
+    if (state == yuzu::app_usage::SourceState::Errored)
+        check.reason = "usage_enabled=" + yuzu::util::safe_output_field(cfg.value);
+    return check;
 }
 
 const YuzuActionDescriptor kActionDescriptors[] = {
@@ -259,10 +301,8 @@ private:
     }
 
     int do_summary_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
-        const auto raw_enabled = get_tar_config_optional(db, yuzu::app_usage::kConfigUsageEnabled);
-        const auto state = yuzu::app_usage::source_state_from_config(
-            raw_enabled ? std::optional<std::string_view>(*raw_enabled) : std::nullopt);
-        if (state == yuzu::app_usage::SourceState::Disabled) {
+        const auto check = check_usage_source_state(db);
+        if (check.state == yuzu::app_usage::SourceState::Disabled) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, "usage_enabled=false");
             ctx.write_output("constrained|usage_source_disabled");
@@ -271,12 +311,13 @@ private:
         // Exactly one token on this path (#560 tri-state, adjudication P3
         // respec §3) — a single failure mode, so no ConstraintAccumulator
         // (that composes genuinely multi-source failures; see read_meta).
-        if (state == yuzu::app_usage::SourceState::Errored) {
-            const std::string reason =
-                "usage_enabled=" + yuzu::util::safe_output_field(*raw_enabled);
+        // Covers both a corrupted stored value AND a failed tar_config
+        // prepare/step (check_usage_source_state maps the latter to Errored
+        // directly, fail-closed — never silently Enabled).
+        if (check.state == yuzu::app_usage::SourceState::Errored) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, reason);
-            ctx.write_output("constrained|usage_source_errored|" + reason);
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, check.reason);
+            ctx.write_output("constrained|usage_source_errored|" + check.reason);
             return 0;
         }
         if (!yuzu::app_usage::usage_daily_table_exists(db)) {
@@ -338,10 +379,8 @@ private:
     }
 
     int do_last_used_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
-        const auto raw_enabled = get_tar_config_optional(db, yuzu::app_usage::kConfigUsageEnabled);
-        const auto state = yuzu::app_usage::source_state_from_config(
-            raw_enabled ? std::optional<std::string_view>(*raw_enabled) : std::nullopt);
-        if (state == yuzu::app_usage::SourceState::Disabled) {
+        const auto check = check_usage_source_state(db);
+        if (check.state == yuzu::app_usage::SourceState::Disabled) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, "usage_enabled=false");
             ctx.write_output("constrained|usage_source_disabled");
@@ -350,12 +389,13 @@ private:
         // Exactly one token on this path (#560 tri-state, adjudication P3
         // respec §3) — a single failure mode, so no ConstraintAccumulator
         // (that composes genuinely multi-source failures; see read_meta).
-        if (state == yuzu::app_usage::SourceState::Errored) {
-            const std::string reason =
-                "usage_enabled=" + yuzu::util::safe_output_field(*raw_enabled);
+        // Covers both a corrupted stored value AND a failed tar_config
+        // prepare/step (check_usage_source_state maps the latter to Errored
+        // directly, fail-closed — never silently Enabled).
+        if (check.state == yuzu::app_usage::SourceState::Errored) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, reason);
-            ctx.write_output("constrained|usage_source_errored|" + reason);
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, check.reason);
+            ctx.write_output("constrained|usage_source_errored|" + check.reason);
             return 0;
         }
         if (!yuzu::app_usage::usage_daily_table_exists(db)) {
@@ -389,12 +429,19 @@ private:
     }
 
     int do_foreground(yuzu::CommandContext& ctx) {
-        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
+        // Permanent, by-design degraded outcome — never a hard failure. Matches
+        // this file's own Disabled/Errored branches and repo convention
+        // (autoruns_plugin.cpp, power_health_plugin.cpp's do_battery): CONSTRAINED
+        // status + rc 0, so a dispatch of this action records as the documented
+        // "always constrained" outcome (content/definitions/app_usage.yaml) in the
+        // executions history, never a FAILURE (agent.cpp derives the wire status
+        // from rc alone, independent of this typed status).
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                               "foreground/focus attribution not captured by this source");
         ctx.write_output(
             "constrained|foreground_not_captured|user-context-bridge roadmap (session-scope "
             "attribution)");
-        return 1;
+        return 0;
     }
 
     std::string data_dir_;

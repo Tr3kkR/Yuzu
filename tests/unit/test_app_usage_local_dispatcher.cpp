@@ -210,8 +210,8 @@ TEST_CASE("app_usage plugin: summary — real tar.db if present, else an explici
         CHECK(rows[i].rfind("usage|", 0) == 0);
 }
 
-TEST_CASE("app_usage plugin: foreground is always constrained/unavailable, exit code agrees "
-         "with typed status",
+TEST_CASE("app_usage plugin: foreground is always constrained, rc 0 -- a permanent "
+         "by-design degraded outcome, never a hard failure",
           "[app_usage][actions]") {
     auto plugin = load_app_usage_plugin();
     if (!plugin) {
@@ -222,8 +222,12 @@ TEST_CASE("app_usage plugin: foreground is always constrained/unavailable, exit 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "foreground");
 
-    CHECK(result.rc == 1);
-    CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+    // rc must be 0: agent.cpp derives the wire CommandResponse status purely
+    // from rc (0=SUCCESS, nonzero=FAILURE), independent of this typed status
+    // — a nonzero rc here would record this documented "always constrained"
+    // outcome as a hard failure in the executions history.
+    CHECK(result.rc == 0);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
 
     const auto rows = captured_rows(result.captured);
     REQUIRE(rows.size() == 1);
