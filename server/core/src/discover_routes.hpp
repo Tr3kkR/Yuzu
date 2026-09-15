@@ -9,15 +9,16 @@
 /// agentic worker should be able to learn what is possible from the live
 /// server alone, without a side-channel doc fetch."
 ///
-/// Six endpoints, modeled on the existing discovery precedent
+/// Seven endpoints, modeled on the existing discovery precedent
 /// `GET /api/v1/guaranteed-state/schemas` (rest_api_v1.cpp) — same
 /// ETag + `Cache-Control: public, max-age=300` + 304-revalidation contract:
-///   - `/discover/permissions`   — RBAC securable_type x operation catalog + role grid
-///   - `/discover/instructions`  — published InstructionDefinition subset
-///   - `/discover/routes`        — subset of the OpenAPI document (honesty-flagged)
-///   - `/discover/scope-kinds`   — Scope DSL kinds + operators (fully static)
-///   - `/discover/plugins`       — plugin/action catalog observed across the fleet
-///   - `/discover/plugin-docs`   — per-plugin documentation manifest (fully static)
+///   - `/discover/permissions`         — RBAC securable_type x operation catalog + role grid
+///   - `/discover/instructions`        — published InstructionDefinition subset
+///   - `/discover/routes`              — subset of the OpenAPI document (honesty-flagged)
+///   - `/discover/scope-kinds`         — Scope DSL kinds + operators (fully static)
+///   - `/discover/plugins`             — plugin/action catalog observed across the fleet
+///   - `/discover/plugin-docs`         — per-plugin documentation manifest catalog (fully static)
+///   - `/discover/plugin-docs/{name}`  — one plugin's manifest, narrower (#4108, fully static)
 ///
 /// NAMING NOTE: the obvious filename `discovery_routes.{hpp,cpp}` /
 /// `DiscoveryRoutes` is already taken by an unrelated, pre-existing module
@@ -129,6 +130,22 @@ const DiscoveryDoc& plugin_docs_catalog();
 /// `nullptr` when no manifest documents that plugin. Exposed for the join and
 /// its tests; the full manifest is `plugin_docs_catalog()`.
 const nlohmann::json* plugin_docs_summary(std::string_view plugin_name);
+
+/// One plugin's manifest, pre-serialised with its own content ETag — the
+/// exact element `plugin_docs_catalog()` carries at `plugins[]` for this
+/// name, byte-identical after parse. Backs both `GET
+/// /api/v1/discover/plugin-docs/{name}` and the MCP resource template
+/// `yuzu://plugin-docs/{name}` (#4108) so the two transports cannot drift
+/// from each other (A2's shared-builder principle). This accessor itself is
+/// an exact-name lookup with no normalisation of its own — the two
+/// TRANSPORTS differ upstream of it: httplib decodes the REST path segment
+/// (`decode_path_component`) before routing, so `%5F` reaches here as `_`;
+/// the MCP `resources/read` branch passes the `uri` tail through unchanged.
+/// Immaterial in practice (generated plugin names are `[a-z0-9_]`), but a
+/// caller comparing behaviour across both transports should know the two
+/// answer differently for a percent-encoded name. `nullptr` when no
+/// manifest documents that plugin.
+const DiscoveryDoc* plugin_docs_manifest(std::string_view plugin_name);
 
 /// One row per `yuzu::scope::CompOp` value, hand-maintained (C++ has no enum
 /// reflection). Shared by `build_routes_catalog`'s scope-kinds sibling
