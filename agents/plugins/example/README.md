@@ -127,5 +127,5 @@ echo: (no message)
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_b.hpp`
 - Tests: none found by name
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
-- Changelog: `changelog.d/1986-getting-started-import-examples.fixed.md` · `changelog.d/20260915-build-examples-gating.fixed.md`
+- Changelog: `changelog.d/1986-getting-started-import-examples.fixed.md` · `changelog.d/4262-build-examples-gating.fixed.md`
 <!-- END GENERATED -->

@@ -106,7 +106,7 @@ for opt in opts:
         print("true" if opt.get("value") else "false")
         sys.exit(0)
 print("unknown")
-')"
+' 2>/dev/null || echo "unknown")"
 
   if [ "$build_agent" = "false" ]; then
     echo "check-capability-matrix: SKIP — build_agent=false (no plugins configured, nothing to check)"

@@ -15,23 +15,29 @@
 #
 # Beyond a bare `meson setup` exit code, this also introspects the
 # configured targets (still configure-only — `meson introspect --targets`
-# needs no compile) and asserts the EXACT boundary: precisely the four demo
-# plugins are absent, and a same-sized sample of real plugins/tools --
-# including the two closest-to-toy calls, `netstat` and `status` -- are
-# present. A bare setup-succeeds check would stay green even if a real
-# plugin were silently re-gated behind build_examples (as long as nothing
-# else referenced its *_plugin_lib variable), which defeats the point of a
-# regression test for exactly that class of mistake (code-review CDX-FV-2).
+# needs no compile) and asserts the EXACT boundary: EVERY agents/plugins/*/
+# directory except the four demo plugins has a matching target present,
+# and the four demo plugins are absent. A bare setup-succeeds check would
+# stay green even if a real plugin were silently re-gated behind
+# build_examples (as long as nothing else referenced its *_plugin_lib
+# variable) -- true of 24 of the 48 real plugins, since only 24 are
+# load-bearing link_depends of yuzu_agent_tests (governance Gate 4
+# unhappy-path UP-6). Checking the full discovered set, not a fixed
+# sample, closes that gap regardless of which plugin a future mistake
+# targets.
 set -euo pipefail
 
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null || { cd "$(dirname "$0")/../.." && pwd; })"
 cd "$ROOT"
 
-# Mirrors scripts/setup.sh's own host-triplet detection exactly (including
-# its own gap: native ARM64 Linux is not auto-detected there either --
-# only an explicit --cross-file selects arm64-linux/arm-linux). Diverging
-# from that script's convention here would be a NEW inconsistency, not a
-# fix, so this intentionally does not do more than setup.sh does.
+# Matches scripts/setup.sh's own host-triplet detection on every host this
+# repo runs on (macOS, Linux, and Windows git-bash) -- including its own
+# gap: native ARM64 Linux is not auto-detected there either, only an
+# explicit --cross-file selects arm64-linux/arm-linux, so this
+# intentionally does not do more than setup.sh does. The two scripts'
+# catch-all `case` arm differs (setup.sh defaults to Linux, this defaults
+# to Windows) but that arm is unreachable on any host either script
+# actually targets.
 case "$(uname -s)" in
   Darwin) TRIPLET="$([ "$(uname -m)" = "arm64" ] && echo arm64-osx || echo x64-osx)" ;;
   Linux)  TRIPLET="x64-linux" ;;
@@ -44,7 +50,7 @@ if [ ! -d "$VCPKG_INSTALLED" ]; then
   exit 0
 fi
 
-tmp="$(mktemp -d)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/yuzu_test_build_examples_gating.XXXXXX")"
 trap 'rm -rf "$tmp"' EXIT
 
 if ! meson setup "$tmp/build" \
@@ -64,19 +70,34 @@ meson introspect --targets "$tmp/build" > "$targets" 2>"$tmp/introspect.log" || 
   exit 1
 }
 
-python3 - "$targets" <<'PYEOF'
-import json, sys
+python3 - "$targets" "$ROOT" <<'PYEOF'
+import json, os, sys
 
-with open(sys.argv[1]) as f:
+targets_path, root = sys.argv[1], sys.argv[2]
+
+with open(targets_path) as f:
     names = {t["name"] for t in json.load(f)}
 
 demo_plugins = {"example", "chargen", "procfetch", "netprobe"}
-# netstat and status are the two AC-named "toys" this branch deliberately
-# left unconditional (real attribution action + real test, and a
-# dashboard-consumed key-value plugin, respectively -- see #4262 code
-# review) -- asserting their presence is exactly what would catch a
-# regression that moved either one back under build_examples.
-must_be_present = {"netstat", "status", "capmatrix-gen", "plugin-capture", "yuzu_agent_tests"}
+
+# The full, current plugin roster -- not a fixed sample -- discovered the
+# same way scripts/ci/check-capability-matrix.sh does, so a future plugin
+# addition/removal never silently drifts this test's expectations out of
+# sync with reality.
+plugins_dir = os.path.join(root, "agents", "plugins")
+all_plugins = {
+    name for name in os.listdir(plugins_dir)
+    if os.path.isdir(os.path.join(plugins_dir, name))
+}
+if not all_plugins:
+    print("::error::no agents/plugins/*/ directories found -- introspection setup is broken", file=sys.stderr)
+    sys.exit(1)
+
+real_plugins = all_plugins - demo_plugins
+# The tool/test targets that must also build regardless of build_examples
+# (#4262: tools/capmatrix-gen + tools/plugin-capture moved to `if
+# build_agent` alone; yuzu_agent_tests links every real plugin's lib).
+must_be_present = real_plugins | {"capmatrix-gen", "plugin-capture", "yuzu_agent_tests"}
 
 present_demos = demo_plugins & names
 missing_required = must_be_present - names
@@ -93,4 +114,4 @@ if errors:
     sys.exit(1)
 PYEOF
 
-echo "test_build_examples_gating: OK — -Dbuild_examples=false -Dbuild_tests=true configures cleanly, exactly the four demo plugins are absent, and netstat/status/capmatrix-gen/plugin-capture/yuzu_agent_tests are present"
+echo "test_build_examples_gating: OK — -Dbuild_examples=false -Dbuild_tests=true configures cleanly, exactly the four demo plugins are absent, and every other plugin + capmatrix-gen/plugin-capture/yuzu_agent_tests are present"
