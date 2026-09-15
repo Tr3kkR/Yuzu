@@ -9634,8 +9634,9 @@ void RestApiV1::register_routes(
                           // regardless of backend availability. `orig` may have been minted
                           // via the uncapped POST /api/v1/result-sets (no source_kind
                           // allowlist there) - without this, re-eval would smuggle an
-                          // over-keyed or oversized params object, or an oversized
-                          // instruction_id, past those caps, then dispatch it fleet-wide.
+                          // over-keyed or oversized params object past those caps, then
+                          // dispatch it fleet-wide, and an oversized instruction_id would
+                          // reach instruction_store's lookup unbounded.
                           if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
                               rs_err(res, 400,
                                      std::format(

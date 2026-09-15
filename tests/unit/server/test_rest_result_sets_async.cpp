@@ -728,12 +728,14 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
 // #4373: the kInstructionResult branch was missing the equivalent recheck
 // entirely - a row minted via the uncapped POST /api/v1/result-sets (no
 // source_kind allowlist there) could carry an over-keyed or oversized
-// params object, or an oversized instruction_id, straight past MCP's own
-// bounds (mcp_input_bounds.hpp) and into a fleet-wide dispatch. These five
-// cases mirror the ones reevaluate_result_set's own fix (PR #4394) already
-// has, seeded directly in the store the same way the SQL-cap test above is
-// (never through /from-instruction-result, which has no per-field bound of
-// its own to enforce the smuggled shape at creation time).
+// params object straight past MCP's own bounds (mcp_input_bounds.hpp) and
+// into a fleet-wide dispatch, or an oversized instruction_id straight into
+// instruction_store's lookup unbounded. The six cases below (four bound
+// cases plus two type-confusion cases) mirror the ones
+// reevaluate_result_set's own fix (PR #4394) already has, seeded directly
+// in the store the same way the SQL-cap test above is (never through
+// /from-instruction-result, which has no per-field bound of its own to
+// enforce the smuggled shape at creation time).
 
 TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
           "instruction_result row is refused, never re-dispatched",
