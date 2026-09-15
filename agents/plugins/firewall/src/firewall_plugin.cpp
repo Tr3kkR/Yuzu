@@ -921,7 +921,8 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
                 // failing the dump outright, so an unchecked DONE would
                 // accept a torn/inconsistent read as if it were complete.
                 if ((m.hdr.flags & nft::kNlmFDumpIntr) != 0)
-                    return {}; // io_error -- torn dump, never trusted
+                    return {NftDumpStatus::torn, 0}; // never trusted (code-review: was the
+                                                       // misleading default io_error)
                 // A completed-but-errored dump is NOT trusted either (R9): a
                 // nonzero dump_done_errno means the kernel gave up partway
                 // through, even though it still sent a terminating DONE.

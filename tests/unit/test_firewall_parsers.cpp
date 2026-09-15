@@ -704,6 +704,21 @@ TEST_CASE("nft: nft_dump_reason maps every status to its exact token", "[firewal
     CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::truncated, 0}) == "truncated");
     CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::oversized, 0}) == "oversized");
     CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::io_error, 0}) == "io_error");
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::torn, 0}) == "torn");
+}
+
+TEST_CASE("nft: nft_dump_reason distinguishes an undecoded kernel_error from a genuine errno of "
+         "zero",
+         "[firewall]") {
+    // kernel_errno==0 on a kernel_error status means the NLMSG_ERROR payload
+    // itself couldn't be decoded (too short, or the error==0 ACK-anomaly
+    // parse_nlmsgerr treats as nullopt) -- it must never format as
+    // "errno:0", which would read as a specifically decoded errno that
+    // never happened (code-review finding K1).
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::kernel_error, 0}) == "errno:undecoded");
+    // A genuinely nonzero errno still formats normally, unaffected.
+    CHECK(nft_dump_reason(NftDumpResult{NftDumpStatus::kernel_error, -EINVAL}) ==
+          "errno:" + std::to_string(EINVAL));
 }
 
 TEST_CASE("nft: nft_diag_row and nft_fallthrough_row produce the documented row shapes",

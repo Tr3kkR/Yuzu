@@ -723,6 +723,12 @@ enum class NftDumpStatus {
     truncated,      // the socket read returned less than a full message
     oversized,      // the dump exceeded kNftDumpMaxBytes before terminating
     io_error,       // the socket call itself failed (recv/poll error)
+    torn,           // NLMSG_DONE arrived with NLM_F_DUMP_INTR -- a concurrent
+                     // ruleset mutation interrupted the dump mid-read; the
+                     // kernel signals this on an otherwise-normal DONE, so
+                     // "io_error" (a syscall failure) would be the wrong
+                     // diagnosis for an operator troubleshooting it
+                     // (code-review finding).
 };
 
 /// One dump round-trip's outcome: the status plus, for `kernel_error`, the
@@ -803,6 +809,15 @@ enum class NftVerdict { active, inactive, unknown };
     case NftDumpStatus::kernel_error:
         if (res.kernel_errno == -EPERM)
             return "eperm";
+        // A kernel_error whose errno could not itself be decoded (too-short
+        // NLMSG_ERROR payload, or the error==0 ACK-anomaly parse_nlmsgerr
+        // deliberately treats as nullopt) collapses to kernel_errno==0 here
+        // -- formatting that as "errno:0" would read as a specifically
+        // decoded errno zero, which never happened (code-review finding:
+        // an operator would conclude "the kernel reported errno 0" when
+        // the truth is "the errno couldn't be read at all").
+        if (res.kernel_errno == 0)
+            return "errno:undecoded";
         return "errno:" + std::to_string(std::abs(res.kernel_errno));
     case NftDumpStatus::foreign_flood:
         return "foreign_flood";
@@ -812,6 +827,8 @@ enum class NftVerdict { active, inactive, unknown };
         return "oversized";
     case NftDumpStatus::io_error:
         return "io_error";
+    case NftDumpStatus::torn:
+        return "torn";
     }
     return "io_error"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
 }
