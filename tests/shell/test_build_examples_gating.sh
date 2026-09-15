@@ -70,7 +70,26 @@ meson introspect --targets "$tmp/build" > "$targets" 2>"$tmp/introspect.log" || 
   exit 1
 }
 
-python3 - "$targets" "$ROOT" <<'PYEOF'
+# Resolve a WORKING interpreter, not merely one whose name is on PATH:
+# `command -v python3` reports success on Windows even when the only thing
+# answering to that name is the default python3.exe App Execution Alias
+# stub, which prints a Microsoft-Store-redirect message and exits non-zero
+# instead of running any code -- exactly what broke this test on the
+# Windows CI leg (the runner's provisioned toolchain guarantees `python`,
+# never `python3`; see check-plugin-spawn-lexical.sh's identical guard).
+PYTHON_BIN=""
+for _candidate in python3 python; do
+  if command -v "$_candidate" >/dev/null 2>&1 && "$_candidate" -c "" >/dev/null 2>&1; then
+    PYTHON_BIN="$_candidate"
+    break
+  fi
+done
+if [ -z "$PYTHON_BIN" ]; then
+  echo "::error::no working python interpreter found (tried python3, python)" >&2
+  exit 2
+fi
+
+"$PYTHON_BIN" - "$targets" "$ROOT" <<'PYEOF'
 import json, os, sys
 
 targets_path, root = sys.argv[1], sys.argv[2]

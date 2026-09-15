@@ -448,7 +448,7 @@ if build_agent
   # narrowing this list -- `netstat` (a real `attribution` action + a
   # dedicated real-plugin-by-path test) and `status` (a
   # dashboard-consumed key-value plugin) were the two closest calls and
-  # are NOT toys.
+  # are real, shipped plugins, not demos.
   if build_examples
     subdir('agents/plugins/example')
     subdir('agents/plugins/chargen')

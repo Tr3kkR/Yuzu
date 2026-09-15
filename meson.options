@@ -1,6 +1,6 @@
 option('build_agent',    type: 'boolean', value: true,  description: 'Build the agent daemon')
 option('build_server',   type: 'boolean', value: true,  description: 'Build the server daemon')
-option('build_examples', type: 'boolean', value: true,  description: 'Build the demo/toy example plugins (example, chargen, procfetch, netprobe) -- every other plugin builds regardless of this flag')
+option('build_examples', type: 'boolean', value: true,  description: 'Build the demo example plugins (example, chargen, procfetch, netprobe) -- every other plugin builds regardless of this flag')
 option('build_tests',    type: 'boolean', value: false, description: 'Build unit and integration tests')
 option('build_fuzzers',  type: 'boolean', value: false,
        description: 'Build the libFuzzer harnesses in tests/fuzz/ (requires clang; '
