@@ -185,7 +185,7 @@ TEST_CASE("parse_shimcache: A1's real capture parses to >0 entries with a plausi
     CHECK(ShimCacheRow::insert_flag == "-");
 }
 
-TEST_CASE("parse_shimcache: five negatives all return typed errors, none throw",
+TEST_CASE("parse_shimcache: six negatives all return typed errors, none throw",
           "[execution_artifacts][shimcache][negative]") {
     const auto real_bytes = read_fixture_bytes(fixture_dir() / "shimcache.bin");
 
@@ -247,6 +247,12 @@ TEST_CASE("parse_shimcache: five negatives all return typed errors, none throw",
         REQUIRE_NOTHROW(r = parse_shimcache(buf));
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().token == "truncated_entry");
+    }
+    SECTION("entry_size (10) undercuts what this entry actually needs (~80 bytes)") {
+        auto buf = build_valid_shimcache_blob();
+        put_u32(buf, 0x34 + 8, 10);
+        auto r = parse_shimcache(buf);
+        CHECK((!r.has_value() && r.error().token == "truncated_entry"));
     }
 }
 
@@ -548,7 +554,7 @@ TEST_CASE("parse_prefetch: version 17 (XP/2003) is rejected, not silently mispar
 }
 
 TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, unknown version, "
-          "oversize run count",
+          "oversize run count, undersized file_size",
           "[execution_artifacts][prefetch][negative]") {
     SECTION("truncated header") {
         std::vector<uint8_t> tiny(2, 0); // shorter than the version DWORD itself
@@ -584,6 +590,12 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         REQUIRE_NOTHROW(r = mam_uncompressed_size(mam_header));
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().token == "oversize_count");
+    }
+    SECTION("file_size undercuts this version's required fields (through run_count)") {
+        auto buf = build_valid_prefetch_v31_blob();
+        put_u32(buf, kPrefetchFileSizeOffset, 100);
+        auto r = parse_prefetch(buf);
+        CHECK((!r.has_value() && r.error().token == "truncated_entry"));
     }
 }
 

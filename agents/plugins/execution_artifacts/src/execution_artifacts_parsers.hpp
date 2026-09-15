@@ -283,6 +283,8 @@ inline Result<ShimCacheResult> parse_shimcache(std::span<const uint8_t> in) {
         if (data_off + *data_size > in.size())
             return std::unexpected(detail::err("truncated_entry", data_off));
 
+        if (*entry_size < (path_off + *path_len + *data_size) - off) // excludes FILETIME+data_size DWORD, per A1's capture
+            return std::unexpected(detail::err("truncated_entry", off + 8));
         out.rows.push_back(std::move(row));
 
         // Advance by the entry's own declared size when it is internally
@@ -545,6 +547,8 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
     const size_t last_run_off = is_v23 ? kFileInfoV23LastRunOffset : kFileInfoV26V30V31LastRunOffset;
     const size_t run_count_off = is_v23 ? kFileInfoV23RunCountOffset : kFileInfoV26V30V31RunCountOffset;
     const size_t n_last_runs = is_v23 ? 1 : kPrefetchMaxLastRuns;
+    if (*file_size < run_count_off + 4)
+        return std::unexpected(detail::err("truncated_entry", run_count_off));
 
     for (size_t i = 0; i < n_last_runs; ++i) {
         auto ft = detail::read_u64(in, last_run_off + i * 8, "truncated_entry");
