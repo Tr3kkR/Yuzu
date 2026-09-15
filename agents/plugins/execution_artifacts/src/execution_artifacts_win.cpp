@@ -565,9 +565,8 @@ int collect_amcache(yuzu::CommandContext& ctx) {
         // (fallback path only), the copy, RegLoadAppKeyW, enumeration, and
         // RegCloseKey -- runs under this ONE lock, exactly as with_user_hive
         // (win_profiles.hpp:479-535) holds it for its whole offline arm. See
-        // the file banner for the hold-time bound. ScopedOfflineHiveLock logs
-        // wait/hold time -- see offline_hive_mutex.hpp's INSTRUMENTATION note.
-        const yuzu::agent::ScopedOfflineHiveLock offline_lock("execution_artifacts");
+        // the file banner for the hold-time bound.
+        const std::lock_guard<std::mutex> offline_lock(yuzu::agent::offline_hive_mutex());
 
         TempHiveCleanup cleanup(ctx);
         // Registered before the first CopyFileW attempt (not only on its

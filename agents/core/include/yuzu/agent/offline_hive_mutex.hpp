@@ -33,54 +33,19 @@
  * -> unload -> restore), not just the RegLoadKeyW call itself -- see
  * win_profiles.hpp's with_user_hive() for where it is taken. The live-hive
  * path (the common case) never takes this lock.
- *
- * INSTRUMENTATION (added when execution_artifacts became the 5th caller):
- * this one process-wide lock now serialises the offline arm for FIVE
- * plugins (registry, installed_apps, license_scan, tar via
- * with_user_hive(), and execution_artifacts directly), so a long hold by
- * any one of them blocks the other four with no prior visibility into it.
- * `ScopedOfflineHiveLock` wraps the acquire/release with a wait-time and
- * hold-time log (spdlog, this codebase's existing agent-side logging
- * mechanism -- see guard_registry.cpp for the same pattern applied to
- * Guardian's own shared-resource contention) so an unusually long wait or
- * hold is visible without instrumenting every call site by hand. Prefer it
- * over a bare `std::lock_guard<std::mutex>(offline_hive_mutex())` for any
- * new caller; the two existing call sites (win_profiles.hpp,
- * execution_artifacts_win.cpp) already use it.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
-#include <chrono>
 #include <mutex>
 
 namespace yuzu::agent {
 
 /**
- * The process-global offline-hive-mount lock. Prefer `ScopedOfflineHiveLock`
- * below over taking this directly -- see the file header for the full
- * contract.
+ * The process-global offline-hive-mount lock. Take it as a std::lock_guard
+ * around the whole privilege-enable-through-restore sequence -- see the file
+ * header for the full contract.
  */
 YUZU_EXPORT std::mutex& offline_hive_mutex();
-
-/**
- * RAII guard around offline_hive_mutex() that logs how long this call
- * waited to acquire the lock and how long it held it -- see the file
- * header's INSTRUMENTATION note. `caller` is a short, static string
- * identifying the call site (e.g. "with_user_hive", "execution_artifacts")
- * for attributing contention; it is never freed, so pass a string literal.
- */
-class YUZU_EXPORT ScopedOfflineHiveLock {
-public:
-    explicit ScopedOfflineHiveLock(const char* caller);
-    ~ScopedOfflineHiveLock();
-
-    ScopedOfflineHiveLock(const ScopedOfflineHiveLock&) = delete;
-    ScopedOfflineHiveLock& operator=(const ScopedOfflineHiveLock&) = delete;
-
-private:
-    const char* caller_;
-    std::chrono::steady_clock::time_point acquired_at_;
-};
 
 } // namespace yuzu::agent
