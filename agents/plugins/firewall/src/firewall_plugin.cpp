@@ -776,8 +776,8 @@ open_nft_socket(std::chrono::milliseconds send_budget) {
         // nonzero bound instead so a send() here still fails fast.
         tv.tv_usec = 1;
     } else {
-        tv.tv_sec = send_budget.count() / 1000;
-        tv.tv_usec = (send_budget.count() % 1000) * 1000;
+        tv.tv_sec = static_cast<decltype(tv.tv_sec)>(send_budget.count() / 1000);
+        tv.tv_usec = static_cast<decltype(tv.tv_usec)>((send_budget.count() % 1000) * 1000);
     }
     // Checked: this call installs the ONLY thing bounding the send() this
     // socket will do (the doc comment above's whole guarantee rests on it).
@@ -833,10 +833,15 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
     if (std::chrono::steady_clock::now() >= deadline)
         return {NftDumpStatus::timeout, 0};
 
+    // Bounded by `deadline`, not just by errno: an unbounded EINTR retry
+    // here would let a signal storm spin past the whole budget before the
+    // poll loop below ever gets a chance to time it out (governance gate3
+    // cpp-safety / gate6 sre finding, r1 -- converged, same as the recvmsg
+    // retry just below).
     ssize_t sent;
     do {
         sent = ::send(fd, req, sizeof(req), 0);
-    } while (sent < 0 && errno == EINTR);
+    } while (sent < 0 && errno == EINTR && std::chrono::steady_clock::now() < deadline);
     if (sent != static_cast<ssize_t>(sizeof(req)))
         return {}; // io_error (NftDumpResult's default status)
 
@@ -871,8 +876,9 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
         do {
             // MSG_TRUNC is read from msg_flags below, never passed as a flag
             // here (C2's other, non-negotiable half of the contract).
+            // Bounded by `deadline`, same reasoning as the send retry above.
             n = ::recvmsg(fd, &rm, 0);
-        } while (n < 0 && errno == EINTR);
+        } while (n < 0 && errno == EINTR && std::chrono::steady_clock::now() < deadline);
         if (n <= 0)
             return {}; // io_error
 
@@ -1130,8 +1136,14 @@ bool try_ufw_state(yuzu::CommandContext& ctx, bool tables_seen) {
     // the "Status: active/inactive" first line -- `numbered` also emits it
     // -- and parse_ufw_rules can now count the bracketed rows from the same
     // single command, no extra process and no extra time off the 5s budget.
-    auto state =
-        yuzu::firewall::nft_fallthrough_clamp(tables_seen, yuzu::firewall::parse_ufw_status(res.output));
+    // state| is gated on subprocess_complete(), the same completeness check
+    // ruleset| already used -- a timed-out or output-capped read must not
+    // report a parsed status as though it were trustworthy (governance
+    // gate2 security-guardian finding, r1).
+    auto state = subprocess_complete(res)
+                     ? yuzu::firewall::nft_fallthrough_clamp(
+                           tables_seen, yuzu::firewall::parse_ufw_status(res.output))
+                     : yuzu::firewall::FwState::unknown;
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"
@@ -1197,9 +1209,17 @@ bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
         if (r.type == yuzu::firewall::IptablesEntryType::append)
             ++append_count;
     }
-    auto state = yuzu::firewall::nft_fallthrough_clamp(
-        tables_seen,
-        has_content ? yuzu::firewall::FwState::enabled : yuzu::firewall::FwState::disabled);
+    // state| is gated on subprocess_complete(), the same completeness check
+    // ruleset| already used -- exit_code==0 alone doesn't rule out a
+    // timed-out or output-capped read, and a parsed verdict off a partial
+    // -S dump is not trustworthy (governance gate2 security-guardian
+    // finding, r1).
+    auto state = subprocess_complete(res)
+                     ? yuzu::firewall::nft_fallthrough_clamp(
+                           tables_seen,
+                           has_content ? yuzu::firewall::FwState::enabled
+                                       : yuzu::firewall::FwState::disabled)
+                     : yuzu::firewall::FwState::unknown;
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"
