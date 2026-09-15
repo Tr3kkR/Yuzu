@@ -165,7 +165,7 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     // test can survive into the ceiling-saturation test below and let its
     // "Rejected" call through uncontended -- a real, observed flake (a
     // quality-engineer governance pass caught it failing ~1 run in 6).
-    auto deadline = std::chrono::steady_clock::now() + 2s;
+    auto deadline = std::chrono::steady_clock::now() + 5s;
     while (yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed) !=
                baseline &&
            std::chrono::steady_clock::now() < deadline) {
@@ -234,13 +234,26 @@ TEST_CASE("bounded_keychain_call reports Rejected, and never invokes fn, at the 
     }
 
     // This test's saturation loop assumes it starts from zero outstanding
-    // calls in this image -- if some earlier test in this binary left a
-    // guard alive past its own scope (the abandoned-thread regression test
-    // above once did exactly this, intermittently), the loop below would
-    // silently under-fill `held` and the Rejected assertion could pass
-    // vacuously against a ceiling that was never actually reached. Fail
-    // loudly here instead of discovering it as a flaky Completed/entered
-    // mismatch three assertions down.
+    // calls in this image. g_outstanding_bounded_calls is shared by every
+    // bounded_call_ex consumer linked into this same test binary, not just
+    // this file's own tests -- a sibling test elsewhere (test_bounded_wait's
+    // own rejection case, test_passwd_lookup, etc.) can hold a guard for a
+    // few milliseconds around the exact moment this test starts, especially
+    // under heavy concurrent CPU load (observed once in practice, at a
+    // ~1-in-dozens rate, coinciding with several other unrelated build/test
+    // processes competing for cores on this Mac). Poll-wait for it to settle
+    // rather than asserting immediately, so a transient overlap from an
+    // unrelated test doesn't produce a spurious hard failure here; only a
+    // genuine, permanent leak trips the REQUIRE below.
+    {
+        auto deadline = std::chrono::steady_clock::now() + 5s;
+        while (g_outstanding_bounded_calls.load() != 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(5ms);
+        }
+    }
+    // If it still hasn't settled, fail loudly here instead of discovering it
+    // as a flaky Completed/entered mismatch three assertions down.
     REQUIRE(g_outstanding_bounded_calls.load() == 0);
 
     // Saturate the ceiling from THIS thread, so the next call is rejected
