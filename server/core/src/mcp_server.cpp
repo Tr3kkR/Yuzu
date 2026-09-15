@@ -11621,6 +11621,52 @@ McpServer::HandlerFn McpServer::build_handler(
                          sp["instruction_id"].is_string())
                             ? sp.value("instruction_id", "")
                             : "";
+                    // Gate 6 sre + chaos-injector findings (#4364 re-review):
+                    // re-apply the SAME caps create_result_set_from_instruction_
+                    // result enforces at creation time (instruction_id length,
+                    // plus the three params caps below), checked here ahead of
+                    // the instruction_store gate below - a malformed/oversized
+                    // field is a permanent client error regardless of backend
+                    // availability (same reordering rationale as the Gate 4
+                    // fixes above it in this file). `orig` may have been
+                    // minted via the uncapped create_result_set constructor
+                    // (source_kind labeled instruction_result with no
+                    // create-time field checks of its own) - without this, an
+                    // oversized instruction_id would reach instruction_store's
+                    // lookup unbounded, and an over-keyed or oversized params
+                    // object would dispatch fleet-wide. Mirrors the sql-size
+                    // recheck in the kTarQuery branch above. chaos-injector's
+                    // Finding 1 caught the instruction_id gap: the fix's own
+                    // "re-apply the SAME caps" note originally covered only
+                    // params, not this sibling field.
+                    if (instruction_id.size() > kInstructionIdMaxLen) {
+                        reject_field_too_large(std::format(
+                            "instruction_id must be at most {} bytes", kInstructionIdMaxLen));
+                        return;
+                    }
+                    if (sp.contains("params") && sp["params"].is_object()) {
+                        const auto& p = sp["params"];
+                        if (p.size() > kExecInstrParamCountMax) {
+                            reject_field_too_large(std::format(
+                                "params must have at most {} keys", kExecInstrParamCountMax));
+                            return;
+                        }
+                        for (const auto& [k, v] : p.items()) {
+                            if (k.size() > kExecInstrParamKeyMaxLen) {
+                                reject_field_too_large(std::format(
+                                    "a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
+                                return;
+                            }
+                            const std::size_t vlen = v.is_string()
+                                                          ? v.get_ref<const std::string&>().size()
+                                                          : v.dump().size();
+                            if (vlen > kExecInstrParamValueMaxLen) {
+                                reject_field_too_large(std::format(
+                                    "a params value exceeds {} bytes", kExecInstrParamValueMaxLen));
+                                return;
+                            }
+                        }
+                    }
                     // Adversarial review (PR #4330): this used to fall through
                     // an unwired/closed instruction_store into the same
                     // non-retryable 400 as "the original row genuinely has no
@@ -11655,38 +11701,6 @@ McpServer::HandlerFn McpServer::build_handler(
                                            "RESULT_SET_BAD_REQUEST: original instruction unavailable"),
                             "application/json");
                         return;
-                    }
-                    // Gate 4 unhappy-path BLOCKING fix: re-apply the SAME three
-                    // caps create_result_set_from_instruction_result enforces at
-                    // creation time. `orig` may have been minted via the uncapped
-                    // create_result_set constructor (source_kind labeled
-                    // instruction_result with no create-time params check of its
-                    // own) - without this, re-eval would smuggle an over-keyed
-                    // or oversized params object past those caps, then dispatch
-                    // it fleet-wide. Mirrors the sql-size recheck in the
-                    // kTarQuery branch above.
-                    if (sp.contains("params") && sp["params"].is_object()) {
-                        const auto& p = sp["params"];
-                        if (p.size() > kExecInstrParamCountMax) {
-                            reject_field_too_large(std::format(
-                                "params must have at most {} keys", kExecInstrParamCountMax));
-                            return;
-                        }
-                        for (const auto& [k, v] : p.items()) {
-                            if (k.size() > kExecInstrParamKeyMaxLen) {
-                                reject_field_too_large(std::format(
-                                    "a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
-                                return;
-                            }
-                            const std::size_t vlen = v.is_string()
-                                                          ? v.get_ref<const std::string&>().size()
-                                                          : v.dump().size();
-                            if (vlen > kExecInstrParamValueMaxLen) {
-                                reject_field_too_large(std::format(
-                                    "a params value exceeds {} bytes", kExecInstrParamValueMaxLen));
-                                return;
-                            }
-                        }
                     }
                     std::unordered_map<std::string, std::string> params;
                     if (sp.contains("params") && sp["params"].is_object())

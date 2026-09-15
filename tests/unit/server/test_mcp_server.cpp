@@ -24462,6 +24462,146 @@ TEST_CASE("MCP reevaluate_result_set: a params object smuggled past create_resul
         CHECK(body["error"]["code"] == kInvalidParams);
         CHECK_FALSE(dispatched);
     }
+
+    SECTION("a non-string params value is measured by its dump() size, not skipped - the "
+            "same coverage gap chaos-injector flagged: the create-time check (mirrored "
+            "above) has this SECTION already, but the smuggled-payload recheck did not") {
+        nlohmann::json payload;
+        payload["instruction_id"] = instruction_id;
+        payload["params"] = {{"k", {{"pad", std::string(65537, 'z')}}}};
+
+        CreateRequest cr;
+        cr.owner_principal = "test-user";
+        cr.name = "seed";
+        cr.source_kind = std::string(source_kind::kInstructionResult);
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+
+        bool dispatched = false;
+        auto dispatch =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            dispatched = true;
+            return {.sent = 1, .command_id = "cmd-should-not-happen"};
+        };
+
+        McpTestServer ts;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.instruction_store_for_test = &instr;
+        ts.start_with_dispatch(dispatch, "operator");
+
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":3,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            seeded->id + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK_FALSE(dispatched);
+    }
+
+    SECTION("an instruction_id longer than kInstructionIdMaxLen (256) bytes is rejected - "
+            "chaos-injector Finding 1: the fix's own 'mirror the creation-time caps' note "
+            "originally covered only params, not this sibling field") {
+        nlohmann::json payload;
+        payload["instruction_id"] = std::string(257, 'q');
+
+        CreateRequest cr;
+        cr.owner_principal = "test-user";
+        cr.name = "seed";
+        cr.source_kind = std::string(source_kind::kInstructionResult);
+        cr.source_payload = payload.dump();
+        auto seeded = rs_bundle.get()->create_materialized(cr, {});
+        REQUIRE(seeded.has_value());
+
+        bool dispatched = false;
+        auto dispatch =
+            [&](const std::string&, const std::string&, const std::vector<std::string>&,
+                const std::string&, const std::unordered_map<std::string, std::string>&,
+                const std::string&,
+                const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+            dispatched = true;
+            return {.sent = 1, .command_id = "cmd-should-not-happen"};
+        };
+
+        // instruction_store_for_test stays nullptr: proves the instruction_id
+        // length check runs ahead of the store gate too, matching every
+        // other reordering fix in this PR.
+        McpTestServer ts;
+        ts.execution_tracker_for_test = tracker_bundle.get();
+        ts.result_set_store_for_test = rs_bundle.get();
+        ts.start_with_dispatch(dispatch, "operator");
+
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+            seeded->id + R"("}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == kInvalidParams);
+        CHECK_FALSE(dispatched);
+    }
+}
+
+// Gate 6 sre finding (#4364 re-review): the params-bound recheck just above
+// ran AFTER the instruction_store availability gate, unlike every sibling
+// ordering fix in this same PR - during a concurrent instruction_store
+// outage, an oversized/over-keyed params object got the STORE'S retryable
+// 503 (retry_after_ms set) instead of the permanent 400 the bound violation
+// actually is. instruction_store_for_test is left unwired (nullptr) here on
+// purpose, so the store-unavailable branch would fire first if the
+// reordering fix regressed.
+TEST_CASE("MCP reevaluate_result_set: a smuggled params bound is a permanent client error "
+          "even when the instruction store is unavailable",
+          "[pg][mcp][integration][result-sets][bounds]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    nlohmann::json payload;
+    payload["instruction_id"] = "does-not-matter";
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params[std::format("k{}", i)] = "v";
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "seed";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    // instruction_store_for_test stays nullptr - the point of this test.
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    REQUIRE(body["error"].contains("data"));
+    CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+    CHECK_FALSE(dispatched);
 }
 
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
