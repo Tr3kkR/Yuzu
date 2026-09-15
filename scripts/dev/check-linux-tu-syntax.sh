@@ -105,7 +105,13 @@ done
 
 if [ -f '"$test_tu"' ]; then
     if [ "$have_catch2" -eq 1 ]; then
-        if g++ -std=c++23 -fsyntax-only -Wall -Wextra -Iagents/plugins/firewall/src '"$test_tu"' 2>/tmp/err.log; then
+        # Same $incs as the plugin TU above, not just -Iagents/plugins/
+        # firewall/src -- firewall_parsers.hpp now includes
+        # <yuzu/agent/subprocess_runner.hpp> (the subprocess_complete()
+        # hoist, code-review round 1), so the test TU needs agent-core on
+        # its include path too, or it fails identically to a real build
+        # even though the header itself is fine (caught when this drifted).
+        if g++ -std=c++23 -fsyntax-only -Wall -Wextra $incs '"$test_tu"' 2>/tmp/err.log; then
             echo "  ok    '"$test_tu"'"
         else
             echo "  FAIL  '"$test_tu"'"
@@ -116,7 +122,7 @@ if [ -f '"$test_tu"' ]; then
         echo "  SKIP  '"$test_tu"' (catch2 unavailable in-container — checking firewall_parsers.hpp directly instead)"
         wrapper=/tmp/firewall_parsers_syntax_check.cpp
         echo "#include \"firewall_parsers.hpp\"" > "$wrapper"
-        if g++ -std=c++23 -fsyntax-only -Wall -Wextra -Iagents/plugins/firewall/src "$wrapper" 2>/tmp/err.log; then
+        if g++ -std=c++23 -fsyntax-only -Wall -Wextra $incs "$wrapper" 2>/tmp/err.log; then
             echo "  ok    firewall_parsers.hpp"
         else
             echo "  FAIL  firewall_parsers.hpp"
