@@ -34,9 +34,19 @@ A superseding row restates ONLY what changed - PLUS eight fields SKILL.md
 requires on EVERY row regardless of whether they changed: `schema_version`,
 `run_id`, `finding_id`, `recorded_by`, `recorded_at`, `pass_ordinal`,
 `reviewed_at_sha`, `disposition`. That per-row minimum is checked on every row
-that participates in the post-#2619 regime (identified by carrying either
-`recorded_at` or `schema_version` - a row with neither is genuinely legacy and
-exempt). Attestation pairing and the one frozen field (`severity_native`,
+that participates in the post-#2619 regime - identified by carrying ANY field
+#2619 introduced (`_V2619_ONLY_FIELDS`: `schema_version`, `source`,
+`reporter_ref`, `reviewed_at_sha`, `recorded_at`, `recorded_by`,
+`adjudication_rationale`, the `refuted` pair, or `classification: "absence"`)
+- a row with NONE of them is genuinely legacy and exempt. Checking only
+`recorded_at`/`schema_version` (an earlier version of this checker) missed a
+row that omitted BOTH while still carrying e.g. `recorded_by`/
+`reviewed_at_sha`, letting a real escalation vanish undetected.
+`pass_ordinal` and `run_id` are additionally validated PER ROW, not only on
+the merged result: `pass_ordinal` determines MERGE ORDER itself (a bad value
+maps to 0 for sorting), so a row that wins or loses a tie because of it must
+be checked directly, not only via whichever value happens to survive into the
+merge. Attestation pairing and the one frozen field (`severity_native`,
 compared against the FINDING's first row, not merely the first row that
 happens to mention the key - an omission-then-later-invention is the same
 fabrication as a null-then-later-invention) are also checked PER ROW, so an
@@ -104,6 +114,30 @@ DISPOSITION_PREFIXES = ("deferred-to-issue #", "roadmap-#", "linked-to-#")
 # marker check, not proof the citation is real, but it catches "floor sourced
 # to nothing" / an invented label (the empty-impact gaming vector).
 _FLOOR_MARKERS = ("CLAUDE.md", "ADR", "routed-concern", "routed concern")
+
+# SKILL.md is explicit that missing-`schema_version` IS the legacy discriminator
+# ("A validator treats missing-schema_version as the legacy discriminator") and
+# that on a genuinely legacy row EVERY field #2619 introduced is "absent by
+# construction" - it names these: source, reporter_ref, reviewed_at_sha,
+# recorded_at, recorded_by, adjudication_rationale, the refuted pair, and
+# classification's "absence" value. So a row (or a finding's merged view) that
+# carries schema_version itself, OR ANY OTHER one of these markers, cannot be
+# genuinely legacy - checking only schema_version/recorded_at (an earlier
+# version of this checker) missed a row that omits BOTH of those two while
+# still carrying e.g. recorded_by/reviewed_at_sha, which is unambiguously
+# modern and can otherwise silently discard a real escalation.
+_V2619_ONLY_FIELDS = frozenset({"schema_version", "source", "reporter_ref", "reviewed_at_sha",
+                                "recorded_at", "recorded_by", "adjudication_rationale",
+                                "refuted_by", "refuted_by_reporter"})
+
+
+def _looks_versioned(d):
+    """True if the dict (a single row, or a finding's merged view) carries any
+    field #2619 introduced - meaning it cannot be genuinely legacy, per
+    SKILL.md's own definition of what a legacy row looks like."""
+    if any(k in d for k in _V2619_ONLY_FIELDS):
+        return True
+    return d.get("classification") == "absence"
 
 # base band per impact code (SKILL.md "IMPACT - gives the base band")
 _BASE = {"I1": "HIGH", "I2": "HIGH", "I3": "HIGH", "I4": "HIGH",
@@ -258,7 +292,17 @@ def check_fragment(path):
         ordered = sorted(((idx, r) for idx, (n, r) in entries), key=_order_key)
         line_of = {id(r): n for _, (n, r) in entries}
         merged = merged_view(ordered)
-        legacy = "schema_version" not in merged  # true legacy: NO row ever carried it
+        # Tested against each RAW row, not the merged view: merged_view()
+        # strips the three attestation-only markers (adjudication_rationale,
+        # refuted_by, refuted_by_reporter) since they're row-scoped and
+        # excluded from the merge, so a finding whose ONLY #2619 marker is one
+        # of those three would read as versioned per-row but legacy at the
+        # merged level - never a live hole (such a row still lacks
+        # schema_version, so missing-row-field already fires on it), but it
+        # would wrongly exempt that finding from the merged-view checks below
+        # (reporter/source/policy_floor presence, disposition's closed-enum
+        # half) and make this comment false.
+        legacy = not any(_looks_versioned(r) for _, r in ordered)
 
         # ---------- PER-ROW checks ----------
         # These run per ROW, not first-vs-live, so an intermediate violation a
@@ -266,6 +310,7 @@ def check_fragment(path):
         # ledger permanently contains the act it recorded).
         native_established = False
         native_seen = None
+        seen_bad_recorded_at = False  # a finding with one has indeterminate merge order
         for row_pos, (_, r) in enumerate(ordered):
             ln = line_of[id(r)]
 
@@ -287,32 +332,61 @@ def check_fragment(path):
             elif "severity_native" in r:
                 val = r.get("severity_native")
                 if val != native_seen:
+                    qualifier = ("" if not seen_bad_recorded_at else
+                                 " (NOTE: this finding also has a bad-recorded-at row, so merge order - "
+                                 "and therefore which row is genuinely 'first' - is indeterminate; this "
+                                 "message may be attributing the mutation to the wrong direction)")
                     add(fid, "STRICT", "native-mutated",
-                        f"line {ln}: severity_native set to {val!r}, "
-                        f"differs from the finding's first-row value {native_seen!r} (reporter's own word, immutable)")
+                        f"line {ln}: severity_native set to {val!r}, differs from the finding's "
+                        f"first-row value {native_seen!r} (reporter's own word, immutable){qualifier}")
 
-            # scalar impact/exposure - the shape the jq park probe's array check exists to catch
+            # scalar impact/exposure - the shape the jq park probe's array check
+            # exists to catch. `null` is explicitly EXCLUDED here, not merely
+            # tolerated: SKILL.md states "impact: [] or a null fact set derives
+            # INFO", treating null as an equally legitimate empty-fact-set
+            # spelling - flagging it here would contradict the missing-field
+            # check's own (deliberate) tolerance of it for the same two fields.
             for lf in LIST_FIELDS:
-                if lf in r and not isinstance(r[lf], list):
+                if lf in r and r[lf] is not None and not isinstance(r[lf], list):
                     add(fid, "STRUCTURAL", "scalar-list-field",
-                        f"line {ln}: {lf} must be a JSON array, got {r[lf]!r}")
+                        f"line {ln}: {lf} must be a JSON array (or null for an empty fact set), "
+                        f"got {r[lf]!r}")
+
+            # pass_ordinal and run_id are validated PER ROW, not only on the
+            # merged result: pass_ordinal determines MERGE ORDER itself (a bad
+            # value silently maps to 0 for sorting in _order_key, so the row it
+            # belongs to can WIN or LOSE a tie based on that bad value and then
+            # vanish from the merge before anything downstream ever looks at
+            # it - checking only merged["pass_ordinal"] inspects the winning
+            # row's value, never the losing row's bad one that caused the
+            # wrong outcome). run_id is checked per row for the same reason a
+            # merged-only check missed it: a mid-history wrong run_id that a
+            # later row incidentally restates correctly reads clean at the
+            # merged level while the ledger permanently contains the bad row.
+            if "pass_ordinal" in r and (not _is_int(r["pass_ordinal"]) or r["pass_ordinal"] < 0):
+                add(fid, "STRUCTURAL", "bad-pass-ordinal",
+                    f"line {ln}: pass_ordinal must be a non-negative integer, got {r['pass_ordinal']!r} "
+                    f"(this row's own value, valid or not, determines its precedence in the merge)")
+            if "run_id" in r and r["run_id"] != expected_run:
+                add(fid, "STRUCTURAL", "run-id-mismatch",
+                    f"line {ln}: run_id {r['run_id']!r} != filename stem {expected_run!r}")
 
             # a row that participates in the post-#2619 append model (carries
-            # EITHER recorded_at or schema_version - a genuinely legacy row
-            # carries neither) must restate the eight mandatory fields, even
-            # when otherwise sparse. A malformed recorded_at is reported
-            # (precedence for THIS row is then indeterminate) but still sorts
-            # legacy-first as the least-surprising deterministic placement -
-            # the finding must not read as clean while one exists, since a
-            # malformed timestamp on an ESCALATION can silently lose the merge
-            # to an earlier, lower-severity row with no other signal.
-            ra_present = "recorded_at" in r
-            sv_present = "schema_version" in r
-            if ra_present and _instant(r.get("recorded_at")) is None:
+            # ANY field #2619 introduced - a genuinely legacy row carries NONE
+            # of them, per SKILL.md's own definition) must restate the eight
+            # mandatory fields, even when otherwise sparse. A malformed
+            # recorded_at is reported (precedence for THIS row is then
+            # indeterminate) but still sorts legacy-first as the
+            # least-surprising deterministic placement - the finding must not
+            # read as clean while one exists, since a malformed timestamp on
+            # an ESCALATION can silently lose the merge to an earlier,
+            # lower-severity row with no other signal.
+            if "recorded_at" in r and _instant(r.get("recorded_at")) is None:
                 add(fid, "STRUCTURAL", "bad-recorded-at",
                     f"line {ln}: recorded_at {r.get('recorded_at')!r} does not parse as ISO-8601; "
                     f"this row's precedence relative to its peers is indeterminate")
-            if ra_present or sv_present:
+                seen_bad_recorded_at = True
+            if _looks_versioned(r):
                 for req in REQUIRED_ROW_FIELDS:
                     if req not in r:
                         add(fid, "STRUCTURAL", "missing-row-field",
@@ -327,16 +401,31 @@ def check_fragment(path):
         # loop covers the fields that MAY legitimately be introduced only once
         # and then omitted forever after (they are not in the per-row eight).
         if not legacy:
+            # impact/exposure are deliberately checked for PRESENCE only, not
+            # non-null: SKILL.md is explicit that "impact: [] or a null fact
+            # set derives INFO" - an explicit null is a legitimate empty fact
+            # set, not a missing field.
             for req in ("source", "impact", "exposure", "severity_mapped"):
                 if req not in merged:
                     add(fid, "STRUCTURAL", "missing-field",
                         f"live view lacks required field '{req}'")
+            # SKILL.md's field table: "all required unless marked - on the row
+            # that FIRST raises a finding". epistemic_status/provenance/
+            # classification carry no nullable annotation there (unlike
+            # recorded_by/reporter_ref/adjudicated_by/caused_by/
+            # waiver_rationale, which do), so - UNLIKE impact/exposure above -
+            # an explicit null does not satisfy them. A later supersession may
+            # still legitimately correct an earlier omission (the same general
+            # write model every other content field uses), so this is checked
+            # on the MERGED view, not strictly the raising row itself.
+            for req in ("epistemic_status", "provenance", "classification"):
+                if req not in merged or merged.get(req) is None:
+                    add(fid, "STRUCTURAL", "missing-field",
+                        f"live view lacks required field '{req}' (or it is null) - "
+                        f"SKILL.md marks it required, not nullable, unlike impact/exposure")
             if "policy_floor" not in merged:
                 add(fid, "STRUCTURAL", "missing-field",
                     "live view lacks 'policy_floor' key (write null, do not omit)")
-        if "run_id" in merged and merged.get("run_id") != expected_run:
-            add(fid, "STRUCTURAL", "run-id-mismatch",
-                f"run_id {merged.get('run_id')!r} != filename stem {expected_run!r}")
         if "source" in merged and not _in(merged.get("source"), SOURCES):
             add(fid, "STRUCTURAL", "bad-source",
                 f"source {merged.get('source')!r} not one of {sorted(SOURCES)}")
@@ -379,14 +468,22 @@ def check_fragment(path):
             add(fid, "STRUCTURAL", "bad-independent-reporters",
                 f"independent_reporters must be an integer, got {ir!r}")
         if not legacy:
-            sv = merged.get("schema_version")  # key guaranteed present: that's the def'n of `legacy`
+            # `legacy` is now "no #2619-only field ANYWHERE" (_looks_versioned),
+            # not specifically schema_version's own presence - so a finding can
+            # be non-legacy (carries e.g. recorded_by) while genuinely missing
+            # schema_version, which fires here (redundantly, but harmlessly,
+            # alongside missing-row-field on whichever row triggered non-legacy
+            # status). Any non-bool integer is accepted, not just `1`: SKILL.md
+            # states schema_version is "currently 1" but ALSO that "one fragment
+            # can legitimately hold rows written under two versions of this
+            # table" - a deliberate forward-tolerance choice, not an oversight.
+            sv = merged.get("schema_version")
             if not _is_int(sv):
                 add(fid, "STRUCTURAL", "bad-schema-version", f"schema_version must be an integer, got {sv!r}")
-        if "pass_ordinal" in merged:
-            po = merged["pass_ordinal"]
-            if not _is_int(po) or po < 0:
-                add(fid, "STRUCTURAL", "bad-pass-ordinal",
-                    f"pass_ordinal must be a non-negative integer, got {po!r}")
+        # pass_ordinal is NOT re-checked here: the per-row loop above already
+        # validates every row's own value (including the merge's eventual
+        # winner), which is the point of that fix - a second merged-only check
+        # here would only ever double-report the same row.
         # epistemic_status/provenance/classification are FINDING-CONTENT enums,
         # not append-machinery fields the #2619 schema versioning introduced -
         # their valid values are a general contract, so these checks are NOT

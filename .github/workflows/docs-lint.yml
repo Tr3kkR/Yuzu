@@ -87,7 +87,7 @@ jobs:
 
       # Governance-ledger linter self-test. NOTE: the linter itself
       # (scripts/ci/check-governance-ledger.py) is DELIBERATELY NOT run as a CI
-      # gate over governance.d/ — calibration showed ~93% of historical
+      # gate over governance.d/ — calibration showed most historical
       # fragments predate its strict self-consistency rules, so it is an
       # ADVISORY author-side pre-push check (the /governance skill runs it on
       # the current run's fragment). Only this self-test runs in CI, to keep the

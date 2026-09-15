@@ -1865,12 +1865,26 @@ to close rather than a contradiction to adjudicate.
    rather than silently sorted as legacy, because a malformed timestamp on a
    genuine severity ESCALATION can otherwise vanish from the merge with nothing
    else able to surface it. On top of the merge it separately checks, PER ROW,
-   that a row participating in the post-#2619 regime (carries `recorded_at` or
-   `schema_version`) restates all EIGHT mandatory fields even when sparse
+   that a row participating in the post-#2619 regime — carrying ANY field
+   #2619 introduced (`schema_version`, `source`, `reporter_ref`,
+   `reviewed_at_sha`, `recorded_at`, `recorded_by`, `adjudication_rationale`,
+   the `refuted` pair, or `classification: "absence"` — a genuinely legacy row
+   carries NONE of them, per SKILL.md's own definition, so checking only two of
+   the markers missed a row that omits BOTH while still carrying e.g.
+   `recorded_by`) — restates all EIGHT mandatory fields even when sparse
    (`schema_version`, `run_id`, `finding_id`, `recorded_by`, `recorded_at`,
    `pass_ordinal`, `reviewed_at_sha`, `disposition`) — omitting one of the eight
    is a violation even though every OTHER field may legitimately be omitted when
-   unchanged. On the merged view it checks: `severity_mapped` not weaker than the
+   unchanged. `pass_ordinal` and `run_id` are additionally validated PER ROW
+   (not only on the merged result): `pass_ordinal` determines MERGE ORDER
+   itself, so a bad value on a row that loses a tie because of it would
+   otherwise vanish before anything downstream ever inspects it, and a
+   mid-history wrong `run_id` a later row incidentally restates correctly
+   would otherwise read clean at the merged level alone. On the merged view it
+   also requires `epistemic_status`/`provenance`/`classification` present and
+   non-null on a non-legacy finding — SKILL.md's field table marks them
+   required with no nullable annotation, unlike `impact`/`exposure`, which
+   explicitly tolerate a null fact set — and checks: `severity_mapped` not weaker than the
    facts' derived floor band (over-labeling is left alone — a conditional raise
    can legitimately exceed the flat table — and a floor gates separately via
    `policy_floor`, which must itself cite a closed source or an empty-impact

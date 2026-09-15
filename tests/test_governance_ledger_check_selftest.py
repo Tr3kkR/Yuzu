@@ -53,7 +53,9 @@ def expect(cond, label):
 def _full(**kw):
     """A complete, conforming governance-agent row - carries all eight fields
     SKILL.md mandates on EVERY row (schema_version, run_id, finding_id,
-    recorded_by, recorded_at, pass_ordinal, reviewed_at_sha, disposition) plus
+    recorded_by, recorded_at, pass_ordinal, reviewed_at_sha, disposition),
+    plus epistemic_status/provenance/classification at valid non-null values
+    (SKILL.md marks these required, not nullable, unlike impact/exposure) and
     the usual finding-content fields."""
     base = {
         "schema_version": 1, "run_id": None, "finding_id": "f1",
@@ -62,7 +64,8 @@ def _full(**kw):
         "recorded_at": "2026-09-15T10:00:00Z", "pass_ordinal": 0,
         "severity_native": "MEDIUM", "severity_mapped": "SHOULD",
         "impact": ["I6"], "exposure": ["E0"], "policy_floor": None,
-        "classification": None, "disposition": "open", "independent_reporters": 1,
+        "classification": "truth-contradiction", "epistemic_status": "likely",
+        "provenance": "introduced", "disposition": "open", "independent_reporters": 1,
         "adjudicated_by": None, "adjudication_rationale": None,
     }
     base.update(kw)
@@ -85,11 +88,12 @@ def _sparse(**kw):
     return base
 
 
-def _write(dirpath, stem, rows):
+def _write(dirpath, stem, rows, stamp_run_id=True):
     p = Path(dirpath) / f"{stem}.jsonl"
-    for r in rows:
-        if "run_id" in r:  # only stamp rows that carry the key (keep sparse rows sparse)
-            r["run_id"] = stem
+    if stamp_run_id:
+        for r in rows:
+            if "run_id" in r:  # only stamp rows that carry the key (keep sparse rows sparse)
+                r["run_id"] = stem
     p.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
     return str(p)
 
@@ -141,6 +145,16 @@ def run():
            "pin DISPOSITION_PREFIXES")
     expect(tuple(M._FLOOR_MARKERS) == ("CLAUDE.md", "ADR", "routed-concern", "routed concern"),
            "pin _FLOOR_MARKERS")
+    expect(set(M._V2619_ONLY_FIELDS) == {"schema_version", "source", "reporter_ref", "reviewed_at_sha",
+                                         "recorded_at", "recorded_by", "adjudication_rationale",
+                                         "refuted_by", "refuted_by_reporter"},
+           "pin _V2619_ONLY_FIELDS (SKILL.md's own citation of what a legacy row lacks)")
+    expect(M._looks_versioned({"recorded_by": "x"}) is True,
+           "_looks_versioned: a single #2619-only field is sufficient (round-3 fix)")
+    expect(M._looks_versioned({"classification": "absence"}) is True,
+           "_looks_versioned: classification=='absence' counts too")
+    expect(M._looks_versioned({"reporter": "architect", "impact": ["I6"]}) is False,
+           "_looks_versioned: none of the markers present -> genuinely legacy")
     expect(M.min_derived_band(["I9"], ["E0"]) == "INFO", "derive I9/E0 -> INFO")
     expect(M.min_derived_band(["I3"], ["E0"]) == "HIGH", "derive I3/E0 -> HIGH")
     expect(M.min_derived_band(["I6"], ["E1"]) == "HIGH", "derive I6/E1 -> HIGH (E1 raises)")
@@ -388,27 +402,136 @@ def run():
         clean_of("9-irnull.X", [_full(finding_id="j", independent_reporters=None)],
                  "bad-independent-reporters", "explicit null independent_reporters is NOT flagged (legit 'uncounted')")
 
-        # -------- (5) F11: legacy row (no schema_version, no recorded_at) is PARTIALLY exempt --------
-        # Exempt: the eight per-row-mandatory fields, and disposition's CLOSED-
-        # ENUM half (a #2643-era convention, later than #2619's schema_version).
-        # NOT exempt: disposition's own must-be-a-string check, and the
-        # content-shape enums (classification/epistemic_status/provenance),
-        # which are general contracts predating any schema-versioning split -
-        # a genuinely ancient row can still carry a value worth flagging there.
-        legacy = {"finding_id": "L", "reporter": "architect", "source": "governance-agent",
+        # -------- (5) round-3 review: the two-discriminator legacy heuristic --------
+        # A row is genuinely legacy ONLY if it carries NONE of the fields
+        # #2619 introduced (SKILL.md's own citation: source, reporter_ref,
+        # reviewed_at_sha, recorded_at, recorded_by, adjudication_rationale,
+        # the refuted pair, classification=="absence") - checking only
+        # schema_version/recorded_at missed a row that omits BOTH of those
+        # two while still carrying e.g. recorded_by/reviewed_at_sha, letting a
+        # real escalation vanish with zero findings.
+        double_omit_row1 = _full(finding_id="e1", severity_native="INFO", severity_mapped="NICE",
+                                 impact=["I9"], exposure=["E0"])
+        double_omit_row2 = {"finding_id": "e1", "recorded_by": "x", "reviewed_at_sha": "def",
+                            "pass_ordinal": 1, "severity_native": "HIGH", "severity_mapped": "BLOCKING",
+                            "impact": ["I1"], "exposure": ["E3"], "disposition": "open"}
+        do = M.check_fragment(_write(d, "9-doubleomit.X", [double_omit_row1, double_omit_row2]))
+        expect(do != [],
+               f"a row carrying recorded_by/reviewed_at_sha but omitting BOTH schema_version and "
+               f"recorded_at is still recognized as modern, not silently legacy (got {_rules(do)})")
+        expect("missing-row-field" in _rules(do),
+               f"...specifically via missing-row-field for the omitted schema_version/recorded_at "
+               f"(got {_rules(do)})")
+
+        # round-3 review, blocker 2: pass_ordinal determines MERGE ORDER via
+        # _order_key BEFORE anything validates its value - a bad value on the
+        # LOSING row of a tie can silently determine the wrong outcome and then
+        # vanish, since only merged["pass_ordinal"] (the WINNING row's own,
+        # possibly-fine value) was ever checked. Two rows at an IDENTICAL
+        # timestamp, one with a genuine escalation and a string pass_ordinal.
+        tie_row1 = _full(finding_id="e2", recorded_at="2026-09-15T10:00:00Z", pass_ordinal=1,
+                         severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"])
+        tie_row2 = _full(finding_id="e2", recorded_at="2026-09-15T10:00:00Z", pass_ordinal="2",
+                         severity_native="HIGH", severity_mapped="BLOCKING", impact=["I1"], exposure=["E3"])
+        tf = M.check_fragment(_write(d, "9-tiepo.X", [tie_row1, tie_row2]))
+        expect(any(f.rule == "bad-pass-ordinal" for f in tf),
+               f"a string pass_ordinal on a tied-timestamp row fires bad-pass-ordinal on ITS OWN row, "
+               f"not only checked after it already determined (and lost) the merge (got {_rules(tf)})")
+
+        # per-row run_id mismatch (minor, side effect of the pass_ordinal fix):
+        # a MID-history wrong run_id that a later row incidentally restates
+        # correctly must still fire, since the merged view alone would read
+        # clean. NOTE: _write() normally stamps every row's run_id to match
+        # the stem (so ordinary fixtures don't have to care) - these two
+        # tests need stamp_run_id=False to deliberately keep a WRONG value.
+        midrow1 = _full(finding_id="rid", recorded_at="2026-09-15T10:00:00Z", run_id="WRONG-STEM")
+        midrow2 = _full(finding_id="rid", recorded_at="2026-09-15T11:00:00Z", disposition="fixed")
+        midf = M.check_fragment(_write(d, "9-runidmid.X", [midrow1, midrow2], stamp_run_id=False))
+        expect("run-id-mismatch" in _rules(midf),
+               f"a mid-history wrong run_id still fires even though a later row restates it "
+               f"correctly (got {_rules(midf)})")
+
+        # -------- (6) the 5 previously-unfixtured rules (mutation-tested: stripping
+        # any of these rule bodies from a copy of the checker left the suite green) --------
+        ridtop = _full(finding_id="j", run_id="totally-different-stem")
+        rtf = M.check_fragment(_write(d, "9-ridtop.X", [ridtop], stamp_run_id=False))
+        expect("run-id-mismatch" in _rules(rtf),
+               f"run_id not matching the filename stem fires (got {_rules(rtf)})")
+        fires("9-impact.X", [_full(finding_id="j", impact=["I99"])],
+              "bad-impact", "off-enum impact code fires")
+        fires("9-exposure.X", [_full(finding_id="j", exposure=["E99"])],
+              "bad-exposure", "off-enum exposure code fires")
+        fires("9-sevmap.X", [_full(finding_id="j", severity_mapped="URGENT")],
+              "bad-severity-mapped", "off-enum severity_mapped fires")
+        fires("9-linktop.X", [_full(finding_id="j", impact=["I2"], exposure=["E0"],
+                                    severity_mapped="BLOCKING", severity_native="HIGH",
+                                    disposition="linked-to-#123")],
+              "linked-top-severity", "linked-to- disposition on an I1/I2/I3 finding fires (a prompt, not a verdict)")
+
+        # -------- (7) epistemic_status/provenance/classification are REQUIRED, --------
+        # not nullable, per SKILL.md's field table (unlike impact/exposure,
+        # which explicitly tolerate a null fact set) - on the FIRST-raising row,
+        # resolved via the merge like any other content field (a later
+        # supersession may correct an earlier omission).
+        for req_field in ("epistemic_status", "provenance", "classification"):
+            missing_row = _full(finding_id="j"); missing_row.pop(req_field)
+            fires(f"9-missing-{req_field}.X", [missing_row], "missing-field",
+                  f"omitted {req_field} on the raising row fires missing-field")
+            null_row = _full(finding_id="j", **{req_field: None})
+            fires(f"9-null-{req_field}.X", [null_row], "missing-field",
+                  f"explicit null {req_field} fires missing-field too (unlike impact/exposure)")
+        # severity_mapped is set to NICE here specifically so severity-empty-impact
+        # (a SEPARATE, legitimate rule - empty impact + a non-NICE label + no
+        # floor) doesn't also fire and confuse what this fixture is isolating.
+        impactnull_findings = M.check_fragment(_write(d, "9-impactnull.X",
+            [_full(finding_id="j", impact=None, severity_mapped="NICE", severity_native="INFO")]))
+        expect(_rules(impactnull_findings) == [],
+               f"explicit null impact fires NEITHER missing-field NOR scalar-list-field - a "
+               f"legit empty fact set (got {_rules(impactnull_findings)})")
+
+        # -------- (8) F11: legacy row (no ANY #2619-introduced field) is PARTIALLY exempt --------
+        # Exempt: the eight per-row-mandatory fields, the NEW required-content
+        # fields (epistemic_status/provenance/classification presence), and
+        # disposition's CLOSED-ENUM half (a #2643-era convention, later than
+        # #2619's schema_version). NOT exempt: disposition's own
+        # must-be-a-string check, and the content enums' VALUE validity
+        # (classification/epistemic_status/provenance still reject a garbage
+        # value if present) - those are general contracts predating any
+        # schema-versioning split, so a genuinely ancient row can still carry
+        # a value worth flagging. Deliberately carries NO `source` key: source
+        # is ITSELF one of the #2619-introduced markers (SKILL.md's own
+        # citation), so a fixture that includes it is not actually legacy-shaped.
+        legacy = {"finding_id": "L", "reporter": "architect",
                   "impact": ["I6"], "exposure": ["E0"], "severity_mapped": "SHOULD",
                   "disposition": "open", "run_id": "9-legacy.X"}
         lf = M.check_fragment(_write(d, "9-legacy.X", [legacy]))
         expect(not any(f.rule in ("missing-field", "missing-row-field", "bad-disposition")
                        for f in lf),
-               f"legacy row (no schema_version/recorded_at) not flagged missing-*/bad-disposition-enum "
+               f"legacy row (no #2619-introduced field at all) not flagged missing-*/bad-disposition-enum "
                f"(F11) (got {_rules(lf)})")
         legacy_bad_cls = dict(legacy, classification="invented")
         lbc = M.check_fragment(_write(d, "9-legacycls.X", [legacy_bad_cls]))
         expect("bad-classification" in _rules(lbc),
-               f"legacy row with an off-enum classification STILL fires - content enums are not "
-               f"legacy-exempt, only the per-row-mandatory-8 and disposition's closed-enum half are "
-               f"(got {_rules(lbc)})")
+               f"legacy row with an off-enum classification STILL fires - content-value validity is not "
+               f"legacy-exempt, only the per-row-mandatory-8/required-content-presence and disposition's "
+               f"closed-enum half are (got {_rules(lbc)})")
+
+        # Fable review (post-round-3): the finding-level `legacy` flag must be
+        # computed from the RAW rows, not the merged view - merged_view()
+        # strips the three attestation-only markers (adjudication_rationale,
+        # refuted_by, refuted_by_reporter), so a finding whose ONLY #2619
+        # marker is one of those three would read as versioned per-row but
+        # legacy at the merged level, wrongly exempting it from the merged-view
+        # checks below (source/policy_floor/required-content presence).
+        att_only = {"finding_id": "att-only", "reporter": "architect", "impact": ["I6"],
+                   "exposure": ["E0"], "severity_mapped": "SHOULD", "disposition": "refuted",
+                   "refuted_by": "git show ... proves it false", "refuted_by_reporter": "not-the-author",
+                   "run_id": "9-attonly.X"}
+        af = M.check_fragment(_write(d, "9-attonly.X", [att_only]))
+        expect(any(f.rule == "missing-field" and "'source'" in f.msg for f in af),
+               f"a row whose ONLY #2619 marker is an attestation field (refuted_by) is still treated "
+               f"as non-legacy at the FINDING level, so merged-view checks (e.g. missing 'source') "
+               f"still apply (got {_rules(af)})")
 
         # -------- robustness: odd types / invalid json don't crash --------
         p = Path(d) / "9-weird.X.jsonl"
