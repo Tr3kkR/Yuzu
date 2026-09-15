@@ -171,6 +171,21 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+def _has_visible_id(v):
+    """A genuine, non-blank identifier string: at least one character that is
+    both printable AND not whitespace. `.strip()` alone is NOT enough for a
+    MERGE KEY specifically - it correctly empties ordinary whitespace (space,
+    tab, NBSP, em/ideographic space - all Unicode 'space' category, category
+    Zs) but leaves zero-width/format characters (U+200B ZERO WIDTH SPACE,
+    U+2060 WORD JOINER - Unicode category Cf) untouched, since those are
+    neither whitespace nor deleted by strip(). A finding_id consisting solely
+    of such characters would still be a non-empty string after `.strip()`
+    while being visually indistinguishable from blank - and unlike an
+    ordinary field, finding_id is the MERGE JOIN KEY ITSELF, so accepting one
+    silently lets two unrelated findings collide."""
+    return isinstance(v, str) and any(ch.isprintable() and not ch.isspace() for ch in v)
+
+
 def floor_cites_closed_source(floor):
     return isinstance(floor, str) and any(m in floor for m in _FLOOR_MARKERS)
 
@@ -297,12 +312,20 @@ def check_fragment(path):
     # silently-invented stem instead of an honest unchanged name).
     expected_run = Path(path).name.removesuffix(".jsonl")
 
-    # group rows by finding_id, preserving file order for the ordering key
+    # group rows by finding_id, preserving file order for the ordering key.
+    # finding_id is the MERGE JOIN KEY ITSELF - a bare truthiness check
+    # (`not fid`) accepts a whitespace-only string, since bool("   ") is True
+    # in Python. That's more fundamental than any value-shape gap fixed so
+    # far: two otherwise-unrelated findings sharing a blank-looking id
+    # silently collapse into ONE merge group, and a later NICE row can
+    # overwrite an earlier BLOCKING row's facts with zero findings.
     by_fid = {}
     for i, (n, r) in enumerate(rows):
         fid = r.get("finding_id")
-        if not isinstance(fid, str) or not fid:
-            add("", "STRUCTURAL", "bad-finding-id", f"line {n}: finding_id absent or not a string")
+        if not _has_visible_id(fid):
+            add("", "STRUCTURAL", "bad-finding-id", f"line {n}: finding_id absent, not a string, "
+                "or has no visible (printable, non-whitespace) character - a whitespace-only OR "
+                "zero-width/format-character-only value is not a valid merge key")
             continue
         by_fid.setdefault(fid, []).append((i, (n, r)))
 
@@ -328,12 +351,44 @@ def check_fragment(path):
         # ledger permanently contains the act it recorded).
         native_established = False
         native_seen = None
-        seen_bad_recorded_at = False  # a finding with one has indeterminate merge order
+        # Precomputed ACROSS ALL ROWS before the per-row loop starts - not
+        # updated progressively during iteration. Progressive updates meant a
+        # row's OWN indeterminacy wasn't visible to checks running earlier in
+        # that SAME row's iteration (e.g. native-mutated/bad-recorded-by,
+        # which run before the recorded_at check later in the loop body), so
+        # a genuinely indeterminate row could still emit an undisclosed
+        # misattribution on itself. Gated the same way as the live
+        # bad-recorded-at finding: only a VERSIONED row's unresolved
+        # recorded_at counts (a genuinely legacy row lacking recorded_at is
+        # normal, not indeterminate).
+        seen_bad_recorded_at = any(
+            _looks_versioned(r) and _instant(r.get("recorded_at")) is None
+            for _, r in ordered)
         for row_pos, (_, r) in enumerate(ordered):
             ln = line_of[id(r)]
 
-            # attestation pairing is a property of the ROW that performed the act
-            if bool(r.get("adjudicated_by")) != bool(r.get("adjudication_rationale")):
+            # attestation pairing is a property of the ROW that performed the
+            # act. A bare `bool(x)` truthiness check is the exact class Sol's
+            # broader audit named: a whitespace string, a bare int, or `False`
+            # itself all read as "set" under raw truthiness, so a garbage
+            # non-null value on either field would silently satisfy pairing
+            # with its genuine sibling. Presence is instead "a genuine
+            # non-empty, non-whitespace string" - a value that is neither
+            # None NOR a valid string is its OWN finding (regardless of
+            # pairing), and pairing itself compares the two NORMALIZED
+            # presence booleans, not the raw values.
+            adj_by, adj_rat = r.get("adjudicated_by"), r.get("adjudication_rationale")
+            adj_by_ok = adj_by is None or (isinstance(adj_by, str) and adj_by.strip())
+            adj_rat_ok = adj_rat is None or (isinstance(adj_rat, str) and adj_rat.strip())
+            if not adj_by_ok:
+                add(fid, "STRUCTURAL", "bad-adjudicated-by",
+                    f"line {ln}: adjudicated_by must be null or a non-empty, non-whitespace "
+                    f"string, got {type(adj_by).__name__} {adj_by!r}")
+            if not adj_rat_ok:
+                add(fid, "STRUCTURAL", "bad-adjudication-rationale",
+                    f"line {ln}: adjudication_rationale must be null or a non-empty, "
+                    f"non-whitespace string, got {type(adj_rat).__name__} {adj_rat!r}")
+            if adj_by_ok and adj_rat_ok and (adj_by is not None) != (adj_rat is not None):
                 add(fid, "STRICT", "adjudication-pairing",
                     f"line {ln}: adjudicated_by and adjudication_rationale must be set together on the same row")
 
@@ -351,7 +406,7 @@ def check_fragment(path):
                 val = r.get("severity_native")
                 if val != native_seen:
                     qualifier = ("" if not seen_bad_recorded_at else
-                                 " (NOTE: this finding also has a bad-recorded-at row, so merge order - "
+                                 " (NOTE: this finding also has a row whose recorded_at is absent or malformed, so merge order - "
                                  "and therefore which row is genuinely 'first' - is indeterminate; this "
                                  "message may be attributing the mutation to the wrong direction)")
                     add(fid, "STRICT", "native-mutated",
@@ -428,7 +483,7 @@ def check_fragment(path):
                         # not an escalation loss, since the fragment already
                         # fails via bad-recorded-at either way).
                         qualifier = ("" if not seen_bad_recorded_at else
-                                     " (NOTE: this finding also has a bad-recorded-at row, so which "
+                                     " (NOTE: this finding also has a row whose recorded_at is absent or malformed, so which "
                                      "row genuinely raised the finding is indeterminate - this may be "
                                      "misattributing the raising row)")
                         add(fid, "STRUCTURAL", "bad-recorded-by",
@@ -438,15 +493,39 @@ def check_fragment(path):
                     add(fid, "STRUCTURAL", "bad-recorded-by",
                         f"line {ln}: recorded_by must be a non-empty, non-whitespace string (or null, "
                         f"only on the raising row), got {type(rby).__name__} {rby!r}")
-            # disposition's BEDROCK shape (non-empty string) is checked per row
-            # here; its CLOSED-ENUM half stays a merged-view-only check below,
-            # since the enum applies to the FINAL state a finding is allowed
-            # to evolve through (open -> fixed is a legitimate per-row change
-            # in kind, not merely a correction of a bad early value).
-            if "disposition" in r and not (isinstance(r["disposition"], str) and r["disposition"].strip()):
-                add(fid, "STRUCTURAL", "bad-disposition",
-                    f"line {ln}: disposition must be a non-empty string, got "
-                    f"{type(r['disposition']).__name__} {r['disposition']!r}")
+            # disposition has TWO per-row checks now. (1) BEDROCK shape
+            # (non-empty string) - true in every generation, not legacy-gated.
+            # (2) CLOSED-ENUM membership - a #2643-era convention, so
+            # legacy-gated like the rest of that convention. Checking (2) per
+            # row (not just on the merged view) catches a permanently-recorded
+            # invalid value even when a LATER row's valid disposition would
+            # otherwise hide it with zero findings - and doing it per row does
+            # NOT break the legitimate `open` -> `fixed` evolution, since both
+            # values are individually valid and each row is checked on its own
+            # merits, not against the other. A prefix match requires something
+            # after the '#' ("roadmap-#" alone fails); a non-empty non-numeric
+            # suffix ("linked-to-#garbage") is deliberately accepted - the real
+            # corpus carries free-text notes trailing a placeholder
+            # ("#TBD (draft: ...)"), so a strict numeric/placeholder
+            # requirement would false-positive on legitimate entries.
+            if "disposition" in r:
+                dv = r["disposition"]
+                if not (isinstance(dv, str) and dv.strip()):
+                    add(fid, "STRUCTURAL", "bad-disposition",
+                        f"line {ln}: disposition must be a non-empty string, got "
+                        f"{type(dv).__name__} {dv!r}")
+                # gated on THIS ROW's own versioned-ness (_looks_versioned),
+                # not the finding-level `legacy` flag: a finding-wide flag is
+                # true the moment ANY row is versioned, which would wrongly
+                # retro-apply the #2643-era enum to a genuinely legacy FIRST
+                # row that a later versioned row happens to supersede.
+                elif _looks_versioned(r) and dv not in DISPOSITIONS_CLOSED:
+                    prefix_match = next((p for p in DISPOSITION_PREFIXES if dv.startswith(p)), None)
+                    if prefix_match is None or len(dv) == len(prefix_match):
+                        add(fid, "STRUCTURAL", "bad-disposition",
+                            f"line {ln}: disposition {dv!r} is not in the closed enum "
+                            f"{sorted(DISPOSITIONS_CLOSED)} or a valid non-empty '#<id>' prefix "
+                            f"form ({DISPOSITION_PREFIXES})")
 
             # a row that participates in the post-#2619 append model (carries
             # ANY field #2619 introduced - a genuinely legacy row carries NONE
@@ -458,12 +537,22 @@ def check_fragment(path):
             # read as clean while one exists, since a malformed timestamp on
             # an ESCALATION can silently lose the merge to an earlier,
             # lower-severity row with no other signal.
-            if "recorded_at" in r and _instant(r.get("recorded_at")) is None:
+            # A VERSIONED row's sort position is indeterminate whenever
+            # _instant() can't resolve it - whether recorded_at is malformed/
+            # ambiguous OR simply ABSENT from a row that otherwise
+            # participates in the modern regime (gated on _looks_versioned: an
+            # ORDINARY legacy row also lacks recorded_at, and that is normal,
+            # not an error). `seen_bad_recorded_at` is already precomputed
+            # ABOVE the loop over every row in the finding (not updated here)
+            # so the qualifier it feeds is visible to every row's checks
+            # regardless of iteration order, including this row's own. Only
+            # the present-but-bad case is its own finding here; an absent key
+            # is separately, correctly caught by missing-row-field below.
+            if _looks_versioned(r) and _instant(r.get("recorded_at")) is None and "recorded_at" in r:
                 add(fid, "STRUCTURAL", "bad-recorded-at",
                     f"line {ln}: recorded_at {r.get('recorded_at')!r} is not an unambiguous "
                     f"ISO-8601 instant (unparseable, or parses but carries no timezone offset); "
                     f"this row's precedence relative to its peers is indeterminate")
-                seen_bad_recorded_at = True
             if _looks_versioned(r):
                 for req in REQUIRED_ROW_FIELDS:
                     if req not in r:
@@ -507,9 +596,15 @@ def check_fragment(path):
         if "source" in merged and not _in(merged.get("source"), SOURCES):
             add(fid, "STRUCTURAL", "bad-source",
                 f"source {merged.get('source')!r} not one of {sorted(SOURCES)}")
-        if merged.get("source") and merged.get("source") != "governance-agent" and not merged.get("reporter_ref"):
+        # a bare truthiness check on reporter_ref accepts a whitespace string
+        # or an integer as "present" - it must be a genuine non-empty,
+        # non-whitespace string (the literal "unresolved" satisfies this and
+        # is the documented, legitimate value when no retrievable artefact exists).
+        rref = merged.get("reporter_ref")
+        if merged.get("source") and merged.get("source") != "governance-agent" \
+                and not (isinstance(rref, str) and rref.strip()):
             add(fid, "STRUCTURAL", "missing-reporter-ref",
-                "non-governance-agent finding needs reporter_ref (or 'unresolved')")
+                "non-governance-agent finding needs reporter_ref (or the literal 'unresolved')")
         for i in _as_list(merged.get("impact")):
             if not _in(i, IMPACTS):
                 add(fid, "STRUCTURAL", "bad-impact", f"impact {i!r}")
@@ -571,26 +666,11 @@ def check_fragment(path):
         if cls is not None and not _in(cls, CLASSIFICATIONS):
             add(fid, "STRUCTURAL", "bad-classification",
                 f"classification {cls!r} not one of {sorted(CLASSIFICATIONS)} (or null)")
-        # disposition's bedrock shape (non-empty string) is checked PER ROW
-        # above, not here - a merged-only check would only double-report
-        # whichever row survives into the merge. This is the closed-enum HALF
-        # only: once the merged value IS a string, it's checked against the
-        # closed enum + '#<id>' prefix forms - that convention is #2643-era,
-        # so this half stays legacy-gated (unlike the per-row bedrock check,
-        # which applies regardless of legacy status). A prefix match
-        # additionally requires something after the '#' ("roadmap-#" alone,
-        # with nothing following, still fails); a non-empty but non-numeric
-        # suffix ("linked-to-#garbage") is deliberately still accepted - the
-        # real corpus carries free-text notes trailing a placeholder
-        # ("#TBD (draft: ...)"), so requiring a strictly numeric/placeholder
-        # suffix would false-positive on legitimate historical and future entries.
+        # disposition's BOTH checks (bedrock shape + closed-enum membership)
+        # are now done PER ROW above, not here - a merged-only check would
+        # only double-report whichever row survives into the merge, and would
+        # miss a permanently-recorded bad value a later valid row "corrects".
         disp_val = merged.get("disposition")
-        if not legacy and isinstance(disp_val, str) and disp_val not in DISPOSITIONS_CLOSED:
-            prefix_match = next((p for p in DISPOSITION_PREFIXES if disp_val.startswith(p)), None)
-            if prefix_match is None or len(disp_val) == len(prefix_match):
-                add(fid, "STRUCTURAL", "bad-disposition",
-                    f"disposition {disp_val!r} is not in the closed enum {sorted(DISPOSITIONS_CLOSED)} "
-                    f"or a valid non-empty '#<id>' prefix form ({DISPOSITION_PREFIXES})")
 
         # ---------- STRICT: reviewer-class self-consistency on the merged view ----------
         impact = [i for i in _as_list(merged.get("impact")) if _in(i, IMPACTS)]

@@ -353,6 +353,21 @@ def run():
             _full(finding_id="p", recorded_at="2026-09-15T12:00:00Z", disposition="fixed")],
             "adjudication-pairing", "per-row attestation pairing fires on middle row (F5)")
 
+        # round-5 follow-up (Sol+Fable both independently found this in the
+        # "broader truthiness audit" the round-5 process note requested): a
+        # bare `bool(x)` check on adjudicated_by/adjudication_rationale lets a
+        # whitespace string, a bare int, or `False` itself read as "set".
+        fires("9-adjws.X", [_full(finding_id="j", adjudicated_by="   ", adjudication_rationale="real")],
+              "bad-adjudicated-by", "a whitespace-only adjudicated_by (with a real rationale) fires its own finding")
+        fires("9-adjint.X", [_full(finding_id="j", adjudicated_by=7, adjudication_rationale="real")],
+              "bad-adjudicated-by", "a bare-integer adjudicated_by fires")
+        fires("9-adjratws.X", [_full(finding_id="j", adjudicated_by="real", adjudication_rationale="   ")],
+              "bad-adjudication-rationale", "a whitespace-only adjudication_rationale fires")
+        clean_of("9-adjbothnull.X", [_full(finding_id="j")],
+                 "adjudication-pairing", "both null is clean")
+        clean_of("9-adjbothreal.X", [_full(finding_id="j", adjudicated_by="x", adjudication_rationale="y")],
+                 "adjudication-pairing", "both genuinely set is clean")
+
         # park constraint (F8)
         fires("9-park.X", [_full(finding_id="k", impact=["I1"], exposure=["E0"],
                                  severity_mapped="BLOCKING", severity_native="HIGH",
@@ -498,6 +513,104 @@ def run():
                             encoding="utf-8")
         expect(any(f.rule == "bad-finding-id" for f in M.check_fragment(str(p_badfid))),
                "a row with a null/non-string finding_id fires bad-finding-id")
+
+        # round-5 review BLOCKER: finding_id is the MERGE JOIN KEY ITSELF - a
+        # bare truthiness check accepts a whitespace-only string (bool("   ")
+        # is True in Python), so two unrelated findings sharing one can
+        # silently collapse into ONE merge group. Both the positive-fire on
+        # the guard AND the actual collision-collapse consequence are tested.
+        p_wsfid = Path(d) / "9-wsfid.X.jsonl"
+        p_wsfid.write_text(json.dumps({**_full(), "finding_id": "   ", "run_id": "9-wsfid.X"}) + "\n",
+                           encoding="utf-8")
+        expect(any(f.rule == "bad-finding-id" for f in M.check_fragment(str(p_wsfid))),
+               "a whitespace-only finding_id fires bad-finding-id")
+        collide1 = _full(finding_id="   ", severity_native="HIGH", severity_mapped="BLOCKING",
+                         impact=["I1"], exposure=["E3"])
+        collide2 = _full(finding_id="   ", recorded_at="2026-09-15T11:00:00Z",
+                         severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"])
+        collision = M.check_fragment(_write(d, "9-fidcollide.X", [collide1, collide2]))
+        expect(any(f.rule == "bad-finding-id" for f in collision) and
+               not any(f.rule == "native-mutated" for f in collision),
+               f"two UNRELATED findings sharing a whitespace-only finding_id are each individually "
+               f"flagged, NOT silently merged into one group with a spurious cross-finding "
+               f"native-mutated (got {_rules(collision)})")
+
+        # Sol's round-5 follow-up: `.strip()` empties ordinary whitespace but
+        # NOT zero-width/format characters (Unicode category Cf) - ZWSP
+        # (U+200B), BOM (U+FEFF), soft hyphen (U+00AD), word joiner (U+2060)
+        # are all still "non-empty after strip()" while being visually blank,
+        # and a finding_id built solely from them is just as dangerous a
+        # merge-key collision as plain whitespace.
+        expect(M._has_visible_id("​") is False, "_has_visible_id rejects ZWSP-only")
+        expect(M._has_visible_id("﻿") is False, "_has_visible_id rejects BOM-only")
+        expect(M._has_visible_id("­") is False, "_has_visible_id rejects soft-hyphen-only")
+        expect(M._has_visible_id("a​") is True, "_has_visible_id accepts a real char plus ZWSP")
+        zwsp1 = _full(finding_id="​", severity_native="HIGH", severity_mapped="BLOCKING",
+                     impact=["I1"], exposure=["E3"])
+        zwsp2 = _full(finding_id="​", recorded_at="2026-09-15T11:00:00Z",
+                     severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"])
+        zwsp_collision = M.check_fragment(_write(d, "9-fidzwsp.X", [zwsp1, zwsp2]))
+        expect(any(f.rule == "bad-finding-id" for f in zwsp_collision) and
+               not any(f.rule == "native-mutated" for f in zwsp_collision),
+               f"a ZWSP-only finding_id collision is caught the same way as plain whitespace "
+               f"(got {_rules(zwsp_collision)})")
+
+        # Fable's round-5 follow-up: the per-row disposition CLOSED-ENUM check
+        # must gate on THIS ROW's own versioned-ness, not the finding-level
+        # `legacy` flag - a finding-wide flag is True the moment ANY row is
+        # versioned, which would wrongly retro-apply the #2643-era enum to a
+        # genuinely legacy FIRST row (e.g. the pre-#2643 bare "deferred-to-issue"
+        # spelling) that a later versioned row happens to supersede.
+        legacy_first = {"finding_id": "m3", "reporter": "architect", "impact": ["I6"],
+                        "exposure": ["E0"], "severity_mapped": "SHOULD",
+                        "disposition": "deferred-to-issue", "severity_native": "MEDIUM",
+                        "run_id": "9-legacydisp.X"}
+        versioned_second = _full(finding_id="m3", recorded_at="2026-09-15T10:00:00Z", disposition="fixed")
+        legacydisp = M.check_fragment(_write(d, "9-legacydisp.X", [legacy_first, versioned_second]))
+        expect(not any(f.rule == "bad-disposition" for f in legacydisp),
+               f"a genuinely legacy first row's pre-#2643 disposition spelling is NOT retroactively "
+               f"judged by the closed enum just because a later row in the same finding is versioned "
+               f"(got {_rules(legacydisp)})")
+
+        # round-5 review should-fix: disposition's CLOSED-ENUM half (not just
+        # its bedrock string shape) is now checked per row too - a bad early
+        # value a later valid row "corrects" must still fire, while the
+        # legitimate open->fixed evolution stays clean (both values are
+        # individually valid, so per-row checking doesn't break it).
+        fires("9-dispenumeearly.X", [
+            _full(finding_id="e3", recorded_at="2026-09-15T10:00:00Z", disposition="no_change_needed"),
+            _full(finding_id="e3", recorded_at="2026-09-15T11:00:00Z", disposition="fixed")],
+            "bad-disposition", "an off-enum disposition on an EARLY row still fires even though a later row is valid")
+        clean_of("9-dispevolve.X", [
+            _full(finding_id="e4", recorded_at="2026-09-15T10:00:00Z", disposition="open"),
+            _full(finding_id="e4", recorded_at="2026-09-15T11:00:00Z", disposition="fixed")],
+            "bad-disposition", "the legitimate open -> fixed evolution stays clean under per-row checking")
+
+        # round-5 review minor: reporter_ref's bare truthiness check accepted
+        # a whitespace string; must be a genuine non-empty, non-whitespace one.
+        fires("9-refws.X", [_full(finding_id="j", source="external-model", reporter_ref="   ")],
+              "missing-reporter-ref", "a whitespace-only reporter_ref fires")
+        clean_of("9-refunresolved.X", [_full(finding_id="j", source="external-model", reporter_ref="unresolved")],
+                 "missing-reporter-ref", "the literal 'unresolved' reporter_ref is NOT flagged")
+
+        # round-5 review minor: a versioned row that OMITS recorded_at entirely
+        # (rather than malforming it) makes order just as indeterminate as a
+        # present-but-bad value, and must set the same disclosure qualifier -
+        # a genuinely LEGACY finding (no #2619 markers at all) must NOT.
+        omit_ra_row1 = {"schema_version": 1, "finding_id": "m2", "recorded_by": "x",
+                        "reviewed_at_sha": "abc", "pass_ordinal": 0, "disposition": "open",
+                        "severity_native": "MEDIUM", "run_id": "9-omitra.X"}
+        omit_ra_row2 = _full(finding_id="m2", recorded_at="2026-09-15T10:00:00Z", severity_native="HIGH")
+        omitra = M.check_fragment(_write(d, "9-omitra.X", [omit_ra_row1, omit_ra_row2]))
+        nm = [f.msg for f in omitra if f.rule == "native-mutated"]
+        expect(len(nm) == 1 and "indeterminate" in nm[0],
+               f"an omitted (not malformed) recorded_at on a versioned row still discloses the "
+               f"order-indeterminacy qualifier on a sibling native-mutated (got {nm})")
+        legacy_sanity = {"finding_id": "L2", "reporter": "architect", "impact": ["I6"], "exposure": ["E0"],
+                         "severity_mapped": "SHOULD", "disposition": "open", "run_id": "9-legacysanity.X"}
+        expect(M.check_fragment(_write(d, "9-legacysanity.X", [legacy_sanity])) == [],
+               "a genuinely legacy finding (no #2619 markers) never triggers the indeterminacy "
+               "qualifier machinery - it has no bad-recorded-at row to disclose")
 
         # -------- (5) round-3 review: the two-discriminator legacy heuristic --------
         # A row is genuinely legacy ONLY if it carries NONE of the fields

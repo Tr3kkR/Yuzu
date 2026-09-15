@@ -1859,6 +1859,18 @@ to close rather than a contradiction to adjudicate.
    python3 scripts/ci/check-governance-ledger.py --files "$LEDGER"
    ```
 
+   `finding_id` — the MERGE JOIN KEY ITSELF, more fundamental than any single
+   field's value — must contain a genuine VISIBLE character (printable and
+   not whitespace). `.strip()` alone is not enough for a merge key
+   specifically: it empties ordinary whitespace (space, tab, NBSP, em/
+   ideographic space) but leaves zero-width/format characters untouched
+   (U+200B ZERO WIDTH SPACE, U+FEFF BOM, U+00AD SOFT HYPHEN, U+2060 WORD
+   JOINER — Unicode category Cf), so an id built solely from those would
+   still read as "non-empty" while being visually blank. Either shape
+   silently collapses two unrelated findings that happen to share one into a
+   single merge group, with a later row's facts overwriting an earlier
+   BLOCKING finding's with zero warning.
+
    It builds each finding's live view as the FIELD-WISE MERGE defined above (not
    the last row alone), ordered by `recorded_at` as a true instant — a
    `recorded_at` that is PRESENT but does not resolve to an UNAMBIGUOUS instant
@@ -1897,13 +1909,26 @@ to close rather than a contradiction to adjudicate.
    `severity_native` frozen across supersessions, compared against the finding's
    first row (an omission-then-later-invention is caught, not only an explicit
    null-then-value flip), checked per row; a `wording` finding never carrying
-   `I7`; single-value, non-empty `reporter`; per-row `adjudicated_by` iff
-   `adjudication_rationale`; and enum/type hygiene for `source`; `disposition`
-   (must always be a non-empty string — bedrock, checked regardless of legacy
-   status — with its CLOSED-ENUM half, a later `#2643`-era convention, checked
-   only on a non-legacy finding, and requiring something after a `#<id>`
-   prefix's `#` while still tolerating a non-numeric trailing note like the
-   corpus's own `#TBD (draft: ...)` shape); `epistemic_status`, `provenance`,
+   `I7`; single-value, non-empty `reporter`; per-row `adjudicated_by` and
+   `adjudication_rationale`, each REQUIRED to be null or a genuine non-empty,
+   non-whitespace string (a bare `bool(x)` truthiness check would let a
+   whitespace string, a bare int, or `False` itself read as "set") — pairing
+   is then compared on those NORMALIZED presence booleans, not the raw
+   values; single-value, non-empty, non-whitespace `reporter_ref` (required
+   iff `source` is not `governance-agent`, or the literal `unresolved`); and
+   enum/type hygiene for `source`; `disposition` (must always be a non-empty
+   string — bedrock, checked PER ROW regardless of legacy status — with its
+   CLOSED-ENUM half, a later `#2643`-era convention, ALSO checked per row,
+   gated on THAT ROW's own versioned-ness (not the finding-level `legacy`
+   flag, which is true the moment ANY row is versioned and would wrongly
+   retro-apply the enum to a genuinely legacy first row a later versioned row
+   happens to supersede), requiring something
+   after a `#<id>` prefix's `#` while still tolerating a non-numeric trailing
+   note like the corpus's own `#TBD (draft: ...)` shape — checking the enum
+   per row, not just on the merged view, catches a permanently-recorded bad
+   value a later valid row would otherwise hide, without breaking the
+   legitimate `open` → `fixed` evolution, since both values are individually
+   valid); `epistemic_status`, `provenance`,
    `classification` (general content contracts, so NOT legacy-exempt — a
    genuinely ancient row can still carry a value worth flagging); and
    `independent_reporters` (excluding booleans, which pass a bare
@@ -1916,10 +1941,8 @@ to close rather than a contradiction to adjudicate.
    and `pass_ordinal` must be non-bool integers (`pass_ordinal` also
    non-negative); `reviewed_at_sha` must be a non-empty, non-whitespace
    string (a bare truthiness check alone misses `7` and `"   "`); `disposition`
-   must likewise be a non-empty, non-whitespace string (its closed-enum half
-   stays the separate, legacy-gated, merged-view-only check above, since
-   `open` → `fixed` is a legitimate evolution in KIND, not a correction of a
-   bad early value); `recorded_by` is the one CONDITIONAL case — nullable only
+   must likewise be a non-empty, non-whitespace string, per row, per the
+   closed-enum treatment described above; `recorded_by` is the one CONDITIONAL case — nullable only
    on the row that first raises the finding (SKILL.md: "nullable on the row
    that first raises a finding, required on a supersession"), so `null` is
    flagged only on a later row, and on ANY row a non-null value must still be
