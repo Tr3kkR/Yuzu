@@ -730,10 +730,11 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
 // source_kind allowlist there) could carry an over-keyed or oversized
 // params object straight past MCP's own bounds (mcp_input_bounds.hpp) and
 // into a fleet-wide dispatch, or an oversized instruction_id straight into
-// instruction_store's lookup unbounded. The six cases below (four bound
-// cases plus two type-confusion cases) mirror the ones
-// reevaluate_result_set's own fix (PR #4394) already has, seeded directly
-// in the store the same way the SQL-cap test above is (never through
+// instruction_store's lookup unbounded. The seven cases below (four bound
+// cases, two type-confusion cases, and one unparseable-payload case) cover
+// the ones reevaluate_result_set's own fix (PR #4394) already has plus one
+// more (cpp-safety Gate 3 finding on this PR), seeded directly in the
+// store the same way the SQL-cap test above is (never through
 // /from-instruction-result, which has no per-field bound of its own to
 // enforce the smuggled shape at creation time).
 
@@ -831,6 +832,13 @@ TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
 TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
           "row is refused, never re-dispatched",
           "[pg][result_set][async][reeval]") {
+    // A bogus, non-existent instruction_id 400s regardless of length via the
+    // pre-existing "original instruction unavailable" fallback (dispatch
+    // needs a real matching InstructionDefinition either way), so status==400
+    // alone does not distinguish this fix's length check from that
+    // pre-existing path - both the fixed and unfixed handler return 400 here.
+    // Asserting the error message names the length bound is what actually
+    // proves the NEW check fired, not the old fallback.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -847,9 +855,11 @@ TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
     REQUIRE(seeded.has_value());
 
     int status = 0;
-    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
+            std::string::npos);
 }
 
 TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
@@ -895,6 +905,33 @@ TEST_CASE("re-eval: a type-mismatched instruction_id value on an "
     cr.name = "legacy-type-mismatched-instruction-id";
     cr.source_kind = std::string(source_kind::kInstructionResult);
     cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: an unparseable source_payload on an instruction_result row "
+          "is a clean 400, never an uncaught exception",
+          "[pg][result_set][async][reeval]") {
+    // orig->source_payload is parsed with nlohmann::json::parse(..., nullptr,
+    // false), which discards (rather than throws) on invalid JSON - proves
+    // that discarded-value path degrades safely on the kInstructionResult
+    // branch too: sp.is_object() is false for a discarded value, so every
+    // field read below falls through to "absent", not a crash.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-unparseable-payload";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = "not json";
     auto seeded = h.store->create_materialized(cr, {});
     REQUIRE(seeded.has_value());
 
