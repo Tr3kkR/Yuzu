@@ -479,19 +479,21 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 
 // ─────────────────────────────────────────────────────────── formatting ───
 
+/// See format_usage_row's P5 / no-fixed-buffer note — identical treatment.
+/// `coverage_since`/`gap_last_ts`/`last_fold_ts` are tar_config values TAR
+/// itself writes, not operator/attacker input this plugin controls, but
+/// they are still opaque text reaching this plugin's pipe-delimited wire
+/// format from outside it, so they get the same `safe_output_field` pass
+/// and the same unbounded `std::string` build as an exe_key.
 [[nodiscard]] inline std::string format_meta_line(const WindowParams& w, const MetaInfo& m) {
-    char buf[512];
-    std::snprintf(buf, sizeof buf,
-                 "meta|window_days|%d|coverage_since|%s|days_present|%lld|open_runs|%lld|"
-                 "unmatched_stops|%lld|clock_anomalies|%lld|gap_count|%lld|gap_lost_events|%lld|"
-                 "gap_last_ts|%s|lag_events|%lld|feeder_enabled|%d|last_fold_ts|%s",
-                 w.days, m.coverage_since.c_str(), static_cast<long long>(m.days_present),
-                 static_cast<long long>(m.open_runs), static_cast<long long>(m.unmatched_stops),
-                 static_cast<long long>(m.clock_anomalies), static_cast<long long>(m.gap_count),
-                 static_cast<long long>(m.gap_lost_events), m.gap_last_ts.c_str(),
-                 static_cast<long long>(m.lag_events), m.feeder_enabled ? 1 : 0,
-                 m.last_fold_ts.c_str());
-    return buf;
+    return std::format(
+        "meta|window_days|{}|coverage_since|{}|days_present|{}|open_runs|{}|"
+        "unmatched_stops|{}|clock_anomalies|{}|gap_count|{}|gap_lost_events|{}|"
+        "gap_last_ts|{}|lag_events|{}|feeder_enabled|{}|last_fold_ts|{}",
+        w.days, yuzu::util::safe_output_field(m.coverage_since), m.days_present, m.open_runs,
+        m.unmatched_stops, m.clock_anomalies, m.gap_count, m.gap_lost_events,
+        yuzu::util::safe_output_field(m.gap_last_ts), m.lag_events, m.feeder_enabled ? 1 : 0,
+        yuzu::util::safe_output_field(m.last_fold_ts));
 }
 
 /// exe_key is untrusted, attacker/OS-controlled text — passed through
