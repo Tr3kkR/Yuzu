@@ -1860,15 +1860,40 @@ to close rather than a contradiction to adjudicate.
    ```
 
    It builds each finding's live view as the FIELD-WISE MERGE defined above (not
-   the last row alone) and checks: `severity_mapped` not weaker than the facts'
-   derived floor band (over-labeling is left alone — a conditional raise can
-   legitimately exceed the flat table — and a floor gates separately via
-   `policy_floor`, it does not raise `severity_mapped`); `severity_native` frozen
-   across supersessions, checked per row; a `wording` finding never carrying
-   `I7`; single-value `reporter`; per-row `adjudicated_by` iff
-   `adjudication_rationale`; `source`/enum hygiene and the `policy_floor` key
-   present. It also reproduces this step's own park probe — an `I1`/`I2`/`I3`
-   finding on a `roadmap-` disposition, and the scalar-`impact` shape the `jq`
+   the last row alone), ordered by `recorded_at` as a true instant — a
+   `recorded_at` that is PRESENT but does not parse is reported (`bad-recorded-at`)
+   rather than silently sorted as legacy, because a malformed timestamp on a
+   genuine severity ESCALATION can otherwise vanish from the merge with nothing
+   else able to surface it. On top of the merge it separately checks, PER ROW,
+   that a row participating in the post-#2619 regime (carries `recorded_at` or
+   `schema_version`) restates all EIGHT mandatory fields even when sparse
+   (`schema_version`, `run_id`, `finding_id`, `recorded_by`, `recorded_at`,
+   `pass_ordinal`, `reviewed_at_sha`, `disposition`) — omitting one of the eight
+   is a violation even though every OTHER field may legitimately be omitted when
+   unchanged. On the merged view it checks: `severity_mapped` not weaker than the
+   facts' derived floor band (over-labeling is left alone — a conditional raise
+   can legitimately exceed the flat table — and a floor gates separately via
+   `policy_floor`, which must itself cite a closed source or an empty-impact
+   claim stays flagged rather than excused by a fabricated floor string);
+   `severity_native` frozen across supersessions, compared against the finding's
+   first row (an omission-then-later-invention is caught, not only an explicit
+   null-then-value flip), checked per row; a `wording` finding never carrying
+   `I7`; single-value, non-empty `reporter`; per-row `adjudicated_by` iff
+   `adjudication_rationale`; and enum/type hygiene for `source`; `disposition`
+   (must always be a non-empty string — bedrock, checked regardless of legacy
+   status — with its CLOSED-ENUM half, a later `#2643`-era convention, checked
+   only on a non-legacy finding, and requiring something after a `#<id>`
+   prefix's `#` while still tolerating a non-numeric trailing note like the
+   corpus's own `#TBD (draft: ...)` shape); `epistemic_status`, `provenance`,
+   `classification` (general content contracts, so NOT legacy-exempt — a
+   genuinely ancient row can still carry a value worth flagging); `schema_version`
+   and `pass_ordinal` (two of the eight per-row-mandatory fields, so an explicit
+   `null` is flagged rather than read as merely absent); `independent_reporters`
+   (excluding booleans, which pass a bare `isinstance(x, int)` test in Python,
+   but tolerating `null` — a legitimate "not yet counted" value the corpus
+   carries, unlike the two mandatory integer fields above); and the
+   `policy_floor` key's presence. It also reproduces this step's own park probe — an `I1`/`I2`/`I3` finding on
+   a `roadmap-` disposition, and the scalar-`impact`/`exposure` shape the `jq`
    above catches — but does NOT replace it: the label half of the park contract
    (`roadmap` XOR priority/triage on GitHub, and a `linked-to-` target's labels)
    lives outside the ledger and stays procedural, so run BOTH. It is **advisory,
