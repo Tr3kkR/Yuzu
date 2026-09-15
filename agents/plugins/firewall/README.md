@@ -100,42 +100,53 @@ The plugin does not call `set_result_status`; every run reports `UNDECLARED`, fr
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 11 Pro 10.0.26200 · bare-metal · 2026-09-07 · interactive user (elevated) · leg-hash 8ef7b004fc8a
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash 8ef7b004fc8a
 
 ```
 == action=state
 profile|Domain|enabled
 profile|Private|enabled
 profile|Public|enabled
+ruleset|717
 [result_status] UNDECLARED / UNKNOWN
 
 == action=rules
-rule|ChatGPT|enabled|in|allow|2147483647
-rule|ChatGPT|enabled|in|allow|2147483647
-rule|ChatGPT|enabled|in|allow|2147483647
-rule|ChatGPT|enabled|in|allow|2147483647
-rule|ChatGPT|enabled|in|allow|2147483647
-rule|ChatGPT|enabled|in|allow|2147483647
-rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
-rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
-rule|Tailscale-In|enabled|in|allow|3
-rule|Tailscale-In|enabled|in|allow|3
-rule|Tailscale-Process|enabled|in|allow|2147483647
-rule|Microsoft Edge (mDNS-In)|enabled|in|allow|2147483647
-… 12 of 101 rows shown
+rule|HNS Container Networking - DNS (UDP-In) - 790E58B4-7939-4434-9358-89AE7DDBE87F - 0|enabled|in|allow|2147483647
+rule|HNS Container Networking - ICS DNS (TCP-In) - 790E58B4-7939-4434-9358-89AE7DDBE87F - 0|enabled|in|allow|2147483647
+rule|Logi Plugin Service|enabled|in|allow|2147483647
+rule|Logi Options+ Updater|enabled|out|allow|2147483647
+rule|Logi Options+ Updater|enabled|in|allow|2147483647
+rule|Logi Options+ Voice|enabled|out|allow|2147483647
+rule|Logi Options+ Voice|enabled|in|allow|2147483647
+rule|Logi Options+ Agent|enabled|out|allow|2147483647
+rule|Logi Options+ Agent|enabled|in|allow|2147483647
+rule|WhatsApp|enabled|out|allow|7
+rule|@{Microsoft.WindowsFeedbackHub_2.2608.301.0_x64__8wekyb3d8bbwe?ms-resource://Microsoft.WindowsFeedbackHub/Resources/AppStoreName}|enabled|out|allow|7
+rule|Microsoft Store|enabled|in|allow|7
+… 12 of 102 rows shown
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash 8ef7b004fc8a
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 8ef7b004fc8a
 
 ```
 == action=state
 backend|appfirewall
 state|disabled
 pf|unknown
+ruleset|unknown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=rules
+app|/usr/local/libexec/remotepairingdeviced|allow
+app|/usr/libexec/remoted|allow
+app|/usr/bin/python3|allow
+app|/usr/bin/ruby|allow
+app|/usr/sbin/cupsd|allow
+app|/usr/libexec/sharingd|allow
+app|/usr/libexec/sshd-keygen-wrapper|allow
+app|/usr/sbin/smbd|allow
+ruleset|unknown
 [result_status] UNDECLARED / UNKNOWN
 ```
 

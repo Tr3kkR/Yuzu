@@ -319,11 +319,12 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 3,
+          "row_count": 4,
           "rows": [
             "backend|appfirewall",
             "state|disabled",
-            "pf|unknown"
+            "pf|unknown",
+            "ruleset|unknown"
           ],
           "truncated": false
         },
@@ -337,13 +338,19 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 0,
-          "rows": [],
+          "row_count": 9,
+          "rows": [
+            "app|/usr/local/libexec/remotepairingdeviced|allow",
+            "app|/usr/libexec/remoted|allow",
+            "app|/usr/bin/python3|allow",
+            "app|/usr/bin/ruby|allow",
+            "app|/usr/sbin/cupsd|allow"
+          ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-09-15",
         "host_class": "bare-metal",
         "leg_hash": "8ef7b004fc8a",
         "os": "macos",
@@ -363,11 +370,12 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 3,
+          "row_count": 4,
           "rows": [
             "profile|Domain|enabled",
             "profile|Private|enabled",
-            "profile|Public|enabled"
+            "profile|Public|enabled",
+            "ruleset|717"
           ],
           "truncated": false
         },
@@ -381,23 +389,23 @@
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 101,
+          "row_count": 102,
           "rows": [
-            "rule|ChatGPT|enabled|in|allow|2147483647",
-            "rule|ChatGPT|enabled|in|allow|2147483647",
-            "rule|ChatGPT|enabled|in|allow|2147483647",
-            "rule|ChatGPT|enabled|in|allow|2147483647",
-            "rule|ChatGPT|enabled|in|allow|2147483647"
+            "rule|HNS Container Networking - DNS (UDP-In) - 790E58B4-7939-4434-9358-89AE7DDBE87F - 0|enabled|in|allow|2147483647",
+            "rule|HNS Container Networking - ICS DNS (TCP-In) - 790E58B4-7939-4434-9358-89AE7DDBE87F - 0|enabled|in|allow|2147483647",
+            "rule|Logi Plugin Service|enabled|in|allow|2147483647",
+            "rule|Logi Options+ Updater|enabled|out|allow|2147483647",
+            "rule|Logi Options+ Updater|enabled|in|allow|2147483647"
           ],
           "truncated": false
         }
       ],
       "stamp": {
-        "date": "2026-09-07",
+        "date": "2026-09-15",
         "host_class": "bare-metal",
         "leg_hash": "8ef7b004fc8a",
         "os": "windows",
-        "os_version": "Windows 11 Pro 10.0.26200",
+        "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "interactive user (elevated)"
       }
     }
