@@ -1860,16 +1860,33 @@ to close rather than a contradiction to adjudicate.
    ```
 
    `finding_id` — the MERGE JOIN KEY ITSELF, more fundamental than any single
-   field's value — must contain a genuine VISIBLE character (printable and
-   not whitespace). `.strip()` alone is not enough for a merge key
-   specifically: it empties ordinary whitespace (space, tab, NBSP, em/
-   ideographic space) but leaves zero-width/format characters untouched
-   (U+200B ZERO WIDTH SPACE, U+FEFF BOM, U+00AD SOFT HYPHEN, U+2060 WORD
-   JOINER — Unicode category Cf), so an id built solely from those would
-   still read as "non-empty" while being visually blank. Either shape
-   silently collapses two unrelated findings that happen to share one into a
-   single merge group, with a later row's facts overwriting an earlier
-   BLOCKING finding's with zero warning.
+   field's value — must be an ANCHORED, whole-string match against a CLOSED
+   ASCII token grammar: starts with an alphanumeric, then only alphanumerics
+   plus the small punctuation set the real corpus actually uses (`._+/,-`).
+   This is the fourth attempt at this check, and the first that closes the
+   whole CLASS rather than one more reported instance: bare truthiness
+   (`bool("   ")` is `True`) → `.strip()` (misses zero-width/format
+   characters like ZWSP/BOM, Unicode category Cf) → `isprintable() and not
+   isspace()` (still passes combining marks, variation selectors, and
+   blank-glyph symbols like BRAILLE PATTERN BLANK or a Hangul filler —
+   category Mn/So/Lo) → an EXISTENTIAL "contains at least one alphanumeric
+   somewhere" allowlist (closed the BLANK-id COLLISION direction but not the
+   SPLIT direction of the same class: `"X"` and `"X"` plus a trailing ZWSP
+   both "contain an alphanumeric" while being two DIFFERENT dict keys,
+   silently splitting one finding's history across two merge groups instead
+   of colliding two unrelated ones — same root cause, opposite failure mode).
+   "Renders blank" is a FONT property, not a fixed enumerable Unicode
+   category, so no denylist — and no merely-existential allowlist — is ever
+   complete. An ANCHORED full-match closes both directions at once: no
+   leading, trailing, OR embedded invisible/non-ASCII character can hide
+   anywhere in a value that still matches, with no separate whitespace-strip
+   comparison needed (whitespace of any kind simply isn't in the grammar,
+   wherever it appears). Verified: zero of 11,584 real corpus `finding_id`
+   occurrences fail this grammar, and none starts with a non-alphanumeric
+   character. Any of these shapes, uncaught, silently either collapses two
+   unrelated findings that happen to share a blank-looking id into one merge
+   group (a later row's facts overwriting an earlier BLOCKING finding's with
+   zero warning) or splits one finding's own history into two.
 
    It builds each finding's live view as the FIELD-WISE MERGE defined above (not
    the last row alone), ordered by `recorded_at` as a true instant — a
@@ -1880,8 +1897,10 @@ to close rather than a contradiction to adjudicate.
    bare date, or a naive datetime) — the latter is NOT silently assumed to be
    UTC, because an author hand-typing a bare date is a realistic failure mode
    and a malformed OR ambiguous timestamp on a genuine severity ESCALATION can
-   otherwise vanish from the merge with nothing else able to surface it. On
-   top of the merge it separately checks, PER ROW,
+   otherwise vanish from the merge with nothing else able to surface it. (A
+   lowercase `z` UTC suffix, which RFC 3339 §5.6 also permits, is accepted
+   like `Z` — Python's `fromisoformat` only recognizes the uppercase form
+   natively.) On top of the merge it separately checks, PER ROW,
    that a row participating in the post-#2619 regime — carrying ANY field
    #2619 introduced (`schema_version`, `source`, `reporter_ref`,
    `reviewed_at_sha`, `recorded_at`, `recorded_by`, `adjudication_rationale`,
@@ -1922,8 +1941,10 @@ to close rather than a contradiction to adjudicate.
    gated on THAT ROW's own versioned-ness (not the finding-level `legacy`
    flag, which is true the moment ANY row is versioned and would wrongly
    retro-apply the enum to a genuinely legacy first row a later versioned row
-   happens to supersede), requiring something
-   after a `#<id>` prefix's `#` while still tolerating a non-numeric trailing
+   happens to supersede), requiring real (non-whitespace) content
+   after a `#<id>` prefix's `#` — a bare LENGTH comparison would accept a
+   whitespace-only suffix (`"roadmap-# "`) as "non-empty" — while still
+   tolerating a non-numeric trailing
    note like the corpus's own `#TBD (draft: ...)` shape — checking the enum
    per row, not just on the merged view, catches a permanently-recorded bad
    value a later valid row would otherwise hide, without breaking the

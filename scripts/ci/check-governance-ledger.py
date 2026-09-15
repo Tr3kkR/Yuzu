@@ -171,19 +171,38 @@ def _is_int(v):
     return isinstance(v, int) and not isinstance(v, bool)
 
 
+_FID_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/,-]*")
+
+
 def _has_visible_id(v):
-    """A genuine, non-blank identifier string: at least one character that is
-    both printable AND not whitespace. `.strip()` alone is NOT enough for a
-    MERGE KEY specifically - it correctly empties ordinary whitespace (space,
-    tab, NBSP, em/ideographic space - all Unicode 'space' category, category
-    Zs) but leaves zero-width/format characters (U+200B ZERO WIDTH SPACE,
-    U+2060 WORD JOINER - Unicode category Cf) untouched, since those are
-    neither whitespace nor deleted by strip(). A finding_id consisting solely
-    of such characters would still be a non-empty string after `.strip()`
-    while being visually indistinguishable from blank - and unlike an
-    ordinary field, finding_id is the MERGE JOIN KEY ITSELF, so accepting one
-    silently lets two unrelated findings collide."""
-    return isinstance(v, str) and any(ch.isprintable() and not ch.isspace() for ch in v)
+    """A genuine identifier string: an ANCHORED, whole-string match against a
+    CLOSED ASCII token grammar (must START with an alphanumeric, then only
+    alphanumerics and the small punctuation set the real corpus actually
+    uses: `._+/,-`). This is the fourth attempt at this check, and the first
+    that closes the WHOLE class rather than one more reported instance:
+    - round 3: bare truthiness (`bool("   ")` is `True`)
+    - round 5: `.strip()` (misses zero-width/format chars - ZWSP, BOM -
+      Unicode category Cf - which `.strip()` doesn't remove)
+    - round 6 attempt 1: `isprintable() and not isspace()` EXISTENTIAL check
+      (still passes combining marks/variation selectors/blank-glyph symbols
+      - category Mn/So/Lo - which report printable+non-whitespace despite
+      rendering blank)
+    - round 6 attempt 2 (existential "contains at least one alnum
+      SOMEWHERE"): closed the BLANK-id collision, but said nothing about the
+      REST of the string - "X" and "X\\u200b" both satisfy "contains an
+      alnum" while being two DIFFERENT dict keys, silently SPLITTING one
+      finding's history across two merge groups instead of colliding two
+      unrelated ones (the opposite failure mode, same root cause).
+    An ANCHORED full-match closes both directions of the same class at once:
+    no leading/trailing/embedded invisible or non-ASCII character can hide
+    anywhere in a value that still matches, and no separate `.strip()`
+    comparison is needed (whitespace of any kind isn't in the charset, so it
+    fails the match wherever it appears). Verified: 0 of 11,584 real corpus
+    finding_id occurrences fail this grammar, and none starts with a
+    non-alphanumeric character. finding_id is the MERGE JOIN KEY ITSELF, so
+    any of these shapes silently either collides two unrelated findings or
+    splits one finding's history in two."""
+    return isinstance(v, str) and _FID_TOKEN.fullmatch(v) is not None
 
 
 def floor_cites_closed_source(floor):
@@ -246,7 +265,9 @@ def _instant(ra):
     """
     if not isinstance(ra, str) or not ra:
         return None
-    s = ra[:-1] + "+00:00" if ra.endswith("Z") else ra
+    # RFC 3339 section 5.6 permits a lowercase 'z' spelling too; Python's
+    # fromisoformat only recognizes uppercase 'Z' natively and raises on 'z'.
+    s = ra[:-1] + "+00:00" if ra.endswith(("Z", "z")) else ra
     try:
         dt = datetime.fromisoformat(s)
     except ValueError:
@@ -323,9 +344,18 @@ def check_fragment(path):
     for i, (n, r) in enumerate(rows):
         fid = r.get("finding_id")
         if not _has_visible_id(fid):
-            add("", "STRUCTURAL", "bad-finding-id", f"line {n}: finding_id absent, not a string, "
-                "or has no visible (printable, non-whitespace) character - a whitespace-only OR "
-                "zero-width/format-character-only value is not a valid merge key")
+            # a single anchored full-match check now covers every shape that
+            # would otherwise either collide two unrelated findings (blank/
+            # invisible ids, all equal to each other) or SPLIT one finding's
+            # history in two (a stray leading/trailing/embedded whitespace or
+            # invisible-character variant of an otherwise-legitimate id forms
+            # a DIFFERENT dict key from the canonical one - no separate
+            # `.strip()` comparison is needed, since whitespace of any kind
+            # simply isn't in the allowed grammar wherever it appears).
+            add("", "STRUCTURAL", "bad-finding-id",
+                f"line {n}: finding_id {fid!r} is absent, not a string, or is not an anchored "
+                f"token of ASCII alphanumerics/`._+/,-` starting with an alphanumeric - not a "
+                f"valid merge key")
             continue
         by_fid.setdefault(fid, []).append((i, (n, r)))
 
@@ -521,7 +551,19 @@ def check_fragment(path):
                 # row that a later versioned row happens to supersede.
                 elif _looks_versioned(r) and dv not in DISPOSITIONS_CLOSED:
                     prefix_match = next((p for p in DISPOSITION_PREFIXES if dv.startswith(p)), None)
-                    if prefix_match is None or len(dv) == len(prefix_match):
+                    # .strip() only strips category-Zs whitespace - a
+                    # zero-width/format character (ZWSP, U+200B) or a
+                    # blank-glyph symbol (braille blank, U+2800) survives
+                    # .strip() and would pass as if it were real park-issue
+                    # content. This is not a merge key (unlike finding_id),
+                    # and the real corpus has legitimately free-form suffixes
+                    # (prose, a bare `?` placeholder, parenthetical notes), so
+                    # an anchored grammar would break ~400 real rows. Require
+                    # only that SOME alphanumeric or the documented `?`
+                    # placeholder appears in the suffix - existential, not
+                    # anchored. Verified: 0 of the corpus's real suffix shapes
+                    # fail this; only genuinely blank/invisible suffixes do.
+                    if prefix_match is None or not re.search(r"[A-Za-z0-9?]", dv[len(prefix_match):]):
                         add(fid, "STRUCTURAL", "bad-disposition",
                             f"line {ln}: disposition {dv!r} is not in the closed enum "
                             f"{sorted(DISPOSITIONS_CLOSED)} or a valid non-empty '#<id>' prefix "

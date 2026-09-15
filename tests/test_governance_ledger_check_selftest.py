@@ -544,7 +544,17 @@ def run():
         expect(M._has_visible_id("​") is False, "_has_visible_id rejects ZWSP-only")
         expect(M._has_visible_id("﻿") is False, "_has_visible_id rejects BOM-only")
         expect(M._has_visible_id("­") is False, "_has_visible_id rejects soft-hyphen-only")
-        expect(M._has_visible_id("a​") is True, "_has_visible_id accepts a real char plus ZWSP")
+        # round-6 review (2nd pass) BLOCKER: an EXISTENTIAL "contains an
+        # alnum somewhere" check (the shape this fixture originally asserted)
+        # closed the blank-id COLLISION but not the SPLIT direction of the
+        # same class - "a" and "a<ZWSP>" both "contain an alnum" while being
+        # two DIFFERENT dict keys, silently splitting one finding's history
+        # instead of colliding two unrelated ones. The anchored full-match
+        # grammar closes both directions: NO extra character - leading,
+        # trailing, or embedded - may appear anywhere in the id.
+        expect(M._has_visible_id("a​") is False,
+               "_has_visible_id REJECTS a real char plus ZWSP (round-6 2nd-pass fix - "
+               "an existential check would wrongly accept this as a valid, but DIFFERENT, id)")
         zwsp1 = _full(finding_id="​", severity_native="HIGH", severity_mapped="BLOCKING",
                      impact=["I1"], exposure=["E3"])
         zwsp2 = _full(finding_id="​", recorded_at="2026-09-15T11:00:00Z",
@@ -554,6 +564,96 @@ def run():
                not any(f.rule == "native-mutated" for f in zwsp_collision),
                f"a ZWSP-only finding_id collision is caught the same way as plain whitespace "
                f"(got {_rules(zwsp_collision)})")
+
+        # round-6 review (2nd pass, both reviewers independently): the SPLIT
+        # direction of the same class - a real, otherwise-legitimate id with
+        # an invisible character appended/prepended/embedded forms a
+        # DIFFERENT dict key from the canonical one, silently splitting one
+        # finding's history into two "findings" with no findings on either
+        # half (rather than colliding two unrelated ones - opposite failure
+        # shape, same root cause: the id-validity check said nothing about
+        # what ELSE was in the string).
+        for variant, label in (("X​", "ZWSP-suffix"), ("﻿X", "BOM-prefix"),
+                               ("wsa​4-seam", "interior ZWSP in an otherwise-real kebab id")):
+            expect(M._has_visible_id(variant) is False,
+                   f"_has_visible_id rejects the {label} variant (round-6 2nd-pass fix)")
+        split1 = _full(finding_id="X", severity_native="HIGH", severity_mapped="BLOCKING",
+                      impact=["I1"], exposure=["E3"])
+        split2 = {**_full(recorded_at="2026-09-15T11:00:00Z", disposition="fixed"),
+                 "finding_id": "X​"}  # trailing ZWSP - looks identical to "X"
+        split_result = M.check_fragment(_write(d, "9-fidsplit.X", [split1, split2]))
+        expect(any(f.rule == "bad-finding-id" for f in split_result),
+               f"a real id plus an invisible-character variant (would silently SPLIT one "
+               f"finding's history into two groups) is caught (got {_rules(split_result)})")
+
+        # round-6 review BLOCKER: the round-5 fix (isprintable() and not
+        # isspace()) was ITSELF a denylist and both reviewers independently
+        # found it still passes combining marks, variation selectors, and
+        # blank-glyph symbols (category Mn/So/Lo) - Python reports these as
+        # printable and non-whitespace despite rendering blank. "Renders
+        # blank" is a font property, not an enumerable Unicode category, so
+        # no denylist is ever complete. FIX: switched to an ALLOWLIST -
+        # require at least one ASCII alphanumeric character (verified: 0 of
+        # 11,584 real corpus finding_id occurrences fail this).
+        for bad_id, label in (("⠀", "U+2800 BRAILLE PATTERN BLANK"),
+                              ("͏", "U+034F COMBINING GRAPHEME JOINER"),
+                              ("️", "U+FE0F VARIATION SELECTOR-16"),
+                              ("ᅠ", "U+3164 HANGUL FILLER")):
+            expect(M._has_visible_id(bad_id) is False,
+                   f"_has_visible_id rejects {label}-only (round-6 fix)")
+        blank1 = _full(finding_id="⠀", severity_native="HIGH", severity_mapped="BLOCKING",
+                      impact=["I1"], exposure=["E3"])
+        blank2 = _full(finding_id="⠀", recorded_at="2026-09-15T11:00:00Z",
+                      severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"])
+        blank_collision = M.check_fragment(_write(d, "9-fidblank.X", [blank1, blank2]))
+        expect(any(f.rule == "bad-finding-id" for f in blank_collision) and
+               not any(f.rule == "native-mutated" for f in blank_collision),
+               f"a blank-glyph-only finding_id collision (Braille blank) is caught "
+               f"(got {_rules(blank_collision)})")
+        expect(M._has_visible_id("wsa4-compliance-seam") is True,
+               "the real corpus's ASCII kebab-case convention still passes")
+
+        # round-6 review minor: a leading/trailing-whitespace finding_id
+        # variant ("X " vs "X") is a DIFFERENT merge-grouping key from the
+        # canonical one - if the stray row fully restates every field, the
+        # real finding's history silently splits into two with no findings.
+        fires("9-fidtrailing.X", [_full(finding_id="X ", recorded_at="2026-09-15T10:00:00Z")],
+              "bad-finding-id", "a trailing-whitespace finding_id fires (not silently split)")
+        fires("9-fidleading.X", [_full(finding_id=" X", recorded_at="2026-09-15T10:00:00Z")],
+              "bad-finding-id", "a leading-whitespace finding_id fires")
+
+        # round-6 review minor: the '#<id>' disposition prefix check compared
+        # LENGTH past the prefix, so a whitespace-only suffix ("roadmap-# ")
+        # passed as non-empty-by-length while carrying no real id.
+        fires("9-dispwssuffix.X", [_full(finding_id="e5", recorded_at="2026-09-15T10:00:00Z",
+                                        disposition="roadmap-# ")],
+              "bad-disposition", "a whitespace-only '#<id>' suffix fires")
+        clean_of("9-dispgoodsuffix.X", [_full(finding_id="e5", recorded_at="2026-09-15T10:00:00Z",
+                                             disposition="roadmap-#123")],
+                 "bad-disposition", "a real '#<id>' suffix stays clean")
+
+        # Fable's round-6 confirmation-pass finding: the whitespace-suffix
+        # fix above still used .strip(), which only strips category-Zs
+        # whitespace - a ZWSP (U+200B) or a blank-glyph symbol (braille
+        # blank, U+2800) survives .strip() and would pass as if it carried
+        # real park-issue content. Fixed via an existential
+        # alnum-or-'?' content check.
+        fires("9-dispzwspsuffix.X", [_full(finding_id="e6", recorded_at="2026-09-15T10:00:00Z",
+                                           disposition="roadmap-#​")],
+              "bad-disposition", "a ZWSP-only '#<id>' suffix fires")
+        fires("9-dispbraillesuffix.X", [_full(finding_id="e7", recorded_at="2026-09-15T10:00:00Z",
+                                              disposition="roadmap-#⠀")],
+              "bad-disposition", "a braille-blank-only '#<id>' suffix fires")
+        clean_of("9-dispbaresuffix.X", [_full(finding_id="e8", recorded_at="2026-09-15T10:00:00Z",
+                                              disposition="roadmap-#?")],
+                 "bad-disposition", "the documented bare '?' unfilled-park placeholder stays clean")
+
+        # round-6 review minor: RFC 3339 permits a lowercase 'z' spelling too;
+        # Python's fromisoformat only recognizes uppercase 'Z' natively.
+        expect(M._instant("2026-09-15T10:00:00z") is not None,
+               "_instant accepts a lowercase 'z' UTC suffix (RFC 3339 permits it)")
+        clean_of("9-lowercasez.X", [_full(finding_id="j", recorded_at="2026-09-15T10:00:00z")],
+                 "bad-recorded-at", "a lowercase-z recorded_at is NOT flagged")
 
         # Fable's round-5 follow-up: the per-row disposition CLOSED-ENUM check
         # must gate on THIS ROW's own versioned-ness, not the finding-level
