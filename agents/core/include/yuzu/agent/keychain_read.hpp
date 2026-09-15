@@ -47,6 +47,20 @@
  * operator reading logs) that cannot tell those apart cannot tell "securityd
  * itself is wedged" from "the agent's whole bounded-call budget is currently
  * spent on something else".
+ *
+ * OPEN RISK, NOT RULED OUT: A WEDGED securityd COULD SERIALIZE FUTURE CALLS
+ * ---------------------------------------------------------------------------
+ * The outstanding-call ceiling bounds how many concurrent detached threads
+ * this seam will start; it does NOT bound what those threads do once
+ * running. If SecItemCopyMatching/SecKeychainOpen internally hold a
+ * process-wide Security-framework or securityd XPC connection lock, a
+ * wedged call could serialize -- not just occupy a slot from -- every
+ * subsequent keychain read in this agent process, long after the bounded
+ * wrapper has "returned" TimedOut to its own caller. This has not been
+ * measured (the BR-01 probe below exercises single, sequential calls, never
+ * a wedge concurrent with a fresh read) and is not ruled out by anything in
+ * this file. Treat it as an accepted, disclosed risk pending that
+ * measurement, not as a closed question.
  */
 
 #include <chrono>
@@ -133,6 +147,15 @@ namespace detail {
 /// instantiation consults (see "THE OUTSTANDING-CALL CEILING IS PER IMAGE").
 /// Production instantiates it in keychain_read.cpp with a TU-local lambda, so
 /// every byte the detached thread runs is still agent-core text.
+///
+/// DO NOT call this template from a plugin .cpp. Being header-only, it would
+/// compile Fn's call and the detached-thread machinery around it directly
+/// into the plugin's own .dylib -- reintroducing, for whatever Fn a plugin
+/// author supplied, the exact dlclose()-during-a-wedged-call hazard this
+/// whole seam exists to keep out of plugin code (see the module banner
+/// above). A plugin wanting a keychain read calls the exported
+/// read_keychain_bounded / read_keychain_bounded_for_test below instead,
+/// which stay resident in agent-core no matter who links against them.
 template <typename Fn>
 KeychainReadResult bounded_keychain_call(std::chrono::milliseconds timeout, Fn fn) {
     KeychainReadResult timed_out;

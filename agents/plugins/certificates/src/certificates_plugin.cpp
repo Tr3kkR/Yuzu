@@ -1655,6 +1655,14 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
  * kVerifyUnreadable (an honest "action deadline exceeded" outcome), never
  * kDeleted.
  */
+// Deliberately does not call secitem_failure_reason/mark_result_partial the
+// way list_certs_macos/details_cert_macos do on a non-Completed read: this
+// helper's std::nullopt already reaches delete_cert_macos's own
+// classify_delete_verdict, which turns it into a hard `error|...` result and
+// a non-zero rc -- a stronger signal than CONSTRAINED/PARTIAL, and the one a
+// destructive action's caller actually needs. Naming the specific
+// KeychainReadStatus in that error text (rather than a generic "could not be
+// re-read to verify") would be a nice-to-have, not a correctness gap.
 std::optional<bool> keychain_contains_thumbprint(
     const std::string& keychain_path, const std::string& canonical_needle,
     std::chrono::steady_clock::time_point action_deadline) {
