@@ -42,12 +42,13 @@
  * six, calling the lock directly rather than through with_user_hive().
  * `ScopedOfflineHiveLock` wraps the acquire/release with a wait-time and
  * hold-time log (spdlog, this codebase's existing agent-side logging
- * mechanism -- see guard_registry.cpp for the same pattern applied to
- * Guardian's own shared-resource contention) so an unusually long wait or
- * hold is visible without instrumenting every call site by hand. Prefer it
- * over a bare `std::lock_guard<std::mutex>(offline_hive_mutex())` for any
- * new caller; today with_user_hive() (agents/shared/win_profiles.hpp) is
- * the only call site, serving the five plugins above.
+ * mechanism) so an unusually long wait or hold is visible without
+ * instrumenting every call site by hand. Both lines log together from the
+ * destructor, after the mutex is released, so logging itself never extends
+ * another caller's wait. Prefer it over a bare
+ * `std::lock_guard<std::mutex>(offline_hive_mutex())` for any new caller;
+ * today with_user_hive() (agents/shared/win_profiles.hpp) is the only call
+ * site, serving the five plugins above.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
@@ -87,6 +88,9 @@ private:
     // the explicit lock() call below.
     std::unique_lock<std::mutex> lock_;
     std::chrono::steady_clock::time_point acquired_at_;
+    // Measured in the constructor, logged in the destructor (after unlock) --
+    // see offline_hive_mutex.cpp.
+    std::chrono::milliseconds waited_{};
 };
 
 } // namespace yuzu::agent

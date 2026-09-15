@@ -21,34 +21,32 @@ ScopedOfflineHiveLock::ScopedOfflineHiveLock(const char* caller)
     const auto wait_start = std::chrono::steady_clock::now();
     lock_.lock();
     acquired_at_ = std::chrono::steady_clock::now();
-    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(acquired_at_ -
-                                                                               wait_start);
-    if (waited > std::chrono::milliseconds::zero()) {
-        // Diagnostics must never throw out of construction after the lock
-        // above already succeeded -- that would abort construction, skip
-        // this object's destructor, and leave the mutex locked forever.
-        // Same guard applied to both of the destructor's log calls below --
-        // this codebase's established idiom for a lifetime-boundary log
-        // call that must not affect the boundary itself (see
-        // mcp_stream_bridge.cpp's best-effort spdlog::info, similarly
-        // caught-and-discarded).
-        try {
-            spdlog::debug("offline_hive_mutex: {} waited {}ms to acquire", caller_,
-                          waited.count());
-        } catch (...) {
-        }
-    }
+    waited_ = std::chrono::duration_cast<std::chrono::milliseconds>(acquired_at_ - wait_start);
+    // No I/O here deliberately -- the wait-time log fires from the
+    // destructor instead, alongside the hold-time log, so both happen
+    // after unlock() below and logging itself never extends another
+    // caller's wait. See the destructor for why that placement matters and
+    // why it's the only try/catch this class needs.
 }
 
 ScopedOfflineHiveLock::~ScopedOfflineHiveLock() {
     const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - acquired_at_);
     lock_.unlock();
-    // Same never-let-diagnostics-throw-out-of-a-lifetime-boundary guard as
-    // the constructor above -- a destructor is implicitly noexcept, so an
-    // exception escaping either branch here would call std::terminate()
-    // rather than merely fail to log.
+    // Diagnostics must never throw out of a destructor -- it's implicitly
+    // noexcept, so an escaping exception here would call std::terminate()
+    // rather than merely fail to log (this repo's established idiom for
+    // lifetime-boundary logging; see e.g. mcp_stream_bridge.cpp's
+    // best-effort spdlog::info, similarly caught-and-discarded). Both log
+    // calls sit here, after unlock() above, rather than the wait-time one
+    // living in the constructor next to lock_.lock() -- logging before
+    // releasing would hold the process-wide mutex for the duration of a
+    // spdlog call (format + sink I/O), directly extending the wait for
+    // whichever of the other four plugins is queued behind it.
     try {
+        if (waited_ > std::chrono::milliseconds::zero())
+            spdlog::debug("offline_hive_mutex: {} waited {}ms to acquire", caller_,
+                          waited_.count());
         if (held >= kSlowHoldWarnThreshold)
             spdlog::warn("offline_hive_mutex: {} held lock for {}ms", caller_, held.count());
         else
