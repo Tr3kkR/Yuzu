@@ -123,6 +123,11 @@ namespace {
 /// call sites that report it route through the same string, not an ad-hoc literal.
 constexpr const char* kCompensationReservationExhausted =
     "compensating-disarm reservation exhausted";
+/// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant (different rule_id) tried
+/// to attach onto a key whose head is Wedged - refused immediately rather than
+/// queued, matching kCompensationReservationExhausted's own "one named constant,
+/// not an ad-hoc literal at the call site" pattern.
+constexpr const char* kSparkKeyWedged = "spark key wedged";
 } // namespace
 
 std::function<void(const SparkEvent&)>
@@ -1369,6 +1374,18 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         return std::unexpected(std::move(core.error));
     case AttachCoreState::Pending:
         break; // fall through to the bounded wait below
+    case AttachCoreState::Reobserved:
+        // up-2 (#4221, rung 9c PR-5c): the existing wedged head's own outcome is
+        // already set (abandon_claim_locked wrote it when that claim first timed
+        // out) - return it directly. This function's return type has no way to
+        // expose a receipt for later polling, so there is nothing to wait on: the
+        // wedge is already a known, resolved-shaped fact. Do NOT wait on or
+        // re-abandon core.claim - this call owns nothing, it only observed.
+        if (core.claim->outcome)
+            return *core.claim->outcome;
+        return std::unexpected(std::string{kSparkKeyWedged}); // defensive: outcome
+                                                               // should always be set
+                                                               // for a retained wedge
     }
 
     // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
@@ -1483,6 +1500,16 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         return std::unexpected(std::move(core.error));
     case AttachCoreState::Pending:
         break; // fall through: inspect below, without waiting
+    case AttachCoreState::Reobserved:
+        // up-2 (#4221, rung 9c PR-5c): return the EXISTING head's receipt directly
+        // as Accepted - this call created no claim of its own (arm_claim, the
+        // local out-param, is still null here), so there is nothing for
+        // claim_rollback to undo either way. The caller polls receipt_status() on
+        // this receipt exactly as it would for any other Accepted result; it will
+        // correctly report Wedged until the pre-existing head's own resolution
+        // (already independently in motion) eventually lands.
+        return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
+                          .receipt = ArmReceipt{core.claim}};
     }
 
     // Astra opine review, Blocker 1 step 3: "Reacquire registry_mu_ and inspect this
@@ -1795,6 +1822,54 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // that commits against the same subscription when the head's arm lands.
         const auto cit = claims_.find(key);
         const bool key_claimed = io_class && cit != claims_.end() && !cit->second.fifo.empty();
+
+        // up-2 (#4221, rung 9c PR-5c): when the key is already claimed, its FIFO
+        // front is always the claim that matters (try_dispatch_head_locked only
+        // ever dispatches the front; abandon_claim_locked retains a
+        // dispatching/dispatched claim in place rather than removing it - a
+        // genuinely unresolved dispatched arm can never have a live claim queued
+        // ahead of it). Live followers CAN exist behind a wedged head - irrelevant
+        // here, only the front matters. Checked BEFORE index_->add() below and
+        // BEFORE any index mutation: re-observation must construct nothing new and
+        // touch no index state at all (see the PLAN doc's "Correction to the
+        // kickoff" - a fresh index_->add() here would create a ghost mapping
+        // nothing ever cleans up, since the abandoned head's own completion
+        // already unconditionally releases its index ownership independent of
+        // this call).
+        if (key_claimed) {
+            const auto& head = cit->second.fifo.front();
+            // Compare the underlying ClaimEnd/ClaimDispatch fields directly, never
+            // the public receipt_status() accessor - it acquires registry_mu_
+            // itself, and this locked block already holds it.
+            const bool retained_wedge =
+                head->kind == ClaimKind::Arm &&
+                (head->dispatch == ClaimDispatch::Dispatching ||
+                 head->dispatch == ClaimDispatch::Dispatched) &&
+                head->waiter_abandoned && head->end == ClaimEnd::WaiterTimedOutDispatched;
+            // Do NOT require index_held == false to recognize this state -
+            // abandonment releases the index unconditionally in the ordinary case,
+            // but the existing fault seam can make that release fail and leave
+            // index_held true; that seam must never corrupt this classification.
+            if (retained_wedge) {
+                if (head->rule_id == rule_id && head->spec == spec) {
+                    // Re-observe: return the EXISTING claim's receipt, construct
+                    // nothing new. Must not reset outcome, abandonment, dispatch
+                    // state, or deadline - re-observation never revives or
+                    // restarts anything, it only reports what is already true.
+                    wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
+                    return AttachCoreResult{.state = AttachCoreState::Reobserved,
+                                            .generation = 0, .error = {}, .claim = head};
+                }
+                // A genuinely different claimant (different rule_id - the "same
+                // rule_id, different spec" case is structurally unreachable:
+                // spark_key() canonically encodes the full spec into the key
+                // itself, so two different specs on the same rule_id can never
+                // reach this branch with the SAME key in the first place).
+                wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
+                return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
+                                        .error = std::string{kSparkKeyWedged}, .claim = nullptr};
+            }
+        }
 
         const bool arm_edge = index_->add(key, rule_id, gen); // may throw; index_added still false
                                                               // then. rung 9c PR-5a (#4221 up-101):

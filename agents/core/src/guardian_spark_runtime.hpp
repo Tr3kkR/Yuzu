@@ -653,6 +653,17 @@ public:
     [[nodiscard]] std::uint64_t compensation_deadline_elapsed() const noexcept {
         return compensation_deadline_elapsed_.load(std::memory_order_relaxed);
     }
+    /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant (different rule_id)
+    /// was refused immediately against a Wedged key's head. Lock-free.
+    [[nodiscard]] std::uint64_t wedged_refusals() const noexcept {
+        return wedged_refusals_.load(std::memory_order_relaxed);
+    }
+    /// up-2 (#4221, rung 9c PR-5c): an identical (rule_id, spec) retry re-observed
+    /// a Wedged key's existing head receipt instead of queuing a new claim.
+    /// Lock-free.
+    [[nodiscard]] std::uint64_t wedged_reobservations() const noexcept {
+        return wedged_reobservations_.load(std::memory_order_relaxed);
+    }
     /// rung 9c R5.2: completion-callback drains whose OWN bookkeeping threw (not a
     /// commit throw, which is delivered to the waiter) - the firewall published a
     /// terminal outcome on every claim and dropped the entry. Lock-free.
@@ -1118,16 +1129,26 @@ private:
     /// / Failed) - Pending, not a fourth outcome word, names the same "not yet
     /// resolved" concept from the runtime's own side, where a future non-waiting
     /// entry point (not yet added) would report it as Accepted.
-    enum class AttachCoreState { Armed, Pending, Failed };
+    ///
+    /// rung 9c PR-5c (#4221 up-2): Reobserved means this call created NO new claim
+    /// at all - it is an identical (rule_id, spec) retry onto a key whose head is
+    /// already Wedged, and the claim returned alongside it is that EXISTING,
+    /// already-owned head, handed back purely for observation. Like Pending, the
+    /// caller need not wait further in the sense that nothing further will ever
+    /// resolve differently by waiting - the head's own eventual resolution is
+    /// already in motion independently of this call.
+    enum class AttachCoreState { Armed, Pending, Failed, Reobserved };
     struct AttachCoreResult {
         AttachCoreState state{AttachCoreState::Failed};
         std::uint64_t generation{0};      ///< valid iff state == Armed
         std::string error;                ///< valid iff state == Failed
-        /// valid iff state == Pending. An OBSERVATION handle only (rung 9c PR-2,
-        /// Astra opine review 2026-09-12): destroying it must never withdraw the
-        /// rule or abandon its operation - ownership of cancellation stays in
-        /// claims_ and the callback's own capture, exactly as it does today for
-        /// attach_rule's local `arm_claim`.
+        /// valid iff state == Pending OR Reobserved. An OBSERVATION handle only
+        /// (rung 9c PR-2, Astra opine review 2026-09-12): destroying it must never
+        /// withdraw the rule or abandon its operation - ownership of cancellation
+        /// stays in claims_ and the callback's own capture, exactly as it does
+        /// today for attach_rule's local `arm_claim`. For Reobserved specifically,
+        /// this call OWNS NOTHING NEW - the claim is the pre-existing head's own
+        /// object, already owned by whatever attach originally created it.
         std::shared_ptr<KeyClaim> claim;
     };
 
@@ -1750,6 +1771,12 @@ private:
     /// counter-egress scope like every other internal-only counter in this file.
     std::atomic<std::uint64_t> compensation_reservation_refused_{0};
     std::atomic<std::uint64_t> compensation_deadline_elapsed_{0};
+    /// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant refused immediately
+    /// against a Wedged key, vs. an identical (rule_id, spec) retry that
+    /// re-observed the existing wedged head's receipt instead of queuing a new
+    /// claim. Same "internal-only, rides #3415" scope as the pair above.
+    std::atomic<std::uint64_t> wedged_refusals_{0};
+    std::atomic<std::uint64_t> wedged_reobservations_{0};
 
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_queued_{0};     ///< R5.2: attach_rule queued behind a same-key claim
