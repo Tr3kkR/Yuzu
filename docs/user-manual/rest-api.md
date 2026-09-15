@@ -5753,11 +5753,22 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 **supplied** `parent_id` that is empty, non-string, or `null` is refused with
 `400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
 
+**`{id}/re-eval` field bounds (#4373).** The original set's re-run fields are
+rechecked against the same bounds their creation-time routes enforce, because
+the original row may have been minted through `POST /api/v1/result-sets`
+directly (which carries no `source_kind` allowlist) rather than through
+`from-tar-query`/`from-instruction-result`, and so may never have been
+validated at all: `sql` (tar_query) at 100 KiB, `instruction_id`
+(instruction_result) at 256 bytes, and `params` at 32 keys, 256-byte keys,
+and 64 KiB values. A type-mismatched `sql`/`instruction_id` value (not a
+JSON string) is treated as absent rather than raising an error.
+
 **Errors:**
 
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
+| 400 | On `re-eval` only: the original's `sql` exceeds 100 KiB, `instruction_id` exceeds 256 bytes, or `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB (#4373) |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
