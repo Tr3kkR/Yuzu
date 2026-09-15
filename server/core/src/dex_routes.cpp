@@ -18,6 +18,9 @@
 #include <string_view>
 #include <vector>
 
+#include <yuzu/version_string.hpp> // canon_version — the perf trend's `version` filter
+                                   // must match the SAME canonical key the store filters on
+
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp);
 // {{TITLE}}/{{FRAGMENT}} are substituted per request. Reused verbatim so the DEX
 // page shares the Guardian chrome + `.gp-*` component CSS (incl. .gp-placeholder
@@ -2070,7 +2073,8 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
                     "app=" + url_encode(process_name) + "&window=" + window,
                     "Performance by version &rarr;") +
          " &mdash; same process image, retained daily summaries. Per-app sampling is "
-         "opt-in.</div>";
+         "opt-in where available.</div>"; // macOS has no procperf collector (or toggle)
+                                           // yet — "where available" avoids implying one
     if (s.signals == 0)
         return h + placeholder("No crashes", "No crashes or hangs recorded for this application.");
 
@@ -3097,14 +3101,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
         const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
-        const std::string version = req.has_param("version") ? req.get_param_value("version") : "";
+        const std::string raw_version =
+            req.has_param("version") ? req.get_param_value("version") : "";
         // Shared validator (app_perf_param_valid) — the SAME cap + control-char/NUL
         // re-floor the REST and MCP app-perf surfaces apply, so the three agree (a
         // NUL would truncate the bound libpq text param). `app` must be non-empty.
         // `version` empty = all versions (unfiltered), same convention as REST.
         if (app.empty() || !app_perf_param_valid(app) ||
             (!group.empty() && !app_perf_param_valid(group)) ||
-            (!version.empty() && !app_perf_param_valid(version))) {
+            (!raw_version.empty() && !app_perf_param_valid(raw_version))) {
             res.status = 400;
             res.set_content(placeholder("Pick an application",
                                         "Choose an application from the list to see its "
@@ -3112,6 +3117,18 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             "text/html; charset=utf-8");
             return;
         }
+        // Canonicalize ONCE, here, and use this single value for both the store
+        // filter and the rendered "filtered to version X" state — never the raw
+        // string for one and the canonical form for the other. `app_perf_param_valid`
+        // only bounds length/control-chars; it does NOT reject a non-canonicalizable
+        // value (e.g. "latest", "1.2" short-form, "0.0.0.0"), which `canon_version`
+        // would otherwise silently fold to the SAME "" all-versions sentinel the
+        // store treats as unfiltered — a raw/canonical split here previously let the
+        // page claim "Filtered to version latest" while the store applied no filter
+        // at all, and independently let a short-form/leading-zero value (e.g. "1.2")
+        // filter correctly while the banner/drill-links echoed the un-normalized
+        // input instead of the "1.2.0.0" the store actually matched on.
+        const std::string version = yuzu::util::canon_version(raw_version);
         const std::vector<DexGroupOption> groups =
             group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
 

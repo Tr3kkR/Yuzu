@@ -62,7 +62,7 @@ name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
 hang signals only. Per-version crash/hang *counts* on the performance trend
 (as opposed to the per-app crash/hang totals already shown here) remain
-deferred — see "Application performance over time" under Drill-downs.
+deferred — see "Fleet-wide application performance" under Drill-downs.
 
 ### Catalogue
 

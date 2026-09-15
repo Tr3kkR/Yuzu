@@ -2238,3 +2238,122 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         CHECK(r->body.find("chrome.exe") == std::string::npos);
     }
 }
+
+// Regression pin for a raw/canonical `version` split at the route seam: the
+// handler used to thread the RAW query value to the provider call while ALSO
+// passing it as `render_dex_app_perf_trend`'s `active_version` label — since the
+// store canonicalizes via `canon_version` before filtering (empty OR
+// non-numeric -> "", a short/leading-zero form -> its 4-group canonical form),
+// a mismatched pair let the page claim "Filtered to version X" over data the
+// store never actually filtered (X non-canonicalizable -> store applied NO
+// filter), or echo the wrong string for a value that WAS correctly filtered
+// (X short-form -> store filtered on the canonical form, banner showed the
+// raw one). The fix canonicalizes ONCE in the handler and reuses that single
+// value for both the provider call and the render call — these tests assert
+// the provider and the rendered banner agree, not just that each looks right
+// in isolation.
+TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
+          "rendered banner never disagree",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    auto audit = [](const httplib::Request&, const std::string&, const std::string&,
+                    const std::string&, const std::string&, const std::string&) { return true; };
+
+    SECTION("short-form version canonicalizes before reaching the fleet provider AND the banner") {
+        std::string seen_app, seen_version;
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view app,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{}; // empty rows: banner still renders pre-empty-state
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=1.2");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // provider got the canonical form, not raw "1.2"
+        // Exact tag-boundary check (not a bare substring) — "1.2.0.0" contains
+        // "1.2" as a substring, so a loose check would pass even if the banner
+        // still echoed the raw value.
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+        CHECK(r->body.find(">1.2</span>") == std::string::npos);
+        CHECK(r->body.find("Filtered to version") != std::string::npos);
+    }
+
+    SECTION("non-canonicalizable version folds to unfiltered -- never rendered as \"filtered\"") {
+        std::string seen_version = "not-yet-called";
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=latest");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_version.empty()); // "latest" canonicalizes to "" -> the store's own
+                                     // all-versions sentinel, same as if version were omitted
+        // The page must not claim a filter is active when none was applied.
+        CHECK(r->body.find("Filtered to version") == std::string::npos);
+    }
+
+    // `canon_version` folds an all-zero quad to "" via a DIFFERENT predicate
+    // (`all_zero`) than a non-numeric string ("latest" above, `ngroups==0`) —
+    // distinct branches that happen to share an outcome, so covering one at
+    // this (route) level doesn't exercise the other.
+    SECTION("all-zero version (\"0.0.0.0\") also folds to unfiltered") {
+        std::string seen_version = "not-yet-called";
+        AppPerfProviders providers;
+        providers.fleet = [&](std::string_view,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&version=0.0.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_version.empty());
+        CHECK(r->body.find("Filtered to version") == std::string::npos);
+    }
+
+    SECTION("group path threads the SAME canonical version as the fleet path") {
+        std::string seen_group, seen_app, seen_version;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view group, std::string_view app,
+                              std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_group = std::string(group);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_group == "G1");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // leading-zero form canonicalized, matching the fleet path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+}
