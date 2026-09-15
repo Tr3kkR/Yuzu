@@ -211,7 +211,7 @@ meson compile -C build-windows
 | `-Dbuild_agent` | true | Agent daemon |
 | `-Dbuild_server` | true | Server daemon |
 | `-Dbuild_tests` | false | Catch2 test suite |
-| `-Dbuild_examples` | true | Example plugins |
+| `-Dbuild_examples` | true | Demo/toy plugins only (`example`, `chargen`, `procfetch`, `netprobe`) — every other plugin builds under `-Dbuild_agent` regardless |
 | `-Db_lto` | false | Link-time optimisation |
 | `-Db_sanitize=address,undefined` | — | ASan + UBSan |
 

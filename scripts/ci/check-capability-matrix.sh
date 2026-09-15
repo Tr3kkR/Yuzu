@@ -17,13 +17,15 @@
 # BUILDDIR is the meson build directory (e.g. build-linux-gcc-15-debug). The
 # expected plugin set is discovered from agents/plugins/*/ source
 # subdirectories (independent of the top-level meson.build subdir list PR1.3
-# owns — every plugin directory unconditionally builds a same-named shared
-# object when -Dbuild_examples=true, so the source tree itself is the
-# complete, self-maintaining expected-artifact list; no second name list to
-# keep in sync here). Run AFTER `meson compile` — capmatrix-gen and every
-# discovered plugin's shared object must already exist by the time this
-# runs; a missing artifact is a hard failure, never a silent skip (that
-# silent-skip is exactly the drift this gate exists to catch).
+# owns — every real plugin directory unconditionally builds a same-named
+# shared object under -Dbuild_agent=true regardless of -Dbuild_examples
+# (#4262; that flag now gates only the four decorative demo plugins), so
+# the source tree itself is the complete, self-maintaining expected-artifact
+# list; no second name list to keep in sync here). Run AFTER `meson compile`
+# — capmatrix-gen and every discovered plugin's shared object must already
+# exist by the time this runs; a missing artifact is a hard failure, never a
+# silent skip (that silent-skip is exactly the drift this gate exists to
+# catch).
 #
 # RATCHET MODE: the regenerated "Undeclared plugins" count is compared
 # against RATCHET_BASELINE_UNDECLARED below. It may stay the same or SHRINK
@@ -38,12 +40,14 @@
 # a separate mode flip to get there — lowering the baseline was the whole
 # mechanism, which is why the ratchet was built this way.
 #
-# build-ci B1: -Dbuild_examples=false is a supported, default-true option
-# that skips every agents/plugins/*/ subdir (and, matching that, the
-# tools/capmatrix-gen subdir — see meson.build). With no plugins and no
-# generator built, this gate has nothing to check; it queries the build
-# directory's own build_examples value below and skips rather than hard-
-# failing on an artifact that was never supposed to exist.
+# build-ci B1: -Dbuild_agent=false is a supported option that skips every
+# agents/plugins/*/ subdir (and, matching that, the tools/capmatrix-gen
+# subdir — see meson.build). With no plugins and no generator built, this
+# gate has nothing to check; it queries the build directory's own
+# build_agent value below and skips rather than hard-failing on an artifact
+# that was never supposed to exist. -Dbuild_examples=false is NOT a skip
+# condition (#4262) — it only omits four decorative demo plugins, so every
+# real plugin this gate discovers still has an artifact to check.
 set -euo pipefail
 
 # Every discovered plugin now declares its ABI4 action_descriptors array —
@@ -76,10 +80,10 @@ esac
 
 capmatrix_gen="$BUILDDIR/tools/capmatrix-gen/capmatrix-gen"
 
-# build-ci B1: -Dbuild_examples=false means no plugin subdirs and no
+# build-ci B1: -Dbuild_agent=false means no plugin subdirs and no
 # capmatrix-gen were configured (meson.build gates both on it) — that is a
 # supported build, not drift. Only introspect the build directory's
-# build_examples option when the expected generator binary is absent —
+# build_agent option when the expected generator binary is absent —
 # fixture repos (tests/shell/test_capability_matrix_gate.sh) and other
 # callers that already provide capmatrix_gen supply no Meson build metadata
 # at all, so unconditionally introspecting would hard-fail them for no
@@ -90,6 +94,38 @@ if [ ! -x "$capmatrix_gen" ]; then
     exit 2
   fi
 
+  build_agent="$(meson introspect --buildoptions "$BUILDDIR" 2>/dev/null | python3 -c '
+import json, sys
+try:
+    opts = json.load(sys.stdin)
+except Exception:
+    print("unknown")
+    sys.exit(0)
+for opt in opts:
+    if opt.get("name") == "build_agent":
+        print("true" if opt.get("value") else "false")
+        sys.exit(0)
+print("unknown")
+')"
+
+  if [ "$build_agent" = "false" ]; then
+    echo "check-capability-matrix: SKIP — build_agent=false (no plugins configured, nothing to check)"
+    exit 0
+  fi
+
+  echo "::error::capmatrix-gen binary not found/executable at $capmatrix_gen — did the Build step run first?" >&2
+  exit 1
+fi
+
+# The four decorative demo plugins (#4262) are the ONLY ones -Dbuild_examples
+# gates -- when it's false, exclude them from the expected-artifact set (they
+# genuinely have no build output, by design) rather than treating their
+# absence as drift. Best-effort: a caller supplying a directory with no real
+# Meson build metadata (tests/shell/test_capability_matrix_gate.sh's
+# hermetic fixture repos) gets "unknown" and this filter is skipped
+# entirely, preserving today's strict all-plugins-expected behavior there.
+build_examples="unknown"
+if command -v meson >/dev/null 2>&1; then
   build_examples="$(meson introspect --buildoptions "$BUILDDIR" 2>/dev/null | python3 -c '
 import json, sys
 try:
@@ -102,20 +138,21 @@ for opt in opts:
         print("true" if opt.get("value") else "false")
         sys.exit(0)
 print("unknown")
-')"
-
-  if [ "$build_examples" = "false" ]; then
-    echo "check-capability-matrix: SKIP — build_examples=false (no plugins configured, nothing to check)"
-    exit 0
-  fi
-
-  echo "::error::capmatrix-gen binary not found/executable at $capmatrix_gen — did the Build step run first?" >&2
-  exit 1
+' 2>/dev/null || echo "unknown")"
 fi
+DEMO_PLUGINS=(example chargen procfetch netprobe)
+is_demo_plugin() {
+  local n="$1" d
+  for d in "${DEMO_PLUGINS[@]}"; do [ "$n" = "$d" ] && return 0; done
+  return 1
+}
 
 PLUGIN_NAMES=()
 for d in "$ROOT"/agents/plugins/*/; do
   name="$(basename "$d")"
+  if [ "$build_examples" = "false" ] && is_demo_plugin "$name"; then
+    continue
+  fi
   PLUGIN_NAMES+=("$name")
 done
 (( ${#PLUGIN_NAMES[@]} > 0 )) || { echo "::error::no agents/plugins/*/ source directories found under $ROOT" >&2; exit 2; }
