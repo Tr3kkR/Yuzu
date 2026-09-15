@@ -692,6 +692,39 @@ TEST_CASE("nft: nft_fallthrough_clamp -- full truth table", "[firewall]") {
     CHECK(nft_fallthrough_clamp(false, FwState::unknown) == FwState::unknown);
 }
 
+// gate_state_on_completeness() is the composition try_ufw_state()/
+// try_iptables_state() actually call -- previously an inline ternary at
+// each call site with only its two ingredients (subprocess_complete(),
+// nft_fallthrough_clamp()) independently tested, never the gate itself
+// (governance gate3 quality-engineer finding, r2: this is the security-
+// guardian-HIGH completeness-gating fix from r1, and it had no direct
+// test).
+TEST_CASE("nft: gate_state_on_completeness -- incomplete always wins, regardless of "
+         "the parsed state or tables_seen",
+         "[firewall]") {
+    CHECK(gate_state_on_completeness(false, false, FwState::enabled) == FwState::unknown);
+    CHECK(gate_state_on_completeness(false, false, FwState::disabled) == FwState::unknown);
+    CHECK(gate_state_on_completeness(false, true, FwState::enabled) == FwState::unknown);
+    CHECK(gate_state_on_completeness(false, true, FwState::disabled) == FwState::unknown);
+}
+
+TEST_CASE("nft: gate_state_on_completeness -- complete passes through nft_fallthrough_clamp "
+         "unchanged",
+         "[firewall]") {
+    // complete + tables_seen=false: parsed state stands, matching
+    // nft_fallthrough_clamp(false, x) == x.
+    CHECK(gate_state_on_completeness(true, false, FwState::enabled) == FwState::enabled);
+    CHECK(gate_state_on_completeness(true, false, FwState::disabled) == FwState::disabled);
+    // complete + tables_seen=true + parsed disabled: clamps to unknown, the
+    // exact case this whole mechanism exists to protect (nftables already
+    // reported tables present -- a ufw/iptables "disabled" read here would
+    // contradict that).
+    CHECK(gate_state_on_completeness(true, true, FwState::disabled) == FwState::unknown);
+    // complete + tables_seen=true + parsed enabled: enabled is never
+    // downgraded.
+    CHECK(gate_state_on_completeness(true, true, FwState::enabled) == FwState::enabled);
+}
+
 // ── nftables: dump-outcome diagnostics (#3462-6) ────────────────────────────
 
 TEST_CASE("nft: nft_dump_reason maps every status to its exact token", "[firewall]") {

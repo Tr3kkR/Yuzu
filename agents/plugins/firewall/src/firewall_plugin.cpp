@@ -727,9 +727,16 @@ remaining_ms(std::chrono::steady_clock::time_point deadline) noexcept {
 
 /// How an open_nft_socket() failure should be handled by the caller.
 enum class OpenNftErrClass {
-    fd_exhausted, // EMFILE/ENFILE -- a system-wide condition worth surfacing
-    unsupported,  // EPROTONOSUPPORT/EAFNOSUPPORT -- this kernel has no
-                  // NETLINK_NETFILTER at all; not worth a diagnostic row
+    fd_exhausted,      // EMFILE/ENFILE -- a system-wide condition worth surfacing
+    unsupported,       // EPROTONOSUPPORT/EAFNOSUPPORT -- this kernel has no
+                       // NETLINK_NETFILTER at all; not worth a diagnostic row
+    permission_denied, // EPERM/EACCES -- socket()/bind() itself was refused
+                       // (RestrictAddressFamilies=, seccomp, AppArmor). Distinct
+                       // from `other`: this is diagnosable and actionable the
+                       // same way the existing dump-level eperm token already is
+                       // (governance gate6 sre finding, r2 -- previously fell
+                       // into `other` and emitted no row at all, indistinguishable
+                       // from "kernel genuinely has no nftables").
     other,
 };
 
@@ -738,16 +745,31 @@ enum class OpenNftErrClass {
         return OpenNftErrClass::fd_exhausted;
     if (err == EPROTONOSUPPORT || err == EAFNOSUPPORT)
         return OpenNftErrClass::unsupported;
+    if (err == EPERM || err == EACCES)
+        return OpenNftErrClass::permission_denied;
     return OpenNftErrClass::other;
 }
 
-/// Emits `error|fd_exhausted` iff `sock_err` is a fd-exhaustion errno --
-/// shared by all three open_nft_socket() call sites in run_nft_probe() so
-/// the check-and-emit pair exists once (code-review finding: it was
-/// previously triplicated with only the surrounding control flow differing).
-void report_if_fd_exhausted(yuzu::CommandContext& ctx, int sock_err) {
-    if (classify_open_errno(sock_err) == OpenNftErrClass::fd_exhausted)
+/// Emits a diagnostic row for `sock_err` classes an operator can act on --
+/// `fd_exhausted` and `permission_denied` -- shared by all three
+/// open_nft_socket() call sites in run_nft_probe() so the check-and-emit
+/// pair exists once (code-review finding: it was previously triplicated
+/// with only the surrounding control flow differing). `unsupported`/`other`
+/// stay silent: `unsupported` means the kernel genuinely has no
+/// NETLINK_NETFILTER (not worth a row), and `other` has no known,
+/// specifically-actionable cause yet.
+void report_open_nft_diagnostic(yuzu::CommandContext& ctx, int sock_err) {
+    switch (classify_open_errno(sock_err)) {
+    case OpenNftErrClass::fd_exhausted:
         ctx.write_output("error|fd_exhausted");
+        return;
+    case OpenNftErrClass::permission_denied:
+        ctx.write_output("error|nftables:socket:eperm");
+        return;
+    case OpenNftErrClass::unsupported:
+    case OpenNftErrClass::other:
+        return;
+    }
 }
 
 /// Opens and binds a NETLINK_NETFILTER socket for one dump round-trip, with
@@ -842,8 +864,16 @@ nft_dump(int fd, std::uint16_t msg_type, std::vector<std::byte>& out,
     do {
         sent = ::send(fd, req, sizeof(req), 0);
     } while (sent < 0 && errno == EINTR && std::chrono::steady_clock::now() < deadline);
-    if (sent != static_cast<ssize_t>(sizeof(req)))
+    if (sent != static_cast<ssize_t>(sizeof(req))) {
+        // The retry loop above can exit two ways: a genuine send() failure
+        // (any errno other than EINTR), or the deadline elapsing while still
+        // getting EINTR -- the latter is a timeout, not an I/O error, and
+        // reporting it as the generic io_error default previously collapsed
+        // the distinction (governance gate3 cpp-safety finding, r2).
+        if (sent < 0 && errno == EINTR)
+            return {NftDumpStatus::timeout, 0};
         return {}; // io_error (NftDumpResult's default status)
+    }
 
     std::vector<std::byte> recv_buf(kNftRecvBufSize);
     int foreign_datagrams = 0;
@@ -1004,7 +1034,7 @@ struct NftProbeResult {
 
     auto table_sock = open_nft_socket(remaining_ms(table_deadline));
     if (!table_sock) {
-        report_if_fd_exhausted(ctx, table_sock.error());
+        report_open_nft_diagnostic(ctx, table_sock.error());
         return std::nullopt; // unreachable -- fall through untouched
     }
     std::vector<std::byte> table_buf;
@@ -1033,7 +1063,7 @@ struct NftProbeResult {
     // including fd_exhausted, the one that actually needs an operator's
     // attention. Surface it the same way here.
     if (!chain_sock)
-        report_if_fd_exhausted(ctx, chain_sock.error());
+        report_open_nft_diagnostic(ctx, chain_sock.error());
     const auto chain_res = chain_sock ? nft_dump(chain_sock->get(), nft::kNftMsgGetchain,
                                                  result.chain_buf, chain_deadline)
                                       : yuzu::firewall::NftDumpResult{};
@@ -1042,10 +1072,15 @@ struct NftProbeResult {
 
     auto rule_sock = open_nft_socket(remaining_ms(rule_deadline));
     if (!rule_sock)
-        report_if_fd_exhausted(ctx, rule_sock.error());
+        report_open_nft_diagnostic(ctx, rule_sock.error());
     const auto rule_res = rule_sock ? nft_dump(rule_sock->get(), nft::kNftMsgGetrule,
                                                result.rule_buf, rule_deadline)
                                     : yuzu::firewall::NftDumpResult{};
+    if (rule_sock)
+        rule_sock->reset(); // consistency with table_sock/chain_sock above --
+                            // not a leak either way (scope exit closes it),
+                            // but this keeps the fresh-fd-per-dump discipline
+                            // explicit at every call site.
 
     const bool chains_ok = chain_res.status == yuzu::firewall::NftDumpStatus::ok;
     const bool rules_ok = rule_res.status == yuzu::firewall::NftDumpStatus::ok;
@@ -1139,11 +1174,10 @@ bool try_ufw_state(yuzu::CommandContext& ctx, bool tables_seen) {
     // state| is gated on subprocess_complete(), the same completeness check
     // ruleset| already used -- a timed-out or output-capped read must not
     // report a parsed status as though it were trustworthy (governance
-    // gate2 security-guardian finding, r1).
-    auto state = subprocess_complete(res)
-                     ? yuzu::firewall::nft_fallthrough_clamp(
-                           tables_seen, yuzu::firewall::parse_ufw_status(res.output))
-                     : yuzu::firewall::FwState::unknown;
+    // gate2 security-guardian finding, r1). gate_state_on_completeness()
+    // is the shared, unit-tested composition of that check.
+    auto state = yuzu::firewall::gate_state_on_completeness(
+        subprocess_complete(res), tables_seen, yuzu::firewall::parse_ufw_status(res.output));
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"
@@ -1213,13 +1247,11 @@ bool try_iptables_state(yuzu::CommandContext& ctx, bool tables_seen) {
     // ruleset| already used -- exit_code==0 alone doesn't rule out a
     // timed-out or output-capped read, and a parsed verdict off a partial
     // -S dump is not trustworthy (governance gate2 security-guardian
-    // finding, r1).
-    auto state = subprocess_complete(res)
-                     ? yuzu::firewall::nft_fallthrough_clamp(
-                           tables_seen,
-                           has_content ? yuzu::firewall::FwState::enabled
-                                       : yuzu::firewall::FwState::disabled)
-                     : yuzu::firewall::FwState::unknown;
+    // finding, r1). gate_state_on_completeness() is the shared,
+    // unit-tested composition of that check.
+    auto state = yuzu::firewall::gate_state_on_completeness(
+        subprocess_complete(res), tables_seen,
+        has_content ? yuzu::firewall::FwState::enabled : yuzu::firewall::FwState::disabled);
     ctx.write_output(std::format(
         "state|{}", state == yuzu::firewall::FwState::enabled    ? "active"
                     : state == yuzu::firewall::FwState::disabled ? "inactive"

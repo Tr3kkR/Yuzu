@@ -37,7 +37,7 @@ adversarial harness, not a mutation tool.
 
 THE FORGED FIXTURE IS A BASE CHAIN, NOT A BARE TABLE+NAME (review R2). A
 NEWCHAIN carrying only NFTA_CHAIN_TABLE/NFTA_CHAIN_NAME is silently skipped
-by try_nftables_rules()'s `!is_base_chain` guard (firewall_parsers.hpp) and
+by try_nftables_rules()'s `!is_base_chain` guard (firewall_plugin.cpp) and
 never surfaces in output — the spoof would be undetectable even if the
 sender check were absent. This script therefore always attaches
 NFTA_CHAIN_HOOK (making parse_nft_chains() set is_base_chain=true) and

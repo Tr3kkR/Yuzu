@@ -796,6 +796,21 @@ enum class NftVerdict { active, inactive, unknown };
     return downstream_state;
 }
 
+/// Composes subprocess_complete() with nft_fallthrough_clamp(): the single
+/// completeness-gated state decision every rung-2 backend (ufw, iptables)
+/// makes the same way -- an incomplete subprocess read must degrade to
+/// unknown regardless of what its (possibly partial) output parsed to
+/// (governance gate2 security-guardian HIGH finding, r1). Pulled out so
+/// this composition itself is unit-tested, not just its two halves
+/// independently (governance gate3 quality-engineer finding, r2) -- the
+/// prior shape (`subprocess_complete(res) ? nft_fallthrough_clamp(...) :
+/// FwState::unknown`) was inline at each call site and only its two
+/// ingredients had direct test coverage, never the gate itself.
+[[nodiscard]] constexpr FwState gate_state_on_completeness(bool complete, bool tables_seen,
+                                                            FwState parsed_state) noexcept {
+    return complete ? nft_fallthrough_clamp(tables_seen, parsed_state) : FwState::unknown;
+}
+
 /// Maps a dump outcome to its diagnostic token. `kernel_error` further
 /// distinguishes the common permission-denied case (no CAP_NET_ADMIN) from
 /// any other kernel errno, since that's the one an operator can act on
@@ -818,7 +833,15 @@ enum class NftVerdict { active, inactive, unknown };
         // the truth is "the errno couldn't be read at all").
         if (res.kernel_errno == 0)
             return "errno:undecoded";
-        return "errno:" + std::to_string(std::abs(res.kernel_errno));
+        // Widen to int64_t before abs(): std::abs(INT_MIN) on a plain int
+        // is signed-overflow UB. Real kernel errnos are bounded to
+        // [-MAX_ERRNO,-1] by convention and this path is only reached
+        // after sender verification, so INT_MIN is not reachable in
+        // practice -- but nothing upstream enforces that range, so widen
+        // rather than rely on it (governance gate2 security-guardian
+        // finding, r2).
+        return "errno:" +
+               std::to_string(std::abs(static_cast<std::int64_t>(res.kernel_errno)));
     case NftDumpStatus::foreign_flood:
         return "foreign_flood";
     case NftDumpStatus::truncated:
