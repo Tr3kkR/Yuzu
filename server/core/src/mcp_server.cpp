@@ -2470,8 +2470,9 @@ static const ToolDef kTools[] = {
      "call it, not just that it exists); actions without one are name+description only — "
      "discover_instructions is the full schema-bearing catalog. NOT a build-time manifest. Each "
      "plugin carries docs — {summary, kind, platforms, readme, resource} when its README has adopted the "
-     "plugin documentation standard, else null; read the yuzu://plugin-docs resource for the full "
-     "per-plugin manifest (how it works, privileges, output columns, sample rows). New to the "
+     "plugin documentation standard, else null; resource names the per-plugin yuzu://plugin-docs/<name> "
+     "template (or read the whole-catalog yuzu://plugin-docs resource) for the full per-plugin manifest "
+     "(how it works, privileges, output columns, sample rows). New to the "
      "fleet? Read the yuzu://operating-model and yuzu://capabilities resources first to orient "
      "before acting. Read-only catalog.",
      R"({"type":"object","properties":{}})",
@@ -2480,7 +2481,7 @@ static const ToolDef kTools[] = {
      // and fixed; only actions[].parameter_schema is conditional (present
      // only when the action has a matching published InstructionDefinition),
      // typed generically for the same reason as discover_instructions above.
-     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. kind says whether the plugin is a read-only collector or mutates state and whether it runs on a gather schedule. The full manifest is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"kind":{"type":"object","properties":{"collector":{"type":"boolean"},"mutating":{"type":"boolean"},"gathered":{"type":"boolean"}},"required":["collector","mutating","gathered"]},"platforms":{"type":"object","properties":{"windows":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"macos":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"linux":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]}},"required":["windows","macos","linux"]},"readme":{"type":"string"},"resource":{"type":"string"}},"required":["summary","kind","platforms","readme","resource"]},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
+     R"j({"type":"object","properties":{"version":{"type":"integer"},"description":{"type":"string"},"limitation":{"type":"string"},"actions_enriched_with_schema":{"type":"integer"},"plugins":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"version":{"type":"string"},"description":{"type":"string"},"docs":{"type":["object","null"],"description":"Build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard; null when it has not. kind says whether the plugin is a read-only collector or mutates state and whether it runs on a gather schedule. resource is the per-plugin yuzu://plugin-docs/<name> resource template; the whole catalog is the yuzu://plugin-docs resource.","properties":{"summary":{"type":"string"},"kind":{"type":"object","properties":{"collector":{"type":"boolean"},"mutating":{"type":"boolean"},"gathered":{"type":"boolean"}},"required":["collector","mutating","gathered"]},"platforms":{"type":"object","properties":{"windows":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"macos":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]},"linux":{"type":"string","enum":["supported","constrained","planned","unsupported","undeclared"]}},"required":["windows","macos","linux"]},"readme":{"type":"string"},"resource":{"type":"string"}},"required":["summary","kind","platforms","readme","resource"]},"actions":{"type":"array","items":{"type":"object","properties":{"name":{"type":"string"},"description":{"type":"string"},"parameter_schema":{"type":"object","description":"Present only when the action has a matching published InstructionDefinition"}},"required":["name","description"]}}},"required":["name","version","description","docs","actions"]}},"commands":{"type":"array","items":{"type":"string"}}},"required":["version","description","limitation","actions_enriched_with_schema","plugins","commands"]})j"},
     {"query_software_licenses",
      "Query a single agent's discovered software licences (ADR-0024 discovery plane) — the "
      "MCP twin of GET /api/v1/sle/agents/{id}. Returns each detected licence's product, "
@@ -4420,11 +4421,39 @@ static const ResourceDef kResources[] = {
      "Per-plugin documentation as data — how each agent plugin works, on which OS, "
      "what it needs and what it emits (generated from agents/plugins/<name>/README.md) — "
      "same builder as GET /api/v1/discover/plugin-docs; discover_plugins carries a "
-     "per-plugin summary that points here",
+     "per-plugin summary that points at the narrower per-plugin resource template below",
      "application/json"},
 };
 
 static constexpr int kResourceCount = sizeof(kResources) / sizeof(kResources[0]);
+
+// ── Resource templates (#4108) ────────────────────────────────────────────
+// MCP resource templates (resources/templates/list, spec 2025-06-18) — a URI
+// template a client expands with its own parameter rather than a fixed URI.
+// One entry today: the per-plugin narrow read beside the whole-catalog
+// yuzu://plugin-docs resource above. No MCP capability change needed —
+// templates live under the existing "resources" capability the initialize
+// response already advertises.
+
+struct ResourceTemplateDef {
+    const char* uri_template;
+    const char* name;
+    const char* description;
+    const char* mime_type;
+};
+
+static const ResourceTemplateDef kResourceTemplates[] = {
+    {"yuzu://plugin-docs/{name}", "Plugin Documentation Manifest",
+     "One plugin's documentation manifest by name — the same element GET "
+     "/api/v1/discover/plugin-docs/{name} and the yuzu://plugin-docs catalog resource's "
+     "plugins[] array carry for that plugin, byte-identical. An unrecognised name is an "
+     "Invalid params error naming the catalog resource as the way to list documented "
+     "plugins.",
+     "application/json"},
+};
+
+static constexpr int kResourceTemplateCount =
+    sizeof(kResourceTemplates) / sizeof(kResourceTemplates[0]);
 
 // ── Prompt definitions ────────────────────────────────────────────────────
 
@@ -5396,6 +5425,21 @@ McpServer::HandlerFn McpServer::build_handler(
             return;
         }
 
+        // ── resources/templates/list (#4108) ────────────────────────────────
+        if (method == "resources/templates/list") {
+            JArr arr;
+            for (int i = 0; i < kResourceTemplateCount; ++i) {
+                arr.add(JObj()
+                            .add("uriTemplate", kResourceTemplates[i].uri_template)
+                            .add("name", kResourceTemplates[i].name)
+                            .add("description", kResourceTemplates[i].description)
+                            .add("mimeType", kResourceTemplates[i].mime_type));
+            }
+            auto result = JObj().raw("resourceTemplates", arr.str()).str();
+            res.set_content(success_response(id, result), "application/json");
+            return;
+        }
+
         // ── prompts/list ──────────────────────────────────────────────────
         if (method == "prompts/list") {
             JArr arr;
@@ -5792,25 +5836,32 @@ McpServer::HandlerFn McpServer::build_handler(
                 "MCP token (operator or supervised), or the REST API / dashboard";
             // The compiled-in catalogs share ONE shape — tier gate, then perm gate,
             // then the text as a single application/json content entry — kept as
-            // one local so a further static resource cannot drift from the
-            // tier-then-perm order. Each caller names its source; the bytes are
-            // whatever that builder serves to its REST twin.
-            auto serve_compiled_json_resource = [&](std::string_view text) {
+            // two locals so a further static resource, or the #4108 per-plugin
+            // template below, cannot drift from the tier-then-perm order. Split
+            // into admit + emit (rather than one lambda) so a templated branch can
+            // gate BEFORE its name lookup, without a caller ever emitting content
+            // to a denied session.
+            auto admit_compiled_json_resource = [&]() -> bool {
                 if (!tier_allows(session->mcp_tier, "Infrastructure", "Read")) {
                     res.set_content(
                         error_response_a4(id, kTierDenied, "MCP tier does not allow this operation",
                                           yuzu::server::detail::make_correlation_id(),
                                           kResourceTierRemediation),
                         "application/json");
-                    return;
+                    return false;
                 }
-                if (!perm_fn(req, res, "Infrastructure", "Read"))
-                    return;
+                return perm_fn(req, res, "Infrastructure", "Read");
+            };
+            auto emit_compiled_json_resource = [&](std::string_view text) {
                 JArr contents;
                 contents.add(
                     JObj().add("uri", uri).add("mimeType", "application/json").add("text", text));
                 res.set_content(success_response(id, JObj().raw("contents", contents.str()).str()),
                                 "application/json");
+            };
+            auto serve_compiled_json_resource = [&](std::string_view text) {
+                if (admit_compiled_json_resource())
+                    emit_compiled_json_resource(text);
             };
             if (uri == "yuzu://openapi") {
                 // Raw openapi_spec_json(): byte-identical to REST GET /api/v1/openapi.json,
@@ -5829,6 +5880,29 @@ McpServer::HandlerFn McpServer::build_handler(
                 // GET /api/v1/discover/plugin-docs. Compiled-in content only, never
                 // fleet-derived.
                 serve_compiled_json_resource(yuzu::server::plugin_docs_catalog().json);
+                return;
+            }
+            // #4108: yuzu://plugin-docs/{name} resource template — the narrow
+            // per-plugin read beside the whole-catalog resource above, same
+            // manifest_by_name builder as REST GET /api/v1/discover/plugin-docs/{name}.
+            // Gate BEFORE the name lookup so a denied caller learns nothing about
+            // which plugin names exist.
+            constexpr std::string_view kPluginDocsPrefix = "yuzu://plugin-docs/";
+            if (uri.starts_with(kPluginDocsPrefix)) {
+                if (!admit_compiled_json_resource())
+                    return;
+                const auto* doc =
+                    yuzu::server::plugin_docs_manifest(uri.substr(kPluginDocsPrefix.size()));
+                if (!doc) {
+                    res.set_content(
+                        error_response_a4(id, kInvalidParams, "Unknown resource URI: " + uri,
+                                          yuzu::server::detail::make_correlation_id(),
+                                          "read yuzu://plugin-docs or call discover_plugins for the "
+                                          "documented plugin names"),
+                        "application/json");
+                    return;
+                }
+                emit_compiled_json_resource(doc->json);
                 return;
             }
 
