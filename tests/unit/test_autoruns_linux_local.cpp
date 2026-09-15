@@ -1487,6 +1487,70 @@ TEST_CASE("autoruns Linux leg: scan_xdg_autostart_user distinguishes a real "
     }
 }
 
+TEST_CASE("autoruns Linux leg: systemd_user_timer_status's three dispatch branches "
+          "each independently reachable, not just whichever one this host's own "
+          "/run/systemd/system state happens to hit (PR #4154 round 8's should-fix, "
+          "previously never actually driven into all three shapes by any test)",
+          "[autoruns][actions][linux]") {
+    using yuzu::autoruns::systemd_user_timer_status;
+    using yuzu::autoruns::TimerScan;
+
+    SECTION("branch 1: a readable directory somewhere -- routes through "
+            "timer_scan_status, then the permanent narrow-search-path-coverage "
+            "downgrade composes on top (a clean scan's would-be Supported "
+            "becomes Constrained/narrow_search_path_coverage, never a bare "
+            "Supported -- this source's catalog-declared permanent gap, "
+            "apply_narrow_search_path_coverage's own banner)") {
+        TimerScan scan; // clean: no truncation, no constraint of any kind
+        const auto [support, reason, rows] =
+            systemd_user_timer_status(/*any_dir_readable=*/true,
+                                      /*home_listing_opened=*/false,
+                                      /*home_listing_permission_denied=*/false, scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "narrow_search_path_coverage");
+        CHECK(rows == 0);
+    }
+
+    SECTION("branch 1, a genuinely constrained scan: the scan's own reason "
+            "composes alongside the permanent coverage gap, not replaced by it") {
+        TimerScan scan;
+        scan.any_truncated = true;
+        const auto [support, reason, rows] =
+            systemd_user_timer_status(/*any_dir_readable=*/true,
+                                      /*home_listing_opened=*/false,
+                                      /*home_listing_permission_denied=*/false, scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "row_cap,narrow_search_path_coverage");
+        CHECK(rows == 0);
+    }
+
+    SECTION("branch 2: /home itself permission-denied (and branch 1's condition "
+            "is false) -- permission_denied composes with the coverage gap") {
+        TimerScan scan; // any_dir_readable/home_listing_opened/any_dir_open_failure all false
+        const auto [support, reason, rows] =
+            systemd_user_timer_status(/*any_dir_readable=*/false,
+                                      /*home_listing_opened=*/false,
+                                      /*home_listing_permission_denied=*/true, scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "permission_denied,narrow_search_path_coverage");
+        CHECK(rows == 0);
+    }
+
+    SECTION("branch 3: the terminal case -- no readable directory anywhere and "
+            "/home itself is genuinely absent (neither branch 1 nor branch 2's "
+            "condition holds) -- still Constrained via the coverage gap, never "
+            "the bare Supported this source's own catalog declaration forbids") {
+        TimerScan scan;
+        const auto [support, reason, rows] =
+            systemd_user_timer_status(/*any_dir_readable=*/false,
+                                      /*home_listing_opened=*/false,
+                                      /*home_listing_permission_denied=*/false, scan);
+        CHECK(support == YUZU_SUPPORT_CONSTRAINED);
+        CHECK(reason == "narrow_search_path_coverage");
+        CHECK(rows == 0);
+    }
+}
+
 #endif // defined(__linux__)
 
 TEST_CASE("autoruns Linux leg: an unknown action is refused, not silently ignored",
