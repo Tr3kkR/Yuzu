@@ -725,6 +725,174 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
     REQUIRE(h.calls.empty());
 }
 
+// #4373: the kInstructionResult branch was missing the equivalent recheck
+// entirely - a row minted via the uncapped POST /api/v1/result-sets (no
+// source_kind allowlist there) could carry an over-keyed or oversized
+// params object, or an oversized instruction_id, straight past MCP's own
+// bounds (mcp_input_bounds.hpp) and into a fleet-wide dispatch. These five
+// cases mirror the ones reevaluate_result_set's own fix (PR #4394) already
+// has, seeded directly in the store the same way the SQL-cap test above is
+// (never through /from-instruction-result, which has no per-field bound of
+// its own to enforce the smuggled shape at creation time).
+
+TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
+          "instruction_result row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = "some-instruction";
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params["k" + std::to_string(i)] = "v";
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-overkeyed";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: an oversized params value smuggled onto an existing "
+          "instruction_result row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = "some-instruction";
+    payload["params"] = {{"k", std::string(65537, 'z')}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-value";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
+          "not skipped, smuggled onto an existing instruction_result row",
+          "[pg][result_set][async][reeval]") {
+    // Proves the value-size check measures dump() size for a non-string JSON
+    // value (an object/array), not merely `.is_string()`-gated away - the
+    // exact regression MCP's own reevaluate_result_set fix had a dedicated
+    // SECTION for.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = "some-instruction";
+    payload["params"] = {{"k", {{"pad", std::string(65537, 'z')}}}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-nonstring-value";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
+          "row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = std::string(257, 'q');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
+          "400, never an uncaught type_error",
+          "[pg][result_set][async][reeval]") {
+    // nlohmann::json::value("sql", "") throws json::type_error on a type
+    // mismatch rather than coercing - #4373's second finding. Proves the
+    // type-confusion guard actually fires, not merely that the comment says
+    // it should.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["sql"] = 12345;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-type-mismatched-sql";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: a type-mismatched instruction_id value on an "
+          "instruction_result row is a clean 400, never an uncaught type_error",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = 12345;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-type-mismatched-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // CWE-862 — the three async producers DISPATCH, so they must gate on
 // Execution:Execute.
