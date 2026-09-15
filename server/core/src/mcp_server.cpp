@@ -8177,9 +8177,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (engine_principal.credential.reveal) — audit BEFORE the payload
                 // is built, and on failure the data is WITHHELD entirely, never
                 // served with an audit_persisted:false flag. DUAL audit, same
-                // shape as credential.reveal: the domain event (the interface
-                // contract's docs/wave7/integration-app-usage-read.md name,
-                // shared with the REST twin) plus the generic mcp.<tool>
+                // shape as credential.reveal: the domain event ("app_usage.agent.view"
+                // — same verb as the REST twin) plus the generic mcp.<tool>
                 // bookkeeping event — either dropping fails the whole request
                 // closed, since both are the durable evidence this gate exists
                 // to guarantee.
