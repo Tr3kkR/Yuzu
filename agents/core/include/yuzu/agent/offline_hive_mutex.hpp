@@ -34,19 +34,20 @@
  * win_profiles.hpp's with_user_hive() for where it is taken. The live-hive
  * path (the common case) never takes this lock.
  *
- * INSTRUMENTATION (added when execution_artifacts became the 5th caller):
- * this one process-wide lock now serialises the offline arm for FIVE
- * plugins (registry, installed_apps, license_scan, tar via
- * with_user_hive(), and execution_artifacts directly), so a long hold by
- * any one of them blocks the other four with no prior visibility into it.
+ * INSTRUMENTATION: this one process-wide lock already serialises the
+ * offline arm for FIVE plugins via with_user_hive() -- autoruns,
+ * installed_apps, license_scan, registry, tar -- so a long hold by any one
+ * of them blocks the other four with no prior visibility into it. A
+ * planned execution_artifacts caller (not yet on this branch) will make it
+ * six, calling the lock directly rather than through with_user_hive().
  * `ScopedOfflineHiveLock` wraps the acquire/release with a wait-time and
  * hold-time log (spdlog, this codebase's existing agent-side logging
  * mechanism -- see guard_registry.cpp for the same pattern applied to
  * Guardian's own shared-resource contention) so an unusually long wait or
  * hold is visible without instrumenting every call site by hand. Prefer it
  * over a bare `std::lock_guard<std::mutex>(offline_hive_mutex())` for any
- * new caller; the two existing call sites (win_profiles.hpp,
- * execution_artifacts_win.cpp) already use it.
+ * new caller; today with_user_hive() (agents/shared/win_profiles.hpp) is
+ * the only call site, serving the five plugins above.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
@@ -80,6 +81,11 @@ public:
 
 private:
     const char* caller_;
+    // std::unique_lock, never a bare lock()/unlock() pair on the raw mutex
+    // (docs/cpp-conventions.md's Concurrency section) -- constructed
+    // std::defer_lock so the constructor can still measure wait time around
+    // the explicit lock() call below.
+    std::unique_lock<std::mutex> lock_;
     std::chrono::steady_clock::time_point acquired_at_;
 };
 
