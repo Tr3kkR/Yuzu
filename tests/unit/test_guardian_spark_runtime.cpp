@@ -7231,6 +7231,309 @@ TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous
     REQUIRE(ok.has_value());
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// rung 9c PR-5c (#4221): the Dispatching-window race. abandon_claim_locked() can
+// tag a claim WaiterTimedOutDispatched while dispatch_arm_off_lock()'s own
+// admission decision is still unresolved; fail_all_claims_locked()'s guard
+// (`if (c->end == ClaimEnd::None)`) then can't overwrite that stale value once
+// admission genuinely resolves. All three tests below reproduce a genuine REFILL
+// dispatch for a second claim (r2) on the same key as a withdrawn r1: r2 must be
+// queued only AFTER on_arm_complete() has already decided nobody is eligible to
+// ADOPT r1's late result (i.e. from inside the drain-gap hook, which fires right
+// before the compensating disarm is submitted) - queuing r2 any earlier makes it
+// a legitimate adopter of r1's own watcher instead (the "N consumers, 1 watcher"
+// dedup path), which resolves inline and never dispatches r2 separately at all.
+// Only a genuine refill's own dispatch runs on a detached worker thread, separate
+// from the caller that already holds r2's own receipt - which is what makes the
+// corrected `end` value observable via receipt_status() at all.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclassifies "
+          "an ordinary admission failure on a REFILLED claim as Wedged",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    const auto key = spark_key(file_spec("/a"));
+
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread a_thread{[&] {
+        gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->detach_rule("r1"); // Case 0: withdrawn, stays as the key's marker for its late result
+    a_thread.join();
+    REQUIRE_FALSE(gen_r1.has_value());
+    CHECK(gen_r1.error() == "withdrawn");
+
+    // From inside the drain-gap hook - fires once on_arm_complete() has already
+    // decided nobody is eligible to adopt r1's late result, right before the
+    // compensating disarm is submitted (its own doc comment: "the ONE gap where a
+    // key's outcome is decided but its claims are still unpublished") - queue r2
+    // and install our own entry hook for ITS eventual (genuine) refill dispatch.
+    std::expected<GuardianSparkRuntime::ArmOutcome, std::string> res2;
+    std::thread r2_thread;
+    std::promise<void> entered;
+    std::promise<void> release_hook;
+    bool released_by_test = false;
+    auto entered_fut = entered.get_future();
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_dispatch_entry_hook_for_test([&] {
+            entered.set_value();
+            release_hook.get_future().wait();
+        });
+        r2_thread = std::thread{[&] {
+            res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                   file_exists_rule("r2"), true);
+        }};
+        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                       std::chrono::seconds(10)));
+    });
+    struct Cleanup {
+        std::promise<void>* release_hook;
+        bool* released;
+        std::thread* r2t;
+        ~Cleanup() {
+            if (!*released)
+                release_hook->set_value();
+            if (r2t->joinable())
+                r2t->join();
+        }
+    } cleanup{&release_hook, &released_by_test, &r2_thread};
+
+    b->release_hang(); // r1's late arm lands: drain -> gap hook (queues r2) -> compensation
+    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    r2_thread.join();
+    rt->set_drain_gap_hook_for_test({});
+    REQUIRE(res2.has_value());
+    REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+
+    // r2 is now Dispatching (try_dispatch_head_locked flipped it before this
+    // function was ever entered) but its own admission is still unresolved -
+    // parked in the hook. Time it out from the test's own thread.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1); // only r2 - r1 already compensated and popped.
+
+    // Let admission resolve for real, as an ORDINARY (non-Stopped) refusal.
+    rt->set_io_executor_fail_launch_for_test(true);
+    released_by_test = true;
+    release_hook.set_value();
+    // NOT is_terminal(): expire_overdue_claims() above already made that trivially
+    // true (WaiterTimedOutDispatched/Expired is itself a terminal-shaped status) -
+    // wait specifically for the value to move AWAY from the stale Expired result,
+    // which only happens once the real (corrected) resolution below has actually run.
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Expired;
+        },
+        std::chrono::seconds(10)));
+    rt->set_io_executor_fail_launch_for_test(false);
+
+    // Pre-fix: fail_all_claims_locked()'s guard could not overwrite the stale
+    // WaiterTimedOutDispatched already on r2, so this stayed Expired even though
+    // the real cause was an ordinary admission rejection, not a timeout.
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
+    CHECK(rt->rule_count() == 0); // r1 withdrawn, never committed; r2 failed too
+
+    // The key fully recovers: a fresh attach now arms normally.
+    const auto res3 = rt->attach_rule("r3", file_spec("/a"), file_exists_rule("r3"), true);
+    REQUIRE(res3.has_value());
+    CHECK(rt->rule_count() == 1);
+}
+
+TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant - a "
+          "stop landing in the same window still reports Stopped, not a stale timeout",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread a_thread{[&] {
+        gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->detach_rule("r1");
+    a_thread.join();
+    REQUIRE_FALSE(gen_r1.has_value());
+
+    std::expected<GuardianSparkRuntime::ArmOutcome, std::string> res2;
+    std::thread r2_thread;
+    std::promise<void> entered;
+    std::promise<void> release_hook;
+    bool released_by_test = false;
+    auto entered_fut = entered.get_future();
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_dispatch_entry_hook_for_test([&] {
+            entered.set_value();
+            release_hook.get_future().wait();
+        });
+        r2_thread = std::thread{[&] {
+            res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                   file_exists_rule("r2"), true);
+        }};
+        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                       std::chrono::seconds(10)));
+    });
+    struct Cleanup {
+        std::promise<void>* release_hook;
+        bool* released;
+        std::thread* r2t;
+        ~Cleanup() {
+            if (!*released)
+                release_hook->set_value();
+            if (r2t->joinable())
+                r2t->join();
+        }
+    } cleanup{&release_hook, &released_by_test, &r2_thread};
+
+    b->release_hang();
+    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    r2_thread.join();
+    rt->set_drain_gap_hook_for_test({});
+    REQUIRE(res2.has_value());
+    REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+
+    // begin_stop() itself would drop a Queued claim outright, but r2 is already
+    // Dispatching (retained in place by abandon_claim_locked above) - it survives
+    // to reach dispatch_arm_off_lock()'s own submission attempt, which now observes
+    // Stopped synchronously once the executor is stopping.
+    rt->begin_stop();
+    released_by_test = true;
+    release_hook.set_value();
+    // NOT is_terminal(): see the equivalent comment in the non-Stopped variant
+    // above - wait for the value to move away from the stale Expired result.
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Expired;
+        },
+        std::chrono::seconds(10)));
+
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Stopped);
+}
+
+TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED claim also "
+          "reaches the compensation-reservation-exhaustion call site, not only submission",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    const auto key = spark_key(file_spec("/a"));
+
+    std::expected<std::uint64_t, std::string> gen_r1;
+    std::thread a_thread{[&] {
+        gen_r1 = rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    }};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    rt->detach_rule("r1");
+    a_thread.join();
+    REQUIRE_FALSE(gen_r1.has_value());
+
+    // r2 is queued and parked at its own dispatch entry - BEFORE it ever reaches
+    // the reservation check - from inside the drain-gap hook, same as the other
+    // two tests above.
+    std::expected<GuardianSparkRuntime::ArmOutcome, std::string> res2;
+    std::thread r2_thread;
+    std::promise<void> entered;
+    std::promise<void> release_hook;
+    bool released_by_test = false;
+    auto entered_fut = entered.get_future();
+    rt->set_drain_gap_hook_for_test([&] {
+        rt->set_dispatch_entry_hook_for_test([&] {
+            entered.set_value();
+            release_hook.get_future().wait();
+        });
+        r2_thread = std::thread{[&] {
+            res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
+                                   file_exists_rule("r2"), true);
+        }};
+        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                       std::chrono::seconds(10)));
+    });
+    struct Cleanup {
+        std::promise<void>* release_hook;
+        bool* released;
+        std::thread* r2t;
+        ~Cleanup() {
+            if (!*released)
+                release_hook->set_value();
+            if (r2t->joinable())
+                r2t->join();
+        }
+    } cleanup{&release_hook, &released_by_test, &r2_thread};
+
+    b->release_hang(); // r1's late arm is compensated, popped (releasing its OWN
+                       // reservation as part of that same completion), and r2 is
+                       // refilled -> parked in our hook, before its own reservation
+                       // attempt.
+    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    r2_thread.join();
+    rt->set_drain_gap_hook_for_test({});
+    REQUIRE(res2.has_value());
+
+    // NOW saturate File-class reservation capacity (4) with 4 parked arms on
+    // distinct keys - r1's own reservation is already released (its whole
+    // compensation completed before the refill above ever ran), so full capacity
+    // is genuinely free here, and r2 is safely parked in our hook, unable to reach
+    // its own reservation attempt until we release it below.
+    b->arm_park.park_every = 1;
+    constexpr int kFillerCount = 4;
+    const int base_entries = b->arm_entries.load();
+    std::vector<std::thread> fillers;
+    std::vector<std::expected<std::uint64_t, std::string>> filler_results(
+        static_cast<std::size_t>(kFillerCount));
+    for (int i = 0; i < kFillerCount; ++i) {
+        fillers.emplace_back([&, i] {
+            const auto rid = "f" + std::to_string(i);
+            filler_results[static_cast<std::size_t>(i)] = rt->attach_rule(
+                rid, file_spec("/f" + std::to_string(i)), file_exists_rule(rid), true);
+        });
+    }
+    // Constructed BEFORE the REQUIRE below can throw: a std::thread destructor
+    // running while still joinable() is std::terminate(), not an exception - this
+    // guard must survive a failed spin_until, not just the success path.
+    struct FillerCleanup {
+        BlockingGate* gate;
+        std::vector<std::thread>* t;
+        ~FillerCleanup() {
+            gate->pulse();
+            for (auto& th : *t)
+                if (th.joinable())
+                    th.join();
+        }
+    } filler_cleanup{&b->arm_park, &fillers};
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return b->arm_entries.load() == base_entries + kFillerCount; },
+        std::chrono::seconds(10)));
+    b->arm_park.park_every = 0; // stop parking future arrivals - r2 must reach the
+                               // reservation check itself, not get parked in arm()
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+
+    released_by_test = true;
+    release_hook.set_value(); // r2 proceeds into a now-exhausted reservation pool
+    // NOT is_terminal(): see the equivalent comment in the submission-failure
+    // variant above - wait for the value to move away from the stale Expired result.
+    REQUIRE(yuzu::test::spin_until(
+        [&] {
+            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Expired;
+        },
+        std::chrono::seconds(10)));
+
+    CHECK(rt->compensation_reservation_refused() >= 1);
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
+}
+
 TEST_CASE("up-4 (#4221): a Queued, withdrawn head with no outcome (a double-fault residue) "
           "is reaped by expire_overdue_claims' new terminal-recovery pass - the CONFIRMED "
           "real defect (Fable review), reached here via genuine allocation-failure seams, "

@@ -714,6 +714,15 @@ public:
     /// asserting "the hook did not fire" on a plain successful attach pins that. Set
     /// before triggering the drain; copied under registry_mu_ at the drain's start.
     void set_drain_gap_hook_for_test(std::function<void()> hook);
+    /// rung 9c PR-5c (#4221) test seam: fires exactly once, at the very top of
+    /// dispatch_arm_off_lock(), before that function takes registry_mu_ at all - a
+    /// hook body is free to call expire_overdue_claims() or anything else needing
+    /// that lock without deadlocking. This is the window a caller-side timeout
+    /// needs to land in, racing either the reservation check or the executor
+    /// submission further down in that function, to reproduce the
+    /// Dispatching-window race deterministically. Set before triggering the
+    /// dispatch; consumed (moved out, resetting to empty) under registry_mu_.
+    void set_dispatch_entry_hook_for_test(std::function<void()> hook);
     /// R5.2 drain fault seam (C2/K5): consumed once by the next on_arm_complete.
     /// 1 = std::bad_alloc before the fifo snapshot (after `compensating` took ownership
     /// of a successful arm); 2 = a throw right after the first commit adopted the
@@ -1696,6 +1705,26 @@ private:
     void clear_retained_locked(KeyClaim& claim) noexcept {
         claim.retained_guard.reset();
     }
+    /// rung 9c PR-5c (#4221, the Dispatching-window race): abandon_claim_locked()
+    /// can tag a claim WaiterTimedOutDispatched while its admission outcome is
+    /// still genuinely unresolved (a caller timeout racing dispatch_arm_off_lock's
+    /// own re-lock after building the executor submission). If admission then
+    /// resolves via fail_all_claims_locked(), that function's own per-claim guard
+    /// (`if (c->end == ClaimEnd::None) c->end = end;`) cannot overwrite the stale
+    /// value - the claim would report Wedged for what was really an ordinary
+    /// AdmissionRejected/Stopped outcome. Call this immediately before
+    /// fail_all_claims_locked() at both call sites the race can reach
+    /// (dispatch_arm_off_lock()'s reservation-exhaustion branch and its submission-
+    /// failure branch) - and only there: force-reclassifies this ONE claim's own
+    /// already-set `end` to the real outcome. Every other caller/claim's guard is
+    /// deliberately left untouched; this is not a relaxation of
+    /// fail_all_claims_locked()'s own contract, which stays conservative for
+    /// everything else in this file.
+    void reclassify_dispatching_race_locked(KeyClaim& claim, ClaimEnd real_end) noexcept {
+        if (claim.dispatch == ClaimDispatch::Dispatching &&
+            claim.end == ClaimEnd::WaiterTimedOutDispatched)
+            claim.end = real_end;
+    }
     /// rung 9c PR-5b hardening (this governance run): std::atomic<int> elements
     /// (was a plain std::array<int, kIoClassCount>) specifically so a
     /// CompensationPermit's destructor can release a slot safely regardless of
@@ -1723,6 +1752,7 @@ private:
     std::atomic<std::uint64_t> claim_index_release_failures_{0}; ///< r3 C2/C3: contained remove_rule throw
     std::atomic<std::uint64_t> detach_sweep_left_residue_{0}; ///< PR-5a #4221 cs-103: last-on-key sweep left the fifo non-empty (should never happen)
     std::function<void()> drain_gap_hook_for_test_; ///< registry_mu_-guarded; see the setter
+    std::function<void()> dispatch_entry_hook_for_test_; ///< registry_mu_-guarded; see the setter
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter

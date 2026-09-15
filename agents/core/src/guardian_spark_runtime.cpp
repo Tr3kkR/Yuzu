@@ -519,6 +519,21 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
             claim->dispatch = ClaimDispatch::Queued;
         return;
     }
+    // rung 9c PR-5c (#4221) test seam: default-empty, one-shot, fired here at entry -
+    // before this function takes registry_mu_ at all, so a hook body is free to call
+    // expire_overdue_claims() (or anything else needing that lock) without deadlocking.
+    // This is the window a caller-side timeout needs to land in, racing either the
+    // reservation check just below or the executor submission further down, to
+    // reproduce the Dispatching-window race deterministically.
+    {
+        std::function<void()> entry_hook;
+        {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            entry_hook = std::move(dispatch_entry_hook_for_test_);
+        }
+        if (entry_hook)
+            entry_hook();
+    }
     // up-3 (#4221): reserve this claim's compensating-disarm slot BEFORE the arm is
     // ever submitted, while no subscription exists yet - see
     // compensation_reserved_count_'s header comment for why this is a separate,
@@ -542,6 +557,12 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
             } else {
                 refused = true;
                 compensation_reservation_refused_.fetch_add(1, std::memory_order_relaxed);
+                // Dispatching-window race (rung 9c PR-5c, #4221): this claim may already
+                // carry a stale WaiterTimedOutDispatched from a caller timeout that raced
+                // this same re-lock - see reclassify_dispatching_race_locked()'s own doc
+                // comment. Correct it before fail_all_claims_locked()'s guard would
+                // otherwise leave it in place.
+                reclassify_dispatching_race_locked(*claim, ClaimEnd::AdmissionRejected);
                 try {
                     std::string reason{kCompensationReservationExhausted};
                     fail_all_claims_locked(key, reason, ClaimEnd::AdmissionRejected);
@@ -606,13 +627,18 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
         // claims' waiters stay bounded by their own deadlines. Nothing crosses the
         // noexcept boundary. fail_all_claims_locked itself is contained per claim.
         try {
+            const ClaimEnd real_end = adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
+                                                                        : ClaimEnd::AdmissionRejected;
+            // Dispatching-window race (rung 9c PR-5c, #4221): see
+            // reclassify_dispatching_race_locked()'s own doc comment. Done before the
+            // reason-string allocation below so the corrected classification survives
+            // even if that allocation throws.
+            reclassify_dispatching_race_locked(*claim, real_end);
             // Timeout/WorkerThrew are unreachable at admission (submit() has no
             // deadline; a throw happens on the worker) - the shared map keeps them so
             // the two sites can never drift (governance consistency c-1).
             std::string reason{arm_failure_reason(adm.error())};
-            fail_all_claims_locked(key, reason,
-                                   adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
-                                                                     : ClaimEnd::AdmissionRejected);
+            fail_all_claims_locked(key, reason, real_end);
         } catch (...) {
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             if (claim->dispatch == ClaimDispatch::Dispatching)
@@ -3389,6 +3415,11 @@ void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {
 void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hook) {
     std::lock_guard<std::mutex> lk{registry_mu_};
     drain_gap_hook_for_test_ = std::move(hook);
+}
+
+void GuardianSparkRuntime::set_dispatch_entry_hook_for_test(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    dispatch_entry_hook_for_test_ = std::move(hook);
 }
 
 void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker) {
