@@ -469,6 +469,12 @@ std::string decompress_mam(std::span<const uint8_t> raw, std::vector<uint8_t>& o
     // MAM header is 8 bytes (4-byte "MAM\x04" magic + 4-byte uncompressed
     // size, both validated by mam_uncompressed_size above) -- the compressed
     // payload starts immediately after it.
+    //
+    // const_cast safety: RtlDecompressBufferEx's CompressedBuffer parameter is
+    // documented [in]-only (never written); and even in the hypothetical worst
+    // case that it did write, `raw`/`payload`/`bytes` is never read again after
+    // this call (payload is reassigned to `decompressed` immediately below), so
+    // there is no downstream effect either way. Same pattern as auth.cpp:134.
     auto* compressed = const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(raw.data() + 8));
     const ULONG compressed_bytes = static_cast<ULONG>(raw.size() - 8);
 

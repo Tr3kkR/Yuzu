@@ -24,11 +24,14 @@
 /// test_capability_catalogue's `kSeededSecurableTypes` check, which runs
 /// after P0 lands.
 ///
-/// `execution_artifacts` and `app_usage` share the same ENFORCED authorization
-/// boundary: both authorize as `Forensics:Read` with `ExecuteGate::AdminOrApproval`,
-/// and `Forensics` is seeded to Administrator only. `authz::RiskTier::High`
-/// here (vs app_usage's `Medium`) is operator-triage metadata, not a wider
-/// authorization gap — it does not gate who can dispatch either plugin. The
+/// `execution_artifacts` authorizes as `Forensics:Read` with
+/// `ExecuteGate::AdminOrApproval`, and `Forensics` is seeded to Administrator
+/// only. `app_usage` (a sibling Wave 7b plugin, not yet merged as of this
+/// writing — verify its own catalogue fragment once it lands rather than
+/// trusting this comment) is PLANNED to share the same `Forensics:Read`/
+/// `AdminOrApproval` boundary at a lower `authz::RiskTier::Medium`.
+/// `authz::RiskTier::High` here is operator-triage metadata, not a wider
+/// authorization gap — it does not gate who can dispatch this plugin. The
 /// higher tier reflects that ShimCache/Amcache/Prefetch name real executable
 /// paths, cryptographic hashes, and precise run timestamps for a SINGLE named
 /// machine — the kind of evidence an incident responder pulls during an
