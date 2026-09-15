@@ -1,4 +1,4 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 21254047acbd
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash pending
 == action=summary
 meta|window_days|30|coverage_since|1789413708|days_present|1|open_runs|698|unmatched_stops|0|clock_anomalies|0|gap_count|0|gap_lost_events|0|gap_last_ts|-|lag_events|0|feeder_enabled|1|last_fold_ts|1789430443
 usage|clang|2924|178112|1789413824|1789430019|1|0|0
