@@ -5754,14 +5754,18 @@ re-runs a set's own source query and creates a **sibling** (same parent, new id)
 `400 RESULT_SET_BAD_PARENT` rather than silently widening to the fleet.
 
 **`{id}/re-eval` field bounds (#4373).** The original set's re-run fields are
-rechecked against the same bounds their creation-time routes enforce, because
-the original row may have been minted through `POST /api/v1/result-sets`
-directly (which carries no `source_kind` allowlist) rather than through
+rechecked against the same bound values used elsewhere, because the original
+row may have been minted through `POST /api/v1/result-sets` directly (which
+carries no `source_kind` allowlist) rather than through
 `from-tar-query`/`from-instruction-result`, and so may never have been
-validated at all: `sql` (tar_query) at 100 KiB, `instruction_id`
-(instruction_result) at 256 bytes, and `params` at 32 keys, 256-byte keys,
-and 64 KiB values. A type-mismatched `sql`/`instruction_id` value (not a
-JSON string) is treated as absent rather than raising an error.
+validated at all: `sql` (tar_query) at 100 KiB, the bound `from-tar-query`
+itself already enforces at creation time; and `instruction_id`
+(instruction_result) at 256 bytes plus `params` at 32 keys / 256-byte keys /
+64 KiB values, the bounds the MCP tool `create_result_set_from_instruction_result`
+enforces at creation time (REST's own `from-instruction-result` route does not
+yet enforce these). A type-mismatched `sql`/`instruction_id` value (not a JSON
+string) is treated as absent, taking the existing missing-field 400 path,
+rather than surfacing as an uncaught exception.
 
 **Errors:**
 
