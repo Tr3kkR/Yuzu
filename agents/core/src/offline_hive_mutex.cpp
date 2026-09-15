@@ -22,8 +22,18 @@ ScopedOfflineHiveLock::ScopedOfflineHiveLock(const char* caller) : caller_(calle
     acquired_at_ = std::chrono::steady_clock::now();
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(acquired_at_ -
                                                                                wait_start);
-    if (waited > std::chrono::milliseconds::zero())
-        spdlog::debug("offline_hive_mutex: {} waited {}ms to acquire", caller_, waited.count());
+    if (waited > std::chrono::milliseconds::zero()) {
+        // Diagnostics must never throw out of construction after the lock
+        // above already succeeded -- that would abort construction, skip
+        // this object's destructor, and leave offline_hive_mutex() locked
+        // forever (same never-let-diagnostics-throw-out reasoning as
+        // TempHiveCleanup's destructor in execution_artifacts_win.cpp).
+        try {
+            spdlog::debug("offline_hive_mutex: {} waited {}ms to acquire", caller_,
+                          waited.count());
+        } catch (...) {
+        }
+    }
 }
 
 ScopedOfflineHiveLock::~ScopedOfflineHiveLock() {
