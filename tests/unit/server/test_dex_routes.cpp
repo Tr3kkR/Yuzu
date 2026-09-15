@@ -1005,6 +1005,19 @@ TEST_CASE("DEX app drill-down: unknown app → no-crashes placeholder", "[pg][de
     CHECK(html.find("No crashes") != std::string::npos);
 }
 
+TEST_CASE("DEX app drill-down: performance cross-link uses the EXACT process-name "
+          "key, never normalized (no case-fold, no .exe strip) — shown even with no "
+          "crash history",
+          "[pg][dex][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto html = render_dex_app_fragment(&store, "MyApp.EXE", "7d");
+    CHECK(html.find("/fragments/dex/perf/app?app=MyApp.EXE&window=7d") != std::string::npos);
+    CHECK(html.find("myapp.exe") == std::string::npos);    // no case-fold
+    CHECK(html.find("app=MyApp&window=") == std::string::npos); // no .EXE stripping
+}
+
 TEST_CASE("DEX device drill-down: friendly multi-signal history (UP-4)",
           "[pg][dex][routes]") {
     YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);

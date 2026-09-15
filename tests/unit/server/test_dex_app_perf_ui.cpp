@@ -80,6 +80,28 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     CHECK(has(render_dex_app_perf_trend("x", {}, "", groups, 10, 30), "No performance history"));
 }
 
+// Pins the exact-key contract for the crash/hang cross-link (Apps tab ↔
+// Performance tab): crash identity (process_name) and perf identity (app_name)
+// are ALREADY the same canonicalized key at the agent, so the join must be
+// byte-identical — never case-folded, never stripped of a ".exe" suffix, never
+// a display-name/fuzzy lookup. A mixed-case, ".EXE"-suffixed name is the
+// regression trap: any normalization would visibly change the rendered href.
+TEST_CASE("render_dex_app_perf_trend: crash/hang cross-link uses the EXACT app-name "
+          "key, never normalized",
+          "[dex][app_perf][ui]") {
+    AppPerfVersionSummary v1;
+    v1.version = "1.0";
+    v1.latest_day = 1;
+    v1.device_count = 5;
+    v1.cpu_mean = 1.0;
+
+    std::vector<DexGroupOption> groups;
+    const auto h = render_dex_app_perf_trend("MyApp.EXE", {v1}, "", groups, 10, 7);
+    CHECK(has(h, "/fragments/dex/app?name=MyApp.EXE&amp;window=7d"));
+    CHECK_FALSE(has(h, "myapp.exe")); // no case-fold
+    CHECK_FALSE(has(h, "name=MyApp&amp;")); // no .EXE stripping
+}
+
 TEST_CASE("render_dex_device_app_perf: empty state", "[dex][app_perf][ui]") {
     const auto h = render_dex_device_app_perf({});
     CHECK(has(h, "No application performance history for this device"));

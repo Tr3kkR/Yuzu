@@ -2060,6 +2060,17 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(process_name) +
          "</h1></div><div class=\"gp-sub\">Crash &amp; hang blast radius across the "
          "fleet.</div></div></div>";
+    // Cross-link to the per-version performance trend — same process-image key
+    // (process_name), no normalization: Windows/Linux crash + perf identity are
+    // already the same canonicalized key at the agent (dex_signal_catalog.cpp),
+    // so this is an exact-key join, never a display-name/fuzzy match. Shown
+    // regardless of crash history — a quiet app can still have perf history.
+    h += "<div class=\"gp-note\">" +
+         drill_link("/fragments/dex/perf/app",
+                    "app=" + url_encode(process_name) + "&window=" + window,
+                    "Performance by version &rarr;") +
+         " &mdash; same process image, retained daily summaries. Per-app sampling is "
+         "opt-in.</div>";
     if (s.signals == 0)
         return h + placeholder("No crashes", "No crashes or hangs recorded for this application.");
 
@@ -2282,9 +2293,10 @@ std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const st
     }
     h += "</tbody></table>";
     h += "<div class=\"gp-note\">Stability by application (crashes + hangs). Devices = blast radius "
-         "(distinct devices); row &rarr; app detail. Repository / install / other reliability "
-         "signals attribute to an app once per-event app capture lands (Option&nbsp;D); per-app "
-         "performance and version are follow-on slices.</div>";
+         "(distinct devices); row &rarr; app detail, which cross-links to per-version CPU &amp; "
+         "memory performance. Repository / install / other reliability signals attribute to an app "
+         "once per-event app capture lands (Option&nbsp;D); per-version crash/hang counts on the "
+         "performance page remain a follow-on slice.</div>";
     return h;
 }
 
@@ -3085,11 +3097,14 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
         const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
+        const std::string version = req.has_param("version") ? req.get_param_value("version") : "";
         // Shared validator (app_perf_param_valid) — the SAME cap + control-char/NUL
         // re-floor the REST and MCP app-perf surfaces apply, so the three agree (a
         // NUL would truncate the bound libpq text param). `app` must be non-empty.
+        // `version` empty = all versions (unfiltered), same convention as REST.
         if (app.empty() || !app_perf_param_valid(app) ||
-            (!group.empty() && !app_perf_param_valid(group))) {
+            (!group.empty() && !app_perf_param_valid(group)) ||
+            (!version.empty() && !app_perf_param_valid(version))) {
             res.status = 400;
             res.set_content(placeholder("Pick an application",
                                         "Choose an application from the list to see its "
@@ -3112,7 +3127,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.fleet(app, "");
+            rows = app_perf_providers_.fleet(app, version);
             if (!rows) {
                 // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
                 // already counted the degrade. (REST twin stays fail-closed.)
@@ -3129,7 +3144,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 "text/html; charset=utf-8");
                 return;
             }
-            rows = app_perf_providers_.group(group, app, "");
+            rows = app_perf_providers_.group(group, app, version);
             if (!rows) {
                 // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the group
                 // reader already counted the degrade. (REST twin stays fail-closed.)
@@ -3141,7 +3156,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
         }
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
-                                                  window_days),
+                                                  window_days, version),
                         "text/html; charset=utf-8");
     });
 

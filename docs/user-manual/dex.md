@@ -54,10 +54,15 @@ A **fleet-wide Applications list** ranked by reliability signals — crash count
 and hang counts, keyed on the process image name. Each row links to the existing
 per-application blast-radius drill-down (top subjects, faulting modules,
 most-affected devices). Built on the same `dex_top_apps` aggregation that drives
-the Overview crash cards — no new agent collection. Per-app performance, version
-breakdown, and attribution of repository/install/service signals to the
-originating app are follow-on slices; the Apps tab today scopes to crash and
-hang signals only.
+the Overview crash cards — no new agent collection. The app detail page
+cross-links to per-version CPU & memory performance (the Performance tab's
+application trend), joined on the same process-image key an application's crash
+and perf identity already share on Windows/Linux — an exact match, not a
+name-normalized guess. Attribution of repository/install/service signals to the
+originating app is a follow-on slice; the Apps tab today scopes to crash and
+hang signals only. Per-version crash/hang *counts* on the performance trend
+(as opposed to the per-app crash/hang totals already shown here) remain
+deferred — see "Application performance over time" under Drill-downs.
 
 ### Catalogue
 
@@ -161,6 +166,19 @@ numbers match.
 
 - **Per-application** — click an app to see its crash/hang blast radius across
   the fleet: faulting modules, exception codes, and which devices are affected.
+  Cross-links to that app's **fleet-wide performance trend** (below), and the
+  trend links back — same process-image key both directions, exact match.
+- **Fleet-wide application performance** — reached from the Performance tab's
+  application picker, or the cross-link above: each version of an application
+  gets its own row with avg/p95 CPU, a CPU sparkline, avg working set, and the
+  reporting device count, over the retained fleet window (≤180 days) or, when a
+  management group is selected, that group's on-the-fly aggregate (≤31 days,
+  sub-10-device points suppressed to a count only). A **version filter**
+  narrows the trend to one version at a time (the same `version` parameter the
+  `GET /api/v1/dex/perf/app` / `/perf/group` endpoints already accept); "all
+  versions" is the default. Per-version crash/hang counts are not shown here
+  yet (a separate central crash-store join, still deferred) — use the
+  per-application crash/hang drill above for those.
 - **Per-device** — click a device to see its unified signal history (every
   signal type on one timeline, with friendly labels) plus a **device
   performance** panel: CPU, memory, and disk-latency sparklines built from the
