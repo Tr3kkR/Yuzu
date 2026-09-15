@@ -148,6 +148,19 @@ was_managed_plugin() {
     [[ -f "$MANIFEST" ]] && grep -Fqx -- "plugins/$plugin" "$MANIFEST"
 }
 
+reject_unmanaged_plugin_collisions() {
+    local incoming_plugin incoming_name
+    for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
+        [[ -e "$incoming_plugin" ]] || continue
+        incoming_name="$(basename "$incoming_plugin")"
+        if [[ "$incoming_name" == *.dylib && -e "$PLUGIN_DIR/$incoming_name" ]] && \
+           ! was_managed_plugin "$incoming_name"; then
+            echo "ERROR: incoming plugin collides with an unmanaged third-party plugin: $incoming_name" >&2
+            return 1
+        fi
+    done
+}
+
 require_stopped() {
     if launchctl print "system/com.yuzu.agent" >/dev/null 2>&1; then
         launchctl bootout "system/com.yuzu.agent"
@@ -231,6 +244,9 @@ MODE="$(cat "$INCOMING_MODE_FILE")"
     echo "ERROR: invalid incoming package mode" >&2; exit 1; }
 [[ -d "$INCOMING_PLUGIN_DIR" && -f "$INCOMING_MANIFEST" ]] || {
     echo "ERROR: package payload is missing incoming plugin state" >&2; exit 1; }
+# Reject a third-party plugin collision before stopping the current daemon or
+# changing either code lane. A failed preflight leaves the active service alone.
+reject_unmanaged_plugin_collisions || exit 1
 if [[ "$MODE" == "bundle" ]]; then
     [[ -x "$INCOMING_APP/Contents/MacOS/yuzu-agent" ]] || {
         echo "ERROR: incoming bundle executable is missing" >&2; exit 1; }
@@ -261,12 +277,6 @@ fi
 mkdir -p "$PLUGIN_DIR"
 for incoming_plugin in "$INCOMING_PLUGIN_DIR"/*; do
     [[ -e "$incoming_plugin" ]] || continue
-    incoming_name="$(basename "$incoming_plugin")"
-    if [[ "$incoming_name" == *.dylib && -e "$PLUGIN_DIR/$incoming_name" ]] && \
-       ! was_managed_plugin "$incoming_name"; then
-        echo "ERROR: incoming plugin collides with an unmanaged third-party plugin: $incoming_name" >&2
-        exit 1
-    fi
     mv "$incoming_plugin" "$PLUGIN_DIR/"
 done
 rmdir "$INCOMING_PLUGIN_DIR"

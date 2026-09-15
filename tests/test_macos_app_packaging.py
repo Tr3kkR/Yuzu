@@ -213,6 +213,10 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('harden_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('collides with an unmanaged third-party plugin', postinstall)
+        self.assertIn('reject_unmanaged_plugin_collisions()', postinstall)
+        self.assertLess(postinstall.index('reject_unmanaged_plugin_collisions || exit 1'),
+                        postinstall.index('require_stopped\nremove_managed_plugins'))
+        self.assertEqual(postinstall.count('collides with an unmanaged third-party plugin'), 1)
         self.assertIn('remove_managed_plugins "$INCOMING_MANIFEST"', postinstall)
         self.assertIn('LEGACY_APP="$DATA_DIR/YuzuAgent.app"', preinstall)
         self.assertIn('legacy_app_is_managed()', preinstall)
@@ -257,6 +261,8 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('unrecognized', package_readme)
         self.assertIn('uninstall-legacy.*', package_readme)
         self.assertIn('exits nonzero', package_readme)
+        self.assertIn('daemon remains unloaded until a later successful package', package_readme)
+        self.assertIn('transition, so do not restart it before that inspection', package_readme)
 
     def test_package_builder_rejects_a_mixed_cms_plugin_set_before_publishing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_mixed_cms_") as temporary:
