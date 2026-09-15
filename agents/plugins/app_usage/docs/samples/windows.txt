@@ -11,6 +11,5 @@ constrained|tar_db_unavailable|C:\ProgramData\yuzu\agent\tar.db|unable to open d
 
 == action=foreground
 constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)
-[result_status] UNAVAILABLE / PARTIAL / foreground/focus attribution not captured by this source
-[rc] 1
+[result_status] CONSTRAINED / PARTIAL / foreground/focus attribution not captured by this source
 
