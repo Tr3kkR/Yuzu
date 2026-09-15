@@ -2336,6 +2336,15 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 60,
   )
+  # #4262: -Dbuild_examples=false must keep configuring a real build.
+  # Configure-only smoke test (no compile) so it stays cheap on every leg;
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  test('build_examples=false gating smoke test',
+    _bash_test,
+    args: [files('shell/test_build_examples_gating.sh')],
+    suite: 'docs',
+    timeout: 120,
+  )
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
@@ -2356,20 +2365,18 @@ endif
 # to schedule it.
 #
 # CDX-P1-04/K-5: that "caught, not skipped" reasoning only holds when
-# capmatrix-gen SHOULD have been built. Under `-Dbuild_examples=false` (a
-# supported configuration, meson.build:508's `if build_agent and
-# build_examples`) the top-level build deliberately never builds
-# capmatrix-gen at all — there are no agents/plugins/*/ subdirs configured
-# for it to inspect — so this test's hard `[ -x "$CAPGEN" ]` requirement
-# would fail loudly for a configuration that is correct by design, not
-# broken. Gate registration on the SAME condition tools/capmatrix-gen's own
-# build is gated on (root meson.build: `if build_agent and build_examples`),
-# so `-Dbuild_agent=false` or `-Dbuild_examples=false` (with -Dbuild_tests=true)
-# both get a clean `meson test` rather than a false-red gate (gov-fix/build-ci:
-# the build_examples-only guard reproduced the same false-red class this PR
-# fixed under `-Dbuild_agent=false -Dbuild_tests=true`, since capmatrix-gen
-# lives under `if build_agent`).
-if _bash_test.found() and meson.can_run_host_binaries() and build_agent and build_examples
+# capmatrix-gen SHOULD have been built. Under `-Dbuild_agent=false` the
+# top-level build deliberately never builds capmatrix-gen at all — there is
+# no agent, no plugins, nothing for it to inspect — so this test's hard
+# `[ -x "$CAPGEN" ]` requirement would fail loudly for a configuration that
+# is correct by design, not broken. Gate registration on the SAME condition
+# tools/capmatrix-gen's own build is gated on (root meson.build: `if
+# build_agent`), so `-Dbuild_agent=false` (with -Dbuild_tests=true) gets a
+# clean `meson test` rather than a false-red gate. `build_examples` is
+# deliberately NOT part of this condition (#4262): every real plugin now
+# builds unconditionally under build_agent regardless of build_examples, so
+# capmatrix-gen always has something to inspect once build_agent is on.
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   test('capability matrix gate shell tests (#2204 F10)',
     _bash_test,
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],
