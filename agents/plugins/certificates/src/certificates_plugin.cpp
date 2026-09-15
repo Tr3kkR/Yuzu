@@ -1305,9 +1305,14 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                         // inaccessible keychain path all land here. Report it
                         // honestly instead of emitting zero rows, which would be
                         // indistinguishable from "this keychain is genuinely
-                        // empty".
-                        ctx.write_output("not_available|login keychain read failed");
-                        mark_result_partial(ctx, "login-keychain");
+                        // empty". Names the termination reason (post
+                        // code-review CXR-03: this used to drop
+                        // login_result.failure_detail entirely, unlike
+                        // details_cert_macos's equivalent branch, contrary to
+                        // what the #2318 changelog fragment already claimed).
+                        ctx.write_output(std::format("not_available|login keychain read failed ({})",
+                                                     login_result.failure_detail));
+                        mark_result_partial(ctx, "login-keychain", login_result.failure_detail);
                     }
                 }
             }
