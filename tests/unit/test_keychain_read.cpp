@@ -133,6 +133,14 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     // while giving the scheduler enough room in practice; the upper bound
     // (waited < 10s) is the actual correctness assertion this test exists
     // to make -- the caller must get its thread back, not hang forever.
+    // Captured before the read starts so we can tell, below, when the
+    // abandoned thread's OutstandingCallGuard has actually released --
+    // g_outstanding_bounded_calls is shared process-wide (this image's copy;
+    // see the ceiling test below), so a guard this test leaves outstanding
+    // past its own scope would corrupt that test's saturation count.
+    auto baseline =
+        yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed);
+
     auto started = std::chrono::steady_clock::now();
     auto res = read_keychain_bounded_for_test("/tmp/wedged.keychain", 500ms,
                                                [stop, entered](const std::string&) {
@@ -150,6 +158,21 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     CHECK(waited < 10s);
 
     stop->store(true, std::memory_order_relaxed); // let the detached thread retire
+
+    // Wait for the retirement to actually land (fn() returns -> the guard's
+    // destructor runs within microseconds, per bounded_call_ex) before this
+    // TEST_CASE returns. Without this, a still-outstanding guard from this
+    // test can survive into the ceiling-saturation test below and let its
+    // "Rejected" call through uncontended -- a real, observed flake (a
+    // quality-engineer governance pass caught it failing ~1 run in 6).
+    auto deadline = std::chrono::steady_clock::now() + 2s;
+    while (yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed) !=
+               baseline &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(5ms);
+    }
+    REQUIRE(yuzu::shared::detail::g_outstanding_bounded_calls.load(std::memory_order_relaxed) ==
+            baseline);
 }
 
 TEST_CASE("read_keychain_bounded refuses to start a read it cannot wait for",
@@ -209,6 +232,16 @@ TEST_CASE("bounded_keychain_call reports Rejected, and never invokes fn, at the 
         REQUIRE(ok.certs_der.size() == 1);
         CHECK(ok.certs_der[0] == blob);
     }
+
+    // This test's saturation loop assumes it starts from zero outstanding
+    // calls in this image -- if some earlier test in this binary left a
+    // guard alive past its own scope (the abandoned-thread regression test
+    // above once did exactly this, intermittently), the loop below would
+    // silently under-fill `held` and the Rejected assertion could pass
+    // vacuously against a ceiling that was never actually reached. Fail
+    // loudly here instead of discovering it as a flaky Completed/entered
+    // mismatch three assertions down.
+    REQUIRE(g_outstanding_bounded_calls.load() == 0);
 
     // Saturate the ceiling from THIS thread, so the next call is rejected
     // deterministically rather than by racing real work. No threads, no
