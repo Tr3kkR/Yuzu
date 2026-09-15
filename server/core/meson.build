@@ -488,7 +488,9 @@ yuzu_server_core_lib = static_library(
     'src/mcp_transport.cpp',
     'src/rest_api_v1.cpp',
     'src/compliance_model.cpp',
+    'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
     'src/compliance_routes.cpp',
+    'src/policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes (no public twin — outside the seam)
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_read_model.cpp',

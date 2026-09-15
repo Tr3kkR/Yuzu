@@ -31,6 +31,7 @@
 /// column pair (`policies.enabled`/`updated_at`) is LIFECYCLE, and
 /// `policy_status` is fully LIFECYCLE.
 
+#include "compliance_types.hpp"
 #include "pg/pg_pool.hpp"
 
 #include <chrono>
@@ -39,111 +40,16 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server {
 
-// ── Data types (unchanged shape from the SQLite store) ──────────────────────
-
-struct PolicyFragment {
-    std::string id;
-    std::string name;
-    std::string description;
-    std::string yaml_source;
-    std::string check_instruction;
-    std::string check_compliance;     // CEL expression (stored, evaluated later)
-    std::string check_parameters;     // JSON of parameter bindings
-    std::string fix_instruction;
-    std::string fix_parameters;       // JSON of parameter bindings
-    std::string post_check_instruction;
-    std::string post_check_compliance;
-    std::string post_check_parameters;
-    int64_t created_at{0};
-    int64_t updated_at{0};
-};
-
-struct PolicyTrigger {
-    int64_t id{0};
-    std::string policy_id;
-    std::string trigger_type;  // "interval", "file_change", "event_log", etc.
-    std::string config_json;   // type-specific config (e.g. {"interval_seconds": 300})
-};
-
-struct PolicyInput {
-    std::string policy_id;
-    std::string key;
-    std::string value;
-};
-
-struct PolicyGroupBinding {
-    std::string policy_id;
-    std::string group_id;
-};
-
-struct Policy {
-    std::string id;
-    std::string name;
-    std::string description;
-    std::string yaml_source;
-    std::string fragment_id;
-    std::string scope_expression;
-    bool enabled{true};
-    int64_t created_at{0};
-    int64_t updated_at{0};
-
-    // Populated by query methods (not stored in the policies table directly)
-    std::vector<PolicyInput> inputs;
-    std::vector<PolicyTrigger> triggers;
-    std::vector<std::string> management_groups;
-};
-
-struct PolicyAgentStatus {
-    std::string policy_id;
-    std::string agent_id;
-    std::string status;        // "compliant", "non_compliant", "unknown", "fixing", "error"
-    int64_t last_check_at{0};
-    int64_t last_fix_at{0};
-    std::string check_result;  // JSON of last check output
-};
-
-struct ComplianceSummary {
-    std::string policy_id;
-    int64_t compliant{0};
-    int64_t non_compliant{0};
-    int64_t unknown{0};
-    int64_t fixing{0};
-    int64_t error{0};
-    int64_t total{0};
-};
-
-struct FleetCompliance {
-    int64_t total_checks{0};     // total (policy, agent) pairs
-    int64_t compliant{0};
-    int64_t non_compliant{0};
-    int64_t unknown{0};
-    int64_t fixing{0};
-    int64_t error{0};
-    double compliance_pct{0.0};  // compliant / total * 100
-};
-
-struct PolicyQuery {
-    std::string name_filter;
-    std::string fragment_filter;
-    bool enabled_only{false};
-    int limit{100};
-};
-
-struct FragmentQuery {
-    std::string name_filter;
-    int limit{100};
-};
-
-/// ADR-0036 degrade marker: a read on a dispatch/compliance-feeding path
-/// could not be answered (store not open / pool-acquire timeout / query
-/// error) — distinct from a genuinely empty result. Callers must never
-/// collapse this into "nothing due" / "nothing non-compliant" / "0% fleet
-/// compliance".
-enum class PolicyReadError { kDegraded };
+// ── Data types (moved verbatim to compliance_types.hpp, ADR-0031 WS-A4 —
+// PolicyTrigger/PolicyInput/PolicyGroupBinding/PolicyFragment/Policy/
+// PolicyQuery/FragmentQuery/PolicyAgentStatus/ComplianceSummary/
+// FleetCompliance/PolicyReadError; re-exposed here via the include above so
+// every existing includer keeps seeing them transitively) ──────────────────
 
 /// Prefix for a genuine DB/lease failure on a mutator, so callers (route
 /// handlers) can classify 503 (this prefix) vs 400/404/409 (a validation or
