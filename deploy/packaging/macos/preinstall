@@ -231,6 +231,7 @@ rm -rf "$APP_ROOT/.YuzuAgent.incoming.app" \
 rm -f "/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
       "/usr/local/bin/.yuzu-agent.incoming" \
       "/usr/local/lib/.libyuzu_agent_core.incoming.dylib" \
+      "/usr/local/lib/yuzu/.bundle-contents.incoming.zip" \
       "/usr/local/lib/yuzu/.package-mode.incoming" \
       "/usr/local/lib/yuzu/.package-files.incoming"
 write_recovery_phase "$RECOVERY" prepared

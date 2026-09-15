@@ -31,7 +31,8 @@ fi
 STAGING="$(mktemp -d)"
 SCRIPTS="$(mktemp -d)"
 COMPONENT_DIR="$(mktemp -d)"
-trap 'rm -rf "$STAGING" "$SCRIPTS" "$COMPONENT_DIR"' EXIT
+VALIDATION_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGING" "$SCRIPTS" "$COMPONENT_DIR" "$VALIDATION_DIR"' EXIT
 install -m 755 "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
 install -m 755 "$SCRIPT_DIR/postinstall" "$SCRIPTS/postinstall"
 install -d "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
@@ -49,8 +50,13 @@ if [[ -n "$BUNDLE_DIR" ]]; then
         echo "ERROR: --bundle-dir must contain YuzuAgent.app and plugins/" >&2; exit 1; }
     install -d "${STAGING}/Library/Application Support/YuzuAgent"
     install -d "${STAGING}/Library/LaunchDaemons" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
-    cp -R "$APP" "${STAGING}/Library/Application Support/YuzuAgent/.YuzuAgent.incoming.app"
-    STAGED_APP="${STAGING}/Library/Application Support/YuzuAgent/.YuzuAgent.incoming.app"
+    # pkgbuild recognizes a signed .app by its bundle identifier and relocates it
+    # before postinstall, even when its payload name is hidden. Deliver a ZIP of
+    # Contents instead; postinstall reconstructs and verifies the sealed app.
+    STAGED_BUNDLE_ARCHIVE="${STAGING}/usr/local/lib/yuzu/.bundle-contents.incoming.zip"
+    ditto -c -k --keepParent "$APP/Contents" "$STAGED_BUNDLE_ARCHIVE"
+    STAGED_APP="${VALIDATION_DIR}/YuzuAgent.app"
+    ditto -x -k "$STAGED_BUNDLE_ARCHIVE" "$STAGED_APP"
     STAGED_PLUGINS="${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
     STAGED_POLICY="${STAGING}/usr/local/lib/yuzu/plugin-signing-policy.json"
     AGENT_BIN="$STAGED_APP/Contents/MacOS/yuzu-agent"
@@ -67,8 +73,8 @@ if [[ -n "$BUNDLE_DIR" ]]; then
         install -m 755 "$plugin" "$STAGED_PLUGINS/$(basename "$plugin")"
         [[ ! -f "$plugin.sig" ]] || install -m 644 "$plugin.sig" "$STAGED_PLUGINS/$(basename "$plugin").sig"
     done
-    # Validate only this private snapshot. Source bundle paths are intentionally
-    # never read again after the copy, closing validation-to-publication races.
+    # Validate only this private archive snapshot. Source bundle paths are
+    # intentionally never read again, closing validation-to-publication races.
     codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
     [[ ! -f "$STAGED_POLICY" ]] || POLICY_ARGS=(--plugin-signing-policy "$STAGED_POLICY")
     CMS_ENFORCEMENT=0

@@ -172,7 +172,8 @@ class PackagingStructureTests(unittest.TestCase):
         preinstall = (ROOT / "deploy/packaging/macos/preinstall").read_text()
         postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
         package_builder = BUILD_PKG.read_text()
-        self.assertIn('.YuzuAgent.incoming.app', package_builder)
+        self.assertIn('.bundle-contents.incoming.zip', package_builder)
+        self.assertIn('ditto -c -k --keepParent "$APP/Contents"', package_builder)
         self.assertIn('.plugins.incoming', package_builder)
         self.assertNotIn('rm -rf "/Library/Application Support/Yuzu/YuzuAgent.app"', preinstall)
         self.assertIn('recover_interrupted_promotion', preinstall)
@@ -193,6 +194,11 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('promoting)', preinstall)
         self.assertIn('recover_interrupted_promotion "$pending"', preinstall)
         self.assertIn('mv "$INCOMING_APP" "$APP"', postinstall)
+        self.assertIn('incoming bundle archive is missing or symlinked', postinstall)
+        self.assertIn('set -euo pipefail', postinstall)
+        self.assertIn('/usr/bin/unzip -Z1 "$INCOMING_BUNDLE_ARCHIVE"', postinstall)
+        self.assertIn('incoming bundle archive has an unsafe entry', postinstall)
+        self.assertIn('incoming bundle contains a symlink', postinstall)
         self.assertIn('require_stopped', postinstall)
         self.assertIn('require_started', postinstall)
         self.assertIn('stable=0', postinstall)
@@ -244,6 +250,7 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('sync', postinstall)
         self.assertNotIn('rm -rf "$APP" "$PLUGIN_DIR"', postinstall)
         self.assertIn('.YuzuAgent.incoming.app', uninstall)
+        self.assertIn('.bundle-contents.incoming.zip', uninstall)
         self.assertIn('.plugins.incoming', uninstall)
         self.assertIn('invalid package plugin manifest entry', uninstall)
         self.assertNotIn('rm -rf "/Library/Application Support/Yuzu/YuzuAgent.app" \\\n+       "/Library/Application Support/Yuzu/.YuzuAgent.incoming.app" \\\n+       /usr/local/lib/yuzu/plugins', uninstall)
@@ -254,7 +261,7 @@ class PackagingStructureTests(unittest.TestCase):
         package_builder = (ROOT / "deploy/packaging/macos/build-pkg.sh").read_text()
         self.assertIn('all external plugins must have CMS sidecars when signing policy is present', package_builder)
         self.assertIn('CMS_ENFORCEMENT=1', package_builder)
-        self.assertIn('never read again after the copy, closing validation-to-publication races', package_builder)
+        self.assertIn('intentionally never read again, closing validation-to-publication races', package_builder)
         self.assertIn('codesign --verify --deep --strict --verbose=2 "$STAGED_APP"', package_builder)
         self.assertIn('for plugin in "$STAGED_PLUGINS"/*.dylib; do', package_builder)
         self.assertIn('AGENT_BIN="$STAGED_APP/Contents/MacOS/yuzu-agent"', package_builder)
@@ -338,7 +345,7 @@ class PackagingStructureTests(unittest.TestCase):
             tools.mkdir()
             captured = root / "captured-plugin"
             for name, body in {
-                "codesign": "#!/bin/sh\ncase \"$*\" in *.YuzuAgent.incoming.app*) printf 'mutated source bytes' > \"$RACE_SOURCE\"; printf 'mutated source plist' > \"$RACE_INFO\" ;; esac\nexit 0\n",
+                "codesign": "#!/bin/sh\ncase \"$*\" in */YuzuAgent.app*) printf 'mutated source bytes' > \"$RACE_SOURCE\"; printf 'mutated source plist' > \"$RACE_INFO\" ;; esac\nexit 0\n",
                 "lipo": "#!/bin/sh\necho arm64\n",
                 "pkgbuild": "#!/bin/sh\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.plugins.incoming/tar.dylib\" \"$CAPTURED_PLUGIN\"\n: > \"$last\"\n",
                 "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",

@@ -72,7 +72,10 @@ expected Yuzu team, signed application identifier, and signer; a renewed or
 otherwise different profile is intentionally retained.
 Package transitions preserve them and retain package-owned code/configuration for
 recovery. The package first writes its code and LaunchDaemon plist to package-owned
-incoming paths; postinstall validates them, then promotes them and removes the
+incoming paths. To prevent Installer from relocating an upgradeable `.app` before
+the transaction, the sealed bundle arrives as a private archive of `Contents`;
+postinstall extracts it only inside the trusted incoming root, rejects symlinks,
+strictly verifies the reconstructed app, then promotes it and removes the
 recovery snapshot only after launchd reports `running` with a PID for three
 consecutive observations (up to six seconds). Interrupted-promotion recovery has
 the same sustained check; a failure restores the previous state and retains the
