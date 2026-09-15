@@ -202,6 +202,9 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('preserve_or_create_directory "$CONFIG_DIR" 755', postinstall)
         self.assertIn('operational directory must be root-owned and not group/world writable', postinstall)
         self.assertIn('preserve_or_create_directory "$CERT_DIR" 755', postinstall)
+        self.assertIn('"$parent" == "/etc" && -L "$parent"', postinstall)
+        self.assertIn('"$(readlink "$parent")" == "private/etc"', postinstall)
+        self.assertIn('require_trusted_directory "/private/etc"', postinstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('rm -rf "$recovery"', postinstall)
 

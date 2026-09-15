@@ -87,7 +87,16 @@ preserve_or_create_directory() {
         return 0
     fi
     parent="$(dirname "$path")"
-    require_trusted_directory "$parent"
+    # macOS deliberately exposes /etc as the root-owned private/etc alias.
+    # Accept only that exact platform alias; every other symlinked parent stays
+    # subject to require_trusted_directory's no-symlink rule.
+    if [[ "$parent" == "/etc" && -L "$parent" ]]; then
+        [[ "$(readlink "$parent")" == "private/etc" ]] || {
+            echo "ERROR: refusing unexpected /etc alias" >&2; exit 1; }
+        require_trusted_directory "/private/etc"
+    else
+        require_trusted_directory "$parent"
+    fi
     mkdir -m "$mode" "$path"
     chown root:wheel "$path"
 }
