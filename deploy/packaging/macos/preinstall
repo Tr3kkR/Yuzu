@@ -14,7 +14,6 @@ LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
 LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 YUZU_LIB="/usr/local/lib/yuzu"
 RECOVERY_FILE="$STATE_DIR/current-recovery"
-mkdir -p "$STATE_DIR"
 
 require_trusted_directory() {
     local path="$1" owner mode
@@ -40,6 +39,49 @@ secure_payload_parent() {
     chmod "$mode" "$path"
 }
 
+ensure_state_dir() {
+    local parent owner group mode
+    parent="$(dirname "$STATE_DIR")"
+    require_trusted_directory "$parent"
+    if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || {
+            echo "ERROR: refusing symlinked or non-directory recovery state root" >&2; exit 1; }
+        owner="$(stat -f '%u' "$STATE_DIR")"
+        group="$(stat -f '%g' "$STATE_DIR")"
+        mode="$(stat -f '%Lp' "$STATE_DIR")"
+        [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+            echo "ERROR: recovery state root must be root:wheel mode 700" >&2; exit 1; }
+    else
+        mkdir -m 700 "$STATE_DIR"
+        chown root:wheel "$STATE_DIR"
+    fi
+}
+
+require_recovery_directory() {
+    local recovery="$1" owner group mode
+    [[ "$recovery" == "$STATE_DIR"/install-recovery.* && -d "$recovery" && ! -L "$recovery" ]] || {
+        echo "ERROR: refusing recovery path outside the trusted state root" >&2; return 1; }
+    owner="$(stat -f '%u' "$recovery")"
+    group="$(stat -f '%g' "$recovery")"
+    mode="$(stat -f '%Lp' "$recovery")"
+    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+        echo "ERROR: recovery snapshot must be root:wheel mode 700" >&2; return 1; }
+}
+
+read_recovery_path() {
+    local owner group mode pending
+    [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]] || {
+        echo "ERROR: refusing missing or symlinked recovery pointer" >&2; return 1; }
+    owner="$(stat -f '%u' "$RECOVERY_FILE")"
+    group="$(stat -f '%g' "$RECOVERY_FILE")"
+    mode="$(stat -f '%Lp' "$RECOVERY_FILE")"
+    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 600 ]] || {
+        echo "ERROR: recovery pointer must be root:wheel mode 600" >&2; return 1; }
+    pending="$(cat "$RECOVERY_FILE")"
+    require_recovery_directory "$pending" || return 1
+    printf '%s\n' "$pending"
+}
+
 write_recovery_phase() {
     local recovery="$1" phase="$2"
     printf '%s\n' "$phase" > "$recovery/.phase.new"
@@ -53,6 +95,7 @@ write_recovery_phase() {
 # non-package owner. Never change it: stage sealed code in its own trusted root.
 secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
+ensure_state_dir
 
 remove_managed_plugins() {
     local manifest="$1" relative plugin
@@ -88,6 +131,23 @@ legacy_app_is_managed() {
         == "$LEGACY_PROFILE_SHA256" ]]
 }
 
+require_started() {
+    local observation attempt stable=0
+    for attempt in 1 2 3 4 5 6; do
+        observation="$(launchctl print "system/com.yuzu.agent" 2>/dev/null || true)"
+        if grep -Eq 'state = running' <<<"$observation" && \
+           grep -Eq 'pid = [1-9][0-9]*' <<<"$observation"; then
+            stable=$((stable + 1))
+            [[ "$stable" -ge 3 ]] && return 0
+        else
+            stable=0
+        fi
+        sleep 1
+    done
+    echo "ERROR: Yuzu Agent did not remain running after bootstrap" >&2
+    return 1
+}
+
 recover_interrupted_promotion() {
     local recovery="$1"
     launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
@@ -117,34 +177,32 @@ recover_interrupted_promotion() {
             return 1
         fi
         launchctl bootstrap system "$PLIST"
+        require_started
     fi
 }
 
-if [[ -f "$RECOVERY_FILE" ]]; then
-    pending="$(cat "$RECOVERY_FILE" 2>/dev/null || true)"
-    if [[ -d "$pending" ]]; then
-        phase="$(cat "$pending/phase" 2>/dev/null || true)"
-        case "$phase" in
-            prepared)
-                rm -rf "$pending"
-                rm -f "$RECOVERY_FILE"
-                ;;
-            promoting)
-                recover_interrupted_promotion "$pending"
-                rm -rf "$pending"
-                rm -f "$RECOVERY_FILE"
-                ;;
-            *)
-                echo "ERROR: unknown pending Yuzu installation recovery state" >&2
-                exit 1
-                ;;
-        esac
-    else
-        rm -f "$RECOVERY_FILE"
-    fi
+if [[ -e "$RECOVERY_FILE" || -L "$RECOVERY_FILE" ]]; then
+    pending="$(read_recovery_path)" || exit 1
+    phase="$(cat "$pending/phase" 2>/dev/null || true)"
+    case "$phase" in
+        prepared)
+            rm -rf "$pending"
+            rm -f "$RECOVERY_FILE"
+            ;;
+        promoting)
+            recover_interrupted_promotion "$pending"
+            rm -rf "$pending"
+            rm -f "$RECOVERY_FILE"
+            ;;
+        *)
+            echo "ERROR: unknown pending Yuzu installation recovery state" >&2
+            exit 1
+            ;;
+    esac
 fi
 
 RECOVERY="$(mktemp -d "${STATE_DIR}/install-recovery.XXXXXX")"
+chmod 700 "$RECOVERY"
 
 copy_if_present "$PLIST" "$RECOVERY/LaunchDaemons/com.yuzu.agent.plist"
 copy_if_present "$APP_ROOT/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
@@ -176,5 +234,7 @@ rm -f "/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
       "/usr/local/lib/yuzu/.package-mode.incoming" \
       "/usr/local/lib/yuzu/.package-files.incoming"
 write_recovery_phase "$RECOVERY" prepared
+umask 077
 printf '%s\n' "$RECOVERY" > "$RECOVERY_FILE"
+chmod 600 "$RECOVERY_FILE"
 sync

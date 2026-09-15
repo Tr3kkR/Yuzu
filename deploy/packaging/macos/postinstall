@@ -27,8 +27,65 @@ INCOMING_MANIFEST="$YUZU_LIB/.package-files.incoming"
 APP="$APP_ROOT/YuzuAgent.app"
 INCOMING_APP="$APP_ROOT/.YuzuAgent.incoming.app"
 
+require_trusted_directory() {
+    local path="$1" owner mode
+    [[ -d "$path" && ! -L "$path" ]] || {
+        echo "ERROR: refusing untrusted package directory: $path" >&2; exit 1; }
+    owner="$(stat -f '%u' "$path")"
+    mode="$(stat -f '%Lp' "$path")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: package directory must be root-owned and not group/world writable: $path" >&2; exit 1; }
+}
+
+ensure_state_dir() {
+    local parent owner group mode
+    parent="$(dirname "$STATE_DIR")"
+    require_trusted_directory "$parent"
+    if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || {
+            echo "ERROR: refusing symlinked or non-directory recovery state root" >&2; exit 1; }
+        owner="$(stat -f '%u' "$STATE_DIR")"
+        group="$(stat -f '%g' "$STATE_DIR")"
+        mode="$(stat -f '%Lp' "$STATE_DIR")"
+        [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+            echo "ERROR: recovery state root must be root:wheel mode 700" >&2; exit 1; }
+    else
+        mkdir -m 700 "$STATE_DIR"
+        chown root:wheel "$STATE_DIR"
+    fi
+}
+
 recovery_path() {
-    cat "$RECOVERY_FILE" 2>/dev/null || true
+    local owner group mode pending
+    [[ -f "$RECOVERY_FILE" && ! -L "$RECOVERY_FILE" ]] || {
+        echo "ERROR: refusing missing or symlinked recovery pointer" >&2; return 1; }
+    owner="$(stat -f '%u' "$RECOVERY_FILE")"
+    group="$(stat -f '%g' "$RECOVERY_FILE")"
+    mode="$(stat -f '%Lp' "$RECOVERY_FILE")"
+    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 600 ]] || {
+        echo "ERROR: recovery pointer must be root:wheel mode 600" >&2; return 1; }
+    pending="$(cat "$RECOVERY_FILE")"
+    [[ "$pending" == "$STATE_DIR"/install-recovery.* && -d "$pending" && ! -L "$pending" ]] || {
+        echo "ERROR: refusing recovery path outside the trusted state root" >&2; return 1; }
+    owner="$(stat -f '%u' "$pending")"
+    group="$(stat -f '%g' "$pending")"
+    mode="$(stat -f '%Lp' "$pending")"
+    [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+        echo "ERROR: recovery snapshot must be root:wheel mode 700" >&2; return 1; }
+    printf '%s\n' "$pending"
+}
+
+preserve_or_create_directory() {
+    local path="$1" mode="$2" parent
+    if [[ -e "$path" || -L "$path" ]]; then
+        [[ -d "$path" && ! -L "$path" ]] || {
+            echo "ERROR: refusing symlinked or non-directory operational path: $path" >&2; exit 1; }
+        return 0
+    fi
+    parent="$(dirname "$path")"
+    require_trusted_directory "$parent"
+    mkdir -m "$mode" "$path"
+    chown root:wheel "$path"
 }
 
 legacy_app_is_managed() {
@@ -98,11 +155,15 @@ require_stopped() {
 }
 
 require_started() {
-    local observation attempt
-    for attempt in 1 2 3; do
+    local observation attempt stable=0
+    for attempt in 1 2 3 4 5 6; do
         observation="$(launchctl print "system/com.yuzu.agent" 2>/dev/null || true)"
-        if grep -Eq 'state = running|pid = [1-9][0-9]*' <<<"$observation"; then
-            return 0
+        if grep -Eq 'state = running' <<<"$observation" && \
+           grep -Eq 'pid = [1-9][0-9]*' <<<"$observation"; then
+            stable=$((stable + 1))
+            [[ "$stable" -ge 3 ]] && return 0
+        else
+            stable=0
         fi
         sleep 1
     done
@@ -112,8 +173,7 @@ require_started() {
 
 restore_previous() {
     local recovery
-    recovery="$(recovery_path)"
-    [[ -d "$recovery" ]] || return 0
+    recovery="$(recovery_path)" || return 1
     launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
     # Clear both lanes and the generated plist first: recovery must restore an
     # exact prior package state, including the prior "no installed agent" case.
@@ -145,15 +205,20 @@ restore_previous() {
             echo "ERROR: recovered legacy service was preserved but not bootstrapped from non-package-owned data" >&2
             return 1
         fi
-        launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true
+        launchctl bootstrap system "$PLIST"
+        require_started
     fi
 }
 trap 'restore_previous' ERR
 
-mkdir -p "$APP_ROOT" "$LOG_DIR" "$CERT_DIR" "$YUZU_LIB"
-chown root:wheel "$APP_ROOT" "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
-chmod 755 "$APP_ROOT"
-chmod 755 "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"
+ensure_state_dir
+require_trusted_directory "$APP_ROOT"
+require_trusted_directory "$YUZU_LIB"
+preserve_or_create_directory "$LOG_DIR" 755
+# Enrollment configuration and trust material may be owned or permissioned by
+# an operator. Validate an existing directory but never reset it in an upgrade.
+[[ ! -e "$CONFIG_DIR" && ! -L "$CONFIG_DIR" ]] || preserve_or_create_directory "$CONFIG_DIR" 755
+[[ ! -e "$CERT_DIR" && ! -L "$CERT_DIR" ]] || preserve_or_create_directory "$CERT_DIR" 755
 
 [[ -f "$INCOMING_MODE_FILE" && -f "$INCOMING_PLIST" ]] || {
     echo "ERROR: package payload is missing incoming mode or LaunchDaemon plist" >&2; exit 1; }

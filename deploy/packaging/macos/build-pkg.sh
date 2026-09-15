@@ -8,8 +8,9 @@ BUNDLE_DIR=""
 VERSION=""
 OUTPUT_DIR="."
 IDENTIFIER="com.yuzu.agent"
+PLUGIN_TRUST_BUNDLE=""
 
-usage() { echo "Usage: $0 (--bin-dir DIR | --bundle-dir DIR) --version VER [--output DIR]" >&2; }
+usage() { echo "Usage: $0 (--bin-dir DIR | --bundle-dir DIR) --version VER [--output DIR] [--plugin-trust-bundle PEM]" >&2; }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -17,6 +18,7 @@ while [[ $# -gt 0 ]]; do
         --bundle-dir) BUNDLE_DIR="$2"; shift 2 ;;
         --version) VERSION="$2"; shift 2 ;;
         --output) OUTPUT_DIR="$2"; shift 2 ;;
+        --plugin-trust-bundle) PLUGIN_TRUST_BUNDLE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "ERROR: unknown option: $1" >&2; usage; exit 1 ;;
     esac
@@ -64,6 +66,12 @@ if [[ -n "$BUNDLE_DIR" ]]; then
     for plugin in "$PLUGINS"/*.dylib; do
         [[ -f "$plugin" ]] || continue
         codesign --verify --strict --verbose=2 "$plugin"
+        if [[ -f "$plugin.sig" ]]; then
+            [[ -n "$PLUGIN_TRUST_BUNDLE" && -f "$PLUGIN_TRUST_BUNDLE" ]] || {
+                echo "ERROR: plugin CMS sidecars require --plugin-trust-bundle for final-byte verification" >&2; exit 1; }
+            "$AGENT_BIN" --verify-plugin-signature "$plugin" \
+                --plugin-trust-bundle "$PLUGIN_TRUST_BUNDLE"
+        fi
         install -m 755 "$plugin" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming/$(basename "$plugin")"
         [[ ! -f "$plugin.sig" ]] || install -m 644 "$plugin.sig" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming/$(basename "$plugin").sig"
         if [[ -f "$plugin.sig" && ! -f "$PLUGINS/plugin-signing-policy.json" ]]; then

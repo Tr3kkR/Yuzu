@@ -13,10 +13,16 @@ plugins external at `/usr/local/lib/yuzu/plugins`:
 python3 deploy/packaging/macos/build-app.py \
   --bin-dir build-macos --version <version> --bundle-id <registered-app-id> \
   --profile <original.provisionprofile> --sign-identity <SHA-1-identity> \
-  --output-dir <empty-task-directory>
+  --output-dir <empty-task-directory> \
+  --final-plugin-sig-dir <final-sidecars-dir> --plugin-trust-bundle <build-trust.pem> \
+  --runtime-plugin-trust-bundle <installed-trust-bundle-path>
 bash deploy/packaging/macos/build-pkg.sh --bundle-dir <empty-task-directory> \
-  --version <version> --output dist
+  --version <version> --output dist --plugin-trust-bundle <build-trust.pem>
 ```
+
+Omit the three sidecar options and the package trust-bundle option only when no
+plugin has a CMS sidecar. For sidecars, the package command uses the same
+build-time trust bundle as `build-app.py` to verify the final copied bytes.
 
 The helper requires `security cms` to decode the original profile, a current
 explicit macOS App ID, ES Boolean entitlement, matching developer certificate,
@@ -49,7 +55,9 @@ The bundle LaunchDaemon runs as root, retains external plugins, and always passe
 `--no-auto-update`. The sealed app is in the package-owned, root-owned
 `/Library/Application Support/YuzuAgent/YuzuAgent.app`; data stays in
 `/Library/Application Support/Yuzu` and is never ownership-reset or removed by
-this lane. Logs and trust anchors also remain outside the sealed app.
+this lane. Logs, configuration, and trust anchors also remain outside the sealed
+app, with existing configuration and certificate-directory ownership and modes
+preserved.
 When upgrading an earlier development build that placed `YuzuAgent.app` below
 the data directory, the installer snapshots that package-owned child for
 recovery and removes it only after the new daemon is healthy; it never changes
@@ -65,9 +73,12 @@ otherwise different profile is intentionally retained.
 Package transitions preserve them and retain package-owned code/configuration for
 recovery. The package first writes its code and LaunchDaemon plist to package-owned
 incoming paths; postinstall validates them, then promotes them and removes the
-recovery snapshot only after launchd accepts the selected lane. A payload failure
-before postinstall therefore leaves the active installation in place. Development
-app signing does not installer-sign or notarize the `.pkg`.
+recovery snapshot only after launchd reports `running` with a PID for three
+consecutive observations (up to six seconds). Interrupted-promotion recovery has
+the same sustained check; a failure restores the previous state and retains the
+recovery journal. A payload failure before postinstall therefore leaves the active
+installation in place. Development app signing does not installer-sign or notarize
+the `.pkg`.
 
 Do not install the root LaunchDaemon, grant Full Disk Access, or test live
 Endpoint Security without explicit test-rig authorization. A valid signature, a
@@ -83,6 +94,10 @@ bundle with `--plugin-require-signature`. During an upgrade, existing server/TLS
 arguments and supported `YUZU_*` environment settings are retained. A generated
 sidecar policy deliberately replaces existing plugin-signing arguments and
 environment settings; bundle-owned paths and `--no-auto-update` are forced.
+If the bundle contains CMS sidecars, pass the same build-time
+`--plugin-trust-bundle` to `build-pkg.sh`: packaging reruns the shared verifier
+over the bytes it is about to copy, so a stale or final-byte-modified sidecar
+cannot produce a package.
 
 ## Authorized test-rig lifecycle
 
@@ -99,11 +114,12 @@ The same command performs loose-to-bundle, bundle-to-bundle, and bundle-to-loose
 transitions. It stages the new payload under incoming names while the old daemon
 continues to run, validates the bundle, then stops and replaces the selected lane.
 The postinstall script restores the saved plist and package-owned files if that
-promotion or its bounded launchd health observation fails. It leaves data, logs,
-certificates, and third-party plugins alone. The recovery snapshot records a
+promotion or its sustained launchd health observation fails. It leaves data, logs,
+configuration, certificates, and third-party plugins alone. The recovery snapshot records a
 durable `prepared` or `promoting` phase; a later package invocation discards an
 unused prepared snapshot or restores an interrupted promotion before taking a
-new snapshot.
+new snapshot. The root-owned recovery state rejects symlinked,
+group/world-writable, or out-of-root pointers rather than using them.
 
 For an authorized silent uninstall, run:
 

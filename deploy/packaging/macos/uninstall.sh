@@ -12,6 +12,29 @@ LEGACY_SIGNING_AUTHORITY="Mac Developer: Nathan Dornbrook (YA95685L8R)"
 LEGACY_PROFILE_SHA256="3e764aafaa5cd29398ef6646b98c7b00332404c5ea57f79b92663695acdd70e1"
 STATE_DIR="/var/db/yuzu-agent"
 
+ensure_state_dir() {
+    local parent owner group mode
+    parent="$(dirname "$STATE_DIR")"
+    [[ -d "$parent" && ! -L "$parent" ]] || {
+        echo "ERROR: refusing untrusted recovery state parent" >&2; exit 1; }
+    owner="$(stat -f '%u' "$parent")"
+    mode="$(stat -f '%Lp' "$parent")"
+    [[ "$owner" == 0 && $((8#$mode & 8#022)) == 0 ]] || {
+        echo "ERROR: recovery state parent must be root-owned and not group/world writable" >&2; exit 1; }
+    if [[ -e "$STATE_DIR" || -L "$STATE_DIR" ]]; then
+        [[ -d "$STATE_DIR" && ! -L "$STATE_DIR" ]] || {
+            echo "ERROR: refusing symlinked or non-directory recovery state root" >&2; exit 1; }
+        owner="$(stat -f '%u' "$STATE_DIR")"
+        group="$(stat -f '%g' "$STATE_DIR")"
+        mode="$(stat -f '%Lp' "$STATE_DIR")"
+        [[ "$owner" == 0 && "$group" == 0 && "$mode" == 700 ]] || {
+            echo "ERROR: recovery state root must be root:wheel mode 700" >&2; exit 1; }
+    else
+        mkdir -m 700 "$STATE_DIR"
+        chown root:wheel "$STATE_DIR"
+    fi
+}
+
 legacy_app_is_managed() {
     local candidate="$1"
     [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
@@ -30,8 +53,9 @@ legacy_app_is_managed() {
 retire_legacy_app() {
     local recovery retired
     [[ ! -e "$LEGACY_APP" && ! -L "$LEGACY_APP" ]] && return 0
-    mkdir -p "$STATE_DIR"
+    ensure_state_dir
     recovery="$(mktemp -d "${STATE_DIR}/uninstall-legacy.XXXXXX")"
+    chmod 700 "$recovery"
     retired="$recovery/YuzuAgent.app"
     mv "$LEGACY_APP" "$retired"
     if legacy_app_is_managed "$retired"; then

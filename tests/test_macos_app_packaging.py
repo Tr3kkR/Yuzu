@@ -6,6 +6,7 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 import json
+import os
 import plistlib
 import subprocess
 import tempfile
@@ -183,6 +184,10 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertNotIn('chown root:wheel "$DATA_DIR"', postinstall)
         self.assertIn('secure_payload_parent "$YUZU_LIB" 755', preinstall)
         self.assertIn('root-owned and not group/world writable', preinstall)
+        self.assertIn('ensure_state_dir()', preinstall)
+        self.assertIn('recovery state root must be root:wheel mode 700', preinstall)
+        self.assertIn('recovery pointer must be root:wheel mode 600', preinstall)
+        self.assertIn('refusing recovery path outside the trusted state root', preinstall)
         self.assertIn('secure_payload_parent "$parent" 755', preinstall)
         self.assertIn('write_recovery_phase "$RECOVERY" prepared', preinstall)
         self.assertIn('promoting)', preinstall)
@@ -190,6 +195,11 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('mv "$INCOMING_APP" "$APP"', postinstall)
         self.assertIn('require_stopped', postinstall)
         self.assertIn('require_started', postinstall)
+        self.assertIn('stable=0', postinstall)
+        self.assertIn('require_started', preinstall)
+        self.assertNotIn('launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true', postinstall)
+        self.assertNotIn('chown root:wheel "$APP_ROOT" "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"', postinstall)
+        self.assertIn('preserve_or_create_directory "$CONFIG_DIR" 755', postinstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('rm -rf "$recovery"', postinstall)
 
@@ -232,6 +242,8 @@ class PackagingStructureTests(unittest.TestCase):
     def test_cms_enforcement_refuses_mixed_plugin_sidecars(self) -> None:
         source = HELPER.read_text()
         self.assertIn('all external plugins must have CMS sidecars', source)
+        package_readme = (ROOT / "deploy/packaging/macos/README.md").read_text()
+        self.assertIn('--plugin-trust-bundle <build-trust.pem>', package_readme)
 
     def test_builder_refuses_a_populated_output_before_touching_inputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
@@ -395,6 +407,44 @@ class PackagingStructureTests(unittest.TestCase):
         run.assert_called_once_with(["/bundle/yuzu-agent", "--verify-plugin-signature",
                                      "/plugins/tar.dylib", "--plugin-trust-bundle",
                                      "/trust/plugins.pem"])
+
+    def test_packaging_refuses_a_stale_cms_sidecar_before_publishing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
+            root = Path(temporary)
+            app = root / "bundle/YuzuAgent.app"
+            executable = app / "Contents/MacOS/yuzu-agent"
+            executable.parent.mkdir(parents=True)
+            executable.write_text("#!/bin/sh\nexit 42\n")
+            executable.chmod(0o755)
+            with (app / "Contents/Info.plist").open("wb") as output:
+                plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
+            plugins = root / "bundle/plugins"
+            plugins.mkdir()
+            (plugins / "tar.dylib").write_bytes(b"stale-final-plugin-bytes")
+            (plugins / "tar.dylib.sig").write_bytes(b"stale-sidecar")
+            (plugins / "plugin-signing-policy.json").write_text(
+                json.dumps({"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/plugins.pem"}) + "\n")
+            trust = root / "plugins.pem"
+            trust.write_text("test trust material\n")
+            tools = root / "tools"
+            tools.mkdir()
+            for name, body in {
+                "codesign": "#!/bin/sh\nexit 0\n",
+                "lipo": "#!/bin/sh\necho arm64\n",
+                "pkgbuild": "#!/bin/sh\nexit 99\n",
+                "productbuild": "#!/bin/sh\nexit 99\n",
+            }.items():
+                tool = tools / name
+                tool.write_text(body)
+                tool.chmod(0o755)
+            environment = os.environ | {"PATH": f"{tools}:{os.environ['PATH']}"}
+            output = root / "dist"
+            result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+                                     "--version", "1.0", "--output", str(output),
+                                     "--plugin-trust-bundle", str(trust)],
+                                    capture_output=True, text=True, env=environment)
+            self.assertEqual(result.returncode, 42, result.stderr)
+            self.assertFalse((output / "YuzuAgent-1.0-macos-arm64.pkg").exists())
 
     def test_builder_rejects_ambiguous_lanes_before_invoking_macos_tools(self) -> None:
         result = subprocess.run(["bash", str(BUILD_PKG), "--bin-dir", "x", "--bundle-dir", "y",
