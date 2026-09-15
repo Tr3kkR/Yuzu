@@ -191,6 +191,21 @@ if [ ! -s "$committed_block" ]; then
   exit 1
 fi
 
+# CDX-FV-1 (#4262 code-review): the committed block always documents the
+# FULL plugin set -- there is no separate "reduced" doc for
+# -Dbuild_examples=false, so comparing it byte-for-byte against a
+# regenerated block that's missing the four demo plugins' rows would ALWAYS
+# report false drift for a perfectly correct reduced build. Strip the same
+# four demo plugins' rows from the COMMITTED side before comparing, so the
+# comparison stays apples-to-apples (does the real-plugin subset match?)
+# instead of either false-failing or skipping real-plugin drift checking
+# entirely.
+if [ "$build_examples" = "false" ]; then
+  filtered_committed="$tmp/committed-filtered.md"
+  grep -Ev "^\| ($(IFS='|'; echo "${DEMO_PLUGINS[*]}")) \|" "$committed_block" > "$filtered_committed"
+  committed_block="$filtered_committed"
+fi
+
 # git diff --no-index, not the `diff` binary: git is a hard build/CI
 # dependency on every leg (unlike diffutils, which the Windows runner's
 # msys2 bash does not carry) and --no-index is explicitly designed to work
