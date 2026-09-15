@@ -47,6 +47,7 @@
 #include <cstdint>
 #include <cstring>
 #include <expected>
+#include <format>
 #include <map>
 #include <string>
 #include <string_view>
@@ -538,11 +539,7 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
     auto hash = detail::read_u32(in, kPrefetchHashOffset, "truncated_header");
     if (!hash)
         return std::unexpected(hash.error());
-    {
-        char buf[9];
-        std::snprintf(buf, sizeof(buf), "%08X", *hash);
-        out.hash_hex = buf;
-    }
+    out.hash_hex = std::format("{:08X}", *hash);
 
     const bool is_v23 = (*version == 23);
     const size_t last_run_off = is_v23 ? kFileInfoV23LastRunOffset : kFileInfoV26V30V31LastRunOffset;
