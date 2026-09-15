@@ -742,8 +742,14 @@ TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
+    // A REAL, registered instruction_id (never a made-up one): without the
+    // params bound this fix adds, the lookup below succeeds and the old
+    // code reaches run_async, so this proves the bound is what stops the
+    // dispatch, not merely that an unrelated "instruction unavailable" path
+    // happens to also 400.
+    auto iid = make_instruction(*h.instr);
     nlohmann::json payload;
-    payload["instruction_id"] = "some-instruction";
+    payload["instruction_id"] = iid;
     nlohmann::json params = nlohmann::json::object();
     for (int i = 0; i < 33; ++i)
         params["k" + std::to_string(i)] = "v";
@@ -770,8 +776,10 @@ TEST_CASE("re-eval: an oversized params value smuggled onto an existing "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
+    // Real instruction_id, same reasoning as the over-keyed case above.
+    auto iid = make_instruction(*h.instr);
     nlohmann::json payload;
-    payload["instruction_id"] = "some-instruction";
+    payload["instruction_id"] = iid;
     payload["params"] = {{"k", std::string(65537, 'z')}};
 
     CreateRequest cr;
@@ -794,13 +802,14 @@ TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
     // Proves the value-size check measures dump() size for a non-string JSON
     // value (an object/array), not merely `.is_string()`-gated away - the
     // exact regression MCP's own reevaluate_result_set fix had a dedicated
-    // SECTION for.
+    // SECTION for. Real instruction_id, same reasoning as the two cases above.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
     nlohmann::json payload;
-    payload["instruction_id"] = "some-instruction";
+    payload["instruction_id"] = iid;
     payload["params"] = {{"k", {{"pad", std::string(65537, 'z')}}}};
 
     CreateRequest cr;
