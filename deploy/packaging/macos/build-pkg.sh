@@ -47,36 +47,53 @@ if [[ -n "$BUNDLE_DIR" ]]; then
     AGENT_BIN="$APP/Contents/MacOS/yuzu-agent"
     [[ -d "$APP" && -x "$AGENT_BIN" && -d "$PLUGINS" ]] || {
         echo "ERROR: --bundle-dir must contain YuzuAgent.app and plugins/" >&2; exit 1; }
-    ACTUAL_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
-    [[ "$ACTUAL_VERSION" == "$VERSION" ]] || { echo "ERROR: bundle version does not match --version" >&2; exit 1; }
-    codesign --verify --deep --strict --verbose=2 "$APP"
     install -d "${STAGING}/Library/Application Support/YuzuAgent"
-    install -d "${STAGING}/Library/LaunchDaemons"
+    install -d "${STAGING}/Library/LaunchDaemons" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
     cp -R "$APP" "${STAGING}/Library/Application Support/YuzuAgent/.YuzuAgent.incoming.app"
+    STAGED_APP="${STAGING}/Library/Application Support/YuzuAgent/.YuzuAgent.incoming.app"
+    STAGED_PLUGINS="${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
+    STAGED_POLICY="${STAGING}/usr/local/lib/yuzu/plugin-signing-policy.json"
+    AGENT_BIN="$STAGED_APP/Contents/MacOS/yuzu-agent"
+    [[ -x "$AGENT_BIN" ]] || { echo "ERROR: staged bundle executable is missing" >&2; exit 1; }
+    ACTUAL_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$STAGED_APP/Contents/Info.plist")"
+    [[ "$ACTUAL_VERSION" == "$VERSION" ]] || { echo "ERROR: staged bundle version does not match --version" >&2; exit 1; }
     POLICY_ARGS=()
     if [[ -f "$PLUGINS/plugin-signing-policy.json" ]]; then
-        POLICY_ARGS=(--plugin-signing-policy "$PLUGINS/plugin-signing-policy.json")
         install -m 644 "$PLUGINS/plugin-signing-policy.json" \
-            "${STAGING}/usr/local/lib/yuzu/plugin-signing-policy.json"
+            "$STAGED_POLICY"
+    fi
+    for plugin in "$PLUGINS"/*.dylib; do
+        [[ -f "$plugin" ]] || continue
+        install -m 755 "$plugin" "$STAGED_PLUGINS/$(basename "$plugin")"
+        [[ ! -f "$plugin.sig" ]] || install -m 644 "$plugin.sig" "$STAGED_PLUGINS/$(basename "$plugin").sig"
+    done
+    # Validate only this private snapshot. Source bundle paths are intentionally
+    # never read again after the copy, closing validation-to-publication races.
+    codesign --verify --deep --strict --verbose=2 "$STAGED_APP"
+    [[ ! -f "$STAGED_POLICY" ]] || POLICY_ARGS=(--plugin-signing-policy "$STAGED_POLICY")
+    CMS_ENFORCEMENT=0
+    if [[ -f "$STAGED_POLICY" ]] || compgen -G "$STAGED_PLUGINS/*.dylib.sig" >/dev/null; then
+        CMS_ENFORCEMENT=1
+        [[ -f "$STAGED_POLICY" ]] || {
+            echo "ERROR: plugin CMS sidecars require a verified signing policy" >&2; exit 1; }
+        [[ -n "$PLUGIN_TRUST_BUNDLE" && -f "$PLUGIN_TRUST_BUNDLE" ]] || {
+            echo "ERROR: plugin CMS sidecars require --plugin-trust-bundle for final-byte verification" >&2; exit 1; }
+        for plugin in "$STAGED_PLUGINS"/*.dylib; do
+            [[ -f "$plugin" ]] || continue
+            [[ -f "$plugin.sig" ]] || {
+                echo "ERROR: all external plugins must have CMS sidecars when signing policy is present" >&2; exit 1; }
+        done
     fi
     python3 "$SCRIPT_DIR/generate-launchd-plist.py" --source "$SCRIPT_DIR/com.yuzu.agent.plist" \
         --output "${STAGING}/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist" \
         --bundle-executable "/Library/Application Support/YuzuAgent/YuzuAgent.app/Contents/MacOS/yuzu-agent" \
         "${POLICY_ARGS[@]}"
-    for plugin in "$PLUGINS"/*.dylib; do
+    for plugin in "$STAGED_PLUGINS"/*.dylib; do
         [[ -f "$plugin" ]] || continue
         codesign --verify --strict --verbose=2 "$plugin"
-        if [[ -f "$plugin.sig" ]]; then
-            [[ -n "$PLUGIN_TRUST_BUNDLE" && -f "$PLUGIN_TRUST_BUNDLE" ]] || {
-                echo "ERROR: plugin CMS sidecars require --plugin-trust-bundle for final-byte verification" >&2; exit 1; }
-            "$AGENT_BIN" --verify-plugin-signature "$plugin" \
+        if [[ "$CMS_ENFORCEMENT" == 1 ]]; then
+            "$STAGED_APP/Contents/MacOS/yuzu-agent" --verify-plugin-signature "$plugin" \
                 --plugin-trust-bundle "$PLUGIN_TRUST_BUNDLE"
-        fi
-        install -m 755 "$plugin" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming/$(basename "$plugin")"
-        [[ ! -f "$plugin.sig" ]] || install -m 644 "$plugin.sig" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming/$(basename "$plugin").sig"
-        if [[ -f "$plugin.sig" && ! -f "$PLUGINS/plugin-signing-policy.json" ]]; then
-            echo "ERROR: plugin CMS sidecars require a verified signing policy" >&2
-            exit 1
         fi
         printf 'plugins/%s\n' "$(basename "$plugin")" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
         PLUGIN_COUNT=$((PLUGIN_COUNT + 1))

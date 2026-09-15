@@ -76,10 +76,14 @@ recovery_path() {
 }
 
 preserve_or_create_directory() {
-    local path="$1" mode="$2" parent
+    local path="$1" mode="$2" parent owner writable
     if [[ -e "$path" || -L "$path" ]]; then
         [[ -d "$path" && ! -L "$path" ]] || {
             echo "ERROR: refusing symlinked or non-directory operational path: $path" >&2; exit 1; }
+        owner="$(stat -f '%u' "$path")"
+        writable="$(stat -f '%Lp' "$path")"
+        [[ "$owner" == 0 && $((8#$writable & 8#022)) == 0 ]] || {
+            echo "ERROR: operational directory must be root-owned and not group/world writable: $path" >&2; exit 1; }
         return 0
     fi
     parent="$(dirname "$path")"
@@ -215,10 +219,10 @@ ensure_state_dir
 require_trusted_directory "$APP_ROOT"
 require_trusted_directory "$YUZU_LIB"
 preserve_or_create_directory "$LOG_DIR" 755
-# Enrollment configuration and trust material may be owned or permissioned by
-# an operator. Validate an existing directory but never reset it in an upgrade.
-[[ ! -e "$CONFIG_DIR" && ! -L "$CONFIG_DIR" ]] || preserve_or_create_directory "$CONFIG_DIR" 755
-[[ ! -e "$CERT_DIR" && ! -L "$CERT_DIR" ]] || preserve_or_create_directory "$CERT_DIR" 755
+# Preserve existing operational contents and modes only when their directory is
+# safe for a root daemon.  Fresh installs create the documented external paths.
+preserve_or_create_directory "$CONFIG_DIR" 755
+preserve_or_create_directory "$CERT_DIR" 755
 
 [[ -f "$INCOMING_MODE_FILE" && -f "$INCOMING_PLIST" ]] || {
     echo "ERROR: package payload is missing incoming mode or LaunchDaemon plist" >&2; exit 1; }

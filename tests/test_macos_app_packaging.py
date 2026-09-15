@@ -200,6 +200,8 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertNotIn('launchctl bootstrap system "$PLIST" >/dev/null 2>&1 || true', postinstall)
         self.assertNotIn('chown root:wheel "$APP_ROOT" "$LOG_DIR" "$CONFIG_DIR" "$CERT_DIR" "$YUZU_LIB"', postinstall)
         self.assertIn('preserve_or_create_directory "$CONFIG_DIR" 755', postinstall)
+        self.assertIn('operational directory must be root-owned and not group/world writable', postinstall)
+        self.assertIn('preserve_or_create_directory "$CERT_DIR" 755', postinstall)
         self.assertIn('remove_managed_plugins "$MANIFEST"', postinstall)
         self.assertIn('rm -rf "$recovery"', postinstall)
 
@@ -242,8 +244,111 @@ class PackagingStructureTests(unittest.TestCase):
     def test_cms_enforcement_refuses_mixed_plugin_sidecars(self) -> None:
         source = HELPER.read_text()
         self.assertIn('all external plugins must have CMS sidecars', source)
+        package_builder = (ROOT / "deploy/packaging/macos/build-pkg.sh").read_text()
+        self.assertIn('all external plugins must have CMS sidecars when signing policy is present', package_builder)
+        self.assertIn('CMS_ENFORCEMENT=1', package_builder)
+        self.assertIn('never read again after the copy, closing validation-to-publication races', package_builder)
+        self.assertIn('codesign --verify --deep --strict --verbose=2 "$STAGED_APP"', package_builder)
+        self.assertIn('for plugin in "$STAGED_PLUGINS"/*.dylib; do', package_builder)
+        self.assertIn('AGENT_BIN="$STAGED_APP/Contents/MacOS/yuzu-agent"', package_builder)
+        self.assertIn('staged bundle version does not match --version', package_builder)
         package_readme = (ROOT / "deploy/packaging/macos/README.md").read_text()
         self.assertIn('--plugin-trust-bundle <build-trust.pem>', package_readme)
+        self.assertIn('unrecognized', package_readme)
+        self.assertIn('uninstall-legacy.*', package_readme)
+        self.assertIn('exits nonzero', package_readme)
+
+    def test_package_builder_rejects_a_mixed_cms_plugin_set_before_publishing(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_mixed_cms_") as temporary:
+            root = Path(temporary)
+            app = root / "bundle/YuzuAgent.app/Contents/MacOS"
+            app.mkdir(parents=True)
+            executable = app / "yuzu-agent"
+            executable.write_text("#!/bin/sh\nexit 42\n")
+            executable.chmod(0o755)
+            with (app.parent / "Info.plist").open("wb") as output:
+                plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
+            plugins = root / "bundle/plugins"
+            plugins.mkdir()
+            (plugins / "tar.dylib").write_bytes(b"tar")
+            (plugins / "tar.dylib.sig").write_bytes(b"tar sidecar")
+            (plugins / "other.dylib").write_bytes(b"missing sidecar")
+            (plugins / "plugin-signing-policy.json").write_text(
+                json.dumps({"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/plugins.pem"}) + "\n")
+            trust = root / "plugins.pem"
+            trust.write_text("test trust material\n")
+            tools = root / "tools"
+            tools.mkdir()
+            codesign = tools / "codesign"
+            codesign.write_text("#!/bin/sh\nexit 0\n")
+            codesign.chmod(0o755)
+            output = root / "dist"
+            result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+                                     "--version", "1.0", "--output", str(output),
+                                     "--plugin-trust-bundle", str(trust)],
+                                    capture_output=True, text=True,
+                                    env=os.environ | {"PATH": f"{tools}:{os.environ['PATH']}"})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("all external plugins must have CMS sidecars", result.stderr)
+            self.assertFalse(output.exists())
+
+    def test_operational_directory_guard_rejects_untrusted_owner_and_symlink(self) -> None:
+        postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
+        start = postinstall.index("preserve_or_create_directory()")
+        end = postinstall.index("\n\nlegacy_app_is_managed()", start)
+        guard = postinstall[start:end]
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_operational_dir_") as temporary:
+            root = Path(temporary)
+            unsafe = root / "unsafe"
+            unsafe.mkdir()
+            for path in (unsafe, root / "linked"):
+                if path.name == "linked":
+                    path.symlink_to(unsafe, target_is_directory=True)
+                result = subprocess.run(["bash", "-ceu", guard + "\npreserve_or_create_directory \"$TARGET\" 755"],
+                                        env=os.environ | {"TARGET": str(path)},
+                                        capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("operational path", result.stderr) if path.is_symlink() else \
+                    self.assertIn("operational directory must be root-owned", result.stderr)
+
+    def test_package_builder_validates_the_private_plugin_snapshot_after_source_mutation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_package_race_") as temporary:
+            root = Path(temporary)
+            app = root / "bundle/YuzuAgent.app/Contents/MacOS"
+            app.mkdir(parents=True)
+            executable = app / "yuzu-agent"
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o755)
+            with (app.parent / "Info.plist").open("wb") as output:
+                plistlib.dump({"CFBundleShortVersionString": "1.0"}, output)
+            plugins = root / "bundle/plugins"
+            plugins.mkdir()
+            source_plugin = plugins / "tar.dylib"
+            source_plugin.write_bytes(b"original staged bytes")
+            tools = root / "tools"
+            tools.mkdir()
+            captured = root / "captured-plugin"
+            for name, body in {
+                "codesign": "#!/bin/sh\ncase \"$*\" in *.YuzuAgent.incoming.app*) printf 'mutated source bytes' > \"$RACE_SOURCE\"; printf 'mutated source plist' > \"$RACE_INFO\" ;; esac\nexit 0\n",
+                "lipo": "#!/bin/sh\necho arm64\n",
+                "pkgbuild": "#!/bin/sh\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.plugins.incoming/tar.dylib\" \"$CAPTURED_PLUGIN\"\n: > \"$last\"\n",
+                "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+            }.items():
+                tool = tools / name
+                tool.write_text(body)
+                tool.chmod(0o755)
+            output = root / "dist"
+            result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+                                     "--version", "1.0", "--output", str(output)],
+                                    capture_output=True, text=True,
+                                    env=os.environ | {"PATH": f"{tools}:{os.environ['PATH']}",
+                                                      "RACE_SOURCE": str(source_plugin),
+                                                      "RACE_INFO": str(app.parent / "Info.plist"),
+                                                      "CAPTURED_PLUGIN": str(captured)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(source_plugin.read_bytes(), b"mutated source bytes")
+            self.assertEqual((app.parent / "Info.plist").read_bytes(), b"mutated source plist")
+            self.assertEqual(captured.read_bytes(), b"original staged bytes")
 
     def test_builder_refuses_a_populated_output_before_touching_inputs(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:

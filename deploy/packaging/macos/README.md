@@ -129,6 +129,11 @@ sudo /usr/local/lib/yuzu/uninstall.sh
 
 It removes only Yuzu's manifest-listed plugin files and both package-owned code
 lanes; it retains operational data, logs, configuration, trust anchors, and
-third-party plugins. If an installation reports an error, retain
+third-party plugins. If the legacy app in the data root is unrecognized, the
+script moves it to a root-only `/var/db/yuzu-agent/uninstall-legacy.*` recovery
+directory, exits nonzero, and leaves the package-owned code lanes and plist in
+place. Inspect that retained app and deliberately retry or remediate the
+installation; do not delete the recovery directory to force an uninstall. If
+an installation reports an error, retain
 `/var/db/yuzu-agent/install-recovery.*` and the Installer log for diagnosis;
 do not delete them before comparing the restored plist and package manifest.
