@@ -64,8 +64,9 @@ bool is_sha256_hex(std::string_view s) {
 /// async-failure warn previously logged no reason at all, unlike the sync-refusal
 /// warn in reconcile_rule_locked() which always names one. Exhaustive switch, no
 /// `default`, mirroring GuardianSparkRuntime::receipt_status()'s own convention -
-/// a future ReceiptStatus addition (e.g. a K-bound Wedged) fails to COMPILE
-/// here rather than silently landing in a catch-all bucket.
+/// a future ReceiptStatus addition produces a missing-case WARNING here (this
+/// repo's meson.build sets werror=false repo-wide, so it is not a build failure -
+/// correcting an earlier overclaim in this comment), not a silent catch-all.
 const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
     using S = GuardianSparkRuntime::ReceiptStatus;
     switch (status) {
@@ -75,8 +76,10 @@ const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
         return "Committed";
     case S::Failed:
         return "Failed";
-    case S::Expired:
-        return "Expired";
+    case S::CongestionExpired:
+        return "CongestionExpired";
+    case S::Wedged:
+        return "Wedged";
     case S::Withdrawn:
         return "Withdrawn";
     case S::Stopped:
@@ -170,9 +173,20 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         it != current_->pending.end() && resolved < max_per_tick;) {
         const auto status = runtime.receipt_status(it->second);
         // Exhaustive switch, no `default` - SHOULD-1's own fix (see the
-        // receipt_status_name() helper above): a future ReceiptStatus value fails
-        // to compile here rather than silently landing in a catch-all "failed"
+        // receipt_status_name() helper above): a future ReceiptStatus value
+        // produces a missing-case WARNING here (werror=false repo-wide - not a
+        // build failure), rather than silently landing in a catch-all "failed"
         // bucket the way the old if/else-if/else chain would have.
+        //
+        // rung 9c PR-5c (#4221): CongestionExpired and Wedged both fold into
+        // resolved_failed exactly like the pre-split Expired did - neither
+        // represents a committed arm. This PR adds classification only, not the
+        // later K-bound acknowledgement policy (5e): a Wedged receipt still
+        // counts as an ordinary resolved failure on every drain, and a repeated
+        // application can still count the same wedge again - nothing about up-2's
+        // re-observation changes that (re-observation exists so a TYPED Wedged
+        // status reaches this ledger at all, not to change what it means once it
+        // arrives).
         using S = GuardianSparkRuntime::ReceiptStatus;
         switch (status) {
         case S::Pending:
@@ -182,7 +196,8 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             ++current_->resolved_armed;
             break;
         case S::Failed:
-        case S::Expired:
+        case S::CongestionExpired:
+        case S::Wedged:
         case S::Withdrawn:
         case S::Stopped:
             ++current_->resolved_failed;

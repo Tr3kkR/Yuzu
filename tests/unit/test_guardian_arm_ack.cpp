@@ -613,3 +613,96 @@ TEST_CASE("GuardianArmAckLedger::arm_stats(): a Failed drain increases failed; "
     CHECK(s->pending == 0);
     CHECK(s->failed == 0);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// rung 9c PR-5c (#4221): the ReceiptStatus enum split - Expired became
+// CongestionExpired (timed out merely queued) / Wedged (timed out while
+// dispatching/dispatched). Both new variants fold into drain_locked()'s
+// resolved_failed exactly like the pre-split Expired did - this PR adds
+// classification only, not the later K-bound acknowledgement policy (5e).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out while "
+          "dispatching) resolves as an ordinary failure, exactly once",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    b->hang_next_arm.store(true);
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 1);
+    ledger.add_pending("r1", receipt);
+
+    std::size_t failed_out = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 1);
+    CHECK(failed_out == 1);
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 1);
+    }
+    CHECK_FALSE(ledger.can_advance());
+
+    // Already resolved and erased from pending - a second drain on the same
+    // application finds nothing left to resolve, never double-counts this claim.
+    std::size_t failed_out2 = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0);
+    CHECK(failed_out2 == 0);
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (timed "
+          "out merely queued, never reached dispatch) resolves as an ordinary "
+          "failure too",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_every_arm.store(true); // r1 (the head) parks; r2 queues behind it
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    // Same key: r1 occupies the head (Dispatching, parked); r2 queues behind it
+    // and never reaches dispatch at all before its own deadline elapses.
+    auto r1_receipt = accept(*rt, "r1", "/a");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    auto r2_receipt = accept(*rt, "r2", "/a");
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // Both r1 (Dispatching) and r2 (Queued) are overdue by now.
+    REQUIRE(rt->expire_overdue_claims() == 2);
+    REQUIRE(rt->receipt_status(r1_receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_status(r2_receipt) == GuardianSparkRuntime::ReceiptStatus::CongestionExpired);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 2);
+    ledger.add_pending("r1", r1_receipt);
+    ledger.add_pending("r2", r2_receipt);
+
+    std::size_t failed_out = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 2);
+    CHECK(failed_out == 2);
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->pending == 0);
+        CHECK(s->failed == 2);
+    }
+    CHECK_FALSE(ledger.can_advance());
+}

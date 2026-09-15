@@ -7017,19 +7017,22 @@ TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue a
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(rt->expire_overdue_claims() == 1);
     CHECK(rt->is_terminal(res->receipt));
-    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Expired);
+    // rung 9c PR-5c (#4221): this claim timed out while Dispatching (the backend
+    // arm() call itself hung, not merely queued) - WaiterTimedOutDispatched, which
+    // the enum split now names Wedged rather than the pre-split Expired.
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK(rt->backend_op_timeouts() == 1);
     CHECK(rt->rule_count() == 0); // never committed - the expiry beat the late success
 
     // The worker is still parked; releasing it now delivers a "late success" nobody
     // wants (waiter_abandoned was set by abandon_claim_locked above) - it must be
-    // compensated (disarmed), not leaked, and the receipt's own Expired status must
+    // compensated (disarmed), not leaked, and the receipt's own Wedged status must
     // not flip back to Committed once that late success lands.
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
     CHECK(rt->backend_op_late_arms() == 1);
-    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Expired);
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
 }
@@ -7321,18 +7324,18 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     released_by_test = true;
     release_hook.set_value();
     // NOT is_terminal(): expire_overdue_claims() above already made that trivially
-    // true (WaiterTimedOutDispatched/Expired is itself a terminal-shaped status) -
-    // wait specifically for the value to move AWAY from the stale Expired result,
+    // true (WaiterTimedOutDispatched/Wedged is itself a terminal-shaped status) -
+    // wait specifically for the value to move AWAY from the stale Wedged result,
     // which only happens once the real (corrected) resolution below has actually run.
     REQUIRE(yuzu::test::spin_until(
         [&] {
-            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Expired;
+            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Wedged;
         },
         std::chrono::seconds(10)));
     rt->set_io_executor_fail_launch_for_test(false);
 
     // Pre-fix: fail_all_claims_locked()'s guard could not overwrite the stale
-    // WaiterTimedOutDispatched already on r2, so this stayed Expired even though
+    // WaiterTimedOutDispatched already on r2, so this stayed Wedged even though
     // the real cause was an ordinary admission rejection, not a timeout.
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Failed);
     CHECK(rt->rule_count() == 0); // r1 withdrawn, never committed; r2 failed too
@@ -7409,10 +7412,10 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     released_by_test = true;
     release_hook.set_value();
     // NOT is_terminal(): see the equivalent comment in the non-Stopped variant
-    // above - wait for the value to move away from the stale Expired result.
+    // above - wait for the value to move away from the stale Wedged result.
     REQUIRE(yuzu::test::spin_until(
         [&] {
-            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Expired;
+            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Wedged;
         },
         std::chrono::seconds(10)));
 
@@ -7523,10 +7526,10 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     released_by_test = true;
     release_hook.set_value(); // r2 proceeds into a now-exhausted reservation pool
     // NOT is_terminal(): see the equivalent comment in the submission-failure
-    // variant above - wait for the value to move away from the stale Expired result.
+    // variant above - wait for the value to move away from the stale Wedged result.
     REQUIRE(yuzu::test::spin_until(
         [&] {
-            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Expired;
+            return rt->receipt_status(res2->receipt) != GuardianSparkRuntime::ReceiptStatus::Wedged;
         },
         std::chrono::seconds(10)));
 

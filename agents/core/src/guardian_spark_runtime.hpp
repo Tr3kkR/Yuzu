@@ -1157,7 +1157,17 @@ public:
     /// `outcome` string failed to allocate (see begin_stop's queued-claim drop and
     /// publish_locked's own fill-in, both of which write `end` unconditionally),
     /// which is exactly the case that must not read back as stuck Pending.
-    enum class ReceiptStatus { Pending, Committed, Failed, Expired, Withdrawn, Stopped };
+    /// rung 9c PR-5c (#4221): `Expired` split into `CongestionExpired` (timed out
+    /// merely queued behind another claim - never reached dispatch, ordinary
+    /// backpressure) and `Wedged` (timed out while dispatching/dispatched - the
+    /// state up-2's immediate-refusal/re-observation logic keys off). "Wedged" is a
+    /// SLIGHT overclaim for this name: `Dispatching` doesn't prove the backend call
+    /// actually started, and compensation can remain outstanding even after an arm
+    /// eventually returns - read it as "an overdue retained dispatch episode," not
+    /// a guarantee the backend is literally hung.
+    enum class ReceiptStatus {
+        Pending, Committed, Failed, CongestionExpired, Wedged, Withdrawn, Stopped
+    };
 
     /// registry_mu_ taken internally (short critical section, allocation-free). A
     /// default-constructed (empty) receipt reports Failed - there is nothing to

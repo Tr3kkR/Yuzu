@@ -1413,8 +1413,9 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
     case ClaimEnd::Stopped:
         return ReceiptStatus::Stopped;
     case ClaimEnd::WaiterTimedOutQueued:
+        return ReceiptStatus::CongestionExpired;
     case ClaimEnd::WaiterTimedOutDispatched:
-        return ReceiptStatus::Expired;
+        return ReceiptStatus::Wedged;
     case ClaimEnd::BackendRefused:
     case ClaimEnd::WorkerThrew:
     case ClaimEnd::AdmissionRejected:
@@ -1428,8 +1429,10 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
         // default:) so this switch stays exhaustive against ClaimEnd's real set.
         return ReceiptStatus::Failed;
     }
-    return ReceiptStatus::Failed; // unreachable (exhaustive above); no default so a
-                                  // new ClaimEnd enumerator fails to compile here
+    // unreachable (exhaustive above). No `default:` so a new ClaimEnd enumerator
+    // produces a missing-case WARNING here (meson.build's werror=false repo-wide -
+    // this is NOT a build failure, correcting an earlier overclaim in this comment).
+    return ReceiptStatus::Failed;
 }
 
 bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
