@@ -372,6 +372,22 @@ std::optional<std::vector<CertRecord>> enumerate_store(const char* store_name) {
         rec.key_usage = get_key_usage(cert);
         records.push_back(std::move(rec));
     }
+    // CertEnumCertificatesInStore returns NULL both at genuine end-of-store
+    // (CRYPT_E_NOT_FOUND, per Microsoft Learn) and on a real mid-enumeration
+    // error -- treating every NULL as "fully scanned" would let a transient
+    // CryptoAPI failure look like a clean, complete, possibly-empty result
+    // (adversarial-review CDX-003). Fold anything else into the same honest
+    // std::nullopt the open-failure path above already returns: this
+    // function's callers already treat nullopt as "cannot trust this
+    // store's results, mark PARTIAL, never report a definitive not_found".
+    DWORD enum_err = GetLastError();
+    if (enum_err != CRYPT_E_NOT_FOUND) {
+        spdlog::warn("certificates: CryptoAPI enumeration of store '{}' ended abnormally "
+                    "(GetLastError={}), scan incomplete",
+                    store_name, enum_err);
+        CertCloseStore(hStore, 0);
+        return std::nullopt;
+    }
 
     CertCloseStore(hStore, 0);
     return records;
@@ -501,6 +517,20 @@ bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
     }
 
     if (!found) {
+        // CertEnumCertificatesInStore returns NULL both at genuine
+        // end-of-store (CRYPT_E_NOT_FOUND) and on a real mid-enumeration
+        // error (adversarial-review CDX-003, same fix as enumerate_store
+        // above) -- a "not found" verdict on a destructive delete must not
+        // be reported unless the scan genuinely completed.
+        DWORD enum_err = GetLastError();
+        if (enum_err != CRYPT_E_NOT_FOUND) {
+            auto reason = std::format(
+                "error|{} store enumeration ended abnormally; nothing removed", safe_store);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-open", reason);
+            CertCloseStore(hStore, 0);
+            return false;
+        }
         // A definitive negative: the store opened and was fully scanned,
         // so "not found" is a successful idempotent no-op, matching
         // delete_cert_macos's pre-delete presence check.
