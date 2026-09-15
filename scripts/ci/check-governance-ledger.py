@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from decimal import Decimal
 import json
 import os
 import re
@@ -278,17 +279,29 @@ _MIN_INSTANT = datetime.min.replace(tzinfo=timezone.utc)
 # shapes the real corpus actually uses (a mandatory 'T'/'t' separator, then
 # EXACTLY ONE terminal zone designator: 'Z', 'z', or a colon-separated
 # numeric offset - never a mix of the two, never an extra character):
-#   verified: 0 of the real corpus's non-null recorded_at values fail this
-#   grammar (7 distinct shapes seen, all covered)
+#   verified: of the real corpus's non-null recorded_at values, only the
+#   pre-existing bare-date shape (166 occurrences, 3 files) fails to resolve
+#   to an instant under this grammar - by design (SKILL.md treats a bare date
+#   as AMBIGUOUS, not malformed); every value that DOES carry a time
+#   component matches (7 further distinct shapes seen, all covered)
 #
 # `[0-9]` deliberately, NOT `\d`: in a `str` pattern `\d` matches every
 # Unicode Nd-category digit (e.g. Arabic-Indic, fullwidth), not just ASCII -
 # `_FID_TOKEN` above spells its classes out for exactly this reason and this
 # grammar must too, or a non-ASCII-digit date/time silently fullmatches here
 # and only gets caught two lines later by fromisoformat raising.
+#
+# The offset alternative is `[01][0-9]|2[0-3]` hours / `[0-5][0-9]` minutes,
+# NOT a bare `[0-9]{2}:[0-9]{2}`: round-8 review (Fable + Sol, independently
+# converged) found that an unconstrained two-digit offset admits minute
+# values 60-99, which fromisoformat NORMALIZES rather than rejecting
+# ("+05:60" silently becomes "+06:00") - a malformed-but-accepted offset that
+# still parses to a DEFINITE instant, the same escalation-loss mechanism as
+# every prior finding in this field. Verified: 0 of 1,811 real corpus numeric
+# offsets fall outside 00-23:00-59.
 _INSTANT_RE = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
-    r"(\.[0-9]+)?(Z|z|[+-][0-9]{2}:[0-9]{2})$")
+    r"(\.[0-9]+)?(Z|z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$")
 
 
 def _instant(ra):
@@ -299,25 +312,49 @@ def _instant(ra):
     offset, an out-of-range field). Compares actual instants, so fractional
     seconds and non-Z offsets order correctly (a plain string sort does not).
 
-    The grammar validates SHAPE ONLY (digit count and position), never RANGE:
+    The grammar validates SHAPE for every field, but only ENFORCES RANGE
+    directly for the offset (hours 00-23, minutes 00-59, tightened in round
+    8 after an unconstrained offset let fromisoformat silently NORMALIZE a
+    malformed value like "+05:60" into "+06:00" rather than rejecting it).
+    Every OTHER field - month, day, hour, minute, second - is shape-only in
+    the regex and range-enforced by fromisoformat RAISING instead: e.g.
     "2026-13-01T00:00:00Z" (month 13), "2026-02-30T00:00:00Z" (day 30 in
-    February), "2026-09-15T23:60:00Z" (minute 60), and
-    "2026-09-15T10:00:00+24:00" (an out-of-range offset) all fullmatch this
-    regex and only fail at fromisoformat, which RAISES rather than returning
-    a bad value. round-7 review (Fable + Sol, independently converged) caught
-    that an earlier version of this function let that exception escape
-    uncaught: a single out-of-range recorded_at - the single most realistic
-    hand-typing mistake in this field, more likely than any invisible-
-    character shape this whole review cycle has chased - would crash the
-    entire check_fragment() call (raised again for the whole --all corpus, an
-    exit-0 contract), silencing every OTHER finding in the run rather than
-    reporting this one row as bad-recorded-at. A malformed value here means
-    "unparseable", exactly like the absent/wrong-type/no-offset cases above -
-    never an uncaught exception.
+    February), "2026-09-15T23:60:00Z" (minute 60) all fullmatch the grammar
+    and only fail at fromisoformat. round-7 review (Fable + Sol, independently
+    converged) caught that an earlier version of this function let that
+    exception escape uncaught: a single out-of-range recorded_at - the single
+    most realistic hand-typing mistake in this field, more likely than any
+    invisible-character shape this whole review cycle has chased - would
+    crash the entire check_fragment() call (raised again for the whole --all
+    corpus, an exit-0 contract), silencing every OTHER finding in the run
+    rather than reporting this one row as bad-recorded-at. A malformed value
+    here means "unparseable", exactly like the absent/wrong-type/no-offset
+    cases above - never an uncaught exception.
+
+    Known, deliberate narrowing: a genuine RFC 3339 leap-second timestamp
+    ("...T23:59:60Z") returns None - Python's datetime cannot represent leap
+    seconds at all, so no parser change here could accept one. This is a
+    loud, rare false rejection (reported as bad-recorded-at), never a silent
+    escalation-loss path, and is treated as out of this function's profile.
+
+    "-00:00" is rejected explicitly, even though it fullmatches the grammar
+    and Python parses it without error: RFC 3339 section 4.3 reserves this
+    EXACT spelling to mean "local offset unknown", as distinct from "+00:00"
+    (genuinely UTC) - Python parses both identically to UTC, silently
+    discarding that distinction. round-8 review (Sol) raised this: the
+    resulting INSTANT is not ambiguous (RFC 3339 4.3 is explicit that the
+    UTC time is known; only the writer's LOCAL offset is unknown), but ISO
+    8601 forbids a negative-zero offset outright, and RFC 3339 reserves the
+    spelling as a writer-declared data-quality flag - refusing to silently
+    launder it into "+00:00" is the honest behavior, not a correctness fix
+    for a wrong instant like every other malformed shape this field has
+    chased. Verified: 0 real corpus recorded_at values use this spelling.
     """
     if not isinstance(ra, str) or not ra:
         return None
     if _INSTANT_RE.fullmatch(ra) is None:
+        return None
+    if ra.endswith("-00:00"):
         return None
     # RFC 3339 section 5.6 permits a lowercase 'z' spelling too; Python's
     # fromisoformat only recognizes uppercase 'Z' natively and raises on 'z'.
@@ -330,13 +367,51 @@ def _instant(ra):
         return None
 
 
+# fromisoformat truncates fractional seconds to 6 digits (microseconds), but
+# _INSTANT_RE deliberately admits more (the real corpus has 34 rows with 7-9
+# digits) - so two rows differing only PAST microsecond precision parse to
+# the IDENTICAL `datetime`, a false tie that falls through to `pass_ordinal`
+# (reserved by SKILL.md for GENUINE ties) and can invert the rows' real
+# order. round-8 review (Fable + Sol, independently converged) reproduced
+# this directly.
+#
+# Comparing as a `Decimal` fraction - NOT a fixed-width zero-padded int, this
+# function's own first attempt - is what makes the comparison correct for
+# ARBITRARY digit counts: since `_INSTANT_RE`'s fractional group is
+# unbounded (`[0-9]+`), a fixed pad width is a second instance of exactly
+# the class of bug this whole field's review cycle has chased (an
+# unvalidated dimension of a merge-order value). Fable and Sol's round-8
+# confirmation pass both independently found the first version's fixed
+# 32-char width was reachable: a 34-digit fraction and a 32-digit fraction
+# that both truncate to the IDENTICAL microsecond value under `datetime`
+# produced a wrong relative order once padded to unequal effective scales
+# and compared as plain ints.
+# `Decimal("0." + digits)` has no width limit and compares two fractions
+# exactly as the real numbers they denote, however many digits either has -
+# on the standard C `_decimal` build every official CPython distribution and
+# `actions/setup-python` ships. The self-test's 5000-digit fixture (past
+# int()'s 4300-digit conversion cap) is what would catch this reopening
+# loudly on a from-source interpreter built WITHOUT the C extension (the
+# pure-Python `_pydecimal` fallback goes through `int()` internally and
+# would hit the same cap) - never re-add a digit cap here to "fix" that; a
+# cap reintroduces the unvalidated-width class this fix exists to remove.
+def _frac_key(ra):
+    if not isinstance(ra, str):
+        return Decimal(0)
+    m = re.search(r"\.([0-9]+)", ra)
+    return Decimal("0." + m.group(1)) if m else Decimal(0)
+
+
 def _order_key(item):
     idx, r = item
-    inst = _instant(r.get("recorded_at"))
+    ra = r.get("recorded_at")
+    inst = _instant(ra)
     po = r.get("pass_ordinal") if _is_int(r.get("pass_ordinal")) else 0
     if inst is not None:
-        return (1, inst, po, idx)          # timestamped: by instant, then pass_ordinal, then file order
-    return (0, _MIN_INSTANT, 0, idx)       # no parseable recorded_at: sorts first, in file order
+        # timestamped: by instant, then EXACT sub-instant fractional
+        # precision, then pass_ordinal, then file order
+        return (1, inst, _frac_key(ra), po, idx)
+    return (0, _MIN_INSTANT, 0, 0, idx)    # no parseable recorded_at: sorts first, in file order
 
 
 def merged_view(ordered_rows):
@@ -359,7 +434,14 @@ def check_fragment(path):
 
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as e:
+    except (OSError, UnicodeDecodeError) as e:
+        # UnicodeDecodeError is a ValueError subclass, NOT an OSError - a
+        # single non-UTF-8 byte anywhere in a fragment would otherwise raise
+        # uncaught here, crashing check_fragment() (and, in --all, the whole
+        # run) rather than reporting this one fragment as unreadable. round-8
+        # review (Fable + Sol) caught this as the sibling of the same
+        # uncaught-exception class round 7 fixed one function earlier in the
+        # same call chain (the fromisoformat try/except).
         add("", "STRUCTURAL", "unreadable", str(e))
         return out
 

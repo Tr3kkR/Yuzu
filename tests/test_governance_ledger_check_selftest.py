@@ -188,7 +188,7 @@ def run():
     # one-character regex widening) and its rejections:
     expect(M._INSTANT_RE.pattern ==
            r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
-           r"(\.[0-9]+)?(Z|z|[+-][0-9]{2}:[0-9]{2})$",
+           r"(\.[0-9]+)?(Z|z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$",
            "pin _INSTANT_RE grammar")
 
     # round-7 review "should fix" (C1/K1): the round-6 finding_id grammar and
@@ -241,6 +241,92 @@ def run():
            "_instant rejects fullwidth-digit (non-ASCII \\d) date fields")
     expect(M._instant("2026-09-15T10:00:00.١Z") is None,
            "_instant rejects an Arabic-Indic digit in the fractional-seconds field")
+
+    # round-8 review blocker #1 (Fable + Sol, independently converged then
+    # cross-confirmed): the offset alternative was an unconstrained
+    # `[0-9]{2}:[0-9]{2}`, admitting minute values 60-99 - which fromisoformat
+    # NORMALIZES rather than rejecting ("+05:60" silently becomes "+06:00").
+    # A malformed-but-accepted offset still parses to a DEFINITE instant, the
+    # same escalation-loss mechanism as every prior finding in this field.
+    expect(M._instant("2026-09-15T10:00:00+05:60") is None,
+           "_instant rejects an offset with minutes >= 60 (silently normalized by fromisoformat, not raised)")
+    expect(M._instant("2026-09-15T10:00:00-00:99") is None,
+           "_instant rejects an offset with minutes >= 60 (negative sign variant)")
+    expect(M._instant("2026-09-15T10:00:00+23:59") is not None,
+           "_instant still accepts the maximum valid offset (+23:59)")
+    expect(M._instant("2026-09-15T10:00:00+24:00") is None,
+           "_instant rejects an offset with hours >= 24 (grammar-level now, not just fromisoformat)")
+
+    # round-8 review blocker #2 (Fable + Sol, independently converged then
+    # cross-confirmed): fromisoformat truncates fractional seconds to 6
+    # digits, but _INSTANT_RE deliberately admits more (the real corpus has
+    # 34 rows with 7-9 digits) - so two rows differing only PAST microsecond
+    # precision parse to the IDENTICAL datetime, a false tie that falls
+    # through to pass_ordinal (reserved for GENUINE ties) and can invert the
+    # rows' real order. _frac_key compares the value as an exact Decimal
+    # fraction (arbitrary precision, no width limit) to break the tie at the
+    # true precision before ever reaching pass_ordinal.
+    expect(M._frac_key("2026-09-15T10:00:00.0000001Z") <
+           M._frac_key("2026-09-15T10:00:00.0000002Z"),
+           "_frac_key orders sub-microsecond fractions fromisoformat's own comparison would tie")
+    expect(M._frac_key("2026-09-15T10:00:00.1Z") == M._frac_key("2026-09-15T10:00:00.10Z"),
+           "_frac_key treats '.1' and '.10' as the equal decimals they denote (0.1 == 0.10)")
+    expect(M._frac_key("2026-09-15T10:00:00.09Z") < M._frac_key("2026-09-15T10:00:00.1Z"),
+           "_frac_key orders '.09' before '.1' (0.09 < 0.1), not by raw digit-string comparison")
+    expect(M._frac_key("2026-09-15T10:00:00Z") == 0, "_frac_key is 0 for a fraction-less timestamp")
+
+    # round-8 CONFIRMATION-pass finding (Fable + Sol, both independently
+    # reproduced against THIS round's own fix, before push): the first
+    # version of _frac_key right-padded the raw digit string to a FIXED
+    # width (32 chars) and converted to int - a second instance of the
+    # exact "validates one dimension, not the actual unbounded range" defect
+    # this whole field's review cycle has chased, since _INSTANT_RE's
+    # fractional group is unbounded (`[0-9]+`). Two consequences, both fixed
+    # by comparing as a Decimal instead (arbitrary precision, no width, no
+    # int() call):
+    # (a) OVERFLOW: a 34-digit fraction padded to 32 chars is UNCHANGED
+    #     (ljust only pads shorter strings), so it compares as a LARGER int
+    #     than a 32-digit fraction even when its true decimal value is
+    #     SMALLER - inverting merge order silently, zero findings.
+    long_a = "2026-09-15T10:00:00." + ("0" * 6) + "1" + ("0" * 27) + "Z"  # 34 digits: 0.0000001...
+    long_b = "2026-09-15T10:00:00.0000002Z"                              # 32 digits: 0.0000002
+    expect(M._frac_key(long_a) < M._frac_key(long_b),
+           f"_frac_key orders a 34-digit fraction (0.0000001...) correctly below a 32-digit one "
+           f"(0.0000002) - NOT by raw padded-string/int length (got {M._frac_key(long_a)!r} "
+           f"vs {M._frac_key(long_b)!r})")
+    # (b) CRASH: Python 3.11+ caps `int(str)` conversion at 4300 digits
+    #     (sys.get_int_max_str_digits, CVE-2020-10735 mitigation);
+    #     _INSTANT_RE's unbounded fractional group admits a longer digit
+    #     string, so `int(...)` on it raises uncaught INSIDE sorted() - the
+    #     same crash class round 7 fixed one function earlier in the call
+    #     chain. Decimal has no such limit.
+    huge_frac = "2026-09-15T10:00:00." + ("1" * 5000) + "Z"
+    expect(M._instant(huge_frac) is not None,
+           "a 5000-digit fraction (past int()'s 4300-digit string-conversion cap) still parses")
+    expect(isinstance(M._frac_key(huge_frac), type(M._frac_key("2026-09-15T10:00:00.1Z"))),
+           "_frac_key doesn't crash on a 5000-digit fraction (past int()'s conversion cap)")
+    with tempfile.TemporaryDirectory() as huge_d:
+        huge_path = _write(huge_d, "9-hugefrac.X", [
+            {"finding_id": "huge1", "run_id": "9-hugefrac.X", "pass_ordinal": 0,
+             "recorded_at": huge_frac, "disposition": "open"}])
+        cli_huge = subprocess.run([sys.executable, str(_SCRIPT), "--files", huge_path],
+                                   capture_output=True, text=True)
+        expect(cli_huge.returncode in (0, 1) and "Traceback" not in cli_huge.stderr,
+               f"CLI on a 5000-digit fraction never crashes with a Python traceback "
+               f"(got exit={cli_huge.returncode}, stderr={cli_huge.stderr[:200]!r})")
+
+    # round-8 CONFIRMATION-pass finding (Sol): "-00:00" is valid RFC 3339
+    # syntax but its EXACT spelling is reserved (section 4.3) to mean "local
+    # offset unknown", distinct from "+00:00" (genuinely UTC) - Python parses
+    # both identically to UTC, silently discarding that distinction. Unlike
+    # every other malformed shape in this field, this does NOT shift the
+    # resulting instant (both are UTC either way) - but it contradicts this
+    # function's own "unambiguous instant" contract, since the writer is
+    # explicitly declaring they did not know their true offset.
+    expect(M._instant("2026-09-15T10:00:00-00:00") is None,
+           "_instant rejects '-00:00' (RFC 3339's reserved 'unknown local offset' spelling)")
+    expect(M._instant("2026-09-15T10:00:00+00:00") is not None,
+           "_instant still accepts '+00:00' (genuinely UTC, not the unknown-offset marker)")
 
     with tempfile.TemporaryDirectory() as d:
         # -------- (2a) field-wise merge: a CONFORMING sparse supersession is clean --------
@@ -782,6 +868,46 @@ def run():
                f"CLI on an out-of-range recorded_at exits 1 with a finding, never a Python "
                f"traceback (got exit={cli.returncode}, stderr={cli.stderr[:200]!r})")
 
+        # round-8 review blocker #1 (Fable + Sol): an offset with minutes >= 60
+        # ("+05:60") is silently NORMALIZED by fromisoformat to "+06:00" rather
+        # than rejected - the exact same escalation-loss mechanism as c2, just
+        # a different malformed shape. With the tightened grammar this now
+        # fires bad-recorded-at exactly like every prior malformed-timestamp
+        # case, rather than silently merging as a definite-but-wrong instant.
+        c2_offsetmin_rows = [
+            _full(finding_id="c6", recorded_at="2026-09-15T04:30:00Z",
+                  severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"]),
+            _sparse(finding_id="c6", recorded_at="2026-09-15T10:00:00+05:60",
+                    severity_native="INFO", severity_mapped="BLOCKING", impact=["I1"], exposure=["E3"]),
+        ]
+        c2_offsetmin_findings = M.check_fragment(_write(d, "9-c2offsetmin.X", c2_offsetmin_rows))
+        expect("bad-recorded-at" in _rules(c2_offsetmin_findings),
+               f"an offset with minutes >= 60 is caught as bad-recorded-at, not silently "
+               f"normalized into a definite-but-wrong instant (got {_rules(c2_offsetmin_findings)})")
+
+        # round-8 review blocker #2 (Fable + Sol): two rows differing only PAST
+        # microsecond precision (fromisoformat's own truncation limit) parse to
+        # the IDENTICAL datetime under the old code - a false tie that fell
+        # through to pass_ordinal (reserved for GENUINE ties) and could invert
+        # the rows' real order. Discriminating check, same style as the F1
+        # fractional-ordering test above: the row with the SMALLER raw
+        # sub-microsecond fraction is disposition:open (correctly earlier),
+        # the LARGER is disposition:fixed (correctly later/superseding) -
+        # `datetime`'s own truncated comparison would tie them and fall
+        # through to pass_ordinal, which is deliberately set backwards here
+        # (open's pass_ordinal > fixed's) so a tie-driven merge would pick the
+        # WRONG (open) row instead.
+        subfrac_rows = [
+            {"finding_id": "sf", "run_id": "9-subfrac.X", "pass_ordinal": 5,
+             "recorded_at": "2026-09-15T10:00:00.0000001Z", "disposition": "open"},
+            {"finding_id": "sf", "run_id": "9-subfrac.X", "pass_ordinal": 1,
+             "recorded_at": "2026-09-15T10:00:00.0000002Z", "disposition": "fixed"},
+        ]
+        subfrac_ordered = sorted(((i, r) for i, r in enumerate(subfrac_rows)), key=M._order_key)
+        expect(M.merged_view(subfrac_ordered).get("disposition") == "fixed",
+               "sub-microsecond fractional precision orders correctly even though fromisoformat's "
+               "own comparison would tie the two instants (merged disposition=fixed)")
+
         # Fable's round-5 follow-up: the per-row disposition CLOSED-ENUM check
         # must gate on THIS ROW's own versioned-ness, not the finding-level
         # `legacy` flag - a finding-wide flag is True the moment ANY row is
@@ -976,6 +1102,21 @@ def run():
                      encoding="utf-8")
         expect(any(f.rule == "invalid-json" for f in M.check_fragment(str(p))),
                "invalid-json flagged without crashing")
+
+        # round-8 review should-fix (Fable + Sol): UnicodeDecodeError is a
+        # ValueError subclass, NOT an OSError - a single non-UTF-8 byte
+        # anywhere in a fragment would raise uncaught past a bare
+        # `except OSError`, crashing check_fragment() (and, in --all, the
+        # whole run) rather than reporting this one fragment as unreadable.
+        # Caught only by mutation-testing: removing the UnicodeDecodeError
+        # arm from the except clause left every OTHER self-test assertion
+        # passing, since none of them exercised a non-UTF-8 fragment.
+        badbytes = Path(d) / "9-badbytes.X.jsonl"
+        badbytes.write_bytes(b"\xff\xfe not valid utf-8\n")
+        bb_findings = M.check_fragment(str(badbytes))
+        expect(bb_findings and bb_findings[0].rule == "unreadable",
+               f"a non-UTF-8 fragment is reported as unreadable, not an uncaught "
+               f"UnicodeDecodeError crash (got {_rules(bb_findings)})")
 
         # -------- (6) CLI exit-code contract (F10), via subprocess, pinned cwd --------
         scratch = _scratch_git_repo(d)
