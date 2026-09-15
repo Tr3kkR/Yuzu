@@ -1848,29 +1848,35 @@ to close rather than a contradiction to adjudicate.
    omitted passes, which is the gaming vector the severity block already names — so
    spot-check parked rows' `impact` against their own `trigger` and `summary`.
 
-   **Then lint the whole fragment before you push.** The `jq` probe above sees
-   one park constraint; `scripts/ci/check-governance-ledger.py` is the mechanized
-   SUPERSET — an author-side self-check that previews the self-consistency
-   problems a strict reviewer will flag, so a ledger stops taking multiple review
-   rounds to converge (PR #4337 took seven rounds, every one a ledger-metadata
-   defect while the code was byte-identical from round 1; each rule below is one
-   of those rounds' lessons):
+   **Then lint the whole fragment before you push.**
+   `scripts/ci/check-governance-ledger.py` is an author-side self-check that
+   previews the self-consistency problems a strict reviewer will flag, so a
+   ledger stops taking multiple review rounds to converge (PR #4337 took seven
+   rounds, every one a ledger-metadata defect while the code was byte-identical
+   from round 1; each rule is one of those rounds' lessons):
 
    ```bash
    python3 scripts/ci/check-governance-ledger.py --files "$LEDGER"
    ```
 
-   It checks the LIVE VIEW (last row per `finding_id`, per the step-3 merge
-   rules) for: `severity_mapped` == the derived band (a floor gates separately in
-   `policy_floor`, it does not raise `severity_mapped`); `severity_native` and
-   `reviewed_at_sha` IMMUTABLE across supersessions; a `wording` row never
-   carrying `I7`; single-value `reporter`; `adjudicated_by` iff
+   It builds each finding's live view as the FIELD-WISE MERGE defined above (not
+   the last row alone) and checks: `severity_mapped` not weaker than the facts'
+   derived floor band (over-labeling is left alone — a conditional raise can
+   legitimately exceed the flat table — and a floor gates separately via
+   `policy_floor`, it does not raise `severity_mapped`); `severity_native` frozen
+   across supersessions, checked per row; a `wording` finding never carrying
+   `I7`; single-value `reporter`; per-row `adjudicated_by` iff
    `adjudication_rationale`; `source`/enum hygiene and the `policy_floor` key
-   present. It is **advisory, not a CI gate** — calibration found ~93% of the
-   historical `governance.d/` corpus predates these rules, so it is deliberately
-   NOT wired as a blocking check; only its self-test runs in CI. It judges
-   mechanical field-consistency, never whether a finding is true or a severity
-   right. Resolve or consciously accept each finding before pushing.
+   present. It also reproduces this step's own park probe — an `I1`/`I2`/`I3`
+   finding on a `roadmap-` disposition, and the scalar-`impact` shape the `jq`
+   above catches — but does NOT replace it: the label half of the park contract
+   (`roadmap` XOR priority/triage on GitHub, and a `linked-to-` target's labels)
+   lives outside the ledger and stays procedural, so run BOTH. It is **advisory,
+   not a CI gate** — calibration found most of the historical `governance.d/`
+   corpus predates these rules, so it is deliberately NOT wired as a blocking
+   check; only its self-test runs in CI. It judges mechanical field-consistency,
+   never whether a finding is true or a severity right. Resolve or consciously
+   accept each finding before pushing.
 
 ## Known patterns from prior runs
 
