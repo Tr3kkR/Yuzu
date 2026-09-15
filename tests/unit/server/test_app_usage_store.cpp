@@ -135,7 +135,7 @@ TEST_CASE("AppUsageStore: replace_agent_last_used round-trips rows and the raw h
     const std::string agent = "agent-1";
     std::vector<AgentLastUsedRow> rows = {row("chrome.exe", 1699000000, 1700000500, 12, 43200),
                                           row("word.exe", 1698000000, 1700000600, 3, 900)};
-    REQUIRE(store.replace_agent_last_used(agent, rows, "hash-v1"));
+    REQUIRE(store.replace_agent_last_used(agent, rows, "hash-v1", 1700000900));
 
     auto stored = store.stored_hash(agent);
     REQUIRE(stored.has_value());
@@ -150,6 +150,11 @@ TEST_CASE("AppUsageStore: replace_agent_last_used round-trips rows and the raw h
     CHECK((*got)[0].run_count_30d == 12);
     CHECK((*got)[0].total_seconds_30d == 43200);
     CHECK((*got)[1].exe_key == "word.exe");
+
+    auto collected = store.collected_at(agent);
+    REQUIRE(collected.has_value());
+    REQUIRE(collected->has_value());
+    CHECK(**collected == 1700000900);
 }
 
 TEST_CASE("AppUsageStore: a second replace supersedes the first (old rows gone)",
@@ -158,9 +163,9 @@ TEST_CASE("AppUsageStore: a second replace supersedes the first (old rows gone)"
 
     const std::string agent = "agent-2";
     REQUIRE(store.replace_agent_last_used(
-        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1"));
+        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1", 1700000500));
     REQUIRE(store.replace_agent_last_used(agent, {row("word.exe", 1698000000, 1700000600)},
-                                          "hash-v2"));
+                                          "hash-v2", 1700000600));
 
     auto got = store.get_agent_last_used(agent);
     REQUIRE(got.has_value());
@@ -171,16 +176,25 @@ TEST_CASE("AppUsageStore: a second replace supersedes the first (old rows gone)"
     REQUIRE(stored.has_value());
     REQUIRE(stored->has_value());
     CHECK(**stored == "hash-v2");
+
+    auto collected = store.collected_at(agent);
+    REQUIRE(collected.has_value());
+    REQUIRE(collected->has_value());
+    CHECK(**collected == 1700000600); // the second replace's value wins
 }
 
-TEST_CASE("AppUsageStore: an empty rows replace is a legitimate replace-to-empty",
+TEST_CASE("AppUsageStore: an empty rows replace is a legitimate replace-to-empty, and "
+          "collected_at survives it (#C2)",
           "[app_usage_store][pg]") {
     AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-3";
     REQUIRE(store.replace_agent_last_used(
-        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1"));
-    REQUIRE(store.replace_agent_last_used(agent, {}, "hash-empty"));
+        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1", 1699000900));
+    // The empty-snapshot replace's OWN collected_at — distinct from the prior
+    // value above — must still land on usage_state even though there is no
+    // agent_last_used row to carry it.
+    REQUIRE(store.replace_agent_last_used(agent, {}, "hash-empty", 1699009999));
 
     auto got = store.get_agent_last_used(agent);
     REQUIRE(got.has_value());
@@ -189,15 +203,40 @@ TEST_CASE("AppUsageStore: an empty rows replace is a legitimate replace-to-empty
     REQUIRE(stored.has_value());
     REQUIRE(stored->has_value());
     CHECK(**stored == "hash-empty");
+
+    // The pinned regression: collected_at must be the empty replace's real
+    // batch time (1699009999), NEVER 0 — 0 would be indistinguishable from
+    // "never collected" and silently defeat the freshness signal for a
+    // legitimate empty snapshot.
+    auto collected = store.collected_at(agent);
+    REQUIRE(collected.has_value());
+    REQUIRE(collected->has_value());
+    CHECK(**collected == 1699009999);
 }
 
-TEST_CASE("AppUsageStore: touch bumps freshness without altering child rows",
+TEST_CASE("AppUsageStore: collected_at on a cold cache is a value holding nullopt",
+          "[app_usage_store][pg]") {
+    AUSG_SHARED(store, pool);
+    auto result = store.collected_at("never-seen-agent");
+    REQUIRE(result.has_value()); // not degraded
+    CHECK_FALSE(result->has_value()); // cold cache
+}
+
+TEST_CASE("AppUsageStore: collected_at with an empty agent_id is an empty value, not a degrade",
+          "[app_usage_store][pg]") {
+    AUSG_SHARED(store, pool);
+    auto result = store.collected_at("");
+    REQUIRE(result.has_value());
+    CHECK_FALSE(result->has_value());
+}
+
+TEST_CASE("AppUsageStore: touch bumps freshness without altering child rows or collected_at",
           "[app_usage_store][pg]") {
     AUSG_SHARED(store, pool);
 
     const std::string agent = "agent-4";
     REQUIRE(store.replace_agent_last_used(
-        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1"));
+        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1", 1700000500));
     CHECK(store.touch(agent));
 
     auto stored = store.stored_hash(agent);
@@ -207,6 +246,10 @@ TEST_CASE("AppUsageStore: touch bumps freshness without altering child rows",
     auto got = store.get_agent_last_used(agent);
     REQUIRE(got.has_value());
     REQUIRE(got->size() == 1);
+    auto collected = store.collected_at(agent);
+    REQUIRE(collected.has_value());
+    REQUIRE(collected->has_value());
+    CHECK(**collected == 1700000500); // touch never changes collected_at either
 }
 
 TEST_CASE("AppUsageStore: touch on a cold cache (no state row) fails",
@@ -231,7 +274,7 @@ TEST_CASE("AppUsageStore: delete_agent guards an empty id and reports commit sta
           "[app_usage_store][pg]") {
     AUSG_SHARED(store, pool);
     REQUIRE(store.replace_agent_last_used(
-        "agent-5", {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1"));
+        "agent-5", {row("chrome.exe", 1699000000, 1700000500)}, "hash-v1", 1700000500));
 
     // Empty id: guarded — never a `WHERE agent_id = ''` — reports false, and
     // the real row is untouched.
@@ -250,7 +293,7 @@ TEST_CASE("AppUsageStore: delete_agent erases usage_state AND agent_last_used in
     const std::string agent = "agent-6";
     REQUIRE(store.replace_agent_last_used(
         agent, {row("chrome.exe", 1699000000, 1700000500), row("word.exe", 1698000000, 1700000600)},
-        "hash-v1"));
+        "hash-v1", 1700000600));
 
     REQUIRE(store.delete_agent(agent));
 
@@ -269,7 +312,7 @@ TEST_CASE("AppUsageStore: delete_agent erases usage_state AND agent_last_used in
     // A real full resend after the delete must be accepted as a fresh cold
     // start (not "touched" against a resurrected hash).
     REQUIRE(store.replace_agent_last_used(
-        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v2"));
+        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-v2", 1700000501));
     auto got2 = store.get_agent_last_used(agent);
     REQUIRE(got2.has_value());
     REQUIRE(got2->size() == 1);
@@ -285,7 +328,7 @@ TEST_CASE("AppUsageStore: count_stale_agents counts by last_seen threshold",
           "[app_usage_store][pg]") {
     AUSG_SHARED(store, pool);
     REQUIRE(store.replace_agent_last_used(
-        "agent-stale-1", {row("chrome.exe", 1699000000, 1700000500)}, "h1"));
+        "agent-stale-1", {row("chrome.exe", 1699000000, 1700000500)}, "h1", 1700000500));
 
     // Everything is fresh (last_seen == now()) relative to a threshold far in
     // the past, so the stale count is 0; relative to a threshold far in the
@@ -309,8 +352,9 @@ TEST_CASE("AppUsageStore: a store on an unreachable pool is closed and reads deg
     REQUIRE_FALSE(store.is_open());
     CHECK_FALSE(store.stored_hash("agent").has_value());
     CHECK_FALSE(store.touch("agent"));
-    CHECK_FALSE(store.replace_agent_last_used("agent", {}, "h"));
+    CHECK_FALSE(store.replace_agent_last_used("agent", {}, "h", 0));
     CHECK_FALSE(store.get_agent_last_used("agent").has_value());
+    CHECK_FALSE(store.collected_at("agent").has_value());
     CHECK_FALSE(store.delete_agent("agent"));
     CHECK_FALSE(store.count_stale_agents(0).has_value());
 }

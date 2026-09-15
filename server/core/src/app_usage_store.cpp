@@ -50,12 +50,18 @@ const std::vector<pg::PgMigration>& migrations() {
          // Per-agent sync parent. content_hash is the RAW received blob
          // bytes' SHA-256, recomputed by the ingest seam and persisted
          // VERBATIM (mirrors SoftwareLicensingStore — never re-derived from
-         // parsed rows). first_seen/last_seen/updated_at are the SERVER
-         // receipt time (#1685 / ADR-0016 clock-skew rule) — the staleness
-         // read keys on last_seen, served by the index below.
+         // parsed rows). collected_at is the agent-supplied BATCH collection
+         // time — every agent_last_used row from one replace shares it, so it
+         // is persisted here on the parent, not derived from a child row: an
+         // empty replace-to-empty has no child row to carry it, and this
+         // column is what keeps that case's collected_at honest instead of
+         // reading back as "never collected". first_seen/last_seen/updated_at
+         // are the SERVER receipt time (#1685 / ADR-0016 clock-skew rule) —
+         // the staleness read keys on last_seen, served by the index below.
          "CREATE TABLE usage_state ("
          "  agent_id     TEXT PRIMARY KEY,"
          "  content_hash TEXT NOT NULL DEFAULT '',"
+         "  collected_at BIGINT NOT NULL DEFAULT 0,"
          "  first_seen   TIMESTAMPTZ NOT NULL,"
          "  last_seen    TIMESTAMPTZ NOT NULL,"
          "  updated_at   TIMESTAMPTZ NOT NULL);"
@@ -202,7 +208,8 @@ bool AppUsageStore::touch(std::string_view agent_id) {
 
 bool AppUsageStore::replace_agent_last_used(std::string_view agent_id,
                                             const std::vector<AgentLastUsedRow>& rows,
-                                            std::string_view content_hash) {
+                                            std::string_view content_hash,
+                                            std::int64_t collected_at) {
     if (!open_ || agent_id.empty())
         return false;
     const std::string agent_id_s{agent_id};
@@ -221,19 +228,23 @@ bool AppUsageStore::replace_agent_last_used(std::string_view agent_id,
         if (lk.status() != PGRES_TUPLES_OK)
             return false;
         // Parent upsert FIRST (the children's FK targets it): persist the
-        // seam-recomputed raw-blob hash VERBATIM; keep first_seen on
-        // conflict, refresh last_seen/updated_at to the server receipt time.
+        // seam-recomputed raw-blob hash AND the batch collected_at VERBATIM
+        // (both survive an empty `rows` replace — see the file header); keep
+        // first_seen on conflict, refresh last_seen/updated_at to the server
+        // receipt time.
         pg::PgResult par = pg::exec_params(
             c,
             "INSERT INTO app_usage_store.usage_state "
-            "(agent_id, content_hash, first_seen, last_seen, updated_at) "
-            "VALUES ($1, $2, now(), now(), now()) "
+            "(agent_id, content_hash, collected_at, first_seen, last_seen, updated_at) "
+            "VALUES ($1, $2, $3, now(), now(), now()) "
             "ON CONFLICT (agent_id) DO UPDATE SET "
             "  content_hash = EXCLUDED.content_hash, "
+            "  collected_at = EXCLUDED.collected_at, "
             "  last_seen = EXCLUDED.last_seen, "
             "  updated_at = EXCLUDED.updated_at "
             "RETURNING agent_id",
-            std::vector<std::string>{agent_id_s, std::string(content_hash)});
+            std::vector<std::string>{agent_id_s, std::string(content_hash),
+                                     std::to_string(collected_at)});
         if (par.status() != PGRES_TUPLES_OK)
             return false;
         pg::PgResult del =
@@ -349,6 +360,42 @@ AppUsageStore::get_agent_last_used(std::string_view agent_id) {
         out.push_back(std::move(r));
     }
     return out;
+}
+
+std::expected<std::optional<std::int64_t>, AppUsageReadError>
+AppUsageStore::collected_at(std::string_view agent_id) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("AppUsageStore: collected_at degraded — store not open (occurrence {})",
+                         d.occurrence);
+        return std::unexpected(AppUsageReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return std::optional<std::int64_t>{}; // precondition miss, not a degrade
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("AppUsageStore: collected_at degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::unexpected(AppUsageReadError::kDegraded);
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(), "SELECT collected_at FROM app_usage_store.usage_state WHERE agent_id = $1",
+        std::vector<std::string>{std::string(agent_id)});
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("AppUsageStore: collected_at degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::unexpected(AppUsageReadError::kDegraded);
+    }
+    if (PQntuples(res.get()) == 0)
+        return std::optional<std::int64_t>{}; // no state row → never collected
+    return std::optional<std::int64_t>{result_i64(res, 0, 0)};
 }
 
 bool AppUsageStore::delete_agent(std::string_view agent_id) {

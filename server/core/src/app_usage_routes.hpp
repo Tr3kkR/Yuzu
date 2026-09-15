@@ -27,10 +27,13 @@
 /// when the access-audit row cannot persist — set BEFORE the store read
 /// (per-open, not per-row).
 ///
-/// DEGRADE != EMPTY: the provider returns `std::nullopt` on a store/pool/
-/// query degrade -> the route answers 503 (A4 envelope, retryable), NEVER a
-/// silent empty 200. An empty vector = the agent genuinely reported no rows
-/// for the retained window -> 200 with `data.apps` as an empty array.
+/// DEGRADE != EMPTY: both providers (`agent_last_used_fn`, `collected_at_fn`)
+/// return `std::nullopt` on a store/pool/query degrade -> the route answers
+/// 503 (A4 envelope, retryable), NEVER a silent empty/zero 200. An empty
+/// `apps` vector = the agent genuinely reported no rows for the retained
+/// window -> 200 with `data.apps` as an empty array and `data.collected_at`
+/// still the real batch collection time (#C2 — sourced from the store's
+/// `usage_state` parent row, not derived from a row that may not exist).
 
 #include "app_usage_store.hpp" // AgentLastUsedRow
 
@@ -63,6 +66,15 @@ public:
     using AgentLastUsedFn =
         std::function<std::optional<std::vector<AgentLastUsedRow>>(const std::string& agent_id)>;
 
+    /// The batch `collected_at` for one agent (REAL data via
+    /// `AppUsageStore::collected_at`, sourced from the `usage_state` parent
+    /// row — NOT `rows.front().collected_at`, which loses the value on a
+    /// legitimate empty-snapshot replace, #C2). `std::nullopt` on a degrade
+    /// (-> 503, same as `AgentLastUsedFn`). A value of 0 is legitimate — both
+    /// "never collected" (no state row) and an agent-reported 0 read back as
+    /// 0; the route does not need to distinguish them.
+    using CollectedAtFn = std::function<std::optional<std::int64_t>(const std::string& agent_id)>;
+
     /// who/when/what audit sink (bool = persisted; false = a persist failure
     /// OR a throwing sink, routed through the #1647 throw-safe kernel).
     using AuditFn = std::function<bool(const httplib::Request& req, const std::string& action,
@@ -70,17 +82,20 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
 
     void register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn,
-                         AgentLastUsedFn agent_last_used_fn, AuditFn audit_fn = {});
+                         AgentLastUsedFn agent_last_used_fn,
+                         CollectedAtFn collected_at_fn = {}, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no
     /// httplib acceptor; the #438 TSan trap). The httplib::Server& overload
     /// wraps + delegates.
     void register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn,
-                         AgentLastUsedFn agent_last_used_fn, AuditFn audit_fn = {});
+                         AgentLastUsedFn agent_last_used_fn,
+                         CollectedAtFn collected_at_fn = {}, AuditFn audit_fn = {});
 
 private:
     ScopedPermFn scoped_perm_fn_;
     AgentLastUsedFn agent_last_used_fn_;
+    CollectedAtFn collected_at_fn_;
     AuditFn audit_fn_;
 };
 

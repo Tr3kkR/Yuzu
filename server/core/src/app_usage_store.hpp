@@ -139,17 +139,23 @@ public:
 
     /// Full replace for one agent (trichotomy leg 3 — "stored"), in ONE
     /// transaction: upsert the `usage_state` parent (persisting the
-    /// seam-recomputed raw-blob `content_hash` VERBATIM; `first_seen`
-    /// preserved on conflict, `last_seen`/`updated_at` = server receipt
-    /// time), delete the agent's old `agent_last_used` rows, batch-insert the
-    /// new ones. An empty `rows` is a legitimate replace-to-empty — the
-    /// retained-window projection can genuinely shrink to nothing once every
-    /// row ages out of TAR's usage retention. Fail-soft: false on any
-    /// failure (the txn rolls back whole — old rows survive untouched; the
-    /// seam nacks and the agent re-sends).
+    /// seam-recomputed raw-blob `content_hash` VERBATIM and the batch
+    /// `collected_at` — every row in this call shares one collection time,
+    /// so it is persisted on the PARENT row, not derived from a child row;
+    /// `first_seen` preserved on conflict, `last_seen`/`updated_at` = server
+    /// receipt time), delete the agent's old `agent_last_used` rows,
+    /// batch-insert the new ones. An empty `rows` is a legitimate
+    /// replace-to-empty — the retained-window projection can genuinely
+    /// shrink to nothing once every row ages out of TAR's usage retention —
+    /// and `collected_at` is persisted on the parent row EVEN THEN, so a
+    /// legitimate empty snapshot does not read back as "never collected"
+    /// (see `collected_at()` below). Fail-soft: false on any failure (the
+    /// txn rolls back whole — old rows survive untouched; the seam nacks and
+    /// the agent re-sends).
     [[nodiscard]] bool replace_agent_last_used(std::string_view agent_id,
                                                const std::vector<AgentLastUsedRow>& rows,
-                                               std::string_view content_hash);
+                                               std::string_view content_hash,
+                                               std::int64_t collected_at);
 
     /// All per-executable last-used rows for one agent, exe_key-sorted,
     /// capped. AUTHORITATIVE read: `std::nullopt` on a store/pool/query
@@ -159,6 +165,22 @@ public:
     /// `agent_id` is a precondition miss → empty value.
     [[nodiscard]] std::optional<std::vector<AgentLastUsedRow>>
     get_agent_last_used(std::string_view agent_id);
+
+    /// The stored batch collection time for one agent — `usage_state.
+    /// collected_at`, persisted on the PARENT row by `replace_agent_last_used`
+    /// so it survives a legitimate replace-to-empty (an empty `agent_last_used`
+    /// row set has no row to carry it — the bug this accessor exists to close,
+    /// see app_usage_routes.cpp / mcp_server.cpp's `get_agent_app_usage`, both
+    /// of which source `collected_at` from here rather than
+    /// `rows.front().collected_at`). AUTHORITATIVE read, mirrors
+    /// `get_agent_last_used`: `std::unexpected(kDegraded)` on a store/pool/
+    /// query failure; a value holding `std::nullopt` when no state row exists
+    /// (never collected — callers treat this as 0); a value holding the
+    /// epoch-seconds timestamp otherwise (0 is also a legitimate STORED value
+    /// if the agent reported `collected_at == 0`). An empty `agent_id` is a
+    /// precondition miss → value holding `std::nullopt`, not a degrade.
+    [[nodiscard]] std::expected<std::optional<std::int64_t>, AppUsageReadError>
+    collected_at(std::string_view agent_id);
 
     /// Drop an agent's `agent_last_used` rows AND its `usage_state` row in
     /// ONE transaction (see the file header — the two-table delete is

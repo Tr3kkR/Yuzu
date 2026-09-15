@@ -8156,6 +8156,20 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
+                // collected_at is sourced from the usage_state PARENT row (never
+                // rows->front().collected_at — a legitimate replace-to-empty snapshot
+                // has no row to carry it, and that empty case must still report the
+                // real collection time, not 0, #C2). Same authoritative-read posture
+                // as the rows read above: a store/pool/query degrade is an ERROR.
+                auto collected_at_result = app_usage_store->collected_at(agent_id);
+                if (!collected_at_result.has_value()) {
+                    mcp_audit("failure", "app-usage store degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "app-usage store unavailable — read failed",
+                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
                 // Per-access behavioural audit — same posture as the REST twin
                 // (app_usage_routes.cpp): this data is behavioural PII (what ran,
                 // when, how often), so a dropped audit row FAILS CLOSED rather than
@@ -8199,10 +8213,9 @@ McpServer::HandlerFn McpServer::build_handler(
                                 .add("run_count_30d", r.run_count_30d)
                                 .add("total_seconds_30d", r.total_seconds_30d));
                 }
-                // collected_at is the agent-batch collection time (every row in one
-                // replace_agent_last_used call shares it) — hoisted to the top level
-                // exactly as the REST drill does; 0 for an empty result.
-                const std::int64_t collected_at = rows->empty() ? 0 : rows->front().collected_at;
+                // Hoisted to the top level exactly as the REST drill does — sourced
+                // from usage_state (collected_at_result), not rows->front().
+                const std::int64_t collected_at = collected_at_result->value_or(0);
                 JObj payload;
                 payload.add("agent_id", agent_id).raw("apps", arr.str()).add("collected_at", collected_at);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),

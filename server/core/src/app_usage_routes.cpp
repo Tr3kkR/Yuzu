@@ -91,16 +91,19 @@ json app_usage_row_to_json(const AgentLastUsedRow& r) {
 } // namespace
 
 void AppUsageRoutes::register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn,
-                                     AgentLastUsedFn agent_last_used_fn, AuditFn audit_fn) {
+                                     AgentLastUsedFn agent_last_used_fn,
+                                     CollectedAtFn collected_at_fn, AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(scoped_perm_fn), std::move(agent_last_used_fn),
-                    std::move(audit_fn));
+                    std::move(collected_at_fn), std::move(audit_fn));
 }
 
 void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn,
-                                     AgentLastUsedFn agent_last_used_fn, AuditFn audit_fn) {
+                                     AgentLastUsedFn agent_last_used_fn,
+                                     CollectedAtFn collected_at_fn, AuditFn audit_fn) {
     scoped_perm_fn_ = std::move(scoped_perm_fn);
     agent_last_used_fn_ = std::move(agent_last_used_fn);
+    collected_at_fn_ = std::move(collected_at_fn);
     audit_fn_ = std::move(audit_fn);
 
     // ── GET /api/v1/forensics/agents/{agent_id}/app-usage — scoped + fail-closed audit ──
@@ -154,18 +157,31 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                      return;
                  }
 
+                 // collected_at is sourced from the usage_state PARENT row (via
+                 // AppUsageStore::collected_at), never rows->front().collected_at —
+                 // a legitimate replace-to-empty snapshot has no row to carry it, and
+                 // that empty case must still report the real collection time, not 0
+                 // (#C2). The MCP twin (mcp_server.cpp) sources it the same way.
+                 std::optional<std::int64_t> collected_at;
+                 if (collected_at_fn_)
+                     collected_at = collected_at_fn_(agent_id);
+                 if (!collected_at) {
+                     (void)detail::try_persist_audit(audit_fn_, req, "app_usage.agent.view",
+                                                     "failure", "Agent", agent_id,
+                                                     "app-usage store degraded; cid=" + cid);
+                     send_json(res, 503,
+                               a4_error(503, "app-usage store unavailable — read failed", cid, 5000,
+                                        "retry the request"));
+                     return;
+                 }
+
                  json apps = json::array();
                  for (const auto& r : *rows)
                      apps.push_back(app_usage_row_to_json(r));
-                 // collected_at is the agent-batch collection time (every row in one
-                 // replace_agent_last_used call shares it), not response-generation
-                 // wall time — the MCP twin (mcp_server.cpp) hoists the same field the
-                 // same way; 0 for an empty result.
-                 const std::int64_t collected_at = rows->empty() ? 0 : rows->front().collected_at;
                  json data;
                  data["agent_id"] = agent_id;
                  data["apps"] = std::move(apps);
-                 data["collected_at"] = collected_at;
+                 data["collected_at"] = *collected_at;
                  send_json(res, 200, ok_json(std::move(data)));
              });
 }

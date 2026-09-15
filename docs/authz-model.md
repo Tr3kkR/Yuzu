@@ -372,14 +372,26 @@ infrastructure only.
 **Wave 7 PR7b: application usage is the first live `Forensics` consumer, not `execution_artifacts`.**
 The `app_usage` plugin's dedicated read surface (single-target, `Forensics:Read`) is the first row
 to actually classify anything `Forensics` — application usage history (TAR's `usage_live`/
-`usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is reachable ONLY
-through that surface. It is deliberately unreachable through the generic `tar.sql` endpoint
-(`Infrastructure:Read`, `plugin_action_catalogue_a.hpp`): the three usage tables are excluded from
-`is_queryable_table()`'s allowlist in `tar_schema_registry.cpp`, so the read-only connection's
-SQLite authorizer denies every access path to them — direct name, `$Usage_*` placeholder, alias,
-JOIN, or subquery — with the same no-existence-oracle posture `tar_events` already gets (#760
-UP-8). #4260 tracked this gap; closed by this exclusion. #2744 (the app_usage measurand ADR) is
-superseded by the machine-scope decision above and closes without a code change.
+`usage_daily`/`usage_daily_user` tables, retained on a 31-day rolling window) is designed to be
+reachable only through that surface (see the residual read-path caveat below). It is deliberately
+unreachable through the generic `tar.sql` endpoint (`Infrastructure:Read`,
+`plugin_action_catalogue_a.hpp`): the three usage tables are excluded from `is_queryable_table()`'s
+allowlist in `tar_schema_registry.cpp`, so the read-only connection's SQLite authorizer denies every
+access path to them — direct name, `$Usage_*` placeholder, alias, JOIN, or subquery — with the same
+no-existence-oracle posture `tar_events` already gets (#760 UP-8). #4260 tracked this gap; closed by
+this exclusion. #2744 (the app_usage measurand ADR) is superseded by the machine-scope decision
+above and closes without a code change.
+
+**Residual read path, accepted not closed:** `app_usage` is also a typed daily-sync source
+(`typed_inventory_sources.hpp`) excluded from the generic `InventoryStore` only on the gateway's
+*write* path, with a boot-time purge cleaning up any stray row from a mixed-version deployment
+window (an older gateway writing before an upgraded server's boot purge runs). The generic *read*
+path (`InventoryStore::get`/`query`/`list_tables`) carries no typed-source filter, so a stray row
+from that window — or a failed purge — stays readable via the far lower-privileged
+`Infrastructure:Read`/`Inventory:Read` securable until the next boot purge. This is the same
+architectural gap `device_ci` already carries (per `typed_inventory_sources.hpp`'s own header
+comment) and is not being retrofitted here either; it was accepted at this feature's planning gate
+in favor of purge-on-upgrade over a read-time filter.
 
 ## Testing
 

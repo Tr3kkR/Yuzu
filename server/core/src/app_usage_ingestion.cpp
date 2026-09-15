@@ -54,11 +54,14 @@ std::string clamp_field(std::string_view raw) {
 
 // Locale-independent numeric parse (std::from_chars), clamped non-negative. A
 // malformed or negative token yields 0 rather than rejecting the whole row.
+// The end pointer is checked against the full token so a trailing non-digit
+// tail (e.g. "12junk") falls back to 0 instead of silently accepting the
+// leading-digit prefix "12" — from_chars parses as much as it can and does
+// not itself reject unconsumed trailing characters.
 std::int64_t parse_nonneg_i64(std::string_view s) {
     std::int64_t v = 0;
     const auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
-    (void)p;
-    if (ec != std::errc{} || v < 0)
+    if (ec != std::errc{} || v < 0 || p != s.data() + s.size())
         return 0;
     return v;
 }
@@ -258,9 +261,13 @@ void ingest_app_usage_report(AppUsageStore& store, const std::string& agent_id,
     for (auto& r : parsed.rows)
         r.collected_at = collected_at;
 
-    // An empty rows vector is a legitimate full replace-to-empty.
+    // An empty rows vector is a legitimate full replace-to-empty — collected_at
+    // is passed as its own parameter (not derived from parsed.rows) precisely
+    // so that case still persists a real batch collection time on the parent
+    // usage_state row rather than losing it (#C2).
     const auto t0 = std::chrono::steady_clock::now();
-    const bool ok = store.replace_agent_last_used(agent_id, parsed.rows, raw_hash);
+    const bool ok =
+        store.replace_agent_last_used(agent_id, parsed.rows, raw_hash, collected_at);
     observe("full", t0);
     if (!ok) {
         emit("error"); // fail-soft: nack, the agent re-sends next cycle

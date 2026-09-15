@@ -1821,8 +1821,8 @@ public:
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "generic - generic is the ADR-0037 InventoryStore). /readyz stays "
-                          "green under pure pool saturation, so "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
         // Management-group CONFINEMENT store observability (ADR-0042). The
@@ -16237,6 +16237,18 @@ private:
                 if (!app_usage_store_)
                     return std::nullopt;
                 return app_usage_store_->get_agent_last_used(agent_id);
+            },
+            // Batch collected_at, sourced from the usage_state PARENT row — never
+            // rows.front().collected_at, which loses the value on a legitimate
+            // replace-to-empty snapshot (#C2). nullopt on degrade → 503; a
+            // present-but-absent state row (never collected) flattens to 0.
+            [this](const std::string& agent_id) -> std::optional<std::int64_t> {
+                if (!app_usage_store_)
+                    return std::nullopt;
+                auto r = app_usage_store_->collected_at(agent_id);
+                if (!r.has_value())
+                    return std::nullopt;
+                return r->value_or(0);
             },
             audit_fn);
 

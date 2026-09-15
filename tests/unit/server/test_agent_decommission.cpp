@@ -380,7 +380,7 @@ void seed_agent(const std::string& agent_id, yuzu::server::InventoryStore& inv,
     ur.last_seen = 2000;
     ur.run_count_30d = 5;
     ur.total_seconds_30d = 600;
-    REQUIRE(usage.replace_agent_last_used(agent_id, {ur}, "usagehash-" + agent_id));
+    REQUIRE(usage.replace_agent_last_used(agent_id, {ur}, "usagehash-" + agent_id, 2000));
 }
 
 } // namespace

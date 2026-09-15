@@ -199,6 +199,24 @@ TEST_CASE("parse: negative numeric fields clamp to 0", "[app_usage_ingest][parse
     CHECK(p.rows[0].total_seconds_30d == 0);
 }
 
+TEST_CASE("parse: a numeric field with a non-digit tail falls back to 0, not the leading-digit "
+          "prefix",
+          "[app_usage_ingest][parse]") {
+    // std::from_chars parses as much of the token as it can and does not
+    // itself reject unconsumed trailing characters — "12junk" parses to 12
+    // with an end pointer short of the token's end. parse_nonneg_i64 must
+    // check that end pointer and fall back to the documented
+    // malformed-token-to-zero behavior rather than silently accepting the
+    // prefix.
+    AppUsageParse p =
+        parse_app_usage_blob(rec({"lu", "chrome.exe", "12junk", "1700000500junk", "3x", "x4"}));
+    REQUIRE(p.rows.size() == 1);
+    CHECK(p.rows[0].first_seen == 0);
+    CHECK(p.rows[0].last_seen == 0);
+    CHECK(p.rows[0].run_count_30d == 0);
+    CHECK(p.rows[0].total_seconds_30d == 0);
+}
+
 TEST_CASE("parse: unknown record kinds are skipped without error (forward-compat)",
           "[app_usage_ingest][parse]") {
     std::string blob =

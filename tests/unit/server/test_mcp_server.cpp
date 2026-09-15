@@ -16121,7 +16121,7 @@ TEST_CASE("MCP get_agent_app_usage: success mirrors the REST twin field-for-fiel
     REQUIRE(pool.valid());
     yuzu::server::AppUsageStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1"));
+    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1", 1751600000));
 
     yuzu::server::RbacStore rbac{pool}; // shares the app-usage pool
     REQUIRE(rbac.is_open());
@@ -16179,6 +16179,46 @@ TEST_CASE("MCP get_agent_app_usage: success mirrors the REST twin field-for-fiel
     CHECK(saw_success);
 }
 
+TEST_CASE("MCP get_agent_app_usage: an empty-snapshot replace still returns the real "
+          "collected_at, never 0 (#C2)",
+          "[mcp][pg][app_usage]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_app_usage_rbac_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    yuzu::server::AppUsageStore store{pool};
+    REQUIRE(store.is_open());
+    // A real sync, then a legitimate replace-to-empty (the store's own header
+    // banner: "the retained-window projection can genuinely shrink to
+    // nothing") — collected_at must survive the empty replace intact and be
+    // sourced from usage_state, never rows->front() (there is no row).
+    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1", 1751600000));
+    REQUIRE(store.replace_agent_last_used("agent-in", {}, "rawhash-2", 1751700000));
+
+    yuzu::server::RbacStore rbac{pool};
+    REQUIRE(rbac.is_open());
+    McpTestServer ts;
+    ts.rbac_store_for_test = &rbac;
+    ts.app_usage_store_for_test = &store;
+    ts.scoped_perm_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                    const std::string&, const std::string&,
+                                    const std::string& agent_id) -> bool {
+        return agent_id == "agent-in";
+    };
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/call","id":1985,)"
+                       R"("params":{"name":"get_agent_app_usage","arguments":{"agent_id":"agent-in"}}})");
+    REQUIRE(res->status == 200);
+
+    auto envelope = nlohmann::json::parse(res->body);
+    const auto& payload = envelope.at("result").at("structuredContent");
+    CHECK(payload.at("agent_id").get<std::string>() == "agent-in");
+    // Pinned: the empty replace's OWN batch time (1751700000) — never 0, and
+    // never the earlier snapshot's 1751600000.
+    CHECK(payload.at("collected_at").get<std::int64_t>() == 1751700000);
+    REQUIRE(payload.at("apps").is_array());
+    CHECK(payload.at("apps").empty());
+}
+
 TEST_CASE("MCP get_agent_app_usage: a degraded store errors, never success+[]",
           "[mcp][pg][app_usage]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mcp_app_usage_rbac_tpl);
@@ -16230,7 +16270,7 @@ TEST_CASE("MCP get_agent_app_usage: dropped audit row fails closed — no data s
     REQUIRE(pool.valid());
     yuzu::server::AppUsageStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1"));
+    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1", 1751600000));
 
     yuzu::server::RbacStore rbac{pool};
     REQUIRE(rbac.is_open());
@@ -16270,7 +16310,7 @@ TEST_CASE("MCP get_agent_app_usage: dropped DOMAIN audit row alone still fails c
     REQUIRE(pool.valid());
     yuzu::server::AppUsageStore store{pool};
     REQUIRE(store.is_open());
-    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1"));
+    REQUIRE(store.replace_agent_last_used("agent-in", {app_usage_row()}, "rawhash-1", 1751600000));
 
     yuzu::server::RbacStore rbac{pool};
     REQUIRE(rbac.is_open());

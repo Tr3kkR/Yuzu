@@ -69,9 +69,11 @@ struct AppUsageHarness {
     bool allow_scoped_all = false;
     std::vector<std::string> scoped_agents; // in-scope agent ids
     bool degrade_agent = false;
+    bool degrade_collected_at = false;
     bool audit_should_fail = false;
 
     std::vector<AgentLastUsedRow> agent_rows;
+    std::int64_t collected_at_value = 0;
 
     std::vector<std::string> audits;     // "action|result"
     std::vector<std::string> audit_full; // "action|result|target_type|target_id"
@@ -100,13 +102,18 @@ struct AppUsageHarness {
                 return std::nullopt;
             return agent_rows;
         };
+        auto collected_at_fn = [this](const std::string&) -> std::optional<std::int64_t> {
+            if (degrade_collected_at)
+                return std::nullopt;
+            return collected_at_value;
+        };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string& tt, const std::string& tid, const std::string&) {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             return !audit_should_fail;
         };
-        routes.register_routes(sink, scoped, agents_fn, audit);
+        routes.register_routes(sink, scoped, agents_fn, collected_at_fn, audit);
     }
 
     bool audited(const std::string& tok) const {
@@ -186,6 +193,20 @@ TEST_CASE("app-usage: provider nullopt -> 503 A4 envelope, never a silent empty 
     CHECK(h.audited("app_usage.agent.view|failure"));
 }
 
+TEST_CASE("app-usage: collected_at provider nullopt -> 503 A4 envelope",
+          "[app_usage_routes]") {
+    AppUsageHarness h;
+    h.allow_scoped_all = true;
+    h.agent_rows = {row("chrome.exe")}; // rows read succeeds; collected_at read degrades
+    h.degrade_collected_at = true;
+    auto res = h.sink.Get(kPath);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = json::parse(res->body);
+    CHECK(j["error"]["code"] == 503);
+    CHECK(h.audited("app_usage.agent.view|failure"));
+}
+
 // ───────────────────────── empty result -> 200 with apps: [] ────────────────
 
 TEST_CASE("app-usage: empty result -> 200 with data.apps as an empty array", "[app_usage_routes]") {
@@ -199,6 +220,25 @@ TEST_CASE("app-usage: empty result -> 200 with data.apps as an empty array", "[a
     CHECK(j["agent_id"] == "agent-1");
     CHECK(j["apps"].is_array());
     CHECK(j["apps"].empty());
+}
+
+TEST_CASE("app-usage: an empty-snapshot result still carries the real collected_at, "
+          "never 0 (#C2)",
+          "[app_usage_routes]") {
+    AppUsageHarness h;
+    h.allow_scoped_all = true;
+    // A legitimate replace-to-empty snapshot (the store's own header banner:
+    // "the retained-window projection can genuinely shrink to nothing") — the
+    // provider closure mirrors AppUsageStore::collected_at, sourced from
+    // usage_state, NOT rows->front() (there is no row to source it from).
+    h.agent_rows = {};
+    h.collected_at_value = 1751700000;
+    auto res = h.sink.Get(kPath);
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto j = json::parse(res->body)["data"];
+    CHECK(j["apps"].empty());
+    CHECK(j["collected_at"] == 1751700000);
 }
 
 // ───────────────────────── success response shape ───────────────────────────
@@ -316,10 +356,12 @@ struct ProductionFixture {
             [](const std::string&) -> std::optional<std::vector<AgentLastUsedRow>> {
             return std::vector<AgentLastUsedRow>{};
         };
+        AppUsageRoutes::CollectedAtFn collected_at_fn =
+            [](const std::string&) -> std::optional<std::int64_t> { return 0; };
         // Audit-off (empty AuditFn): this fixture exercises the AUTHZ
         // composition, not the audit tier — SleRoutes'/FloorFixture's
         // precedent of keeping unrelated dimensions out of scope.
-        routes.register_routes(sink, scoped, agents_fn, /*audit_fn=*/{});
+        routes.register_routes(sink, scoped, agents_fn, collected_at_fn, /*audit_fn=*/{});
     }
 
     httplib::Request session_request(const std::string& username, auth::Role role) {
