@@ -167,6 +167,13 @@ def run():
            "floor_cites_closed_source recognizes a real citation")
     expect(M.floor_cites_closed_source("just because") is False,
            "floor_cites_closed_source rejects a bare excuse string")
+    # round-4 review blocker: a parsed-but-offset-less recorded_at must be
+    # treated as AMBIGUOUS, not silently coerced to UTC (one parseability
+    # tier away from the wholly-invalid-string case round 2 already fixed).
+    expect(M._instant("2026-09-15") is None, "_instant rejects a bare date (no time, no offset)")
+    expect(M._instant("2026-09-15T08:00:00") is None, "_instant rejects a naive datetime (no offset)")
+    expect(M._instant("2026-09-15T08:00:00Z") is not None, "_instant still accepts a Z-suffixed instant")
+    expect(M._instant("2026-09-15T08:00:00+05:00") is not None, "_instant still accepts an explicit offset")
 
     with tempfile.TemporaryDirectory() as d:
         # -------- (2a) field-wise merge: a CONFORMING sparse supersession is clean --------
@@ -315,6 +322,22 @@ def run():
         expect(any(f.rule == "bad-recorded-at" for f in ef),
                f"malformed-timestamp escalation is NOT reported clean (got {_rules(ef)})")
 
+        # round-4 review blocker: an AMBIGUOUS timestamp (parses, but no
+        # timezone offset) on a genuine escalation is just as dangerous as a
+        # wholly-invalid one - reproduced for both the bare-date and the
+        # naive-datetime forms.
+        for ambiguous_ra, label in (("2026-09-15", "bare date"), ("2026-09-15T08:00:00", "naive datetime")):
+            esc2 = _write(d, f"9-ambig-{label.replace(' ', '')}.X", [
+                _full(finding_id="e1", recorded_at="2026-09-15T10:00:00Z",
+                      severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"]),
+                _full(finding_id="e1", recorded_at=ambiguous_ra,
+                      severity_native="HIGH", severity_mapped="BLOCKING", impact=["I1"], exposure=["E3"]),
+            ])
+            ef2 = M.check_fragment(esc2)
+            expect(any(f.rule == "bad-recorded-at" for f in ef2),
+                   f"ambiguous recorded_at ({label}) on an escalation is NOT reported clean "
+                   f"(got {_rules(ef2)})")
+
         # reviewed_at_sha is NOT immutable: correcting it across a supersession
         # (e.g. an early pre-rebase SHA that no longer resolves) is legitimate.
         clean_of("9-sha.X", [
@@ -401,6 +424,80 @@ def run():
               "bad-pass-ordinal", "explicit null pass_ordinal fires (not silently 'absent')")
         clean_of("9-irnull.X", [_full(finding_id="j", independent_reporters=None)],
                  "bad-independent-reporters", "explicit null independent_reporters is NOT flagged (legit 'uncounted')")
+
+        # round-4 review should-fix: generalize the pass_ordinal/run_id
+        # per-row-VALUE pattern to the rest of the eight mandatory fields - a
+        # bad value on an EARLY row that a later valid row "corrects" must
+        # still fire, since the merge would otherwise erase all trace of it.
+        fires("9-svearly.X", [
+            _full(finding_id="e", recorded_at="2026-09-15T10:00:00Z", schema_version="one"),
+            _full(finding_id="e", recorded_at="2026-09-15T11:00:00Z", schema_version=1, disposition="fixed")],
+            "bad-schema-version", "a bad schema_version on an EARLY row still fires even though a later row corrects it")
+        fires("9-shaempty.X", [_full(finding_id="j", reviewed_at_sha="")],
+              "bad-reviewed-at-sha", "empty-string reviewed_at_sha fires")
+        fires("9-shanull.X", [_full(finding_id="j", reviewed_at_sha=None)],
+              "bad-reviewed-at-sha", "null reviewed_at_sha fires")
+        # Sol's round-4 review caught that a bare truthiness/None check on
+        # these two fields lets wrong-typed and whitespace-only values slip
+        # through (7 and "   " are both truthy; [] is falsy but not a SHA).
+        fires("9-shawrongtype.X", [_full(finding_id="j", reviewed_at_sha=7)],
+              "bad-reviewed-at-sha", "a non-string reviewed_at_sha (e.g. int) fires")
+        fires("9-shawhitespace.X", [_full(finding_id="j", reviewed_at_sha="   ")],
+              "bad-reviewed-at-sha", "a whitespace-only reviewed_at_sha fires")
+        # recorded_by is the ONE conditional case: nullable on the row that
+        # FIRST raises the finding, required (non-null, non-empty-string) on
+        # any supersession.
+        clean_of("9-rbfirstnull.X", [_full(finding_id="j", recorded_by=None)],
+                 "bad-recorded-by", "null recorded_by on the FIRST (raising) row is legitimate")
+        fires("9-rblatenull.X", [
+            _full(finding_id="j", recorded_at="2026-09-15T10:00:00Z"),
+            _full(finding_id="j", recorded_at="2026-09-15T11:00:00Z", recorded_by=None, disposition="fixed")],
+            "bad-recorded-by", "null recorded_by on a SUPERSESSION fires (someone must be named as recorder)")
+        fires("9-rbwrongtype.X", [
+            _full(finding_id="j", recorded_at="2026-09-15T10:00:00Z"),
+            _full(finding_id="j", recorded_at="2026-09-15T11:00:00Z", recorded_by=7, disposition="fixed")],
+            "bad-recorded-by", "a non-string recorded_by (e.g. int) on a supersession fires")
+        fires("9-rbempty.X", [
+            _full(finding_id="j", recorded_at="2026-09-15T10:00:00Z"),
+            _full(finding_id="j", recorded_at="2026-09-15T11:00:00Z", recorded_by="", disposition="fixed")],
+            "bad-recorded-by", "an empty-string recorded_by on a supersession fires")
+        # Fable's round-4 misattribution note: row_pos depends on sort order,
+        # which a prior bad-recorded-at row already makes indeterminate - the
+        # genuine raising row (legitimately null recorded_by) can get displaced
+        # to row_pos!=0 and misfire bad-recorded-by. The fragment is already
+        # non-clean via bad-recorded-at either way, but the message must own
+        # the ambiguity rather than assert a wrong attribution as fact.
+        misattr = M.check_fragment(_write(d, "9-rbmisattr.X", [
+            _full(finding_id="m", recorded_at="NOT-A-TIMESTAMP"),
+            _full(finding_id="m", recorded_at="2026-09-15T10:00:00Z", recorded_by=None)]))
+        rb_msgs = [f.msg for f in misattr if f.rule == "bad-recorded-by"]
+        expect(len(rb_msgs) == 1 and "indeterminate" in rb_msgs[0] and "misattributing" in rb_msgs[0],
+               f"a bad-recorded-by fired alongside bad-recorded-at discloses the row-order ambiguity "
+               f"rather than silently asserting a possibly-wrong attribution (got {rb_msgs})")
+        fires("9-dispearly.X", [
+            _full(finding_id="e2", recorded_at="2026-09-15T10:00:00Z", disposition=7),
+            _full(finding_id="e2", recorded_at="2026-09-15T11:00:00Z", disposition="fixed")],
+            "bad-disposition", "a non-string disposition on an EARLY row still fires per row")
+        # positive control: a LEGITIMATE corrective supersession of an earlier
+        # omission of epistemic_status/provenance/classification must stay
+        # clean - the required-presence check resolves via the MERGE (like
+        # every other content field), not strictly the raising row.
+        missing_then_fixed = _full(finding_id="corr", recorded_at="2026-09-15T10:00:00Z")
+        missing_then_fixed.pop("epistemic_status")
+        epicorrected = M.check_fragment(_write(d, "9-epicorrected.X", [
+            missing_then_fixed,
+            _sparse(finding_id="corr", recorded_at="2026-09-15T11:00:00Z", epistemic_status="likely")]))
+        expect(epicorrected == [],
+               f"a later CONFORMING sparse row legitimately supplying an earlier-omitted "
+               f"epistemic_status is fully clean, not merely missing-field-free (got {_rules(epicorrected)})")
+
+        # bad-finding-id: previously zero self-test coverage (mutation-tested
+        # by both round-4 reviewers - deleting the rule left the suite green).
+        p_badfid = Path(d) / "9-badfid.X.jsonl"
+        p_badfid.write_text(json.dumps({**_full(), "finding_id": None, "run_id": "9-badfid.X"}) + "\n",
+                            encoding="utf-8")
+        expect(any(f.rule == "bad-finding-id" for f in M.check_fragment(str(p_badfid))),
+               "a row with a null/non-string finding_id fires bad-finding-id")
 
         # -------- (5) round-3 review: the two-discriminator legacy heuristic --------
         # A row is genuinely legacy ONLY if it carries NONE of the fields

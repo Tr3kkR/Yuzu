@@ -1861,10 +1861,15 @@ to close rather than a contradiction to adjudicate.
 
    It builds each finding's live view as the FIELD-WISE MERGE defined above (not
    the last row alone), ordered by `recorded_at` as a true instant — a
-   `recorded_at` that is PRESENT but does not parse is reported (`bad-recorded-at`)
-   rather than silently sorted as legacy, because a malformed timestamp on a
-   genuine severity ESCALATION can otherwise vanish from the merge with nothing
-   else able to surface it. On top of the merge it separately checks, PER ROW,
+   `recorded_at` that is PRESENT but does not resolve to an UNAMBIGUOUS instant
+   is reported (`bad-recorded-at`) rather than silently sorted as legacy. This
+   covers TWO tiers, not just wholly-invalid strings: a value that fails to
+   parse at all, AND a value that parses but carries no timezone offset (a
+   bare date, or a naive datetime) — the latter is NOT silently assumed to be
+   UTC, because an author hand-typing a bare date is a realistic failure mode
+   and a malformed OR ambiguous timestamp on a genuine severity ESCALATION can
+   otherwise vanish from the merge with nothing else able to surface it. On
+   top of the merge it separately checks, PER ROW,
    that a row participating in the post-#2619 regime — carrying ANY field
    #2619 introduced (`schema_version`, `source`, `reporter_ref`,
    `reviewed_at_sha`, `recorded_at`, `recorded_by`, `adjudication_rationale`,
@@ -1900,13 +1905,26 @@ to close rather than a contradiction to adjudicate.
    prefix's `#` while still tolerating a non-numeric trailing note like the
    corpus's own `#TBD (draft: ...)` shape); `epistemic_status`, `provenance`,
    `classification` (general content contracts, so NOT legacy-exempt — a
-   genuinely ancient row can still carry a value worth flagging); `schema_version`
-   and `pass_ordinal` (two of the eight per-row-mandatory fields, so an explicit
-   `null` is flagged rather than read as merely absent); `independent_reporters`
-   (excluding booleans, which pass a bare `isinstance(x, int)` test in Python,
-   but tolerating `null` — a legitimate "not yet counted" value the corpus
-   carries, unlike the two mandatory integer fields above); and the
-   `policy_floor` key's presence. It also reproduces this step's own park probe — an `I1`/`I2`/`I3` finding on
+   genuinely ancient row can still carry a value worth flagging); and
+   `independent_reporters` (excluding booleans, which pass a bare
+   `isinstance(x, int)` test in Python, but tolerating `null` — a legitimate
+   "not yet counted" value the corpus carries). All EIGHT per-row-mandatory
+   fields have their VALUE (not merely their presence) checked PER ROW, not
+   only on whatever survives into the merge — an explicit `null` or a
+   wrong-typed value on an early row is a permanently-recorded defect a later
+   valid row would otherwise silently "correct" with no trace: `schema_version`
+   and `pass_ordinal` must be non-bool integers (`pass_ordinal` also
+   non-negative); `reviewed_at_sha` must be a non-empty, non-whitespace
+   string (a bare truthiness check alone misses `7` and `"   "`); `disposition`
+   must likewise be a non-empty, non-whitespace string (its closed-enum half
+   stays the separate, legacy-gated, merged-view-only check above, since
+   `open` → `fixed` is a legitimate evolution in KIND, not a correction of a
+   bad early value); `recorded_by` is the one CONDITIONAL case — nullable only
+   on the row that first raises the finding (SKILL.md: "nullable on the row
+   that first raises a finding, required on a supersession"), so `null` is
+   flagged only on a later row, and on ANY row a non-null value must still be
+   a genuine non-empty, non-whitespace string. And the `policy_floor` key's
+   presence. It also reproduces this step's own park probe — an `I1`/`I2`/`I3` finding on
    a `roadmap-` disposition, and the scalar-`impact`/`exposure` shape the `jq`
    above catches — but does NOT replace it: the label half of the park contract
    (`roadmap` XOR priority/triage on GitHub, and a `linked-to-` target's labels)

@@ -55,9 +55,11 @@ intermediate violation a later row incidentally restores is still caught.
 across a supersession is legitimate (its field definition is "the head the
 reporter read", not a permanent record).
 
-A `recorded_at` that is PRESENT but does not parse as ISO-8601 is reported
-(`bad-recorded-at`) rather than silently treated as legacy: precedence for
-that row becomes genuinely indeterminate, and a malformed timestamp on a
+A `recorded_at` that is PRESENT but does not resolve to an UNAMBIGUOUS
+instant - unparseable, OR parseable but carrying no timezone offset (a bare
+date, a naive datetime) - is reported (`bad-recorded-at`) rather than
+silently treated as legacy or coerced to UTC: precedence for that row becomes
+genuinely indeterminate, and a malformed OR ambiguous timestamp on a
 severity ESCALATION can silently vanish from the merged view with nothing
 else in the format able to surface it - so the fragment must not read as
 clean while one exists, even though this script still sorts it legacy-first
@@ -215,9 +217,18 @@ _MIN_INSTANT = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _instant(ra):
-    """Parse an ISO-8601 recorded_at to a tz-aware instant, or None if absent
-    or unparseable. Compares actual instants, so fractional seconds and non-Z
-    offsets order correctly (a plain string sort does not)."""
+    """Parse an ISO-8601 recorded_at to a tz-aware instant, or None if absent,
+    unparseable, OR AMBIGUOUS (no timezone offset - a bare date or a naive
+    datetime). Compares actual instants, so fractional seconds and non-Z
+    offsets order correctly (a plain string sort does not).
+
+    A parsed value with no utcoffset() is deliberately treated the SAME as an
+    unparseable one, not silently coerced to UTC: recorded_at determines merge
+    PRECEDENCE, and an author hand-typing a bare date (a realistic failure
+    mode) would otherwise have that guess accepted as fact, which can discard
+    a genuine severity escalation with zero findings - one parseability tier
+    away from the wholly-invalid-string case this function already rejected.
+    """
     if not isinstance(ra, str) or not ra:
         return None
     s = ra[:-1] + "+00:00" if ra.endswith("Z") else ra
@@ -225,7 +236,9 @@ def _instant(ra):
         dt = datetime.fromisoformat(s)
     except ValueError:
         return None
-    return dt if dt.tzinfo is not None else dt.replace(tzinfo=timezone.utc)
+    if dt.utcoffset() is None:
+        return None
+    return dt
 
 
 def _order_key(item):
@@ -277,7 +290,12 @@ def check_fragment(path):
     if not rows:
         return out
 
-    expected_run = Path(path).name[:-len(".jsonl")]
+    # removesuffix strips exactly the literal ".jsonl" extension, unlike a
+    # fixed [:-len(".jsonl")] chop (which mangled a non-.jsonl path into a
+    # garbage stem) or Path.stem (which strips WHATEVER extension is present,
+    # so an extension-less or wrong-extension --files misuse still gets a
+    # silently-invented stem instead of an honest unchanged name).
+    expected_run = Path(path).name.removesuffix(".jsonl")
 
     # group rows by finding_id, preserving file order for the ordering key
     by_fid = {}
@@ -371,6 +389,65 @@ def check_fragment(path):
                 add(fid, "STRUCTURAL", "run-id-mismatch",
                     f"line {ln}: run_id {r['run_id']!r} != filename stem {expected_run!r}")
 
+            # Generalizing pass_ordinal/run_id's per-row treatment to the
+            # REST of the eight mandatory fields (round-4 review's explicit
+            # ask, after three straight rounds of fixing one field at a
+            # time): a bad VALUE on an early row - not just an absent KEY -
+            # is a permanently-recorded defect nothing else catches, since a
+            # later valid row silently "corrects" it at the merged level
+            # with no trace of the bad row ever having existed.
+            if "schema_version" in r and not _is_int(r["schema_version"]):
+                add(fid, "STRUCTURAL", "bad-schema-version",
+                    f"line {ln}: schema_version must be an integer, got {r['schema_version']!r}")
+            # A falsy/None check alone isn't enough here: 7, [], and "   " are
+            # all truthy-or-empty-shaped in ways a bare `not x` check misses
+            # or wrongly accepts - both fields need a genuine non-empty,
+            # non-whitespace STRING (Sol's round-4 review caught this gap in
+            # my own first draft of these two checks).
+            if "reviewed_at_sha" in r:
+                rsha = r["reviewed_at_sha"]
+                if not (isinstance(rsha, str) and rsha.strip()):
+                    add(fid, "STRUCTURAL", "bad-reviewed-at-sha",
+                        f"line {ln}: reviewed_at_sha must be a non-empty, non-whitespace string, "
+                        f"got {type(rsha).__name__} {rsha!r}")
+            # recorded_by is the one field of the eight with a CONDITIONAL
+            # value rule: "nullable on the row that first raises a finding,
+            # required on a supersession" - null is fine at row_pos==0 (the
+            # reporter and recorder are the same person) but not on any later
+            # row (a supersession must name who wrote it). Any NON-null value,
+            # at any row position, must still be a genuine non-empty string -
+            # 7/[]/"" are never a legitimate recorder identity.
+            if "recorded_by" in r:
+                rby = r["recorded_by"]
+                if rby is None:
+                    if row_pos != 0:
+                        # row_pos itself depends on sort order, which a prior
+                        # bad-recorded-at row already made indeterminate - the
+                        # row this fires on may not genuinely be "not the
+                        # raising row" (Fable's round-4 review: misattribution,
+                        # not an escalation loss, since the fragment already
+                        # fails via bad-recorded-at either way).
+                        qualifier = ("" if not seen_bad_recorded_at else
+                                     " (NOTE: this finding also has a bad-recorded-at row, so which "
+                                     "row genuinely raised the finding is indeterminate - this may be "
+                                     "misattributing the raising row)")
+                        add(fid, "STRUCTURAL", "bad-recorded-by",
+                            f"line {ln}: recorded_by is nullable only on the row that first raises "
+                            f"the finding; a supersession must name who wrote it{qualifier}")
+                elif not (isinstance(rby, str) and rby.strip()):
+                    add(fid, "STRUCTURAL", "bad-recorded-by",
+                        f"line {ln}: recorded_by must be a non-empty, non-whitespace string (or null, "
+                        f"only on the raising row), got {type(rby).__name__} {rby!r}")
+            # disposition's BEDROCK shape (non-empty string) is checked per row
+            # here; its CLOSED-ENUM half stays a merged-view-only check below,
+            # since the enum applies to the FINAL state a finding is allowed
+            # to evolve through (open -> fixed is a legitimate per-row change
+            # in kind, not merely a correction of a bad early value).
+            if "disposition" in r and not (isinstance(r["disposition"], str) and r["disposition"].strip()):
+                add(fid, "STRUCTURAL", "bad-disposition",
+                    f"line {ln}: disposition must be a non-empty string, got "
+                    f"{type(r['disposition']).__name__} {r['disposition']!r}")
+
             # a row that participates in the post-#2619 append model (carries
             # ANY field #2619 introduced - a genuinely legacy row carries NONE
             # of them, per SKILL.md's own definition) must restate the eight
@@ -383,7 +460,8 @@ def check_fragment(path):
             # lower-severity row with no other signal.
             if "recorded_at" in r and _instant(r.get("recorded_at")) is None:
                 add(fid, "STRUCTURAL", "bad-recorded-at",
-                    f"line {ln}: recorded_at {r.get('recorded_at')!r} does not parse as ISO-8601; "
+                    f"line {ln}: recorded_at {r.get('recorded_at')!r} is not an unambiguous "
+                    f"ISO-8601 instant (unparseable, or parses but carries no timezone offset); "
                     f"this row's precedence relative to its peers is indeterminate")
                 seen_bad_recorded_at = True
             if _looks_versioned(r):
@@ -467,23 +545,15 @@ def check_fragment(path):
         if ir is not None and not _is_int(ir):
             add(fid, "STRUCTURAL", "bad-independent-reporters",
                 f"independent_reporters must be an integer, got {ir!r}")
-        if not legacy:
-            # `legacy` is now "no #2619-only field ANYWHERE" (_looks_versioned),
-            # not specifically schema_version's own presence - so a finding can
-            # be non-legacy (carries e.g. recorded_by) while genuinely missing
-            # schema_version, which fires here (redundantly, but harmlessly,
-            # alongside missing-row-field on whichever row triggered non-legacy
-            # status). Any non-bool integer is accepted, not just `1`: SKILL.md
-            # states schema_version is "currently 1" but ALSO that "one fragment
-            # can legitimately hold rows written under two versions of this
-            # table" - a deliberate forward-tolerance choice, not an oversight.
-            sv = merged.get("schema_version")
-            if not _is_int(sv):
-                add(fid, "STRUCTURAL", "bad-schema-version", f"schema_version must be an integer, got {sv!r}")
-        # pass_ordinal is NOT re-checked here: the per-row loop above already
+        # schema_version/pass_ordinal/reviewed_at_sha/recorded_by/disposition's
+        # bedrock shape are NOT re-checked here: the per-row loop above already
         # validates every row's own value (including the merge's eventual
         # winner), which is the point of that fix - a second merged-only check
-        # here would only ever double-report the same row.
+        # here would only ever double-report the same row. (Any non-bool
+        # integer is accepted for schema_version, not just `1`: SKILL.md
+        # states it is "currently 1" but ALSO that "one fragment can
+        # legitimately hold rows written under two versions of this table" -
+        # a deliberate forward-tolerance choice, not an oversight.)
         # epistemic_status/provenance/classification are FINDING-CONTENT enums,
         # not append-machinery fields the #2619 schema versioning introduced -
         # their valid values are a general contract, so these checks are NOT
@@ -501,22 +571,21 @@ def check_fragment(path):
         if cls is not None and not _in(cls, CLASSIFICATIONS):
             add(fid, "STRUCTURAL", "bad-classification",
                 f"classification {cls!r} not one of {sorted(CLASSIFICATIONS)} (or null)")
-        # disposition has TWO independent checks. (1) It must always be a
-        # non-empty string - bedrock, true in every generation, NOT legacy-
-        # gated: a null/int/list/dict disposition is never valid. (2) ONLY once
-        # it IS a string is it checked against the closed enum + '#<id>' prefix
-        # forms - that convention is #2643-era, so this half stays legacy-gated.
-        # A prefix match additionally requires something after the '#' ("roadmap-#"
-        # alone, with nothing following, still fails); a non-empty but non-numeric
-        # suffix ("linked-to-#garbage") is deliberately still accepted - the real
-        # corpus carries free-text notes trailing a placeholder ("#TBD (draft: ...)"),
-        # so requiring a strictly numeric/placeholder suffix would false-positive
-        # on legitimate historical and future entries.
+        # disposition's bedrock shape (non-empty string) is checked PER ROW
+        # above, not here - a merged-only check would only double-report
+        # whichever row survives into the merge. This is the closed-enum HALF
+        # only: once the merged value IS a string, it's checked against the
+        # closed enum + '#<id>' prefix forms - that convention is #2643-era,
+        # so this half stays legacy-gated (unlike the per-row bedrock check,
+        # which applies regardless of legacy status). A prefix match
+        # additionally requires something after the '#' ("roadmap-#" alone,
+        # with nothing following, still fails); a non-empty but non-numeric
+        # suffix ("linked-to-#garbage") is deliberately still accepted - the
+        # real corpus carries free-text notes trailing a placeholder
+        # ("#TBD (draft: ...)"), so requiring a strictly numeric/placeholder
+        # suffix would false-positive on legitimate historical and future entries.
         disp_val = merged.get("disposition")
-        if "disposition" in merged and not (isinstance(disp_val, str) and disp_val.strip()):
-            add(fid, "STRUCTURAL", "bad-disposition",
-                f"disposition must be a non-empty string, got {type(disp_val).__name__} {disp_val!r}")
-        elif not legacy and isinstance(disp_val, str) and disp_val not in DISPOSITIONS_CLOSED:
+        if not legacy and isinstance(disp_val, str) and disp_val not in DISPOSITIONS_CLOSED:
             prefix_match = next((p for p in DISPOSITION_PREFIXES if disp_val.startswith(p)), None)
             if prefix_match is None or len(disp_val) == len(prefix_match):
                 add(fid, "STRUCTURAL", "bad-disposition",
