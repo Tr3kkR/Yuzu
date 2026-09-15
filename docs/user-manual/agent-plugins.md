@@ -460,6 +460,29 @@ Plugins for antivirus, firewall, disk encryption, event logs, vulnerability scan
 > content-distribution plane. Treat `scan`/`cve_scan` results as increasingly
 > stale until then.
 
+### ssh_hardening
+
+| | |
+|---|---|
+| **Version** | v1.0.0 |
+| **Platforms** | L |
+| **Description** | Audits `/etc/ssh/sshd_config` against the Mozilla "Modern" OpenSSH baseline (<https://wiki.mozilla.org/Security/Guidelines/OpenSSH>). |
+
+| Action | Description |
+|---|---|
+| `audit` | Checks that `KexAlgorithms`, `Ciphers`, and `MACs` are restricted to the approved algorithm list, and that every `HostKey` directive references an approved key type (`ed25519`, `rsa`, `ecdsa`). Returns one finding per directive, `severity\|category\|title\|detail`. |
+
+> **Note (Linux-only):** `sshd_config` and its `Include`d drop-ins
+> (`/etc/ssh/sshd_config.d/*.conf` by default) are read and flattened using
+> sshd's own semantics — first-obtained-value-wins for `KexAlgorithms`/
+> `Ciphers`/`MACs`, cumulative for repeated `HostKey` lines, and everything
+> after a top-level `Match` block is out of scope (not evaluated). A
+> directive using a `+`/`-`/`^` modifier is flagged `MEDIUM` rather than
+> evaluated, since the resulting effective list depends on OpenSSH's
+> compiled-in defaults and cannot be resolved from the config file alone —
+> verify those manually (`sshd -T`). Audit-only: this plugin never modifies
+> `sshd_config`.
+
 ### certificates
 
 | | |

@@ -1,0 +1,79 @@
+## SSH Server Hardening Definitions
+## Audits /etc/ssh/sshd_config against the Mozilla "Modern" OpenSSH baseline
+## (https://wiki.mozilla.org/Security/Guidelines/OpenSSH): KexAlgorithms,
+## Ciphers, MACs, and HostKey are checked against an approved allow-list.
+## Audit-only -- never modifies sshd_config. Linux-only.
+## Plugin: ssh_hardening | Actions: audit
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.ssh_hardening.audit
+  displayName: SSH Server Hardening Audit
+  version: 1.0.0
+  description: >
+    Audits /etc/ssh/sshd_config (and any files it Includes) against the
+    Mozilla "Modern" OpenSSH baseline. Checks that KexAlgorithms, Ciphers,
+    and MACs are restricted to the approved algorithm list, and that every
+    HostKey directive references an approved key type (ed25519, rsa, ecdsa).
+    A directive that is not explicitly set, uses a +/-/^ modifier the audit
+    cannot resolve, or permits an algorithm outside the baseline is reported
+    as a finding. Audit-only -- never modifies sshd_config. Linux-only.
+  tags: [security, ssh, sshd, compliance, hardening, mozilla]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: ssh_hardening
+    action: audit
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: category
+        type: string
+      - name: title
+        type: string
+      - name: detail
+        type: string
+    aggregation:
+      groupBy: [severity, title]
+      operations: [count]
+
+  visualization:
+    # ssh_hardening emits one row per directive check on `audit`, format
+    # `severity|category|title|detail`. labelField=0 picks severity so
+    # HIGH/MEDIUM/INFO each become a pie slice.
+    type: pie
+    processor: single_series
+    title: SSH hardening findings by severity
+    labelField: 0
+    valueLabel: Findings
+
+  readablePayload: "Audit SSH server hardening (sshd_config vs. Mozilla Modern baseline)"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [ssh_hardening]
+
+status:
+  phase: active

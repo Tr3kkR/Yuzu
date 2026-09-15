@@ -1664,6 +1664,7 @@ This section enumerates the stable builtin primitives that content authors targe
 | `security.disk_encryption.status` | `bitlocker` | Y | - | - | Verified |
 | `security.disk_encryption.status` | LUKS/FileVault adapter | - | Y | Y | Proposed |
 | `security.vulnerability.scan` | `vuln_scan` | Y | Y | Y | Verified |
+| `security.ssh_hardening.audit` | `ssh_hardening` | - | Y | - | Verified |
 | `security.event_log.query` | `event_logs` | Y | Y | Y | Verified |
 | `security.ioc.check` | `ioc` | Y | Y | Y | Planned |
 | `security.certificate.inventory` | `certificates` | Y | Y | Y | Planned |
