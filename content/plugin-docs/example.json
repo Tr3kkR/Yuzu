@@ -259,7 +259,8 @@
       "server/core/src/capability_decls/plugin_action_catalogue_b.hpp"
     ],
     "changelog": [
-      "changelog.d/1986-getting-started-import-examples.fixed.md"
+      "changelog.d/1986-getting-started-import-examples.fixed.md",
+      "changelog.d/20260915-build-examples-gating.fixed.md"
     ],
     "definitions": [],
     "plugin": [
