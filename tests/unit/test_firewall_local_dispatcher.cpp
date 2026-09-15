@@ -127,6 +127,25 @@ TEST_CASE("firewall macOS 'state' acquires through the real bounded-subprocess c
     // intentional, not the same gap as the state check above.
     CHECK(result.captured.find("pf|") != std::string::npos);
     CHECK(result.captured.find("error|") == std::string::npos);
+
+    // ruleset| and anchor| wiring (do_state_macos) had no assertion at all
+    // (code-review r1, FV-codex-01/F1) -- same shape-not-value discipline as
+    // "rules" below: ruleset| must always appear as unknown-or-integer (pf
+    // needs root, so unknown is the correct unprivileged value); an anchor|
+    // row, if pf happened to be readable, must have a non-empty name after
+    // the prefix. This pins the gate wiring, not a specific privilege level.
+    const auto state_lines = split_lines(result.captured);
+    bool saw_state_ruleset_row = false;
+    for (const auto& line : state_lines) {
+        if (line.rfind("ruleset|", 0) == 0) {
+            saw_state_ruleset_row = true;
+            const std::string value = line.substr(std::string_view("ruleset|").size());
+            CHECK((value == "unknown" || is_non_negative_integer(value)));
+        } else if (line.rfind("anchor|", 0) == 0) {
+            CHECK(line.size() > std::string_view("anchor|").size());
+        }
+    }
+    CHECK(saw_state_ruleset_row);
 }
 
 TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess call site",
@@ -171,6 +190,17 @@ TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess c
         REQUIRE(last_sep != std::string::npos);
         const std::string decision = line.substr(last_sep + 1);
         CHECK((decision == "allow" || decision == "block" || decision == "unknown"));
+    }
+
+    // anchor| rows (do_rules_macos) had no assertion at all (code-review r1,
+    // FV-codex-01/F1) -- same host-state-dependent shape check as app|
+    // above: whether any anchor rows appear depends on real pf anchors and
+    // privilege, neither of which this test controls, but every row that
+    // DOES appear must have a non-empty name after the prefix.
+    for (const auto& line : lines) {
+        if (line.rfind("anchor|", 0) != 0)
+            continue;
+        CHECK(line.size() > std::string_view("anchor|").size());
     }
 
     // ruleset| must always appear, and be either a non-negative integer (a

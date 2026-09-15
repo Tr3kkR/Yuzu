@@ -167,6 +167,29 @@ TEST_CASE("alf listapps: empty input (unprivileged refusal) yields empty", "[fir
     CHECK(parse_alf_listapps("").empty());
 }
 
+// The two "no following parenthetical" fallback branches the header
+// comment documents -- an index line immediately followed by another
+// index line, and a dangling pending row at end of input -- were
+// previously unexercised by any fixture (code-review r1, FV-claude-fallback-04).
+TEST_CASE("alf listapps: index line immediately followed by another index line is unknown",
+          "[firewall]") {
+    auto rows = parse_alf_listapps("1 : /a \n"
+                                    "2 : /b \n"
+                                    "             (Allow incoming connections)\n");
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].path == "/a");
+    CHECK(rows[0].decision == AlfDecision::unknown);
+    CHECK(rows[1].path == "/b");
+    CHECK(rows[1].decision == AlfDecision::allow);
+}
+
+TEST_CASE("alf listapps: dangling pending row at end of input is unknown", "[firewall]") {
+    auto rows = parse_alf_listapps("1 : /a \n");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].path == "/a");
+    CHECK(rows[0].decision == AlfDecision::unknown);
+}
+
 // Real capture: `pfctl -s Anchors` and `pfctl -s rules`, run as root
 // (~/pf-capture.txt, 2026-09-14) — only the anchor-name / rule lines
 // themselves, verbatim.
