@@ -18,7 +18,7 @@
 /// itself is actually exercised by a test (`test_compliance_model.cpp`).
 
 #include "authz_model.hpp"
-#include "policy_store.hpp"
+#include "compliance_types.hpp"
 
 #include <nlohmann/json.hpp>
 
