@@ -7,7 +7,7 @@
  * agents/shared/win_profiles.hpp's with_user_hive() enables
  * SeBackupPrivilege/SeRestorePrivilege on the PROCESS token before an offline
  * RegLoadKeyW mount and restores the token's prior attributes on the way out.
- * Four plugins load this ladder into the SAME agent process --
+ * Five plugins load this ladder into the SAME agent process -- autoruns,
  * registry, installed_apps, license_scan, tar -- and tar's collectors run on
  * a background thread, so two overlapping offline-mount attempts race the
  * shared process token: A enables it, B enables it (recording A's now-enabled
@@ -15,10 +15,10 @@
  * "previous" -- silently disabling it out from under B, mid-mount.
  *
  * A std::mutex defined as a plain `inline`/header-local static in
- * win_profiles.hpp does NOT solve this: each of the four plugin .dll/.so
- * files is a SEPARATE dynamically loaded module, and a function-local static
- * in a header is instantiated once PER TRANSLATION UNIT THAT LINKS IT IN --
- * in practice, once per plugin binary. Four plugins therefore got four
+ * win_profiles.hpp does NOT solve this: each plugin .dll/.so file is a
+ * SEPARATE dynamically loaded module, and a function-local static in a
+ * header is instantiated once PER TRANSLATION UNIT THAT LINKS IT IN -- in
+ * practice, once per plugin binary. Five plugins therefore got five
  * independent mutexes, not one process-wide lock (confirmed: each plugin DLL
  * exports exactly its one required `yuzu_plugin_descriptor` symbol and
  * nothing else -- the mutex was never shared).

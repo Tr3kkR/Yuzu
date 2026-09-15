@@ -23,6 +23,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <mutex>
 #include <thread>
 
@@ -33,13 +34,26 @@ TEST_CASE("ScopedOfflineHiveLock acquires on construction and releases on destru
     {
         const ScopedOfflineHiveLock guard("test_offline_hive_mutex");
         // Held for the guard's whole scope: a second, non-blocking attempt from another
-        // thread must fail while `guard` is alive.
-        std::thread contender([] { CHECK_FALSE(offline_hive_mutex().try_lock()); });
+        // thread must fail while `guard` is alive. The probe is a std::unique_lock with
+        // std::try_to_lock (never a bare try_lock()/unlock() pair -- docs/cpp-conventions.md's
+        // Concurrency section, and see tests/unit/fake_journal_store.hpp for the same
+        // try_to_lock-by-RAII shape) so an unexpected successful acquisition -- were this test
+        // ever to catch a real regression -- still releases via RAII instead of leaking the
+        // process-wide mutex out of this test's own failure path. The result is published to
+        // an atomic and asserted on the main thread after join(): Catch2 assertion macros are
+        // not thread-safe (tests/unit/test_kv_store.cpp / test_updater_signature.cpp use the
+        // same publish-then-assert-after-join pattern for a worker-thread probe).
+        std::atomic<bool> contender_acquired{false};
+        std::thread contender([&] {
+            std::unique_lock<std::mutex> probe(offline_hive_mutex(), std::try_to_lock);
+            contender_acquired = probe.owns_lock();
+        });
         contender.join();
+        CHECK_FALSE(contender_acquired.load());
     }
     // Released on scope exit: the mutex must be free again.
-    REQUIRE(offline_hive_mutex().try_lock());
-    offline_hive_mutex().unlock();
+    std::unique_lock<std::mutex> probe(offline_hive_mutex(), std::try_to_lock);
+    REQUIRE(probe.owns_lock());
 }
 
 TEST_CASE("ScopedOfflineHiveLock serialises two overlapping guards", "[agent][offline_hive_mutex]") {

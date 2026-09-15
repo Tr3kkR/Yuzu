@@ -416,9 +416,9 @@ struct HiveAccessReport {
 /// Serialises the OFFLINE arm of with_user_hive across the whole process.
 ///
 /// PrivilegeScope adjusts the PROCESS token, not a thread token. Once more
-/// than one plugin in the agent uses this ladder -- registry, installed_apps,
-/// license_scan and tar all load into one process, and tar's collectors run
-/// on background threads -- two overlapping scopes race:
+/// than one plugin in the agent uses this ladder -- autoruns, registry,
+/// installed_apps, license_scan and tar all load into one process, and
+/// tar's collectors run on background threads -- two overlapping scopes race:
 ///
 ///   A.ctor(prev=disabled) -> B.ctor(prev=enabled) -> A.dtor(restores
 ///   disabled) -> B's RegLoadKeyW fails
@@ -435,7 +435,7 @@ struct HiveAccessReport {
 /// agents/core/include/yuzu/agent/offline_hive_mutex.hpp, NOT a header-local
 /// static (code-review CFX-1). Each plugin is a SEPARATE .dll/.so; a
 /// function-local static `inline` mutex defined here would be instantiated
-/// once per plugin binary -- four independent mutexes, not one process-wide
+/// once per plugin binary -- five independent mutexes, not one process-wide
 /// lock, confirmed by inspecting each built plugin's export table (each
 /// exports only its required `yuzu_plugin_descriptor` symbol). Defining it in
 /// agents/core -- the one shared library every plugin links against -- and
