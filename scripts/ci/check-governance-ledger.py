@@ -173,6 +173,13 @@ def _is_int(v):
 
 _FID_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+/,-]*")
 
+# Named (not inline) so the self-test can pin the exact pattern - round-6
+# shipped this as an inline `re.search(...)` call, which meant only specific
+# behavioral instances were tested and a future one-character widening of the
+# charset could reintroduce the blank-suffix defect while every existing
+# assertion kept passing.
+_DISPOSITION_SUFFIX_CONTENT_RE = re.compile(r"[A-Za-z0-9?]")
+
 
 def _has_visible_id(v):
     """A genuine identifier string: an ANCHORED, whole-string match against a
@@ -250,31 +257,77 @@ class Finding:
 _MIN_INSTANT = datetime.min.replace(tzinfo=timezone.utc)
 
 
+# recorded_at determines MERGE PRECEDENCE, so - exactly like finding_id, the
+# merge JOIN KEY - it needs an anchored, whole-string grammar rather than a
+# delegate-to-fromisoformat-and-hope approach: Python's fromisoformat (3.11+)
+# is far more lenient than RFC 3339 in ways that matter for an order-critical
+# field. Verified directly (all three accepted despite being invalid or
+# self-contradictory under any RFC 3339 reading):
+#   fromisoformat("2026-09-15T10:00:00z+14:00")  -> 2026-09-15 10:00:00+14:00
+#     (a lowercase-z UTC marker AND an explicit numeric offset - the 'z' is
+#     silently ignored and the offset wins, even though the two disagree)
+#   fromisoformat("2026-09-15T10:00:00x+14:00")  -> the same result, with a
+#     literal garbage character in place of the zone marker
+#   fromisoformat("2026-09-15X10:00:00+00:00")   -> accepted with ANY single
+#     character as the date/time separator, not just 'T'
+# A self-contradictory or malformed-but-accepted string like the first two
+# still parses to a DEFINITE instant, so it silently participates in merge
+# ordering rather than being caught as unparseable - this can shift a row's
+# effective UTC instant by hours and invert which of two rows is treated as
+# the later, superseding one. The anchored grammar below is the closed set of
+# shapes the real corpus actually uses (a mandatory 'T'/'t' separator, then
+# EXACTLY ONE terminal zone designator: 'Z', 'z', or a colon-separated
+# numeric offset - never a mix of the two, never an extra character):
+#   verified: 0 of the real corpus's non-null recorded_at values fail this
+#   grammar (7 distinct shapes seen, all covered)
+#
+# `[0-9]` deliberately, NOT `\d`: in a `str` pattern `\d` matches every
+# Unicode Nd-category digit (e.g. Arabic-Indic, fullwidth), not just ASCII -
+# `_FID_TOKEN` above spells its classes out for exactly this reason and this
+# grammar must too, or a non-ASCII-digit date/time silently fullmatches here
+# and only gets caught two lines later by fromisoformat raising.
+_INSTANT_RE = re.compile(
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(\.[0-9]+)?(Z|z|[+-][0-9]{2}:[0-9]{2})$")
+
+
 def _instant(ra):
     """Parse an ISO-8601 recorded_at to a tz-aware instant, or None if absent,
-    unparseable, OR AMBIGUOUS (no timezone offset - a bare date or a naive
-    datetime). Compares actual instants, so fractional seconds and non-Z
-    offsets order correctly (a plain string sort does not).
+    unparseable, AMBIGUOUS (no timezone offset - a bare date or a naive
+    datetime), or malformed under the anchored grammar above (an extra/
+    self-contradictory zone marker, a non-'T'/'t' separator, a non-colon
+    offset, an out-of-range field). Compares actual instants, so fractional
+    seconds and non-Z offsets order correctly (a plain string sort does not).
 
-    A parsed value with no utcoffset() is deliberately treated the SAME as an
-    unparseable one, not silently coerced to UTC: recorded_at determines merge
-    PRECEDENCE, and an author hand-typing a bare date (a realistic failure
-    mode) would otherwise have that guess accepted as fact, which can discard
-    a genuine severity escalation with zero findings - one parseability tier
-    away from the wholly-invalid-string case this function already rejected.
+    The grammar validates SHAPE ONLY (digit count and position), never RANGE:
+    "2026-13-01T00:00:00Z" (month 13), "2026-02-30T00:00:00Z" (day 30 in
+    February), "2026-09-15T23:60:00Z" (minute 60), and
+    "2026-09-15T10:00:00+24:00" (an out-of-range offset) all fullmatch this
+    regex and only fail at fromisoformat, which RAISES rather than returning
+    a bad value. round-7 review (Fable + Sol, independently converged) caught
+    that an earlier version of this function let that exception escape
+    uncaught: a single out-of-range recorded_at - the single most realistic
+    hand-typing mistake in this field, more likely than any invisible-
+    character shape this whole review cycle has chased - would crash the
+    entire check_fragment() call (raised again for the whole --all corpus, an
+    exit-0 contract), silencing every OTHER finding in the run rather than
+    reporting this one row as bad-recorded-at. A malformed value here means
+    "unparseable", exactly like the absent/wrong-type/no-offset cases above -
+    never an uncaught exception.
     """
     if not isinstance(ra, str) or not ra:
         return None
+    if _INSTANT_RE.fullmatch(ra) is None:
+        return None
     # RFC 3339 section 5.6 permits a lowercase 'z' spelling too; Python's
     # fromisoformat only recognizes uppercase 'Z' natively and raises on 'z'.
+    # Safe to rewrite unconditionally here: the grammar above already proved
+    # 'Z'/'z' is the sole terminal zone token when it appears at all.
     s = ra[:-1] + "+00:00" if ra.endswith(("Z", "z")) else ra
     try:
-        dt = datetime.fromisoformat(s)
+        return datetime.fromisoformat(s)
     except ValueError:
         return None
-    if dt.utcoffset() is None:
-        return None
-    return dt
 
 
 def _order_key(item):
@@ -563,7 +616,7 @@ def check_fragment(path):
                     # placeholder appears in the suffix - existential, not
                     # anchored. Verified: 0 of the corpus's real suffix shapes
                     # fail this; only genuinely blank/invisible suffixes do.
-                    if prefix_match is None or not re.search(r"[A-Za-z0-9?]", dv[len(prefix_match):]):
+                    if prefix_match is None or not _DISPOSITION_SUFFIX_CONTENT_RE.search(dv[len(prefix_match):]):
                         add(fid, "STRUCTURAL", "bad-disposition",
                             f"line {ln}: disposition {dv!r} is not in the closed enum "
                             f"{sorted(DISPOSITIONS_CLOSED)} or a valid non-empty '#<id>' prefix "

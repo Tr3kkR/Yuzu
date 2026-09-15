@@ -175,6 +175,73 @@ def run():
     expect(M._instant("2026-09-15T08:00:00Z") is not None, "_instant still accepts a Z-suffixed instant")
     expect(M._instant("2026-09-15T08:00:00+05:00") is not None, "_instant still accepts an explicit offset")
 
+    # round-7 review blocker (C2): Python's fromisoformat (3.11+) is far more
+    # lenient than RFC 3339 - it accepts a lowercase-z UTC marker FOLLOWED BY
+    # an explicit numeric offset (the two disagree and the offset silently
+    # wins), a literal garbage character in the same position, and even an
+    # arbitrary single character as the date/time separator. Each of these
+    # still parses to a DEFINITE instant, so - unlike the wholly-unparseable
+    # or offset-less cases above - it would silently participate in merge
+    # ordering rather than being caught, which can invert which of two rows
+    # supersedes the other. Pin the grammar's exact pattern (round-6's own
+    # "should fix": a behavioral-instance-only self-test can't catch a future
+    # one-character regex widening) and its rejections:
+    expect(M._INSTANT_RE.pattern ==
+           r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+           r"(\.[0-9]+)?(Z|z|[+-][0-9]{2}:[0-9]{2})$",
+           "pin _INSTANT_RE grammar")
+
+    # round-7 review "should fix" (C1/K1): the round-6 finding_id grammar and
+    # the disposition-suffix content check were verified correct against the
+    # real corpus and an exhaustive Unicode sweep, but neither pattern was
+    # PINNED - a future one-character widening of either (e.g. admitting
+    # U+115F into _FID_TOKEN's tail charset) would silently reintroduce the
+    # exact split-key/blank-suffix defect these rounds closed, while every
+    # existing behavioral-instance assertion below kept passing (both
+    # reviewers independently reproduced this exact mutation and confirmed
+    # the shipped self-test, unmodified, still reports success against it).
+    expect(M._FID_TOKEN.pattern == r"[A-Za-z0-9][A-Za-z0-9._+/,-]*",
+           "pin _FID_TOKEN grammar (round-6 finding_id merge-key fix)")
+    expect(M._DISPOSITION_SUFFIX_CONTENT_RE.pattern == r"[A-Za-z0-9?]",
+           "pin the disposition '#<id>' suffix content grammar (round-6 fix)")
+    expect(M._instant("2026-09-15T10:00:00z+14:00") is None,
+           "_instant rejects a lowercase-z marker FOLLOWED BY an explicit offset (self-contradictory)")
+    expect(M._instant("2026-09-15T10:00:00x+14:00") is None,
+           "_instant rejects a literal garbage character in the zone-marker position")
+    expect(M._instant("2026-09-15T10:00:00zz") is None,
+           "_instant rejects a doubled lowercase-z (not a single terminal zone token)")
+    expect(M._instant("2026-09-15X10:00:00+00:00") is None,
+           "_instant rejects an arbitrary (non-T/t) date/time separator character")
+    expect(M._instant("2026-09-15T10:00:00+1400") is None,
+           "_instant rejects a colon-less numeric offset (not the corpus's canonical shape)")
+
+    # round-7 review blocker, found independently by BOTH Fable and Sol on
+    # THIS round's own fix: the anchored grammar validates SHAPE (digit count/
+    # position) but not RANGE. An out-of-range field (month 13, day 30 in
+    # February, minute 60, an offset past +/-24:00) fullmatches the grammar
+    # and only fails at fromisoformat - which RAISES rather than returning a
+    # bad value. An earlier version of this round's fix let that exception
+    # escape UNCAUGHT: a single out-of-range recorded_at (the single most
+    # realistic hand-typing mistake in this field) would crash the whole
+    # check_fragment() call, silencing every other finding in the run, rather
+    # than reporting the one bad row as bad-recorded-at. This must behave
+    # exactly like every other malformed-timestamp case: None, never a raise.
+    for bad in ("2026-13-01T00:00:00Z", "2026-02-30T00:00:00Z",
+                "2026-09-15T23:60:00Z", "2026-09-15T10:00:00+24:00",
+                "2026-09-15T10:00:00+99:99"):
+        expect(M._instant(bad) is None,
+               f"_instant treats an out-of-range field ({bad!r}) as unparseable, not a crash")
+    # Sol's independent finding: `\d` in a str pattern matches every Unicode
+    # Nd-category digit (Arabic-Indic, fullwidth, ...), not just ASCII -
+    # _FID_TOKEN spells its classes out for exactly this reason and this
+    # grammar must too, or a non-ASCII-digit timestamp fullmatches here and
+    # is only caught two lines later by fromisoformat raising (the same
+    # crash class as the range-validation gap above).
+    expect(M._instant("２０２６-09-15T10:00:00Z") is None,
+           "_instant rejects fullwidth-digit (non-ASCII \\d) date fields")
+    expect(M._instant("2026-09-15T10:00:00.١Z") is None,
+           "_instant rejects an Arabic-Indic digit in the fractional-seconds field")
+
     with tempfile.TemporaryDirectory() as d:
         # -------- (2a) field-wise merge: a CONFORMING sparse supersession is clean --------
         # row1 is the full finding; row2 restates the eight per-row-mandatory
@@ -654,6 +721,66 @@ def run():
                "_instant accepts a lowercase 'z' UTC suffix (RFC 3339 permits it)")
         clean_of("9-lowercasez.X", [_full(finding_id="j", recorded_at="2026-09-15T10:00:00z")],
                  "bad-recorded-at", "a lowercase-z recorded_at is NOT flagged")
+
+        # round-7 review blocker (C2): FortitudeEtc's exact reproduction - a
+        # self-contradictory recorded_at (a lowercase-z UTC marker followed by
+        # an explicit numeric offset) parsed to a DEFINITE-but-wrong instant
+        # under the OLD code, shifted hours into the past by the trailing
+        # offset, sorting a later BLOCKING escalation BEFORE an earlier NICE
+        # row - so the merge treated the NICE row as superseding and the
+        # fragment reported ZERO findings with the escalation silently
+        # discarded. The fix must surface this as a finding (bad-recorded-at
+        # on the malformed row), never let it merge silently.
+        c2_rows = [
+            _full(finding_id="c2", recorded_at="2026-09-15T09:00:00Z",
+                  severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"]),
+            _sparse(finding_id="c2", recorded_at="2026-09-15T10:00:00z+14:00",
+                    severity_native="INFO", severity_mapped="BLOCKING", impact=["I1"], exposure=["E3"]),
+        ]
+        c2_findings = M.check_fragment(_write(d, "9-c2selfcontra.X", c2_rows))
+        expect("bad-recorded-at" in _rules(c2_findings),
+               f"a self-contradictory recorded_at (lowercase-z marker + explicit offset) is caught, "
+               f"not silently merged as a definite-but-wrong instant (got {_rules(c2_findings)})")
+
+        # the doubled-'z' variant Kimi raised, and the arbitrary-separator
+        # variant Codex additionally probed - same escalation-loss mechanism.
+        fires("9-c2doublez.X", [_full(finding_id="c3", recorded_at="2026-09-15T10:00:00zz")],
+              "bad-recorded-at", "a doubled lowercase-z recorded_at is caught, not silently accepted")
+        fires("9-c2badsep.X", [_full(finding_id="c4", recorded_at="2026-09-15X10:00:00+00:00")],
+              "bad-recorded-at", "a non-T/t date/time separator is caught, not silently accepted")
+
+        # Fable's round-7 confirmation-pass blocker: an out-of-range field
+        # (here, month 13 - the single most realistic hand-typing mistake in
+        # this entire field) fullmatches the anchored grammar and only fails
+        # at fromisoformat, which RAISES. An earlier version of THIS round's
+        # own fix let that exception escape uncaught, crashing the whole
+        # check_fragment() call and silencing every other finding in the run
+        # - worse than the escalation-LOSS defect this round set out to fix,
+        # since a crash is a total run failure rather than a silent gap.
+        # Mirrors the c2 shape exactly (NICE -> BLOCKING), but with an
+        # out-of-range month instead of a self-contradictory zone marker.
+        c2_month13_rows = [
+            _full(finding_id="c5", recorded_at="2026-09-15T09:00:00Z",
+                  severity_native="INFO", severity_mapped="NICE", impact=["I9"], exposure=["E0"]),
+            _sparse(finding_id="c5", recorded_at="2026-13-01T00:00:00Z",
+                    severity_native="INFO", severity_mapped="BLOCKING", impact=["I1"], exposure=["E3"]),
+        ]
+        c2_month13_path = _write(d, "9-c2month13.X", c2_month13_rows)
+        c2_month13_findings = M.check_fragment(c2_month13_path)
+        expect("bad-recorded-at" in _rules(c2_month13_findings),
+               f"an out-of-range recorded_at field (month 13) is caught as bad-recorded-at, "
+               f"not an uncaught crash (got {_rules(c2_month13_findings)})")
+        # the crash class specifically: run the CLI end-to-end and assert no
+        # Python traceback reaches stderr - `check_fragment` returning a
+        # finding list only proves the FUNCTION doesn't raise; the CLI test
+        # is what would have caught the round-7 regression's actual blast
+        # radius (the /governance SKILL.md pre-push gate invokes the CLI,
+        # not the function directly).
+        cli = subprocess.run([sys.executable, str(_SCRIPT), "--files", c2_month13_path],
+                              capture_output=True, text=True)
+        expect(cli.returncode == 1 and "Traceback" not in cli.stderr,
+               f"CLI on an out-of-range recorded_at exits 1 with a finding, never a Python "
+               f"traceback (got exit={cli.returncode}, stderr={cli.stderr[:200]!r})")
 
         # Fable's round-5 follow-up: the per-row disposition CLOSED-ENUM check
         # must gate on THIS ROW's own versioned-ness, not the finding-level
