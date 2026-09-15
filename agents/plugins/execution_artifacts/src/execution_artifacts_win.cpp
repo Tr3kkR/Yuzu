@@ -83,6 +83,7 @@
 #endif
 #include <windows.h>
 #include <winternl.h> // NTSTATUS (confined_fs_win.cpp precedent)
+#include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW (amcache_dest_dir DACL)
 
 #include <win_profiles.hpp> // RegKey, PrivilegeScope, offline_hive_mutex, read_reg_value,
                             // enumerate_value_names, to_wide/from_wide
@@ -542,7 +543,21 @@ int collect_amcache(yuzu::CommandContext& ctx) {
             return emit_constrained(ctx, "hive_oversized");
 
         CreateDirectoryW(L"C:\\ProgramData\\yuzu\\agent", nullptr); // best-effort; may pre-exist
-        CreateDirectoryW(amcache_dest_dir().c_str(), nullptr);      // ditto
+
+        // Owner-only, inheritable DACL (same D:P(A;;GA;;;OW) idiom as
+        // temp_file.cpp's make_owner_only_sa, +OICI so it propagates to the
+        // .LOG1/.LOG2 side files the registry engine creates loading the
+        // hive) -- this dir holds the RAW Amcache.hve copy, not just
+        // paths/hashes, and must not inherit ProgramData's Users-readable
+        // default.
+        PSECURITY_DESCRIPTOR amcache_sd = nullptr;
+        SECURITY_ATTRIBUTES amcache_sa{sizeof(amcache_sa), nullptr, FALSE};
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;OICI;GA;;;OW)", SDDL_REVISION_1, &amcache_sd, nullptr))
+            amcache_sa.lpSecurityDescriptor = amcache_sd;
+        CreateDirectoryW(amcache_dest_dir().c_str(), amcache_sd ? &amcache_sa : nullptr);
+        if (amcache_sd)
+            LocalFree(amcache_sd);
 
         const std::wstring dest_hve = amcache_temp_path();
 
