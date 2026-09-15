@@ -401,13 +401,23 @@ void do_rules_macos(yuzu::CommandContext& ctx) {
         }
     }
 
+    // rule| rows and the trailing ruleset| count share ONE completeness gate
+    // -- a truncated or timed-out pfctl read must not publish whatever
+    // partial lines it captured as though they were the whole rule set,
+    // with only the trailing sentinel hinting otherwise (adversarial-review
+    // r1, C1: rows were previously written unconditionally, ahead of the
+    // gate that only protected ruleset|). Matches every other completeness-
+    // gated emission in this function (app|, anchor|) and the honest-status
+    // invariant documented in README.md's "How it works".
     auto res = run_bounded_subprocess({"/sbin/pfctl", "-s", "rules"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
-    std::istringstream iss(res.output);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (!line.empty()) {
-            ctx.write_output(std::format("rule|{}", sanitize_field(line)));
+    if (res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated) {
+        std::istringstream iss(res.output);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty()) {
+                ctx.write_output(std::format("rule|{}", sanitize_field(line)));
+            }
         }
     }
 
