@@ -1216,3 +1216,44 @@ TEST_CASE("capture_failure_detail: each termination reason and the spawn/output-
     // A usable capture (is_usable_capture's positive case) has no detail.
     CHECK(capture_failure_detail(true, false, false, 0, "exited").empty());
 }
+
+// ── fold_secitem_presence (code-review F1, #2318a delete-path fix) ─────────
+// keychain_contains_thumbprint() no longer shells out to `security
+// find-certificate`; this is the pure fold deciding its return value from a
+// read_keychain_secitem() outcome. The load-bearing vector is the last one:
+// a non-Completed status with no match must NEVER fold to `false` (absent) --
+// that was the exact bug (a permission-denied keychain's empty read folding
+// into "certificate not found", verified reproducible against a real
+// chmod-000 System.keychain copy on macOS 26.6.2 during code review).
+
+TEST_CASE("fold_secitem_presence: a match is present regardless of status",
+          "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::fold_secitem_presence;
+
+    CHECK(fold_secitem_presence(KeychainReadStatus::Completed, /*matched=*/true) == true);
+    CHECK(fold_secitem_presence(KeychainReadStatus::Truncated, /*matched=*/true) == true);
+}
+
+TEST_CASE("fold_secitem_presence: a Completed read with no match proves absence",
+          "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::fold_secitem_presence;
+
+    auto result = fold_secitem_presence(KeychainReadStatus::Completed, /*matched=*/false);
+    REQUIRE(result.has_value());
+    CHECK(result.value() == false);
+}
+
+TEST_CASE("fold_secitem_presence: every non-Completed status with no match is nullopt, "
+         "never a false absence -- the exact #2318a delete-path defect this closes",
+         "[certificates][macos]") {
+    using yuzu::agent::KeychainReadStatus;
+    using yuzu::certificates_macos::fold_secitem_presence;
+
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::Truncated, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::NotReadable, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::OpenFailed, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::TimedOut, /*matched=*/false).has_value());
+    CHECK_FALSE(fold_secitem_presence(KeychainReadStatus::Rejected, /*matched=*/false).has_value());
+}

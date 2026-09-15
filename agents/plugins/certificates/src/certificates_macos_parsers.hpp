@@ -460,4 +460,28 @@ inline std::string capture_failure_detail(bool tool_ran, bool timed_out, bool ou
     return "";
 }
 
+/// Folds a read_keychain_secitem()-backed scan into the presence verdict
+/// keychain_contains_thumbprint() returns (post code-review F1, #2318a).
+/// `matched` is true iff the caller already found a definitive thumbprint
+/// match among the read's parsed certs -- a match is proof of presence
+/// regardless of `status` (mirrors the old fold_presence_scan's kMatch
+/// short-circuit: a positive identification is never invalidated by an
+/// otherwise-degraded read). With no match: a Completed read genuinely
+/// proves absence; anything else -- NotReadable, OpenFailed, TimedOut,
+/// Rejected, or Truncated (a DER blob Security.framework accepted but
+/// libcrypto rejected, or the per-keychain cert cap) -- can only narrow
+/// future certainty, never manufacture it, so it stays std::nullopt. This
+/// is the fold that closes the gap a subprocess-based read could not: an
+/// unreadable keychain (locked-but-inaccessible, permission-denied, or a
+/// transient SecItem failure) is `NotReadable`/`OpenFailed`, never folded
+/// into "no certs found" the way an empty `security` stdout used to be.
+inline std::optional<bool> fold_secitem_presence(yuzu::agent::KeychainReadStatus status,
+                                                 bool matched) {
+    if (matched)
+        return true;
+    if (status == yuzu::agent::KeychainReadStatus::Completed)
+        return false;
+    return std::nullopt;
+}
+
 } // namespace yuzu::certificates_macos

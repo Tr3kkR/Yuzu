@@ -1605,74 +1605,67 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
  * (ACL/SIP quirks, an unexpected keychain state), and reporting "deleted"
  * in that case would be exactly the false-success this package exists to
  * prevent. Returns std::nullopt when the keychain itself could not be read
- * (locked, missing, permission denied, a `security` failure, ...) --
+ * (locked, missing, permission denied, a read failure, ...) --
  * delete_cert_macos() treats that as the unreadable-keychain verdict,
  * never "absent": a verification read that could not run proves nothing
- * about the outcome. An UNRELATED unparseable block (parse_pem_block_macos
- * falls back to the literal "(unknown)" on a per-record openssl/temp-file
- * failure -- classify_block_identity reports kInconclusive) does NOT abort
- * the proof (UP-5): openssl could not turn it into a cert, so it can never be
- * a positive match for the needle, and aborting on it made a genuinely
- * successful delete report failure (kVerifyUnreadable) whenever the keychain
- * also held any unrelated malformed cert. Such blocks are skipped and the
- * scan continues; only a definitive match returns `true`, and a keychain that
- * was fully read AND fully scanned within budget with no match returns
- * `false` (provably absent). The fail-safe is preserved for the cases that
- * genuinely prove nothing -- a `security` read failure, or a cap/deadline-
- * truncated scan -- which still return std::nullopt (see fold_presence_scan),
- * so an unread/partly-read keychain is never reported as a clean "deleted".
- * Reuses run_bounded_checked + the same PEM-enumeration path as list/details
- * rather than adding a second certificate-reading mechanism.
+ * about the outcome.
+ *
+ * MECHANISM (post code-review F1, #2318a): this used to shell out to
+ * `/usr/bin/security find-certificate -a -p <keychain_path>` and trust a
+ * zero exit status plus empty stdout as proof the keychain is genuinely
+ * empty. That is exactly the #2318a UP-4 defect the issue named this
+ * function by, and it is NOT hypothetical: empirically verified on real
+ * macOS 26.6.2 (`security find-certificate -a -p` against a chmod-000,
+ * genuinely permission-denied copy of a populated System.keychain) --
+ * `security` exits 0 with EMPTY stdout and no diagnostic, indistinguishable
+ * from a truly empty keychain. (A merely LOCKED-but-otherwise-readable
+ * keychain does NOT trigger this: certificates are non-secret keychain
+ * items and both `security` and `SecItemCopyMatching` correctly enumerate
+ * them regardless of lock state -- also empirically verified. The
+ * reproducible failure mode is a file-permission/ACL denial, not a lock.)
+ * delete_cert_macos() only ever resolves `keychain_path` to System.keychain
+ * (see resolve_delete_keychain_path -- "root" is rejected earlier as
+ * SIP-sealed, "login" is rejected outright, nothing else is recognized), so
+ * this now reuses the SAME bounded, in-process SecItem seam
+ * (read_keychain_secitem / agents/core/include/yuzu/agent/keychain_read.hpp,
+ * #3246) that list_certs_macos/details_cert_macos already use for
+ * System.keychain -- eliminating the second, honesty-blind reading
+ * mechanism entirely rather than teaching it a new special case.
+ * KeychainReadStatus::NotReadable/OpenFailed/TimedOut/Rejected all map to
+ * std::nullopt (never "absent"); only Completed with no match, or Truncated
+ * with no match found before truncation, is a real "not present" answer --
+ * and Truncated can only narrow future certainty, never manufacture it, so
+ * it takes the same nullopt-if-inconclusive path as the old scan-incomplete
+ * case did.
  *
  * `action_deadline` is the CALLER's whole-action budget (fix-round finding
  * FP-CERTS-R3: this used to start its own fresh kCertActionBudget window
  * regardless of how much of delete_cert_macos()'s own budget the preceding
  * `security delete-certificate` call had already spent, letting the pair
- * run to roughly 75s worst case). The keychain read AND every per-block
- * parse below now clamp to this same shared deadline via
- * clamp_to_action_budget, same as list/details_cert_macos. If the budget is
- * already exhausted before the read can even be attempted, this returns
- * std::nullopt without issuing a doomed call -- classify_delete_verdict
- * already treats std::nullopt as kVerifyUnreadable (an honest "action
- * deadline exceeded" outcome), never kDeleted.
+ * run to roughly 75s worst case). The keychain read below clamps to this
+ * same shared deadline via clamp_to_action_budget, same as
+ * list/details_cert_macos. If the budget is already exhausted before the
+ * read can even be attempted, this returns std::nullopt without issuing a
+ * doomed call -- classify_delete_verdict already treats std::nullopt as
+ * kVerifyUnreadable (an honest "action deadline exceeded" outcome), never
+ * kDeleted.
  */
 std::optional<bool> keychain_contains_thumbprint(
     const std::string& keychain_path, const std::string& canonical_needle,
     std::chrono::steady_clock::time_point action_deadline) {
-    auto read_deadline = clamp_to_action_budget(action_deadline, kKeychainReadDeadline);
+    auto read_deadline = clamp_to_action_budget(action_deadline, kSecItemReadDeadline);
     if (read_deadline <= std::chrono::milliseconds::zero()) {
         return std::nullopt;
     }
-    // sink: certificates/keychain_contains_thumbprint#1 — rung-2 runner argv,
-    // fixed literal keychain path, see manifest
-    auto result = run_bounded_checked(
-        {"/usr/bin/security", "find-certificate", "-a", "-p", keychain_path},
-        yuzu::agent::SubprocessOptions{.deadline = read_deadline}, "keychain verify read");
-    if (!result.ok)
-        return std::nullopt;
-
-    // Accumulate each block's identity outcome and hand the final verdict to
-    // the shared, unit-tested fold_presence_scan. A definitive match
-    // short-circuits (no need to parse the rest); an unrelated unparseable
-    // block (kInconclusive) is collected and skipped rather than aborting the
-    // proof (UP-5, see the function comment). A cap/deadline-truncated scan
-    // is passed as scan_complete=false so fold_presence_scan yields the honest
-    // std::nullopt -- an incomplete scan can never positively prove absence.
-    std::vector<BlockIdentityOutcome> outcomes;
-    std::size_t parsed = 0;
-    for (const auto& block : split_pem_blocks(result.output)) {
-        auto parse_deadline = clamp_to_action_budget(action_deadline, kCertParseDeadline);
-        if (parsed >= kMaxCertsPerKeychain || parse_deadline <= std::chrono::milliseconds::zero()) {
-            return fold_presence_scan(outcomes, /*scan_complete=*/false);
+    auto result = read_keychain_secitem(keychain_path, read_deadline);
+    bool matched = false;
+    for (const auto& cert : result.certs) {
+        if (cert.thumbprint == canonical_needle) {
+            matched = true;
+            break;
         }
-        ++parsed;
-        auto rec = parse_pem_block_macos(block, "", parse_deadline);
-        auto outcome = classify_block_identity(rec.thumbprint, canonical_needle);
-        if (outcome == BlockIdentityOutcome::kMatch)
-            return true;
-        outcomes.push_back(outcome);
     }
-    return fold_presence_scan(outcomes, /*scan_complete=*/true);
+    return fold_secitem_presence(result.status, matched);
 }
 
 // is_provably_absent_macos moved to certificates_macos_parsers.hpp (shared

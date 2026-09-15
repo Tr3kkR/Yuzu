@@ -122,8 +122,19 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     // and we really waited, not that the call was refused outright.
     auto entered = std::make_shared<std::atomic<bool>>(false);
 
+    // Budget widened from an original 200ms (code-review CXR-04): this test
+    // races the caller's cv.wait_for deadline against the OS actually
+    // scheduling the detached thread that sets `entered`. Under transient
+    // load right after a fresh compile, 200ms was observed to occasionally
+    // elapse before the detached thread got a scheduling slot at all
+    // (entered still false when the caller's wait returned) -- not a defect
+    // in the primitive, just too little headroom for two threads to race
+    // for CPU time. 500ms/400ms keeps the same ~75% safety-margin ratio
+    // while giving the scheduler enough room in practice; the upper bound
+    // (waited < 10s) is the actual correctness assertion this test exists
+    // to make -- the caller must get its thread back, not hang forever.
     auto started = std::chrono::steady_clock::now();
-    auto res = read_keychain_bounded_for_test("/tmp/wedged.keychain", 200ms,
+    auto res = read_keychain_bounded_for_test("/tmp/wedged.keychain", 500ms,
                                                [stop, entered](const std::string&) {
                                                    entered->store(true, std::memory_order_relaxed);
                                                    while (!stop->load(std::memory_order_relaxed))
@@ -135,7 +146,7 @@ TEST_CASE("read_keychain_bounded gives the caller its thread back when the read 
     CHECK(res.status == KeychainReadStatus::TimedOut);
     CHECK_FALSE(res.ok());
     CHECK(entered->load(std::memory_order_relaxed)); // the read really ran
-    CHECK(waited >= 150ms);                          // and we really waited the budget out
+    CHECK(waited >= 400ms);                          // and we really waited the budget out
     CHECK(waited < 10s);
 
     stop->store(true, std::memory_order_relaxed); // let the detached thread retire
