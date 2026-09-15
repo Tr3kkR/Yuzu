@@ -1324,6 +1324,16 @@ public:
             metrics_.counter("yuzu_mcp_tool_args_too_large_total",
                              {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
         }
+        // #4353 follow-up (Gate 2 finding on #4364): the 19 kFieldBoundTools
+        // share the SAME counter as execute_instruction above but a single
+        // fixed reason ("arg_too_large") - see mcp_server.cpp's
+        // reject_field_too_large comment for why these 19 don't get
+        // execute_instruction's per-field reason breakdown. Iterated from that
+        // one array for the same emitted-but-unseeded reason as above.
+        for (const auto tool : yuzu::server::mcp::kFieldBoundTools) {
+            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                             {{"tool", std::string(tool)}, {"reason", "arg_too_large"}});
+        }
         // #2500 REST targeting refusals. Deliberately NOT the MCP counter above:
         // these are different surfaces with different gates, and folding them into
         // one series would make `yuzu_mcp_*` count calls that never touched MCP.
