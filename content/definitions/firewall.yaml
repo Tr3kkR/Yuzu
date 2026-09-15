@@ -50,8 +50,12 @@ spec:
         description: >-
           Row key. Windows: "profile" rows carry the profile name in the next
           field (Domain, Private, Public). Linux and macOS: "backend", "state",
-          "mode" and "pf" rows, one key each.
-        values: [profile, backend, state, mode, pf, error]
+          "mode" and "pf" rows, one key each. Linux additionally emits "error"
+          rows (a refused or fd-exhausted backend read), "fallthrough" rows (the
+          nftables leg handing off to the next backend after a dump failure),
+          and "ruleset" rows (the rule count, or unknown when that count could
+          not be trusted).
+        values: [profile, backend, state, mode, pf, error, fallthrough, ruleset]
         example: profile
       - name: state
         type: string
@@ -62,7 +66,14 @@ spec:
           error:<hresult>). Linux "state" rows: running (firewalld), active, inactive or
           unknown. macOS "state" rows: enabled, disabled or unknown; "pf" rows
           the same; "mode" row is block_all. "backend" rows name the backend
-          (appfirewall, firewalld, nftables, ufw, iptables, none).
+          (appfirewall, firewalld, nftables, ufw, iptables, none). Linux "error"
+          rows: nftables:<table|chain|rule>:<eperm|timeout|foreign_flood|...> for
+          a refused/failed dump, or fd_exhausted for EMFILE/ENFILE on the
+          nftables socket. Linux "fallthrough" rows: nftables:<table|chain|rule>:<reason>,
+          written when a dump fails and the leg hands off to the next backend.
+          Linux "ruleset" rows: the rule count as an integer, or unknown
+          whenever the backend's read was incomplete or refused rather than a
+          fabricated 0.
         example: enabled
     aggregation:
       groupBy: [state]

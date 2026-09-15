@@ -504,7 +504,11 @@ this claim describes is real in the source. Claim holds.)*
 
 `firewall` plugin (cross-platform). macOS `state` reports the Application
 Firewall (`socketfilterfw --getglobalstate`) as the primary signal, with the
-pf packet filter demoted to a secondary row; `rules` lists pf rules.
+pf packet filter demoted to a secondary row; `rules` lists pf rules. Linux
+probes a fixed backend ladder — firewalld (sd-bus) → nftables (netlink,
+kernel-origin-verified via `nl_pid == 0`) → ufw → iptables — stopping at the
+first that answers; a refused or partial read reports `unknown`, never a
+false-safe guess.
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 

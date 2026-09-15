@@ -19,8 +19,11 @@
  */
 
 #include <algorithm>
+#include <bit>
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <optional>
@@ -28,8 +31,11 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
+
+#include <yuzu/agent/subprocess_runner.hpp>
 
 namespace yuzu::firewall {
 
@@ -297,6 +303,13 @@ struct IptablesRule {
 
 namespace nft_raw {
 
+// Every supported deployment target is little-endian (see the byte-order
+// note above); the plain memcpy decode of nlmsghdr/nfgenmsg/nlattr header
+// fields below relies on that silently. Pin it so a future big-endian
+// target fails the build, not a live host.
+static_assert(std::endian::native == std::endian::little,
+              "nft_raw header decode assumes a little-endian host");
+
 /// linux/netlink.h `struct nlmsghdr` (16 bytes, host byte order).
 struct NlMsgHdr {
     std::uint32_t len{};
@@ -306,6 +319,14 @@ struct NlMsgHdr {
     std::uint32_t pid{};
 };
 static_assert(sizeof(NlMsgHdr) == 16);
+// The decode is "memcpy the netlink bytes into a NlMsgHdr", which is only
+// defined for a trivially copyable, standard-layout type (same precedent as
+// linux_tcp_info.hpp) — pin both so a future field breaking either property
+// fails the build, not a sanitizer at runtime.
+static_assert(std::is_trivially_copyable_v<NlMsgHdr>,
+              "NlMsgHdr must stay trivially copyable for the memcpy decode");
+static_assert(std::is_standard_layout_v<NlMsgHdr>,
+              "NlMsgHdr must stay standard-layout for its field layout to be well-defined");
 
 /// linux/netfilter/nfnetlink.h `struct nfgenmsg` (4 bytes) — immediately
 /// follows nlmsghdr in every NFNETLINK-family message, nftables included.
@@ -319,6 +340,10 @@ struct NfGenMsg {
     std::uint16_t res_id{}; // __be16 in the kernel struct; unused/always-zero here
 };
 static_assert(sizeof(NfGenMsg) == 4);
+static_assert(std::is_trivially_copyable_v<NfGenMsg>,
+              "NfGenMsg must stay trivially copyable for the memcpy decode");
+static_assert(std::is_standard_layout_v<NfGenMsg>,
+              "NfGenMsg must stay standard-layout for its field layout to be well-defined");
 
 /// linux/netlink.h `struct nlattr` (4 bytes) — precedes each attribute's
 /// value; `len` counts the header itself plus the (unpadded) value.
@@ -327,6 +352,10 @@ struct NlAttr {
     std::uint16_t type{};
 };
 static_assert(sizeof(NlAttr) == 4);
+static_assert(std::is_trivially_copyable_v<NlAttr>,
+              "NlAttr must stay trivially copyable for the memcpy decode");
+static_assert(std::is_standard_layout_v<NlAttr>,
+              "NlAttr must stay standard-layout for its field layout to be well-defined");
 
 constexpr std::uint16_t kNlaTypeMask = 0x3fff; // NLA_TYPE_MASK
 constexpr std::size_t kNlaAlignTo = 4;
@@ -345,6 +374,19 @@ constexpr std::uint8_t kNfnlSubsysNftables = 10;
 constexpr std::uint16_t kNftMsgGettable = 1;
 constexpr std::uint16_t kNftMsgGetchain = 4;
 constexpr std::uint16_t kNftMsgGetrule = 7;
+
+// Reply message subtypes: the kernel answers a GET* dump request with the
+// corresponding NEW* body (never an echo of the GET* type itself).
+constexpr std::uint16_t kNftMsgNewtable = 0;
+constexpr std::uint16_t kNftMsgNewchain = 3;
+constexpr std::uint16_t kNftMsgNewrule = 6;
+
+/// A full nlmsghdr `type` field packs the NFNETLINK subsystem into the high
+/// byte and the subsystem-local message subtype into the low byte.
+[[nodiscard]] constexpr std::uint16_t nft_msg_type(std::uint16_t msg) noexcept {
+    return static_cast<std::uint16_t>((static_cast<std::uint16_t>(kNfnlSubsysNftables) << 8) |
+                                       msg);
+}
 
 constexpr std::uint8_t kNfprotoUnspec = 0;
 constexpr std::uint8_t kNfprotoInet = 1;
@@ -389,7 +431,11 @@ struct RawNlMsg {
     while (off + sizeof(NlMsgHdr) <= buf.size()) {
         NlMsgHdr hdr{};
         std::memcpy(&hdr, buf.data() + off, sizeof(hdr));
-        if (hdr.len < sizeof(NlMsgHdr) || off + hdr.len > buf.size())
+        // Subtraction form, not off + hdr.len > buf.size(): the loop guard
+        // above already proves off <= buf.size(), so buf.size() - off can
+        // never underflow, whereas the addition form is only safe because
+        // hdr.len/off happen to stay well under SIZE_MAX today.
+        if (hdr.len < sizeof(NlMsgHdr) || hdr.len > buf.size() - off)
             break;
         const std::size_t payload_len = hdr.len - sizeof(NlMsgHdr);
         msgs.push_back({hdr, buf.subspan(off + sizeof(NlMsgHdr), payload_len)});
@@ -419,7 +465,8 @@ struct RawAttr {
     while (off + sizeof(NlAttr) <= data.size()) {
         NlAttr hdr{};
         std::memcpy(&hdr, data.data() + off, sizeof(hdr));
-        if (hdr.len < sizeof(NlAttr) || off + hdr.len > data.size())
+        // Subtraction form — see split_nlmsgs()'s identical guard above.
+        if (hdr.len < sizeof(NlAttr) || hdr.len > data.size() - off)
             break;
         const std::uint16_t type = hdr.type & kNlaTypeMask;
         const std::size_t value_len = hdr.len - sizeof(NlAttr);
@@ -464,7 +511,59 @@ load_be64(std::span<const std::byte> v) noexcept {
     return r;
 }
 
+/// Decodes an NLMSG_ERROR payload's leading `struct nlmsgerr::error` field
+/// (host byte order, like every other header field this file decodes — see
+/// the byte-order note above). This backend never sets NLM_F_ACK on its own
+/// requests (#3462-5), so error==0 (an ACK, not a failure) is itself
+/// anomalous rather than meaningful — treated as nullopt, same as a payload
+/// too short to hold the field, rather than misread as "no error".
+[[nodiscard]] inline std::optional<std::int32_t>
+parse_nlmsgerr(std::span<const std::byte> payload) noexcept {
+    if (payload.size() < sizeof(std::int32_t))
+        return std::nullopt;
+    std::int32_t error{};
+    std::memcpy(&error, payload.data(), sizeof(error));
+    if (error == 0)
+        return std::nullopt; // NLM_F_ACK is never requested; a bare ACK is anomalous, not success
+    return error;
+}
+
+/// Decodes the signed `dump_done_errno` the kernel memcpys into an
+/// NLMSG_DONE message's body (confirmed against net/netlink/af_netlink.c
+/// netlink_dump_done(): nlmsg_put_answer(sizeof(dump_done_errno)) then
+/// memcpy(nlmsg_data(nlh), &dump_done_errno, ...)). A pre-v4.13 kernel emits
+/// a bare DONE with no payload at all — indistinguishable here from "field
+/// absent", so that decodes to nullopt and the caller treats it as ok, not
+/// as a truncation.
+[[nodiscard]] inline std::optional<std::int32_t>
+parse_nft_done_errno(std::span<const std::byte> done_msg_payload) noexcept {
+    if (done_msg_payload.size() < sizeof(std::int32_t))
+        return std::nullopt; // bare (pre-v4.13) DONE, or a too-short payload -- treat as ok
+    std::int32_t errno_val{};
+    std::memcpy(&errno_val, done_msg_payload.data(), sizeof(errno_val));
+    return errno_val;
+}
+
 } // namespace nft_raw
+
+namespace detail {
+
+/// Keeps only the messages whose header `type` is EXACTLY `expected_type`
+/// (UP-11 #3461): a mistyped/stray reply body — e.g. a NEWCHAIN row arriving
+/// on what should be a GETTABLE dump — is dropped rather than misparsed as
+/// this dump's data. NLMSG_DONE/NLMSG_ERROR are excluded by the same exact
+/// match, since neither carries the requested data-message type.
+[[nodiscard]] inline std::vector<nft_raw::RawNlMsg>
+nft_data_msgs(std::span<const std::byte> buf, std::uint16_t expected_type) {
+    std::vector<nft_raw::RawNlMsg> out;
+    for (auto& m : nft_raw::split_nlmsgs(buf)) {
+        if (m.hdr.type == expected_type)
+            out.push_back(std::move(m));
+    }
+    return out;
+}
+
+} // namespace detail
 
 struct NftTableInfo {
     std::uint8_t family{};
@@ -487,17 +586,17 @@ struct NftRuleInfo {
     std::optional<std::uint64_t> handle;
 };
 
-/// Parses one NFT_MSG_GETTABLE dump-reply buffer. NLMSG_DONE/NLMSG_ERROR
-/// messages are skipped (the caller decides reachability from the dump
-/// round-trip's own success/failure, not from this function); a message
-/// whose table name could not be decoded is dropped rather than emitted with
-/// an empty name.
+/// Parses one NFT_MSG_GETTABLE dump-reply buffer. Only exactly
+/// NFT_MSG_NEWTABLE-typed messages are examined (detail::nft_data_msgs) —
+/// NLMSG_DONE/NLMSG_ERROR and any stray/mistyped body are excluded by that
+/// same exact match, and the caller decides reachability from the dump
+/// round-trip's own success/failure, not from this function; a message whose
+/// table name could not be decoded is dropped rather than emitted with an
+/// empty name.
 [[nodiscard]] inline std::vector<NftTableInfo> parse_nft_tables(std::span<const std::byte> buf) {
     using namespace nft_raw;
     std::vector<NftTableInfo> out;
-    for (const auto& m : split_nlmsgs(buf)) {
-        if (m.hdr.type == kNlmsgDone || m.hdr.type == kNlmsgError)
-            continue;
+    for (const auto& m : detail::nft_data_msgs(buf, nft_msg_type(kNftMsgNewtable))) {
         if (m.payload.size() < sizeof(NfGenMsg))
             continue;
         NfGenMsg gen{};
@@ -521,9 +620,7 @@ struct NftRuleInfo {
 [[nodiscard]] inline std::vector<NftChainInfo> parse_nft_chains(std::span<const std::byte> buf) {
     using namespace nft_raw;
     std::vector<NftChainInfo> out;
-    for (const auto& m : split_nlmsgs(buf)) {
-        if (m.hdr.type == kNlmsgDone || m.hdr.type == kNlmsgError)
-            continue;
+    for (const auto& m : detail::nft_data_msgs(buf, nft_msg_type(kNftMsgNewchain))) {
         if (m.payload.size() < sizeof(NfGenMsg))
             continue;
         NfGenMsg gen{};
@@ -566,9 +663,7 @@ struct NftRuleInfo {
 [[nodiscard]] inline std::vector<NftRuleInfo> parse_nft_rules(std::span<const std::byte> buf) {
     using namespace nft_raw;
     std::vector<NftRuleInfo> out;
-    for (const auto& m : split_nlmsgs(buf)) {
-        if (m.hdr.type == kNlmsgDone || m.hdr.type == kNlmsgError)
-            continue;
+    for (const auto& m : detail::nft_data_msgs(buf, nft_msg_type(kNftMsgNewrule))) {
         if (m.payload.size() < sizeof(NfGenMsg))
             continue;
         NfGenMsg gen{};
@@ -609,6 +704,171 @@ struct NftRuleInfo {
             return true;
     }
     return false;
+}
+
+// ── nftables dump outcome (#3462-6, #3463-2) ────────────────────────────
+//
+// Every possible way a single GET*-dump round-trip (the impure shell's
+// bounded netlink socket I/O in firewall_plugin.cpp) can end, decoupled from
+// that I/O so the decision of what a given outcome MEANS is pure and
+// unit-testable independent of the socket/poll/deadline machinery that
+// produces it.
+
+/// How one nftables dump round-trip (GETTABLE/GETCHAIN/GETRULE) ended.
+enum class NftDumpStatus {
+    ok,             // clean NLMSG_DONE, errno 0 (or a bare pre-v4.13 DONE)
+    timeout,        // the acquisition deadline elapsed before NLMSG_DONE
+    kernel_error,   // NLMSG_ERROR, or a nonzero NLMSG_DONE dump_done_errno
+    foreign_flood,  // too many non-matching-pid/seq datagrams (kNftMaxForeignDatagrams)
+    truncated,      // the socket read returned less than a full message
+    oversized,      // the dump exceeded kNftDumpMaxBytes before terminating
+    io_error,       // the socket call itself failed (recv/poll error)
+    torn,           // NLMSG_DONE arrived with NLM_F_DUMP_INTR -- a concurrent
+                     // ruleset mutation interrupted the dump mid-read; the
+                     // kernel signals this on an otherwise-normal DONE, so
+                     // "io_error" (a syscall failure) would be the wrong
+                     // diagnosis for an operator troubleshooting it
+                     // (code-review finding).
+};
+
+/// One dump round-trip's outcome: the status plus, for `kernel_error`, the
+/// decoded errno (from parse_nlmsgerr or parse_nft_done_errno) that caused
+/// it — 0 when the status carries no specific errno.
+struct NftDumpResult {
+    NftDumpStatus status{NftDumpStatus::io_error};
+    int kernel_errno{0};
+};
+
+constexpr std::size_t kNftDumpMaxBytes = 4 * 1024 * 1024;
+constexpr int kNftMaxForeignDatagrams = 64;
+
+/// Whether a dump's data may be trusted as a complete, honest enumeration —
+/// the gate try_nftables_state()/try_nftables_rules() must pass before
+/// treating either dump's rows as meaningful rather than "reachability
+/// unknown".
+[[nodiscard]] constexpr bool nft_dumps_trusted(bool chains_ok, bool rules_ok) noexcept {
+    return chains_ok && rules_ok;
+}
+
+/// The nftables-backend state verdict: `unknown` whenever either dump could
+/// not be trusted (never inferred from partial/possibly-truncated content),
+/// otherwise `active`/`inactive` per nft_has_content() — moved out of the
+/// shell (#3463-2) so this decision is unit-tested at the pure layer.
+enum class NftVerdict { active, inactive, unknown };
+
+[[nodiscard]] inline NftVerdict nft_decide_state(bool chains_ok, bool rules_ok,
+                                                  const std::vector<NftChainInfo>& chains,
+                                                  const std::vector<NftRuleInfo>& rules) {
+    if (!nft_dumps_trusted(chains_ok, rules_ok))
+        return NftVerdict::unknown;
+    return nft_has_content(chains, rules) ? NftVerdict::active : NftVerdict::inactive;
+}
+
+/// The wire token for a verdict -- `try_nftables_state()` formats its
+/// `state|<token>` row through this rather than re-deriving the string
+/// inline, so the tested decision function (nft_decide_state, above) is the
+/// same code the production dispatch path actually runs (code-review
+/// finding, both Functional and Spec axes: nft_decide_state previously had
+/// zero production callers despite being unit-tested).
+[[nodiscard]] constexpr std::string_view nft_verdict_name(NftVerdict v) noexcept {
+    switch (v) {
+    case NftVerdict::active:
+        return "active";
+    case NftVerdict::inactive:
+        return "inactive";
+    case NftVerdict::unknown:
+        return "unknown";
+    }
+    return "unknown"; // unreachable -- exhaustive switch, -Wswitch flags enum drift
+}
+
+/// Reconciles the nftables backend's own verdict against the fact that a
+/// later probe stage already found nftables *tables* present (C4): a
+/// downstream `disabled` verdict is contradicted by tables existing at all
+/// (something is managing this ruleset, even if this dump could not read its
+/// content trustworthily) and is clamped to `unknown` rather than reported
+/// as a confident "disabled". `enabled` always stands unchanged — a rung-2
+/// active reading is never downgraded by this reconciliation.
+[[nodiscard]] constexpr FwState nft_fallthrough_clamp(bool tables_seen,
+                                                        FwState downstream_state) noexcept {
+    if (tables_seen && downstream_state == FwState::disabled)
+        return FwState::unknown;
+    return downstream_state;
+}
+
+/// Composes subprocess_complete() with nft_fallthrough_clamp(): the single
+/// completeness-gated state decision every rung-2 backend (ufw, iptables)
+/// makes the same way -- an incomplete subprocess read must degrade to
+/// unknown regardless of what its (possibly partial) output parsed to
+/// (governance gate2 security-guardian HIGH finding, r1). Pulled out so
+/// this composition itself is unit-tested, not just its two halves
+/// independently (governance gate3 quality-engineer finding, r2) -- the
+/// prior shape (`subprocess_complete(res) ? nft_fallthrough_clamp(...) :
+/// FwState::unknown`) was inline at each call site and only its two
+/// ingredients had direct test coverage, never the gate itself.
+[[nodiscard]] constexpr FwState gate_state_on_completeness(bool complete, bool tables_seen,
+                                                            FwState parsed_state) noexcept {
+    return complete ? nft_fallthrough_clamp(tables_seen, parsed_state) : FwState::unknown;
+}
+
+/// Maps a dump outcome to its diagnostic token. `kernel_error` further
+/// distinguishes the common permission-denied case (no CAP_NET_ADMIN) from
+/// any other kernel errno, since that's the one an operator can act on
+/// directly.
+[[nodiscard]] inline std::string nft_dump_reason(NftDumpResult res) {
+    switch (res.status) {
+    case NftDumpStatus::ok:
+        return "ok";
+    case NftDumpStatus::timeout:
+        return "timeout";
+    case NftDumpStatus::kernel_error:
+        if (res.kernel_errno == -EPERM)
+            return "eperm";
+        // A kernel_error whose errno could not itself be decoded (too-short
+        // NLMSG_ERROR payload, or the error==0 ACK-anomaly parse_nlmsgerr
+        // deliberately treats as nullopt) collapses to kernel_errno==0 here
+        // -- formatting that as "errno:0" would read as a specifically
+        // decoded errno zero, which never happened (code-review finding:
+        // an operator would conclude "the kernel reported errno 0" when
+        // the truth is "the errno couldn't be read at all").
+        if (res.kernel_errno == 0)
+            return "errno:undecoded";
+        // Widen to int64_t before abs(): std::abs(INT_MIN) on a plain int
+        // is signed-overflow UB. Real kernel errnos are bounded to
+        // [-MAX_ERRNO,-1] by convention and this path is only reached
+        // after sender verification, so INT_MIN is not reachable in
+        // practice -- but nothing upstream enforces that range, so widen
+        // rather than rely on it (governance gate2 security-guardian
+        // finding, r2).
+        return "errno:" +
+               std::to_string(std::abs(static_cast<std::int64_t>(res.kernel_errno)));
+    case NftDumpStatus::foreign_flood:
+        return "foreign_flood";
+    case NftDumpStatus::truncated:
+        return "truncated";
+    case NftDumpStatus::oversized:
+        return "oversized";
+    case NftDumpStatus::io_error:
+        return "io_error";
+    case NftDumpStatus::torn:
+        return "torn";
+    }
+    return "io_error"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
+}
+
+/// Formats a failed-dump diagnostic row for one nftables sub-dump (`dump` is
+/// "table"/"chain"/"rule") in the same `<kind>|nftables|...` row family the
+/// rest of this backend writes.
+[[nodiscard]] inline std::string nft_diag_row(std::string_view dump, NftDumpResult res) {
+    return std::format("error|nftables:{}:{}", dump, nft_dump_reason(res));
+}
+
+/// Formats the row written when the nftables backend gives up on `dump`
+/// entirely and probing falls through to the next backend in the ladder
+/// (ufw/iptables) — same shape as nft_diag_row(), distinct leading token so
+/// the two cases are distinguishable downstream.
+[[nodiscard]] inline std::string nft_fallthrough_row(std::string_view dump, NftDumpResult res) {
+    return std::format("fallthrough|nftables:{}:{}", dump, nft_dump_reason(res));
 }
 
 [[nodiscard]] inline std::string nft_family_name(std::uint8_t family) {
@@ -662,25 +922,31 @@ struct NftRuleInfo {
     return "policy" + std::to_string(*policy);
 }
 
+/// Strips pipe/newline/CR from a value echoed back into the pipe-delimited
+/// protocol so a hostile/unusual value cannot inject synthetic fields or
+/// rows. Hoisted from firewall_plugin.cpp's file-local helper of the same
+/// name/body so both the shell's own output rows and this header's
+/// format_nft_* rows route through one definition instead of two.
+[[nodiscard]] inline std::string sanitize_field(std::string_view s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char c : s) {
+        out += (c == '|' || c == '\n' || c == '\r') ? '_' : c;
+    }
+    return out;
+}
+
 /// Formats one base chain as the exact `rule|nftables|...` pipe-delimited
 /// row try_nftables_rules() (firewall_plugin.cpp) writes for it. Table/chain
-/// names are pipe/newline/CR-sanitized inline (mirrors firewall_plugin.cpp's
-/// file-local sanitize_field) so a hostile/unusual nftables name can't
-/// inject a synthetic field or row. Pulled out as its own pure function so
-/// the try_nftables_* -> output-row integration path — previously only
-/// exercised by manual live-kernel verification — is covered by a unit test
-/// against the actual field order/shape, not just the upstream parse_nft_*
-/// decoders.
+/// names are sanitized via sanitize_field() so a hostile/unusual nftables
+/// name can't inject a synthetic field or row. Pulled out as its own pure
+/// function so the try_nftables_* -> output-row integration path —
+/// previously only exercised by manual live-kernel verification — is
+/// covered by a unit test against the actual field order/shape, not just
+/// the upstream parse_nft_* decoders.
 [[nodiscard]] inline std::string format_nft_chain_rule_row(const NftChainInfo& c) {
-    auto sanitize = [](std::string_view s) {
-        std::string out;
-        out.reserve(s.size());
-        for (char ch : s)
-            out += (ch == '|' || ch == '\n' || ch == '\r') ? '_' : ch;
-        return out;
-    };
     return std::format("rule|nftables|{}|{}|{}|{}|{}", nft_family_name(c.family),
-                        sanitize(c.table), sanitize(c.name), nft_hook_name(c.hooknum),
+                        sanitize_field(c.table), sanitize_field(c.name), nft_hook_name(c.hooknum),
                         nft_policy_name(c.policy));
 }
 
@@ -688,16 +954,21 @@ struct NftRuleInfo {
 /// try_nftables_rules() writes for it -- same pull-out rationale as
 /// format_nft_chain_rule_row() above.
 [[nodiscard]] inline std::string format_nft_rule_handle_row(const NftRuleInfo& r) {
-    auto sanitize = [](std::string_view s) {
-        std::string out;
-        out.reserve(s.size());
-        for (char ch : s)
-            out += (ch == '|' || ch == '\n' || ch == '\r') ? '_' : ch;
-        return out;
-    };
     return std::format("rule|nftables|{}|{}|{}|handle|{}", nft_family_name(r.family),
-                        sanitize(r.table), sanitize(r.chain),
+                        sanitize_field(r.table), sanitize_field(r.chain),
                         r.handle ? std::to_string(*r.handle) : "unknown");
+}
+
+/// Whether a subprocess-backed acquisition genuinely completed: only under
+/// this gate may a backend report a real ruleset|<n> count -- anything short
+/// (didn't run, nonzero exit, killed by the deadline, or output clipped)
+/// must report ruleset|unknown instead of a fabricated/undercounted number.
+/// Hoisted out of the (previously Linux-only-compiled) shell so this
+/// completeness decision -- which every backend on every platform makes the
+/// same way -- is itself unit-tested rather than only exercised indirectly
+/// through platform-specific dispatch tests (code-review finding).
+[[nodiscard]] constexpr bool subprocess_complete(const yuzu::agent::SubprocessResult& res) noexcept {
+    return res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated;
 }
 
 } // namespace yuzu::firewall
