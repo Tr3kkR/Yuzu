@@ -27,6 +27,7 @@ namespace yuzu::server {
 
 // Shared with dex_routes.cpp (declared in dex_routes.hpp).
 std::string dex_window_token(int window_days);
+std::string dex_subnav(const std::string& active, int window_days);
 
 namespace {
 
@@ -107,15 +108,43 @@ std::string spark(const std::vector<double>& vals) {
            "stroke-width=\"1.5\" points=\"" + pts + "\"/></svg>";
 }
 
+// Case-insensitive ASCII substring match helper — mirrors the ?q= search idiom
+// already used by the device list (device_routes.cpp's to_lower/matches).
+std::string ci_lower(std::string s) {
+    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+// Best-effort Windows/Linux split for the picker's platform chips. `AppPerfAppSummary`
+// (app_perf_fleet_store.hpp) is keyed on (app_name, version, day) only — it carries
+// NO real platform column — so this is a NAME-SUFFIX heuristic, not an authoritative
+// field: a ".exe"-suffixed name is treated as Windows, anything else as Linux. It
+// cannot distinguish Linux from macOS, which is why the picker offers only
+// Windows/Linux chips (unlike the Catalogue OS filter's four). The rendered note
+// says so; revisit if/when a real per-app platform column lands.
+bool looks_windows(const std::string& app_name) {
+    const std::string lower = ci_lower(app_name);
+    return lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".exe") == 0;
+}
+
+// Canonical sort token — unrecognized/absent falls back to the default, mirroring
+// dex_window_token's validate-and-default idiom.
+std::string app_perf_sort_token(const std::string& sort) {
+    return (sort == "name" || sort == "versions") ? sort : "last_seen";
+}
+
 } // namespace
 
 std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& apps, bool truncated,
-                                       int window_days) {
+                                       int window_days, const std::string& q,
+                                       const std::string& platform, const std::string& sort) {
     const std::string w = dex_window_token(window_days);
+    const std::string plat = (platform == "windows" || platform == "linux") ? platform : "";
+    const std::string sortv = app_perf_sort_token(sort);
+
     std::string h;
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf?window=" + w +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-         "style=\"cursor:pointer;\">&larr; Fleet performance</a>";
+    h += "<a class=\"gp-back\" href=\"/\">&larr; Dashboard</a>";
+    h += dex_subnav("app_perf", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Application performance "
          "over time</h1></div><div class=\"gp-sub\">Per-application CPU &amp; memory across the "
          "fleet, broken out by version, over the retained window. Pick an application to compare "
@@ -128,9 +157,88 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
                                "opt-in (procperf_enabled, off by default) — enable it on the "
                                "devices you want to track.");
 
+    // -- Controls: search, platform, sort — CSP-safe (htmx core attrs only, no
+    // hx-on). Each control's hx-get carries every OTHER current param so a
+    // re-fetch never silently drops a sibling filter (the Catalogue OS-chip
+    // idiom in dex_routes.cpp). ------------------------------------------------
+    const std::string qs_plat = plat.empty() ? "" : "&platform=" + plat;
+    const std::string qs_q = q.empty() ? "" : "&q=" + url_encode(q);
+    const std::string qs_sort = "&sort=" + sortv;
+
+    h += "<div class=\"gp-filters\"><input name=\"q\" value=\"" + esc(q) +
+         "\" placeholder=\"Search applications\xE2\x80\xA6\" "
+         "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+         "border-radius:.4rem;padding:.3rem .6rem;font-size:.78rem;min-width:220px\" "
+         "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_sort +
+         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+         "hx-trigger=\"keyup changed delay:300ms\"></div>";
+
+    {
+        auto chip = [&](const char* val, const char* label) {
+            const std::string on = (plat.empty() ? std::string("all") : plat) == val ? " on" : "";
+            const std::string val_qs = std::string(val) == "all" ? "" : "&platform=" + std::string(val);
+            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
+                   val_qs + qs_sort + qs_q +
+                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+        };
+        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
+             "align-self:center\">Platform</span>" +
+             chip("all", "All") + chip("windows", "Windows") + chip("linux", "Linux") + "</div>";
+        h += "<div class=\"gp-mute\" style=\"font-size:.66rem;margin-top:.2rem\">Platform is "
+             "inferred from the app name (&quot;.exe&quot; = Windows) &mdash; it is not a "
+             "tracked field yet, so a mismatch is possible.</div>";
+    }
+
+    {
+        auto opt = [&](const char* val, const char* label) {
+            return "<option value=\"" + std::string(val) + "\"" +
+                   (sortv == val ? " selected" : "") + ">" + label + "</option>";
+        };
+        h += "<div class=\"gp-filters\"><span class=\"gp-mute\" style=\"font-size:.66rem;"
+             "align-self:center\">Sort</span><select name=\"sort\" "
+             "hx-get=\"/fragments/dex/perf/apps?window=" + w + qs_plat + qs_q +
+             "\" hx-trigger=\"change\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+             "border-radius:.35rem;padding:.15rem .4rem;\">" +
+             opt("last_seen", "Last seen (most recent)") + opt("name", "Name (A-Z)") +
+             opt("versions", "Versions (most first)") + "</select></div>";
+    }
+
+    // -- Filter + sort (in-memory over the fetched universe — see looks_windows) --
+    const std::string qlc = ci_lower(q);
+    std::vector<const AppPerfAppSummary*> filtered;
+    for (const auto& a : apps) {
+        if (!plat.empty() && looks_windows(a.app_name) != (plat == "windows"))
+            continue;
+        if (!qlc.empty() && ci_lower(a.app_name).find(qlc) == std::string::npos)
+            continue;
+        filtered.push_back(&a);
+    }
+    std::stable_sort(filtered.begin(), filtered.end(),
+                     [&](const AppPerfAppSummary* x, const AppPerfAppSummary* y) {
+                         if (sortv == "name")
+                             return ci_lower(x->app_name) < ci_lower(y->app_name);
+                         if (sortv == "versions")
+                             return x->versions > y->versions;
+                         return x->last_day > y->last_day; // last_seen (default)
+                     });
+
+    h += "<div class=\"gp-note\">" + std::to_string(filtered.size()) + " of " +
+         std::to_string(apps.size()) + " application" + (apps.size() == 1 ? "" : "s") +
+         (q.empty() ? "" : " match &quot;" + esc(q) + "&quot;") + "</div>";
+
+    if (filtered.empty()) {
+        h += placeholder("No applications match",
+                         q.empty() ? "No applications match the selected platform filter."
+                                  : "No applications match \"" + q + "\". Try a different search "
+                                    "term or clear the filters.");
+        return h;
+    }
+
     h += "<table class=\"gp-table\"><thead><tr><th>Application</th><th>Versions seen</th>"
          "<th>Last reported</th></tr></thead><tbody>";
-    for (const auto& a : apps) {
+    for (const auto* ap : filtered) {
+        const auto& a = *ap;
         h += "<tr><td>" +
              drill("/fragments/dex/perf/app?app=" + url_encode(a.app_name) + "&amp;window=" + w,
                    esc(a.app_name)) +

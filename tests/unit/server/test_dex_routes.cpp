@@ -2357,3 +2357,58 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
     }
 }
+
+TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "
+          "function raw (normalization/filtering happens there)",
+          "[dex][app_perf][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+
+    AppPerfProviders providers;
+    providers.apps = [](bool& truncated) -> std::optional<std::vector<AppPerfAppSummary>> {
+        truncated = false;
+        return std::vector<AppPerfAppSummary>{
+            {.app_name = "chrome.exe", .versions = 3, .last_day = 200},
+            {.app_name = "sshd", .versions = 1, .last_day = 100},
+        };
+    };
+    test::TestRouteSink sink;
+    DexRoutes routes;
+    routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, {}, {}, {}, {}, {}, {}, providers,
+                           {});
+
+    SECTION("no params: both apps render, unfiltered") {
+        auto r = sink.Get("/fragments/dex/perf/apps");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find("sshd") != std::string::npos);
+    }
+
+    SECTION("q= substring-filters by name") {
+        auto r = sink.Get("/fragments/dex/perf/apps?q=chrome");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("platform=windows keeps only the .exe-suffixed row") {
+        auto r = sink.Get("/fragments/dex/perf/apps?platform=windows");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") != std::string::npos);
+        CHECK(r->body.find(">sshd<") == std::string::npos);
+    }
+
+    SECTION("sort=name orders alphabetically") {
+        auto r = sink.Get("/fragments/dex/perf/apps?sort=name");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("chrome.exe") < r->body.find("sshd")); // c before s
+    }
+}

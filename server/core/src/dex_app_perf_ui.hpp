@@ -28,8 +28,17 @@ struct DexGroupOption {
 
 /// PURE: the app picker — every application with retained fleet perf history, each
 /// row a drill into its per-version trend. `truncated` adds the honest cap note.
+/// `q` (default "" = unfiltered) case-insensitive substring-filters by app name.
+/// `platform` ("windows"|"linux", default "" = all) filters by a NAME-SUFFIX
+/// heuristic (".exe" = windows, anything else = linux) — `AppPerfAppSummary`
+/// (app_perf_fleet_store.hpp) carries no real platform column today, so this is a
+/// best-effort fallback, not authoritative; the rendered note says so. `sort`
+/// selects "last_seen" (default, most-recent-first), "name" (A-Z), or "versions"
+/// (most retained versions first); an unrecognized token falls back to "last_seen".
 std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& apps, bool truncated,
-                                       int window_days);
+                                       int window_days, const std::string& q = "",
+                                       const std::string& platform = "",
+                                       const std::string& sort = "");
 
 /// PURE: the per-(app,version) perf-over-time table. `versions` is the reduced
 /// per-version summary (`app_perf_version_summaries` over the trend points) —

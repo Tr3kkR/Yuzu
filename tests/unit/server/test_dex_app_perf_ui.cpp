@@ -36,6 +36,109 @@ TEST_CASE("render_dex_app_perf_picker: empty state + populated rows + cap note",
     CHECK(has(h, "/api/v1/dex/perf/apps"));                  // truncation points at the REST API
 }
 
+TEST_CASE("render_dex_app_perf_picker: top-level tab — subnav + Dashboard back-link",
+          "[dex][app_perf][ui]") {
+    std::vector<AppPerfAppSummary> apps = {
+        {.app_name = "chrome.exe", .versions = 1, .last_day = 1}};
+    const auto h = render_dex_app_perf_picker(apps, false, 7);
+    CHECK(has(h, "gp-subnav"));
+    // "App Performance" is the active tab and a SIBLING of "Performance" — both
+    // present, not merged (dex_subnav row #4035's picker guard).
+    CHECK(has(h, "class=\"on\" hx-get=\"/fragments/dex/perf/apps"));
+    CHECK(has(h, ">Performance<"));
+    CHECK(has(h, ">App Performance<"));
+    CHECK(has(h, "href=\"/\">&larr; Dashboard</a>")); // top-level convention, not a sub-fragment back-link
+}
+
+TEST_CASE("render_dex_app_perf_picker: search filters by name, case-insensitive",
+          "[dex][app_perf][ui]") {
+    std::vector<AppPerfAppSummary> apps = {
+        {.app_name = "Chrome.exe", .versions = 3, .last_day = 100},
+        {.app_name = "firefox", .versions = 2, .last_day = 200},
+    };
+    const auto h = render_dex_app_perf_picker(apps, false, 7, "chr");
+    CHECK(has(h, "Chrome.exe"));
+    CHECK_FALSE(has(h, "firefox"));
+    CHECK(has(h, "1 of 2 application")); // result count line
+    CHECK(has(h, "match &quot;chr&quot;"));
+    // The search box preserves its OWN value and re-issues with the other
+    // params in its hx-get URL (window at minimum) — never a bare route.
+    CHECK(has(h, "value=\"chr\""));
+}
+
+TEST_CASE("render_dex_app_perf_picker: search yielding nothing is an honest empty "
+          "state, never a blank table",
+          "[dex][app_perf][ui]") {
+    std::vector<AppPerfAppSummary> apps = {{.app_name = "chrome.exe", .versions = 1, .last_day = 1}};
+    const auto h = render_dex_app_perf_picker(apps, false, 7, "nonexistent-app-xyz");
+    CHECK(has(h, "0 of 1 application"));
+    CHECK(has(h, "No applications match"));
+    CHECK_FALSE(has(h, "<table"));
+}
+
+TEST_CASE("render_dex_app_perf_picker: platform filter is a NAME-SUFFIX heuristic "
+          "(.exe = windows), documented as such",
+          "[dex][app_perf][ui]") {
+    std::vector<AppPerfAppSummary> apps = {
+        {.app_name = "Chrome.EXE", .versions = 1, .last_day = 1}, // mixed case suffix
+        {.app_name = "sshd", .versions = 1, .last_day = 2},
+    };
+    const auto win = render_dex_app_perf_picker(apps, false, 7, "", "windows");
+    CHECK(has(win, "Chrome.EXE"));
+    CHECK_FALSE(has(win, ">sshd<"));
+
+    const auto lin = render_dex_app_perf_picker(apps, false, 7, "", "linux");
+    CHECK(has(lin, "sshd"));
+    CHECK_FALSE(has(lin, "Chrome.EXE"));
+
+    // The heuristic caveat is rendered honestly, not silently assumed.
+    CHECK(has(win, "inferred from the app name"));
+
+    // An unrecognized platform token falls back to "all" (never a 500/empty page).
+    const auto bogus = render_dex_app_perf_picker(apps, false, 7, "", "solaris");
+    CHECK(has(bogus, "Chrome.EXE"));
+    CHECK(has(bogus, "sshd"));
+}
+
+TEST_CASE("render_dex_app_perf_picker: sort — last_seen (default), name, versions",
+          "[dex][app_perf][ui]") {
+    // Three independent rankings (a Latin square) so each sort produces a
+    // DIFFERENT row order — a test that happened to share an order across
+    // criteria couldn't tell a correct sort from an accidental one.
+    //   last_seen desc (by last_day): charlie(300), alpha(200), bravo(100)
+    //   name asc:                     alpha, bravo, charlie
+    //   versions desc:                bravo(5), alpha(2), charlie(1)
+    std::vector<AppPerfAppSummary> apps = {
+        {.app_name = "charlie", .versions = 1, .last_day = 300},
+        {.app_name = "alpha", .versions = 2, .last_day = 200},
+        {.app_name = "bravo", .versions = 5, .last_day = 100},
+    };
+    auto row_order = [](const std::string& h, std::initializer_list<const char*> names) {
+        std::size_t pos = 0;
+        for (const char* n : names) {
+            const auto p = h.find(n, pos);
+            if (p == std::string::npos)
+                return false;
+            pos = p + 1;
+        }
+        return true;
+    };
+
+    // Default (no sort= given) and the explicit "last_seen" token both mean
+    // most-recently-seen first.
+    CHECK(row_order(render_dex_app_perf_picker(apps, false, 7), {"charlie", "alpha", "bravo"}));
+    CHECK(row_order(render_dex_app_perf_picker(apps, false, 7, "", "", "last_seen"),
+                    {"charlie", "alpha", "bravo"}));
+    CHECK(row_order(render_dex_app_perf_picker(apps, false, 7, "", "", "name"),
+                    {"alpha", "bravo", "charlie"}));
+    CHECK(row_order(render_dex_app_perf_picker(apps, false, 7, "", "", "versions"),
+                    {"bravo", "alpha", "charlie"}));
+
+    // An unrecognized sort token falls back to the default (last_seen), never a crash.
+    CHECK(row_order(render_dex_app_perf_picker(apps, false, 7, "", "", "bogus"),
+                    {"charlie", "alpha", "bravo"}));
+}
+
 TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector",
           "[dex][app_perf][ui]") {
     AppPerfVersionSummary v1;

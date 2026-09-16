@@ -520,12 +520,16 @@ std::string dex_window_token(int window_days) {
     return window_days == 1 ? "24h" : window_days == 30 ? "30d" : window_days == 0 ? "all" : "7d";
 }
 
-// Shared DEX sub-nav (Overview · Catalogue · Health score · Trends · Performance ·
-// Network). htmx core attrs into the page mount — CSP-safe (no hx-on). The Network
-// tab loads the /fragments/network/* renderers (network_ui.cpp), which render this
-// same sub-nav with "network" active — so Network sits UNDER DEX rather than as its
-// own top-level nav item. The network fragments ignore the threaded ?window= (the
-// quality view is a now-view with no window of its own).
+// Shared DEX sub-nav (Overview · Apps · Catalogue · Health score · Trends ·
+// Performance · App Performance · Network). htmx core attrs into the page mount —
+// CSP-safe (no hx-on). The Network tab loads the /fragments/network/* renderers
+// (network_ui.cpp), which render this same sub-nav with "network" active — so
+// Network sits UNDER DEX rather than as its own top-level nav item. The network
+// fragments ignore the threaded ?window= (the quality view is a now-view with no
+// window of its own). "App Performance" is a SIBLING of "Performance", not a
+// replacement — "Performance" is the live fleet-now widget (F2a,
+// render_dex_perf_fragment), "App Performance" is the retained per-(app,version)
+// trend picker (F2b, render_dex_app_perf_picker) — do not merge or confuse them.
 std::string dex_subnav(const std::string& active, int window_days) {
     const std::string w = dex_window_token(window_days);
     auto tab = [&](const char* id, const char* label, const char* frag) {
@@ -539,6 +543,7 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("health", "Health score", "/fragments/dex/health") +
            tab("trends", "Trends", "/fragments/dex/trends") +
            tab("perf", "Performance", "/fragments/dex/perf") +
+           tab("app_perf", "App Performance", "/fragments/dex/perf/apps") +
            tab("network", "Network", "/fragments/network/overview") + "</div>";
 }
 
@@ -3089,7 +3094,17 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                      "text/html; charset=utf-8");
                      return;
                  }
-                 res.set_content(render_dex_app_perf_picker(*apps, truncated, window_days),
+                 // Search/platform/sort are RAW here (same posture as the Catalogue
+                 // os= param) — render_dex_app_perf_picker normalizes/validates and
+                 // filters/sorts in-memory over the fetched universe; an unrecognized
+                 // platform/sort token falls back to "all"/"last_seen" there.
+                 const std::string q = req.has_param("q") ? req.get_param_value("q") : "";
+                 const std::string platform_filter =
+                     req.has_param("platform") ? req.get_param_value("platform") : "";
+                 const std::string sort =
+                     req.has_param("sort") ? req.get_param_value("sort") : "";
+                 res.set_content(render_dex_app_perf_picker(*apps, truncated, window_days, q,
+                                                            platform_filter, sort),
                                  "text/html; charset=utf-8");
              });
 

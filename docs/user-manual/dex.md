@@ -11,14 +11,14 @@ only reads and aggregates.
 It is reached from the **DEX** link in the dashboard nav, or directly at
 `/dex`. Access requires the **`GuaranteedState:Read`** permission.
 
-## The seven views
+## The eight views
 
 DEX is organised as a **hub** (the Overview at `/dex`) that *summarises and
-links* into six deep pages. A shared sub-nav switches between **Overview · Apps ·
-Catalogue · Health score · Trends · Performance · Network**; the window selector
-(below) applies to the signal views (Performance and Network are now-views — see
-below). The Network view also has its own URL, `/network`, but it is a DEX
-sub-view, not a standalone top-level nav item.
+links* into seven deep pages. A shared sub-nav switches between **Overview ·
+Apps · Catalogue · Health score · Trends · Performance · App Performance ·
+Network**; the window selector (below) applies to the signal views (Performance
+and Network are now-views — see below). The Network view also has its own URL,
+`/network`, but it is a DEX sub-view, not a standalone top-level nav item.
 
 ### Overview (the hub)
 
@@ -55,8 +55,8 @@ and hang counts, keyed on the process image name. Each row links to the existing
 per-application blast-radius drill-down (top subjects, faulting modules,
 most-affected devices). Built on the same `dex_top_apps` aggregation that drives
 the Overview crash cards — no new agent collection. The app detail page
-cross-links to per-version CPU & memory performance (the Performance tab's
-application trend), joined on the same process-image key an application's crash
+cross-links to per-version CPU & memory performance (the **App Performance**
+tab's application trend), joined on the same process-image key an application's crash
 and perf identity already share on Windows/Linux — an exact match, not a
 name-normalized guess. Attribution of repository/install/service signals to the
 originating app is a follow-on slice; the Apps tab today scopes to crash and
@@ -144,6 +144,31 @@ server-side series store).
   row opens that cohort's device list — and every device row opens the
   per-device drill-down.
 
+### App Performance
+
+A dedicated top-level tab for the **retained per-(app, version) performance
+trend** (see "Fleet-wide application performance" under Drill-downs) — a
+sibling of Performance, not a replacement: Performance is the live fleet-now
+widget above; App Performance is the picker into retained history. Previously
+this picker was reachable only via a buried inline link on the Performance
+page; it now has its own tab.
+
+The picker lists every application with retained history and adds three
+controls, all server-rendered (HTMX round-trips, no client-side framework):
+
+- **Search** — a text box that re-filters the list by name (case-insensitive
+  substring), debounced client-side before each re-fetch.
+- **Platform** — `All` / `Windows` / `Linux` chips. Today this is a **name-suffix
+  heuristic** (an app name ending `.exe` is treated as Windows, anything else as
+  Linux) — the app-perf roll-up carries no real per-app platform field yet, so a
+  mismatch is possible; the page says so.
+- **Sort** — most-recently-seen first (default), name (A–Z), or most retained
+  versions first.
+
+A result-count line ("N of M applications", or "N of M applications match
+&lsquo;query&rsquo;") and an honest empty state (never a blank table) reflect
+the current filters.
+
 ### Network
 
 The fleet's TCP **network quality**, measured on each endpoint from kernel
@@ -168,8 +193,9 @@ numbers match.
   the fleet: faulting modules, exception codes, and which devices are affected.
   Cross-links to that app's **fleet-wide performance trend** (below), and the
   trend links back — same process-image key both directions, exact match.
-- **Fleet-wide application performance** — reached from the Performance tab's
-  application picker, or the cross-link above: each version of an application
+- **Fleet-wide application performance** — reached from its own **App
+  Performance** top-level tab (search/platform/sort over the application list —
+  see below), or the cross-link above: each version of an application
   gets its own row with avg/p95 CPU, a CPU sparkline, avg working set, and the
   reporting device count, over the retained fleet window (≤180 days) or, when a
   management group is selected, that group's on-the-fly aggregate (≤31 days,
