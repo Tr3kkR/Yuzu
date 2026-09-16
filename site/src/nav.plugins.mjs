@@ -50,6 +50,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/users/README', slug: 'plugins/users', title: 'users' },
   { file: 'agents/plugins/vuln_scan/README', slug: 'plugins/vuln_scan', title: 'vuln_scan' },
   { file: 'agents/plugins/wifi/README', slug: 'plugins/wifi', title: 'wifi' },
+  { file: 'agents/plugins/windows_optional_features/README', slug: 'plugins/windows_optional_features', title: 'windows_optional_features' },
   { file: 'agents/plugins/windows_updates/README', slug: 'plugins/windows_updates', title: 'windows_updates' },
   { file: 'agents/plugins/wmi/README', slug: 'plugins/wmi', title: 'wmi' },
   { file: 'agents/plugins/wol/README', slug: 'plugins/wol', title: 'wol' }

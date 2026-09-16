@@ -24,7 +24,7 @@ Run Yuzu governance as a Codex-native review fanout. This skill may use Codex su
 7. Findings resolution: consolidate findings and fix blocking items.
 8. Iteration and ledger: re-run affected gates, record deferrals, and make the blocking decision.
 
-Blocking contract: **identical to the Claude runner — load it, do not restate it.** Read the "Shared preamble" severity block in `.claude/skills/governance/SKILL.md` and apply it verbatim: severity is DERIVED from TRIGGER + IMPACT (`I1`-`I9`) + EXPOSURE (all applicable `E0`-`E6`, including `E0` = no actor required; strongest raise first, then any cap — `E6` applies last and dominates) + EPISTEMIC STATUS, `BLOCKING` = a derived band of CRITICAL or HIGH, and the policy floors gate independently of the derivation. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
+Blocking contract: **identical to the Claude runner — load it, do not restate it.** Read the "Shared preamble" severity block in `.claude/skills/governance/SKILL.md` and apply it verbatim: severity is DERIVED from TRIGGER + IMPACT + EXPOSURE + EPISTEMIC STATUS per that block's own closed lists (do not enumerate the IMPACT/EXPOSURE codes here — a second copy of the list is exactly the restatement the next line forbids), `BLOCKING` = a derived band of CRITICAL or HIGH, and the policy floors gate independently of the derivation. MEDIUM/SHOULD findings need either a fix or an explicit deferral with an issue.
 
 This file MUST NOT carry its own copy of the severity rule. The two runners advertise parity; a second copy is how they drifted into enforcing different gates (found in #2623 re-review).
 

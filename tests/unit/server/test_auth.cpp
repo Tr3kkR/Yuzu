@@ -21,6 +21,10 @@
 #include <thread>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <unistd.h> // geteuid()
+#endif
+
 namespace fs = std::filesystem;
 using namespace yuzu::server::auth;
 using yuzu::server::AuthDB;
@@ -132,6 +136,121 @@ TEST_CASE("pending_status_to_string", "[auth][role]") {
     REQUIRE(pending_status_to_string(PendingStatus::approved) == "approved");
     REQUIRE(pending_status_to_string(PendingStatus::denied) == "denied");
 }
+
+// ── Default Path Resolution — macOS non-root fallback ───────────────────────
+//
+// default_cert_dir() / default_config_path() must never resolve a root run to
+// a per-user path: macOS `sudo` preserves $HOME by default, so an unqualified
+// $HOME fallback would send "sudo yuzu-server" to write CA/KEK key material
+// (or read/write the config file) inside an unprivileged user's home instead
+// of the shared /etc/yuzu location. These tests branch on the ACTUAL euid of
+// the test process (never skip) so they assert the correct behaviour whether
+// CI runs as root or not — see docs/testing/unit-test-conventions.md's
+// ScopedEnv precedent in test_server_ota_options.cpp.
+#if defined(__APPLE__)
+namespace {
+// RAII save/restore of an environment variable, set OR unset for the scope's
+// duration. The unset overload matters as much as the set one: a REQUIRE/SKIP
+// between an inline unsetenv() and a manual restore leaks the mutated env
+// across the rest of the test binary if anything in between throws (SKIP()
+// does, via Catch::TestSkipException) — this guard's destructor always runs.
+struct ScopedEnv {
+    struct Unset {};
+    std::string name;
+    bool had_prev = false;
+    std::string prev;
+    ScopedEnv(std::string n, const std::string& v) : name(std::move(n)) {
+        capture_prev();
+        ::setenv(name.c_str(), v.c_str(), 1);
+    }
+    ScopedEnv(std::string n, Unset) : name(std::move(n)) {
+        capture_prev();
+        ::unsetenv(name.c_str());
+    }
+    ~ScopedEnv() {
+        if (had_prev)
+            ::setenv(name.c_str(), prev.c_str(), 1);
+        else
+            ::unsetenv(name.c_str());
+    }
+
+  private:
+    void capture_prev() {
+        if (const char* cur = std::getenv(name.c_str())) {
+            had_prev = true;
+            prev = cur;
+        }
+    }
+};
+} // namespace
+
+TEST_CASE("default_cert_dir: root always resolves to /etc/yuzu/certs", "[auth][paths][macos]") {
+    // This project's self-hosted macOS CI runner never runs as root
+    // (deploy/macos/README.md), so this branch is SKIPPED, not passed, on
+    // every real CI run today — SKIP is reported distinctly from a passing
+    // REQUIRE, unlike SUCCEED, so the root path stays visibly unverified
+    // rather than silently green (governance false-green floor, qe Gate 3).
+    if (::geteuid() != 0) {
+        SKIP("test process is not root — covered by the non-root case below");
+    }
+    yuzu::test::TempDir home;
+    ScopedEnv env{"HOME", home.path.string()};
+    REQUIRE(default_cert_dir() == fs::path{"/etc/yuzu/certs"});
+}
+
+TEST_CASE("default_cert_dir: non-root falls back to per-user Application Support",
+          "[auth][paths][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — covered by the root case above");
+    }
+    yuzu::test::TempDir home;
+    ScopedEnv env{"HOME", home.path.string()};
+    REQUIRE(default_cert_dir() ==
+            home.path / "Library/Application Support/Yuzu/certs");
+}
+
+TEST_CASE("default_cert_dir: non-root with HOME unset falls back to the fixed "
+          "Application Support path",
+          "[auth][paths][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — HOME-unset fallback is a non-root-only path");
+    }
+    ScopedEnv env{"HOME", ScopedEnv::Unset{}};
+    REQUIRE(default_cert_dir() == fs::path{"/Library/Application Support/Yuzu/certs"});
+}
+
+TEST_CASE("default_config_path: root always resolves to /etc/yuzu/yuzu-server.cfg",
+          "[auth][paths][macos]") {
+    if (::geteuid() != 0) {
+        SKIP("test process is not root — covered by the non-root case below");
+    }
+    yuzu::test::TempDir home;
+    ScopedEnv env{"HOME", home.path.string()};
+    REQUIRE(default_config_path() == fs::path{"/etc/yuzu/yuzu-server.cfg"});
+}
+
+TEST_CASE("default_config_path: non-root falls back to per-user Application Support",
+          "[auth][paths][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — covered by the root case above");
+    }
+    yuzu::test::TempDir home;
+    ScopedEnv env{"HOME", home.path.string()};
+    REQUIRE(default_config_path() ==
+            home.path / "Library/Application Support/Yuzu/yuzu-server.cfg");
+}
+
+TEST_CASE("default_config_path: non-root with HOME unset falls back to the fixed "
+          "Application Support path",
+          "[auth][paths][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — HOME-unset fallback is a non-root-only path");
+    }
+    ScopedEnv env{"HOME", ScopedEnv::Unset{}};
+    REQUIRE(default_config_path() ==
+            fs::path{"/Library/Application Support/Yuzu/yuzu-server.cfg"});
+}
+#endif // __APPLE__
 
 // ── User Management ──────────────────────────────────────────────────────────
 

@@ -88,7 +88,12 @@ from pathlib import Path
 LEDGER_DIR = "governance.d"
 
 IMPACTS = frozenset(f"I{i}" for i in range(1, 10))
-EXPOSURES = frozenset({f"E{i}" for i in range(0, 7)} | {"unresolved"})
+# E0-E7: E7 (advisory-artifact + author-controlled-input cap) added
+# 2026-09-16 to SKILL.md's severity-derivation table after PR #4386's own
+# 11-round review history showed the table had no way to discount a finding
+# on author-controlled input to advisory tooling from one on reachable
+# production input - range(0, 8) to include E7.
+EXPOSURES = frozenset({f"E{i}" for i in range(0, 8)} | {"unresolved"})
 MAPPED = frozenset({"BLOCKING", "SHOULD", "NICE"})
 SOURCES = frozenset({"governance-agent", "collaborator", "external-model"})
 ATTESTATION = frozenset({"adjudicated_by", "adjudication_rationale", "refuted_by",
@@ -220,16 +225,20 @@ def min_derived_band(impact, exposure):
     """The FLOOR of the finding's band from the recorded facts alone.
 
     Only the mechanical parts of the derivation are modelled: base band per
-    impact code, the E1/E2 single raise, the E6 LOW cap, and the I4/I7 HIGH
-    cap - applied PER IMPACT CODE before taking the max, so a mixed finding
-    (e.g. I1+I4 under E1) correctly floors at I1's escalated CRITICAL rather
-    than being dragged down to I4's own HIGH ceiling. The CONDITIONAL raises
-    SKILL.md defines (I5(a)-(c), I6 FALSE-ASSURANCE/DORMANT-AUTH, I7-conceals)
-    can only push the true band HIGHER and cannot be evaluated from the fields
+    impact code, the E1/E2 single raise, the E6 LOW cap, the E7 MEDIUM cap
+    (added 2026-09-16 for author-controlled input to advisory tooling - see
+    SKILL.md's severity-derivation table), and the I4/I7 HIGH cap - applied
+    PER IMPACT CODE before taking the max, so a mixed finding (e.g. I1+I4
+    under E1) correctly floors at I1's escalated CRITICAL rather than being
+    dragged down to I4's own HIGH ceiling. The CONDITIONAL raises SKILL.md
+    defines (I5(a)-(c), I6 FALSE-ASSURANCE/DORMANT-AUTH, I7-conceals) can
+    only push the true band HIGHER and cannot be evaluated from the fields
     alone, so this is a lower bound, not the exact band. Used only to catch
     UNDER-grading (a label whose ceiling cannot even reach this floor);
     over-labeling is left alone because it is indistinguishable from a
-    legitimate conditional raise.
+    legitimate conditional raise. E6 and E7 are independent `min()` caps, so
+    applying both in either order gives the same result: E6's LOW dominates
+    E7's MEDIUM whenever both are present, exactly as SKILL.md specifies.
     """
     codes = [i for i in impact if i in _BASE]
     if not codes:
@@ -244,6 +253,8 @@ def min_derived_band(impact, exposure):
     idx = max(_code_band(c) for c in codes)
     if "E6" in exposure:
         idx = min(idx, _ORDER.index("LOW"))
+    if "E7" in exposure:
+        idx = min(idx, _ORDER.index("MEDIUM"))
     return _ORDER[idx]
 
 
@@ -483,8 +494,32 @@ def _reject_duplicate_keys(pairs):
             dups.append(k)
         result[k] = v
     if dups:
-        raise ValueError(f"duplicate object member(s): {', '.join(sorted(set(dups)))}")
+        # `repr()`, NOT the raw name: a duplicate member name can itself be
+        # a lone Unicode surrogate (`\ud800`, reachable via a JSON `\uXXXX`
+        # escape with no matching low surrogate - `json.loads` decodes it
+        # into a Python str without complaint). Printing that character to a
+        # normal UTF-8 stdout raises UnicodeEncodeError uncaught - round-11
+        # review (Fable + Sol) caught that this was the first place in the
+        # file to interpolate a row-controlled string without the `!r`
+        # discipline every other such site already uses, and the crash
+        # lands mid-report: under --all, every fragment after the offending
+        # one, and the summary line, never print.
+        raise ValueError(f"duplicate object member(s): "
+                          f"{', '.join(repr(d) for d in sorted(set(dups)))}")
     return result
+
+
+def _reject_json_constant(token):
+    """`json.loads`'s `parse_constant`: Python's json module accepts the
+    non-standard literals `NaN`/`Infinity`/`-Infinity` (RFC 8259 section 6
+    permits ONLY finite numbers) with no diagnostic by default. round-11
+    review (Fable + Sol) found every merge/severity-governing field with a
+    type check already fires a loud downstream finding on one of these
+    (`_is_int` rejects a float; an enum membership check rejects `inf`), so
+    this is format-hygiene rather than an escalation-loss path - but it is
+    a one-line close, so close it rather than leave a documented gap."""
+    raise ValueError(f"non-standard JSON constant {token!r} "
+                      f"(NaN/Infinity/-Infinity are not valid JSON per RFC 8259 section 6)")
 
 
 def check_fragment(path):
@@ -523,7 +558,8 @@ def check_fragment(path):
         if not line.strip():
             continue
         try:
-            obj = json.loads(line, object_pairs_hook=_reject_duplicate_keys)
+            obj = json.loads(line, object_pairs_hook=_reject_duplicate_keys,
+                              parse_constant=_reject_json_constant)
         except (ValueError, RecursionError) as e:
             # `json.JSONDecodeError` is a `ValueError` subclass, so catching
             # `ValueError` covers it - but ALSO catches two siblings a
@@ -993,6 +1029,29 @@ def changed_fragments(base):
 
 
 def main():
+    # round-11 CONFIRMATION-pass finding (Fable): the round-11 fix for a
+    # duplicate JSON member name that is a lone Unicode surrogate only
+    # patched that ONE interpolation site (via `repr()`) - but this is an
+    # instance fix, not a class fix. `f.path` is printed raw a few lines
+    # below, and a FRAGMENT'S OWN FILENAME can carry the identical shape: a
+    # non-UTF-8 byte in a filename decodes (via the OS's surrogateescape
+    # handler) into a lone surrogate character Python can represent
+    # in-memory but cannot ENCODE to a normal UTF-8 stream - reproduced
+    # directly (a file named "4-bad\xff.X.jsonl" crashes `print()` at the
+    # findings-report loop, uncaught, in both --files and --all). `repr()`
+    # doesn't even fully close the CLASS on ORDINARY row content either: it
+    # only escapes NON-PRINTABLE characters, so a duplicate key named
+    # literally "e" with an acute accent - printable, valid Unicode - would
+    # still crash under a non-UTF-8 stdout (e.g. PYTHONIOENCODING=ascii).
+    # The actual invariant this tool needs is at the STREAM, not at each
+    # interpolation site: reconfigure stdout/stderr to backslash-escape
+    # anything they can't encode, rather than crashing on it. This closes
+    # every current and future row/filename-controlled string in one place,
+    # rather than requiring every future print site to remember `!r`.
+    for _stream in (sys.stdout, sys.stderr):
+        if hasattr(_stream, "reconfigure"):
+            _stream.reconfigure(errors="backslashreplace")
+
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     g = ap.add_mutually_exclusive_group()
