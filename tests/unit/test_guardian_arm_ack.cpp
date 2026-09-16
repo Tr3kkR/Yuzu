@@ -12,6 +12,7 @@
 #include <yuzu/agent/spark.hpp>
 
 #include "test_helpers.hpp" // yuzu::test::spin_until
+#include "test_log_capture.hpp" // yuzu::test::LogCapture
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -647,7 +648,11 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
     ledger.add_pending("r1", receipt);
 
     std::size_t failed_out = 0;
-    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 1);
+    yuzu::test::LogCapture logs;
+    const std::size_t drained = ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out);
+    logs.stop();
+    CHECK(logs.text().find("status=Wedged") != std::string::npos);
+    CHECK(drained == 1);
     CHECK(failed_out == 1);
     {
         const auto s = ledger.arm_stats();
@@ -696,7 +701,12 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (ti
     ledger.add_pending("r2", r2_receipt);
 
     std::size_t failed_out = 0;
-    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 2);
+    yuzu::test::LogCapture logs;
+    const std::size_t drained = ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out);
+    logs.stop();
+    CHECK(logs.text().find("status=Wedged") != std::string::npos);
+    CHECK(logs.text().find("status=CongestionExpired") != std::string::npos);
+    CHECK(drained == 2);
     CHECK(failed_out == 2);
     {
         const auto s = ledger.arm_stats();
@@ -705,4 +715,12 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (ti
         CHECK(s->failed == 2);
     }
     CHECK_FALSE(ledger.can_advance());
+
+    // Adversarial-review finding (2026-09-15): the Wedged test above already covers
+    // this half (":660-664") - CongestionExpired needs the identical proof. Both
+    // receipts are already resolved and erased from pending; a second drain finds
+    // nothing left for either and must not double-count.
+    std::size_t failed_out2 = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0);
+    CHECK(failed_out2 == 0);
 }

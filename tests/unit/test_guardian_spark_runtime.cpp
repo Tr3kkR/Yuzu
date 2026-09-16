@@ -7599,6 +7599,18 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2), coupling proof: an identical (rule_id, sp
                                    std::chrono::seconds(10)));
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
+
+    // Adversarial-review finding (2026-09-15): the assertions above prove the FIFO
+    // cleared, but not that a fresh attach on the SAME key genuinely arms afterward -
+    // the direct regression test for the ghost-mapping hazard the no-index-handback
+    // design (PLAN "Correction to the kickoff") exists to avoid. A different rule_id
+    // targeting the identical spec (same key) proves no stale index refcount from
+    // re-observation is blocking a real 0->1 edge.
+    const auto res3 = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
+    REQUIRE(res3.has_value());
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->arm_entries.load() == 2); // the original arm, plus this genuinely new one
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_id) "
@@ -7778,6 +7790,14 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): repeated identical retries onto a Wedged 
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
+
+    // Adversarial-review finding (2026-09-15): same ghost-mapping regression test as
+    // the coupling-proof case above - repeated re-observation must leave nothing
+    // behind that blocks a genuinely fresh arm on the same key afterward.
+    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
+    REQUIRE(res_fresh.has_value());
+    CHECK(rt->rule_count() == 1);
+    CHECK(b->arm_entries.load() == 2); // the original arm, plus this genuinely new one
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id targets a "
