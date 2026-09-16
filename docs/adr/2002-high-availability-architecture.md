@@ -353,7 +353,7 @@ candidates the local `AgentRegistry` has no live session for, and every send sti
 for an already-confined send, never bypasses it. **This changes ZERO monolith routing outcomes**: a
 direct-connected agent never gets a `GatewayRouteStore` row (only the gateway-service writer path
 writes rows), so on today's single-replica monolith a local miss means the agent is genuinely absent and
-the fallback consult only ever CONFIRMS "no route." Proven in Task C's own test suite ([dispatch] 2152
+the fallback consult only ever CONFIRMS "no route." Proven in Task C's own test suite ([dispatch] 2163
 assertions unchanged-green plus a decoy-directory-row test where a locally-known agent ignores a
 deliberately-wrong directory row). A routable local-miss queues via the new
 `AgentRegistry::send_via_directory` onto `gw_pending_`, carrying an optional `cluster_id` that is INERT
@@ -374,8 +374,10 @@ writes stay fail-open (see the design-obligations bullets below for the full rat
 consumed the degraded-read case Task C defined (`ConfinedDispatchOutcome::route_unreadable`): the
 command-outbox delivery loop now RESCHEDULES on it (a new
 `yuzu_server_command_outbox_deliver_retry_cause_total{cause}` counter separates the two causes), and it
-is discriminated at all five operator-facing zero-reach cascade sites (#3424/#3511:
-`mcp_server.cpp`/`command_routes.cpp`/`server.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`) plus two
+is discriminated at all FOUR operator-facing zero-reach cascade sites that can actually reach it
+(#3424/#3511: `mcp_server.cpp`/`command_routes.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`) —
+`server.cpp`'s legacy-forward site is Broadcast-only and correctly carries no `route_unreadable` branch
+(`ArmDispatchResult::route_unreadable` can never be set on that path) — plus two
 additional `ConfinedDispatchOutcome` consumers a grep of every `containment_unreadable` site caught
 (`deployment_engine.cpp`, `policy_evaluator.cpp`). **`route_unreadable` is deliberately NOT
 interchangeable with `containment_unreadable`** (Gate-8 finding UP-1): a fail-closed containment gate
@@ -552,8 +554,10 @@ routing outcomes** because a direct-connected agent never has a directory row; c
 (`authz::in_scope`) is checked before every send regardless of where the routing information came from.
 **Task D consumed the resulting `route_unreadable` outcome** (a degraded directory READ, the systemic
 sibling of `containment_unreadable`): the outbox delivery loop RESCHEDULES on it instead of marking
-`no_agents_reached`, it is discriminated at the five zero-reach cascade sites (#3424/#3511) plus the
-`deployment_engine.cpp`/`policy_evaluator.cpp` consumers, and the `YuzuGatewayRouteWriteFailed` /
+`no_agents_reached`, it is discriminated at the FOUR operator-facing zero-reach cascade sites
+(#3424/#3511: `mcp_server.cpp`/`command_routes.cpp`/`workflow_routes.cpp`/`dashboard_routes.cpp`;
+`server.cpp`'s legacy-forward is Broadcast-only, wires no route fallback, and correctly has no branch)
+plus the `deployment_engine.cpp`/`policy_evaluator.cpp` consumers, and the `YuzuGatewayRouteWriteFailed` /
 `YuzuGatewayRouteUnreadable` alert rules shipped (`docs/prometheus/yuzu-alerts.yml`). 4.2b's review also
 RE-VERIFIED the once-per-session property (#4324) before this wiring landed — see the design-obligations
 bullet above. **The directory is no longer literally inert, but it is still BEHAVIORALLY inert on the
