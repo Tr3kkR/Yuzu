@@ -149,22 +149,37 @@ TEST_CASE("pending_status_to_string", "[auth][role]") {
 // ScopedEnv precedent in test_server_ota_options.cpp.
 #if defined(__APPLE__)
 namespace {
+// RAII save/restore of an environment variable, set OR unset for the scope's
+// duration. The unset overload matters as much as the set one: a REQUIRE/SKIP
+// between an inline unsetenv() and a manual restore leaks the mutated env
+// across the rest of the test binary if anything in between throws (SKIP()
+// does, via Catch::TestSkipException) — this guard's destructor always runs.
 struct ScopedEnv {
+    struct Unset {};
     std::string name;
     bool had_prev = false;
     std::string prev;
     ScopedEnv(std::string n, const std::string& v) : name(std::move(n)) {
-        if (const char* cur = std::getenv(name.c_str())) {
-            had_prev = true;
-            prev = cur;
-        }
+        capture_prev();
         ::setenv(name.c_str(), v.c_str(), 1);
+    }
+    ScopedEnv(std::string n, Unset) : name(std::move(n)) {
+        capture_prev();
+        ::unsetenv(name.c_str());
     }
     ~ScopedEnv() {
         if (had_prev)
             ::setenv(name.c_str(), prev.c_str(), 1);
         else
             ::unsetenv(name.c_str());
+    }
+
+  private:
+    void capture_prev() {
+        if (const char* cur = std::getenv(name.c_str())) {
+            had_prev = true;
+            prev = cur;
+        }
     }
 };
 } // namespace
@@ -200,16 +215,8 @@ TEST_CASE("default_cert_dir: non-root with HOME unset falls back to the fixed "
     if (::geteuid() == 0) {
         SKIP("test process is root — HOME-unset fallback is a non-root-only path");
     }
-    bool had_prev = false;
-    std::string prev;
-    if (const char* cur = std::getenv("HOME")) {
-        had_prev = true;
-        prev = cur;
-    }
-    ::unsetenv("HOME");
+    ScopedEnv env{"HOME", ScopedEnv::Unset{}};
     REQUIRE(default_cert_dir() == fs::path{"/Library/Application Support/Yuzu/certs"});
-    if (had_prev)
-        ::setenv("HOME", prev.c_str(), 1);
 }
 
 TEST_CASE("default_config_path: root always resolves to /etc/yuzu/yuzu-server.cfg",
@@ -239,17 +246,9 @@ TEST_CASE("default_config_path: non-root with HOME unset falls back to the fixed
     if (::geteuid() == 0) {
         SKIP("test process is root — HOME-unset fallback is a non-root-only path");
     }
-    bool had_prev = false;
-    std::string prev;
-    if (const char* cur = std::getenv("HOME")) {
-        had_prev = true;
-        prev = cur;
-    }
-    ::unsetenv("HOME");
+    ScopedEnv env{"HOME", ScopedEnv::Unset{}};
     REQUIRE(default_config_path() ==
             fs::path{"/Library/Application Support/Yuzu/yuzu-server.cfg"});
-    if (had_prev)
-        ::setenv("HOME", prev.c_str(), 1);
 }
 #endif // __APPLE__
 

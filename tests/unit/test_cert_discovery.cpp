@@ -130,22 +130,37 @@ TEST_CASE("discover_install_ca_path() default overload scans the standard instal
 
 #if defined(__APPLE__)
 namespace {
+// RAII save/restore of an environment variable, set OR unset for the scope's
+// duration. The unset overload matters as much as the set one: a REQUIRE/SKIP
+// between an inline unsetenv() and a manual restore leaks the mutated env
+// across the rest of the test binary if anything in between throws (SKIP()
+// does, via Catch::TestSkipException) — this guard's destructor always runs.
 struct ScopedEnv {
+    struct Unset {};
     std::string name;
     bool had_prev = false;
     std::string prev;
     ScopedEnv(std::string n, const std::string& v) : name(std::move(n)) {
-        if (const char* cur = std::getenv(name.c_str())) {
-            had_prev = true;
-            prev = cur;
-        }
+        capture_prev();
         ::setenv(name.c_str(), v.c_str(), 1);
+    }
+    ScopedEnv(std::string n, Unset) : name(std::move(n)) {
+        capture_prev();
+        ::unsetenv(name.c_str());
     }
     ~ScopedEnv() {
         if (had_prev)
             ::setenv(name.c_str(), prev.c_str(), 1);
         else
             ::unsetenv(name.c_str());
+    }
+
+  private:
+    void capture_prev() {
+        if (const char* cur = std::getenv(name.c_str())) {
+            had_prev = true;
+            prev = cur;
+        }
     }
 };
 } // namespace
@@ -219,13 +234,7 @@ TEST_CASE("discover_install_ca_path(): non-root with HOME unset only checks "
     if (::geteuid() == 0) {
         SKIP("test process is root — HOME-unset behaviour is a non-root-only path");
     }
-    bool had_prev = false;
-    std::string prev;
-    if (const char* cur = std::getenv("HOME")) {
-        had_prev = true;
-        prev = cur;
-    }
-    ::unsetenv("HOME");
+    ScopedEnv env{"HOME", ScopedEnv::Unset{}};
 
     auto found = discover_install_ca_path();
     // /etc/yuzu/certs/default-ca.pem is expected absent in the test sandbox
@@ -234,8 +243,5 @@ TEST_CASE("discover_install_ca_path(): non-root with HOME unset only checks "
     // other candidate, since none should have been added.
     if (!fs::exists("/etc/yuzu/certs/default-ca.pem"))
         REQUIRE_FALSE(found.has_value());
-
-    if (had_prev)
-        ::setenv("HOME", prev.c_str(), 1);
 }
 #endif // __APPLE__
