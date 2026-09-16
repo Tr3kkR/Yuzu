@@ -1505,9 +1505,16 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         // as Accepted - this call created no claim of its own (arm_claim, the
         // local out-param, is still null here), so there is nothing for
         // claim_rollback to undo either way. The caller polls receipt_status() on
-        // this receipt exactly as it would for any other Accepted result; it will
-        // correctly report Wedged until the pre-existing head's own resolution
-        // (already independently in motion) eventually lands.
+        // this receipt exactly as it would for any other Accepted result - but
+        // unlike an ordinary unresolved Accepted receipt, this one is already
+        // terminal (Wedged) at the moment it's handed back, and STAYS Wedged:
+        // every downstream write site only sets a claim's `end` while it is
+        // still None, so this receipt's status never changes, even once the
+        // head's own underlying async operation eventually completes
+        // (test-pinned: test_guardian_spark_runtime.cpp's sticky-Wedged-after-
+        // late-success case). Don't read "eventually resolves" into this -
+        // nothing about calling attach_rule again changes it either, short of
+        // a genuinely different rule_id/spec reaching this key.
         return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
                           .receipt = ArmReceipt{core.claim}};
     }

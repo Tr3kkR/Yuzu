@@ -7,14 +7,17 @@
  *
  * GuardianArmAckLedger tracks ONE outstanding "application" - the set of rules
  * a single apply_rules() push accepted for spark arming
- * (GuardianEngine::ReconcileOutcome::Accepted) whose arms have not yet
- * resolved - so a heartbeat-bounded drain (§R5.3) can tell whether a
- * generation may advance, and a same-generation full_sync retry can be told
- * apart from a genuinely new or changed push (§R5.3's own duplicate-retry
- * language: "A same-generation re-push ... is a no-op while every outstanding
- * episode for that generation is still genuinely pending ... and only
- * triggers a full re-apply once something has actually failed, expired, or
- * the push's content has changed underneath it").
+ * (GuardianEngine::ReconcileOutcome::Accepted) - so a heartbeat-bounded drain
+ * (§R5.3) can tell whether a generation may advance, and a same-generation
+ * full_sync retry can be told apart from a genuinely new or changed push
+ * (§R5.3's own duplicate-retry language: "A same-generation re-push ... is a
+ * no-op while every outstanding episode for that generation is still
+ * genuinely pending ... and only triggers a full re-apply once something has
+ * actually failed, expired, or the push's content has changed underneath
+ * it"). Most Accepted receipts genuinely have not yet resolved when added -
+ * but a re-observed Wedged receipt (rung 9c PR-5c, #4221 up-2) is already
+ * terminal the moment it is registered; the ledger does not distinguish the
+ * two cases, it just drains whatever each receipt's own status reports.
  *
  * Built and independently tested here in Unit 5; wired into the live path by
  * Unit 6 - reconcile_rule_locked() now calls GuardianSparkRuntime::attach_rule
@@ -106,13 +109,16 @@ public:
     void begin_application(std::uint64_t generation, std::string content_id, bool full_sync,
                            std::size_t applied);
 
-    /// Add one rule's accepted-but-unresolved arm to the current application.
-    /// Caller's responsibility: only ever called for a rule_id
-    /// reconcile_rule_locked mapped to ReconcileOutcome::Accepted, for the
-    /// application currently open (i.e. after begin_application() for this
-    /// push - never across a push boundary, and never with no current
-    /// application). A no-op (logged, not asserted - this is bookkeeping, not
-    /// a safety property) if called with no current application.
+    /// Add one rule's accepted arm to the current application - USUALLY still
+    /// unresolved, but a re-observed Wedged receipt (rung 9c PR-5c, #4221
+    /// up-2) is already terminal at this call; drain_locked() resolves it on
+    /// its very next tick either way. Caller's responsibility: only ever
+    /// called for a rule_id reconcile_rule_locked mapped to
+    /// ReconcileOutcome::Accepted, for the application currently open (i.e.
+    /// after begin_application() for this push - never across a push
+    /// boundary, and never with no current application). A no-op (logged, not
+    /// asserted - this is bookkeeping, not a safety property) if called with
+    /// no current application.
     void add_pending(std::string rule_id, GuardianSparkRuntime::ArmReceipt receipt);
 
     /// Mark the current application as having hit one of apply_rules()'s

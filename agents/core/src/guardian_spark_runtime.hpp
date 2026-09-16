@@ -1218,8 +1218,14 @@ public:
     /// return Armed"). On an unresolved claim it hands ownership to claims_/the
     /// completion callback - never marking it waiter_abandoned, since Accepted means
     /// the operation is still wanted, not abandoned - and returns Accepted(receipt)
-    /// immediately, without waiting. GuardianEngine::reconcile_rule_locked() is the
-    /// production caller as of Unit 6.
+    /// immediately, without waiting.
+    ///
+    /// Exception (rung 9c PR-5c, #4221 up-2): AttachCoreState::Reobserved also
+    /// returns Accepted, but for a pre-existing, already-Wedged head this call did
+    /// NOT create and does not own - see attach_core()'s own doc comment for that
+    /// branch. That receipt is already terminal; nothing further resolves it.
+    ///
+    /// GuardianEngine::reconcile_rule_locked() is the production caller as of Unit 6.
     std::expected<ArmOutcome, std::string> attach_rule(NonWaiting, std::string rule_id,
                                                        SparkSpec spec, RuleAssertion assertion,
                                                        bool emit_compliant_edge);

@@ -1243,9 +1243,11 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // same-rule_id/same-spec retry, which constructs no new claim at all) - so
         // it is counted as applied exactly like Armed/Inert, never added to
         // reconcile_failures/arm_failures_. reconcile_rule_locked() already
-        // registered the receipt with ack_ledger_ (this application was begun
-        // before this loop started, or - for a re-observed retry - was already
-        // registered by the original attach this retry is reporting on); the
+        // registered the receipt with ack_ledger_ for THIS application (this
+        // application was begun before this loop started) - including for a
+        // re-observed retry, whose receipt is registered fresh by THIS call, not
+        // inherited from whatever application the original attach ran under (see
+        // the add_pending() call site's own doc comment below, ~:1940); the
         // generation-hold gate below now reads ack_ledger_->can_advance(), not this
         // counter - pending_arms is kept only for the diagnostic log line.
         if (outcome == ReconcileOutcome::Accepted)
