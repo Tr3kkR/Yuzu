@@ -560,7 +560,16 @@ public:
     /// yields rather than overwriting a live session with a stale one (its own revoke already
     /// committed, so nothing is lost by not installing). This restores the ordering the old
     /// single-locked implementation gave for free; it does not add a NEW guarantee beyond that.
-    [[nodiscard]] std::expected<void, std::string> register_agent(const pb::AgentInfo& info);
+    ///
+    /// Follow-up (HA WS-4 4.2b, post-merge review #4344, MEDIUM finding 1): on success, returns
+    /// the `shared_ptr<AgentSession>` this call just installed — pointer identity a caller can
+    /// hand to `remove_agent_if_same` for an identity-guarded rollback if a LATER step in its own
+    /// registration flow (e.g. `GatewayRouteStore::register_fresh`) fails after this call already
+    /// installed the session. session_id is still empty at this point (mapped later by
+    /// `map_session`), so identity — not session_id string equality — is the only safe key for
+    /// that rollback; see `remove_agent_if_same`.
+    [[nodiscard]] std::expected<std::shared_ptr<AgentSession>, std::string>
+    register_agent(const pb::AgentInfo& info);
 
     void set_stream(const std::string& agent_id,
                     grpc::ServerReaderWriter<pb::CommandRequest, pb::CommandResponse>* stream,
@@ -596,6 +605,18 @@ public:
     /// Remove an agent only if its current session_id matches (prevents stale
     /// Subscribe cleanup from clobbering a newer reconnection).
     void remove_agent_if_session(const std::string& agent_id, const std::string& session_id);
+
+    /// HA WS-4 4.2b follow-up (post-merge review #4344, MEDIUM finding 1): remove an agent ONLY
+    /// if the CURRENTLY installed session is the exact object `install` returned — pointer
+    /// identity, not session_id (which is empty until `map_session` runs, so a string key cannot
+    /// discriminate here). Ghost-session rollback: a caller whose `register_agent` succeeded but
+    /// a LATER step in its own registration flow failed (e.g. gateway `register_fresh`) calls
+    /// this with the shared_ptr `register_agent` returned, tearing the just-installed session
+    /// back down. A concurrent `register_agent` for the same `agent_id` that has already
+    /// superseded `installed` by the time this runs is left alone — this call is a no-op, exactly
+    /// like `remove_agent_if_session`'s own supersede tolerance.
+    void remove_agent_if_same(const std::string& agent_id,
+                              const std::shared_ptr<AgentSession>& installed);
 
     /// Clear stream only if the session_id matches the current session.
     void clear_stream_if_session(const std::string& agent_id, const std::string& session_id);

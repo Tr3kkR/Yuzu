@@ -2394,7 +2394,19 @@ std::string DashboardRoutes::render_results(
             for (size_t c = 0; c < rl.fields.size(); ++c) {
                 if (!is_visible(c + 1)) continue;
                 auto esc = html_escape(rl.fields[c]);
-                html += "<td title=\"" + esc + "\">" + esc + "</td>";
+                // #4187: a cell whose raw value has a documented non-obvious
+                // meaning (e.g. autoruns' enabled=unknown) gets an
+                // explanatory title= instead of the value echoed back at
+                // itself, plus a visible affordance so it's not hover-only
+                // discoverable -- matches the retention-paused table's
+                // existing badge-with-title precedent elsewhere in this file.
+                auto hint = cell_hint_for(plugin, rl.fields, c);
+                if (hint.empty()) {
+                    html += "<td title=\"" + esc + "\">" + esc + "</td>";
+                } else {
+                    html += "<td class=\"cell-hint\" title=\"" +
+                           html_escape(std::string{hint}) + "\">" + esc + "</td>";
+                }
             }
             html += "</tr>";
             // Detail drawer — show every column regardless of template

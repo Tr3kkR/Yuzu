@@ -118,7 +118,16 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      a resource IS the MCP surface for static content. Recorded class-level
      so the next compiled-in catalog cites this entry (governance Gate-3
      architect + Gate-4 consistency-auditor, PR D.1 of the plugin docs
-     programme).
+     programme). **Addendum, 2026-09-14 (#4108):** this entry extends
+     verbatim to a compiled-in specification surfaced as a REST route + an
+     MCP **resource template** (`resources/templates/list`), not only a
+     static resource — `GET /api/v1/discover/plugin-docs/{name}` and
+     `yuzu://plugin-docs/{name}` satisfy the twin the same way, enumerable
+     via `resources/templates/list` in place of `resources/list`. Recorded
+     as an addendum rather than a new entry because the underlying
+     rationale (compiled-in content, tier-then-permission gated, the same
+     `discover_plugins` tool-level entry point) is identical; only the
+     listing method differs (governance Gate-4 consistency-auditor).
 
    - **2026-07-08 — SCIM v2 provisioning (`/scim/v2/*`, PR #2018).** REST-only,
      no MCP twin, and absent from route discovery (A2/A3) — a "no" on
