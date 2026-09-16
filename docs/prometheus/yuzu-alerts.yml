@@ -903,7 +903,9 @@ groups:
             sending arguments past the tool's published inputSchema bounds -
             check whether it read tools/list - or someone is probing the limits.
             Denials are audited as mcp.<tool>|denied with detail
-            "input bound exceeded: <reason>"; correlate there for the principal.
+            "input bound exceeded: <reason or field message>"; correlate there
+            for the principal (the #4353-follow-up tools carry a human-
+            readable field message here, not the bare reason label).
 
       - alert: YuzuMcpEngineRevalidateStoreUnreachable
         expr: |

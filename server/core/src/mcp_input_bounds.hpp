@@ -82,6 +82,84 @@ inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
     "target_conflict",
 };
 
+// ── #4353 follow-up: batch B2/B4 field bounds (handler-side) ──────────────
+// Gate 2 finding on #4364 (governance re-run): the maxLength bounds #4353
+// added to 19 of its 20 tools' served schemas were enforced ONLY on the
+// approval-gated path - `mcp_server.cpp`'s sole `compiled_input_schemas()
+// .at(tool_name).validate(args)` call site sits inside `requires_approval()`
+// (mcp_policy.hpp), which itself returns false immediately for an EMPTY
+// `mcp_tier` - and `/mcp/v1/`'s `auth_fn` (`require_auth`) admits a plain
+// RBAC session or a non-MCP-tiered API token the same way any REST route
+// does, so that caller class never reaches C8 at all, on ANY tool. 11 of the
+// 19 are ALSO never approval-gated even at a non-empty tier; 3
+// (`create_result_set_from_tar_query`, `create_result_set_from_instruction_result`,
+// `reevaluate_result_set`) are approval-gated at supervised tier only, so an
+// operator-tier call skipped validate() too; the remaining 5
+// (`create_management_group`, `update_management_group`,
+// `add_management_group_member`, `assign_management_group_role`,
+// `delete_result_set`) are approval-gated whenever `mcp_tier` is non-empty,
+// but the empty-tier gap above still applies to them. `unlock_account` is
+// the ONE tool of #4353's 20 that needed nothing further: it already denies
+// an empty `mcp_tier` outright (Gate 6 #2146 B4 fix) and its `username`
+// already goes through `is_valid_username()`, whose own limit IS this
+// field's 64-byte bound - not merely equal to it by coincidence. Each
+// constant below mirrors its field's served schema `maxLength` exactly -
+// the same "one contract in two places" discipline as kExecInstr* above,
+// minus the cross-check test (these are single-tool, low-traffic surfaces;
+// execute_instruction's worst-case-body static_asserts don't apply here -
+// none of these tools accept unbounded-count arrays).
+// `update_management_group`'s `membership_type` has no constant here for the
+// same reason it has none in the schema - it is enum-constrained
+// (`static`/`dynamic`), not a free-text field.
+inline constexpr std::size_t kResultSetIdMaxLen = 64;             // result-set `id`
+inline constexpr std::size_t kMgmtGroupIdMaxLen = 256;            // management-group `group_id` (and
+                                                                   // `agent_id`/`principal_id`, same value)
+inline constexpr std::size_t kMgmtGroupNameMaxLen = 256;          // management-group `name`
+inline constexpr std::size_t kMgmtGroupDescriptionMaxLen = 1024;  // management-group `description`
+inline constexpr std::size_t kMgmtGroupScopeExprMaxLen = 4096;    // management-group `scope_expression`
+inline constexpr std::size_t kMcpCursorMaxLen = 2048;             // pagination `cursor`
+inline constexpr std::size_t kResultSetNameMaxLen = 256;          // result-set `name`
+inline constexpr std::size_t kResultSetParentIdMaxLen = 64;       // result-set `parent_id`
+inline constexpr std::size_t kResultSetSourceKindMaxLen = 64;     // create_result_set `source_kind`
+inline constexpr std::size_t kResultSetDeviceIdMaxLen = 256;      // create_result_set `device_ids[]` item
+inline constexpr std::size_t kCheckPermSecurableTypeMaxLen = 128; // check_permission `securable_type`
+inline constexpr std::size_t kCheckPermOperationMaxLen = 64;      // check_permission `operation`
+inline constexpr std::size_t kInventoryQueryPluginMaxLen = 64;    // inventory-query `conditions[].plugin`
+inline constexpr std::size_t kInventoryQueryFieldMaxLen = 128;    // inventory-query `conditions[].field`
+inline constexpr std::size_t kInventoryQueryOpMaxLen = 32;        // inventory-query `conditions[].op`
+inline constexpr std::size_t kInventoryQueryValueMaxLen = 512;    // inventory-query `conditions[].value`
+inline constexpr std::size_t kInstructionIdMaxLen = 256;          // from-instruction-result `instruction_id`
+inline constexpr std::size_t kMatcherColumnMaxLen = 128;          // from-instruction-result `matcher.column`
+inline constexpr std::size_t kMatcherOpMaxLen = 32;               // from-instruction-result `matcher.op`
+inline constexpr std::size_t kMatcherValueMaxLen = 512;           // from-instruction-result `matcher.value`
+
+/// The 19 of #4353's 20 tools whose schema `maxLength` needed a handler-side
+/// twin (see block above; `unlock_account` is the exception). Single source
+/// for the `yuzu_mcp_tool_args_too_large_total` boot pre-seed in server.cpp -
+/// same discipline as kExecInstrBoundReasons: a second literal list here is
+/// how a tool ends up emitted-but-unseeded.
+inline constexpr std::array<std::string_view, 19> kFieldBoundTools{
+    "create_management_group",
+    "update_management_group",
+    "add_management_group_member",
+    "get_management_group",
+    "list_management_group_roles",
+    "assign_management_group_role",
+    "check_permission",
+    "list_result_sets",
+    "create_result_set",
+    "create_result_set_from_inventory_query",
+    "create_result_set_from_tar_query",
+    "create_result_set_from_instruction_result",
+    "get_result_set",
+    "get_result_set_members",
+    "get_result_set_lineage",
+    "pin_result_set",
+    "unpin_result_set",
+    "reevaluate_result_set",
+    "delete_result_set",
+};
+
 // ── Sizing: the per-field caps must fit under the TRANSPORT cap ───────────
 // #2478 refuses a /mcp/ body over kMcpMaxRequestBodyBytes before reading it.
 // The caps above are what a caller may legitimately fill, so their sum has to

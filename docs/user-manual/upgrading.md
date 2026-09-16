@@ -2821,7 +2821,7 @@ Before upgrading any component:
   outbound `ReportInventory` traffic per agent — adjust egress baselines/firewall
   expectations; (b) the data lands in a **new Postgres schema**
   (`software_inventory_store`, auto-migrated at boot, fail-closed); (c) it requires
-  the `installed_apps` plugin to be loaded — a build with `-Dbuild_examples=false`
+  the `installed_apps` plugin to be loaded — a build with `-Dbuild_agent=false`
   (or a plugin dir missing it) collects **nothing**, silently (agent logs only at
   debug). Machine-scope only, no end-user PII (no username collection) — but the
   data is device-attributable, and on **personally-assigned devices** installed-

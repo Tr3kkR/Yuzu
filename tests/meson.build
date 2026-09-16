@@ -331,6 +331,7 @@ agent_test_exe = executable(
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
+    'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
     'unit/test_passwd_lookup.cpp',       # #3406: bounded passwd resolution (agent-core seam). The
                                           # load-bearing case injects a NEVER-RETURNING lookup and asserts
                                           # the caller is released inside its budget -- the regression that
@@ -466,6 +467,8 @@ agent_test_exe = executable(
     'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
     'unit/test_windows_optional_features_parsers.cpp',           # Wave 9 PR9.2a: DismSlot CAS state machine +
                                                 # row/parameter parsers (agents/shared, agent-core primitive)
+    'unit/test_windows_optional_features_local_dispatcher.cpp',  # Wave 9 PR9.2b: real windows_optional_features
+                                                # dylib/.so/.dll driven end to end via LocalDispatcher
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -486,6 +489,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
@@ -624,6 +628,7 @@ agent_test_exe = executable(
                 wifi_plugin_lib,
                 power_health_plugin_lib,
                 autoruns_plugin_lib,  # Wave 7 PR7.1
+                windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
                 windows_updates_plugin_lib,
                 ],
 )
@@ -993,6 +998,7 @@ if build_server
       'unit/server/test_sensitive_instruction_params.cpp',
       'unit/server/test_workflow_routes.cpp',
       'unit/server/test_compliance_routes.cpp',
+      'unit/server/test_policy_admin_routes.cpp', # ADR-0031 WS-A4 Task B: policy/fragment mutator routes
       'unit/server/test_compliance_model.cpp',
       'unit/server/test_verify_routes.cpp',
       'unit/server/test_notification_routes.cpp',
@@ -1135,6 +1141,7 @@ if build_server
       'unit/server/test_network_perf_model.cpp',
       'unit/server/test_network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
       'unit/server/test_verify_api.cpp', # ADR-0031 WS-A4: the second per-family in-process API seam
+      'unit/server/test_compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
       'unit/server/test_spark_fleet_tags.cpp',
       'unit/server/test_guardian_journal_fleet_tags.cpp',
       'unit/server/test_guardian_arm_fleet_tags.cpp', # rung 9c PR-3 — arm-ledger + io-ceiling fleet rollup pin
@@ -2335,6 +2342,15 @@ if _bash_test.found()
     suite: 'docs',
     timeout: 60,
   )
+  # #4262: -Dbuild_examples=false must keep configuring a real build.
+  # Configure-only smoke test (no compile) so it stays cheap on every leg;
+  # SKIPs cleanly when vcpkg_installed/<triplet> isn't populated yet.
+  test('build_examples=false gating smoke test',
+    _bash_test,
+    args: [files('shell/test_build_examples_gating.sh')],
+    suite: 'docs',
+    timeout: 120,
+  )
 endif
 
 # QE-INFO / build-ci B3: tests/shell/test_capability_matrix_gate.sh (PR1.1
@@ -2355,20 +2371,18 @@ endif
 # to schedule it.
 #
 # CDX-P1-04/K-5: that "caught, not skipped" reasoning only holds when
-# capmatrix-gen SHOULD have been built. Under `-Dbuild_examples=false` (a
-# supported configuration, meson.build:508's `if build_agent and
-# build_examples`) the top-level build deliberately never builds
-# capmatrix-gen at all — there are no agents/plugins/*/ subdirs configured
-# for it to inspect — so this test's hard `[ -x "$CAPGEN" ]` requirement
-# would fail loudly for a configuration that is correct by design, not
-# broken. Gate registration on the SAME condition tools/capmatrix-gen's own
-# build is gated on (root meson.build: `if build_agent and build_examples`),
-# so `-Dbuild_agent=false` or `-Dbuild_examples=false` (with -Dbuild_tests=true)
-# both get a clean `meson test` rather than a false-red gate (gov-fix/build-ci:
-# the build_examples-only guard reproduced the same false-red class this PR
-# fixed under `-Dbuild_agent=false -Dbuild_tests=true`, since capmatrix-gen
-# lives under `if build_agent`).
-if _bash_test.found() and meson.can_run_host_binaries() and build_agent and build_examples
+# capmatrix-gen SHOULD have been built. Under `-Dbuild_agent=false` the
+# top-level build deliberately never builds capmatrix-gen at all — there is
+# no agent, no plugins, nothing for it to inspect — so this test's hard
+# `[ -x "$CAPGEN" ]` requirement would fail loudly for a configuration that
+# is correct by design, not broken. Gate registration on the SAME condition
+# tools/capmatrix-gen's own build is gated on (root meson.build: `if
+# build_agent`), so `-Dbuild_agent=false` (with -Dbuild_tests=true) gets a
+# clean `meson test` rather than a false-red gate. `build_examples` is
+# deliberately NOT part of this condition (#4262): every real plugin now
+# builds unconditionally under build_agent regardless of build_examples, so
+# capmatrix-gen always has something to inspect once build_agent is on.
+if _bash_test.found() and meson.can_run_host_binaries() and build_agent
   test('capability matrix gate shell tests (#2204 F10)',
     _bash_test,
     args: [files('shell/test_capability_matrix_gate.sh'), meson.project_build_root()],

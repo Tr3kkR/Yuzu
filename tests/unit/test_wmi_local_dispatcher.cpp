@@ -43,7 +43,7 @@ namespace {
 // test_registry_local_dispatcher.cpp's find_registry_plugin, pointed at the
 // wmi plugin's own build output directory. Returns an empty path (never
 // fails) when not found -- a build invoked without the agent plugins
-// (-Dbuild_examples=false) must not fail this test, it must skip it.
+// (-Dbuild_agent=false) must not fail this test, it must skip it.
 fs::path find_wmi_plugin() {
     const std::string lib_name = "wmi.dll";
 
@@ -73,7 +73,7 @@ TEST_CASE("wmi plugin: query action returns real Win32_OperatingSystem rows via 
           "[wmi][windows][local_dispatcher]") {
     auto plugin_path = find_wmi_plugin();
     if (plugin_path.empty()) {
-        WARN("wmi.dll not found (build_examples=false?) -- skipping LocalDispatcher "
+        WARN("wmi.dll not found (build_agent=false?) -- skipping LocalDispatcher "
              "round-trip test");
         return;
     }
@@ -109,7 +109,7 @@ TEST_CASE("wmi plugin: get_instance action returns real Win32_OperatingSystem "
           "[wmi][windows][local_dispatcher]") {
     auto plugin_path = find_wmi_plugin();
     if (plugin_path.empty()) {
-        WARN("wmi.dll not found (build_examples=false?) -- skipping LocalDispatcher "
+        WARN("wmi.dll not found (build_agent=false?) -- skipping LocalDispatcher "
              "round-trip test");
         return;
     }
@@ -134,7 +134,7 @@ TEST_CASE("wmi plugin: query action surfaces the plugin's own validation error, 
           "[wmi][windows][local_dispatcher]") {
     auto plugin_path = find_wmi_plugin();
     if (plugin_path.empty()) {
-        WARN("wmi.dll not found (build_examples=false?) -- skipping LocalDispatcher "
+        WARN("wmi.dll not found (build_agent=false?) -- skipping LocalDispatcher "
              "round-trip test");
         return;
     }
