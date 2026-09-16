@@ -3641,10 +3641,11 @@ persistent signer outage), the agent bounds its retries and gives up
 auto-provisioning for that run rather than looping.
 
 **Agent CA pinning is fail-closed (#1303).** When the agent has TLS on but no CA
-to pin — no `--ca-cert` **and** no install CA auto-discovered at the standard
-shared-cert path (`/etc/yuzu/certs/default-ca.pem`, ProgramData on Windows) — it
-**refuses to connect** rather than silently falling back to the system trust
-store. An empty root set makes gRPC verify against the OS roots, which do **not**
+to pin — no `--ca-cert` **and** no install CA auto-discovered at any standard
+shared-cert path (`/etc/yuzu/certs/default-ca.pem`, ProgramData on Windows, or
+`~/Library/Application Support/Yuzu/certs/default-ca.pem` for a non-root agent
+on macOS) — it **refuses to connect** rather than silently falling back to the
+system trust store. An empty root set makes gRPC verify against the OS roots, which do **not**
 trust a Yuzu self-signed install CA, so with the gateway one-way-TLS edge live any
 publicly-trusted impostor cert for the dial host would be accepted — a fail-open
 MITM on the command fan-out plane. The deliberate escape hatch is

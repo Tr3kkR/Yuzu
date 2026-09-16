@@ -25,6 +25,8 @@
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared execution/fleet statistics builders
 #include "api_token_model.hpp" // #2146 Batch B4: shared REST+MCP API-token JSON builders
 #include "management_group_model.hpp" // #2146 Batch B4: shared REST+MCP management-group JSON builders
+#include "license_model.hpp" // #2146 Batch B5: shared REST+MCP platform-license JSON builders
+#include "software_deployment_model.hpp" // #2146 Batch B5: shared REST+MCP software-deployment JSON builder
 #include "execution_scope_rules.hpp" // #4030: execution_visible/confined_projection — reused from
                                      // the #3789 GET /api/executions precedent, not re-derived
 #include "guardian_rule_spec.hpp"
@@ -1251,13 +1253,19 @@ const std::string& openapi_spec() {
       "get": {"summary": "Scope DSL kind + operator catalog (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Compiled-in static catalog (answers even when every store is down, like GET /guaranteed-state/schemas): the two GROUND kinds (__all__, group:<name>) that short-circuit per-device evaluation, every ATTRIBUTE kind the AgentRegistry::evaluate_scope resolver answers (from scope_kind_catalog(), agent_registry.hpp — colocated with the resolver so the two can't silently diverge), the CompOp comparison operators (via yuzu::scope::operator_token, scope_engine.hpp), and the EXISTS/LEN(...)/STARTSWITH(...) extended forms.", "responses": {"200": {"description": "{version, description, ground_kinds[], attribute_kinds[], operators[].{token,name,description}, extended_forms[], combinators[]}"}, "304": {"description": "Not Modified"}}}
     },
     "/discover/plugins": {
-      "get": {"summary": "Plugin/action catalog observed across connected agents (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Wraps AgentRegistry::help_json() (deduplicated plugin metadata across all currently-connected agents, richest action list wins per plugin name) with a discovery envelope. NOT a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent. Action entries carry {name, description} plus an inline parameter_schema when the action has a published InstructionDefinition (v2); actions without one are name+description only, and the envelope's actions_enriched_with_schema counts the enriched ones (GET /discover/instructions is the full schema-bearing catalog). Each plugin additionally carries docs — a build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard (docs/plugin-readme-standard.md), else null; the full manifest is GET /discover/plugin-docs.", "responses": {"200": {"description": "{version (3, treat as a minimum), description, limitation, actions_enriched_with_schema, plugins[].{name, version, description, docs, actions[].{name, description, parameter_schema?}}, commands[]}"}, "304": {"description": "Not Modified"}, "503": {"description": "Agent registry unavailable"}}}
+      "get": {"summary": "Plugin/action catalog observed across connected agents (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Wraps AgentRegistry::help_json() (deduplicated plugin metadata across all currently-connected agents, richest action list wins per plugin name) with a discovery envelope. NOT a build-time manifest of every plugin that could ever load — a plugin no currently-connected agent reports is absent. Action entries carry {name, description} plus an inline parameter_schema when the action has a published InstructionDefinition (v2); actions without one are name+description only, and the envelope's actions_enriched_with_schema counts the enriched ones (GET /discover/instructions is the full schema-bearing catalog). Each plugin additionally carries docs — a build-embedded documentation summary {summary, kind, platforms, readme, resource} when the plugin has adopted the README standard (docs/plugin-readme-standard.md), else null; the full manifest is GET /discover/plugin-docs, or GET /discover/plugin-docs/{name} for one plugin.", "responses": {"200": {"description": "{version (3, treat as a minimum), description, limitation, actions_enriched_with_schema, plugins[].{name, version, description, docs, actions[].{name, description, parameter_schema?}}, commands[]}"}, "304": {"description": "Not Modified"}, "503": {"description": "Agent registry unavailable"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — plugin
         // documentation manifests (docs/plugin-readme-standard.md rule 10).
         R"json(,
     "/discover/plugin-docs": {
-      "get": {"summary": "Per-plugin documentation manifests (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Compiled-in static catalog (answers even when every store is down, like GET /discover/scope-kinds): one manifest per agent plugin that has adopted the README standard, generated by tools/plugin-doc-gen from agents/plugins/<name>/README.md and embedded at build time — how the plugin works, per-OS support/rung/mechanism, privileges, inputs, output columns with vocabularies, sample rows, caveats and source paths. Byte-identical to the MCP resource yuzu://plugin-docs. A plugin absent here has not adopted the standard yet; GET /discover/plugins reports docs:null for it.", "responses": {"200": {"description": "{catalog:\"plugin-docs\", version, source:\"build-embedded\", description, plugin_count, skipped_invalid, plugins[].{manifest_version, name, version, description, kind, platforms, security[], actions[].{action, definition_ids[], legs}, definitions[], inputs[].{definition_id, name, type, required, default, constraints, description}, outputs[], how_it_works, outputs_note, privileges[], result_status[], where_the_data_goes[], samples, caveats[], source, readme, leg_hash}}"}, "304": {"description": "Not Modified"}}}
+      "get": {"summary": "Per-plugin documentation manifests (A2 discovery)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read. Compiled-in static catalog (answers even when every store is down, like GET /discover/scope-kinds): one manifest per agent plugin that has adopted the README standard, generated by tools/plugin-doc-gen from agents/plugins/<name>/README.md and embedded at build time — how the plugin works, per-OS support/rung/mechanism, privileges, inputs, output columns with vocabularies, sample rows, caveats and source paths. Byte-identical to the MCP resource yuzu://plugin-docs. A plugin absent here has not adopted the standard yet; GET /discover/plugins reports docs:null for it. GET /discover/plugin-docs/{name} below narrows this to one plugin.", "responses": {"200": {"description": "{catalog:\"plugin-docs\", version, source:\"build-embedded\", description, plugin_count, skipped_invalid, plugins[].{manifest_version, name, version, description, kind, platforms, security[], actions[].{action, definition_ids[], legs}, definitions[], inputs[].{definition_id, name, type, required, default, constraints, description}, outputs[], how_it_works, outputs_note, privileges[], result_status[], where_the_data_goes[], samples, caveats[], source, readme, leg_hash}}"}, "304": {"description": "Not Modified"}}}
+    })json"
+        // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — per-plugin
+        // documentation manifest, #4108.
+        R"json(,
+    "/discover/plugin-docs/{name}": {
+      "get": {"summary": "Single plugin's documentation manifest (A2 discovery, #4108)", "tags": ["Discovery"], "description": "Requires Infrastructure:Read, gated BEFORE the name lookup so a denied caller learns nothing about which plugin names exist. Same manifest_by_name builder as GET /discover/plugin-docs and the MCP resource template yuzu://plugin-docs/{name} — the response is byte-identical to the matching plugins[] element of the whole catalog. An unrecognised name is a 404, never a 200 with an empty body.", "parameters": [{"name": "name", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "One manifest object: {manifest_version, name, version, description, kind, platforms, security[], actions[].{action, definition_ids[], legs}, definitions[], inputs[].{definition_id, name, type, required, default, constraints, description}, outputs[], how_it_works, outputs_note, privileges[], result_status[], where_the_data_goes[], samples, caveats[], source, readme, leg_hash}"}, "304": {"description": "Not Modified"}, "404": {"description": "No documentation manifest for that plugin name"}}}
     })json"
         // Fresh literal split (MSVC C2026 ~16 KB per-literal cap) — Periodic
         // Access Reviews (SOC 2 CC6.2) paths.
@@ -1497,7 +1505,7 @@ const std::string& openapi_spec() {
       "delete": {"summary": "Remove a license entry", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Write.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[a-f0-9]+$"}}], "responses": {"200": {"description": "{removed: true}"}, "404": {"description": "No license with this id"}, "503": {"description": "A genuine database write failure"}}}
     },
     "/license/alerts": {
-      "get": {"summary": "List license alerts (expiration warnings, seat-limit approaching)", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Read.", "parameters": [{"name": "unacknowledged", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When present/true, return only unacknowledged alerts"}], "responses": {"200": {"description": "{data: [{id, alert_type, message, triggered_at, acknowledged}]}"}, "503": {"description": "A genuine database read failure"}}}
+      "get": {"summary": "List license alerts (expiration warnings, seat-limit approaching)", "tags": ["License Management"], "description": "Only available when LicenseStore is wired — the server does not construct it today (licensing deliberately shelved, ADR-0048); documented for when a future change re-wires it. Requires License:Read.", "parameters": [{"name": "unacknowledged", "in": "query", "required": false, "schema": {"type": "boolean"}, "description": "When present/true, return only unacknowledged alerts"}], "responses": {"200": {"description": "{data: [{id, license_id, alert_type, message, triggered_at, acknowledged}]}"}, "503": {"description": "A genuine database read failure"}}}
     })json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #4031 directory/
         // enrollment/OIDC-config read twins.
@@ -10353,20 +10361,12 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
+            // Shared builder (software_deployment_model.hpp) - the MCP twin
+            // list_software_deployments calls the SAME per-row function
+            // (docs/api-twin-recipe.md §1 Rule 1 / §8 worked example).
             JArr arr;
-            for (const auto& d : *deps) {
-                arr.add(JObj()
-                            .add("id", d.id)
-                            .add("package_id", d.package_id)
-                            .add("status", d.status)
-                            .add("created_by", d.created_by)
-                            .add("created_at", d.created_at)
-                            .add("started_at", d.started_at)
-                            .add("completed_at", d.completed_at)
-                            .add("agents_targeted", static_cast<int64_t>(d.agents_targeted))
-                            .add("agents_success", static_cast<int64_t>(d.agents_success))
-                            .add("agents_failure", static_cast<int64_t>(d.agents_failure)));
-            }
+            for (const auto& d : *deps)
+                arr.add_raw(software_deployment_row_json(d).dump());
             res.set_content(list_json(arr.str(), static_cast<int64_t>(deps->size())),
                             "application/json");
         });
@@ -10521,18 +10521,10 @@ void RestApiV1::register_routes(
                 res.set_content(detail::a4_error(res, days.error()), "application/json");
                 return;
             }
-            auto data = JObj()
-                            .add("id", (*lic)->id)
-                            .add("organization", (*lic)->organization)
-                            .add("seat_count", (*lic)->seat_count)
-                            .add("seats_used", (*lic)->seats_used)
-                            .add("issued_at", (*lic)->issued_at)
-                            .add("expires_at", (*lic)->expires_at)
-                            .add("edition", (*lic)->edition)
-                            .add("status", (*lic)->status)
-                            .add("days_remaining", *days)
-                            .str();
-            res.set_content(ok_json(data), "application/json");
+            // Shared builder (license_model.hpp) - the MCP twin get_platform_license
+            // calls the SAME function (docs/api-twin-recipe.md §1 Rule 1).
+            res.set_content(ok_json(platform_license_json(**lic, *days).dump()),
+                            "application/json");
         });
 
         sink.Post("/api/v1/license", [auth_fn, perm_fn, audit_fn, license_store](
@@ -10598,15 +10590,12 @@ void RestApiV1::register_routes(
                                          "application/json");
                          return;
                      }
+                     // Shared builder (license_model.hpp) - the MCP twin
+                     // list_license_alerts calls the SAME per-alert function
+                     // (docs/api-twin-recipe.md §1 Rule 1).
                      JArr arr;
-                     for (const auto& a : *alerts) {
-                         arr.add(JObj()
-                                     .add("id", a.id)
-                                     .add("alert_type", a.alert_type)
-                                     .add("message", a.message)
-                                     .add("triggered_at", a.triggered_at)
-                                     .add("acknowledged", a.acknowledged));
-                     }
+                     for (const auto& a : *alerts)
+                         arr.add_raw(license_alert_json(a).dump());
                      res.set_content(list_json(arr.str(), static_cast<int64_t>(alerts->size())),
                                      "application/json");
                  });

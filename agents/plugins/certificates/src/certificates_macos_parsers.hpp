@@ -25,8 +25,11 @@
 // unconditionally by certificates_plugin.cpp.
 
 #include <array>
+#include <cctype>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <format>
@@ -54,6 +57,129 @@ inline bool is_valid_thumbprint(std::string_view s) {
             return false;
     }
     return true;
+}
+
+// ── Store honesty (Windows/Linux) ───────────────────────────────────────────
+
+/**
+ * Canonicalize a thumbprint to uppercase hex so every downstream comparison
+ * against a parsed value (certificates_x509::extract_thumbprint always emits
+ * uppercase) is a plain `==`. The `thumbprint` request parameter is
+ * documented as case-insensitive (content/definitions/certificates.yaml) but
+ * was compared as-is on both the macOS and Linux paths, so a lowercase
+ * caller-supplied value silently failed to match. `s` is assumed already
+ * hex-validated by is_valid_thumbprint(); this only changes case, never
+ * rejects input. Also serves the Windows leg (#3247), which has the same
+ * case-insensitive-thumbprint contract.
+ */
+inline std::string canonical_thumbprint(std::string_view s) {
+    std::string out{s};
+    for (auto& c : out)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return out;
+}
+
+/// The Linux cert-store directory filter: true iff `name` contains a '.' at
+/// an index > 0 and the suffix after the LAST '.' is exactly "pem" or "crt"
+/// (case-sensitive) -- byte-for-byte parity with the retired
+/// `entry.path().extension()` test (".pem"/.crt" via std::filesystem). A
+/// leading-dot name with no other '.' (e.g. ".pem") has no extension under
+/// std::filesystem and is therefore excluded here too. Needed because A3
+/// enumerates via readdir(3) `d_name`, not `std::filesystem::directory_iterator`
+/// (peer review F4/F5), so the filter can no longer lean on
+/// `std::filesystem::path::extension()`.
+inline bool is_cert_entry_name(std::string_view name) {
+    auto dot = name.find_last_of('.');
+    if (dot == std::string_view::npos || dot == 0)
+        return false;
+    auto suffix = name.substr(dot + 1);
+    return suffix == "pem" || suffix == "crt";
+}
+
+/// Classifies the outcome of opening the Linux cert-store directory (or a
+/// `readdir(3)` call mid-enumeration, which reports failure the same way:
+/// errno set, nullptr returned). `ok` is whether the open/readdir succeeded;
+/// `err` is the resulting `errno` when it did not. ENOENT/ENOTDIR means the
+/// store simply doesn't exist -- today's "no store" semantics (list emits the
+/// header only; details/delete emit status|not_found). Anything else (EACCES,
+/// EPERM, EIO, ELOOP, ...) is a real, reportable failure to open a store that
+/// does exist.
+enum class CertDirOpen { kOpened, kAbsent, kUnreadable };
+inline CertDirOpen classify_cert_dir_open(bool ok, int err) {
+    if (ok)
+        return CertDirOpen::kOpened;
+    if (err == ENOENT || err == ENOTDIR)
+        return CertDirOpen::kAbsent;
+    return CertDirOpen::kUnreadable;
+}
+
+/// Classifies the outcome of opening one directory entry found during
+/// enumeration. `ELOOP` is the `openat(O_NOFOLLOW)` signature of a symlink
+/// entry (the Debian `c_rehash` case: entries are often symlinks into
+/// `/usr/share/ca-certificates`). `ENOENT` means the entry vanished mid-scan
+/// (removed by a concurrent process) and is skipped silently. Anything else
+/// is a genuine per-entry read failure.
+enum class CertEntryOpen { kOpened, kSymlink, kVanished, kUnreadable };
+inline CertEntryOpen classify_cert_entry_open(bool ok, int err) {
+    if (ok)
+        return CertEntryOpen::kOpened;
+    if (err == ELOOP)
+        return CertEntryOpen::kSymlink;
+    if (err == ENOENT)
+        return CertEntryOpen::kVanished;
+    return CertEntryOpen::kUnreadable;
+}
+
+/// Identity of one cert-store directory entry, captured at the moment it was
+/// opened for parsing. `dev`/`ino` are the ENTRY's own inode (an
+/// `fstatat(AT_SYMLINK_NOFOLLOW)` of the link itself for a symlink, or of the
+/// file for a regular entry). For a symlink, `link_target` is the
+/// `readlinkat` text and `target_dev`/`target_ino` are the inode the link
+/// resolved to when the certificate was parsed (captured from the fd that did
+/// the parse); both target fields stay 0 for a regular entry.
+///
+/// This closes peer-review finding F2: `example.pem -> /usr/share/ca-certificates/example.crt`,
+/// the reader parses certificate A through the link, then a package update
+/// renames certificate B over the target path -- the link's inode and its
+/// `link_target` TEXT are unchanged, only the resolved target inode differs.
+/// An identity that omitted `target_dev`/`target_ino` would delete a link now
+/// serving B, believing it was still deleting the link that served A.
+///
+/// Honest limit: an in-place rewrite of the SAME target inode (open +
+/// truncate + write, no rename) is NOT detectable by identity -- the delete
+/// decision is identity-bound, not content-bound, and proceeds against the
+/// link whose target inode is the one that was parsed, even though that
+/// inode's content has since changed underneath it.
+struct CertEntryIdentity {
+    bool is_symlink = false;
+    std::uint64_t dev = 0;
+    std::uint64_t ino = 0;
+    std::string link_target;
+    std::uint64_t target_dev = 0;
+    std::uint64_t target_ino = 0;
+
+    friend bool operator==(const CertEntryIdentity&, const CertEntryIdentity&) = default;
+};
+
+/// Decides whether a delete may proceed given the entry identity captured at
+/// match time (when the thumbprint was matched) and re-captured immediately
+/// before unlinking. Either capture missing means the identity could not be
+/// established and the delete fails closed (`kUnknown`). Both present and
+/// equal means nothing has moved underneath the caller (`kProceed`). This
+/// closes #3245's TOCTOU: the match was established on one inode, and the
+/// unlink must act on that same inode. `kChanged` covers every other case --
+/// a regular file flipped to a symlink (or vice versa) between capture and
+/// unlink, a symlink retargeted to a different path, or a symlink whose
+/// `link_target` text is unchanged but whose resolved target inode differs
+/// (the rename-over-target case F2 describes) -- any of which means the
+/// entry the caller is about to delete is not provably the entry that was
+/// matched.
+enum class DeleteRecheck { kProceed, kChanged, kUnknown };
+inline DeleteRecheck classify_delete_recheck(const std::optional<CertEntryIdentity>& at_match,
+                                             const std::optional<CertEntryIdentity>& at_unlink) {
+    if (!at_match.has_value() || !at_unlink.has_value())
+        return DeleteRecheck::kUnknown;
+    return *at_match == *at_unlink ? DeleteRecheck::kProceed : DeleteRecheck::kChanged;
 }
 
 // ── Expiry filtering helper ──────────────────────────────────────────────────

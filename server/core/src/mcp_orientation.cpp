@@ -96,8 +96,12 @@ constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundl
 constexpr std::string_view kRemediation[] = {"quarantine_device"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
+// B5 (api-parity #2146): export_ca_root_csr joins too — same PKI/CA domain,
+// same Security securable, distinct from the "Offload targets" family below
+// despite both being new in this same PR.
 constexpr std::string_view kCerts[] = {"list_issued_certs", "revoke_certificate",
-                                       "issue_code_signing_cert"};
+                                       "issue_code_signing_cert", "export_ca_root_csr",
+                                       "import_ca_chain"};
 // KEK rotation (#2395 track C) is its own family, distinct from Certificates:
 // a KEK is the server's own secrets-at-rest encryption key, not a PKI
 // certificate, and it gates on a different lifecycle (rotate/rewrap/status,
@@ -227,8 +231,30 @@ constexpr std::string_view kRbacCheck[] = {"check_permission"};
 // distinct from Directory & identity (AD/Entra sync, a different identity
 // axis) and from Engine principals (a different principal class entirely).
 constexpr std::string_view kAccountLockout[] = {"unlock_account"};
+// B5 (api-parity #2146) — response-offload targets (event-forwarding
+// webhooks). Own family: distinct securable (Infrastructure, same as several
+// others, but a distinct operator mental model) and no prior MCP presence.
+// export_ca_root_csr joins Certificates (same PKI domain as
+// list_issued_certs/revoke_certificate/issue_code_signing_cert), not this
+// family, despite both being CA-adjacent — see kCerts below.
+constexpr std::string_view kOffloadTargets[] = {
+    "list_offload_targets", "create_offload_target", "get_offload_target",
+    "delete_offload_target", "list_offload_target_deliveries"};
+// B5 — platform license lifecycle. LicenseStore is dormant on `dev`
+// (ADR-0048) — see mcp_server.hpp's forward-declaration comment — so this
+// family answers "unavailable" in production today, same posture as its
+// REST siblings.
+constexpr std::string_view kLicense[] = {"get_platform_license", "activate_platform_license",
+                                         "list_license_alerts"};
+// B5 — software-package fleet deployments. SoftwareDeploymentStore is
+// dormant on `dev` (ADR-0051) — same posture note as kLicense above. No
+// start_software_deployment tool (MFA step-up, non-interactive MCP tokens
+// cannot satisfy it) — see the tool family's own per-tool doc comments.
+constexpr std::string_view kSoftwareDeployments[] = {
+    "list_software_deployments", "create_software_deployment",
+    "rollback_software_deployment", "cancel_software_deployment"};
 
-constexpr std::array<ToolFamily, 35> kFamilies{{
+constexpr std::array<ToolFamily, 38> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -309,6 +335,14 @@ constexpr std::array<ToolFamily, 35> kFamilies{{
      kRbacCheck},
     {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
      kAccountLockout},
+    {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "
+                        "history",
+     kOffloadTargets},
+    {"Platform license", "the active platform license, activation, and lifecycle alerts",
+     kLicense},
+    {"Software deployments", "software-package fleet deployment lifecycle (list, create, "
+                             "rollback, cancel)",
+     kSoftwareDeployments},
 }};
 
 }  // namespace

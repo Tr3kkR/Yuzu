@@ -852,6 +852,89 @@ TEST_CASE("discover.plugin-docs: permission denied -> 403, no body leak",
     CHECK(res->body.find("\"plugins\"") == std::string::npos);
 }
 
+TEST_CASE("discover.plugin-docs/{name}: single manifest shape + ETag + 404 (#4108)",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    const std::string name = catalog["plugins"][0]["name"].get<std::string>();
+
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs/" + name);
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const std::string etag = res->get_header_value("ETag");
+    CHECK_FALSE(etag.empty());
+    // Same revalidation contract as the whole-catalog route (#4108 review):
+    // publicly cacheable, five-minute floor, not just "some ETag exists".
+    CHECK(res->get_header_value("Cache-Control") == "public, max-age=300");
+    CHECK(h.last_securable_type == "Infrastructure");
+    CHECK(h.last_operation == "Read");
+
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j == catalog["plugins"][0]);
+    // Same builder as the MCP resource template — byte-identical.
+    const auto* manifest = yuzu::server::plugin_docs_manifest(name);
+    REQUIRE(manifest != nullptr);
+    CHECK(res->body == manifest->json);
+
+    // No store dependency — answers 200 even with everything unwired, like
+    // the whole-catalog route.
+    DiscoverHarness bare(/*wire_rbac=*/false, /*wire_instr=*/false, /*wire_registry=*/false);
+    auto bare_res = bare.sink.Get("/api/v1/discover/plugin-docs/" + name);
+    REQUIRE(bare_res);
+    CHECK(bare_res->status == 200);
+
+    auto cached = h.sink.Get("/api/v1/discover/plugin-docs/" + name, {{"If-None-Match", etag}});
+    REQUIRE(cached);
+    CHECK(cached->status == 304);
+
+    // Unknown name: 404, A4 envelope, no leak of a real manifest's shape.
+    auto missing = h.sink.Get("/api/v1/discover/plugin-docs/no_such_plugin_for_docs");
+    REQUIRE(missing);
+    CHECK(missing->status == 404);
+    auto mj = nlohmann::json::parse(missing->body);
+    REQUIRE(mj.contains("error"));
+    CHECK(mj["error"]["code"] == 404);
+    CHECK(mj["error"]["correlation_id"].is_string());
+    CHECK_FALSE(mj["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(missing->body.find("\"actions\"") == std::string::npos);
+}
+
+TEST_CASE("discover.plugin-docs/{name}: every documented plugin resolves, not just the first "
+          "(#4108)",
+          "[discovery][plugin_docs][pg]") {
+    // #4108 review: the single-name cases above always pick plugins[0], which
+    // cannot detect an index-construction regression that only populates the
+    // first entry. Loop the whole catalog.
+    DiscoverHarness h;
+    const auto catalog = nlohmann::json::parse(yuzu::server::plugin_docs_catalog().json);
+    REQUIRE(catalog["plugins"].is_array());
+    REQUIRE_FALSE(catalog["plugins"].empty());
+    for (const auto& expected : catalog["plugins"]) {
+        const std::string name = expected["name"].get<std::string>();
+        const auto* manifest = yuzu::server::plugin_docs_manifest(name);
+        REQUIRE(manifest != nullptr);
+        CHECK(nlohmann::json::parse(manifest->json) == expected);
+
+        auto res = h.sink.Get("/api/v1/discover/plugin-docs/" + name);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(res->body == manifest->json);
+    }
+}
+
+TEST_CASE("discover.plugin-docs/{name}: permission denied -> 403 before the name lookup, "
+          "even for an unknown name",
+          "[discovery][plugin_docs][pg]") {
+    DiscoverHarness h;
+    h.grant_perms = false;
+    auto res = h.sink.Get("/api/v1/discover/plugin-docs/no_such_plugin_for_docs");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("\"actions\"") == std::string::npos);
+}
+
 TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undocumented",
           "[discovery][plugins][plugin_docs][pg]") {
     DiscoverHarness h;
@@ -880,6 +963,14 @@ TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undoc
     REQUIRE(yuzu::server::plugin_docs_summary(documented_name) != nullptr);
     CHECK(yuzu::server::plugin_docs_summary("no_such_plugin_for_docs") == nullptr);
 
+    // Same shape for the #4108 per-plugin manifest accessor: present for a
+    // documented name, null for an undocumented one, and byte-identical to
+    // that plugin's own element in the whole catalog.
+    const auto* manifest = yuzu::server::plugin_docs_manifest(documented_name);
+    REQUIRE(manifest != nullptr);
+    CHECK(nlohmann::json::parse(manifest->json) == catalog["plugins"][0]);
+    CHECK(yuzu::server::plugin_docs_manifest("no_such_plugin_for_docs") == nullptr);
+
     auto res = h.sink.Get("/api/v1/discover/plugins");
     REQUIRE(res);
     CHECK(res->status == 200);
@@ -899,7 +990,7 @@ TEST_CASE("discover.plugins: docs summary joined by plugin name, null when undoc
             CHECK(pl["docs"]["kind"]["mutating"].is_boolean());
             CHECK(pl["docs"]["kind"]["gathered"].is_boolean());
             CHECK(pl["docs"]["readme"] == "agents/plugins/" + documented_name + "/README.md");
-            CHECK(pl["docs"]["resource"] == "yuzu://plugin-docs");
+            CHECK(pl["docs"]["resource"] == "yuzu://plugin-docs/" + documented_name);
         } else if (pl["name"] == "no_such_plugin_for_docs") {
             saw_undocumented = true;
             CHECK(pl["docs"].is_null());

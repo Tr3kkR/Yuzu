@@ -80,6 +80,94 @@ TEST_CASE("render_dex_app_perf_trend: floor pctile, suppression, scope selector"
     CHECK(has(render_dex_app_perf_trend("x", {}, "", groups, 10, 30), "No performance history"));
 }
 
+// Pins the exact-key contract for the crash/hang cross-link (Apps tab ↔
+// Performance tab): crash identity (process_name) and perf identity (app_name)
+// are ALREADY the same canonicalized key at the agent, so the join must be
+// byte-identical — never case-folded, never stripped of a ".exe" suffix, never
+// a display-name/fuzzy lookup. A mixed-case, ".EXE"-suffixed name is the
+// regression trap: any normalization would visibly change the rendered href.
+TEST_CASE("render_dex_app_perf_trend: crash/hang cross-link uses the EXACT app-name "
+          "key, never normalized",
+          "[dex][app_perf][ui]") {
+    AppPerfVersionSummary v1;
+    v1.version = "1.0";
+    v1.latest_day = 1;
+    v1.device_count = 5;
+    v1.cpu_mean = 1.0;
+
+    std::vector<DexGroupOption> groups;
+    const auto h = render_dex_app_perf_trend("MyApp.EXE", {v1}, "", groups, 10, 7);
+    CHECK(has(h, "/fragments/dex/app?name=MyApp.EXE&amp;window=7d"));
+    CHECK_FALSE(has(h, "myapp.exe")); // no case-fold
+    CHECK_FALSE(has(h, "name=MyApp&amp;")); // no .EXE stripping
+}
+
+// The `active_version` (filtered) branch had ZERO coverage before this test —
+// every prior TEST_CASE calls render_dex_app_perf_trend with the 6-arg form,
+// which defaults `active_version` to "" (unfiltered). This exercises the
+// filtered banner, the "all versions" back-link's querystring, per-row link
+// suppression while filtered, the scope-selector's version-preserving base
+// URL, and the filtered-empty-state fallback link.
+TEST_CASE("render_dex_app_perf_trend: filtered (active_version set) — banner, "
+          "back-link, link suppression, empty-state fallback",
+          "[dex][app_perf][ui]") {
+    AppPerfVersionSummary v1;
+    v1.version = "1.2.0.0";
+    v1.latest_day = 200;
+    v1.device_count = 12;
+    v1.cpu_mean = 6.0;
+
+    SECTION("fleet scope, no group selector (groups={}) — banner + back-link + row "
+            "is plain text, not a re-narrowing link") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", {}, 10, 7, "1.2.0.0");
+        CHECK(has(h, "Filtered to version"));
+        CHECK(has(h, ">1.2.0.0</span>")); // the banner names the active version
+        // "all versions" back-link drops `version=`, no group (fleet scope) — the
+        // exact querystring `all_qs` builds, as its own `<a hx-get="...">`.
+        CHECK(has(h, "<a hx-get=\"/fragments/dex/perf/app?app=chrome.exe&amp;window=7d\" "));
+        CHECK(has(h, "all versions"));
+        // With no groups, the scope selector doesn't render at all, so the ONLY
+        // way this exact qs (app+window+version, no group) could appear is as a
+        // per-row narrow-to-version link — which must be absent while filtered:
+        // the row renders as plain text instead.
+        CHECK_FALSE(has(h, "<a hx-get=\"/fragments/dex/perf/app?app=chrome.exe&amp;window="
+                          "7d&amp;version=1.2.0.0\""));
+        CHECK(has(h, "<td><span style=\"font-family:var(--mono)\">1.2.0.0</span>"));
+    }
+
+    SECTION("groups present — scope-selector hx-get preserves the active version filter") {
+        std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 7, "1.2.0.0");
+        // Anchored on the <select>'s own opening tag so this doesn't depend on
+        // the per-row-suppression-while-filtered behaviour asserted elsewhere.
+        CHECK(has(h, "<select name=\"group\" hx-get=\"/fragments/dex/perf/app?app=chrome.exe"
+                    "&amp;window=7d&amp;version=1.2.0.0\""));
+    }
+
+    SECTION("group scope, filtered — back-link preserves group=, drops version=") {
+        std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
+        const auto h =
+            render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 7, "1.2.0.0");
+        CHECK(has(h, "<a hx-get=\"/fragments/dex/perf/app?app=chrome.exe&amp;window=7d&amp;"
+                    "group=g1\" "));
+    }
+
+    SECTION("filtered to a version with NO matching rows -> empty-state fallback link "
+            "preserves group=") {
+        std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
+        const auto h = render_dex_app_perf_trend("chrome.exe", {}, "g1", groups, 10, 7, "9.9.9.9");
+        CHECK(has(h, "No performance history"));
+        // The empty-state fallback link specifically (not the top filtered-banner
+        // link, which renders unconditionally before the versions.empty() check
+        // and would satisfy a bare `hx-get` substring check on its own): anchor
+        // on its distinct "&larr; all versions" display text, which only the
+        // empty-state block emits (the banner's back-link reads "all versions
+        // &rarr;" — opposite arrow, opposite word order).
+        CHECK(has(h, "&amp;group=g1\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
+                    "style=\"cursor:pointer;\">&larr; all versions</a>"));
+    }
+}
+
 TEST_CASE("render_dex_device_app_perf: empty state", "[dex][app_perf][ui]") {
     const auto h = render_dex_device_app_perf({});
     CHECK(has(h, "No application performance history for this device"));
