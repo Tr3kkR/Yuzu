@@ -1,6 +1,7 @@
 #include "guardian_push_builder.hpp"
 
 #include "guardian_rule_spec.hpp" // dangerous_enforce_in_spec (H1 push backstop)
+#include "mcp_jsonrpc.hpp"        // json_exceeds_depth / kMcpMaxJsonDepth (depth guard)
 
 #include <algorithm>
 #include <cctype>
@@ -134,6 +135,32 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
             continue;
         if (!row.scope_expr.empty() && in_scope && !in_scope(row.scope_expr))
             continue;
+
+        // Depth guard on the raw stored text, before anything below interprets it
+        // (including dangerous_enforce_in_spec's own parse just below, and the
+        // nlohmann::json::parse further down): spec_json is stored,
+        // caller-influenced text that this read path re-parses and re-dumps on
+        // EVERY push/reconcile call, for EVERY rule, on ordinary fleet traffic -
+        // the heartbeat reconcile call site has no operator action in the loop at
+        // all. fill_block()'s params dump() is unboundedly recursive and SIGSEGVs
+        // the whole process well under 1 MiB of nesting; because the poisoned row
+        // persists in the store, an unguarded crash here is a crash-loop on
+        // restart, not a one-time failure. Mirrors json_exceeds_depth's own
+        // "never construct the deep tree" rationale (mcp_jsonrpc.hpp): this rule
+        // is excluded from this agent's push in its entirety (nothing is added
+        // for it, including the header) rather than partially marshalled, so a
+        // single poisoned spec_json cannot block or corrupt the rest of the
+        // batch. This is a structural "too deep to safely parse" rejection only -
+        // it makes no judgment about the (unparsed) content, and it does not
+        // change what dangerous_enforce_in_spec itself considers dangerous.
+        if (!row.spec_json.empty() &&
+            yuzu::server::mcp::json_exceeds_depth(row.spec_json,
+                                                  yuzu::server::mcp::kMcpMaxJsonDepth)) {
+            spdlog::error("Guardian push: rule {} ('{}') has spec_json nested past the depth "
+                         "guard (max {}); excluding it from this push, cannot be safely parsed",
+                         row.rule_id, row.name, yuzu::server::mcp::kMcpMaxJsonDepth);
+            continue;
+        }
 
         auto* r = push.add_rules();
         r->set_rule_id(row.rule_id);
