@@ -440,61 +440,71 @@ subdir('sdk')
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')
+  # build_examples gates ONLY the four genuinely decorative demo plugins
+  # below -- every other plugin is a real, shipped capability (several are
+  # unconditional link_depends of tests/meson.build's yuzu_agent_tests
+  # target) and must build regardless of this flag (#4262). Verified via
+  # a grep sweep of every subdir name against the rest of the tree before
+  # narrowing this list -- `netstat` (a real `attribution` action + a
+  # dedicated real-plugin-by-path test) and `status` (a
+  # dashboard-consumed key-value plugin) were the two closest calls and
+  # are real, shipped plugins, not demos.
   if build_examples
     subdir('agents/plugins/example')
     subdir('agents/plugins/chargen')
     subdir('agents/plugins/procfetch')
-    subdir('agents/plugins/netstat')
     subdir('agents/plugins/netprobe')
-    subdir('agents/plugins/status')
-    subdir('agents/plugins/device_identity')
-    subdir('agents/plugins/os_info')
-    subdir('agents/plugins/hardware')
-    subdir('agents/plugins/users')
-    subdir('agents/plugins/installed_apps')
-    subdir('agents/plugins/msi_packages')
-    subdir('agents/plugins/network_config')
-    subdir('agents/plugins/diagnostics')
-    subdir('agents/plugins/agent_actions')
-    subdir('agents/plugins/processes')
-    subdir('agents/plugins/services')
-    subdir('agents/plugins/filesystem')
-    subdir('agents/plugins/filesystem_posture')
-    subdir('agents/plugins/windows_updates')
-    subdir('agents/plugins/disk_actions')
-    subdir('agents/plugins/disk_space')
-    subdir('agents/plugins/event_logs')
-    subdir('agents/plugins/sccm')
-    subdir('agents/plugins/script_exec')
-    subdir('agents/plugins/software_actions')
-    subdir('agents/plugins/network_diag')
-    subdir('agents/plugins/network_actions')
-    subdir('agents/plugins/firewall')
-    subdir('agents/plugins/antivirus')
-    subdir('agents/plugins/bitlocker')
-    subdir('agents/plugins/vuln_scan')
-    subdir('agents/plugins/tags')
-    subdir('agents/plugins/asset_tags')
-    subdir('agents/plugins/quarantine')
-    subdir('agents/plugins/certificates')
-    subdir('agents/plugins/ioc')
-    subdir('agents/plugins/storage')
-    subdir('agents/plugins/interaction')
-    subdir('agents/plugins/agent_logging')
-    subdir('agents/plugins/http_client')
-    subdir('agents/plugins/content_dist')
-    subdir('agents/plugins/registry')
-    subdir('agents/plugins/rdp_control')
-    subdir('agents/plugins/wmi')
-    subdir('agents/plugins/tar')
-    subdir('agents/plugins/wifi')
-    subdir('agents/plugins/wol')
-    subdir('agents/plugins/discovery')
-    subdir('agents/plugins/license_scan')
-    subdir('agents/plugins/power_health')
-    subdir('agents/plugins/autoruns')  # Wave 7 PR7.1
-    subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
   endif
+  subdir('agents/plugins/netstat')
+  subdir('agents/plugins/status')
+  subdir('agents/plugins/device_identity')
+  subdir('agents/plugins/os_info')
+  subdir('agents/plugins/hardware')
+  subdir('agents/plugins/users')
+  subdir('agents/plugins/installed_apps')
+  subdir('agents/plugins/msi_packages')
+  subdir('agents/plugins/network_config')
+  subdir('agents/plugins/diagnostics')
+  subdir('agents/plugins/agent_actions')
+  subdir('agents/plugins/processes')
+  subdir('agents/plugins/services')
+  subdir('agents/plugins/filesystem')
+  subdir('agents/plugins/filesystem_posture')
+  subdir('agents/plugins/windows_updates')
+  subdir('agents/plugins/disk_actions')
+  subdir('agents/plugins/disk_space')
+  subdir('agents/plugins/event_logs')
+  subdir('agents/plugins/sccm')
+  subdir('agents/plugins/script_exec')
+  subdir('agents/plugins/software_actions')
+  subdir('agents/plugins/network_diag')
+  subdir('agents/plugins/network_actions')
+  subdir('agents/plugins/firewall')
+  subdir('agents/plugins/antivirus')
+  subdir('agents/plugins/bitlocker')
+  subdir('agents/plugins/vuln_scan')
+  subdir('agents/plugins/tags')
+  subdir('agents/plugins/asset_tags')
+  subdir('agents/plugins/quarantine')
+  subdir('agents/plugins/certificates')
+  subdir('agents/plugins/ioc')
+  subdir('agents/plugins/storage')
+  subdir('agents/plugins/interaction')
+  subdir('agents/plugins/agent_logging')
+  subdir('agents/plugins/http_client')
+  subdir('agents/plugins/content_dist')
+  subdir('agents/plugins/registry')
+  subdir('agents/plugins/rdp_control')
+  subdir('agents/plugins/wmi')
+  subdir('agents/plugins/tar')
+  subdir('agents/plugins/wifi')
+  subdir('agents/plugins/wol')
+  subdir('agents/plugins/discovery')
+  subdir('agents/plugins/license_scan')
+  subdir('agents/plugins/power_health')
+  subdir('agents/plugins/autoruns')  # Wave 7 PR7.1
+  subdir('agents/plugins/windows_optional_features')  # Wave 9 PR9.2b
+  subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
 endif
 
 # ── Server ────────────────────────────────────────────────────────────────────
@@ -524,13 +534,13 @@ endif
 # ── Capability-matrix generator (PR1.1 / #2204; IT-2) ────────────────────────
 # Placed AFTER the build_fuzzers endif — OUTSIDE that conditional (PLAN-04: an
 # insert right after subdir('tests/fuzz') would bury it inside the fuzzer gate
-# and normal CI would never build it). Guarded on build_agent (the tool
-# dlopens the built plugin shared objects to read their ABI4 descriptors) AND
-# build_examples (build-ci B1: with no agents/plugins/*/ subdirs configured
-# there is nothing for the generator to inspect — building it anyway would
-# leave scripts/ci/check-capability-matrix.sh looking for plugin artifacts
-# that were never going to exist).
-if build_agent and build_examples
+# and normal CI would never build it). Guarded on build_agent alone (the tool
+# dlopens the built plugin shared objects to read their ABI4 descriptors) —
+# every real plugin now builds unconditionally under build_agent regardless
+# of build_examples (#4262), so there is always something for the generator
+# to inspect; the former build_examples half of this guard predated that fix
+# and no longer applies.
+if build_agent
   subdir('tools/capmatrix-gen')
   # plugin-capture (docs/plugin-readme-standard.md rule 5): same guard, same
   # reason — it exists to run the built plugins.

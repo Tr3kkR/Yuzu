@@ -61,6 +61,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `users` | ✅ ✅ ✅ | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history | [README](../../agents/plugins/users/README.md) |
 | `vuln_scan` | ✅ ✅ ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |
 | `wifi` | ✅ 🟡 🟡 | Scans visible WiFi networks and reports current connection status | [README](../../agents/plugins/wifi/README.md) |
+| `windows_optional_features` | ✅ ⛔ ⛔ | Windows optional OS feature state (enabled/disabled/pending) via the DISM API | [README](../../agents/plugins/windows_optional_features/README.md) |
 | `windows_updates` | ✅ ✅ ✅ | Updates/packages: installed, available, pending-reboot, patch connectivity | [README](../../agents/plugins/windows_updates/README.md) |
 | `wmi` | ✅ ⛔ ⛔ | Windows Management Instrumentation — WQL queries and instance enumeration | [README](../../agents/plugins/wmi/README.md) |
 | `wol` | ✅ ✅ ✅ | Sends Wake-on-LAN magic packets and checks host reachability | [README](../../agents/plugins/wol/README.md) |

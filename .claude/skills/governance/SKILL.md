@@ -259,11 +259,18 @@ is not reached by an attacker, so EXPOSURE cannot promote it to CRITICAL.
       disk full, concurrent writer, partial failure)                  no change
   E6  the WRONG OUTCOME — not merely the code branch — is proven
       unable to occur in production                                   cap at LOW
+  E7  the artifact is documented ADVISORY (never gates CI or a merge on
+      its own — the skill/doc that owns it says so) AND the input is
+      author-controlled: hand-typed, self-authored, or fed only by the
+      author's own tooling, never reachable from an external actor, a
+      production request, or production data                          cap at MEDIUM
 
 Bands, ordered:  INFO < LOW < MEDIUM < HIGH < CRITICAL
-Order of operations: apply the strongest RAISE first, then any CAP. `E6` is
-applied LAST and dominates every raise — the same recorded facts must not derive
-CRITICAL or LOW depending on the order they are read in.
+Order of operations: apply the strongest RAISE first, then any CAP. `E6` and
+`E7` are applied LAST, in that order — `E6`'s LOW cap dominates `E7`'s MEDIUM
+cap when both apply, and both dominate every raise. The same recorded facts
+must not derive CRITICAL, LOW, or MEDIUM depending on the order they are read
+in.
 
 E4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
 hardened setting — RBAC off is the default, `--auth-mode=sso-only` is opt-in — so
@@ -274,6 +281,26 @@ usually I6 (shipped-incomplete), not E6 — E6 requires proving the wrong outcom
 cannot occur, which a missing caller does not establish. If both a security
 control failed AND the actor ends up beyond its privilege, that is I1 with E2;
 do not report the escalation as though it were the only fact.
+
+E7 exists because the derivation table otherwise has no way to distinguish
+"an attacker can trigger this" from "only the author, hand-authoring a test
+fixture or their own input file, can trigger this" — added 2026-09-16 after
+PR #4386 (an author-side, advisory-only JSONL linter) ran 11 external review
+rounds, roughly half of them contrived Unicode/timestamp/precision shapes no
+production caller or attacker could ever supply, each still graded HIGH/
+BLOCKING because nothing in the table could discount them. E7 is narrow and
+BOTH conjuncts must hold — the artifact's own doc/skill must call it advisory
+(a merge-gating CI check, a production parser, or anything an external
+request can reach forfeits E7 immediately, even if today's actual caller
+happens to be internal), and the SPECIFIC finding's input must be one only
+the author controls (a duplicate-JSON-object-member finding on a real,
+already-committed governance.d fragment is NOT author-controlled in this
+sense — that data source is exactly what the tool exists to check, and it
+already contained real, previously-invisible instances of that exact defect
+in production ledger data; a hand-typed 5000-digit fractional-second fixture
+built solely to probe a regression LOCK's implementation boundary is). When
+in doubt, do not apply E7 — a wrongly-withheld E7 costs one extra SHOULD
+finding; a wrongly-applied E7 silently downgrades a reachable defect.
 
 ### The gate
 
@@ -1697,7 +1724,7 @@ to close rather than a contradiction to adjudicate.
    | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule — so for a conforming writer it always agrees with `impact`/`exposure`. Restate it whenever the facts change: a stale label is read at the stronger of the two and is itself reported |
    | `trigger` | the concrete input/state/config, or `unresolved` |
    | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
-   | `exposure` | every applicable `E0`…`E6`, or `unresolved` — a list, not one value. `E6` is applied last and dominates every raise |
+   | `exposure` | every applicable `E0`…`E7`, or `unresolved` — a list, not one value. `E6` and `E7` are applied last, in that order — `E6`'s LOW cap dominates `E7`'s MEDIUM cap when both apply, and both dominate every raise |
    | `epistemic_status` | `verified` / `likely` / `speculative`. Operates on the GATE, not the band — flipping it to `speculative` converts a blocker into a mandatory investigation without changing the derived band, which is why the de-escalation rule guards it |
    | `independent_reporters` | how many REPORTERS raised it WITHOUT having been shown it — downstream echoes are not confirmations. Counts reporters of every `source`, not agents only: a human colleague finding the same defect independently is the strongest confirmation available, and counting it zero inverts the signal |
    | `policy_floor` (nullable) | the floor hit, if the finding gates as a contract violation rather than by derivation. Null on an ordinary finding, which is most of them |
@@ -1847,6 +1874,143 @@ to close rather than a contradiction to adjudicate.
    procedural. It also reads a field the author supplied — an `impact` list with `I1`
    omitted passes, which is the gaming vector the severity block already names — so
    spot-check parked rows' `impact` against their own `trigger` and `summary`.
+
+   **Then lint the whole fragment before you push.**
+   `scripts/ci/check-governance-ledger.py` is an author-side self-check that
+   previews the self-consistency problems a strict reviewer will flag, so a
+   ledger stops taking multiple review rounds to converge (PR #4337 took seven
+   rounds, every one a ledger-metadata defect while the code was byte-identical
+   from round 1; each rule is one of those rounds' lessons):
+
+   ```bash
+   python3 scripts/ci/check-governance-ledger.py --files "$LEDGER"
+   ```
+
+   `finding_id` — the MERGE JOIN KEY ITSELF, more fundamental than any single
+   field's value — must be an ANCHORED, whole-string match against a CLOSED
+   ASCII token grammar: starts with an alphanumeric, then only alphanumerics
+   plus the small punctuation set the real corpus actually uses (`._+/,-`).
+   This is the fourth attempt at this check, and the first that closes the
+   whole CLASS rather than one more reported instance: bare truthiness
+   (`bool("   ")` is `True`) → `.strip()` (misses zero-width/format
+   characters like ZWSP/BOM, Unicode category Cf) → `isprintable() and not
+   isspace()` (still passes combining marks, variation selectors, and
+   blank-glyph symbols like BRAILLE PATTERN BLANK or a Hangul filler —
+   category Mn/So/Lo) → an EXISTENTIAL "contains at least one alphanumeric
+   somewhere" allowlist (closed the BLANK-id COLLISION direction but not the
+   SPLIT direction of the same class: `"X"` and `"X"` plus a trailing ZWSP
+   both "contain an alphanumeric" while being two DIFFERENT dict keys,
+   silently splitting one finding's history across two merge groups instead
+   of colliding two unrelated ones — same root cause, opposite failure mode).
+   "Renders blank" is a FONT property, not a fixed enumerable Unicode
+   category, so no denylist — and no merely-existential allowlist — is ever
+   complete. An ANCHORED full-match closes both directions at once: no
+   leading, trailing, OR embedded invisible/non-ASCII character can hide
+   anywhere in a value that still matches, with no separate whitespace-strip
+   comparison needed (whitespace of any kind simply isn't in the grammar,
+   wherever it appears). Verified: zero of 11,584 real corpus `finding_id`
+   occurrences fail this grammar, and none starts with a non-alphanumeric
+   character. Any of these shapes, uncaught, silently either collapses two
+   unrelated findings that happen to share a blank-looking id into one merge
+   group (a later row's facts overwriting an earlier BLOCKING finding's with
+   zero warning) or splits one finding's own history into two.
+
+   It builds each finding's live view as the FIELD-WISE MERGE defined above (not
+   the last row alone), ordered by `recorded_at` as a true instant — a
+   `recorded_at` that is PRESENT but does not resolve to an UNAMBIGUOUS instant
+   is reported (`bad-recorded-at`) rather than silently sorted as legacy. This
+   covers TWO tiers, not just wholly-invalid strings: a value that fails to
+   parse at all, AND a value that parses but carries no timezone offset (a
+   bare date, or a naive datetime) — the latter is NOT silently assumed to be
+   UTC, because an author hand-typing a bare date is a realistic failure mode
+   and a malformed OR ambiguous timestamp on a genuine severity ESCALATION can
+   otherwise vanish from the merge with nothing else able to surface it. (A
+   lowercase `z` UTC suffix, which RFC 3339 §5.6 also permits, is accepted
+   like `Z` — Python's `fromisoformat` only recognizes the uppercase form
+   natively.) BELOW the merge, every line is parsed with a duplicate-object-member
+   check: standard JSON parsers (Python's `json.loads`, jq, JavaScript's
+   `JSON.parse`) all silently keep only the LAST value for a repeated key with
+   no diagnostic, so a row whose raw text states a merge-governing field twice
+   can lose its real value before ANY of the checks above ever run — reported
+   as `invalid-json: duplicate object member(s): ...`, never silently resolved.
+   On top of the merge it separately checks, PER ROW,
+   that a row participating in the post-#2619 regime — carrying ANY field
+   #2619 introduced (`schema_version`, `source`, `reporter_ref`,
+   `reviewed_at_sha`, `recorded_at`, `recorded_by`, `adjudication_rationale`,
+   the `refuted` pair, or `classification: "absence"` — a genuinely legacy row
+   carries NONE of them, per SKILL.md's own definition, so checking only two of
+   the markers missed a row that omits BOTH while still carrying e.g.
+   `recorded_by`) — restates all EIGHT mandatory fields even when sparse
+   (`schema_version`, `run_id`, `finding_id`, `recorded_by`, `recorded_at`,
+   `pass_ordinal`, `reviewed_at_sha`, `disposition`) — omitting one of the eight
+   is a violation even though every OTHER field may legitimately be omitted when
+   unchanged. `pass_ordinal` and `run_id` are additionally validated PER ROW
+   (not only on the merged result): `pass_ordinal` determines MERGE ORDER
+   itself, so a bad value on a row that loses a tie because of it would
+   otherwise vanish before anything downstream ever inspects it, and a
+   mid-history wrong `run_id` a later row incidentally restates correctly
+   would otherwise read clean at the merged level alone. On the merged view it
+   also requires `epistemic_status`/`provenance`/`classification` present and
+   non-null on a non-legacy finding — SKILL.md's field table marks them
+   required with no nullable annotation, unlike `impact`/`exposure`, which
+   explicitly tolerate a null fact set — and checks: `severity_mapped` not weaker than the
+   facts' derived floor band (over-labeling is left alone — a conditional raise
+   can legitimately exceed the flat table — and a floor gates separately via
+   `policy_floor`, which must itself cite a closed source or an empty-impact
+   claim stays flagged rather than excused by a fabricated floor string);
+   `severity_native` frozen across supersessions, compared against the finding's
+   first row (an omission-then-later-invention is caught, not only an explicit
+   null-then-value flip), checked per row; a `wording` finding never carrying
+   `I7`; single-value, non-empty `reporter`; per-row `adjudicated_by` and
+   `adjudication_rationale`, each REQUIRED to be null or a genuine non-empty,
+   non-whitespace string (a bare `bool(x)` truthiness check would let a
+   whitespace string, a bare int, or `False` itself read as "set") — pairing
+   is then compared on those NORMALIZED presence booleans, not the raw
+   values; single-value, non-empty, non-whitespace `reporter_ref` (required
+   iff `source` is not `governance-agent`, or the literal `unresolved`); and
+   enum/type hygiene for `source`; `disposition` (must always be a non-empty
+   string — bedrock, checked PER ROW regardless of legacy status — with its
+   CLOSED-ENUM half, a later `#2643`-era convention, ALSO checked per row,
+   gated on THAT ROW's own versioned-ness (not the finding-level `legacy`
+   flag, which is true the moment ANY row is versioned and would wrongly
+   retro-apply the enum to a genuinely legacy first row a later versioned row
+   happens to supersede), requiring real (non-whitespace) content
+   after a `#<id>` prefix's `#` — a bare LENGTH comparison would accept a
+   whitespace-only suffix (`"roadmap-# "`) as "non-empty" — while still
+   tolerating a non-numeric trailing
+   note like the corpus's own `#TBD (draft: ...)` shape — checking the enum
+   per row, not just on the merged view, catches a permanently-recorded bad
+   value a later valid row would otherwise hide, without breaking the
+   legitimate `open` → `fixed` evolution, since both values are individually
+   valid); `epistemic_status`, `provenance`,
+   `classification` (general content contracts, so NOT legacy-exempt — a
+   genuinely ancient row can still carry a value worth flagging); and
+   `independent_reporters` (excluding booleans, which pass a bare
+   `isinstance(x, int)` test in Python, but tolerating `null` — a legitimate
+   "not yet counted" value the corpus carries). All EIGHT per-row-mandatory
+   fields have their VALUE (not merely their presence) checked PER ROW, not
+   only on whatever survives into the merge — an explicit `null` or a
+   wrong-typed value on an early row is a permanently-recorded defect a later
+   valid row would otherwise silently "correct" with no trace: `schema_version`
+   and `pass_ordinal` must be non-bool integers (`pass_ordinal` also
+   non-negative); `reviewed_at_sha` must be a non-empty, non-whitespace
+   string (a bare truthiness check alone misses `7` and `"   "`); `disposition`
+   must likewise be a non-empty, non-whitespace string, per row, per the
+   closed-enum treatment described above; `recorded_by` is the one CONDITIONAL case — nullable only
+   on the row that first raises the finding (SKILL.md: "nullable on the row
+   that first raises a finding, required on a supersession"), so `null` is
+   flagged only on a later row, and on ANY row a non-null value must still be
+   a genuine non-empty, non-whitespace string. And the `policy_floor` key's
+   presence. It also reproduces this step's own park probe — an `I1`/`I2`/`I3` finding on
+   a `roadmap-` disposition, and the scalar-`impact`/`exposure` shape the `jq`
+   above catches — but does NOT replace it: the label half of the park contract
+   (`roadmap` XOR priority/triage on GitHub, and a `linked-to-` target's labels)
+   lives outside the ledger and stays procedural, so run BOTH. It is **advisory,
+   not a CI gate** — calibration found most of the historical `governance.d/`
+   corpus predates these rules, so it is deliberately NOT wired as a blocking
+   check; only its self-test runs in CI. It judges mechanical field-consistency,
+   never whether a finding is true or a severity right. Resolve or consciously
+   accept each finding before pushing.
 
 ## Known patterns from prior runs
 

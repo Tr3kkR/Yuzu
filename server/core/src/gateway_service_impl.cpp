@@ -149,6 +149,21 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
             "writers this counter is the only signal a systemic write failure would "
             "otherwise leave invisible.",
             "counter");
+        // Post-merge review #4344 follow-up (MEDIUM finding 2, docs/observability-conventions.md):
+        // pre-seed every (op,reason) combo this counter can ACTUALLY emit (record_route_store_failure
+        // is called for all four ops above with only these two GatewayRouteStoreError reasons —
+        // gateway_route_store.hpp). Lazy-created-on-first-increment means a single isolated
+        // incident never crosses `rate()>0`/`increase()>0` — the first sample IS the incident, and
+        // there is no second sample within the window to diff against — so the very alert meant to
+        // catch a lone failure stays silent on it. Mirrors the desync counter's own pre-seed block
+        // immediately below.
+        for (const char* op :
+            {"register_fresh", "announce_connected", "deregister", "renew_leases"}) {
+            for (const char* reason : {"store_unavailable", "db_error"}) {
+                metrics_->counter("yuzu_server_gateway_route_write_failed_total",
+                                  {{"op", op}, {"reason", reason}});
+            }
+        }
         metrics_->describe(
             "yuzu_server_gateway_route_desync_total",
             "HA WS-4 4.2a: GatewayRouteStore session-guard writes (announce_connected/"
@@ -535,12 +550,18 @@ gw_enrolled:
     // agent's own registration is refused. UNAVAILABLE, not accepted=false (the agent's
     // PERMANENT-rejection signal, agent.cpp:1649-1657), so the agent retries on its normal
     // reconnect backoff.
-    if (auto reg_result = registry_.register_agent(info); !reg_result) {
+    auto reg_result = registry_.register_agent(info);
+    if (!reg_result) {
         spdlog::error("ProxyRegister: register_agent failed for '{}': {}", info.agent_id(),
                       reg_result.error());
         return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                             "registration temporarily unavailable");
     }
+    // HA WS-4 4.2b follow-up (post-merge review #4344, MEDIUM finding 1): the just-installed
+    // session, held by pointer identity so a later rollback below (if register_fresh fails) can
+    // tell "still ours" apart from "already superseded by a concurrent registration" without
+    // relying on session_id (still empty at this point — mapped later by map_session).
+    auto installed = *reg_result;
     // Auto-add to root management group
     if (mgmt_group_store_ && mgmt_group_store_->is_open())
         mgmt_group_store_->add_member(ManagementGroupStore::kRootGroupId, info.agent_id());
@@ -676,9 +697,26 @@ gw_enrolled:
                 // write on this path fills in a first row for this agent), so
                 // an agent whose route cannot be durably recorded must be
                 // refused rather than allowed to connect unrouteable.
-                // Mirrors the existing #3401 register_agent failure above
-                // (~line 517) exactly: UNAVAILABLE, not accepted=false, so
-                // the agent retries on its normal reconnect backoff.
+                // Same STATUS shape as the #3401 register_agent refusal earlier
+                // in this handler: UNAVAILABLE, not accepted=false, so the agent
+                // retries on its normal reconnect backoff. UNLIKE that
+                // refusal, though, THIS one runs AFTER register_agent has
+                // already installed the session (connected gauge, agent-online
+                // publish, root-group membership) — so refusing here without
+                // rollback would leave a contextless "ghost" session behind
+                // forever: reap_stale_sessions only TryCancels sessions that
+                // carry a server_context, and a gateway-proxied session never
+                // has one. Ghost-session rollback (post-merge review #4344,
+                // MEDIUM finding 1): tear the just-installed session back down
+                // by POINTER identity — remove_agent_if_same is a no-op if a
+                // concurrent registration has already superseded `installed`,
+                // so this never clobbers a newer session that won the race in
+                // between. Root-group membership above is deliberately LEFT —
+                // it's an idempotent (ON CONFLICT DO NOTHING), durable
+                // fleet-membership fact, not a liveness signal, and removing
+                // it would hide a re-registering agent's data from
+                // root-confined operators.
+                registry_.remove_agent_if_same(info.agent_id(), installed);
                 return grpc::Status(grpc::StatusCode::UNAVAILABLE,
                                     "routing directory unavailable");
             } else if (!res->won) {

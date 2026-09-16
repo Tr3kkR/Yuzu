@@ -74,6 +74,15 @@ EXPECTED_FAMILIES = {
             "server/core/src/verify_api_local.hpp",
         ],
     },
+    "compliance": {
+        "tus": [
+            "server/core/src/compliance_routes.cpp",
+            "server/core/src/compliance_ui.cpp",
+            "server/core/src/compliance_model.cpp",
+            "server/core/src/compliance_api.hpp",
+            "server/core/src/compliance_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",

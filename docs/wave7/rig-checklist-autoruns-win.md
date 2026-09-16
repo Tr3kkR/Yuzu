@@ -62,26 +62,26 @@ family, Startup folders, or the WMI subscription content this leg formats.
    `target`/`args` empty (link targets are documented as NOT resolved) and
    a real `mtime` matching the file's last-write time.
 
-7a. **Known-bug reproduction, `win_startup_folder_user` under LocalSystem.**
-    The default path test above does NOT exercise the bug (the default
-    non-redirected path resolves correctly even with the bug present).
-    Read the test user's `HKCU\...\Explorer\User Shell Folders\Startup`
-    value directly from a session running AS that user -- it will very
-    likely already contain a `REG_EXPAND_SZ` value like
+7a. **Redirect-resolution verification, `win_startup_folder_user` under
+    LocalSystem (#4219 fix).** The default path test above does NOT
+    exercise this: the default (non-redirected) path resolves correctly
+    either way. Read the test user's `HKCU\...\Explorer\User Shell
+    Folders\Startup` value directly from a session running AS that user --
+    it will very likely already contain a `REG_EXPAND_SZ` value like
     `%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup`
     (Windows populates this on essentially every profile at creation, not
     only redirected ones). Then, from the LocalSystem-running agent, drop a
     `.lnk` into that same user's actual Startup folder and check the
-    `win_startup_folder_user` result -- LocalSystem's own Startup folder is
-    normally EMPTY, so the expected (bug-confirming) outcome is most likely
-    **zero rows and a `constrained|0|startup_redirect_env_mismatch` status**
-    (the `.lnk` you just dropped goes unreported), not a row whose `location`
-    visibly points at `C:\Windows\System32\config\systemprofile\...`. Only
-    treat the run as inconclusive if the status comes back `supported` --
-    that would mean the constraint fix (`autoruns_win.cpp`, the
-    `note_constraint(startup_folder_user, ...)` call) itself regressed, which
-    is worth its own report. See `changelog.d/20260909-autoruns-plugin.added.md`
-    for the full known-limitation writeup.
+    `win_startup_folder_user` result -- the fix now resolves `%USERPROFILE%`
+    against the ENUMERATED PROFILE's own path (never LocalSystem's), so the
+    expected outcome is the `.lnk` correctly appearing as a row, with
+    `location` pointing at the real user's `AppData\Roaming\...\Startup`,
+    and status `supported`. Treat the run as a regression if the status
+    instead comes back `constrained` with `startup_redirect_unresolved` (or
+    the row is silently missing) -- see
+    `changelog.d/20260909-autoruns-plugin.added.md` and
+    `agents/plugins/autoruns/src/autoruns_parsers.hpp`'s
+    `resolve_profile_shell_folder` for the fixed resolution logic.
 
 8. **Scheduled Tasks.** A1's probe (admin session, MTA):
    `CoInitializeEx` HRESULT `0x00000000`, `Connect` HRESULT `0x00000000`,
