@@ -7430,6 +7430,14 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
         // RMW mutual exclusion on ITS OWN modification order - it publishes no
         // other field through itself, so no stronger ordering is needed.
+    std::atomic<int> entry_hook_fire_count{0}; // external review finding (fjarvis's
+        // adversarial panel, Kimi, 2026-09-16) - matching counter for the
+        // dispatch-entry hook (registered inside the drain-gap hook above, see its
+        // own comment for why): entered is the ONLY promise this file's hooks ever
+        // set from a worker thread, making it the more plausible route for the
+        // original CI crash's duplicate set_value() than the gap hook itself
+        // (which already carries full instrumentation). Diagnostic only - see the
+        // entry hook body below for why no early-return guard is needed here.
     rt->set_drain_gap_hook_for_test([&] {
         // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
         // follow-up, 2026-09-16): use fetch_add's OWN return value for the
@@ -7447,7 +7455,27 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
                          prior + 1);
             return;
         }
+        // External review finding (fjarvis's adversarial panel, Kimi's Phase-2
+        // reasoning, 2026-09-16): release_hook can only ever be set from the main
+        // thread (both call sites are main-thread-sequenced, one guarded by
+        // released_by_test), so `entered` is the ONLY promise this file's hooks
+        // ever set from a worker thread - meaning if the original CI crash's
+        // duplicate set_value() was on a promise at all, `entered` is the more
+        // plausible route, not the gap hook (which already carries full forensic
+        // instrumentation above). Matching counter for symmetry - diagnostic only,
+        // not a safety fix: set_value_once already makes a repeat set_value() safe,
+        // and a shared_future tolerates repeat .wait() calls, so nothing here needs
+        // an early-return guard the way gap_hook_fire_count's does.
         rt->set_dispatch_entry_hook_for_test([&] {
+            if (const int prior = entry_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
+                prior > 0) {
+                std::fprintf(stderr,
+                             "dispatch-entry hook fired again (fire #%d) - entered "
+                             "was already set; set_value_once absorbs it safely, "
+                             "but this is worth investigating (see "
+                             "entry_hook_fire_count's own declaration comment).\n",
+                             prior + 1);
+            }
             set_value_once(entered);
             release_fut.wait();
         });
@@ -7562,19 +7590,22 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     // trimming this margin - tracked, not fixed, in this pass.
     REQUIRE(entered_fut.wait_for(std::chrono::seconds(30) * yuzu::test::kSpinScale) ==
             std::future_status::ready);
-    // Safe here (main thread): entered_fut succeeding does NOT by itself prove the
-    // drain-gap hook has returned (Gate 4 happy-path finding, governance follow-up
-    // 2026-09-16 - on the regression this test exists to catch, entry_hook can fire
-    // from r2_thread directly, independent of the hook's own thread, so entered_fut
-    // could go ready WHILE the hook is still inside its own spin_until). What makes
-    // this read safe is that Cleanup's destructor (above) now waits on hook_done - a
-    // genuine HOOK-COMPLETION signal set only as the hook's own last statement -
-    // before this frame's locals can be destroyed on ANY unwind path, including one
-    // triggered by the REQUIRE below failing (Gate 8 round 4 cpp-safety finding,
-    // HP-1: fixed, not merely parked - an earlier "same class as the pre-existing,
-    // parked F10 finding" framing was itself wrong, since it assumed this already
-    // matched the r2_queue_wait_ok precedent's shape, which uses a genuine
-    // hook-completion signal, not a dispatch-entry one like entered_fut).
+    // External review finding (fjarvis's adversarial panel, Codex+Kimi convergent,
+    // 2026-09-16): entered_fut succeeding does NOT by itself prove the drain-gap
+    // hook has returned or that r2_queued_before_dispatch has been stored (entry_hook
+    // can fire from r2_thread directly, independent of the hook's own thread - see
+    // hook_done's own declaration comment above - so entered_fut can go ready WHILE
+    // the hook is still inside its own spin_until, before it has written anything).
+    // An earlier version of this comment claimed the read below was "safe" because
+    // Cleanup's destructor waits on hook_done - true for UAF-safety (HP-1, still
+    // correct), but irrelevant to THIS read: the destructor only runs AFTER this
+    // REQUIRE, on the unwind path IF it throws - it protects safe teardown of a
+    // spurious failure, it does not prevent one. Wait for hook_done HERE, on the
+    // main thread, before reading the flag it guards - bare duration (spin_until
+    // scales internally, matching every other call site in this file); no deadlock
+    // risk since the hook's own wait is bounded and depends on nothing from this
+    // thread.
+    REQUIRE(yuzu::test::spin_until([&] { return hook_done.load(); }, std::chrono::seconds(30)));
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
@@ -7697,6 +7728,14 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
         // RMW mutual exclusion on ITS OWN modification order - it publishes no
         // other field through itself, so no stronger ordering is needed.
+    std::atomic<int> entry_hook_fire_count{0}; // external review finding (fjarvis's
+        // adversarial panel, Kimi, 2026-09-16) - matching counter for the
+        // dispatch-entry hook (registered inside the drain-gap hook above, see its
+        // own comment for why): entered is the ONLY promise this file's hooks ever
+        // set from a worker thread, making it the more plausible route for the
+        // original CI crash's duplicate set_value() than the gap hook itself
+        // (which already carries full instrumentation). Diagnostic only - see the
+        // entry hook body below for why no early-return guard is needed here.
     rt->set_drain_gap_hook_for_test([&] {
         // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
         // follow-up, 2026-09-16): use fetch_add's OWN return value for the
@@ -7714,7 +7753,27 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
                          prior + 1);
             return;
         }
+        // External review finding (fjarvis's adversarial panel, Kimi's Phase-2
+        // reasoning, 2026-09-16): release_hook can only ever be set from the main
+        // thread (both call sites are main-thread-sequenced, one guarded by
+        // released_by_test), so `entered` is the ONLY promise this file's hooks
+        // ever set from a worker thread - meaning if the original CI crash's
+        // duplicate set_value() was on a promise at all, `entered` is the more
+        // plausible route, not the gap hook (which already carries full forensic
+        // instrumentation above). Matching counter for symmetry - diagnostic only,
+        // not a safety fix: set_value_once already makes a repeat set_value() safe,
+        // and a shared_future tolerates repeat .wait() calls, so nothing here needs
+        // an early-return guard the way gap_hook_fire_count's does.
         rt->set_dispatch_entry_hook_for_test([&] {
+            if (const int prior = entry_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
+                prior > 0) {
+                std::fprintf(stderr,
+                             "dispatch-entry hook fired again (fire #%d) - entered "
+                             "was already set; set_value_once absorbs it safely, "
+                             "but this is worth investigating (see "
+                             "entry_hook_fire_count's own declaration comment).\n",
+                             prior + 1);
+            }
             set_value_once(entered);
             release_fut.wait();
         });
@@ -7829,19 +7888,22 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     // trimming this margin - tracked, not fixed, in this pass.
     REQUIRE(entered_fut.wait_for(std::chrono::seconds(30) * yuzu::test::kSpinScale) ==
             std::future_status::ready);
-    // Safe here (main thread): entered_fut succeeding does NOT by itself prove the
-    // drain-gap hook has returned (Gate 4 happy-path finding, governance follow-up
-    // 2026-09-16 - on the regression this test exists to catch, entry_hook can fire
-    // from r2_thread directly, independent of the hook's own thread, so entered_fut
-    // could go ready WHILE the hook is still inside its own spin_until). What makes
-    // this read safe is that Cleanup's destructor (above) now waits on hook_done - a
-    // genuine HOOK-COMPLETION signal set only as the hook's own last statement -
-    // before this frame's locals can be destroyed on ANY unwind path, including one
-    // triggered by the REQUIRE below failing (Gate 8 round 4 cpp-safety finding,
-    // HP-1: fixed, not merely parked - an earlier "same class as the pre-existing,
-    // parked F10 finding" framing was itself wrong, since it assumed this already
-    // matched the r2_queue_wait_ok precedent's shape, which uses a genuine
-    // hook-completion signal, not a dispatch-entry one like entered_fut).
+    // External review finding (fjarvis's adversarial panel, Codex+Kimi convergent,
+    // 2026-09-16): entered_fut succeeding does NOT by itself prove the drain-gap
+    // hook has returned or that r2_queued_before_dispatch has been stored (entry_hook
+    // can fire from r2_thread directly, independent of the hook's own thread - see
+    // hook_done's own declaration comment above - so entered_fut can go ready WHILE
+    // the hook is still inside its own spin_until, before it has written anything).
+    // An earlier version of this comment claimed the read below was "safe" because
+    // Cleanup's destructor waits on hook_done - true for UAF-safety (HP-1, still
+    // correct), but irrelevant to THIS read: the destructor only runs AFTER this
+    // REQUIRE, on the unwind path IF it throws - it protects safe teardown of a
+    // spurious failure, it does not prevent one. Wait for hook_done HERE, on the
+    // main thread, before reading the flag it guards - bare duration (spin_until
+    // scales internally, matching every other call site in this file); no deadlock
+    // risk since the hook's own wait is bounded and depends on nothing from this
+    // thread.
+    REQUIRE(yuzu::test::spin_until([&] { return hook_done.load(); }, std::chrono::seconds(30)));
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
@@ -7956,6 +8018,14 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
         // RMW mutual exclusion on ITS OWN modification order - it publishes no
         // other field through itself, so no stronger ordering is needed.
+    std::atomic<int> entry_hook_fire_count{0}; // external review finding (fjarvis's
+        // adversarial panel, Kimi, 2026-09-16) - matching counter for the
+        // dispatch-entry hook (registered inside the drain-gap hook above, see its
+        // own comment for why): entered is the ONLY promise this file's hooks ever
+        // set from a worker thread, making it the more plausible route for the
+        // original CI crash's duplicate set_value() than the gap hook itself
+        // (which already carries full instrumentation). Diagnostic only - see the
+        // entry hook body below for why no early-return guard is needed here.
     rt->set_drain_gap_hook_for_test([&] {
         // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
         // follow-up, 2026-09-16): use fetch_add's OWN return value for the
@@ -7973,7 +8043,27 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
                          prior + 1);
             return;
         }
+        // External review finding (fjarvis's adversarial panel, Kimi's Phase-2
+        // reasoning, 2026-09-16): release_hook can only ever be set from the main
+        // thread (both call sites are main-thread-sequenced, one guarded by
+        // released_by_test), so `entered` is the ONLY promise this file's hooks
+        // ever set from a worker thread - meaning if the original CI crash's
+        // duplicate set_value() was on a promise at all, `entered` is the more
+        // plausible route, not the gap hook (which already carries full forensic
+        // instrumentation above). Matching counter for symmetry - diagnostic only,
+        // not a safety fix: set_value_once already makes a repeat set_value() safe,
+        // and a shared_future tolerates repeat .wait() calls, so nothing here needs
+        // an early-return guard the way gap_hook_fire_count's does.
         rt->set_dispatch_entry_hook_for_test([&] {
+            if (const int prior = entry_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
+                prior > 0) {
+                std::fprintf(stderr,
+                             "dispatch-entry hook fired again (fire #%d) - entered "
+                             "was already set; set_value_once absorbs it safely, "
+                             "but this is worth investigating (see "
+                             "entry_hook_fire_count's own declaration comment).\n",
+                             prior + 1);
+            }
             set_value_once(entered);
             release_fut.wait();
         });
@@ -8091,19 +8181,22 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     // trimming this margin - tracked, not fixed, in this pass.
     REQUIRE(entered_fut.wait_for(std::chrono::seconds(30) * yuzu::test::kSpinScale) ==
             std::future_status::ready);
-    // Safe here (main thread): entered_fut succeeding does NOT by itself prove the
-    // drain-gap hook has returned (Gate 4 happy-path finding, governance follow-up
-    // 2026-09-16 - on the regression this test exists to catch, entry_hook can fire
-    // from r2_thread directly, independent of the hook's own thread, so entered_fut
-    // could go ready WHILE the hook is still inside its own spin_until). What makes
-    // this read safe is that Cleanup's destructor (above) now waits on hook_done - a
-    // genuine HOOK-COMPLETION signal set only as the hook's own last statement -
-    // before this frame's locals can be destroyed on ANY unwind path, including one
-    // triggered by the REQUIRE below failing (Gate 8 round 4 cpp-safety finding,
-    // HP-1: fixed, not merely parked - an earlier "same class as the pre-existing,
-    // parked F10 finding" framing was itself wrong, since it assumed this already
-    // matched the r2_queue_wait_ok precedent's shape, which uses a genuine
-    // hook-completion signal, not a dispatch-entry one like entered_fut).
+    // External review finding (fjarvis's adversarial panel, Codex+Kimi convergent,
+    // 2026-09-16): entered_fut succeeding does NOT by itself prove the drain-gap
+    // hook has returned or that r2_queued_before_dispatch has been stored (entry_hook
+    // can fire from r2_thread directly, independent of the hook's own thread - see
+    // hook_done's own declaration comment above - so entered_fut can go ready WHILE
+    // the hook is still inside its own spin_until, before it has written anything).
+    // An earlier version of this comment claimed the read below was "safe" because
+    // Cleanup's destructor waits on hook_done - true for UAF-safety (HP-1, still
+    // correct), but irrelevant to THIS read: the destructor only runs AFTER this
+    // REQUIRE, on the unwind path IF it throws - it protects safe teardown of a
+    // spurious failure, it does not prevent one. Wait for hook_done HERE, on the
+    // main thread, before reading the flag it guards - bare duration (spin_until
+    // scales internally, matching every other call site in this file); no deadlock
+    // risk since the hook's own wait is bounded and depends on nothing from this
+    // thread.
+    REQUIRE(yuzu::test::spin_until([&] { return hook_done.load(); }, std::chrono::seconds(30)));
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
