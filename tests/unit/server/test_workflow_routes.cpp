@@ -2185,6 +2185,31 @@ TEST_CASE("#2500 — numeric agent_ids entries are refused DELIBERATELY, with a 
     CHECK(denied_audit);
 }
 
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. This body is an otherwise-VALID, otherwise-ACCEPTED
+// request (a real single target) with one extra deeply-nested field inside
+// "params" - the exact field this handler's params-building loop calls
+// .dump() on for non-string values - so on unguarded code the request
+// proceeds all the way to dispatch, and only the new depth check tells
+// fixed and unfixed code apart. depth 40 is trivially safe to build/dump
+// directly in this test process; the real attack depth this guard exists
+// for is many orders of magnitude higher (~100,000 levels).
+TEST_CASE("POST /api/instructions/:id/execute: a body nested past the depth limit is "
+          "rejected before dispatch",
+          "[pg][workflow][executions][execute][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-DEPTH", "DEPTH");
+
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string body = R"({"agent_ids":["agent-1"],"params":{"deep":)" + deep_array + "}}";
+    auto res = h.sink.Post("/api/instructions/def-DEPTH/execute", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(h.dispatch_calls == 0);
+}
+
 TEST_CASE("#2500 — a genuinely omitted target still broadcasts (the over-broadness guard)",
           "[pg][workflow][executions][execute][targeting]") {
     // The half of the rule that is NOT a refusal, and the one a careless fix
