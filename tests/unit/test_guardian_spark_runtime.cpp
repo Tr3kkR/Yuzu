@@ -7307,29 +7307,36 @@ TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous
 // Lifetime, corrected (cpp-safety + security-guardian finding, governance
 // follow-up, 2026-09-16): a stale gap-hook invocation that already copied
 // the closure under registry_mu_ before Cleanup's destructor clears the
-// registration is the SAME already-parked HC-1b cross-teardown TOCTOU
-// below, not a distinct hazard class - gap_hook_fire_count is one more
-// [&]-captured local newly reachable through that pre-existing, deferred
-// window, exactly like entered/release_hook/r2_thread already were.
-// Independently confirmed unchanged/not worsened by this fix (narrows the
-// blast radius of an in-frame second firing from a guaranteed crash to a
-// safe no-op; does not itself widen or narrow HC-1b's own separate,
-// already-tracked window). This is NOT a claim that these firings, if they
-// happen, cannot outlive this TEST_CASE's own stack frame via that same
-// TOCTOU - an earlier draft of this comment wrongly claimed that; see HC-1b
-// below for the actual, still-open window.
+// registration is the SAME already-parked cross-teardown TOCTOU Cleanup's
+// own destructor comment below describes ("tracked, not fixed" there;
+// tracked as finding HC-1b-residual-toctou-already-copied-hook in
+// governance.d/4417-spark-9c-pr5c-macos-tsan-fix.MinBIf.jsonl, referred to
+// as "HC-1b" below for brevity), not a distinct hazard class -
+// gap_hook_fire_count is one more [&]-captured local newly reachable
+// through that pre-existing, deferred window, exactly like
+// entered/release_hook/r2_thread already were. Independently confirmed
+// unchanged/not worsened by this fix (narrows the blast radius of an
+// in-frame second firing from a guaranteed crash to a safe no-op; does not
+// itself widen or narrow that window). This is NOT a claim that these
+// firings, if they happen, cannot outlive this TEST_CASE's own stack frame
+// via that same TOCTOU - an earlier draft of this comment wrongly claimed
+// that; see Cleanup's own destructor comment below for the actual,
+// still-open window.
 static void set_value_once(std::promise<void>& p) noexcept {
     try {
         p.set_value();
     } catch (const std::future_error& e) {
         // cpp-expert/cpp-safety/unhappy-path finding (governance follow-up,
-        // 2026-09-16, UP-4): narrowed from a blanket catch - promise_already_
-        // satisfied is the duplicate-wake case this function exists to
-        // swallow; no_state (set_value on an empty/moved-from promise) is a
-        // genuinely different defect class and must not be silently
-        // absorbed. noexcept forbids rethrowing here, so report loudly
-        // instead - fprintf(stderr) is safe from any thread (plain stdio,
-        // not Catch2's non-thread-safe assertion machinery).
+        // 2026-09-16, UP-4): the catch clause itself still catches every
+        // future_error code (security-guardian correction, Gate 8, 2026-09-16:
+        // an earlier version of this comment said "narrowed from a blanket
+        // catch", which overstated it) - what's new is discriminating INSIDE
+        // the catch: promise_already_satisfied is the duplicate-wake case this
+        // function exists to swallow; no_state (set_value on an empty/moved-
+        // from promise) is a genuinely different defect class and must not be
+        // silently absorbed. noexcept forbids rethrowing here, so report
+        // loudly instead - fprintf(stderr) is safe from any thread (plain
+        // stdio, not Catch2's non-thread-safe assertion machinery).
         if (e.code() != std::future_errc::promise_already_satisfied) {
             std::fprintf(stderr,
                          "set_value_once(): unexpected future_error (%s) - not "
@@ -7379,9 +7386,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // future_already_retrieved on any call after the first, REGARDLESS of
         // whether set_value() was ever called - retrieved once here, before any
         // hook registration, so the entry hook below can safely .wait() on the
-        // shared_future even if it were ever invoked more than once (today
-        // structurally prevented - see gap_hook_fire_count above - this is
-        // defense-in-depth, not a live gap).
+        // shared_future even if it were ever invoked more than once. Today
+        // prevented under this test's own sequencing (move-consumption at
+        // dispatch_arm_off_lock's entry-hook read, under registry_mu_; no
+        // other dispatch reaches this runtime instance between the drain-gap
+        // hook's registration and r2's own consumption of it) - #4415 tracks
+        // the open question of whether anything can violate that sequencing
+        // (tracked as finding UP-5 in
+        // governance.d/4417-spark-9c-pr5c-second-macos-followup.OatQnp.jsonl:
+        // speculative, not confirmed as live, linked to #4415). This hoist is
+        // defense-in-depth either way.
     std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
         // worker thread, not this one) - atomic per this file's own established
         // pattern for exactly this hook-thread-to-main-thread signal (see
@@ -7412,15 +7426,25 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // the first firing). Reachable through the same pre-existing,
         // already-parked HC-1b TOCTOU as entered/release_hook/r2_thread - see
         // the CI-finding comment above set_value_once for the full account.
+        // relaxed is sufficient (cpp-safety-confirmed, Gate 8 governance
+        // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
+        // RMW mutual exclusion on ITS OWN modification order - it publishes no
+        // other field through itself, so no stronger ordering is needed.
     rt->set_drain_gap_hook_for_test([&] {
-        if (gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+        // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
+        // follow-up, 2026-09-16): use fetch_add's OWN return value for the
+        // printed count, not a separate .load() - under 3+ concurrent firings
+        // a separate load could print a stale or duplicate count relative to
+        // the caller's own fetch_add result.
+        if (const int prior = gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
+            prior > 0) {
             std::fprintf(stderr,
                          "drain-gap hook fired again (fire #%d) after the first "
                          "firing already parked r2 - no-op (see "
                          "gap_hook_fire_count's own declaration comment). Plain "
                          "fprintf(stderr), not a Catch2 assertion, so safe from "
                          "this (non-main) thread.\n",
-                         gap_hook_fire_count.load(std::memory_order_relaxed));
+                         prior + 1);
             return;
         }
         rt->set_dispatch_entry_hook_for_test([&] {
@@ -7554,6 +7578,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
+    // quality-engineer/unhappy-path finding (Gate 8 governance follow-up,
+    // 2026-09-16): unlike Cleanup's noexcept destructor (which must never
+    // assert), THIS is a safe, ordinary main-thread assertion point - after
+    // r2_thread has joined and the hook is cleared, so no further firing can
+    // be registered. A stale ALREADY-in-flight copy from the pre-existing,
+    // parked HC-1b TOCTOU could theoretically still land after this line, but
+    // that window is unchanged by this file's own fix and already tracked
+    // separately - this CHECK closes the ordinary case: on every one of this
+    // round's 25 empirical runs the count was 1, never higher.
+    CHECK(gap_hook_fire_count.load(std::memory_order_relaxed) == 1);
     REQUIRE(res2.has_value());
     REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
 
@@ -7619,9 +7653,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // future_already_retrieved on any call after the first, REGARDLESS of
         // whether set_value() was ever called - retrieved once here, before any
         // hook registration, so the entry hook below can safely .wait() on the
-        // shared_future even if it were ever invoked more than once (today
-        // structurally prevented - see gap_hook_fire_count above - this is
-        // defense-in-depth, not a live gap).
+        // shared_future even if it were ever invoked more than once. Today
+        // prevented under this test's own sequencing (move-consumption at
+        // dispatch_arm_off_lock's entry-hook read, under registry_mu_; no
+        // other dispatch reaches this runtime instance between the drain-gap
+        // hook's registration and r2's own consumption of it) - #4415 tracks
+        // the open question of whether anything can violate that sequencing
+        // (tracked as finding UP-5 in
+        // governance.d/4417-spark-9c-pr5c-second-macos-followup.OatQnp.jsonl:
+        // speculative, not confirmed as live, linked to #4415). This hoist is
+        // defense-in-depth either way.
     std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
         // worker thread, not this one) - atomic per this file's own established
         // pattern for exactly this hook-thread-to-main-thread signal (see
@@ -7652,15 +7693,25 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // the first firing). Reachable through the same pre-existing,
         // already-parked HC-1b TOCTOU as entered/release_hook/r2_thread - see
         // the CI-finding comment above set_value_once for the full account.
+        // relaxed is sufficient (cpp-safety-confirmed, Gate 8 governance
+        // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
+        // RMW mutual exclusion on ITS OWN modification order - it publishes no
+        // other field through itself, so no stronger ordering is needed.
     rt->set_drain_gap_hook_for_test([&] {
-        if (gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+        // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
+        // follow-up, 2026-09-16): use fetch_add's OWN return value for the
+        // printed count, not a separate .load() - under 3+ concurrent firings
+        // a separate load could print a stale or duplicate count relative to
+        // the caller's own fetch_add result.
+        if (const int prior = gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
+            prior > 0) {
             std::fprintf(stderr,
                          "drain-gap hook fired again (fire #%d) after the first "
                          "firing already parked r2 - no-op (see "
                          "gap_hook_fire_count's own declaration comment). Plain "
                          "fprintf(stderr), not a Catch2 assertion, so safe from "
                          "this (non-main) thread.\n",
-                         gap_hook_fire_count.load(std::memory_order_relaxed));
+                         prior + 1);
             return;
         }
         rt->set_dispatch_entry_hook_for_test([&] {
@@ -7794,6 +7845,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
+    // quality-engineer/unhappy-path finding (Gate 8 governance follow-up,
+    // 2026-09-16): unlike Cleanup's noexcept destructor (which must never
+    // assert), THIS is a safe, ordinary main-thread assertion point - after
+    // r2_thread has joined and the hook is cleared, so no further firing can
+    // be registered. A stale ALREADY-in-flight copy from the pre-existing,
+    // parked HC-1b TOCTOU could theoretically still land after this line, but
+    // that window is unchanged by this file's own fix and already tracked
+    // separately - this CHECK closes the ordinary case: on every one of this
+    // round's 25 empirical runs the count was 1, never higher.
+    CHECK(gap_hook_fire_count.load(std::memory_order_relaxed) == 1);
     REQUIRE(res2.has_value());
     REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
 
@@ -7851,9 +7912,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // future_already_retrieved on any call after the first, REGARDLESS of
         // whether set_value() was ever called - retrieved once here, before any
         // hook registration, so the entry hook below can safely .wait() on the
-        // shared_future even if it were ever invoked more than once (today
-        // structurally prevented - see gap_hook_fire_count above - this is
-        // defense-in-depth, not a live gap).
+        // shared_future even if it were ever invoked more than once. Today
+        // prevented under this test's own sequencing (move-consumption at
+        // dispatch_arm_off_lock's entry-hook read, under registry_mu_; no
+        // other dispatch reaches this runtime instance between the drain-gap
+        // hook's registration and r2's own consumption of it) - #4415 tracks
+        // the open question of whether anything can violate that sequencing
+        // (tracked as finding UP-5 in
+        // governance.d/4417-spark-9c-pr5c-second-macos-followup.OatQnp.jsonl:
+        // speculative, not confirmed as live, linked to #4415). This hoist is
+        // defense-in-depth either way.
     std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
         // worker thread, not this one) - atomic per this file's own established
         // pattern for exactly this hook-thread-to-main-thread signal (see
@@ -7884,15 +7952,25 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // the first firing). Reachable through the same pre-existing,
         // already-parked HC-1b TOCTOU as entered/release_hook/r2_thread - see
         // the CI-finding comment above set_value_once for the full account.
+        // relaxed is sufficient (cpp-safety-confirmed, Gate 8 governance
+        // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
+        // RMW mutual exclusion on ITS OWN modification order - it publishes no
+        // other field through itself, so no stronger ordering is needed.
     rt->set_drain_gap_hook_for_test([&] {
-        if (gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+        // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
+        // follow-up, 2026-09-16): use fetch_add's OWN return value for the
+        // printed count, not a separate .load() - under 3+ concurrent firings
+        // a separate load could print a stale or duplicate count relative to
+        // the caller's own fetch_add result.
+        if (const int prior = gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
+            prior > 0) {
             std::fprintf(stderr,
                          "drain-gap hook fired again (fire #%d) after the first "
                          "firing already parked r2 - no-op (see "
                          "gap_hook_fire_count's own declaration comment). Plain "
                          "fprintf(stderr), not a Catch2 assertion, so safe from "
                          "this (non-main) thread.\n",
-                         gap_hook_fire_count.load(std::memory_order_relaxed));
+                         prior + 1);
             return;
         }
         rt->set_dispatch_entry_hook_for_test([&] {
@@ -8029,6 +8107,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
+    // quality-engineer/unhappy-path finding (Gate 8 governance follow-up,
+    // 2026-09-16): unlike Cleanup's noexcept destructor (which must never
+    // assert), THIS is a safe, ordinary main-thread assertion point - after
+    // r2_thread has joined and the hook is cleared, so no further firing can
+    // be registered. A stale ALREADY-in-flight copy from the pre-existing,
+    // parked HC-1b TOCTOU could theoretically still land after this line, but
+    // that window is unchanged by this file's own fix and already tracked
+    // separately - this CHECK closes the ordinary case: on every one of this
+    // round's 25 empirical runs the count was 1, never higher.
+    CHECK(gap_hook_fire_count.load(std::memory_order_relaxed) == 1);
     REQUIRE(res2.has_value());
 
     // NOW saturate File-class reservation capacity (4) with 4 parked arms on
