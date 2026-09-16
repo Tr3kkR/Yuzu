@@ -98,11 +98,20 @@ std::string ci_cell(const std::string& v) { return ci_disp(v); }
 
 // Full query string for /fragments/hardware/list, echoing every facet so every
 // control on the page is self-describing on swap (device_ui.cpp's chip idiom).
-std::string list_url(const HardwareListQuery& q) {
-    std::string u = "/fragments/hardware/list?q=" + url_encode(q.q) + "&os=" + url_encode(q.os) +
+// `with_q=false` omits `q=` — used by every control that carries `hx-include="#hw-q"`
+// instead, so the LIVE (not-yet-submitted) search box value wins rather than a stale
+// URL-embedded copy; httplib keeps only the FIRST of two same-named params, so a
+// control must never emit both. `results_only=true` asks the route for just the
+// `#hw-results` region (table/chips/breadcrumb/pager), never the KPI strip or h1 —
+// that is what makes the search box's own swap not destroy the input mid-keystroke
+// (round-2 item 5).
+std::string list_url(const HardwareListQuery& q, bool with_q = true, bool results_only = false) {
+    std::string u = "/fragments/hardware/list?os=" + url_encode(q.os) +
                     "&status=" + url_encode(q.status) + "&sort=" + url_encode(q.sort) +
                     "&dir=" + (q.desc ? "desc" : "asc") + "&offset=" + std::to_string(q.offset) +
                     "&limit=" + std::to_string(q.limit);
+    if (with_q) u += "&q=" + url_encode(q.q);
+    if (results_only) u += "&results_only=1";
     return u;
 }
 
@@ -148,6 +157,8 @@ std::string hw_style() {
   .ci-grid .ci-lab{color:var(--muted,#8fa3bd);font-size:.62rem;text-transform:uppercase;letter-spacing:.03em}
   .ci-sec{margin-top:1rem}
   .ci-sec h4{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted,#8fa3bd);margin:0 0 .35rem;border-bottom:1px solid var(--border,#2d4068);padding-bottom:.25rem}
+  .hw-scroll{overflow-x:auto}
+  .hw-macs{display:flex;flex-wrap:wrap;gap:.25rem;margin-top:.2rem}
 </style>)css";
 }
 
@@ -175,9 +186,9 @@ std::string sortable_th(const char* label, HwSortKey key, const HardwareListQuer
     nq.desc = next_desc;
     nq.offset = 0; // any sort change resets to page 1
     std::string indicator = active ? (q.desc ? " &#9660;" : " &#9650;") : "";
-    return std::string("<th class=\"sortable\" hx-get=\"") + esc(list_url(nq)) +
-           "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"this:abort\">" + label +
-           indicator + "</th>";
+    return std::string("<th class=\"sortable\" hx-get=\"") + esc(list_url(nq, false, true)) +
+           "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
+           "hx-sync=\"this:abort\">" + label + indicator + "</th>";
 }
 
 std::string chip(const char* label, const std::string& value, const HardwareListQuery& q,
@@ -186,29 +197,36 @@ std::string chip(const char* label, const std::string& value, const HardwareList
     if (is_os) nq.os = value; else nq.status = value;
     nq.offset = 0;
     const bool on = (is_os ? q.os : q.status) == value;
-    return std::string("<a class=\"gp-chip") + (on ? " on" : "") + "\" hx-get=\"" + esc(list_url(nq)) +
-           "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+    return std::string("<a class=\"gp-chip") + (on ? " on" : "") + "\" hx-get=\"" +
+           esc(list_url(nq, false, true)) + "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" "
+           "hx-include=\"#hw-q\">" + label + "</a>";
 }
 
 std::string breadcrumb(const HardwareListQuery& q) {
-    std::vector<std::pair<std::string, std::string>> active; // label -> cleared URL
+    // (label, cleared-url, needs-live-q-include). The search crumb clears q itself
+    // (with_q=true, blank) so it must NOT also hx-include the (still-populated) box —
+    // that would resurrect the just-cleared value. Every other crumb keeps the box's
+    // live value via hx-include instead of a URL-embedded (possibly stale) copy.
+    std::vector<std::tuple<std::string, std::string, bool>> active;
     if (!q.q.empty()) {
         HardwareListQuery nq = q; nq.q.clear(); nq.offset = 0;
-        active.emplace_back("Search: “" + esc(q.q) + "”", list_url(nq));
+        active.emplace_back("Search: “" + esc(q.q) + "”", list_url(nq, true, true), false);
     }
     if (q.os != "all") {
         HardwareListQuery nq = q; nq.os = "all"; nq.offset = 0;
-        active.emplace_back("OS: " + os_label(q.os), list_url(nq));
+        active.emplace_back("OS: " + os_label(q.os), list_url(nq, false, true), true);
     }
     if (q.status != "all") {
         HardwareListQuery nq = q; nq.status = "all"; nq.offset = 0;
-        active.emplace_back(q.status == "online" ? "Status: Online" : "Status: Offline", list_url(nq));
+        active.emplace_back(q.status == "online" ? "Status: Online" : "Status: Offline",
+                            list_url(nq, false, true), true);
     }
     if (active.empty()) return "";
     std::string h = "<div class=\"hw-breadcrumb\">";
-    for (auto& [label, url] : active)
+    for (auto& [label, url, inc] : active)
         h += "<span class=\"hw-crumb\">" + label + "<a hx-get=\"" + esc(url) +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&times;</a></span>";
+             "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\"" +
+             (inc ? " hx-include=\"#hw-q\"" : "") + ">&times;</a></span>";
     h += "</div>";
     return h;
 }
@@ -221,13 +239,15 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
     if (q.offset > 0) {
         HardwareListQuery pq = q;
         pq.offset = q.offset >= q.limit ? q.offset - q.limit : 0;
-        h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(pq)) +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"this:abort\">Prev</button>";
+        h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(pq, false, true)) +
+             "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
+             "hx-sync=\"this:abort\">Prev</button>";
     }
     if (q.offset + q.limit < total_matching) {
         HardwareListQuery nq = q; nq.offset = q.offset + q.limit;
-        h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(nq)) +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-sync=\"this:abort\">Next</button>";
+        h += " <button class=\"gp-btn\" hx-get=\"" + esc(list_url(nq, false, true)) +
+             "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
+             "hx-sync=\"this:abort\">Next</button>";
     }
     h += "</div>";
     return h;
@@ -295,10 +315,47 @@ std::string sync_button(const std::string& agent_id, const char* source, const c
     return h;
 }
 
+std::string render_hardware_results_region(const HardwareListPage& page, bool ci_degraded) {
+    const HardwareListQuery& q = page.query;
+    std::string h = "<div id=\"hw-results\">";
+    h += "<div class=\"gp-filters\">" + chip("All OS", "all", q, true) + chip("Windows", "windows", q, true) +
+         chip("Linux", "linux", q, true) + chip("macOS", "macos", q, true) + "</div>";
+    h += "<div class=\"gp-filters\">" + chip("All status", "all", q, false) +
+         chip("Online", "online", q, false) + chip("Offline", "offline", q, false) + "</div>";
+
+    h += breadcrumb(q);
+
+    if (page.rows.empty()) {
+        h += "<div class=\"gp-placeholder\"><b>No devices match.</b> Try clearing a filter.</div>";
+    } else {
+        h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr>";
+        h += sortable_th("Name", HwSortKey::Name, q);
+        h += sortable_th("OS", HwSortKey::Os, q);
+        h += sortable_th("Status", HwSortKey::Status, q);
+        h += sortable_th("Last seen", HwSortKey::LastSeen, q);
+        h += sortable_th("Manufacturer", HwSortKey::Manufacturer, q);
+        h += sortable_th("Model", HwSortKey::Model, q);
+        h += sortable_th("Serial", HwSortKey::Serial, q);
+        h += sortable_th("CPU", HwSortKey::Cpu, q);
+        h += sortable_th("RAM", HwSortKey::Ram, q);
+        h += sortable_th("OS version", HwSortKey::OsVersion, q);
+        h += "</tr></thead><tbody>";
+        for (const auto& row : page.rows)
+            h += row_html(row);
+        h += "</tbody></table></div>";
+        h += pagination(q, page.total_matching);
+    }
+    h += "</div>";
+    return h;
+}
+
 } // namespace
 
 std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
-                                          bool roster_unavailable) {
+                                          bool roster_unavailable, bool results_only) {
+    if (results_only)
+        return render_hardware_results_region(page, ci_degraded);
+
     std::string h = hw_style();
     h += "<div class=\"hw-wrap\">";
     h += "<h1 class=\"hw-h1\">Hardware</h1>";
@@ -318,39 +375,20 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
 
     const HardwareListQuery& q = page.query;
     h += "<div class=\"hw-ctrls\">";
-    h += "<input class=\"hw-search\" name=\"q\" value=\"" + esc(q.q) +
+    // CSP-safe search (round-2 item 5): htmx's `[key=='Enter']` event filter compiles
+    // with `Function()`, which the dashboard CSP (no unsafe-eval) refuses at runtime —
+    // htmx silently drops the filter and falls back to a bare `keyup`, firing on every
+    // keystroke. `changed`/`delay:` are plain token parsing (no eval), so they degrade
+    // safely instead of silently. The input also lives OUTSIDE `#hw-results`, targeted
+    // by every other control via `hx-include`, so its own swap can never destroy it.
+    h += "<input id=\"hw-q\" type=\"search\" class=\"hw-search\" name=\"q\" value=\"" + esc(q.q) +
          "\" placeholder=\"Search hostname, serial, model, CPU&hellip;\" hx-get=\"" +
-         esc(list_url([&] { HardwareListQuery nq = q; nq.offset = 0; return nq; }())) +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"keyup[key=='Enter'], search\" "
-         "hx-include=\"this\">";
-    h += "<div class=\"gp-filters\">" + chip("All OS", "all", q, true) + chip("Windows", "windows", q, true) +
-         chip("Linux", "linux", q, true) + chip("macOS", "macos", q, true) + "</div>";
-    h += "<div class=\"gp-filters\">" + chip("All status", "all", q, false) +
-         chip("Online", "online", q, false) + chip("Offline", "offline", q, false) + "</div>";
+         esc(list_url([&] { HardwareListQuery nq = q; nq.offset = 0; return nq; }(), false, true)) +
+         "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" "
+         "hx-trigger=\"keyup changed delay:400ms, search\" hx-sync=\"this:replace\">";
     h += "</div>";
 
-    h += breadcrumb(q);
-
-    if (page.rows.empty()) {
-        h += "<div class=\"gp-placeholder\"><b>No devices match.</b> Try clearing a filter.</div>";
-    } else {
-        h += "<table class=\"hw-tbl\"><thead><tr>";
-        h += sortable_th("Name", HwSortKey::Name, q);
-        h += sortable_th("OS", HwSortKey::Os, q);
-        h += sortable_th("Status", HwSortKey::Status, q);
-        h += sortable_th("Last seen", HwSortKey::LastSeen, q);
-        h += sortable_th("Manufacturer", HwSortKey::Manufacturer, q);
-        h += sortable_th("Model", HwSortKey::Model, q);
-        h += sortable_th("Serial", HwSortKey::Serial, q);
-        h += sortable_th("CPU", HwSortKey::Cpu, q);
-        h += sortable_th("RAM", HwSortKey::Ram, q);
-        h += sortable_th("OS version", HwSortKey::OsVersion, q);
-        h += "</tr></thead><tbody>";
-        for (const auto& row : page.rows)
-            h += row_html(row);
-        h += "</tbody></table>";
-        h += pagination(q, page.total_matching);
-    }
+    h += render_hardware_results_region(page, ci_degraded);
     h += "</div>";
     return h;
 }
@@ -422,8 +460,28 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
 
             h += "<div class=\"ci-sec\"><h4>Network</h4><div class=\"ci-grid\">";
             h += field("Primary MAC", r.primary_mac);
-            h += field("All MACs", r.macs_summary);
             h += field("NIC count", r.nic_count);
+            h += "</div>";
+            // A comma-joined string trails off the page at any width (round-3 item
+            // 12) — one wrapping chip per address instead of one unbroken line.
+            h += "<div><span class=\"ci-lab\">All MACs: </span>";
+            if (r.macs_summary.empty() || r.macs_summary == "unknown") {
+                h += "<span class=\"inv-grey\">&mdash;</span>";
+            } else {
+                h += "<div class=\"hw-macs\">";
+                std::string cur;
+                for (std::size_t i = 0; i <= r.macs_summary.size(); ++i) {
+                    if (i == r.macs_summary.size() || r.macs_summary[i] == ',') {
+                        while (!cur.empty() && cur.front() == ' ') cur.erase(cur.begin());
+                        while (!cur.empty() && cur.back() == ' ') cur.pop_back();
+                        if (!cur.empty()) h += "<span class=\"hw-tag\">" + esc(cur) + "</span>";
+                        cur.clear();
+                    } else {
+                        cur.push_back(r.macs_summary[i]);
+                    }
+                }
+                h += "</div>";
+            }
             h += "</div></div>";
 
             h += "<div class=\"ci-sec\"><h4>Operating system</h4><div class=\"ci-grid\">";
@@ -475,14 +533,21 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
         h += "</div>";
     }
 
-    h += "<div class=\"hw-lens\">";
-    h += device_lens_tab("overview", "Overview", agent_id, active_lens);
-    h += device_lens_tab("software", "Installed software", agent_id, active_lens);
-    h += device_lens_tab("tags", "Tags", agent_id, active_lens);
-    h += device_lens_tab("actions", "Actions", agent_id, active_lens);
-    h += "</div><div id=\"hw-ci-lens\">";
+    h += render_hardware_lens_bar(agent_id, active_lens, /*oob=*/false);
+    h += "<div id=\"hw-ci-lens\">";
     h += render_hardware_lens_body(agent_id, detail, active_lens, now_secs, aff);
     h += "</div></div>";
+    return h;
+}
+
+std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob) {
+    std::string h = "<div class=\"hw-lens\" id=\"hw-lens-bar\"" +
+                    std::string(oob ? " hx-swap-oob=\"true\"" : "") + ">";
+    h += device_lens_tab("overview", "Overview", agent_id, active);
+    h += device_lens_tab("software", "Installed software", agent_id, active);
+    h += device_lens_tab("tags", "Tags", agent_id, active);
+    h += device_lens_tab("actions", "Actions", agent_id, active);
+    h += "</div>";
     return h;
 }
 

@@ -52,7 +52,7 @@ class HttpRouteSink;
 /// pagination. `roster_unavailable` = the RosterFn itself is unwired/failed (distinct
 /// from `ci_degraded`, which only means the CI *columns* are blank on live rows).
 std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
-                                          bool roster_unavailable);
+                                          bool roster_unavailable, bool results_only = false);
 
 /// What the CI record may OFFER the caller beyond reading — computed by the route
 /// (online state, agent version floor, Execute / Tag:Write probes) and passed to
@@ -65,6 +65,14 @@ struct HwCiAffordances {
     HwSyncAffordance sync;
     bool can_write_tags{false}; // Tag:Write probe passed → Add/remove tag controls render
 };
+
+/// The lens tab bar alone, id="hw-lens-bar" — factored out so a lens-only response
+/// can prepend it as an out-of-band swap (round-2 item 6: without this the `on`
+/// class only ever moves on a full record render, so clicking a tab never visibly
+/// changes which tab looks active). `oob=true` emits `hx-swap-oob="true"` on the
+/// wrapping div; the full record render uses `oob=false` since the bar is already
+/// in the right place in the DOM.
+std::string render_hardware_lens_bar(const std::string& agent_id, const std::string& active, bool oob);
 
 /// The CI record: back link + header (hostname/OS/online/last-seen/agent id/Sync now)
 /// + lens tabs + the active lens's body. `lens` in {"overview","software","tags","actions"}.

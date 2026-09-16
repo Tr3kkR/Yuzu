@@ -136,6 +136,8 @@ std::optional<HwSortKey> parse_hw_sort_key(std::string_view token) {
     if (token == "cpu") return HwSortKey::Cpu;
     if (token == "ram") return HwSortKey::Ram;
     if (token == "os_version") return HwSortKey::OsVersion;
+    if (token == "version") return HwSortKey::Version;
+    if (token == "ip") return HwSortKey::Ip;
     return std::nullopt;
 }
 
@@ -151,6 +153,8 @@ std::string_view hw_sort_token(HwSortKey key) {
         case HwSortKey::Cpu: return "cpu";
         case HwSortKey::Ram: return "ram";
         case HwSortKey::OsVersion: return "os_version";
+        case HwSortKey::Version: return "version";
+        case HwSortKey::Ip: return "ip";
     }
     return "name"; // unreachable; silences -Wreturn-type on some compilers
 }

@@ -43,6 +43,8 @@ enum class HwSortKey {
     Cpu,
     Ram,
     OsVersion,
+    Version, // agent_version — round-3 merge; NOT DEX (see hardware_kpis' doc note)
+    Ip,
 };
 
 [[nodiscard]] std::optional<HwSortKey> parse_hw_sort_key(std::string_view token);
@@ -58,6 +60,10 @@ struct HardwareListQuery {
     bool desc{false};
     std::size_t offset{0};
     std::size_t limit{50};
+    /// "" = no tag filter. "key" = any value; "key=value" = exact value match.
+    /// The key half is validated against TagStore::validate_key by
+    /// normalise_hardware_query — an invalid key is a 400, same as a bad sort token.
+    std::string tag;
 };
 
 /// Validates and clamps a raw query. Returns `nullopt` when `os`/`status`/`sort` is
@@ -68,11 +74,12 @@ struct HardwareListQuery {
 /// Lowercased, whitespace-split, deduplicated-by-position search tokens, capped at 8.
 [[nodiscard]] std::vector<std::string> hw_search_tokens(std::string_view q);
 
-/// True iff `row` matches every token in `tokens` (AND, substring, case-folded) AND
-/// the `os`/`status` facet. `os`/`status` are assumed already-normalised tokens
-/// ("all" or a specific value) — call `normalise_hardware_query` first.
+/// True iff `row` matches every token in `tokens` (AND, substring, case-folded), the
+/// `os`/`status` facet, AND the tag facet. `os`/`status`/`tag` are assumed
+/// already-normalised ("all"/a specific value, and "" or "key"/"key=value") — call
+/// `normalise_hardware_query` first. Empty `tag` = no tag filter.
 [[nodiscard]] bool hw_row_matches(const InventoryDeviceRow& row, const std::vector<std::string>& tokens,
-                                  std::string_view os, std::string_view status);
+                                  std::string_view os, std::string_view status, std::string_view tag);
 
 struct HardwareKpis {
     std::size_t total{0};
@@ -107,7 +114,7 @@ struct HardwareListPage {
 [[nodiscard]] nlohmann::json hardware_row_json(const InventoryDeviceRow& row);
 
 [[nodiscard]] nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded,
-                                                std::size_t devices_omitted);
+                                                std::size_t devices_omitted, bool tags_degraded = false);
 
 /// The full CI record composition — identity + CI blob + installed software + tags.
 /// Each optional/expected member independently distinguishes "degraded" from

@@ -23,6 +23,7 @@ extern const char* const kGuardianDetailPageHtml =
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{TITLE}}</title>
   <link rel="stylesheet" href="/static/yuzu.css">
+  <meta name="htmx-config" content='{"allowEval":false}'>
   <script src="/static/htmx.js"></script>
   <style>
     .gp-wrap { max-width: 1100px; margin: 1.5rem auto; padding: 0 1.5rem; }
@@ -355,6 +356,21 @@ extern const char* const kGuardianDetailPageHtml =
     document.body.addEventListener('showToast', function (e) {
       var d = e.detail || {};
       showToast(d.message || 'Done', d.level || 'success');
+    });
+
+    /* htmx.config.allowEval=false (meta tag above) means an `[expr]` event filter
+       or hx-on mistake fires htmx:evalDisallowedError instead of just silently
+       always-matching; a raw CSP throw inside htmx's own eval attempt is caught
+       internally and re-fired as htmx:syntax:error. Neither reaches window.onerror
+       on its own — without these listeners the failure is invisible in the console,
+       which is exactly how the round-2 search-box bug went unnoticed until a human
+       hit tab+backspace enough times to see the input clear (round-3 item 5). */
+    document.body.addEventListener('htmx:evalDisallowedError', function (e) {
+      console.error('htmx eval disallowed (CSP) at', e.target, e.detail);
+      showToast('A page control tried to run disallowed script — please report this.', 'error');
+    });
+    document.body.addEventListener('htmx:syntax:error', function (e) {
+      console.error('htmx syntax/eval error at', e.target, e.detail);
     });
 
     /* ── Device live-snapshot helpers (feat/device-live-snapshot). Plain functions

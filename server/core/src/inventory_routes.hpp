@@ -83,6 +83,31 @@ struct InventoryDeviceRow {
     std::string ci_arch;
     std::string ci_domain;
     std::string ci_primary_mac;
+
+    // Round-3 merge fields (the retired /devices list + /device entity page folded
+    // into Hardware — nothing left duplicated between the two surfaces):
+    /// Online: the live session's self-reported agent_version (registry, identity
+    /// field, lock-free). Offline: the last value a session of this agent reported,
+    /// persisted in endpoint_state (empty until that migration lands). "" = unknown.
+    std::string agent_version;
+    /// Same online/offline provenance as agent_version. Prefer this over ci_arch
+    /// when both are present — it is the agent's own self-report, not a device-CI
+    /// sync cycle that may be up to 24h stale.
+    std::string arch;
+    /// Claimed IPs from the live TAR fleet-snapshot cache (FleetTopologyStore,
+    /// 60s TTL) — ONLINE-ONLY, evicted on deregistration. Empty is honest for an
+    /// offline row, not a degrade: there is no durable IP source today (round-3
+    /// item 10; a device-CI blob field is the tracked follow-up).
+    std::vector<std::string> ips;
+    /// Key-sorted tags (TagStore, bulk-preloaded once per roster build — never a
+    /// per-row store read). Empty is a genuine "no tags", not a degrade; see
+    /// InventoryDevicesResult::tags_degraded for the degrade case.
+    std::vector<std::pair<std::string, std::string>> tags;
+    /// DEX experience score 0-100, scored ONLY for rows the caller is about to
+    /// render (device_routes.cpp's "score only rendered rows" rule — a GROUP-BY
+    /// per device is too costly to run over the whole roster). -1 = not scored /
+    /// no GuaranteedStateStore wired.
+    int dex_score = -1;
 };
 
 /// Result of the device-CI roster read. `rows` is the roster and is ALWAYS populated
@@ -95,6 +120,10 @@ struct InventoryDeviceRow {
 struct InventoryDevicesResult {
     std::vector<InventoryDeviceRow> rows;
     bool ci_degraded = false;
+    /// True when the bulk tag preload failed (TagStore degrade / unwired) — every
+    /// row's `tags` is then genuinely empty-because-degraded, not empty-because-
+    /// no-tags; the Tags column renders an honest note instead of a blank column.
+    bool tags_degraded = false;
 };
 
 // ── PURE renderers (implemented in inventory_ui.cpp) ─────────────────────────────

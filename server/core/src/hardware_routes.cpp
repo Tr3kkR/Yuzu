@@ -209,7 +209,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 " omitted=" + std::to_string(omitted));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
-        send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false));
+        const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
+        send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only));
     });
 
     // -- Fragment: CI record (overview / installed software / tags lenses) --
@@ -292,10 +293,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
         }
 
-        if (lens_only)
-            send_html(res, render_hardware_lens_body(id, detail, lens, now_secs(), aff));
-        else
+        if (lens_only) {
+            // Round-2 item 2: the tab bar renders once in the full record and is
+            // absent from a lens-only body, so the "on" class never moved when an
+            // operator clicked a different tab. Prepend it as an out-of-band swap —
+            // it lives in the DOM as #hw-lens-bar and htmx patches it in place
+            // alongside the innerHTML swap of #hw-ci-lens. The sync-now poll fires
+            // this same lens_only path every 1-2s while waiting; it never needs the
+            // bar re-swapped (the active tab hasn't changed), so it's skipped there.
+            std::string body = render_hardware_lens_body(id, detail, lens, now_secs(), aff);
+            if (!await_since)
+                body = render_hardware_lens_bar(id, lens, /*oob=*/true) + body;
+            send_html(res, body);
+        } else {
             send_html(res, render_hardware_ci_fragment(id, detail, lens, now_secs(), aff));
+        }
     });
 
     // -- REST v1: POST /api/v1/hardware/{id}/sync — operator-requested sync-on-demand --
