@@ -14498,10 +14498,13 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    std::string key =
-                        args.contains("key") && args["key"].is_string() && !args["key"].get<std::string>().empty()
-                            ? args["key"].get<std::string>()
-                            : std::string(kDexDefaultCohortKey);
+                    // Present (even empty) means explicit — validated, never silently
+                    // defaulted; only an ABSENT key falls back. Matches REST's
+                    // has_param-based behavior so key="" 400s identically on both
+                    // transports instead of MCP quietly substituting the default.
+                    std::string key = args.contains("key") && args["key"].is_string()
+                                           ? args["key"].get<std::string>()
+                                           : std::string(kDexDefaultCohortKey);
                     if (!TagStore::validate_key(key)) {
                         res.set_content(
                             error_response(id, kInvalidParams, "invalid parameter 'key'",
@@ -14509,7 +14512,8 @@ McpServer::HandlerFn McpServer::build_handler(
                             "application/json");
                         return;
                     }
-                    if (!args.contains("value") || !args["value"].is_string()) {
+                    if (!args.contains("value") || !args["value"].is_string() ||
+                        args["value"].get<std::string>().empty()) {
                         res.set_content(
                             error_response(id, kInvalidParams, "missing required parameter 'value'",
                                            a4_data(0, "supply value=<tag value>; discover values via "
@@ -14674,6 +14678,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto rows =
                     app_perf_providers.version_devices(app, version, visible_ids, truncated);
                 if (!rows) { // AUTHORITATIVE read degrade
+                    // Dedicated verb on the degrade path too, matching the REST/dashboard
+                    // siblings (set-and-proceed — MCP has no Sec-Audit-Failed equivalent).
+                    (void)yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, "dex.app_perf.devices.view", "failure", "GuaranteedState",
+                        "", "app=" + app + " version=" + version + " store degraded via MCP "
+                            "list_dex_app_perf_devices");
                     mcp_audit("failure", "app-perf store read degraded; app=" + app +
                                              " version=" + version);
                     res.set_content(

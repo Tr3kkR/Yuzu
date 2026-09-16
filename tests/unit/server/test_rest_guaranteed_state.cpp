@@ -2873,6 +2873,18 @@ TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floo
         REQUIRE(res);
         CHECK(res->status == 400);
     }
+    SECTION("present-but-empty value → 400, not treated as 'every value' (sec-M1)") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("present-but-empty key → 400, not silently defaulted (sec-M1)") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?key=&value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
     SECTION("provider absent → 503") {
         RestGsHarness h(true, true, false);
         auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");

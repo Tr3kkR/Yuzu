@@ -8326,6 +8326,42 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     auto tbk_body = nlohmann::json::parse(tag_bad_key->body);
     REQUIRE(tbk_body.contains("error"));
     CHECK(tbk_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // sec-M1: a present-but-empty value must 400, not silently read as "every
+    // value" — matches REST's has_param-then-.empty() check.
+    auto tag_empty_value = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8501,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"","app":"chrome.exe"}}})");
+    auto tev_body = nlohmann::json::parse(tag_empty_value->body);
+    REQUIRE(tev_body.contains("error"));
+    CHECK(tev_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // A present-but-empty key must 400 too, aligning MCP to REST's
+    // has_param-based behavior instead of silently substituting the default
+    // (the divergence happy-path flagged: REST rejects key="", MCP used to
+    // quietly default it to "model").
+    auto tag_empty_key = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8502,"params":{"name":"get_dex_tag_app_perf","arguments":{"key":"","value":"Latitude 5420","app":"chrome.exe"}}})");
+    auto tek_body = nlohmann::json::parse(tag_empty_key->body);
+    REQUIRE(tek_body.contains("error"));
+    CHECK(tek_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP get_dex_tag_app_perf: store degrade (wired provider returns nullopt) "
+          "-> internal error, never a silent empty trend",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.tag_cohort =
+        [](std::string_view, std::string_view, std::string_view,
+           std::string_view) -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::nullopt; // AUTHORITATIVE degrade (tag lookup OR the aggregate read failed)
+    };
+    ts.start("readonly");
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":8503,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"Latitude 5420","app":"chrome.exe"}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
 TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential, no verdict)",
@@ -8696,6 +8732,37 @@ TEST_CASE("MCP list_dex_app_perf_devices: unwired fleet_read_fn_ -> fail-closed,
     CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
     for (const auto& a : ts.audit_log)
         CHECK(a != "dex.app_perf.devices.view|success");
+}
+
+TEST_CASE("MCP list_dex_app_perf_devices: store degrade -> dedicated failure audit "
+          "(regression, was silently missing), never success",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.version_devices =
+        [](std::string_view, std::string_view, const std::optional<std::vector<std::string>>&,
+           bool&) -> std::optional<std::vector<yuzu::server::AppPerfVersionDeviceRow>> {
+        return std::nullopt; // AUTHORITATIVE degrade
+    };
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::nullopt};
+    };
+    ts.start("readonly");
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":89,"params":{"name":"list_dex_app_perf_devices","arguments":{"app":"chrome.exe","version":"119.0.0.0"}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+
+    bool saw_dedicated_failure = false;
+    for (const auto& a : ts.audit_log) {
+        CHECK(a != "dex.app_perf.devices.view|success");
+        if (a == "dex.app_perf.devices.view|failure")
+            saw_dedicated_failure = true;
+    }
+    CHECK(saw_dedicated_failure); // the dedicated verb, not just the generic mcp.<tool> audit
 }
 
 TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)",

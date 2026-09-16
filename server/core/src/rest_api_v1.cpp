@@ -12928,7 +12928,9 @@ void RestApiV1::register_routes(
                                 "application/json");
                 return;
             }
-            if (!req.has_param("value")) {
+            const std::string value =
+                req.has_param("value") ? req.get_param_value("value") : "";
+            if (value.empty()) {
                 res.status = 400;
                 res.set_content(
                     detail::error_json_a4(400, "missing required parameter 'value'", cid,
@@ -12937,7 +12939,6 @@ void RestApiV1::register_routes(
                     "application/json");
                 return;
             }
-            const std::string value = req.get_param_value("value");
             if (!app_perf_param_valid(value)) { // shared cap + control-char/NUL re-floor
                 res.status = 400;
                 res.set_content(detail::error_json_a4(400, "invalid parameter 'value'", cid),

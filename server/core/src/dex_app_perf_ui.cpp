@@ -328,6 +328,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             base += "&amp;version=" + url_encode(active_version); // preserve the version filter
         h += "<div class=\"gp-note\">Scope: <select name=\"group\" hx-get=\"" + base +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+             "hx-sync=\"#guardian-detail:replace\" "
              "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
              "border-radius:.35rem;padding:.15rem .4rem;\">";
         h += "<option value=\"\"" + std::string(is_group ? "" : " selected") +
@@ -351,6 +352,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             mbase += "&amp;version=" + url_encode(active_version);
         h += "<div class=\"gp-note\">Model: <select name=\"model\" hx-get=\"" + mbase +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+             "hx-sync=\"#guardian-detail:replace\" "
              "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
              "border-radius:.35rem;padding:.15rem .4rem;\">";
         h += "<option value=\"\"" + std::string(is_model ? "" : " selected") +

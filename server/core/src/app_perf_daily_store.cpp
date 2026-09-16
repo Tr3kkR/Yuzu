@@ -108,38 +108,15 @@ const std::vector<pg::PgMigration>& migrations() {
          // is safe here — this table is born-on-Pg alongside B2, so it is empty at
          // first migration (no ACCESS EXCLUSIVE stall, no CONCURRENTLY needed).
          "CREATE INDEX app_perf_daily_day_idx ON app_perf_daily (day, app_name, version);"},
-        {3,
-         // Version-drill index (DEX app-perf-over-time "which devices" drill):
-         // list_devices_for_version filters WHERE app_name=$1 AND version=$2
-         // [AND agent_id = ANY($3)] then DISTINCT ON (agent_id) ... ORDER BY
-         // agent_id, day DESC. v2's (day, app_name, version) index is LEADING on
-         // day, so it does not serve an (app_name, version)-led lookup (it would
-         // scan every day-bucket for a match instead of pruning directly).
-         // Leading (app_name, version) here serves the WHERE equality; trailing
-         // (agent_id, day DESC) serves the DISTINCT ON's per-agent grouping and
-         // ordering without a separate sort.
-         //
-         // Plain (non-CONCURRENT) CREATE INDEX, unlike v2 above: this table is
-         // NOT born-empty at this migration (daily-sync ingestion has been live
-         // since v1/v2 shipped), and the PgMigrationRunner has no
-         // non-transactional migration kind yet (`CREATE INDEX CONCURRENTLY`
-         // cannot run inside the runner's per-migration transaction — see
-         // pg_migration_runner.hpp's "Future-evolution note"), so a plain build
-         // takes this table's ACCESS EXCLUSIVE lock for its duration. Two things
-         // bound the blast radius rather than merely excuse it: (1) apply_daily
-         // (the sole writer) is explicitly fail-soft — a lease/SQL failure
-         // during the lock window returns false without blocking the gRPC
-         // thread, and the agent re-sends its 2-day window next daily-sync
-         // cycle (this file's own header "Failure posture" contract), so a
-         // stalled write here is NOT a durable loss, it silently self-heals;
-         // (2) steady-state table size is bounded by fleet size x top-N(~20) x
-         // 31 days, not unbounded growth. A fleet large enough to make the lock
-         // window operator-visible should apply this migration in a
-         // maintenance window; a genuinely non-transactional migration kind is
-         // the durable fix, tracked in pg_migration_runner.hpp's own
-         // future-evolution note, and is out of this change's scope.
-         "CREATE INDEX app_perf_daily_version_devices_idx ON app_perf_daily "
-         "(app_name, version, agent_id, day DESC);"},
+        // v3 (the version-drill index) is deliberately NOT here. list_devices_for_version
+        // below runs correctly without it — a full scan, not a wrong answer — until the
+        // non-transactional migration kind exists (ADR-0008 Update, 2026-06-22): this
+        // table is live-written (daily-sync has been shipping since v1/v2), so a plain
+        // CREATE INDEX would take an ACCESS EXCLUSIVE lock for the build's duration, and
+        // ADR-0008 requires the non-transactional kind for DDL on an already-large,
+        // live table rather than "weakening the transactional default to sneak one in".
+        // Tracked as a follow-up once that migration kind lands (or a reviewed
+        // ADR-0008 exception is granted) — do not re-add a plain CREATE INDEX here.
     };
     return kMigrations;
 }

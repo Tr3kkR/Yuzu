@@ -229,7 +229,19 @@ numbers match.
   Every row names an `agent_id`, so this drill is **audit-logged**
   (`dex.app_perf.devices.view`) and confined to the caller's own
   management-group / service-scope visibility, unlike the unaudited aggregate
-  trend above it.
+  trend above it. The daily rollup that feeds this trend **excludes kernel
+  threads** (Linux `PF_KTHREAD`, e.g. `kworker/*`) — unlike the live,
+  per-device [procperf tier](tar.md) these devices still capture, where
+  kernel threads remain visible (their zero working set keeps them out of the
+  live top-N; see the procperf row of the source-coverage table). A device
+  upgraded across this change shows the old, unfiltered counts up to its last
+  pre-upgrade day and the filtered counts from the day after — not a data
+  glitch, just the two rollup versions meeting at the upgrade boundary. A
+  userspace process whose name happens to collide with a kernel-thread name
+  in one sampling tick loses that tick's contribution to the trend (diluted
+  into the hourly bucket the collision landed in, not a whole-day or
+  whole-app loss) — rare, since kernel-thread names are short and
+  Linux-kernel-specific, but not impossible for an oddly-named binary.
 - **Per-device** — click a device to see its unified signal history (every
   signal type on one timeline, with friendly labels) plus a **device
   performance** panel: CPU, memory, and disk-latency sparklines built from the

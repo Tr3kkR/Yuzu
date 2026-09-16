@@ -2534,6 +2534,84 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK(seen_version == "1.2.0.0"); // leading-zero form canonicalized, matching the fleet path
         CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
     }
+
+    SECTION("model path fires tag_cohort with the SAME canonical version as the fleet path") {
+        std::string seen_key, seen_value, seen_app, seen_version;
+        bool group_called = false;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view key, std::string_view value,
+                                   std::string_view app,
+                                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            seen_key = std::string(key);
+            seen_value = std::string(value);
+            seen_app = std::string(app);
+            seen_version = std::string(version);
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420&version=01.2.0.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK_FALSE(group_called); // model= alone must dispatch tag_cohort, not group
+        CHECK(seen_key == "model"); // default key
+        CHECK(seen_value == "Latitude 5420");
+        CHECK(seen_app == "Foo");
+        CHECK(seen_version == "1.2.0.0"); // canonicalized, matching every other scope path
+        CHECK(r->body.find(">1.2.0.0</span>") != std::string::npos);
+    }
+
+    SECTION("group wins when both group= and model= are present") {
+        bool group_called = false, tag_called = false;
+        AppPerfProviders providers;
+        providers.group = [&](std::string_view, std::string_view,
+                              std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            group_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_cohort = [&](std::string_view, std::string_view, std::string_view,
+                                   std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            tag_called = true;
+            return std::vector<AppPerfFleetRow>{};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&group=G1&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(group_called);
+        CHECK_FALSE(tag_called);
+    }
+
+    SECTION("tag_values populates the Model selector regardless of active scope branch") {
+        AppPerfProviders providers;
+        providers.fleet = [](std::string_view,
+                             std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::vector<AppPerfFleetRow>{};
+        };
+        providers.tag_values = [](std::string_view key) -> std::optional<std::vector<std::string>> {
+            CHECK(key == "model");
+            return std::vector<std::string>{"Latitude 5420", "OptiPlex 7090"};
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo"); // fleet-wide, no scope selected
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Latitude 5420") != std::string::npos);
+        CHECK(r->body.find("OptiPlex 7090") != std::string::npos);
+    }
 }
 
 TEST_CASE("DEX perf/apps picker route: q/platform/sort params reach the render "

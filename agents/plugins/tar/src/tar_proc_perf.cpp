@@ -270,7 +270,7 @@ std::optional<ProcCounter> parse_linux_pid_stat(std::uint32_t pid, std::string_v
         return std::nullopt;
 
     // Tokens after the ')' are stat fields 3+, so 0-indexed: field N → N−3.
-    //   flags=9  utime=11  stime=12  starttime=19  rss=21
+    //   flags=6  utime=11  stime=12  starttime=19  rss=21
     //   (proc(5), fields 9/14/15/22/24)
     constexpr std::size_t kFlags = 6, kUtime = 11, kStime = 12, kStartTime = 19, kRss = 21;
     constexpr std::size_t kNeed = kRss + 1;

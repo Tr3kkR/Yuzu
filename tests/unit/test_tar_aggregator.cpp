@@ -15,6 +15,7 @@
 #include "tar_status_format.hpp"
 #include "test_helpers.hpp"
 
+#include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
@@ -774,6 +775,57 @@ TEST_CASE("TAR rollup: $Module hourly aggregation fires and counts loads only",
     REQUIRE(res.has_value());
     REQUIRE(res->rows.size() == 1);
     CHECK(std::stoll(res->rows[0][0]) == 3); // only the 3 'loaded'; blocked/seed/unloaded excluded
+}
+
+TEST_CASE("TAR rollup: procperf hourly aggregation keeps a kernel-thread and "
+          "same-name userspace row SEPARATE (execution-level, not just SQL-string match)",
+          "[tar][procperf][rollup]") {
+    // The schema test ("hourly rollup SQL exists and groups...") only string-
+    // matches that `is_kthread` appears in the GROUP BY; this proves it
+    // actually PARTITIONS the aggregation — a kernel thread and a userspace
+    // process sharing one `name` (the PF_KTHREAD-flag/comm-collision case,
+    // UP-7) must fold into TWO hourly rows, not one mislabelled row that
+    // silently mixes kernel-scheduling noise into a real app's numbers.
+    yuzu::test::TempDbFile tmp{std::string_view{"tar-procperf-rollup-"}};
+    auto opened = TarDatabase::open(tmp.path);
+    REQUIRE(opened.has_value());
+    TarDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    const int64_t t0 = 1'735'689'600; // 2025-01-01 00:00:00 UTC (an hour boundary)
+    ProcPerfRow kthread;
+    kthread.ts = t0;
+    kthread.snapshot_id = 1;
+    kthread.name = "collide";
+    kthread.instances = 1;
+    kthread.cpu_pct = 5.0;
+    kthread.ws_bytes = 0;
+    kthread.is_kthread = true;
+
+    ProcPerfRow user_proc = kthread;
+    user_proc.snapshot_id = 2;
+    user_proc.cpu_pct = 40.0;
+    user_proc.ws_bytes = 100'000'000;
+    user_proc.is_kthread = false;
+
+    REQUIRE(db.insert_proc_perf_samples({kthread, user_proc}));
+    REQUIRE(row_count(db, "procperf_live") == 2);
+    REQUIRE(row_count(db, "procperf_hourly") == 0);
+
+    run_aggregation(db, t0 + 7200); // boundary two hours on → window covers t0
+
+    // Two rows, not one collapsed row — is_kthread genuinely partitions the
+    // GROUP BY rather than merely appearing in its column list.
+    REQUIRE(row_count(db, "procperf_hourly") == 2);
+    auto res = db.execute_query(
+        "SELECT is_kthread, cpu_avg FROM procperf_hourly WHERE name = 'collide' "
+        "ORDER BY is_kthread");
+    REQUIRE(res.has_value());
+    REQUIRE(res->rows.size() == 2);
+    CHECK(res->rows[0][0] == "0"); // userspace row
+    CHECK(std::stod(res->rows[0][1]) == Catch::Approx(40.0));
+    CHECK(res->rows[1][0] == "1"); // kernel-thread row
+    CHECK(std::stod(res->rows[1][1]) == Catch::Approx(5.0));
 }
 
 TEST_CASE("TAR rollup: $Software live→daily→monthly counts by action",

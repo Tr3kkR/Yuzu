@@ -721,7 +721,7 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
             }
             return false;
         };
-        char* emsg = nullptr;
+        SqliteErrMsg emsg;
         sqlite3_exec(raw_db, "SAVEPOINT v7_migration", nullptr, nullptr, nullptr);
         bool ok = true;
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -729,7 +729,7 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                 continue;
             const auto alter =
                 std::format("ALTER TABLE {} ADD COLUMN is_kthread INTEGER NOT NULL DEFAULT 0", tbl);
-            if (sqlite3_exec(raw_db, alter.c_str(), nullptr, nullptr, &emsg) != SQLITE_OK) {
+            if (sqlite3_exec(raw_db, alter.c_str(), nullptr, nullptr, emsg.addr()) != SQLITE_OK) {
                 // ERROR, not warn: insert_proc_perf_samples and the hourly rollup
                 // both name `is_kthread` unconditionally, so a stranded v6 DB fails
                 // to prepare EVERY tick and ALL procperf collection stops.
@@ -737,9 +737,7 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
                               "procperf collection will fail until the column is added. Recovery: "
                               "stop the agent and run `ALTER TABLE {} ADD COLUMN is_kthread INTEGER "
                               "NOT NULL DEFAULT 0;` on the tar.db, then restart.",
-                              tbl, emsg ? emsg : "unknown", tbl);
-                sqlite3_free(emsg);
-                emsg = nullptr;
+                              tbl, emsg.text(), tbl);
                 ok = false;
                 break;
             }
