@@ -88,6 +88,18 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// regardless of process, restart, or map iteration order.
 YUZU_EXPORT std::string guardian_push_content_id(const yuzu::guardian::v1::GuaranteedStatePush& push);
 
+/// Human-readable rendering of a ReceiptStatus, for drain_locked()'s own async-
+/// failure warn line (the only place a non-Committed resolution is logged - see
+/// that call site's own comment). Exported (unlike an internal helper) so a
+/// direct unit test can assert the full mapping without LogCapture - governance
+/// follow-up (Gate 4, happy-path + unhappy-path, 2026-09-16): the LogCapture-
+/// based assertions this function's naming previously relied on were removed
+/// (cross-image hazard, see resolved_statuses_for_test()'s own doc comment)
+/// without anything replacing their incidental coverage of this mapping.
+/// Exhaustive switch, no `default` (its own definition's comment has the full
+/// rationale) - a missing case is a build WARNING, not a silent "Unknown".
+YUZU_EXPORT const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status);
+
 class YUZU_EXPORT GuardianArmAckLedger {
 public:
     GuardianArmAckLedger();
@@ -194,9 +206,15 @@ public:
     /// caller.
     std::size_t pending_count_for_test() const;
 
-    /// TEST-ONLY: every ReceiptStatus this application's receipts have resolved to
-    /// via drain_locked(), in resolution order (empty if there is no current
-    /// application). Plain object state, not captured log text - a captured-log
+    /// TEST-ONLY: every non-Committed ReceiptStatus this application's receipts
+    /// have resolved to via drain_locked() - i.e. the same failure-group values
+    /// receipt_status_name() would render into the log line this accessor
+    /// replaces (Committed receipts increment resolved_armed instead and are
+    /// never pushed here). In drain order (std::map key order within one
+    /// drain_locked() call, call order across several - NOT the chronological
+    /// order the underlying claims actually resolved in at runtime); empty if
+    /// there is no current application. Plain object state, not captured log
+    /// text - a captured-log
     /// assertion is unreliable here because drain_locked()'s own logging call is
     /// compiled into libyuzu_agent_core, a SEPARATE shared library from the test
     /// binary on macOS: the default-logger swap test_log_capture.hpp performs

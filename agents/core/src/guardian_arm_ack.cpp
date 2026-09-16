@@ -60,6 +60,8 @@ bool is_sha256_hex(std::string_view s) {
     return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
 }
 
+} // namespace
+
 /// Governance finding SHOULD-1 (Gate 4, consistency-auditor): drain_locked()'s own
 /// async-failure warn previously logged no reason at all, unlike the sync-refusal
 /// warn in reconcile_rule_locked() which always names one. Exhaustive switch, no
@@ -67,6 +69,8 @@ bool is_sha256_hex(std::string_view s) {
 /// a future ReceiptStatus addition produces a missing-case WARNING here (this
 /// repo's meson.build sets werror=false repo-wide, so it is not a build failure -
 /// correcting an earlier overclaim in this comment), not a silent catch-all.
+/// Exported (see the header declaration's own comment) so its mapping stays
+/// directly unit-testable without LogCapture's cross-image hazard.
 const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
     using S = GuardianSparkRuntime::ReceiptStatus;
     switch (status) {
@@ -87,8 +91,6 @@ const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
     }
     return "Unknown"; // unreachable if the switch above is kept exhaustive
 }
-
-} // namespace
 
 std::string guardian_push_content_id(const gpb::GuaranteedStatePush& push) {
     std::vector<const gpb::GuaranteedStateRule*> sorted_rules;
@@ -201,7 +203,6 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         case S::Withdrawn:
         case S::Stopped:
             ++current_->resolved_failed;
-            current_->resolved_statuses_for_test.push_back(status);
             if (failed_out)
                 ++*failed_out; // UP-3: feeds GuardianEngine::arm_failures_ (see caller)
             // rung 9c PR-2 Unit 6: the only place this can be logged - reconcile_rule_locked's
@@ -218,6 +219,14 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
                              it->first, receipt_status_name(status));
             } catch (...) {
             }
+            // Governance follow-up (Gate 3, cpp-safety + cpp-expert; Gate 4,
+            // unhappy-path, 2026-09-16): pushed LAST in this branch, after
+            // resolved_failed/failed_out are already consistent with each other -
+            // a push_back bad_alloc here leaves this receipt un-erased (still in
+            // `pending`, re-drained and re-counted together next tick) rather than
+            // desyncing resolved_failed from failed_out the way an earlier-ordered
+            // push_back could have.
+            current_->resolved_statuses_for_test.push_back(status);
             break;
         }
         it = current_->pending.erase(it);

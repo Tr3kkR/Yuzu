@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
 
 using namespace yuzu::agent;
@@ -667,6 +668,24 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
     std::size_t failed_out2 = 0;
     CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0);
     CHECK(failed_out2 == 0);
+}
+
+TEST_CASE("receipt_status_name(): every ReceiptStatus renders a distinct, correct "
+          "name - the mapping drain_locked()'s async-failure warn line depends on",
+          "[spark][ack]") {
+    // Governance follow-up (Gate 4, happy-path + unhappy-path, 2026-09-16): the
+    // LogCapture-based assertions removed from the two tests below (cross-image
+    // hazard) incidentally covered this mapping too - direct, LogCapture-free
+    // coverage restored here instead, now that receipt_status_name() is exported
+    // for exactly this purpose (see its own declaration comment).
+    using S = GuardianSparkRuntime::ReceiptStatus;
+    CHECK(std::string_view(receipt_status_name(S::Pending)) == "Pending");
+    CHECK(std::string_view(receipt_status_name(S::Committed)) == "Committed");
+    CHECK(std::string_view(receipt_status_name(S::Failed)) == "Failed");
+    CHECK(std::string_view(receipt_status_name(S::CongestionExpired)) == "CongestionExpired");
+    CHECK(std::string_view(receipt_status_name(S::Wedged)) == "Wedged");
+    CHECK(std::string_view(receipt_status_name(S::Withdrawn)) == "Withdrawn");
+    CHECK(std::string_view(receipt_status_name(S::Stopped)) == "Stopped");
 }
 
 TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (timed "
