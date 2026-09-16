@@ -7263,33 +7263,80 @@ TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous
 // from the caller that already holds r2's own receipt - which is what makes the
 // corrected `end` value observable via receipt_status() at all.
 //
-// CI finding (macOS, 2026-09-17): the three tests below saw
+// CI finding (macOS, 2026-09-16): the three tests below saw
 // "std::future_error: The state of the promise has already been set" crash the
 // "REFILLED claim ... reservation-exhaustion" variant on CI (not reproduced
 // locally after 250+ runs, incl. under heavy artificial CPU contention). r2's
 // own claim legitimately passes through a transient Wedged classification in
 // that variant (its own REQUIRE below waits for receipt_status() to move away
-// from Wedged) - #4415 (filed, deferred, confirmed pre-existing/not introduced
-// by this PR) tracks a full-ruleset teardown+rearm storm against a
-// persistently-wedged key, driven every heartbeat cycle; each storm cycle is a
-// fresh arm/disarm sequence through on_arm_complete(), which is exactly what
-// re-registers this file's drain-gap/dispatch-entry test hooks (see their own
-// comments below) - a plausible second firing this test's original single-shot
-// assumption did not budget for. Rather than chase that storm's own timing
-// (out of scope here - #4415 owns it), make the hook and its two signalling
-// promises SAFE against a second firing instead of merely single-shot: a
-// second gap_hook call is a no-op (r2 is already correctly set up by the
-// first), and a second set_value() on either promise is an ignored late/
-// duplicate signal rather than an uncaught exception. Both firings, if they
-// happen, occur within this test's own still-live stack frame (the storm
-// would need to complete an entire arm/disarm cycle, which cannot outlive the
-// test process's own teardown boundary) - this is not the same hazard class
-// as HC-1b's parked cross-teardown TOCTOU below, and does not require this
-// test's state to move to the heap the way surviving a torn-down frame would.
-inline void set_value_once(std::promise<void>& p) noexcept {
+// from Wedged).
+//
+// Root cause: UNCONFIRMED (governance follow-up, 2026-09-16 - a 7-reviewer
+// round traced this hard; do not restate as settled). #4415 (filed, deferred,
+// confirmed pre-existing/not introduced by this PR) was the original
+// candidate - a full-ruleset teardown+rearm storm against a
+// persistently-wedged key, driven every heartbeat cycle - but this round
+// traced it against make_rt()'s actual harness and found no heartbeat thread
+// exists here to drive it: expire_overdue_claims() (the real heartbeat
+// driver) is called at most once per test. Two further candidates were
+// traced and also refuted: expire_overdue_claims()'s own reap-and-refill path
+// (reap_stranded_claims_locked deliberately excludes a Dispatching/Dispatched
+// head per its own comment, and r2's claim stays Dispatching throughout this
+// test's call), and r2's own reservation-exhaustion refusal
+// (dispatch_arm_off_lock's compensation-reservation check fails
+// SYNCHRONOUSLY, inline, before io_executor_.submit() is ever reached, so it
+// cannot itself produce a second on_arm_complete() call). No mechanism this
+// round traced legitimately reaches a second firing within this bare-runtime
+// harness; whether the CI crash was a genuine second firing via a mechanism
+// not yet found, or something else entirely, remains open - see #4415 for
+// the live investigation, not this comment.
+//
+// The fix below is deliberately mechanism-agnostic: rather than chase the
+// unconfirmed trigger, make the hook and its two signalling promises SAFE
+// against a second firing instead of merely single-shot - a second gap_hook
+// call is a no-op (r2 is already correctly set up by the first, and this is
+// logged to stderr for CI-log forensic visibility - see
+// gap_hook_fire_count's own comment below), and a second set_value() on
+// either promise is an ignored late/duplicate signal rather than an
+// uncaught exception. This assumes the test's OWN genuine firing arrives
+// before any hypothetical second one; if that ordering ever inverted, the
+// outcome is a bounded REQUIRE/CHECK failure downstream (this file's
+// existing spin_until timeouts), not a hang (sre finding, governance
+// follow-up, 2026-09-16).
+//
+// Lifetime, corrected (cpp-safety + security-guardian finding, governance
+// follow-up, 2026-09-16): a stale gap-hook invocation that already copied
+// the closure under registry_mu_ before Cleanup's destructor clears the
+// registration is the SAME already-parked HC-1b cross-teardown TOCTOU
+// below, not a distinct hazard class - gap_hook_fire_count is one more
+// [&]-captured local newly reachable through that pre-existing, deferred
+// window, exactly like entered/release_hook/r2_thread already were.
+// Independently confirmed unchanged/not worsened by this fix (narrows the
+// blast radius of an in-frame second firing from a guaranteed crash to a
+// safe no-op; does not itself widen or narrow HC-1b's own separate,
+// already-tracked window). This is NOT a claim that these firings, if they
+// happen, cannot outlive this TEST_CASE's own stack frame via that same
+// TOCTOU - an earlier draft of this comment wrongly claimed that; see HC-1b
+// below for the actual, still-open window.
+static void set_value_once(std::promise<void>& p) noexcept {
     try {
         p.set_value();
-    } catch (const std::future_error&) {
+    } catch (const std::future_error& e) {
+        // cpp-expert/cpp-safety/unhappy-path finding (governance follow-up,
+        // 2026-09-16, UP-4): narrowed from a blanket catch - promise_already_
+        // satisfied is the duplicate-wake case this function exists to
+        // swallow; no_state (set_value on an empty/moved-from promise) is a
+        // genuinely different defect class and must not be silently
+        // absorbed. noexcept forbids rethrowing here, so report loudly
+        // instead - fprintf(stderr) is safe from any thread (plain stdio,
+        // not Catch2's non-thread-safe assertion machinery).
+        if (e.code() != std::future_errc::promise_already_satisfied) {
+            std::fprintf(stderr,
+                         "set_value_once(): unexpected future_error (%s) - not "
+                         "a duplicate-wake, swallowing anyway because this "
+                         "function is noexcept; investigate\n",
+                         e.what());
+        }
         // Already satisfied by an earlier (first, or a late-arriving second)
         // firing - a duplicate wake, not a defect in the waiter's own logic.
     }
@@ -7327,6 +7374,14 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     std::promise<void> release_hook;
     bool released_by_test = false;
     auto entered_fut = entered.get_future();
+    auto release_fut = release_hook.get_future().share(); // cpp-safety/chaos-injector
+        // finding (governance follow-up, 2026-09-16, CH-3): get_future() throws
+        // future_already_retrieved on any call after the first, REGARDLESS of
+        // whether set_value() was ever called - retrieved once here, before any
+        // hook registration, so the entry hook below can safely .wait() on the
+        // shared_future even if it were ever invoked more than once (today
+        // structurally prevented - see gap_hook_fire_count above - this is
+        // defense-in-depth, not a live gap).
     std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
         // worker thread, not this one) - atomic per this file's own established
         // pattern for exactly this hook-thread-to-main-thread signal (see
@@ -7342,20 +7397,35 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // own hook's LAST store, not on a different signal entirely). Declared
         // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
         // FIRST, before touching r2_thread or anything else this frame owns.
-    std::atomic<bool> gap_hook_ran{false}; // see set_value_once's own doc comment
-        // above (#4415's storm can legitimately redrive this key through a fresh
-        // on_arm_complete() while this hook is still registered) - only the FIRST
-        // firing sets r2 up; a second one is a no-op, not a re-spawn (re-running
-        // the body below would reassign r2_thread while the first r2_thread may
-        // still be joinable - std::terminate per [thread.thread.assign] - and
-        // double-register the entry hook for no purpose, since r2 is already
-        // correctly parked by the first firing).
+    std::atomic<int> gap_hook_fire_count{0}; // cpp-safety/quality-engineer/
+        // unhappy-path finding (governance follow-up, 2026-09-16, UP-1/QE-1):
+        // was a bool gap_hook_ran - upgraded to a fire count so a repeat firing
+        // is forensically visible in CI logs (see the hook body below) instead
+        // of a silent no-op; a genuine (non-benign) repeat firing this file's
+        // assertions cannot otherwise distinguish from #4415's still-unconfirmed
+        // candidate mechanism (see the CI-finding comment above set_value_once)
+        // now leaves a trace. Only the FIRST firing sets r2 up; every later one
+        // is a no-op, not a re-spawn (re-running the body below would reassign
+        // r2_thread while the first r2_thread may still be joinable -
+        // std::terminate per [thread.thread.assign] - and double-register the
+        // entry hook for no purpose, since r2 is already correctly parked by
+        // the first firing). Reachable through the same pre-existing,
+        // already-parked HC-1b TOCTOU as entered/release_hook/r2_thread - see
+        // the CI-finding comment above set_value_once for the full account.
     rt->set_drain_gap_hook_for_test([&] {
-        if (gap_hook_ran.exchange(true))
+        if (gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+            std::fprintf(stderr,
+                         "drain-gap hook fired again (fire #%d) after the first "
+                         "firing already parked r2 - no-op (see "
+                         "gap_hook_fire_count's own declaration comment). Plain "
+                         "fprintf(stderr), not a Catch2 assertion, so safe from "
+                         "this (non-main) thread.\n",
+                         gap_hook_fire_count.load(std::memory_order_relaxed));
             return;
+        }
         rt->set_dispatch_entry_hook_for_test([&] {
             set_value_once(entered);
-            release_hook.get_future().wait();
+            release_fut.wait();
         });
         r2_thread = std::thread{[&] {
             res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
@@ -7544,6 +7614,14 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     std::promise<void> release_hook;
     bool released_by_test = false;
     auto entered_fut = entered.get_future();
+    auto release_fut = release_hook.get_future().share(); // cpp-safety/chaos-injector
+        // finding (governance follow-up, 2026-09-16, CH-3): get_future() throws
+        // future_already_retrieved on any call after the first, REGARDLESS of
+        // whether set_value() was ever called - retrieved once here, before any
+        // hook registration, so the entry hook below can safely .wait() on the
+        // shared_future even if it were ever invoked more than once (today
+        // structurally prevented - see gap_hook_fire_count above - this is
+        // defense-in-depth, not a live gap).
     std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
         // worker thread, not this one) - atomic per this file's own established
         // pattern for exactly this hook-thread-to-main-thread signal (see
@@ -7559,20 +7637,35 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // own hook's LAST store, not on a different signal entirely). Declared
         // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
         // FIRST, before touching r2_thread or anything else this frame owns.
-    std::atomic<bool> gap_hook_ran{false}; // see set_value_once's own doc comment
-        // above (#4415's storm can legitimately redrive this key through a fresh
-        // on_arm_complete() while this hook is still registered) - only the FIRST
-        // firing sets r2 up; a second one is a no-op, not a re-spawn (re-running
-        // the body below would reassign r2_thread while the first r2_thread may
-        // still be joinable - std::terminate per [thread.thread.assign] - and
-        // double-register the entry hook for no purpose, since r2 is already
-        // correctly parked by the first firing).
+    std::atomic<int> gap_hook_fire_count{0}; // cpp-safety/quality-engineer/
+        // unhappy-path finding (governance follow-up, 2026-09-16, UP-1/QE-1):
+        // was a bool gap_hook_ran - upgraded to a fire count so a repeat firing
+        // is forensically visible in CI logs (see the hook body below) instead
+        // of a silent no-op; a genuine (non-benign) repeat firing this file's
+        // assertions cannot otherwise distinguish from #4415's still-unconfirmed
+        // candidate mechanism (see the CI-finding comment above set_value_once)
+        // now leaves a trace. Only the FIRST firing sets r2 up; every later one
+        // is a no-op, not a re-spawn (re-running the body below would reassign
+        // r2_thread while the first r2_thread may still be joinable -
+        // std::terminate per [thread.thread.assign] - and double-register the
+        // entry hook for no purpose, since r2 is already correctly parked by
+        // the first firing). Reachable through the same pre-existing,
+        // already-parked HC-1b TOCTOU as entered/release_hook/r2_thread - see
+        // the CI-finding comment above set_value_once for the full account.
     rt->set_drain_gap_hook_for_test([&] {
-        if (gap_hook_ran.exchange(true))
+        if (gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+            std::fprintf(stderr,
+                         "drain-gap hook fired again (fire #%d) after the first "
+                         "firing already parked r2 - no-op (see "
+                         "gap_hook_fire_count's own declaration comment). Plain "
+                         "fprintf(stderr), not a Catch2 assertion, so safe from "
+                         "this (non-main) thread.\n",
+                         gap_hook_fire_count.load(std::memory_order_relaxed));
             return;
+        }
         rt->set_dispatch_entry_hook_for_test([&] {
             set_value_once(entered);
-            release_hook.get_future().wait();
+            release_fut.wait();
         });
         r2_thread = std::thread{[&] {
             res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
@@ -7753,6 +7846,14 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     std::promise<void> release_hook;
     bool released_by_test = false;
     auto entered_fut = entered.get_future();
+    auto release_fut = release_hook.get_future().share(); // cpp-safety/chaos-injector
+        // finding (governance follow-up, 2026-09-16, CH-3): get_future() throws
+        // future_already_retrieved on any call after the first, REGARDLESS of
+        // whether set_value() was ever called - retrieved once here, before any
+        // hook registration, so the entry hook below can safely .wait() on the
+        // shared_future even if it were ever invoked more than once (today
+        // structurally prevented - see gap_hook_fire_count above - this is
+        // defense-in-depth, not a live gap).
     std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
         // worker thread, not this one) - atomic per this file's own established
         // pattern for exactly this hook-thread-to-main-thread signal (see
@@ -7768,20 +7869,35 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // own hook's LAST store, not on a different signal entirely). Declared
         // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
         // FIRST, before touching r2_thread or anything else this frame owns.
-    std::atomic<bool> gap_hook_ran{false}; // see set_value_once's own doc comment
-        // above (#4415's storm can legitimately redrive this key through a fresh
-        // on_arm_complete() while this hook is still registered) - only the FIRST
-        // firing sets r2 up; a second one is a no-op, not a re-spawn (re-running
-        // the body below would reassign r2_thread while the first r2_thread may
-        // still be joinable - std::terminate per [thread.thread.assign] - and
-        // double-register the entry hook for no purpose, since r2 is already
-        // correctly parked by the first firing).
+    std::atomic<int> gap_hook_fire_count{0}; // cpp-safety/quality-engineer/
+        // unhappy-path finding (governance follow-up, 2026-09-16, UP-1/QE-1):
+        // was a bool gap_hook_ran - upgraded to a fire count so a repeat firing
+        // is forensically visible in CI logs (see the hook body below) instead
+        // of a silent no-op; a genuine (non-benign) repeat firing this file's
+        // assertions cannot otherwise distinguish from #4415's still-unconfirmed
+        // candidate mechanism (see the CI-finding comment above set_value_once)
+        // now leaves a trace. Only the FIRST firing sets r2 up; every later one
+        // is a no-op, not a re-spawn (re-running the body below would reassign
+        // r2_thread while the first r2_thread may still be joinable -
+        // std::terminate per [thread.thread.assign] - and double-register the
+        // entry hook for no purpose, since r2 is already correctly parked by
+        // the first firing). Reachable through the same pre-existing,
+        // already-parked HC-1b TOCTOU as entered/release_hook/r2_thread - see
+        // the CI-finding comment above set_value_once for the full account.
     rt->set_drain_gap_hook_for_test([&] {
-        if (gap_hook_ran.exchange(true))
+        if (gap_hook_fire_count.fetch_add(1, std::memory_order_relaxed) > 0) {
+            std::fprintf(stderr,
+                         "drain-gap hook fired again (fire #%d) after the first "
+                         "firing already parked r2 - no-op (see "
+                         "gap_hook_fire_count's own declaration comment). Plain "
+                         "fprintf(stderr), not a Catch2 assertion, so safe from "
+                         "this (non-main) thread.\n",
+                         gap_hook_fire_count.load(std::memory_order_relaxed));
             return;
+        }
         rt->set_dispatch_entry_hook_for_test([&] {
             set_value_once(entered);
-            release_hook.get_future().wait();
+            release_fut.wait();
         });
         r2_thread = std::thread{[&] {
             res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
