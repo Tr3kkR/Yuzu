@@ -16,7 +16,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
-#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth — shared #2437 depth guard
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -9454,8 +9454,8 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
-                      // #2437-class guard: raw-text depth check before parse — see
-                      // the identical guard on POST /api/v1/result-sets above.
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
                       if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
                           return;
@@ -9526,8 +9526,8 @@ void RestApiV1::register_routes(
                           rs_err(res, 503, "instruction store not available");
                           return;
                       }
-                      // #2437-class guard: raw-text depth check before parse — see
-                      // the identical guard on POST /api/v1/result-sets above.
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
                       if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
                           return;
@@ -9603,9 +9603,9 @@ void RestApiV1::register_routes(
                       auto orig = load_owned(req, id, session->username, res);
                       if (!orig)
                           return;
-                      // #2437-class guard, read side: the row is a SHARED table —
-                      // a source_payload written before this guard existed, or by
-                      // any other path, past or future, could still be poisoned.
+                      // #2437-class guard, read side: the row is a SHARED table,
+                      // and a source_payload written before this guard existed
+                      // (or by any other path, past or future) could be poisoned.
                       // Check the STORED text before parse, same as the write-time
                       // guards above; on rejection, never reach run_async (no
                       // re-dispatch of a row we can't safely re-serialise).

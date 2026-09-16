@@ -2,7 +2,7 @@
 
 #include <yuzu/audit_retention_rules.hpp>
 
-#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth — shared #2437 depth guard
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "pg/pg_array.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
@@ -984,7 +984,7 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
     // deeply, DISCARD the poisoned original rather than try to preserve it.
     // The row still must transition to 'failed' (callers depend on that
     // contract), so the replacement is a small, fixed, trivially-shallow
-    // object that is always safe to dump — the row is "healed": no longer a
+    // object that is always safe to dump: the row is "healed", no longer a
     // live grenade for a future read.
     nlohmann::json payload;
     if (mcp::json_exceeds_depth(raw_payload, mcp::kMcpMaxJsonDepth)) {
@@ -993,10 +993,10 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
             {"note",
              "original source_payload exceeded the JSON nesting limit and was discarded"}};
     } else {
-        // Merge {"failure": reason} into the payload in C++ rather than relying
-        // on a Postgres JSON-validity cast (source_payload is a plain TEXT
-        // column, not jsonb, and an operator-supplied string is not guaranteed
-        // valid JSON) — replicates the SQLite json1 `json_set(... CASE WHEN
+        // Merge {"failure": reason} into the payload in C++ rather than relying on
+        // a Postgres JSON-validity cast (source_payload is a plain TEXT column,
+        // not jsonb, and an operator-supplied string is not guaranteed valid
+        // JSON) — replicates the SQLite json1 `json_set(... CASE WHEN
         // json_valid ...)` fallback-to-'{}' behavior.
         try {
             payload = nlohmann::json::parse(raw_payload);
