@@ -9593,6 +9593,17 @@ void RestApiV1::register_routes(
                       auto orig = load_owned(req, id, session->username, res);
                       if (!orig)
                           return;
+                      // #2437-class guard, read side: the row is a SHARED table —
+                      // a source_payload written before this guard existed, or by
+                      // any other path, past or future, could still be poisoned.
+                      // Check the STORED text before parse, same as the write-time
+                      // guards above; on rejection, never reach run_async (no
+                      // re-dispatch of a row we can't safely re-serialise).
+                      if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                          return;
+                      }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
                       // Synthesise the parent so the sibling shares the
                       // original's parent (re-eval re-asks the same question
