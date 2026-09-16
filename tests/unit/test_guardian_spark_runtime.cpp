@@ -24,6 +24,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -105,7 +106,10 @@ struct FakeReader : IStateReader {
 /// asserts that count is zero, so a gate that stopped being released fails loudly
 /// instead of wedging the binary the way a bare `wait()` would.
 struct BlockingGate {
-    // ── configuration: set before any thread starts, never touched after ──
+    // ── configuration: set before any thread starts in the COMMON case; a caller
+    // that must mutate it once threads are already live (see the REFILLED-claim
+    // Dispatching-window test, governance follow-up 2026-09-16) MUST take `mu`
+    // first, matching maybe_park()'s own locked read below ──
     int park_every{0};              ///< 0 disables the gate entirely, so the existing
                                     ///< hang_next_* tests are completely unaffected
     int long_every{0};              ///< every Nth park is a LONG hold; 0 = none
@@ -7296,6 +7300,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // pattern for exactly this hook-thread-to-main-thread signal (see
         // r2_queue_wait_ok a few tests up); see the hook's own comment for why this
         // can't be a REQUIRE() there directly
+    std::atomic<bool> hook_done{false}; // Gate 8 round 4 cpp-safety finding
+        // (governance follow-up, 2026-09-16, HP-1): true ONLY as the hook's own
+        // LAST statement below, once r2_queued_before_dispatch has already been
+        // stored - unlike entered_fut (a DISPATCH-ENTRY signal that can fire from
+        // r2_thread directly, independent of this hook, on the exact regression
+        // this test exists to catch), this is a genuine HOOK-COMPLETION signal,
+        // matching r2_queue_wait_ok's own precedent (its outer wait spins on its
+        // own hook's LAST store, not on a different signal entirely). Declared
+        // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
+        // FIRST, before touching r2_thread or anything else this frame owns.
     rt->set_drain_gap_hook_for_test([&] {
         rt->set_dispatch_entry_hook_for_test([&] {
             entered.set_value();
@@ -7319,24 +7333,112 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         r2_queued_before_dispatch.store(
             yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
                                    std::chrono::seconds(10)));
+        hook_done.store(true); // MUST be the hook's last statement - see hook_done's
+                               // own declaration comment above.
     });
     struct Cleanup {
+        std::atomic<bool>* hook_done;
+        GuardianSparkRuntime* rt; // non-owning, same convention as the other raw-pointer
+                                 // fields below; rt is declared far earlier in this
+                                 // TEST_CASE so it outlives cleanup (LIFO destruction)
         std::promise<void>* release_hook;
         bool* released;
         std::thread* r2t;
         ~Cleanup() {
+            // Gate 8 round 4 cpp-safety finding (governance follow-up, 2026-09-16,
+            // HP-1): wait for the drain-gap hook's own worker thread to genuinely
+            // finish BEFORE touching anything else this frame owns - on the exact
+            // regression this test exists to catch, entered_fut (below) can go
+            // ready, and REQUIRE(r2_queued_before_dispatch.load()) can throw and
+            // start unwinding THIS destructor, while that worker thread is still
+            // alive: without this wait, r2_queued_before_dispatch's storage (and
+            // this test's own [&] hook, still registered on rt) would be destroyed
+            // while that thread is still about to write into them - a genuine
+            // use-after-free, not a residual/theoretical race. Bounded (matches the
+            // outer wait's own margin), so a genuinely wedged hook still fails
+            // loudly rather than hanging teardown. Ordering matters: this MUST run
+            // before the joinable()/join() below, because the hook is what ASSIGNS
+            // r2t (see r2_thread's own assignment above) - reading joinable() first
+            // would itself race that assignment.
+            // Never REQUIRE/CHECK/throw here: ~Cleanup() has no exception
+            // specification, so per [class.dtor] it is implicitly noexcept(true)
+            // regardless of unwind state - ANY throw here terminates unconditionally,
+            // not merely "if already unwinding" (cpp-expert finding, governance
+            // follow-up, 2026-09-16, Gate 8 round 5). Exactly the crash class this
+            // whole file's governance history exists to avoid either way. A timeout
+            // is loud (stderr), never silent, but never fatal from here.
+            // quality-engineer finding (governance follow-up, 2026-09-16, Gate 8
+            // round 5): spin_until() ALREADY multiplies its own timeout by
+            // kSpinScale internally (test_helpers.hpp) - passing a pre-scaled
+            // duration here double-scales to kSpinScale^2 (1080s under TSan/ASan,
+            // not the intended 180s). Pass the bare, unscaled duration, matching
+            // every other spin_until call site in this file.
+            if (!yuzu::test::spin_until([&] { return hook_done->load(); },
+                                        std::chrono::seconds(30))) {
+                std::fprintf(stderr,
+                             "Cleanup::~Cleanup(): hook_done wait timed out - the "
+                             "drain-gap hook's worker thread did not finish within "
+                             "its bound; proceeding anyway (see hook_done's own "
+                             "declaration comment)\n");
+            }
+            // cpp-safety finding (governance follow-up, 2026-09-16, Gate 8 round 5,
+            // HC-1): clear BOTH test hooks (each captures this frame's locals by
+            // reference) BEFORE releasing/joining anything else - hook_done above
+            // only proves the drain-gap hook's OWN first firing has finished; it says
+            // nothing about whether on_arm_complete could invoke it AGAIN (e.g. for
+            // r2's own eventual completion) while this frame is being torn down.
+            // set_*_hook_for_test({}) takes the runtime's registry_mu_, the same lock
+            // on_arm_complete copies the hook under, so this closes the window for
+            // any not-yet-in-flight second firing. (A firing that already copied the
+            // hook before this clear lands is a narrower, separate TOCTOU - tracked,
+            // not fixed, in this pass.)
+            rt->set_drain_gap_hook_for_test({});
+            rt->set_dispatch_entry_hook_for_test({});
             if (!*released)
                 release_hook->set_value();
             if (r2t->joinable())
                 r2t->join();
         }
-    } cleanup{&release_hook, &released_by_test, &r2_thread};
+    } cleanup{&hook_done, rt.get(), &release_hook, &released_by_test, &r2_thread};
 
     b->release_hang(); // r1's late arm lands: drain -> gap hook (queues r2) -> compensation
-    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
-    // Safe here (main thread): entered_fut succeeding proves the drain-gap hook
-    // above has already returned on its own worker thread, so this reads a value
-    // that thread is done writing - not a race, just a same-thread-as-Catch2 rule.
+    // Gate 3 sre finding (governance follow-up, 2026-09-16): must be scaled by
+    // kSpinScale like the file's own spin_until-based precedent (r2_queue_wait_ok
+    // a few tests up uses spin_until for ITS outer wait too, which scales
+    // internally) - the gap hook's own inner spin_until above is bounded to
+    // std::chrono::seconds(10) but THAT bound is scaled by kSpinScale (up to 6x
+    // under TSan/ASan). An unscaled 30s outer bound could then be shorter than a
+    // scaled-up inner wait still legitimately running, so unwinding here could
+    // start while the drain-gap hook's worker thread is still alive and about to
+    // write into r2_queued_before_dispatch above - a stack lifetime hazard, not
+    // just a slow test. Scale this bound the same way so it always stays the
+    // larger of the two. Gate 4 unhappy-path (governance follow-up, 2026-09-16,
+    // UP-1) found a tried 2x-margin variant of this fix (outer bound 20s) HALVED
+    // the plain-build (kSpinScale==1) margin-over-the-inner-10s-bound from 20s
+    // to 10s versus the pre-170778b42 baseline of 30s - and this commit's OWN
+    // message records the original
+    // crash reproduced under plain CPU contention on Linux, not only under
+    // TSan/ASan, so a thin plain-build margin is not a safe trade. Reverted to
+    // the file's usual 3x margin (30s); the CI-entry-timeout-budget concern
+    // this 2x variant was chasing (a Gate 8 sre finding) is real but only bites
+    // in an already-red, all-three-hang build and is better closed structurally
+    // (its own meson entry, matching the [tsan-heavy] split precedent) than by
+    // trimming this margin - tracked, not fixed, in this pass.
+    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30) * yuzu::test::kSpinScale) ==
+            std::future_status::ready);
+    // Safe here (main thread): entered_fut succeeding does NOT by itself prove the
+    // drain-gap hook has returned (Gate 4 happy-path finding, governance follow-up
+    // 2026-09-16 - on the regression this test exists to catch, entry_hook can fire
+    // from r2_thread directly, independent of the hook's own thread, so entered_fut
+    // could go ready WHILE the hook is still inside its own spin_until). What makes
+    // this read safe is that Cleanup's destructor (above) now waits on hook_done - a
+    // genuine HOOK-COMPLETION signal set only as the hook's own last statement -
+    // before this frame's locals can be destroyed on ANY unwind path, including one
+    // triggered by the REQUIRE below failing (Gate 8 round 4 cpp-safety finding,
+    // HP-1: fixed, not merely parked - an earlier "same class as the pre-existing,
+    // parked F10 finding" framing was itself wrong, since it assumed this already
+    // matched the r2_queue_wait_ok precedent's shape, which uses a genuine
+    // hook-completion signal, not a dispatch-entry one like entered_fut).
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
@@ -7405,6 +7507,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // pattern for exactly this hook-thread-to-main-thread signal (see
         // r2_queue_wait_ok a few tests up); see the hook's own comment for why this
         // can't be a REQUIRE() there directly
+    std::atomic<bool> hook_done{false}; // Gate 8 round 4 cpp-safety finding
+        // (governance follow-up, 2026-09-16, HP-1): true ONLY as the hook's own
+        // LAST statement below, once r2_queued_before_dispatch has already been
+        // stored - unlike entered_fut (a DISPATCH-ENTRY signal that can fire from
+        // r2_thread directly, independent of this hook, on the exact regression
+        // this test exists to catch), this is a genuine HOOK-COMPLETION signal,
+        // matching r2_queue_wait_ok's own precedent (its outer wait spins on its
+        // own hook's LAST store, not on a different signal entirely). Declared
+        // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
+        // FIRST, before touching r2_thread or anything else this frame owns.
     rt->set_drain_gap_hook_for_test([&] {
         rt->set_dispatch_entry_hook_for_test([&] {
             entered.set_value();
@@ -7428,24 +7540,112 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         r2_queued_before_dispatch.store(
             yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
                                    std::chrono::seconds(10)));
+        hook_done.store(true); // MUST be the hook's last statement - see hook_done's
+                               // own declaration comment above.
     });
     struct Cleanup {
+        std::atomic<bool>* hook_done;
+        GuardianSparkRuntime* rt; // non-owning, same convention as the other raw-pointer
+                                 // fields below; rt is declared far earlier in this
+                                 // TEST_CASE so it outlives cleanup (LIFO destruction)
         std::promise<void>* release_hook;
         bool* released;
         std::thread* r2t;
         ~Cleanup() {
+            // Gate 8 round 4 cpp-safety finding (governance follow-up, 2026-09-16,
+            // HP-1): wait for the drain-gap hook's own worker thread to genuinely
+            // finish BEFORE touching anything else this frame owns - on the exact
+            // regression this test exists to catch, entered_fut (below) can go
+            // ready, and REQUIRE(r2_queued_before_dispatch.load()) can throw and
+            // start unwinding THIS destructor, while that worker thread is still
+            // alive: without this wait, r2_queued_before_dispatch's storage (and
+            // this test's own [&] hook, still registered on rt) would be destroyed
+            // while that thread is still about to write into them - a genuine
+            // use-after-free, not a residual/theoretical race. Bounded (matches the
+            // outer wait's own margin), so a genuinely wedged hook still fails
+            // loudly rather than hanging teardown. Ordering matters: this MUST run
+            // before the joinable()/join() below, because the hook is what ASSIGNS
+            // r2t (see r2_thread's own assignment above) - reading joinable() first
+            // would itself race that assignment.
+            // Never REQUIRE/CHECK/throw here: ~Cleanup() has no exception
+            // specification, so per [class.dtor] it is implicitly noexcept(true)
+            // regardless of unwind state - ANY throw here terminates unconditionally,
+            // not merely "if already unwinding" (cpp-expert finding, governance
+            // follow-up, 2026-09-16, Gate 8 round 5). Exactly the crash class this
+            // whole file's governance history exists to avoid either way. A timeout
+            // is loud (stderr), never silent, but never fatal from here.
+            // quality-engineer finding (governance follow-up, 2026-09-16, Gate 8
+            // round 5): spin_until() ALREADY multiplies its own timeout by
+            // kSpinScale internally (test_helpers.hpp) - passing a pre-scaled
+            // duration here double-scales to kSpinScale^2 (1080s under TSan/ASan,
+            // not the intended 180s). Pass the bare, unscaled duration, matching
+            // every other spin_until call site in this file.
+            if (!yuzu::test::spin_until([&] { return hook_done->load(); },
+                                        std::chrono::seconds(30))) {
+                std::fprintf(stderr,
+                             "Cleanup::~Cleanup(): hook_done wait timed out - the "
+                             "drain-gap hook's worker thread did not finish within "
+                             "its bound; proceeding anyway (see hook_done's own "
+                             "declaration comment)\n");
+            }
+            // cpp-safety finding (governance follow-up, 2026-09-16, Gate 8 round 5,
+            // HC-1): clear BOTH test hooks (each captures this frame's locals by
+            // reference) BEFORE releasing/joining anything else - hook_done above
+            // only proves the drain-gap hook's OWN first firing has finished; it says
+            // nothing about whether on_arm_complete could invoke it AGAIN (e.g. for
+            // r2's own eventual completion) while this frame is being torn down.
+            // set_*_hook_for_test({}) takes the runtime's registry_mu_, the same lock
+            // on_arm_complete copies the hook under, so this closes the window for
+            // any not-yet-in-flight second firing. (A firing that already copied the
+            // hook before this clear lands is a narrower, separate TOCTOU - tracked,
+            // not fixed, in this pass.)
+            rt->set_drain_gap_hook_for_test({});
+            rt->set_dispatch_entry_hook_for_test({});
             if (!*released)
                 release_hook->set_value();
             if (r2t->joinable())
                 r2t->join();
         }
-    } cleanup{&release_hook, &released_by_test, &r2_thread};
+    } cleanup{&hook_done, rt.get(), &release_hook, &released_by_test, &r2_thread};
 
     b->release_hang();
-    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
-    // Safe here (main thread): entered_fut succeeding proves the drain-gap hook
-    // above has already returned on its own worker thread, so this reads a value
-    // that thread is done writing - not a race, just a same-thread-as-Catch2 rule.
+    // Gate 3 sre finding (governance follow-up, 2026-09-16): must be scaled by
+    // kSpinScale like the file's own spin_until-based precedent (r2_queue_wait_ok
+    // a few tests up uses spin_until for ITS outer wait too, which scales
+    // internally) - the gap hook's own inner spin_until above is bounded to
+    // std::chrono::seconds(10) but THAT bound is scaled by kSpinScale (up to 6x
+    // under TSan/ASan). An unscaled 30s outer bound could then be shorter than a
+    // scaled-up inner wait still legitimately running, so unwinding here could
+    // start while the drain-gap hook's worker thread is still alive and about to
+    // write into r2_queued_before_dispatch above - a stack lifetime hazard, not
+    // just a slow test. Scale this bound the same way so it always stays the
+    // larger of the two. Gate 4 unhappy-path (governance follow-up, 2026-09-16,
+    // UP-1) found a tried 2x-margin variant of this fix (outer bound 20s) HALVED
+    // the plain-build (kSpinScale==1) margin-over-the-inner-10s-bound from 20s
+    // to 10s versus the pre-170778b42 baseline of 30s - and this commit's OWN
+    // message records the original
+    // crash reproduced under plain CPU contention on Linux, not only under
+    // TSan/ASan, so a thin plain-build margin is not a safe trade. Reverted to
+    // the file's usual 3x margin (30s); the CI-entry-timeout-budget concern
+    // this 2x variant was chasing (a Gate 8 sre finding) is real but only bites
+    // in an already-red, all-three-hang build and is better closed structurally
+    // (its own meson entry, matching the [tsan-heavy] split precedent) than by
+    // trimming this margin - tracked, not fixed, in this pass.
+    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30) * yuzu::test::kSpinScale) ==
+            std::future_status::ready);
+    // Safe here (main thread): entered_fut succeeding does NOT by itself prove the
+    // drain-gap hook has returned (Gate 4 happy-path finding, governance follow-up
+    // 2026-09-16 - on the regression this test exists to catch, entry_hook can fire
+    // from r2_thread directly, independent of the hook's own thread, so entered_fut
+    // could go ready WHILE the hook is still inside its own spin_until). What makes
+    // this read safe is that Cleanup's destructor (above) now waits on hook_done - a
+    // genuine HOOK-COMPLETION signal set only as the hook's own last statement -
+    // before this frame's locals can be destroyed on ANY unwind path, including one
+    // triggered by the REQUIRE below failing (Gate 8 round 4 cpp-safety finding,
+    // HP-1: fixed, not merely parked - an earlier "same class as the pre-existing,
+    // parked F10 finding" framing was itself wrong, since it assumed this already
+    // matched the r2_queue_wait_ok precedent's shape, which uses a genuine
+    // hook-completion signal, not a dispatch-entry one like entered_fut).
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
@@ -7506,6 +7706,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // pattern for exactly this hook-thread-to-main-thread signal (see
         // r2_queue_wait_ok a few tests up); see the hook's own comment for why this
         // can't be a REQUIRE() there directly
+    std::atomic<bool> hook_done{false}; // Gate 8 round 4 cpp-safety finding
+        // (governance follow-up, 2026-09-16, HP-1): true ONLY as the hook's own
+        // LAST statement below, once r2_queued_before_dispatch has already been
+        // stored - unlike entered_fut (a DISPATCH-ENTRY signal that can fire from
+        // r2_thread directly, independent of this hook, on the exact regression
+        // this test exists to catch), this is a genuine HOOK-COMPLETION signal,
+        // matching r2_queue_wait_ok's own precedent (its outer wait spins on its
+        // own hook's LAST store, not on a different signal entirely). Declared
+        // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
+        // FIRST, before touching r2_thread or anything else this frame owns.
     rt->set_drain_gap_hook_for_test([&] {
         rt->set_dispatch_entry_hook_for_test([&] {
             entered.set_value();
@@ -7529,27 +7739,115 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         r2_queued_before_dispatch.store(
             yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
                                    std::chrono::seconds(10)));
+        hook_done.store(true); // MUST be the hook's last statement - see hook_done's
+                               // own declaration comment above.
     });
     struct Cleanup {
+        std::atomic<bool>* hook_done;
+        GuardianSparkRuntime* rt; // non-owning, same convention as the other raw-pointer
+                                 // fields below; rt is declared far earlier in this
+                                 // TEST_CASE so it outlives cleanup (LIFO destruction)
         std::promise<void>* release_hook;
         bool* released;
         std::thread* r2t;
         ~Cleanup() {
+            // Gate 8 round 4 cpp-safety finding (governance follow-up, 2026-09-16,
+            // HP-1): wait for the drain-gap hook's own worker thread to genuinely
+            // finish BEFORE touching anything else this frame owns - on the exact
+            // regression this test exists to catch, entered_fut (below) can go
+            // ready, and REQUIRE(r2_queued_before_dispatch.load()) can throw and
+            // start unwinding THIS destructor, while that worker thread is still
+            // alive: without this wait, r2_queued_before_dispatch's storage (and
+            // this test's own [&] hook, still registered on rt) would be destroyed
+            // while that thread is still about to write into them - a genuine
+            // use-after-free, not a residual/theoretical race. Bounded (matches the
+            // outer wait's own margin), so a genuinely wedged hook still fails
+            // loudly rather than hanging teardown. Ordering matters: this MUST run
+            // before the joinable()/join() below, because the hook is what ASSIGNS
+            // r2t (see r2_thread's own assignment above) - reading joinable() first
+            // would itself race that assignment.
+            // Never REQUIRE/CHECK/throw here: ~Cleanup() has no exception
+            // specification, so per [class.dtor] it is implicitly noexcept(true)
+            // regardless of unwind state - ANY throw here terminates unconditionally,
+            // not merely "if already unwinding" (cpp-expert finding, governance
+            // follow-up, 2026-09-16, Gate 8 round 5). Exactly the crash class this
+            // whole file's governance history exists to avoid either way. A timeout
+            // is loud (stderr), never silent, but never fatal from here.
+            // quality-engineer finding (governance follow-up, 2026-09-16, Gate 8
+            // round 5): spin_until() ALREADY multiplies its own timeout by
+            // kSpinScale internally (test_helpers.hpp) - passing a pre-scaled
+            // duration here double-scales to kSpinScale^2 (1080s under TSan/ASan,
+            // not the intended 180s). Pass the bare, unscaled duration, matching
+            // every other spin_until call site in this file.
+            if (!yuzu::test::spin_until([&] { return hook_done->load(); },
+                                        std::chrono::seconds(30))) {
+                std::fprintf(stderr,
+                             "Cleanup::~Cleanup(): hook_done wait timed out - the "
+                             "drain-gap hook's worker thread did not finish within "
+                             "its bound; proceeding anyway (see hook_done's own "
+                             "declaration comment)\n");
+            }
+            // cpp-safety finding (governance follow-up, 2026-09-16, Gate 8 round 5,
+            // HC-1): clear BOTH test hooks (each captures this frame's locals by
+            // reference) BEFORE releasing/joining anything else - hook_done above
+            // only proves the drain-gap hook's OWN first firing has finished; it says
+            // nothing about whether on_arm_complete could invoke it AGAIN (e.g. for
+            // r2's own eventual completion) while this frame is being torn down.
+            // set_*_hook_for_test({}) takes the runtime's registry_mu_, the same lock
+            // on_arm_complete copies the hook under, so this closes the window for
+            // any not-yet-in-flight second firing. (A firing that already copied the
+            // hook before this clear lands is a narrower, separate TOCTOU - tracked,
+            // not fixed, in this pass.)
+            rt->set_drain_gap_hook_for_test({});
+            rt->set_dispatch_entry_hook_for_test({});
             if (!*released)
                 release_hook->set_value();
             if (r2t->joinable())
                 r2t->join();
         }
-    } cleanup{&release_hook, &released_by_test, &r2_thread};
+    } cleanup{&hook_done, rt.get(), &release_hook, &released_by_test, &r2_thread};
 
     b->release_hang(); // r1's late arm is compensated, popped (releasing its OWN
                        // reservation as part of that same completion), and r2 is
                        // refilled -> parked in our hook, before its own reservation
                        // attempt.
-    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
-    // Safe here (main thread): entered_fut succeeding proves the drain-gap hook
-    // above has already returned on its own worker thread, so this reads a value
-    // that thread is done writing - not a race, just a same-thread-as-Catch2 rule.
+    // Gate 3 sre finding (governance follow-up, 2026-09-16): must be scaled by
+    // kSpinScale like the file's own spin_until-based precedent (r2_queue_wait_ok
+    // a few tests up uses spin_until for ITS outer wait too, which scales
+    // internally) - the gap hook's own inner spin_until above is bounded to
+    // std::chrono::seconds(10) but THAT bound is scaled by kSpinScale (up to 6x
+    // under TSan/ASan). An unscaled 30s outer bound could then be shorter than a
+    // scaled-up inner wait still legitimately running, so unwinding here could
+    // start while the drain-gap hook's worker thread is still alive and about to
+    // write into r2_queued_before_dispatch above - a stack lifetime hazard, not
+    // just a slow test. Scale this bound the same way so it always stays the
+    // larger of the two. Gate 4 unhappy-path (governance follow-up, 2026-09-16,
+    // UP-1) found a tried 2x-margin variant of this fix (outer bound 20s) HALVED
+    // the plain-build (kSpinScale==1) margin-over-the-inner-10s-bound from 20s
+    // to 10s versus the pre-170778b42 baseline of 30s - and this commit's OWN
+    // message records the original
+    // crash reproduced under plain CPU contention on Linux, not only under
+    // TSan/ASan, so a thin plain-build margin is not a safe trade. Reverted to
+    // the file's usual 3x margin (30s); the CI-entry-timeout-budget concern
+    // this 2x variant was chasing (a Gate 8 sre finding) is real but only bites
+    // in an already-red, all-three-hang build and is better closed structurally
+    // (its own meson entry, matching the [tsan-heavy] split precedent) than by
+    // trimming this margin - tracked, not fixed, in this pass.
+    REQUIRE(entered_fut.wait_for(std::chrono::seconds(30) * yuzu::test::kSpinScale) ==
+            std::future_status::ready);
+    // Safe here (main thread): entered_fut succeeding does NOT by itself prove the
+    // drain-gap hook has returned (Gate 4 happy-path finding, governance follow-up
+    // 2026-09-16 - on the regression this test exists to catch, entry_hook can fire
+    // from r2_thread directly, independent of the hook's own thread, so entered_fut
+    // could go ready WHILE the hook is still inside its own spin_until). What makes
+    // this read safe is that Cleanup's destructor (above) now waits on hook_done - a
+    // genuine HOOK-COMPLETION signal set only as the hook's own last statement -
+    // before this frame's locals can be destroyed on ANY unwind path, including one
+    // triggered by the REQUIRE below failing (Gate 8 round 4 cpp-safety finding,
+    // HP-1: fixed, not merely parked - an earlier "same class as the pre-existing,
+    // parked F10 finding" framing was itself wrong, since it assumed this already
+    // matched the r2_queue_wait_ok precedent's shape, which uses a genuine
+    // hook-completion signal, not a dispatch-entry one like entered_fut).
     REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
@@ -7594,7 +7892,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     // thread can still be racing toward that lock the instant spin_until above
     // is satisfied. An unguarded write here can interleave with maybe_park()'s
     // guarded read of park_every. Take the same lock to make this write visible
-    // under the same mutex maybe_park() reads it under.
+    // with the same mutex maybe_park() reads park_every under.
     {
         std::lock_guard<std::mutex> lk(b->arm_park.mu);
         b->arm_park.park_every = 0; // stop parking future arrivals - r2 must reach
