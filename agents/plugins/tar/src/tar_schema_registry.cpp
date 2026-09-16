@@ -386,8 +386,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "top-N representative only (<= 2N/tick), failures → empty."},
                 {"linux",   OsSupportStatus::kSupported,  "procfs",
                  "One /proc/[pid]/stat pass per tick — comm, utime+stime, rss, "
-                 "starttime; no ptrace, no per-process handles. Names are the "
-                 "kernel's 15-char comm (joins process_live). version is "
+                 "starttime, flags; no ptrace, no per-process handles. Names are "
+                 "the kernel's 15-char comm (joins process_live). version is "
                  "always '' (on-disk version capture is a follow-up)."},
                 {"macos",   OsSupportStatus::kPlanned,    "libproc",
                  "proc_pid_rusage / proc_taskinfo per sysctl PID list."},
@@ -405,6 +405,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"instances",   "INTEGER"},
                         {"cpu_pct",     "REAL"},
                         {"ws_bytes",    "INTEGER"},
+                        {"is_kthread",  "INTEGER"},
                     },
                 },
                 {
@@ -415,6 +416,7 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"hour_ts",       "INTEGER"},
                         {"name",          "TEXT"},
                         {"version",       "TEXT"},
+                        {"is_kthread",    "INTEGER"},
                         {"samples",       "INTEGER"},
                         {"instances_max", "INTEGER"},
                         {"cpu_avg",       "REAL"},
@@ -1548,16 +1550,20 @@ GROUP BY (ts / 3600) * 3600)";
     }
 
     // ── Per-app perf rollups (BRD A2) — per (hour, app name, version) ────
+    // is_kthread rides the GROUP BY as an identity column (module_hourly's
+    // is_kernel precedent) — never aggregated, since every instance sharing
+    // one (name, version) group agrees on it (derive_proc_samples OR's it
+    // across instances of the same name).
     if (source_name == "procperf") {
         if (target_suffix == "hourly") {
-            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, samples, instances_max,
-    cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
-SELECT (ts / 3600) * 3600, name, version, COUNT(*), MAX(instances),
+            return R"(INSERT INTO procperf_hourly (hour_ts, name, version, is_kthread, samples,
+    instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes)
+SELECT (ts / 3600) * 3600, name, version, is_kthread, COUNT(*), MAX(instances),
        AVG(cpu_pct), MAX(cpu_pct),
        CAST(AVG(ws_bytes) AS INTEGER), MAX(ws_bytes)
 FROM procperf_live
 WHERE ts >= ? AND ts < ?
-GROUP BY (ts / 3600) * 3600, name, version)";
+GROUP BY (ts / 3600) * 3600, name, version, is_kthread)";
         }
     }
 
