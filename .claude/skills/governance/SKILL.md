@@ -259,11 +259,18 @@ is not reached by an attacker, so EXPOSURE cannot promote it to CRITICAL.
       disk full, concurrent writer, partial failure)                  no change
   E6  the WRONG OUTCOME — not merely the code branch — is proven
       unable to occur in production                                   cap at LOW
+  E7  the artifact is documented ADVISORY (never gates CI or a merge on
+      its own — the skill/doc that owns it says so) AND the input is
+      author-controlled: hand-typed, self-authored, or fed only by the
+      author's own tooling, never reachable from an external actor, a
+      production request, or production data                          cap at MEDIUM
 
 Bands, ordered:  INFO < LOW < MEDIUM < HIGH < CRITICAL
-Order of operations: apply the strongest RAISE first, then any CAP. `E6` is
-applied LAST and dominates every raise — the same recorded facts must not derive
-CRITICAL or LOW depending on the order they are read in.
+Order of operations: apply the strongest RAISE first, then any CAP. `E6` and
+`E7` are applied LAST, in that order — `E6`'s LOW cap dominates `E7`'s MEDIUM
+cap when both apply, and both dominate every raise. The same recorded facts
+must not derive CRITICAL, LOW, or MEDIUM depending on the order they are read
+in.
 
 E4 is deliberately NOT a downgrade. In Yuzu the default is frequently the LESS
 hardened setting — RBAC off is the default, `--auth-mode=sso-only` is opt-in — so
@@ -274,6 +281,26 @@ usually I6 (shipped-incomplete), not E6 — E6 requires proving the wrong outcom
 cannot occur, which a missing caller does not establish. If both a security
 control failed AND the actor ends up beyond its privilege, that is I1 with E2;
 do not report the escalation as though it were the only fact.
+
+E7 exists because the derivation table otherwise has no way to distinguish
+"an attacker can trigger this" from "only the author, hand-authoring a test
+fixture or their own input file, can trigger this" — added 2026-09-16 after
+PR #4386 (an author-side, advisory-only JSONL linter) ran 11 external review
+rounds, roughly half of them contrived Unicode/timestamp/precision shapes no
+production caller or attacker could ever supply, each still graded HIGH/
+BLOCKING because nothing in the table could discount them. E7 is narrow and
+BOTH conjuncts must hold — the artifact's own doc/skill must call it advisory
+(a merge-gating CI check, a production parser, or anything an external
+request can reach forfeits E7 immediately, even if today's actual caller
+happens to be internal), and the SPECIFIC finding's input must be one only
+the author controls (a duplicate-JSON-object-member finding on a real,
+already-committed governance.d fragment is NOT author-controlled in this
+sense — that data source is exactly what the tool exists to check, and it
+already contained real, previously-invisible instances of that exact defect
+in production ledger data; a hand-typed 5000-digit fractional-second fixture
+built solely to probe a regression LOCK's implementation boundary is). When
+in doubt, do not apply E7 — a wrongly-withheld E7 costs one extra SHOULD
+finding; a wrongly-applied E7 silently downgrades a reachable defect.
 
 ### The gate
 

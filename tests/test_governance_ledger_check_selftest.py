@@ -125,7 +125,7 @@ def run():
                        "I5": "MEDIUM", "I6": "MEDIUM", "I7": "MEDIUM",
                        "I8": "LOW", "I9": "INFO"}, "pin _BASE band table")
     expect(set(M.IMPACTS) == {f"I{i}" for i in range(1, 10)}, "pin IMPACTS")
-    expect(set(M.EXPOSURES) == {f"E{i}" for i in range(0, 7)} | {"unresolved"}, "pin EXPOSURES")
+    expect(set(M.EXPOSURES) == {f"E{i}" for i in range(0, 8)} | {"unresolved"}, "pin EXPOSURES")
     expect(set(M.MAPPED) == {"BLOCKING", "SHOULD", "NICE"}, "pin MAPPED")
     expect(set(M.SOURCES) == {"governance-agent", "collaborator", "external-model"}, "pin SOURCES")
     expect(set(M.ATTESTATION) == {"adjudicated_by", "adjudication_rationale", "refuted_by",
@@ -161,6 +161,14 @@ def run():
     expect(M.min_derived_band(["I3"], ["E0"]) == "HIGH", "derive I3/E0 -> HIGH")
     expect(M.min_derived_band(["I6"], ["E1"]) == "HIGH", "derive I6/E1 -> HIGH (E1 raises)")
     expect(M.min_derived_band(["I2"], ["E6"]) == "LOW", "derive I2/E6 -> LOW (E6 caps)")
+    # E7 added 2026-09-16 (author-controlled input to advisory tooling caps
+    # at MEDIUM - see SKILL.md's severity-derivation table for why).
+    expect(M.min_derived_band(["I1"], ["E7"]) == "MEDIUM",
+           "derive I1/E7 -> MEDIUM (E7 caps a would-be-CRITICAL finding)")
+    expect(M.min_derived_band(["I9"], ["E7"]) == "INFO",
+           "derive I9/E7 -> INFO (E7 never RAISES a genuinely low-impact finding)")
+    expect(M.min_derived_band(["I1"], ["E6", "E7"]) == "LOW",
+           "derive I1/E6+E7 -> LOW (E6's stronger cap dominates E7's, either order)")
     expect(M.min_derived_band(["I4"], ["E1"]) == "HIGH", "derive I4/E1 -> HIGH (I4 cap, F9)")
     expect(M.min_derived_band([], ["E0"]) == "INFO", "derive empty -> INFO")
     expect(M.min_derived_band(["I1", "I4"], ["E1"]) == "CRITICAL",
@@ -1280,6 +1288,12 @@ print("OK", len(findings))
               "bad-impact", "off-enum impact code fires")
         fires("9-exposure.X", [_full(finding_id="j", exposure=["E99"])],
               "bad-exposure", "off-enum exposure code fires")
+        # E7 (advisory-artifact + author-controlled-input cap) added
+        # 2026-09-16 - confirm it's accepted as a valid enum member, not
+        # rejected as off-enum the way an unrecognized code like E99 is.
+        clean_of("9-e7.X", [_full(finding_id="j", impact=["I3"], exposure=["E7"],
+                                   severity_mapped="SHOULD")],
+                 "bad-exposure", "the new E7 exposure code is a valid enum member, not off-enum")
         fires("9-sevmap.X", [_full(finding_id="j", severity_mapped="URGENT")],
               "bad-severity-mapped", "off-enum severity_mapped fires")
         fires("9-linktop.X", [_full(finding_id="j", impact=["I2"], exposure=["E0"],
