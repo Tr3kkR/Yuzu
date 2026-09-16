@@ -447,6 +447,9 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
+    'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
+                                                # parser against a real captured fixture (macOS-only;
+                                                # a no-op TU elsewhere)
     'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
                                                 # pure winget/apt/yum/softwareupdate/dpkg-query parsers
     'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so/.dll

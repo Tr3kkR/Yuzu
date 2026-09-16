@@ -46,6 +46,14 @@
 #ifdef __APPLE__
 // #2273: native CFBundle/SecStaticCode per-app enrichment for list_inventory.
 #include "installed_apps_macos_enrich.hpp"
+// Round-3 sync-speed fix: in-process receipt-plist reads (replaces most
+// pkgutil --pkg-info spawns) + the system_profiler-output memoization cache.
+#include "installed_apps_macos_receipts.hpp"
+#include <dirent.h>
+#include <sys/stat.h>
+#include <algorithm>
+#include <condition_variable>
+#include <mutex>
 #endif
 
 #ifdef __linux__
@@ -79,6 +87,9 @@
 namespace {
 
 namespace parsers = yuzu::installed_apps::parsers;
+#ifdef __APPLE__
+namespace macos_receipts = yuzu::installed_apps::macos_receipts;
+#endif
 
 // ── subprocess helper (Linux / macOS) ──────────────────────────────────────
 //
@@ -610,7 +621,7 @@ InvCollection get_inventory_linux() {
 constexpr std::size_t kMaxEnrichApps = 5000;
 constexpr std::size_t kMaxPkgutilPackages = 5000;
 
-InvCollection get_inventory_macos() {
+InvCollection get_inventory_macos_uncached() {
     bool degraded = false;
     std::vector<inv::InvRecord> recs;
     const auto collection_start = std::chrono::steady_clock::now();
@@ -755,17 +766,30 @@ InvCollection get_inventory_macos() {
             // installed_apps/get_inventory_macos#3 -- one call per receipt,
             // same bounded per-id loop shape as msi_packages_plugin.cpp's
             // established `list` action.
-            // tolerate_nonzero_exit: a receipt forgotten between the --pkgs
-            // enumeration and this lookup makes pkgutil exit 1 (verified). That
-            // is one missing row in a race, not a truncated enumeration, so it
-            // must not degrade the whole cycle. This is the ONLY call here that
-            // gets the exception.
-            auto pkginfo = run_tool({path, "--pkg-info", id}, std::chrono::seconds{20},
-                                    /*tolerate_nonzero_exit=*/true);
-            if (pkginfo.degraded)
-                degraded = true;
+            //
+            // Round-3 sync-speed fix: try an in-process receipt-plist read
+            // FIRST (installed_apps_macos_receipts.hpp) -- same PkgutilInfo
+            // shape, so a hit is indistinguishable from a spawn's result to
+            // everything below. Only a miss (missing/malformed plist, id
+            // rejected) falls back to the EXISTING pkgutil subprocess spawn,
+            // preserving its exact degrade/empty-lookup accounting untouched
+            // for that path.
+            parsers::PkgutilInfo info;
+            if (auto receipt = macos_receipts::read_receipt_plist(id)) {
+                info = std::move(*receipt);
+            } else {
+                // tolerate_nonzero_exit: a receipt forgotten between the --pkgs
+                // enumeration and this lookup makes pkgutil exit 1 (verified). That
+                // is one missing row in a race, not a truncated enumeration, so it
+                // must not degrade the whole cycle. This is the ONLY call here that
+                // gets the exception.
+                auto pkginfo = run_tool({path, "--pkg-info", id}, std::chrono::seconds{20},
+                                        /*tolerate_nonzero_exit=*/true);
+                if (pkginfo.degraded)
+                    degraded = true;
+                info = parsers::parse_pkgutil_pkg_info(pkginfo.output);
+            }
             ++attempted;
-            auto info = parsers::parse_pkgutil_pkg_info(pkginfo.output);
             // The tolerated nonzero exit is scoped by call SHAPE; on its own it
             // is not scoped by RATE. One removed receipt is a benign race, but a
             // systemic per-ID failure (receipts DB partly removed, reads denied)
@@ -802,6 +826,123 @@ InvCollection get_inventory_macos() {
     }
 
     return InvCollection{std::move(recs), degraded};
+}
+
+// ── Round-3 sync-speed fix: memoize the whole macOS collection ─────────────
+//
+// ~90% of a macOS "Sync now" click's wall-clock time is get_inventory_macos_
+// uncached() above (system_profiler ran fresh + per-receipt pkgutil spawns,
+// even after the in-process receipt reads above cut most of those). None of
+// that changes between two clicks a few minutes apart unless the operator
+// actually installed/removed something, so a repeat sync within a short
+// window can serve the previous result outright.
+//
+// Single-flight: two callers can race a miss simultaneously (the daily-sync
+// thread's forced tick vs. an operator's ad-hoc list_inventory/list dispatch
+// on a worker-pool thread — both reach this same in-process collector).
+// Without single-flight both would run the full multi-second scan at once;
+// the second caller instead waits on the first's result via a condition
+// variable (same idiom as FleetTopologyStore's refill slot, server-side).
+//
+// NEVER memoizes a degraded outcome (a transient system_profiler/pkgutil
+// hiccup must not get "stuck" cached and silently repeat for the whole TTL) —
+// a degraded refresh invalidates the cache outright rather than storing it,
+// so the very next call retries fresh instead of serving bad data.
+struct ProfilerCache {
+    std::mutex mu;
+    std::condition_variable cv;
+    bool refilling = false;
+    std::string signature;
+    std::chrono::steady_clock::time_point captured_at{};
+    std::optional<InvCollection> result;
+};
+
+ProfilerCache& profiler_cache() {
+    static ProfilerCache cache;
+    return cache;
+}
+
+constexpr std::chrono::minutes kProfilerCacheTtl{10};
+
+// One lstat()-based fingerprint covering every directory macOS applications
+// or their receipts can appear under: the fixed system roots plus every
+// local user's own ~/Applications. Concatenated inode+mtime pairs, not a
+// cryptographic hash — a collision here only costs an extra cache miss
+// (recomputes fresh), never a correctness issue, since the result is also
+// bounded by kProfilerCacheTtl regardless.
+std::string apps_root_signature() {
+    std::string sig;
+    auto add = [&sig](const std::string& path) {
+        struct stat st{};
+        if (::lstat(path.c_str(), &st) == 0)
+            sig += path + ":" + std::to_string(st.st_ino) + ":" +
+                   std::to_string(st.st_mtimespec.tv_sec) + ";";
+        else
+            sig += path + ":-;"; // absent — its appearance must still invalidate the cache
+    };
+    add("/Applications");
+    add("/Applications/Utilities");
+    add("/System/Applications");
+    add("/System/Applications/Utilities");
+    add("/System/Library/CoreServices");
+    if (DIR* d = ::opendir("/Users")) {
+        std::vector<std::string> users;
+        while (struct dirent* e = ::readdir(d)) {
+            const std::string name(e->d_name);
+            if (name == "." || name == "..")
+                continue;
+            users.push_back(name);
+        }
+        ::closedir(d);
+        std::sort(users.begin(), users.end()); // deterministic signature regardless of readdir order
+        for (const auto& u : users)
+            add("/Users/" + u + "/Applications");
+    }
+    return sig;
+}
+
+InvCollection get_inventory_macos() {
+    ProfilerCache& cache = profiler_cache();
+    const std::string sig = apps_root_signature();
+    std::unique_lock<std::mutex> lk(cache.mu);
+    for (;;) {
+        const bool fresh = cache.result.has_value() && cache.signature == sig &&
+                           (std::chrono::steady_clock::now() - cache.captured_at) < kProfilerCacheTtl;
+        if (fresh) {
+            spdlog::debug("installed_apps: macOS inventory served from the {}-minute memo cache",
+                          kProfilerCacheTtl.count());
+            return *cache.result;
+        }
+        if (!cache.refilling)
+            break; // this thread refills; fall through
+        cache.cv.wait(lk); // another thread is already refilling — wait, then re-check
+    }
+    cache.refilling = true;
+    lk.unlock();
+    InvCollection fresh_result = get_inventory_macos_uncached();
+    lk.lock();
+    cache.refilling = false;
+    if (!fresh_result.degraded) {
+        cache.signature = sig;
+        cache.captured_at = std::chrono::steady_clock::now();
+        cache.result = fresh_result;
+    } else {
+        cache.result.reset(); // never serve a degraded outcome — and don't leave a
+                              // stale-but-good entry silently standing in for it either
+    }
+    cache.cv.notify_all();
+    lk.unlock();
+    return fresh_result;
+}
+
+// Clears the memo cache — called from InstalledAppsPlugin::shutdown() so a
+// re-init'd plugin instance in the SAME process (e.g. a test harness loading
+// the plugin twice) never serves a previous instance's cached collection.
+void clear_profiler_cache() {
+    ProfilerCache& cache = profiler_cache();
+    std::lock_guard<std::mutex> lk(cache.mu);
+    cache.result.reset();
+    cache.signature.clear();
 }
 #endif
 
@@ -1026,7 +1167,11 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
+#ifdef __APPLE__
+        clear_profiler_cache();
+#endif
+    }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "list")

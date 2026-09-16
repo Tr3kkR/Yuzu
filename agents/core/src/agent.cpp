@@ -2207,7 +2207,6 @@ public:
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
                             sync_scheduler_.reset();
                         }};
-                        scheduler.add_source(make_installed_software_source(ia_descriptor));
                         // DEX app-perf-over-time B1. Rides the same daily-sync thread +
                         // transport; collection is further gated by procperf_enabled (an
                         // empty rollup → the source skips the cycle) and the TAR plugin
@@ -2242,6 +2241,17 @@ public:
                             scheduler.add_source(make_software_licensing_source(
                                 license_descriptor, std::move(lic_cfg)));
                         }
+                        // Registers LAST (round-3 item 4 / sync-speed fix): SyncScheduler's
+                        // per-forced-source immediate-RPC pass (tick()) processes forced
+                        // indices in ascending registration order, so when the header's
+                        // "Sync now" forces ALL FOUR sources at once (kAllSources), the
+                        // three fast collectors above report back to the server before this
+                        // one's — installed_software's macOS leg alone can take several
+                        // seconds (system_profiler + per-package pkgutil spawns) — even
+                        // starts. Registration order carries NO persisted meaning (KV keys
+                        // and request_now()'s name match are both name-keyed, per
+                        // sync_scheduler.hpp's own contract), so this reorder is safe.
+                        scheduler.add_source(make_installed_software_source(ia_descriptor));
                         // Publish AFTER the last add_source: request_now() reads sources_
                         // without the mutex on the append-only-before-publication contract.
                         {

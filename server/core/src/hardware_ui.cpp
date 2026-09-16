@@ -693,12 +693,21 @@ std::string render_hardware_lens_bar(const std::string& agent_id, const std::str
 std::string render_hardware_sync_pending(const std::string& agent_id, const std::string& lens,
                                          std::int64_t await_since, int next_attempt,
                                          const std::string& command_id) {
+    // Round-3 item 4: a 1s,1s,2s… poll ladder instead of a flat 2s — most
+    // syncs on Linux/Windows land within a second or two (server ingest is
+    // ~13ms, so the wait is almost entirely the agent's own collect() +
+    // network round trip), so the first couple of polls fire fast; settling
+    // to 2s afterwards keeps a genuinely slow sync (macOS's first-ever
+    // installed_software scan) from polling too aggressively.
+    const char* delay = next_attempt <= 2 ? "1s" : "2s";
     return "<div hx-get=\"/fragments/hardware/ci?id=" + url_encode(agent_id) + "&lens=" +
            url_encode(lens) + "&lens_only=1&await_since=" + std::to_string(await_since) +
            "&n=" + std::to_string(next_attempt) + "&command_id=" + url_encode(command_id) +
-           "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"><span class=\"gp-mute\">Sync "
+           "\" hx-trigger=\"load delay:" + delay +
+           "\" hx-swap=\"outerHTML\"><span class=\"gp-mute\">Sync "
            "requested &mdash; waiting for the device to report (" + std::to_string(next_attempt - 1) +
-           "/30)&hellip;</span></div>";
+           "/30)&hellip; usually a couple of seconds on Linux/Windows, up to ~15s on macOS the "
+           "first time.</span></div>";
 }
 
 std::string render_hardware_sync_terminal(const std::string& agent_id, const std::string& lens,

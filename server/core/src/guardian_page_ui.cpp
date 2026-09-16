@@ -551,9 +551,12 @@ extern const char* const kGuardianDetailPageHtml =
           showToast((resp.data.error && resp.data.error.message) || ('Sync request failed (' + resp.status + ')'), 'error'); return; }
         var d = resp.data.data; showToast('Sync requested (' + d.source + ')', 'success');
         var lensDiv = document.getElementById('hw-ci-lens'); if (!lensDiv) return;
+        // Round-3 item 4: first poll at 1s (was a flat 2s) \u2014 the poll ladder's
+        // 1s/1s/2s\u2026 cadence continues from render_hardware_sync_pending
+        // (hardware_ui.cpp) once this first pending div's own request lands.
         lensDiv.innerHTML = '<div hx-get="/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens) +
           '&lens_only=1&await_since=' + d.requested_at + '&n=1&command_id=' + encodeURIComponent(d.command_id) +
-          '" hx-trigger="load delay:2s" hx-swap="outerHTML"><span class="gp-mute">Sync requested \u2014 waiting for the device to report\u2026</span></div>';
+          '" hx-trigger="load delay:1s" hx-swap="outerHTML"><span class="gp-mute">Sync requested \u2014 waiting for the device to report\u2026 usually a couple of seconds on Linux/Windows, up to ~15s on macOS the first time.</span></div>';
         if (window.htmx) window.htmx.process(lensDiv);
       }).catch(function () { btn.disabled = false; showToast('Sync request failed', 'error'); });
     }

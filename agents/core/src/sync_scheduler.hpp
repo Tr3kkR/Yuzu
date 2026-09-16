@@ -110,13 +110,32 @@ private:
     };
 
     /// Apply every pending request_now() arm to its State (on the ticking thread).
-    void drain_pending(std::int64_t now_secs);
+    /// Returns the (validated, in-bounds) indices just armed — round-3 item 4:
+    /// tick() sends each of these in its OWN immediate RPC (see apply_ack) so an
+    /// operator-forced source is never queued behind an unrelated cadence-due
+    /// source's collect() in the same tick.
+    [[nodiscard]] std::vector<std::size_t> drain_pending(std::int64_t now_secs);
 
     std::string kv_key(const std::string& source, const char* field) const;
     State& load_state(std::size_t idx, std::int64_t now_secs);
     void save_state(const SyncSource& src, const State& st);
     /// Stable per-(agent,source) phase offset in [0, interval).
     std::int64_t phase_offset(const std::string& source, std::int64_t interval) const;
+    /// Hash-skip decision for one source at `now_secs`, given its freshly
+    /// collected `hash` — factored out of tick() so the forced-source (pass 1)
+    /// and batched (pass 2) paths make the identical decision.
+    bool decide_full(const State& st, const std::string& hash, std::int64_t now_secs) const;
+    /// Apply one source's ReportInventory outcome (a name lookup against the
+    /// ack's need_full list) to its persisted State — the exact success/nack
+    /// state-transition tick() ran inline before this factor-out, now shared by
+    /// both the per-forced-source immediate send (pass 1) and the batched
+    /// cadence-due send (pass 2) so they can never drift on the backoff/jitter
+    /// math. `need_full` is the SenderFn's return value for the RPC that just
+    /// carried this source — a caller only invokes this when that RPC actually
+    /// succeeded (returned a value); an RPC failure is handled by the caller
+    /// leaving the source's persisted state untouched so it retries next tick.
+    void apply_ack(std::size_t idx, const std::string& hash, bool sent_full,
+                   const std::vector<std::string>& need_full, std::int64_t now_secs);
 
     std::string agent_id_;
     KvGetFn kv_get_;
