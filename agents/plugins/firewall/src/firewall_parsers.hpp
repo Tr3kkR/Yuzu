@@ -104,6 +104,120 @@ struct AlfGlobalState {
     return FwState::unknown;
 }
 
+/// Per-incoming-connection decision the macOS Application Firewall has
+/// recorded for one app, as printed by `socketfilterfw --listapps`.
+/// `unknown` is a REAL emitted state (an unrecognised parenthetical), not a
+/// dropped row — see AlfAppRule below.
+enum class AlfDecision { allow, block, unknown };
+
+/// One row of `socketfilterfw --listapps`: an application path paired with
+/// its incoming-connection decision.
+struct AlfAppRule {
+    std::string path;
+    AlfDecision decision{AlfDecision::unknown};
+};
+
+/// Parse `socketfilterfw --listapps`. The header line ("Total number of
+/// apps = N") is skipped — it has no " : " separator preceded by a numeric
+/// index. Each app is an "<idx> : <path>" line followed by an indented
+/// "(Allow incoming connections)" / "(Block incoming connections)" line;
+/// the parenthetical is paired with the path that precedes it. An
+/// unrecognised parenthetical is a real emitted state and yields
+/// AlfDecision::unknown rather than dropping the row — as does an app line
+/// with no following parenthetical at all (end of input, or immediately
+/// followed by the next app line). Empty input (unprivileged refusal is
+/// empty stdout) yields an empty vector.
+[[nodiscard]] inline std::vector<AlfAppRule> parse_alf_listapps(std::string_view out) {
+    std::vector<AlfAppRule> rows;
+    std::string buf(out); // istringstream needs an owned string
+    std::istringstream iss(buf);
+    std::string line;
+    bool have_pending = false;
+    AlfAppRule pending;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        const auto sep = line.find(" : ");
+        const std::string_view idx(line.data(), sep == std::string::npos ? 0 : sep);
+        const bool numeric_idx =
+            sep != std::string::npos && !idx.empty() &&
+            std::all_of(idx.begin(), idx.end(), [](char c) { return c >= '0' && c <= '9'; });
+        if (numeric_idx) {
+            if (have_pending)
+                rows.push_back(std::move(pending)); // no parenthetical followed — unknown stands
+            std::string_view path(line.data() + sep + 3, line.size() - sep - 3);
+            while (!path.empty() && path.back() == ' ')
+                path.remove_suffix(1);
+            pending = AlfAppRule{std::string(path), AlfDecision::unknown};
+            have_pending = true;
+            continue;
+        }
+        if (have_pending) {
+            std::string_view trimmed(line);
+            while (!trimmed.empty() && trimmed.front() == ' ')
+                trimmed.remove_prefix(1);
+            while (!trimmed.empty() && trimmed.back() == ' ')
+                trimmed.remove_suffix(1);
+            if (trimmed == "(Allow incoming connections)")
+                pending.decision = AlfDecision::allow;
+            else if (trimmed == "(Block incoming connections)")
+                pending.decision = AlfDecision::block;
+            else
+                pending.decision = AlfDecision::unknown;
+            rows.push_back(std::move(pending));
+            have_pending = false;
+        }
+    }
+    if (have_pending)
+        rows.push_back(std::move(pending));
+    return rows;
+}
+
+/// Parse `pfctl -s Anchors` — one anchor name per line, leading whitespace
+/// trimmed. Empty output (unprivileged refusal — "pfctl: /dev/pf:
+/// Permission denied" goes to stderr, which the caller discards, leaving
+/// empty stdout) yields an empty vector; blank lines are skipped rather than
+/// emitted as empty anchor names.
+[[nodiscard]] inline std::vector<std::string> parse_pf_anchors(std::string_view out) {
+    std::vector<std::string> anchors;
+    std::string buf(out);
+    std::istringstream iss(buf);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        std::string_view trimmed(line);
+        while (!trimmed.empty() && trimmed.front() == ' ')
+            trimmed.remove_prefix(1);
+        if (!trimmed.empty())
+            anchors.push_back(std::string(trimmed));
+    }
+    return anchors;
+}
+
+/// Count the non-empty lines of `pfctl -s rules` — a pure line counter.
+/// Returns 0 for empty input. This must NOT be read as "refused": a
+/// genuinely empty ruleset and an unprivileged refusal both produce empty
+/// stdout, and only the shell layer (run_bounded_subprocess's
+/// tool_ran/exit_code/timed_out/output_truncated) can tell them apart — that
+/// distinction is deliberately out of scope for this parser.
+[[nodiscard]] inline std::size_t count_pf_rules(std::string_view out) {
+    std::size_t count = 0;
+    std::string buf(out);
+    std::istringstream iss(buf);
+    std::string line;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        std::string_view trimmed(line);
+        while (!trimmed.empty() && (trimmed.front() == ' ' || trimmed.front() == '\t'))
+            trimmed.remove_prefix(1);
+        if (!trimmed.empty())
+            ++count;
+    }
+    return count;
+}
+
 // ── Linux: ufw ───────────────────────────────────────────────────────────
 
 /// One row of `ufw status numbered` — a bracketed rule ordinal plus its

@@ -811,6 +811,18 @@ TEST_CASE("ProxyRegister: a degraded GatewayRouteStore register_fresh write FAIL
     GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
     gateway_svc.set_gateway_route_store(&broken_store);
 
+    // Post-merge review #4344 follow-up (MEDIUM finding 1): before this fix, register_agent's
+    // side effects (connected gauge, agent-online publish, root-group membership) survived a
+    // failed register_fresh with no rollback — a contextless "ghost" AgentSession
+    // (reap_stale_sessions can never TryCancel it: a gateway-proxied session carries no
+    // server_context). Collect the bus events this call publishes to assert BOTH agent-online
+    // (register_agent installing) AND agent-offline (the rollback tearing it back down) fire, in
+    // that order.
+    std::vector<std::string> events;
+    auto sub = bus.subscribe([&events](const yuzu::server::detail::SseEvent& ev) {
+        events.push_back(ev.event_type + ":" + ev.data);
+    });
+
     auto req = make_gw_register(auth_mgr, "agent-failclosed-1");
     apb::RegisterResponse resp;
     auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp);
@@ -820,6 +832,115 @@ TEST_CASE("ProxyRegister: a degraded GatewayRouteStore register_fresh write FAIL
               .counter("yuzu_server_gateway_route_write_failed_total",
                        {{"op", "register_fresh"}, {"reason", "store_unavailable"}})
               .value() == 1);
+
+    // The ghost-session rollback: no session left on record, the connected gauge back at 0, and
+    // an agent-offline event published for the rollback (following register_agent's own
+    // agent-online publish). Pre-fix, `get_session` here returned a live (if useless — no stream,
+    // no session_id) AgentSession forever, and the gauge stayed at 1.
+    CHECK(registry.get_session("agent-failclosed-1") == nullptr);
+    CHECK(metrics.gauge("yuzu_agents_connected").value() == 0);
+    REQUIRE(events.size() == 2);
+    CHECK(events[0] == "agent-online:agent-failclosed-1");
+    CHECK(events[1] == "agent-offline:agent-failclosed-1");
+
+    bus.unsubscribe(sub);
+}
+
+TEST_CASE("AgentRegistry::remove_agent_if_same: pointer identity, not session_id, is the "
+          "rollback key — a concurrent registration that already superseded the rolled-back "
+          "session survives untouched (HA WS-4 4.2b follow-up, #4344 MEDIUM finding 1)",
+          "[gateway_route_wiring]") {
+    // Both sessions installed below have an EMPTY session_id (map_session, which only runs on a
+    // live Subscribe stream, never fires here) — the exact state ProxyRegister's own `installed`
+    // capture is in when a rollback would fire (register_fresh runs long before any stream is
+    // established). A session_id-STRING-keyed rollback ("" == "") could not tell these two
+    // sessions apart and would delete whichever is current regardless of which one the caller
+    // actually meant to undo — this test's second SECTION is the case that would fail under that
+    // (hypothetical, pre-fix-shaped) implementation.
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+
+    apb::AgentInfo info;
+    info.set_agent_id("agent-rollback-identity");
+    info.set_hostname("host-1");
+    info.mutable_platform()->set_os("linux");
+    info.mutable_platform()->set_arch("x86_64");
+
+    auto first = registry.register_agent(info);
+    REQUIRE(first.has_value());
+    auto installed_first = *first;
+    REQUIRE(installed_first->session_id.empty());
+
+    SECTION("no concurrent registration: rollback removes the session it installed") {
+        registry.remove_agent_if_same("agent-rollback-identity", installed_first);
+        CHECK(registry.get_session("agent-rollback-identity") == nullptr);
+        CHECK(metrics.gauge("yuzu_agents_connected").value() == 0);
+    }
+
+    SECTION("a concurrent registration already superseded it: rollback is a NO-OP, the newer "
+            "session survives") {
+        info.set_hostname("host-2"); // distinguishes the second session for the assertion below
+        auto second = registry.register_agent(info);
+        REQUIRE(second.has_value());
+        auto installed_second = *second;
+        REQUIRE(installed_second != installed_first); // genuinely a different object
+        REQUIRE(installed_second->session_id.empty()); // same empty-session_id shape as the first
+
+        // Roll back using the FIRST call's captured pointer, exactly as ProxyRegister's
+        // register_fresh-failure branch would (it only ever holds the pointer from its OWN
+        // register_agent call, never a later caller's).
+        registry.remove_agent_if_same("agent-rollback-identity", installed_first);
+
+        auto current = registry.get_session("agent-rollback-identity");
+        REQUIRE(current != nullptr); // NOT removed — the no-op case
+        CHECK(current == installed_second); // the SECOND (still-current) session, untouched
+        CHECK(current->hostname == "host-2");
+        CHECK(metrics.gauge("yuzu_agents_connected").value() == 1); // still 1, not decremented
+    }
+}
+
+TEST_CASE("ProxyRegister: a session that LOSES its register_fresh epoch race still leaves its "
+          "OWN session installed on the registry (only the DIRECTORY row is lost, never the "
+          "in-memory session — the epoch-race branch is NOT the register_fresh-FAILURE branch "
+          "and must not roll anything back)",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    auto req1 = make_gw_register(auth_mgr, "agent-race-noop-rollback");
+    apb::RegisterResponse resp1;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req1, &resp1).ok());
+    auto row1 = store.lookup_route("agent-race-noop-rollback");
+    REQUIRE(row1.has_value());
+    REQUIRE(row1->has_value());
+
+    // Force the SECOND ProxyRegister's register_fresh to lose its epoch race (see
+    // raw_bump_epoch's header comment above).
+    raw_bump_epoch(db.dsn(), "agent-race-noop-rollback", (*row1)->connection_epoch + 1000,
+                  "gw-session-already-won");
+
+    auto req2 = make_gw_register(auth_mgr, "agent-race-noop-rollback");
+    apb::RegisterResponse resp2;
+    auto status = gateway_svc.ProxyRegister(/*context=*/nullptr, &req2, &resp2);
+    CHECK(status.ok()); // still OK — losing the epoch race is NOT a register_fresh failure
+    CHECK(resp2.accepted());
+
+    // The losing call's OWN session is still on the registry — `!res->won` never calls
+    // remove_agent_if_same. (This is a DIFFERENT agent_id from the desync-counter race test
+    // above, so this registry entry is exclusively this call's.)
+    CHECK(registry.get_session("agent-race-noop-rollback") != nullptr);
+    CHECK(metrics.gauge("yuzu_agents_connected").value() == 1);
 }
 
 TEST_CASE("NotifyStreamStatus: a degraded GatewayRouteStore announce_connected write does NOT "

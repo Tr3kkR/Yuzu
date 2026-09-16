@@ -95,6 +95,12 @@ public:
     /// synchronous for the same reason as the two above - a test drives one pass
     /// deterministically rather than waiting on the ~5s priority lane's own cadence.
     void revalidate_subscriptions();
+    /// up-5 (#4221, rung 9c PR-5b): pass-through to GuardianSparkRuntime::
+    /// redrive_retained_disarms() (also what priority_loop's own elapsed-time-gated
+    /// tick calls, see priority_loop's own doc comment). Public and synchronous,
+    /// same reason as revalidate_subscriptions() above - deterministic single-pass
+    /// test coverage independent of the lane's own time-gate.
+    void redrive_retained_disarms();
     /// Deterministic test seam (also lane_loop's own wait-duration source, #3531):
     /// apply cfg_'s jitter_pct to base_ms using the given RNG. Single-sourced with
     /// guardian_spark_bridge.hpp's debounce-default computation via
@@ -154,6 +160,15 @@ private:
     std::shared_ptr<Signal> sig_;
     bool started_{false};
     std::vector<std::thread> threads_;
+    /// up-5 (#4221): priority_loop-thread-only (never touched from any other
+    /// thread, so no lock needed) - the next time redrive_retained_disarms() is
+    /// allowed to run. Advanced by cfg_.priority_poll_ms after every ATTEMPTED
+    /// sweep (including one that throws), never a catch-up burst, so a burst of
+    /// priority wake-ups (e.g. several attaches in quick succession bumping
+    /// priority_gen) cannot drive redundant full claims_ scans. Default-constructed
+    /// (steady_clock's epoch, always in the past) so the very first tick always
+    /// redrives once.
+    std::chrono::steady_clock::time_point next_redrive_{};
 };
 
 } // namespace yuzu::agent
