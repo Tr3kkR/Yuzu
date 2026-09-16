@@ -115,8 +115,9 @@ const std::vector<pg::PgMigration>& migrations() {
         // CREATE INDEX would take an ACCESS EXCLUSIVE lock for the build's duration, and
         // ADR-0008 requires the non-transactional kind for DDL on an already-large,
         // live table rather than "weakening the transactional default to sneak one in".
-        // Tracked as a follow-up once that migration kind lands (or a reviewed
-        // ADR-0008 exception is granted) — do not re-add a plain CREATE INDEX here.
+        // Tracked as https://github.com/Tr3kkR/Yuzu/issues/4432 — land the index via
+        // that migration kind (or a reviewed ADR-0008 exception), never a plain
+        // CREATE INDEX here.
     };
     return kMigrations;
 }

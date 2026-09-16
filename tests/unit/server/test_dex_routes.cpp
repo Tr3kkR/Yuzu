@@ -2592,6 +2592,34 @@ TEST_CASE("DEX perf/app fragment: version canonicalized once, provider and "
         CHECK_FALSE(tag_called);
     }
 
+    SECTION("model path: unwired tag_cohort reader -> honest placeholder, never a crash") {
+        AppPerfProviders providers; // .tag_cohort left null
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200); // dashboard htmx drops 4xx/5xx bodies -- always 200 + a note
+        CHECK(r->body.find("no device-model cohort reader wired") != std::string::npos);
+    }
+
+    SECTION("model path: store degrade (tag_cohort returns nullopt) -> honest placeholder") {
+        AppPerfProviders providers;
+        providers.tag_cohort = [](std::string_view, std::string_view, std::string_view,
+                                  std::string_view) -> std::optional<std::vector<AppPerfFleetRow>> {
+            return std::nullopt; // AUTHORITATIVE degrade (tag lookup OR the aggregate read failed)
+        };
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {});
+        auto r = sink.Get("/fragments/dex/perf/app?app=Foo&model=Latitude+5420");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read right now") != std::string::npos);
+    }
+
     SECTION("tag_values populates the Model selector regardless of active scope branch") {
         AppPerfProviders providers;
         providers.fleet = [](std::string_view,

@@ -233,7 +233,9 @@ numbers match.
   threads** (Linux `PF_KTHREAD`, e.g. `kworker/*`) — unlike the live,
   per-device [procperf tier](tar.md) these devices still capture, where
   kernel threads remain visible (their zero working set keeps them out of the
-  live top-N; see the procperf row of the source-coverage table). A device
+  live working-set top-N, though a genuinely hot one can still surface in the
+  CPU top-N as real signal; see the procperf row of the source-coverage
+  table). A device
   upgraded across this change shows the old, unfiltered counts up to its last
   pre-upgrade day and the filtered counts from the day after — not a data
   glitch, just the two rollup versions meeting at the upgrade boundary. A
