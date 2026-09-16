@@ -159,6 +159,10 @@ std::string hw_style() {
   .ci-sec h4{font-size:.68rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted,#8fa3bd);margin:0 0 .35rem;border-bottom:1px solid var(--border,#2d4068);padding-bottom:.25rem}
   .hw-scroll{overflow-x:auto}
   .hw-macs{display:flex;flex-wrap:wrap;gap:.25rem;margin-top:.2rem}
+  .hw-selbar{display:none;position:sticky;top:0;z-index:2;align-items:center;gap:.5rem;flex-wrap:wrap;background:var(--surface,#1a2940);border:1px solid var(--accent,#00bceb);border-radius:.4rem;padding:.5rem .7rem;margin-bottom:.6rem}
+  .hw-selbar.show{display:flex}
+  #hw-selcount{font-weight:700;color:var(--white,#fff);font-size:.75rem}
+  a.hw-tag.link{cursor:pointer}
 </style>)css";
 }
 
@@ -202,6 +206,30 @@ std::string chip(const char* label, const std::string& value, const HardwareList
            "hx-include=\"#hw-q\">" + label + "</a>";
 }
 
+// Score badge: ≥90 green, ≥75 amber, else red (device_ui.cpp's score_badge idiom,
+// kept independent since this file has no dependency on device_ui.cpp). -1 = "—".
+std::string dex_badge(int score) {
+    if (score < 0)
+        return "<span class=\"hw-grey\">&mdash;</span>";
+    const char* color = score >= 90 ? "#4ed27e" : (score >= 75 ? "#ffcc00" : "#ff5765");
+    return "<span style=\"display:inline-block;min-width:1.7rem;text-align:center;font-weight:700;"
+           "font-size:.68rem;border-radius:.3rem;padding:.05rem .4rem;color:#06121f;background:" +
+           std::string(color) + "\">" + std::to_string(score) + "</span>";
+}
+
+// A clickable tag chip that narrows the list to this exact key[=value] — targets the
+// same #hw-results region as every other control, via hx-include so the live search
+// box value is preserved rather than a URL-embedded (possibly stale) copy.
+std::string tag_chip(const std::string& key, const std::string& value, const HardwareListQuery& q) {
+    HardwareListQuery nq = q;
+    nq.tag = value.empty() ? key : (key + "=" + value);
+    nq.offset = 0;
+    return "<a class=\"hw-tag link\" hx-get=\"" + esc(list_url(nq, false, true)) +
+           "\" hx-target=\"#hw-results\" hx-swap=\"outerHTML\" hx-include=\"#hw-q\" "
+           "onclick=\"event.stopPropagation()\">" + esc(key) +
+           (value.empty() ? "" : "=" + esc(value)) + "</a>";
+}
+
 std::string breadcrumb(const HardwareListQuery& q) {
     // (label, cleared-url, needs-live-q-include). The search crumb clears q itself
     // (with_q=true, blank) so it must NOT also hx-include the (still-populated) box —
@@ -220,6 +248,10 @@ std::string breadcrumb(const HardwareListQuery& q) {
         HardwareListQuery nq = q; nq.status = "all"; nq.offset = 0;
         active.emplace_back(q.status == "online" ? "Status: Online" : "Status: Offline",
                             list_url(nq, false, true), true);
+    }
+    if (!q.tag.empty()) {
+        HardwareListQuery nq = q; nq.tag.clear(); nq.offset = 0;
+        active.emplace_back("Tag: " + esc(q.tag), list_url(nq, false, true), true);
     }
     if (active.empty()) return "";
     std::string h = "<div class=\"hw-breadcrumb\">";
@@ -253,7 +285,7 @@ std::string pagination(const HardwareListQuery& q, std::size_t total_matching) {
     return h;
 }
 
-std::string row_html(const InventoryDeviceRow& d) {
+std::string row_html(const InventoryDeviceRow& d, const HardwareListQuery& q) {
     const std::string name = d.hostname.empty() ? d.agent_id : d.hostname;
     const std::string status_pill = d.online
         ? "<span class=\"hw-pill on\">online</span>"
@@ -270,13 +302,33 @@ std::string row_html(const InventoryDeviceRow& d) {
         const std::string ram = ci_ram_gb(d.ci_ram_bytes);
         return ram.empty() ? std::string("<span class=\"hw-grey\">&mdash;</span>") : ram;
     }();
+    // IP (round-3 item 10): the ONLY source is the live TAR fleet-snapshot cache —
+    // online-only, honestly "—" once offline rather than a stale last-known value.
+    const std::string ip_cell = d.ips.empty()
+        ? "<span class=\"hw-grey\">&mdash;</span>"
+        : "<span title=\"" + esc([&] { std::string t; for (auto& ip : d.ips) t += (t.empty() ? "" : ", ") + ip; return t; }()) +
+          "\">" + esc(d.ips.front()) + (d.ips.size() > 1 ? " +" + std::to_string(d.ips.size() - 1) : "") + "</span>";
+    const std::string version_cell = d.agent_version.empty()
+        ? "<span class=\"hw-grey\">&mdash;</span>" : esc(d.agent_version);
+    std::string tags_cell;
+    if (d.tags.empty()) {
+        tags_cell = "<span class=\"hw-grey\">&mdash;</span>";
+    } else {
+        for (const auto& [k, v] : d.tags) tags_cell += tag_chip(k, v, q);
+    }
     return "<tr class=\"click\" onclick=\"location.href='/hardware/ci?id=" + url_encode(d.agent_id) +
            "'\">"
+           "<td onclick=\"event.stopPropagation()\"><input type=\"checkbox\" class=\"hw-sel\" "
+           "value=\"" + esc(d.agent_id) + "\" onclick=\"hwSelToggle(this)\"></td>"
            "<td><a class=\"hw-name\" href=\"/hardware/ci?id=" + url_encode(d.agent_id) + "\">" +
            esc(name) + "</a></td>"
+           "<td class=\"hw-mono\">" + ip_cell + "</td>"
            "<td><span class=\"hw-pill " + os_cls(d.os) + "\">" + os_label(d.os) + "</span></td>"
            "<td>" + status_pill + "</td>"
+           "<td>" + dex_badge(d.dex_score) + "</td>"
+           "<td class=\"hw-mono\">" + version_cell + "</td>"
            "<td class=\"hw-mono\">" + (d.last_seen.empty() ? "?" : esc(d.last_seen)) + "</td>"
+           "<td>" + tags_cell + "</td>"
            "<td class=\"hw-mono\">" + ci_cell(d.ci_manufacturer) + "</td>"
            "<td class=\"hw-mono\">" + ci_cell(d.ci_model) + "</td>"
            "<td class=\"hw-mono\">" + ci_cell(d.ci_serial) + "</td>"
@@ -317,7 +369,29 @@ std::string sync_button(const std::string& agent_id, const char* source, const c
 
 std::string render_hardware_results_region(const HardwareListPage& page, bool ci_degraded) {
     const HardwareListQuery& q = page.query;
-    std::string h = "<div id=\"hw-results\">";
+    // data-url: the bulk-tag action bar re-fetches this exact view (with the live q
+    // included) after applying tags to the selection, so the refreshed list reflects
+    // the SAME filter/sort/page the operator was looking at.
+    std::string h = "<div id=\"hw-results\" data-url=\"" + esc(list_url(q, true, true)) + "\">";
+    // Sticky bulk-tag action bar (round-3 item 7) — hidden by CSS until a row is
+    // checked (hwSelRender toggles a `show` class); JS lives in guardian_page_ui.cpp.
+    // Applying loops the EXISTING single-agent /api/tags/set|delete per selected
+    // device (each still runs its own scoped Tag:Write gate + tag.set/.delete audit
+    // row) rather than a new bulk route — see hwBulkTag.
+    h += "<div id=\"hw-selbar\" class=\"hw-selbar\">"
+         "<span id=\"hw-selcount\">0 selected</span>"
+         "<span class=\"hw-mono\">Add tag</span>"
+         "<input id=\"hw-bulk-key\" class=\"hw-search\" placeholder=\"key\" style=\"min-width:120px\" "
+         "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
+         "<input id=\"hw-bulk-value\" class=\"hw-search\" placeholder=\"value\" style=\"min-width:120px\" "
+         "maxlength=\"448\">"
+         "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwBulkTag(this,'set')\">Apply</button>"
+         "<span class=\"hw-mono\">Remove tag</span>"
+         "<input id=\"hw-bulk-rkey\" class=\"hw-search\" placeholder=\"key\" style=\"min-width:120px\" "
+         "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\">"
+         "<button type=\"button\" class=\"gp-btn\" onclick=\"hwBulkTag(this,'delete')\">Apply</button>"
+         "<button type=\"button\" class=\"gp-btn\" onclick=\"hwSelClear()\">Clear</button>"
+         "</div>";
     h += "<div class=\"gp-filters\">" + chip("All OS", "all", q, true) + chip("Windows", "windows", q, true) +
          chip("Linux", "linux", q, true) + chip("macOS", "macos", q, true) + "</div>";
     h += "<div class=\"gp-filters\">" + chip("All status", "all", q, false) +
@@ -329,10 +403,15 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
         h += "<div class=\"gp-placeholder\"><b>No devices match.</b> Try clearing a filter.</div>";
     } else {
         h += "<div class=\"hw-scroll\"><table class=\"hw-tbl\"><thead><tr>";
+        h += "<th><input type=\"checkbox\" onclick=\"hwSelAll(this)\" title=\"Select all on this page\"></th>";
         h += sortable_th("Name", HwSortKey::Name, q);
+        h += sortable_th("IP", HwSortKey::Ip, q);
         h += sortable_th("OS", HwSortKey::Os, q);
         h += sortable_th("Status", HwSortKey::Status, q);
+        h += "<th title=\"Scored for the rows on this page only\">DEX</th>";
+        h += sortable_th("Version", HwSortKey::Version, q);
         h += sortable_th("Last seen", HwSortKey::LastSeen, q);
+        h += "<th>Tags</th>";
         h += sortable_th("Manufacturer", HwSortKey::Manufacturer, q);
         h += sortable_th("Model", HwSortKey::Model, q);
         h += sortable_th("Serial", HwSortKey::Serial, q);
@@ -341,7 +420,7 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
         h += sortable_th("OS version", HwSortKey::OsVersion, q);
         h += "</tr></thead><tbody>";
         for (const auto& row : page.rows)
-            h += row_html(row);
+            h += row_html(row, q);
         h += "</tbody></table></div>";
         h += pagination(q, page.total_matching);
     }
@@ -352,7 +431,8 @@ std::string render_hardware_results_region(const HardwareListPage& page, bool ci
 } // namespace
 
 std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
-                                          bool roster_unavailable, bool results_only) {
+                                          bool roster_unavailable, bool results_only,
+                                          bool tags_degraded) {
     if (results_only)
         return render_hardware_results_region(page, ci_degraded);
 
@@ -372,6 +452,9 @@ std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_
     if (ci_degraded)
         h += "<div class=\"hw-degrade\"><b>CI columns unavailable.</b> The device-CI store could not "
              "be read &mdash; a blank cell here is not \"no CI\", it is a degraded read.</div>";
+    if (tags_degraded)
+        h += "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read "
+             "&mdash; a blank Tags column here is not \"no tags\", it is a degraded read.</div>";
 
     const HardwareListQuery& q = page.query;
     h += "<div class=\"hw-ctrls\">";
@@ -417,7 +500,50 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
         h += "<div hx-get=\"/fragments/hardware/ci/actions?id=" + url_encode(agent_id) +
              "\" hx-trigger=\"load\" hx-swap=\"innerHTML\"><span class=\"gp-mute\">Loading "
              "actions&hellip;</span></div>";
+    } else if (lens == "dex" || lens == "guardian" || lens == "live") {
+        // Round-3 merge: these three lenses reuse the retired /device entity page's
+        // OWN fragments verbatim — no re-implementation, so DEX scoring, Guardian
+        // compliance and the live dispatch-and-poll snapshot cards stay a single
+        // source of truth. Each fragment gates on scoped GuaranteedState:Read
+        // itself; htmx does not swap a 403 body, so the permission is probed here
+        // (aff.can_read_guaranteed_state) and an honest note renders instead of a
+        // request that could only fail. `bare=1` tells the dex/guardian fragments
+        // to omit their OWN 3-chip tab bar (device_lens_tabs) — this page already
+        // has one, at the top of the CI record.
+        if (!aff.can_read_guaranteed_state) {
+            h += "<div class=\"gp-placeholder\">This lens needs the <b>GuaranteedState:Read</b> "
+                 "permission for this device.</div>";
+        } else if (lens == "dex") {
+            h += "<div hx-get=\"/fragments/device/dex?id=" + url_encode(agent_id) +
+                 "&bare=1\" hx-trigger=\"load\" hx-swap=\"innerHTML\"><span class=\"gp-mute\">Loading "
+                 "DEX&hellip;</span></div>";
+        } else if (lens == "guardian") {
+            h += "<div hx-get=\"/fragments/device/guardian?id=" + url_encode(agent_id) +
+                 "&bare=1\" hx-trigger=\"load\" hx-swap=\"innerHTML\"><span class=\"gp-mute\">Loading "
+                 "Guardian&hellip;</span></div>";
+        } else {
+            h += "<div hx-get=\"/fragments/device/live?id=" + url_encode(agent_id) +
+                 "\" hx-trigger=\"load\" hx-swap=\"innerHTML\"><span class=\"gp-mute\">Loading live "
+                 "info&hellip;</span></div>";
+        }
     } else {
+        // General identity block — independent of whether a device-CI record has
+        // synced (round-3 merge: this is what the retired /device page's Identity +
+        // Management panels showed, folded in here so nothing duplicates a second
+        // page). Prefer the live session's self-report (identity, or the sync
+        // affordance's own agent_version) over the daily-synced CI blob, which can
+        // be up to 24h stale.
+        if (detail.identity) {
+            const InventoryDeviceRow& id = *detail.identity;
+            const std::string version = !id.agent_version.empty() ? id.agent_version : aff.sync.agent_version;
+            const std::string arch = !id.arch.empty() ? id.arch : id.ci_arch;
+            h += "<div class=\"ci-sec\"><h4>General</h4><div class=\"ci-grid\">";
+            h += "<div><span class=\"ci-lab\">Agent id: </span>" + esc(agent_id) + "</div>";
+            h += "<div><span class=\"ci-lab\">OS: </span>" + esc(os_label(id.os)) + "</div>";
+            h += "<div><span class=\"ci-lab\">Agent version: </span>" + ci_disp(version) + "</div>";
+            h += "<div><span class=\"ci-lab\">Architecture: </span>" + ci_disp(arch) + "</div>";
+            h += "</div></div>";
+        }
         if (!detail.ci.has_value()) {
             h += "<div class=\"hw-degrade\"><b>CI record unavailable.</b> The device-CI store could "
                  "not be read (Postgres pool/query degraded). This is <b>not</b> \"no CI record\" "
@@ -433,8 +559,7 @@ std::string render_hardware_lens_body(const std::string& agent_id, const Hardwar
                 return std::string("<div><span class=\"ci-lab\">") + label + ": </span>" +
                        ci_disp(val) + "</div>";
             };
-            h += "<div class=\"ci-sec\"><h4>General</h4><div class=\"ci-grid\">";
-            h += field("Hostname", r.hostname);
+            h += "<div class=\"ci-sec\"><h4>Domain &amp; sync</h4><div class=\"ci-grid\">";
             h += field("Domain", r.domain);
             h += field("OU", r.ou);
             h += "<div><span class=\"ci-lab\">First synced: </span>" + esc(rel_time(now_secs, r.first_seen)) + "</div>";
@@ -546,6 +671,9 @@ std::string render_hardware_lens_bar(const std::string& agent_id, const std::str
     h += device_lens_tab("overview", "Overview", agent_id, active);
     h += device_lens_tab("software", "Installed software", agent_id, active);
     h += device_lens_tab("tags", "Tags", agent_id, active);
+    h += device_lens_tab("dex", "DEX", agent_id, active);
+    h += device_lens_tab("guardian", "Guardian", agent_id, active);
+    h += device_lens_tab("live", "Live", agent_id, active);
     h += device_lens_tab("actions", "Actions", agent_id, active);
     h += "</div>";
     return h;

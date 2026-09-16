@@ -98,6 +98,7 @@ HardwareListQuery query_from_request(const httplib::Request& req) {
     if (req.has_param("status")) q.status = req.get_param_value("status");
     if (req.has_param("sort")) q.sort = req.get_param_value("sort");
     if (req.has_param("dir")) q.desc = req.get_param_value("dir") == "desc";
+    if (req.has_param("tag")) q.tag = req.get_param_value("tag");
     auto parse_u = [&](const char* name, std::size_t dflt) -> std::size_t {
         if (!req.has_param(name)) return dflt;
         try {
@@ -144,6 +145,8 @@ HwCiAffordances HardwareRoutes::affordances_for(const httplib::Request& req, con
     else
         aff.sync.state = S::Ready;
     aff.can_write_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Write", id);
+    aff.can_read_guaranteed_state =
+        deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "GuaranteedState", "Read", id);
     return aff;
 }
 
@@ -202,6 +205,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
+        // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
+        // run over the whole roster on every filter/sort/page click.
+        if (deps_.dex_score_fn)
+            for (auto& row : page.rows)
+                row.dex_score = deps_.dex_score_fn(row.agent_id);
 
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "",
@@ -210,7 +219,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
         const bool results_only = req.has_param("results_only") && req.get_param_value("results_only") == "1";
-        send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only));
+        send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only, all.tags_degraded));
     });
 
     // -- Fragment: CI record (overview / installed software / tags lenses) --
@@ -426,6 +435,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        if (deps_.dex_score_fn)
+            for (auto& row : page.rows)
+                row.dex_score = deps_.dex_score_fn(row.agent_id);
 
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "",
@@ -439,7 +451,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        nlohmann::json body = hardware_list_json(page, all.ci_degraded, omitted);
+        nlohmann::json body = hardware_list_json(page, all.ci_degraded, omitted, all.tags_degraded);
         nlohmann::json out = {
             {"data", body},
             {"pagination", {{"total", page.total_matching}, {"start", page.query.offset},

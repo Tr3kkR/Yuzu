@@ -52,7 +52,8 @@ class HttpRouteSink;
 /// pagination. `roster_unavailable` = the RosterFn itself is unwired/failed (distinct
 /// from `ci_degraded`, which only means the CI *columns* are blank on live rows).
 std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
-                                          bool roster_unavailable, bool results_only = false);
+                                          bool roster_unavailable, bool results_only = false,
+                                          bool tags_degraded = false);
 
 /// What the CI record may OFFER the caller beyond reading — computed by the route
 /// (online state, agent version floor, Execute / Tag:Write probes) and passed to
@@ -64,6 +65,12 @@ struct HwSyncAffordance {
 struct HwCiAffordances {
     HwSyncAffordance sync;
     bool can_write_tags{false}; // Tag:Write probe passed → Add/remove tag controls render
+    // Round-3 merge: the DEX/Guardian/Live lenses reuse device_routes.cpp's existing
+    // fragments verbatim, which gate on scoped GuaranteedState:Read — a STRICTER
+    // check than the Inventory:Read the CI record itself already passed. htmx does
+    // not swap a 403, so the lens body checks this first and renders an honest note
+    // instead of an hx-get a caller without the permission could never see resolve.
+    bool can_read_guaranteed_state{false};
 };
 
 /// The lens tab bar alone, id="hw-lens-bar" — factored out so a lens-only response
@@ -234,6 +241,12 @@ public:
     /// nullopt when no manifest documents that plugin.
     using ManifestFn = std::function<std::optional<std::string>(const std::string& plugin)>;
 
+    /// DEX experience score 0-100 for one device (`dex_device_score`, one GROUP-BY
+    /// query); -1 = not scored / store unwired. Called ONLY on the page's rendered
+    /// rows (post filter/sort/paginate), never the whole roster — same discipline
+    /// `device_routes.cpp`'s list already follows.
+    using DexScoreFn = std::function<int(const std::string& agent_id)>;
+
     struct Deps {
         AuthFn auth_fn;
         ScopedPermFn scoped_perm_fn;
@@ -250,6 +263,7 @@ public:
         ManifestFn manifest_fn;           // parameter hints (R2.5)
         SyncDispatchFn sync_dispatch_fn;  // Sync now (R2.3)
         AgentVersionFn agent_version_fn;  // Sync now version floor (R2.3)
+        DexScoreFn dex_score_fn;          // Devices-page merge (round 3)
     };
 
     void register_routes(httplib::Server& svr, Deps deps);

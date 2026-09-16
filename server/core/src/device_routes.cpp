@@ -24,9 +24,6 @@
 #include <utility>
 #include <vector>
 
-// Shared full-page shell (global scope, defined in guardian_page_ui.cpp).
-extern const char* const kGuardianDetailPageHtml;
-
 namespace yuzu::server {
 
 namespace {
@@ -34,22 +31,6 @@ namespace {
 std::string to_lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
-}
-
-// Render the shared page shell with the title + initial fragment substituted, and
-// the default-active Guardian nav item de-activated (these pages are cross-cutting,
-// not under Guardian). Mirrors NetworkRoutes' shell handling.
-std::string page_shell(const std::string& title, const std::string& fragment_url) {
-    std::string html(kGuardianDetailPageHtml);
-    auto sub = [&](const std::string& tok, const std::string& val) {
-        for (auto p = html.find(tok); p != std::string::npos; p = html.find(tok, p + val.size()))
-            html.replace(p, tok.size(), val);
-    };
-    sub("{{TITLE}}", title);
-    sub("{{FRAGMENT}}", fragment_url);
-    sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-        "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-    return html;
 }
 
 bool matches(const DeviceRow& d, const std::string& q) {
@@ -482,27 +463,28 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     audit_fn_ = std::move(audit_fn);
 
     // -- /devices page shell (auth-only static chrome) --
+    // Round-3 merge: /devices and /device?id= are retired in favour of the Hardware
+    // CI list and record, which now cover everything these pages showed (DEX score,
+    // agent version, and the DEX/Guardian/Live lenses reuse these very fragments —
+    // see hardware_ui.cpp's render_hardware_lens_body). 302s, not route removal, so
+    // bookmarks and the API-parity ledger's history stay intact; every
+    // /fragments/device/* route below stays registered and gated exactly as before.
     sink.Get("/devices", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res)) {
             res.set_redirect("/login");
             return;
         }
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_content(page_shell("Yuzu \xE2\x80\x94 Devices", "/fragments/devices/list"),
-                        "text/html; charset=utf-8");
+        res.set_redirect("/hardware");
     });
 
-    // -- /device?id= page shell (auth-only) --
     sink.Get("/device", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res)) {
             res.set_redirect("/login");
             return;
         }
         std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        // The shell hx-loads the page-body fragment (which carries the id forward).
-        std::string frag = "/fragments/device/page";
+        std::string loc = "/hardware/ci";
         if (!id.empty()) {
-            // Minimal query-safe echo; the fragment handler re-reads `id` from params.
             std::string enc;
             static const char* kHex = "0123456789ABCDEF";
             for (unsigned char c : id) {
@@ -510,10 +492,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                     enc += static_cast<char>(c);
                 else { enc += '%'; enc += kHex[c >> 4]; enc += kHex[c & 0x0F]; }
             }
-            frag += "?id=" + enc;
+            loc += "?id=" + enc;
         }
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_content(page_shell("Yuzu \xE2\x80\x94 Device", frag), "text/html; charset=utf-8");
+        res.set_redirect(loc.c_str());
     });
 
     // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
@@ -627,13 +608,16 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- DEX lens: per-device score + signal summary (+ link to the full drill) --
     sink.Get("/fragments/device/dex", [this](const httplib::Request& req, httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // bare=1: mounted as a lens inside the Hardware CI record, which already
+        // renders its own 7-tab bar — suppress this fragment's own 3-chip bar.
+        const bool tabs = !req.has_param("bare");
         // Per-device behavioral data (PII): GuaranteedState:Read SCOPED to this
         // device (tier + management group) + audit-on-open. Stronger than the
         // sibling /fragments/dex/device's bare Read gate — closes the cross-scope
         // read of another team's per-device DEX summary.
         if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         if (!store_) {
-            res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable."),
+            res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable.", tabs),
                             "text/html; charset=utf-8");
             return;
         }
@@ -650,17 +634,21 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         std::vector<std::pair<std::string, std::int64_t>> sigs;
         for (const auto& s : store_->dex_device_signal_summary(id, since))
             sigs.emplace_back(s.obs_type, s.count);
-        res.set_content(render_device_dex_lens(id, score, sigs), "text/html; charset=utf-8");
+        res.set_content(render_device_dex_lens(id, score, sigs, tabs), "text/html; charset=utf-8");
     });
     // -- Guardian lens: per-guard compliance state for this device --
     sink.Get("/fragments/device/guardian", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // bare=1: mounted as a lens inside the Hardware CI record — see the dex
+        // fragment above for the same suppression.
+        const bool tabs = !req.has_param("bare");
         // Per-device compliance state: GuaranteedState:Read SCOPED to this device
         // (tier + management group) + audit-on-open (parity with the DEX lens above).
         if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         if (!store_) {
-            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable."),
+            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable.",
+                                                            tabs),
                             "text/html; charset=utf-8");
             return;
         }
@@ -677,7 +665,8 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto rules_result = store_->list_rules();
         auto statuses_result = store_->agent_rule_statuses();
         if (!rules_result || !statuses_result) {
-            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store degraded."),
+            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store degraded.",
+                                                            tabs),
                             "text/html; charset=utf-8");
             return;
         }
@@ -695,7 +684,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
             g.updated_at = st.updated_at;
             guards.push_back(std::move(g));
         }
-        res.set_content(render_device_guardian_lens(id, guards), "text/html; charset=utf-8");
+        res.set_content(render_device_guardian_lens(id, guards, tabs), "text/html; charset=utf-8");
     });
 
     // -- "Get live info": dispatch REAL plugin instructions at the device NOW and

@@ -126,9 +126,10 @@ std::string render_device_page(const DeviceRow& d);
 
 /// PURE: a lens panel that isn't built yet (DEX/Guardian in slice 1) — renders the
 /// lens tab bar (so switching back works) + an honest "coming in a later slice"
-/// message. `active` is the tab id ("dex" | "guardian").
+/// message. `active` is the tab id ("dex" | "guardian"). `tabs=false` suppresses the
+/// own 3-chip bar (Hardware CI record mounts this lens under its own 7-tab bar).
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message);
+                                           const std::string& message, bool tabs = true);
 
 /// One guard's compliance state on a device (Guardian lens row).
 struct DeviceGuardRow {
@@ -139,12 +140,15 @@ struct DeviceGuardRow {
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
 /// (obs_type → count, already fetched) + a link to the full /dex device drill.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                    const std::vector<std::pair<std::string, std::int64_t>>& signals);
+                                    const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                    bool tabs = true);
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which

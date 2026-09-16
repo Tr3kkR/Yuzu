@@ -15993,6 +15993,11 @@ private:
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
                 r.os = e.os;
+                // endpoint_state v2 (round-3 merge): last-known version/arch,
+                // durable across a disconnect. Overwritten below with the live
+                // registry session's copy when the agent is currently online.
+                r.agent_version = e.agent_version;
+                r.arch = e.arch;
                 r.online = online.count(e.agent_id) > 0;
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
@@ -16043,6 +16048,47 @@ private:
             } else {
                 result.ci_degraded = true;
             }
+            // Round-3 Devices-page merge: agent version/arch (session-sourced,
+            // online rows only — an offline row's version/arch come from the
+            // endpoint_state v2 columns via the CI-attach step above, not here),
+            // live IPs (TAR fleet-snapshot claims, online-only, 60 s cache), and
+            // tags (bulk-preloaded, two queries for the whole roster — never a
+            // per-row store call, matching the tag-compliance dashboard's own
+            // ADR-0050 discipline above).
+            for (auto& r : out) {
+                if (!r.online)
+                    continue;
+                if (auto sess = registry_.get_session(r.agent_id)) {
+                    r.agent_version = sess->agent_version;
+                    r.arch = sess->arch;
+                }
+            }
+            if (fleet_topology_store_) {
+                const auto ips = fleet_topology_store_->claimed_ips();
+                for (auto& r : out) {
+                    auto it = ips.find(r.agent_id);
+                    if (it != ips.end())
+                        r.ips = it->second;
+                }
+            }
+            if (tag_store_) {
+                const auto keys = tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
+                auto values_res = tag_store_->get_values_for_keys(keys);
+                if (values_res) {
+                    for (auto& r : out) {
+                        auto it = values_res->find(r.agent_id);
+                        if (it == values_res->end())
+                            continue;
+                        r.tags.reserve(it->second.size());
+                        for (const auto& [k, v] : it->second)
+                            r.tags.emplace_back(k, v);
+                    }
+                } else {
+                    result.tags_degraded = true;
+                }
+            } else {
+                result.tags_degraded = true;
+            }
             return result;
         };
         auto inv_devices_fn = [visible_set_fn,
@@ -16065,6 +16111,10 @@ private:
                 r.agent_id = agent_id;
                 r.hostname = sess->hostname;
                 r.os = sess->os;
+                r.agent_version = sess->agent_version;
+                r.arch = sess->arch;
+                if (fleet_topology_store_)
+                    r.ips = fleet_topology_store_->ips_for(agent_id);
                 r.online = true;
                 r.last_seen = "now";
                 r.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -16085,6 +16135,8 @@ private:
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
                 r.os = e.os;
+                r.agent_version = e.agent_version;
+                r.arch = e.arch;
                 r.online = false;
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
@@ -16325,6 +16377,17 @@ private:
                                      if (!sess)
                                          return std::nullopt;
                                      return sess->agent_version;
+                                 },
+                             // Devices-page merge (round 3): the same 7-day DEX score
+                             // used by the standalone Devices/DEX drills. Deliberately
+                             // NOT baked into RosterFn/build_hw_roster — this must only
+                             // ever be called on the rows actually rendered on the
+                             // current page (post filter/sort/paginate), never the whole
+                             // roster (dex_device_score is one GROUP-BY query per call).
+                             .dex_score_fn =
+                                 [this](const std::string& id) -> int {
+                                     return dex_device_score(guaranteed_state_store_.get(), id,
+                                                             dex_iso_since(7));
                                  },
                          });
 

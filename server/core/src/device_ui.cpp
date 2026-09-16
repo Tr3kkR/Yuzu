@@ -241,14 +241,15 @@ std::string render_device_info_fragment(const DeviceRow& d) {
 }
 
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message) {
-    return device_lens_tabs(active, agent_id) +
+                                           const std::string& message, bool tabs) {
+    return (tabs ? device_lens_tabs(active, agent_id) : std::string()) +
            "<div class=\"gp-placeholder\"><b>Coming in a later slice</b>" + esc(message) + "</div>";
 }
 
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                   const std::vector<std::pair<std::string, std::int64_t>>& signals) {
-    std::string h = device_lens_tabs("dex", agent_id);
+                                   const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                   bool tabs) {
+    std::string h = tabs ? device_lens_tabs("dex", agent_id) : std::string();
     h += "<div class=\"gp-tiles\"><div class=\"gp-tile\">";
     if (score < 0)
         h += "<div class=\"n\">&mdash;</div>";
@@ -880,8 +881,8 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
 }
 
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards) {
-    std::string h = device_lens_tabs("guardian", agent_id);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs) {
+    std::string h = tabs ? device_lens_tabs("guardian", agent_id) : std::string();
     if (guards.empty()) {
         h += "<div class=\"gp-placeholder\"><b>No guards evaluated</b>No Guardian guards have been "
              "evaluated on this device yet.</div>";

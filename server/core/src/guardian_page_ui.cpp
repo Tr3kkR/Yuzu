@@ -644,6 +644,135 @@ extern const char* const kGuardianDetailPageHtml =
       else showToast('Clipboard unavailable', 'error');
     }
   </script>
+)HTM"
+    // Chunk 5: Hardware list bulk tagging (round 3 item 7) — ServiceNow/Intune-
+    // style checkbox selection + a sticky action bar (markup already emitted by
+    // hardware_ui.cpp's render_hardware_results_region / row_html). Own literal
+    // for the same MSVC 16 KiB reason as chunks 3-4.
+    //
+    // hwSel: the live selection, keyed by agent_id — a plain Set, not DOM state,
+    // so it survives a #hw-results outerHTML swap (pagination/sort/filter/search
+    // all replace the whole div). hwSelToggle/hwSelAll/hwSelClear mutate it and
+    // call hwSelRender to show/hide the sticky bar and update its count. The
+    // htmx:afterSwap listener re-checks boxes from the Set after any #hw-results
+    // re-render so a selection made on page 1 is still reflected if the operator
+    // re-sorts without clearing it.
+    //
+    // hwBulkTag(btn, mode): validates the key with the SAME regex hwTagSet uses,
+    // then fans the selection out over the EXISTING single-agent /api/tags/set or
+    // /api/tags/delete (never a new bulk route — each call still runs its own
+    // per-target scoped Tag:Write gate + tag.set/.delete audit row, so a bulk
+    // apply produces the identical audit trail N individual edits would have).
+    // kHwBulkWorkers bounds concurrency so a large selection doesn't fire
+    // hundreds of simultaneous requests; a 403 is counted as "denied" (reported
+    // separately from other failures) rather than folded into a generic error.
+    R"HTM(
+  <script>
+    var hwSel = new Set();
+    function hwSelRender() {
+      var bar = document.getElementById('hw-selbar');
+      var count = document.getElementById('hw-selcount');
+      if (!bar || !count) return;
+      count.textContent = hwSel.size + ' selected';
+      bar.classList.toggle('show', hwSel.size > 0);
+    }
+    function hwSelToggle(cb) {
+      if (cb.checked) hwSel.add(cb.value); else hwSel.delete(cb.value);
+      hwSelRender();
+    }
+    function hwSelAll(cb) {
+      var boxes = document.querySelectorAll('#hw-results .hw-sel');
+      for (var i = 0; i < boxes.length; i++) {
+        boxes[i].checked = cb.checked;
+        if (cb.checked) hwSel.add(boxes[i].value); else hwSel.delete(boxes[i].value);
+      }
+      hwSelRender();
+    }
+    function hwSelClear() {
+      hwSel.clear();
+      var boxes = document.querySelectorAll('#hw-results .hw-sel');
+      for (var i = 0; i < boxes.length; i++) boxes[i].checked = false;
+      var all = document.querySelector('#hw-results thead input[type="checkbox"]');
+      if (all) all.checked = false;
+      hwSelRender();
+    }
+    document.body.addEventListener('htmx:afterSwap', function (e) {
+      if (!e.detail || !e.detail.target || e.detail.target.id !== 'hw-results') return;
+      var boxes = e.detail.target.querySelectorAll('.hw-sel');
+      for (var i = 0; i < boxes.length; i++) boxes[i].checked = hwSel.has(boxes[i].value);
+      hwSelRender();
+    });
+    var kHwBulkWorkers = 4;
+    function hwBulkRun(ids, run, done) {
+      if (!ids.length) { done(0, 0, []); return; }
+      var next = 0, ok = 0, denied = 0, failed = [], active = 0;
+      function pump() {
+        while (active < kHwBulkWorkers && next < ids.length) {
+          (function (id) {
+            active++;
+            run(id).then(function (r) {
+              active--;
+              if (r === true) ok++;
+              else if (r === 'denied') { denied++; failed.push(id); }
+              else failed.push(id);
+              if (next >= ids.length && active === 0) done(ok, denied, failed);
+              else pump();
+            });
+          })(ids[next++]);
+        }
+      }
+      pump();
+    }
+    function hwBulkFetchTag(url, body) {
+      return fetch(url, { method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(function (r) {
+          if (r.status === 200 || r.status === 204) return true;
+          if (r.status === 403) return 'denied';
+          return false;
+        }).catch(function () { return false; });
+    }
+    function hwBulkRefresh() {
+      var results = document.getElementById('hw-results');
+      if (!results || !window.htmx) return;
+      var url = results.getAttribute('data-url');
+      if (!url) return;
+      window.htmx.ajax('GET', url, { target: '#hw-results', swap: 'outerHTML' });
+    }
+    function hwBulkTag(btn, mode) {
+      var ids = Array.from(hwSel);
+      if (!ids.length) { showToast('No devices selected', 'error'); return; }
+      var key, value;
+      if (mode === 'set') {
+        key = (document.getElementById('hw-bulk-key').value || '').trim();
+        value = (document.getElementById('hw-bulk-value').value || '').trim();
+      } else {
+        key = (document.getElementById('hw-bulk-rkey').value || '').trim();
+        value = '';
+      }
+      if (!key) { showToast('Tag key is required', 'error'); return; }
+      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
+      btn.disabled = true;
+      var url = mode === 'set' ? '/api/tags/set' : '/api/tags/delete';
+      hwBulkRun(ids, function (id) {
+        var body = mode === 'set' ? { agent_id: id, key: key, value: value } : { agent_id: id, key: key };
+        return hwBulkFetchTag(url, body);
+      }, function (ok, denied, failed) {
+        btn.disabled = false;
+        var verb = mode === 'set' ? 'Tagged' : 'Untagged';
+        if (!failed.length) {
+          showToast(verb + ' ' + ok + '/' + ids.length, 'success');
+        } else {
+          var shown = failed.slice(0, 3).join(', ') + (failed.length > 3 ? ', …' : '');
+          var reason = denied ? (denied + ' denied') : (failed.length + ' failed');
+          showToast(verb + ' ' + ok + '/' + ids.length + ' — ' + reason + ': ' + shown, 'error');
+        }
+        hwBulkRefresh();
+      });
+    }
+  </script>
+)HTM"
+    R"HTM(
 </body>
 </html>
 )HTM";

@@ -48,6 +48,38 @@ std::int64_t parse_i64_or_min(const std::string& s) {
     return v;
 }
 
+/// "major.minor.patch" -> {major, minor, patch}, ignoring a trailing "+build" suffix
+/// (kFullVersionString = "@PROJECT_VERSION@+@YUZU_BUILD_NUMBER@"). At most 3 dotted
+/// numeric components; missing trailing components read as 0. nullopt on anything
+/// empty, non-numeric, or pre-release-tagged (e.g. "-rc1") — callers fail closed
+/// (agent_supports_sync_now) or fall back to a lexicographic compare (the Version
+/// sort column), never crash or silently misorder.
+std::optional<std::array<int, 3>> parse_semver3(std::string_view agent_version) noexcept {
+    const auto plus = agent_version.find('+');
+    std::string_view v = plus == std::string_view::npos ? agent_version : agent_version.substr(0, plus);
+    if (v.empty())
+        return std::nullopt;
+    std::array<int, 3> parts{0, 0, 0};
+    std::size_t idx = 0;
+    std::size_t start = 0;
+    while (start <= v.size() && idx < 3) {
+        const auto dot = v.find('.', start);
+        const std::string_view comp = v.substr(start, dot == std::string_view::npos ? std::string_view::npos
+                                                                                      : dot - start);
+        if (comp.empty())
+            return std::nullopt;
+        int n = 0;
+        const auto res = std::from_chars(comp.data(), comp.data() + comp.size(), n);
+        if (res.ec != std::errc{} || res.ptr != comp.data() + comp.size() || n < 0)
+            return std::nullopt; // non-numeric (incl. "-rc1") → fail closed
+        parts[idx++] = n;
+        if (dot == std::string_view::npos)
+            break;
+        start = dot + 1;
+    }
+    return parts;
+}
+
 int status_rank(const InventoryDeviceRow& row) {
     if (row.online)
         return 0;
@@ -78,7 +110,38 @@ std::string hw_search_haystack(const InventoryDeviceRow& row) {
     add(row.ci_os_build);
     add(row.ci_domain);
     add(row.ci_arch);
+    add(row.agent_version);
+    add(row.arch);
+    for (const auto& ip : row.ips) add(ip);
+    for (const auto& [k, v] : row.tags) {
+        add(k);
+        if (!v.empty()) add(k + "=" + v);
+    }
     return h;
+}
+
+// "key" or "key=value" -> {key, optional value}. Caller has already validated the
+// key half (normalise_hardware_query); an empty key means "no filter".
+std::pair<std::string_view, std::optional<std::string_view>> split_tag_filter(std::string_view tag) {
+    if (tag.empty())
+        return {{}, std::nullopt};
+    const auto eq = tag.find('=');
+    if (eq == std::string_view::npos)
+        return {tag, std::nullopt};
+    return {tag.substr(0, eq), tag.substr(eq + 1)};
+}
+
+bool tag_token_matches(const InventoryDeviceRow& row, std::string_view tag) {
+    const auto [key, value] = split_tag_filter(tag);
+    if (key.empty())
+        return true;
+    for (const auto& [k, v] : row.tags) {
+        if (k != key)
+            continue;
+        if (!value || *value == v)
+            return true;
+    }
+    return false;
 }
 
 bool os_token_matches(const InventoryDeviceRow& row, std::string_view os_token) {
@@ -174,6 +237,12 @@ std::optional<HardwareListQuery> normalise_hardware_query(HardwareListQuery raw)
         return std::nullopt;
     if (!parse_hw_sort_key(q.sort))
         return std::nullopt;
+    if (!q.tag.empty()) {
+        const auto [key, value] = split_tag_filter(q.tag);
+        (void)value;
+        if (!TagStore::validate_key(std::string(key)))
+            return std::nullopt;
+    }
 
     q.limit = std::clamp<std::size_t>(q.limit == 0 ? 50 : q.limit, 1, 200);
     // offset is clamped against the actual result size later, in build_hardware_list_page.
@@ -203,8 +272,10 @@ std::vector<std::string> hw_search_tokens(std::string_view q) {
 }
 
 bool hw_row_matches(const InventoryDeviceRow& row, const std::vector<std::string>& tokens,
-                    std::string_view os, std::string_view status) {
+                    std::string_view os, std::string_view status, std::string_view tag) {
     if (!os_token_matches(row, os) || !status_token_matches(row, status))
+        return false;
+    if (!tag_token_matches(row, tag))
         return false;
     if (tokens.empty())
         return true;
@@ -240,7 +311,7 @@ HardwareListPage build_hardware_list_page(std::vector<InventoryDeviceRow> roster
     std::vector<InventoryDeviceRow> matched;
     matched.reserve(roster.size());
     for (auto& row : roster)
-        if (hw_row_matches(row, tokens, normalised.os, normalised.status))
+        if (hw_row_matches(row, tokens, normalised.os, normalised.status, normalised.tag))
             matched.push_back(std::move(row));
     page.total_matching = matched.size();
 
@@ -318,6 +389,24 @@ HardwareListPage build_hardware_list_page(std::vector<InventoryDeviceRow> roster
                 lt = am < bm; gt = am > bm;
                 break;
             }
+            case HwSortKey::Version: {
+                const bool ab = a.agent_version.empty(), bb = b.agent_version.empty();
+                if (ab != bb) { lt = !ab; gt = !bb; break; } // blanks (offline, no report) sort last
+                const auto av = parse_semver3(a.agent_version), bv = parse_semver3(b.agent_version);
+                if (av && bv) { lt = *av < *bv; gt = *av > *bv; break; }
+                // Unparsable version strings fall back to a lexicographic compare so
+                // the column never silently drops a row from the ordering.
+                const std::string am = fold(a.agent_version), bm = fold(b.agent_version);
+                lt = am < bm; gt = am > bm;
+                break;
+            }
+            case HwSortKey::Ip: {
+                const bool ab = a.ips.empty(), bb = b.ips.empty();
+                if (ab != bb) { lt = !ab; gt = !bb; break; } // no live claim sorts last
+                const std::string am = fold(a.ips.front()), bm = fold(b.ips.front());
+                lt = am < bm; gt = am > bm;
+                break;
+            }
         }
         if (lt != gt)
             return normalised.desc ? gt : lt;
@@ -361,14 +450,22 @@ nlohmann::json hardware_row_json(const InventoryDeviceRow& row) {
         {"os_name", ci_json(row.ci_os_name)},
         {"os_version", ci_json(row.ci_os_version)},
         {"os_build", ci_json(row.ci_os_build)},
-        {"arch", ci_json(row.ci_arch)},
+        {"arch", row.arch.empty() ? ci_json(row.ci_arch) : nlohmann::json(row.arch)},
         {"domain", ci_json(row.ci_domain)},
         {"primary_mac", ci_json(row.ci_primary_mac)},
+        {"agent_version", row.agent_version.empty() ? nlohmann::json(nullptr) : nlohmann::json(row.agent_version)},
+        {"ips", row.ips.empty() ? nlohmann::json(nullptr) : nlohmann::json(row.ips)},
+        {"tags", [&] {
+             nlohmann::json t = nlohmann::json::array();
+             for (const auto& [k, v] : row.tags) t.push_back({{"key", k}, {"value", v}});
+             return t;
+         }()},
+        {"dex_score", row.dex_score < 0 ? nlohmann::json(nullptr) : nlohmann::json(row.dex_score)},
     };
 }
 
 nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded,
-                                  std::size_t devices_omitted) {
+                                  std::size_t devices_omitted, bool tags_degraded) {
     nlohmann::json rows = nlohmann::json::array();
     for (const auto& row : page.rows)
         rows.push_back(hardware_row_json(row));
@@ -378,6 +475,7 @@ nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded
         {"total_matching", page.total_matching},
         {"devices_omitted", devices_omitted},
         {"ci_degraded", ci_degraded},
+        {"tags_degraded", tags_degraded},
         {"kpis",
          {{"total", page.kpis.total},
           {"online", page.kpis.online},
@@ -391,35 +489,14 @@ nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded
           {"sort", page.query.sort},
           {"dir", page.query.desc ? "desc" : "asc"},
           {"limit", page.query.limit},
-          {"offset", page.query.offset}}},
+          {"offset", page.query.offset},
+          {"tag", page.query.tag}}},
     };
 }
 
 bool agent_supports_sync_now(std::string_view agent_version) noexcept {
-    // Cut the +build suffix; split on '.', at most 3 numeric components.
-    const auto plus = agent_version.find('+');
-    std::string_view v = plus == std::string_view::npos ? agent_version : agent_version.substr(0, plus);
-    if (v.empty())
-        return false;
-    std::array<int, 3> parts{0, 0, 0};
-    std::size_t idx = 0;
-    std::size_t start = 0;
-    while (start <= v.size() && idx < 3) {
-        const auto dot = v.find('.', start);
-        const std::string_view comp = v.substr(start, dot == std::string_view::npos ? std::string_view::npos
-                                                                                      : dot - start);
-        if (comp.empty())
-            return false;
-        int n = 0;
-        const auto res = std::from_chars(comp.data(), comp.data() + comp.size(), n);
-        if (res.ec != std::errc{} || res.ptr != comp.data() + comp.size() || n < 0)
-            return false; // non-numeric (incl. "-rc1") → fail closed
-        parts[idx++] = n;
-        if (dot == std::string_view::npos)
-            break;
-        start = dot + 1;
-    }
-    return parts >= kSyncNowMinAgentVersion; // lexicographic on {major, minor, patch}
+    const auto parts = parse_semver3(agent_version);
+    return parts && *parts >= kSyncNowMinAgentVersion; // lexicographic on {major, minor, patch}
 }
 
 nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*now_secs*/) {
