@@ -41,8 +41,8 @@ TEST_CASE("ScopedOfflineHiveLock acquires on construction and releases on destru
         // ever to catch a real regression -- still releases via RAII instead of leaking the
         // process-wide mutex out of this test's own failure path. The result is published to
         // an atomic and asserted on the main thread after join(): Catch2 assertion macros are
-        // not thread-safe (tests/unit/test_kv_store.cpp / test_updater_signature.cpp use the
-        // same publish-then-assert-after-join pattern for a worker-thread probe).
+        // not thread-safe (tests/unit/test_kv_store.cpp uses the same publish-then-assert-
+        // after-join pattern for a worker-thread probe).
         std::atomic<bool> contender_acquired{false};
         std::thread contender([&] {
             std::unique_lock<std::mutex> probe(offline_hive_mutex(), std::try_to_lock);

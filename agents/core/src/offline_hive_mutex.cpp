@@ -48,10 +48,10 @@ ScopedOfflineHiveLock::~ScopedOfflineHiveLock() {
     // possibly against a degraded sink), so it's the wait-time line
     // arriving slightly late -- at destruction instead of at acquire --
     // rather than risking a pile-up during an active incident
-    // (#governance Gate 8: sre). Two INDEPENDENT try/catch blocks, not
+    // (governance Gate 8: sre). Two INDEPENDENT try/catch blocks, not
     // one -- a throw from either log call must never suppress the other,
     // especially not the hold-time warn branch, the higher-value signal
-    // of the two (#governance Gate 8: unhappy-path, UP-7).
+    // of the two (governance Gate 8: unhappy-path, UP-7).
     try {
         if (waited_ > std::chrono::milliseconds::zero())
             spdlog::debug("offline_hive_mutex: {} waited {}ms to acquire", caller_,
