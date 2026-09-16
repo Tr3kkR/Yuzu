@@ -16147,9 +16147,10 @@ private:
             return std::nullopt;
         };
         // The full per-device CI record composition — ONE closure shared verbatim
-        // with the MCP get_hardware_ci tool (mcp_server_->set_hardware_fns below),
-        // so the dashboard fragment / REST twin / MCP twin can never drift on what
-        // "the CI record" means.
+        // by the dashboard fragment and the REST twin, so the two can never drift
+        // on what "the CI record" means. No MCP twin exists yet (tracked as a
+        // follow-up, governance Gate 3 finding — this comment previously claimed
+        // one was already wired).
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
             detail.identity = hw_identity_fn(agent_id);

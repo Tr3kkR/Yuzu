@@ -402,7 +402,12 @@ HardwareListPage build_hardware_list_page(std::vector<InventoryDeviceRow> roster
             }
             case HwSortKey::Ip: {
                 const bool ab = a.ips.empty(), bb = b.ips.empty();
-                if (ab != bb) return !ab; // no live claim sorts last — independent of desc
+                // Unlike the string-valued blank checks above, an empty `ips` makes
+                // `.front()` UB below — a both-offline pair (`ab && bb`) is everyday
+                // fleet data, not a crafted input (governance Gate 3, CRITICAL: this
+                // used to fall through to `.front()` on that pair). Handle BOTH the
+                // mixed and both-blank cases here, before either `.front()` call.
+                if (ab || bb) return !ab && bb; // no live claim sorts last; both-blank ties
                 const std::string am = fold(a.ips.front()), bm = fold(b.ips.front());
                 lt = am < bm; gt = am > bm;
                 break;

@@ -33,6 +33,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -63,7 +64,9 @@ inline bool parse_plist_root(const std::vector<std::uint8_t>& bytes,
 // plist's InstallDate carries a sub-second fraction that `pkgutil --pkg-info`
 // reports as install-time 1787153822 — llround() on that same value gives
 // 1787153823, one second later, which does not cross-pin. Truncation matches
-// pkgutil's own (evidently floor-toward-zero) conversion exactly.
+// pkgutil's own conversion exactly. `static_cast<long long>` truncates toward
+// ZERO, not toward -infinity (floor) — the two diverge only for a negative
+// (pre-1970) `unix_secs`, which no real receipt can carry.
 inline std::string cfdate_to_unix_epoch_string(CFDateRef date) {
     const CFAbsoluteTime abs_time = CFDateGetAbsoluteTime(date);
     const double unix_secs = abs_time + kCFAbsoluteTimeIntervalSince1970;
@@ -73,15 +76,18 @@ inline std::string cfdate_to_unix_epoch_string(CFDateRef date) {
 // Whole-file read via plain stdio (no mmap needed — receipt plists are a few
 // hundred bytes to a few KB). Returns an empty vector on any I/O failure.
 inline std::vector<std::uint8_t> read_whole_file(const std::string& path) {
+    // RAII-owned so a `bad_alloc` out of `out.insert` (or any future early return
+    // added to this loop) can never unwind past an open `FILE*` (governance Gate 3
+    // policy floor: manual fopen/fclose pairing here previously leaked on that path).
+    std::unique_ptr<FILE, decltype(&std::fclose)> f(std::fopen(path.c_str(), "rb"),
+                                                     &std::fclose);
     std::vector<std::uint8_t> out;
-    FILE* f = std::fopen(path.c_str(), "rb");
     if (!f)
         return out;
     std::uint8_t buf[8192];
     std::size_t n;
-    while ((n = std::fread(buf, 1, sizeof(buf), f)) > 0)
+    while ((n = std::fread(buf, 1, sizeof(buf), f.get())) > 0)
         out.insert(out.end(), buf, buf + n);
-    std::fclose(f);
     return out;
 }
 

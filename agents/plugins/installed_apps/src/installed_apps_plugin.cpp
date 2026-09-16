@@ -885,6 +885,14 @@ std::string apps_root_signature() {
     add("/System/Applications");
     add("/System/Applications/Utilities");
     add("/System/Library/CoreServices");
+    // Both receipt directories the fast path in installed_apps_macos_receipts.hpp
+    // reads from — a .pkg-only install/removal (no app bundle at all: an Xcode
+    // CLT update, an XProtect payload, most vendor installers) touches neither of
+    // the roots above, so without these the signature is blind to it for a full
+    // kProfilerCacheTtl (governance Gate 3: this comment already claimed receipt
+    // coverage the code didn't actually have).
+    for (const char* dir : yuzu::installed_apps::macos_receipts::kReceiptDirs)
+        add(dir);
     if (DIR* d = ::opendir("/Users")) {
         std::vector<std::string> users;
         while (struct dirent* e = ::readdir(d)) {

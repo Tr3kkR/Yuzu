@@ -2220,7 +2220,12 @@ test('plugin readme gate',
   _python3_test,
   args: [files('test_plugin_readmes.py')],
   suite: 'docs',
-  timeout: 60,
+  # Measured ~25-31s standalone; the self-hosted runner pools share one OS
+  # identity across 4 runner agents on one box (CLAUDE.md's documented
+  # shared-runner-under-load invariant), and this test was observed hitting
+  # the old 60s timeout under exactly that kind of concurrent docs-suite
+  # load on this session's own Mac (governance Gate 3, build-ci finding).
+  timeout: 120,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint

@@ -191,11 +191,12 @@ public:
     using RosterFn = std::function<InventoryDevicesResult()>;
 
     /// The full per-device CI record composition (identity + CI blob + software +
-    /// tags — see `HardwareCiDetail`) — ONE closure shared verbatim with the MCP
-    /// `get_hardware_ci` tool (`mcp_server_->set_hardware_fns`), so the dashboard
-    /// fragment, the REST twin, and the MCP twin can never disagree on what "the CI
+    /// tags — see `HardwareCiDetail`) — ONE closure shared verbatim by the dashboard
+    /// fragment and the REST twin, so the two can never disagree on what "the CI
     /// record" contains. The Installed-software and Tags lenses render straight off
-    /// this same struct rather than issuing a second per-lens fetch.
+    /// this same struct rather than issuing a second per-lens fetch. NOTE: there is
+    /// no MCP twin yet (no `get_hardware_ci` tool exists) — tracked as a follow-up,
+    /// not yet an ADR-1005 exception-ledger entry (governance Gate 3 finding).
     using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id)>;
 
     /// One connected agent's advertised plugins/actions — `nullopt` when the agent
