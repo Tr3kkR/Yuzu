@@ -69,6 +69,7 @@
 
 #include <algorithm> // (std::min) in drop_oldest_pending_for_test
 #include <atomic>
+#include <cassert> // UP-6 (#4221): reclassify_dispatching_race_locked()'s debug guard
 #include <new> // std::bad_alloc (detach_fault_here_for_test)
 #include <chrono>
 #include <condition_variable>
@@ -1757,7 +1758,21 @@ private:
     /// deliberately left untouched; this is not a relaxation of
     /// fail_all_claims_locked()'s own contract, which stays conservative for
     /// everything else in this file.
+    ///
+    /// UP-6 (#4221, rung 9c PR-5c follow-up governance): this correction is
+    /// verified safe today only because a Disarm claim structurally can never
+    /// carry WaiterTimedOutDispatched - no caller ever waits on a disarm with a
+    /// deadline, so abandon_claim_locked()'s `stopping ? Stopped :
+    /// WaiterTimedOutDispatched` branch is reachable only for an Arm claim's
+    /// waiter. That is not centrally enforced anywhere, so assert it here rather
+    /// than trust it silently: both current call sites already sit past
+    /// dispatch_arm_off_lock()'s own entry guard (a non-Arm claim returns before
+    /// reaching either call), so this is defense-in-depth - a future third or
+    /// fourth caller, or a change that gives Disarm claims their own deadline,
+    /// fails loudly here in a debug build instead of silently reintroducing the
+    /// Dispatching-window race this function exists to close.
     void reclassify_dispatching_race_locked(KeyClaim& claim, ClaimEnd real_end) noexcept {
+        assert(claim.kind == ClaimKind::Arm);
         if (claim.dispatch == ClaimDispatch::Dispatching &&
             claim.end == ClaimEnd::WaiterTimedOutDispatched)
             claim.end = real_end;

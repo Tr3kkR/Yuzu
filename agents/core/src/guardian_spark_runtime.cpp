@@ -303,6 +303,26 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutQueued;
     } else {
         claim->waiter_abandoned = true; // the completion callback finishes this episode
+        // cpp-safety SHOULD (#4221, rung 9c PR-5c follow-up governance): when
+        // `stopping` is true this writes ClaimEnd::Stopped DIRECTLY, bypassing
+        // the WaiterTimedOutDispatched staging value that
+        // reclassify_dispatching_race_locked()'s guard keys on. A stopping
+        // runtime's own admission attempt also reports IoFailure::Stopped (see
+        // dispatch_arm_off_lock's `real_end` computation), so this converges to
+        // the same real-world value as the guard's own correction would have
+        // produced - but that convergence is untested as an explicit
+        // interleaving (a caller-side timeout landing here with `stopping`
+        // already true, racing dispatch_arm_off_lock's own re-lock, is a
+        // distinct 3-way race from the two Dispatching-window race tests this
+        // PR already carries - see "the Dispatching-window race, Stopped
+        // variant" in test_guardian_spark_runtime.cpp, which instead drives
+        // WaiterTimedOutDispatched via expire_overdue_claims() and only THEN
+        // calls begin_stop(), exercising the guard's correction path, not this
+        // direct-write path). Flagging rather than adding a test: constructing
+        // this exact interleaving deterministically needs a caller-side
+        // wait_for_claim() timeout to land here with `stopping_` already true,
+        // which existing seams (dispatch_entry_hook_for_test_, hang_next_arm)
+        // don't currently give direct control over.
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutDispatched;
     }
     if (!claim->outcome)
@@ -1507,14 +1527,24 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         // claim_rollback to undo either way. The caller polls receipt_status() on
         // this receipt exactly as it would for any other Accepted result - but
         // unlike an ordinary unresolved Accepted receipt, this one is already
-        // terminal (Wedged) at the moment it's handed back, and STAYS Wedged:
-        // every downstream write site only sets a claim's `end` while it is
-        // still None, so this receipt's status never changes, even once the
-        // head's own underlying async operation eventually completes
-        // (test-pinned: test_guardian_spark_runtime.cpp's sticky-Wedged-after-
-        // late-success case). Don't read "eventually resolves" into this -
-        // nothing about calling attach_rule again changes it either, short of
-        // a genuinely different rule_id/spec reaching this key.
+        // terminal (Wedged) at the moment it's handed back, and STAYS Wedged
+        // once *this* claim's own `end` has settled to its final value: every
+        // downstream write site only sets a claim's `end` while it is still
+        // None, so a Reobserved retry's receipt cannot itself move `end` off
+        // Wedged (test-pinned: test_guardian_spark_runtime.cpp's sticky-Wedged-
+        // after-late-success case). This is not a blanket claim that `end` can
+        // never change after a Reobserved retry reads it -
+        // reclassify_dispatching_race_locked() is a deliberate, narrowly-scoped
+        // counter-example: for the one interleaving where a Reobserved retry
+        // lands inside the Dispatching-window race (after abandon_claim_locked
+        // sets the stale WaiterTimedOutDispatched but before
+        // dispatch_arm_off_lock's own re-lock corrects it), the SAME shared
+        // claim object's `end` is corrected to its real outcome, and both the
+        // original waiter and this Reobserved receipt see that corrected value
+        // (they share one claim). Don't read "eventually resolves on its own"
+        // into this either way - nothing about calling attach_rule again
+        // changes an already-settled `end`, short of a genuinely different
+        // rule_id/spec reaching this key.
         return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
                           .receipt = ArmReceipt{core.claim}};
     }
