@@ -377,14 +377,14 @@
     },
     {
       "grant": "n/a",
-      "if_refused": "always `constrained` / `windows_only_artefact`, rc 1",
+      "if_refused": "always `unsupported` / `windows_only_artefact`, rc 1",
       "measured": "not measured (no macOS mechanism exists)",
       "os": "macOS",
       "runs_as": "n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome"
     },
     {
       "grant": "n/a",
-      "if_refused": "always `constrained` / `windows_only_artefact`, rc 1",
+      "if_refused": "always `unsupported` / `windows_only_artefact`, rc 1",
       "measured": "not measured (no Linux mechanism exists)",
       "os": "Linux",
       "runs_as": "n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome"
@@ -594,7 +594,7 @@
       "agents/plugins/execution_artifacts/src/execution_artifacts_plugin.cpp",
       "agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp"
     ],
-    "privilege_row": false,
+    "privilege_row": true,
     "tests": [
       "tests/unit/test_execution_artifacts_local_dispatcher.cpp",
       "tests/unit/test_execution_artifacts_parsers.cpp",

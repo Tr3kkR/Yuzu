@@ -573,26 +573,32 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
     out.volume_count = *volume_count;
 
     // file_ref_count: the number-of-file-references DWORD inside volume
-    // entry 0's own file-references sub-block. Best-effort: this plugin only
-    // reports the COUNT (never walks or emits the references themselves), so
-    // any layout surprise here degrades to 0 rather than failing the whole
-    // parse — the exe/hash/run-count fields above are this action's primary
-    // payload and must not be held hostage to a secondary count.
+    // entry 0's own file-references sub-block. This is a documented,
+    // emitted output field (README.md), not an internal detail, so it
+    // follows the same contract as run_count/volume_count above: a
+    // truncated or over-cap read here fails the whole parse with a named
+    // reason rather than silently defaulting to 0, which would be
+    // indistinguishable from "this file genuinely referenced zero
+    // volumes' worth of files" (routed-concerns.md's execution_artifacts
+    // row, clause (1): never an empty success for malformed input).
     if (out.volume_count > 0) {
         auto vol_info_off =
             detail::read_u32(in, kFileInfoVolumesInfoOffsetField, "truncated_entry");
-        if (vol_info_off) {
-            auto refs_field_off = detail::read_u32(
-                in, static_cast<size_t>(*vol_info_off) + kVolumeEntryFileRefsOffsetField,
-                "truncated_entry");
-            if (refs_field_off) {
-                const size_t refs_count_off =
-                    static_cast<size_t>(*vol_info_off) + static_cast<size_t>(*refs_field_off);
-                auto refs_count = detail::read_u32(in, refs_count_off, "truncated_entry");
-                if (refs_count && *refs_count <= kPrefetchMaxFileRefs)
-                    out.file_ref_count = *refs_count;
-            }
-        }
+        if (!vol_info_off)
+            return std::unexpected(vol_info_off.error());
+        auto refs_field_off = detail::read_u32(
+            in, static_cast<size_t>(*vol_info_off) + kVolumeEntryFileRefsOffsetField,
+            "truncated_entry");
+        if (!refs_field_off)
+            return std::unexpected(refs_field_off.error());
+        const size_t refs_count_off =
+            static_cast<size_t>(*vol_info_off) + static_cast<size_t>(*refs_field_off);
+        auto refs_count = detail::read_u32(in, refs_count_off, "truncated_entry");
+        if (!refs_count)
+            return std::unexpected(refs_count.error());
+        if (*refs_count > kPrefetchMaxFileRefs)
+            return std::unexpected(detail::err("oversize_count", refs_count_off));
+        out.file_ref_count = *refs_count;
     }
 
     return out;

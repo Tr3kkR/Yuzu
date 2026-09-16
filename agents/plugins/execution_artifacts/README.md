@@ -54,8 +54,8 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | agent service account (LocalSystem today, #1442) | None for `shimcache` (a bounded `HKLM` value read) or `prefetch` (a directory glob plus per-file reads under `C:\Windows\Prefetch`). `amcache` needs no elevation either: A1's the-rig probe found `RegLoadAppKeyW` succeeds without `SeBackupPrivilege`, in both an admin session and under LocalSystem; the `SeBackupPrivilege` + backup-semantics fallback (reached only on `ERROR_SHARING_VIOLATION`) exists for a host where the hive is exclusively locked elsewhere, but grants itself no new privilege beyond what the service account can already request. | A1's the-rig probe, 2026-09-06, admin session and LocalSystem (see this plugin's `execution_artifacts_win.cpp` file header for the full probe findings) | `constrained` with a named reason (`reg_<code>`, `hive_locked`, `regload_<code>`, `subkey_open_failed`, …) — this plugin does not distinguish "access denied" from "not found"/"vanished mid-walk" in its tokens; a refused open and a missing key report through the same per-source token family |
-| macOS | n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome | n/a | not measured (no macOS mechanism exists) | always `constrained` / `windows_only_artefact`, rc 1 |
-| Linux | n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome | n/a | not measured (no Linux mechanism exists) | always `constrained` / `windows_only_artefact`, rc 1 |
+| macOS | n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome | n/a | not measured (no macOS mechanism exists) | always `unsupported` / `windows_only_artefact`, rc 1 |
+| Linux | n/a — plugin loads but every action is the fixed `windows_only_artefact` outcome | n/a | not measured (no Linux mechanism exists) | always `unsupported` / `windows_only_artefact`, rc 1 |
 
 No external binaries, no subprocesses, no network access — every call is an in-process Win32 registry/file call or an in-process `ntdll` decompression call. This plugin performs no authorization of its own: `Forensics:Read`/`AdminOrApproval`/single-target enforcement lives at the server dispatch layer (`server/core/src/dispatch_destructive_gate.hpp`), and every read is additionally gated behind the server-side plugin-config kill switch (`PluginConfigStore::seed_kill_switch_default_off`), which is OFF until an operator explicitly enables it.
 
@@ -213,5 +213,5 @@ unsupported|windows_only_artefact
 - Definitions: `content/definitions/execution_artifacts.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp`
 - Tests: `tests/unit/test_execution_artifacts_local_dispatcher.cpp` · `tests/unit/test_execution_artifacts_parsers.cpp` · `tests/unit/test_execution_artifacts_win_local.cpp`
-- Privilege row: `docs/agent-privilege-model.md` (no row yet)
+- Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

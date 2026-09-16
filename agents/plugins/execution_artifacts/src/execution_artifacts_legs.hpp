@@ -38,7 +38,11 @@ namespace yuzu::execution_artifacts {
 // code (CC-07 contract, same as every other plugin in this repo).
 
 int collect_shimcache(yuzu::CommandContext& ctx);
-int collect_amcache(yuzu::CommandContext& ctx);
+// `data_dir` is the agent's configured `agent.data_dir` (empty if unset --
+// see execution_artifacts_win.cpp's amcache_dest_dir for the fallback);
+// only the amcache leg needs it, since it's the only one that writes a
+// scratch file to disk.
+int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir);
 int collect_prefetch(yuzu::CommandContext& ctx);
 
 // ── row formatters (pure, OS-free — shared by the leg TU and tests) ───────

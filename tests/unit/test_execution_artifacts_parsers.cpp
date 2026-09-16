@@ -127,6 +127,25 @@ std::vector<uint8_t> build_valid_prefetch_v31_blob() {
     return buf;
 }
 
+// build_valid_prefetch_v31_blob() plus one well-formed volume entry, so the
+// volume_count > 0 file_ref_count walk (kFileInfoVolumesInfoOffsetField ->
+// kVolumeEntryFileRefsOffsetField -> the refs-count DWORD itself) has a
+// synthetic buffer to mutate for the negative tests below -- mirrors the
+// real layout A1's fixtures use (vol_info_off then a small relative offset
+// to the refs count), just with small, buffer-local offsets instead of the
+// real files' offsets thousands of bytes in.
+std::vector<uint8_t> build_valid_prefetch_v31_blob_with_volume(uint32_t refs_count) {
+    auto buf = build_valid_prefetch_v31_blob();
+    constexpr size_t kVolInfoOff = 0x100;
+    constexpr size_t kRefsFieldOff = 0x08; // relative to kVolInfoOff
+    put_u32(buf, kFileInfoVolumesInfoCountOffset, 1);
+    put_u32(buf, kFileInfoVolumesInfoOffsetField, static_cast<uint32_t>(kVolInfoOff));
+    put_u32(buf, kVolInfoOff + kVolumeEntryFileRefsOffsetField,
+            static_cast<uint32_t>(kRefsFieldOff));
+    put_u32(buf, kVolInfoOff + kRefsFieldOff, refs_count);
+    return buf;
+}
+
 // A minimal but structurally valid v23 prefetch header, isolating the
 // `is_v23` dispatch branch: its single last-run FILETIME slot and run-count
 // field live at kFileInfoV23LastRunOffset/kFileInfoV23RunCountOffset, not
@@ -487,6 +506,13 @@ TEST_CASE("parse_prefetch: A1's three real .pf.decompressed payloads pin exe_nam
         CHECK(result->exe_name == cap.exe_prefix);
         CHECK(result->hash_hex == cap.hash_suffix);
         CHECK(result->run_count >= 1);
+        // All three real captures carry >0 volumes with exactly 3 NTFS file
+        // references recorded in volume 0 (kVolumeEntryFileRefsOffsetField's
+        // doc comment above has the byte-level evidence) -- this is the
+        // volume_count > 0 file_ref_count walk actually exercised against
+        // real data, not just bounded in the mutation fuzz below.
+        CHECK(result->volume_count > 0);
+        CHECK(result->file_ref_count == 3);
         REQUIRE_FALSE(result->last_runs_epoch_ms.empty());
         CHECK(result->last_runs_epoch_ms.size() <= kPrefetchMaxLastRuns);
         for (int64_t ts : result->last_runs_epoch_ms) {
@@ -596,6 +622,55 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         put_u32(buf, kPrefetchFileSizeOffset, 100);
         auto r = parse_prefetch(buf);
         CHECK((!r.has_value() && r.error().token == "truncated_entry"));
+    }
+
+    // The nested volume_count > 0 file_ref_count walk used to default
+    // file_ref_count to 0 and still return success on any of these three
+    // failures -- indistinguishable from "this file genuinely references
+    // zero volumes' worth of files". Each must now fail the whole parse
+    // with a named reason, matching the sibling run_count/volume_count
+    // reads immediately above it.
+    SECTION("volume_count > 0 but the relative refs-field offset stored inside the volume "
+            "entry points past the buffer -- the refs count itself can never be read") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(3);
+        // Overwrite the relative offset (normally 0x08) with a value that
+        // pushes refs_count_off past the end of the buffer.
+        put_u32(buf, 0x100 + kVolumeEntryFileRefsOffsetField, 0xFFFFFF00u);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "truncated_entry");
+    }
+
+    SECTION("volume_count > 0 but the refs-field offset field itself is past the buffer") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(3);
+        // vol_info_off points near the very end of the buffer, so reading
+        // the relative refs-field offset at (vol_info_off +
+        // kVolumeEntryFileRefsOffsetField) runs off the end.
+        put_u32(buf, kFileInfoVolumesInfoOffsetField, static_cast<uint32_t>(buf.size() - 2));
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "truncated_entry");
+    }
+
+    SECTION("volume_count > 0 and every offset resolves, but the refs count exceeds "
+            "kPrefetchMaxFileRefs") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(kPrefetchMaxFileRefs + 1);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "oversize_count");
+    }
+
+    SECTION("volume_count > 0 with a well-formed nested refs chain succeeds with the exact "
+            "count -- proves the walk isn't ALWAYS an error after the fix above") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(5);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE(r.has_value());
+        CHECK(r->volume_count == 1);
+        CHECK(r->file_ref_count == 5);
     }
 }
 

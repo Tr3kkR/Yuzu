@@ -132,7 +132,13 @@ public:
         return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
-    yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+    yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
+        // Copied into a std::string immediately -- ctx.get_config returns a
+        // string_view over the C ABI's own buffer, not guaranteed to
+        // outlive this call (tar_plugin.cpp:569's same precedent).
+        data_dir_ = std::string{ctx.get_config("agent.data_dir")};
+        return {};
+    }
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
@@ -142,7 +148,7 @@ public:
         if (action == "shimcache")
             return yuzu::execution_artifacts::collect_shimcache(ctx);
         if (action == "amcache")
-            return yuzu::execution_artifacts::collect_amcache(ctx);
+            return yuzu::execution_artifacts::collect_amcache(ctx, data_dir_);
         if (action == "prefetch")
             return yuzu::execution_artifacts::collect_prefetch(ctx);
 #else
@@ -160,6 +166,12 @@ public:
         ctx.write_output(std::string{"unknown action: "} + yuzu::util::safe_output_field(action));
         return 1;
     }
+
+private:
+    // Captured at init() (tar_plugin.cpp:565-581's precedent); only the
+    // amcache leg consumes it (execution_artifacts_win.cpp's
+    // amcache_dest_dir), empty when agent.data_dir is unset.
+    std::string data_dir_;
 };
 
 YUZU_PLUGIN_EXPORT(ExecutionArtifactsPlugin)

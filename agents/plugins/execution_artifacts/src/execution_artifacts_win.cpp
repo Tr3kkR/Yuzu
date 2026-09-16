@@ -83,6 +83,7 @@
 #endif
 #include <windows.h>
 #include <winternl.h> // NTSTATUS (confined_fs_win.cpp precedent)
+#include <aclapi.h>   // GetNamedSecurityInfoW/GetAclInformation/GetAce (amcache_dest_dir_is_safe)
 #include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW (amcache_dest_dir DACL)
 
 #include <win_profiles.hpp> // RegKey, PrivilegeScope, offline_hive_mutex, read_reg_value,
@@ -265,22 +266,109 @@ constexpr wchar_t kAmcacheSourceHve[] = L"C:\\Windows\\appcompat\\Programs\\Amca
 constexpr uint64_t kAmcacheMaxBytes = 256ull * 1024 * 1024; // 256 MiB
 constexpr DWORD kAmcacheMaxSubkeys = 20000;
 
-// This leg receives only a CommandContext, not the PluginContext that would
-// carry `agent.data_dir` (that config plumbing lives in
-// execution_artifacts_plugin.cpp, P31's file, out of this package's scope)
-// -- so unlike tar_plugin.cpp's init()-time cache (tar_plugin.cpp:565-580)
-// this is always that same logic's PLATFORM-FALLBACK arm (the literal
-// C:/ProgramData/yuzu/agent path used when agent.data_dir is empty),
-// resolved once via a magic static (confined_fs_win.cpp's
-// resolve_ntcreatefile precedent) rather than recomputed per call.
-const std::wstring& amcache_dest_dir() {
-    static const std::wstring dir = L"C:\\ProgramData\\yuzu\\agent\\execution_artifacts";
-    return dir;
+// `data_dir` is the agent's configured `agent.data_dir` (execution_artifacts_
+// plugin.cpp's init()-time capture, threaded through collect_amcache below --
+// tar_plugin.cpp's init()-time cache precedent, tar_plugin.cpp:565-580).
+// Empty (agent.data_dir unset) falls back to the historical hardcoded
+// C:/ProgramData/yuzu/agent literal -- the profile is never silently
+// dropped, only the platform default substituted for a genuinely absent
+// config value.
+std::wstring amcache_dest_dir(std::string_view data_dir) {
+    std::wstring base =
+        data_dir.empty() ? L"C:\\ProgramData\\yuzu\\agent" : yuzu::win::to_wide(data_dir);
+    return base + L"\\execution_artifacts";
 }
 
-std::wstring amcache_temp_path() {
-    return amcache_dest_dir() + L"\\amcache_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
-           std::to_wstring(GetTickCount64()) + L".hve";
+std::wstring amcache_temp_path(std::string_view data_dir) {
+    return amcache_dest_dir(data_dir) + L"\\amcache_" + std::to_wstring(GetCurrentProcessId()) +
+           L"_" + std::to_wstring(GetTickCount64()) + L".hve";
+}
+
+/// True if `sid` is the well-known SID of `type` (SYSTEM or
+/// BUILTIN\Administrators here) -- compared as a SID, never a localised
+/// account name (yuzu-agent.iss's SecureTrustAnchorDir precedent: matching
+/// "BUILTIN\Administrators" by name fails open off an English build).
+bool sid_is_well_known(PSID sid, WELL_KNOWN_SID_TYPE type) {
+    if (!sid)
+        return false;
+    BYTE buf[SECURITY_MAX_SID_SIZE];
+    DWORD size = sizeof(buf);
+    if (!CreateWellKnownSid(type, nullptr, buf, &size))
+        return false;
+    return EqualSid(sid, buf);
+}
+
+/// Verifies a PRE-EXISTING amcache_dest_dir() is safe to reuse for the raw
+/// Amcache.hve copy below.
+///
+/// CreateDirectoryW only applies the caller's SECURITY_ATTRIBUTES when it
+/// actually creates the directory (ERROR_SUCCESS) -- on ERROR_ALREADY_EXISTS
+/// the existing object's DACL, and reparse status, are untouched. Without
+/// this check an unprivileged local user could pre-create this directory
+/// (or a junction to an attacker-controlled path -- standard users can
+/// create junctions) before the plugin's first dispatch, and the
+/// LocalSystem-run copy below would silently land the raw hive under the
+/// attacker's ACL/target. Mirrors yuzu-agent.iss's SecureTrustAnchorDir
+/// recipe (verify the EXACT owner+ACE set, fail closed on anything
+/// unverifiable) rather than its take-ownership-and-reset half: refusing a
+/// suspect directory is sufficient here, since -- unlike the installer's
+/// trust anchor, which must exist for the agent to run at all -- this
+/// scratch directory has no reason to already exist under a legitimate
+/// install (install-agent-user.ps1 does not provision it) and a refusal
+/// just degrades this one dispatch to `constrained`.
+bool amcache_dest_dir_is_safe(const std::wstring& dir) {
+    const DWORD attrs = GetFileAttributesW(dir.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
+        return false; // gone between create and check, or a junction/symlink.
+
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    PSID owner_sid = nullptr;
+    PACL dacl = nullptr;
+    const DWORD rc = GetNamedSecurityInfoW(
+        dir.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner_sid, nullptr, &dacl, nullptr, &sd);
+    if (rc != ERROR_SUCCESS)
+        return false;
+    struct SdGuard {
+        PSECURITY_DESCRIPTOR p;
+        ~SdGuard() {
+            if (p)
+                LocalFree(p);
+        }
+    } sd_guard{sd};
+
+    // The owner must be a trusted principal -- anything else means a local
+    // user created this directory (and, as owner, permanently holds
+    // WRITE_DAC over it regardless of its current DACL contents).
+    if (!sid_is_well_known(owner_sid, WinLocalSystemSid) &&
+        !sid_is_well_known(owner_sid, WinBuiltinAdministratorsSid))
+        return false;
+
+    if (!dacl) // a null DACL grants Everyone full control.
+        return false;
+
+    ACL_SIZE_INFORMATION acl_info{};
+    if (!GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation))
+        return false;
+
+    for (DWORD i = 0; i < acl_info.AceCount; ++i) {
+        LPVOID ace = nullptr;
+        if (!GetAce(dacl, i, &ace))
+            return false;
+        const auto* header = static_cast<ACE_HEADER*>(ace);
+        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE)
+            continue; // a deny (or other) ACE doesn't grant anyone access.
+        const PSID ace_sid = &static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart;
+        // Trust the same owner SID this directory was verified to have
+        // above (the fresh-create path's own D:P(A;OICI;GA;;;OW) grants
+        // access to CREATOR OWNER, which resolves to exactly this SID), or
+        // SYSTEM/Administrators outright.
+        if (!EqualSid(ace_sid, owner_sid) &&
+            !sid_is_well_known(ace_sid, WinLocalSystemSid) &&
+            !sid_is_well_known(ace_sid, WinBuiltinAdministratorsSid))
+            return false; // some other principal has been granted access.
+    }
+    return true;
 }
 
 /// Process-wide count of persistent temp-hive cleanup failures (e.g. an AV
@@ -538,7 +626,7 @@ int collect_shimcache(yuzu::CommandContext& ctx) {
 
 // ═══════════════════════════════════════════════════════════════ Amcache ══
 
-int collect_amcache(yuzu::CommandContext& ctx) {
+int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
     try {
         WIN32_FILE_ATTRIBUTE_DATA attr{};
         if (!GetFileAttributesExW(kAmcacheSourceHve, GetFileExInfoStandard, &attr))
@@ -548,7 +636,13 @@ int collect_amcache(yuzu::CommandContext& ctx) {
         if (src_bytes > kAmcacheMaxBytes)
             return emit_constrained(ctx, "hive_oversized");
 
-        CreateDirectoryW(L"C:\\ProgramData\\yuzu\\agent", nullptr); // best-effort; may pre-exist
+        // CreateDirectoryW below does not create intermediate parents. When
+        // agent.data_dir is configured its parent is the agent's own root
+        // data directory, which already exists by the time any plugin runs
+        // -- this best-effort create only matters on the historical
+        // hardcoded-fallback path (data_dir unset).
+        if (data_dir.empty())
+            CreateDirectoryW(L"C:\\ProgramData\\yuzu\\agent", nullptr); // best-effort; may pre-exist
 
         // Owner-only, inheritable DACL (same D:P(A;;GA;;;OW) idiom as
         // temp_file.cpp's make_owner_only_sa, +OICI so it propagates to the
@@ -561,11 +655,25 @@ int collect_amcache(yuzu::CommandContext& ctx) {
         if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
                 L"D:P(A;OICI;GA;;;OW)", SDDL_REVISION_1, &amcache_sd, nullptr))
             amcache_sa.lpSecurityDescriptor = amcache_sd;
-        CreateDirectoryW(amcache_dest_dir().c_str(), amcache_sd ? &amcache_sa : nullptr);
+        const std::wstring dest_dir = amcache_dest_dir(data_dir);
+        const BOOL dir_created =
+            CreateDirectoryW(dest_dir.c_str(), amcache_sd ? &amcache_sa : nullptr);
+        const DWORD dir_create_err = dir_created ? ERROR_SUCCESS : GetLastError();
         if (amcache_sd)
             LocalFree(amcache_sd);
 
-        const std::wstring dest_hve = amcache_temp_path();
+        if (!dir_created) {
+            if (dir_create_err != ERROR_ALREADY_EXISTS)
+                return emit_constrained(ctx, "dest_dir_create_" + std::to_string(dir_create_err));
+            // The directory pre-existed, so CreateDirectoryW did NOT apply
+            // the owner-only DACL above (Windows only sets it on a genuine
+            // create) -- verify what's actually there before trusting it
+            // with the raw hive copy below.
+            if (!amcache_dest_dir_is_safe(dest_dir))
+                return emit_constrained(ctx, "dest_dir_acl");
+        }
+
+        const std::wstring dest_hve = amcache_temp_path(data_dir);
 
         // ENTIRE privilege-bearing sequence -- PrivilegeScope construction
         // (fallback path only), the copy, RegLoadAppKeyW, enumeration, and
