@@ -7430,14 +7430,29 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
         // RMW mutual exclusion on ITS OWN modification order - it publishes no
         // other field through itself, so no stronger ordering is needed.
-    std::atomic<int> entry_hook_fire_count{0}; // external review finding (fjarvis's
-        // adversarial panel, Kimi, 2026-09-16) - matching counter for the
-        // dispatch-entry hook (registered inside the drain-gap hook above, see its
-        // own comment for why): entered is the ONLY promise this file's hooks ever
-        // set from a worker thread, making it the more plausible route for the
-        // original CI crash's duplicate set_value() than the gap hook itself
-        // (which already carries full instrumentation). Diagnostic only - see the
-        // entry hook body below for why no early-return guard is needed here.
+    std::atomic<int> entry_hook_fire_count{0}; // Gate 8 governance follow-up
+        // (round 5, 2026-09-16) rewrite of the original external-review comment,
+        // correcting two findings raised against it (quality-engineer,
+        // consistency-auditor): `entered` IS the only promise this file's hooks
+        // ever set from a worker thread (release_hook is always main-thread-
+        // sequenced: set only in Cleanup's destructor and in this test's own
+        // main-thread flow, never inside a hook lambda), but that does NOT make entry_hook
+        // the more plausible duplicate-fire route - the opposite: production code
+        // MOVES `dispatch_entry_hook_for_test_` out at first fire
+        // (guardian_spark_runtime.cpp:557), so this hook is single-fire by
+        // construction under normal operation, unlike `drain_gap_hook_for_test_`
+        // (COPIED at :919, genuinely capable of firing again - why
+        // gap_hook_fire_count needs its early-return guard and CHECK). A
+        // CHECK==1 here would in fact be safely orderable too - entered_fut's
+        // own wait_for()==ready already synchronizes-with the fetch_add below
+        // (security-guardian/cpp-safety confirmed) - but is kept diagnostic-only:
+        // a repeat firing here can only mean the same pre-existing, already-
+        // tracked HC-1b TOCTOU (#4431) or an unspecified moved-from std::function edge
+        // case, not a legitimate repeat path the way gap_hook_fire_count's is.
+        // relaxed is sufficient (same reasoning as gap_hook_fire_count's own
+        // note): this guard's only job is exactly-one-winner RMW mutual
+        // exclusion on its own modification order - it publishes no other field
+        // through itself.
     rt->set_drain_gap_hook_for_test([&] {
         // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
         // follow-up, 2026-09-16): use fetch_add's OWN return value for the
@@ -7455,17 +7470,11 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
                          prior + 1);
             return;
         }
-        // External review finding (fjarvis's adversarial panel, Kimi's Phase-2
-        // reasoning, 2026-09-16): release_hook can only ever be set from the main
-        // thread (both call sites are main-thread-sequenced, one guarded by
-        // released_by_test), so `entered` is the ONLY promise this file's hooks
-        // ever set from a worker thread - meaning if the original CI crash's
-        // duplicate set_value() was on a promise at all, `entered` is the more
-        // plausible route, not the gap hook (which already carries full forensic
-        // instrumentation above). Matching counter for symmetry - diagnostic only,
-        // not a safety fix: set_value_once already makes a repeat set_value() safe,
-        // and a shared_future tolerates repeat .wait() calls, so nothing here needs
-        // an early-return guard the way gap_hook_fire_count's does.
+        // See entry_hook_fire_count's own declaration comment above for why
+        // this hook is single-fire by construction (unlike the gap hook above)
+        // and why no early-return guard is needed here: set_value_once already
+        // makes a repeat set_value() safe, and a shared_future tolerates repeat
+        // .wait() calls.
         rt->set_dispatch_entry_hook_for_test([&] {
             if (const int prior = entry_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
                 prior > 0) {
@@ -7728,14 +7737,29 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
         // RMW mutual exclusion on ITS OWN modification order - it publishes no
         // other field through itself, so no stronger ordering is needed.
-    std::atomic<int> entry_hook_fire_count{0}; // external review finding (fjarvis's
-        // adversarial panel, Kimi, 2026-09-16) - matching counter for the
-        // dispatch-entry hook (registered inside the drain-gap hook above, see its
-        // own comment for why): entered is the ONLY promise this file's hooks ever
-        // set from a worker thread, making it the more plausible route for the
-        // original CI crash's duplicate set_value() than the gap hook itself
-        // (which already carries full instrumentation). Diagnostic only - see the
-        // entry hook body below for why no early-return guard is needed here.
+    std::atomic<int> entry_hook_fire_count{0}; // Gate 8 governance follow-up
+        // (round 5, 2026-09-16) rewrite of the original external-review comment,
+        // correcting two findings raised against it (quality-engineer,
+        // consistency-auditor): `entered` IS the only promise this file's hooks
+        // ever set from a worker thread (release_hook is always main-thread-
+        // sequenced: set only in Cleanup's destructor and in this test's own
+        // main-thread flow, never inside a hook lambda), but that does NOT make entry_hook
+        // the more plausible duplicate-fire route - the opposite: production code
+        // MOVES `dispatch_entry_hook_for_test_` out at first fire
+        // (guardian_spark_runtime.cpp:557), so this hook is single-fire by
+        // construction under normal operation, unlike `drain_gap_hook_for_test_`
+        // (COPIED at :919, genuinely capable of firing again - why
+        // gap_hook_fire_count needs its early-return guard and CHECK). A
+        // CHECK==1 here would in fact be safely orderable too - entered_fut's
+        // own wait_for()==ready already synchronizes-with the fetch_add below
+        // (security-guardian/cpp-safety confirmed) - but is kept diagnostic-only:
+        // a repeat firing here can only mean the same pre-existing, already-
+        // tracked HC-1b TOCTOU (#4431) or an unspecified moved-from std::function edge
+        // case, not a legitimate repeat path the way gap_hook_fire_count's is.
+        // relaxed is sufficient (same reasoning as gap_hook_fire_count's own
+        // note): this guard's only job is exactly-one-winner RMW mutual
+        // exclusion on its own modification order - it publishes no other field
+        // through itself.
     rt->set_drain_gap_hook_for_test([&] {
         // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
         // follow-up, 2026-09-16): use fetch_add's OWN return value for the
@@ -7753,17 +7777,11 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
                          prior + 1);
             return;
         }
-        // External review finding (fjarvis's adversarial panel, Kimi's Phase-2
-        // reasoning, 2026-09-16): release_hook can only ever be set from the main
-        // thread (both call sites are main-thread-sequenced, one guarded by
-        // released_by_test), so `entered` is the ONLY promise this file's hooks
-        // ever set from a worker thread - meaning if the original CI crash's
-        // duplicate set_value() was on a promise at all, `entered` is the more
-        // plausible route, not the gap hook (which already carries full forensic
-        // instrumentation above). Matching counter for symmetry - diagnostic only,
-        // not a safety fix: set_value_once already makes a repeat set_value() safe,
-        // and a shared_future tolerates repeat .wait() calls, so nothing here needs
-        // an early-return guard the way gap_hook_fire_count's does.
+        // See entry_hook_fire_count's own declaration comment above for why
+        // this hook is single-fire by construction (unlike the gap hook above)
+        // and why no early-return guard is needed here: set_value_once already
+        // makes a repeat set_value() safe, and a shared_future tolerates repeat
+        // .wait() calls.
         rt->set_dispatch_entry_hook_for_test([&] {
             if (const int prior = entry_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
                 prior > 0) {
@@ -8018,14 +8036,29 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // follow-up, 2026-09-16): this guard's only job is exactly-one-winner
         // RMW mutual exclusion on ITS OWN modification order - it publishes no
         // other field through itself, so no stronger ordering is needed.
-    std::atomic<int> entry_hook_fire_count{0}; // external review finding (fjarvis's
-        // adversarial panel, Kimi, 2026-09-16) - matching counter for the
-        // dispatch-entry hook (registered inside the drain-gap hook above, see its
-        // own comment for why): entered is the ONLY promise this file's hooks ever
-        // set from a worker thread, making it the more plausible route for the
-        // original CI crash's duplicate set_value() than the gap hook itself
-        // (which already carries full instrumentation). Diagnostic only - see the
-        // entry hook body below for why no early-return guard is needed here.
+    std::atomic<int> entry_hook_fire_count{0}; // Gate 8 governance follow-up
+        // (round 5, 2026-09-16) rewrite of the original external-review comment,
+        // correcting two findings raised against it (quality-engineer,
+        // consistency-auditor): `entered` IS the only promise this file's hooks
+        // ever set from a worker thread (release_hook is always main-thread-
+        // sequenced: set only in Cleanup's destructor and in this test's own
+        // main-thread flow, never inside a hook lambda), but that does NOT make entry_hook
+        // the more plausible duplicate-fire route - the opposite: production code
+        // MOVES `dispatch_entry_hook_for_test_` out at first fire
+        // (guardian_spark_runtime.cpp:557), so this hook is single-fire by
+        // construction under normal operation, unlike `drain_gap_hook_for_test_`
+        // (COPIED at :919, genuinely capable of firing again - why
+        // gap_hook_fire_count needs its early-return guard and CHECK). A
+        // CHECK==1 here would in fact be safely orderable too - entered_fut's
+        // own wait_for()==ready already synchronizes-with the fetch_add below
+        // (security-guardian/cpp-safety confirmed) - but is kept diagnostic-only:
+        // a repeat firing here can only mean the same pre-existing, already-
+        // tracked HC-1b TOCTOU (#4431) or an unspecified moved-from std::function edge
+        // case, not a legitimate repeat path the way gap_hook_fire_count's is.
+        // relaxed is sufficient (same reasoning as gap_hook_fire_count's own
+        // note): this guard's only job is exactly-one-winner RMW mutual
+        // exclusion on its own modification order - it publishes no other field
+        // through itself.
     rt->set_drain_gap_hook_for_test([&] {
         // cpp-expert/security-guardian/unhappy-path finding (Gate 8 governance
         // follow-up, 2026-09-16): use fetch_add's OWN return value for the
@@ -8043,17 +8076,11 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
                          prior + 1);
             return;
         }
-        // External review finding (fjarvis's adversarial panel, Kimi's Phase-2
-        // reasoning, 2026-09-16): release_hook can only ever be set from the main
-        // thread (both call sites are main-thread-sequenced, one guarded by
-        // released_by_test), so `entered` is the ONLY promise this file's hooks
-        // ever set from a worker thread - meaning if the original CI crash's
-        // duplicate set_value() was on a promise at all, `entered` is the more
-        // plausible route, not the gap hook (which already carries full forensic
-        // instrumentation above). Matching counter for symmetry - diagnostic only,
-        // not a safety fix: set_value_once already makes a repeat set_value() safe,
-        // and a shared_future tolerates repeat .wait() calls, so nothing here needs
-        // an early-return guard the way gap_hook_fire_count's does.
+        // See entry_hook_fire_count's own declaration comment above for why
+        // this hook is single-fire by construction (unlike the gap hook above)
+        // and why no early-return guard is needed here: set_value_once already
+        // makes a repeat set_value() safe, and a shared_future tolerates repeat
+        // .wait() calls.
         rt->set_dispatch_entry_hook_for_test([&] {
             if (const int prior = entry_hook_fire_count.fetch_add(1, std::memory_order_relaxed);
                 prior > 0) {
