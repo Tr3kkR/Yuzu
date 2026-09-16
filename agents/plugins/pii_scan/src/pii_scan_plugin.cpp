@@ -77,6 +77,48 @@ namespace {
 
 using namespace yuzu::pii;
 
+// ABI v4+ per-action, per-OS capability declaration (#2204) -- read
+// directly out of the built plugin binary by tools/capmatrix-gen to
+// populate docs/os-capability-matrix.md's generated block. Genuinely
+// cross-platform: std::filesystem walk + RE2 match has no per-OS branch,
+// and the realtime trigger rides the agent's existing, already
+// cross-platform filesystem-trigger primitive (mtime polling).
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "scan",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+    },
+    {
+        /* .action      = */ "enable_realtime",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent_trigger_engine (filesystem mtime poll)",
+         "catches new/renamed files under the watched directory, not in-place edits to an "
+         "existing file -- see the plugin README's Caveats"},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent_trigger_engine (filesystem mtime poll)",
+         "catches new/renamed files under the watched directory, not in-place edits to an "
+         "existing file -- see the plugin README's Caveats"},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "agent_trigger_engine (filesystem mtime poll)",
+         "catches new/renamed files under the watched directory, not in-place edits to an "
+         "existing file -- see the plugin README's Caveats"},
+    },
+    {
+        /* .action      = */ "disable_realtime",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "agent_trigger_engine", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "agent_trigger_engine", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "agent_trigger_engine", nullptr},
+    },
+    {
+        /* .action      = */ "scan_path",
+        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+        /* .windows_leg = */ {YUZU_SUPPORT_SUPPORTED, 1, "std_filesystem", nullptr},
+    },
+};
+
 std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
@@ -248,6 +290,13 @@ public:
         static const char* acts[] = {"scan", "enable_realtime", "disable_realtime", "scan_path",
                                      nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {

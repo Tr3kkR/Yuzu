@@ -7,3 +7,6 @@ captured: linux not built · container · 2026-09-16 · not measured (capture di
 
 == action=disable_realtime
 [not captured] agent-context: no Linux build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+
+== action=scan_path
+[not captured] agent-context: no Linux build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.

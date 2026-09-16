@@ -7,8 +7,8 @@
 | **Version** | 1.0.0 |
 | **Kind** | Action · mutating · gathered (security.pii_scan.scan) |
 | **Platforms** | Windows ✅ · macOS ✅ · Linux ✅ |
-| **Actions** | `disable_realtime` (definition `security.pii_scan.disable_realtime`) · `enable_realtime` (definition `security.pii_scan.enable_realtime`) · `scan` (definition `security.pii_scan.scan`) |
-| **Security** | `scan`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `enable_realtime`: securable `Security` · operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval; `disable_realtime`: securable `Security` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval |
+| **Actions** | `disable_realtime` (definition `security.pii_scan.disable_realtime`) · `enable_realtime` (definition `security.pii_scan.enable_realtime`) · `scan` (definition `security.pii_scan.scan`) · `scan_path` |
+| **Security** | `scan`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None; `enable_realtime`: securable `Security` · operation Write · risk High · dispatch Mutating · approval gate AdminOrApproval; `disable_realtime`: securable `Security` · operation Write · risk Medium · dispatch Mutating · approval gate AdminOrApproval; `scan_path`: securable `Security` · operation Read · risk Medium · dispatch ReadOnly · approval gate None |
 | **Roles** | execute: `scan`: compliance-officer, endpoint-admin, endpoint-operator, security-admin; `enable_realtime`: compliance-officer, endpoint-admin, security-admin; `disable_realtime`: compliance-officer, endpoint-admin, security-admin · author: content-author |
 <!-- END GENERATED -->
 
@@ -37,12 +37,13 @@ flowchart LR
 | `disable_realtime` | ✅ supported · rung 1 · agent_trigger_engine | ✅ supported · rung 1 · agent_trigger_engine | ✅ supported · rung 1 · agent_trigger_engine |
 | `enable_realtime` | ✅ supported · rung 1 · agent_trigger_engine (filesystem mtime poll) | ✅ supported · rung 1 · agent_trigger_engine (filesystem mtime poll) | ✅ supported · rung 1 · agent_trigger_engine (filesystem mtime poll) |
 | `scan` | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem |
+| `scan_path` | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem | ✅ supported · rung 1 · std_filesystem |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`enable_realtime` / Windows** — catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats
-- **`enable_realtime` / macOS** — catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats
-- **`enable_realtime` / Linux** — catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats
+- **`enable_realtime` / Windows** — catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats
+- **`enable_realtime` / macOS** — catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats
+- **`enable_realtime` / Linux** — catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -144,6 +145,9 @@ Every action writes pipe-delimited rows via `ctx.write_output`: `severity|findin
 
 == action=disable_realtime
 [not captured] agent-context: same reason as enable_realtime — needs a live TriggerEngine plugin-capture does not provide.
+
+== action=scan_path
+[not captured] agent-context: same reason as `scan` above (plugin-capture hangs before any plugin code runs on this host) — scan_path routes to the identical run_scan handler `scan` uses, so its own coverage is exercised by the same unit tests.
 ```
 
 **macOS** — captured: macos not built · bare-metal · 2026-09-16 · not measured (capture did not complete) · leg-hash pending
@@ -157,6 +161,9 @@ Every action writes pipe-delimited rows via `ctx.write_output`: `severity|findin
 
 == action=disable_realtime
 [not captured] agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+
+== action=scan_path
+[not captured] agent-context: no macOS build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.
 ```
 
 **Linux** — captured: linux not built · container · 2026-09-16 · not measured (capture did not complete) · leg-hash pending
@@ -170,6 +177,9 @@ Every action writes pipe-delimited rows via `ctx.write_output`: `severity|findin
 
 == action=disable_realtime
 [not captured] agent-context: no Linux build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+
+== action=scan_path
+[not captured] agent-context: no Linux build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.
 ```
 <!-- END GENERATED -->
 

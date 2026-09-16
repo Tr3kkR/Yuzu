@@ -7,3 +7,6 @@ captured: macos not built · bare-metal · 2026-09-16 · not measured (capture d
 
 == action=disable_realtime
 [not captured] agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+
+== action=scan_path
+[not captured] agent-context: no macOS build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.

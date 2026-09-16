@@ -7,7 +7,7 @@
 #include "../command_capability.hpp"
 
 /// @file plugin_action_catalogue_pii_scan.hpp
-/// One fragment of the command capability catalogue: `pii_scan`'s three
+/// One fragment of the command capability catalogue: `pii_scan`'s four
 /// actions (`agents/plugins/pii_scan/src/pii_scan_plugin.cpp`). Classified
 /// by READING the implementation, not the name, per this package's spec.
 /// Every `securable`/`operation` pair reuses an EXISTING `RbacStore`
@@ -50,11 +50,22 @@
 ///     than `enable_realtime`: this row only reverts to the default
 ///     no-realtime-scanning state, it does not itself install new
 ///     standing behaviour).
+///   - `scan_path` — the action the realtime filesystem trigger installed
+///     by `enable_realtime` actually fires (`pii_scan_plugin.cpp`'s own
+///     doc comment: "Internal ... but harmless to call directly"). Routed
+///     to the exact same `run_scan` handler as `scan` with no different
+///     read surface, so it is classified identically: ReadOnly/None,
+///     `Security:Read`, risk_tier Medium, ungated. Needs its OWN row
+///     despite being handler-identical to `scan` — the capability
+///     catalogue keys on the exact dispatched action STRING
+///     (`CommandCapabilityRegistry::classify`), and `scan_path` is a real,
+///     separately-reachable action name once a realtime trigger exists,
+///     not an alias `scan`'s row implicitly covers.
 namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 3> kPluginActionCataloguePiiScan{{
+inline constexpr std::array<CommandCapability, 4> kPluginActionCataloguePiiScan{{
     {
         .plugin = "pii_scan",
         .action = "scan",
@@ -87,6 +98,17 @@ inline constexpr std::array<CommandCapability, 3> kPluginActionCataloguePiiScan{
         .risk_tier = authz::RiskTier::Medium,
         .system_reserved = false,
         .execute_gate = ExecuteGate::AdminOrApproval,
+    },
+    {
+        .plugin = "pii_scan",
+        .action = "scan_path",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Security",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Medium,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
     },
 }};
 

@@ -33,19 +33,19 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats",
+          "fallback": "catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats",
           "mechanism": "agent_trigger_engine (filesystem mtime poll)",
           "rung": "1",
           "support": "supported"
         },
         "macos": {
-          "fallback": "catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats",
+          "fallback": "catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats",
           "mechanism": "agent_trigger_engine (filesystem mtime poll)",
           "rung": "1",
           "support": "supported"
         },
         "windows": {
-          "fallback": "catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats",
+          "fallback": "catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats",
           "mechanism": "agent_trigger_engine (filesystem mtime poll)",
           "rung": "1",
           "support": "supported"
@@ -57,6 +57,30 @@
       "definition_ids": [
         "security.pii_scan.scan"
       ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        },
+        "windows": {
+          "fallback": "",
+          "mechanism": "std_filesystem",
+          "rung": "1",
+          "support": "supported"
+        }
+      }
+    },
+    {
+      "action": "scan_path",
+      "definition_ids": [],
       "legs": {
         "linux": {
           "fallback": "",
@@ -223,7 +247,7 @@
     "gathered": true,
     "mutating": true
   },
-  "leg_hash": "39ffa65d12f0",
+  "leg_hash": "27bc4119033e",
   "manifest_version": 1,
   "name": "pii_scan",
   "outputs": [
@@ -511,6 +535,16 @@
           "row_count": 0,
           "rows": [],
           "truncated": false
+        },
+        {
+          "action": "scan_path",
+          "not_captured": "agent-context: no Linux build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
@@ -547,6 +581,16 @@
         {
           "action": "disable_realtime",
           "not_captured": "agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        },
+        {
+          "action": "scan_path",
+          "not_captured": "agent-context: no macOS build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.",
           "params": "",
           "rc": 0,
           "result_status": null,
@@ -595,6 +639,16 @@
           "row_count": 0,
           "rows": [],
           "truncated": false
+        },
+        {
+          "action": "scan_path",
+          "not_captured": "agent-context: same reason as `scan` above (plugin-capture hangs before any plugin code runs on this host) — scan_path routes to the identical run_scan handler `scan` uses, so its own coverage is exercised by the same unit tests.",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
         }
       ],
       "stamp": {
@@ -632,6 +686,15 @@
       "execute_gate": "AdminOrApproval",
       "mutability": "Reversible",
       "operation": "Write",
+      "risk_tier": "Medium",
+      "securable": "Security"
+    },
+    {
+      "action": "scan_path",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
       "risk_tier": "Medium",
       "securable": "Security"
     }

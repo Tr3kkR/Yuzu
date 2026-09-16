@@ -505,12 +505,15 @@ implementation is.
 | pii_scan | scan | linux | supported | 1 | std_filesystem | - |
 | pii_scan | scan | macos | supported | 1 | std_filesystem | - |
 | pii_scan | scan | windows | supported | 1 | std_filesystem | - |
-| pii_scan | enable_realtime | linux | supported | 1 | agent_trigger_engine (filesystem mtime poll) | catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats |
-| pii_scan | enable_realtime | macos | supported | 1 | agent_trigger_engine (filesystem mtime poll) | catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats |
-| pii_scan | enable_realtime | windows | supported | 1 | agent_trigger_engine (filesystem mtime poll) | catches new/renamed files under the watched directory, not in-place edits to an existing file — see the plugin README's Caveats |
+| pii_scan | enable_realtime | linux | supported | 1 | agent_trigger_engine (filesystem mtime poll) | catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats |
+| pii_scan | enable_realtime | macos | supported | 1 | agent_trigger_engine (filesystem mtime poll) | catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats |
+| pii_scan | enable_realtime | windows | supported | 1 | agent_trigger_engine (filesystem mtime poll) | catches new/renamed files under the watched directory, not in-place edits to an existing file -- see the plugin README's Caveats |
 | pii_scan | disable_realtime | linux | supported | 1 | agent_trigger_engine | - |
 | pii_scan | disable_realtime | macos | supported | 1 | agent_trigger_engine | - |
 | pii_scan | disable_realtime | windows | supported | 1 | agent_trigger_engine | - |
+| pii_scan | scan_path | linux | supported | 1 | std_filesystem | - |
+| pii_scan | scan_path | macos | supported | 1 | std_filesystem | - |
+| pii_scan | scan_path | windows | supported | 1 | std_filesystem | - |
 | power_health | battery | linux | constrained | 1 | /sys/class/power_supply uevent parsing | fixture-verified; no live Linux venue in this run |
 | power_health | battery | macos | supported | 1 | IOPSCopyPowerSourcesInfo/IOPSCopyPowerSourcesList | IOPS is used deliberately over the AppleSmartBattery IORegistry node, which is present, matched and active even on a battery-less Mac mini and would report a phantom battery; the battery-PRESENT path is fixture-tested and UNVERIFIED on real Mac battery hardware — the run host was a desktop |
 | power_health | battery | windows | supported | 1 | GetSystemPowerStatus + CallNtPowerInformation(SystemBatteryState) | no-system-battery path measured live on the-rig (BatteryFlag=128); the battery-PRESENT path is now verified on real hardware (HP ZBook Firefly, PR #4009 review), which is what caught the AC-resting state being reported as unknown rather than not_charging |

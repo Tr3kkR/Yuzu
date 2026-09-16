@@ -7,3 +7,6 @@ captured: windows 11 Pro (10.0.26200) · bare-metal · 2026-09-16 · not measure
 
 == action=disable_realtime
 [not captured] agent-context: same reason as enable_realtime — needs a live TriggerEngine plugin-capture does not provide.
+
+== action=scan_path
+[not captured] agent-context: same reason as `scan` above (plugin-capture hangs before any plugin code runs on this host) — scan_path routes to the identical run_scan handler `scan` uses, so its own coverage is exercised by the same unit tests.
