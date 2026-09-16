@@ -81,8 +81,22 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
     stale_fn_ = std::move(stale_fn);
     audit_fn_ = std::move(audit_fn);
 
-    // -- Page shell (auth-only static chrome; the fragments gate on Inventory:Read) --
+    // -- /inventory is retired in favour of /hardware (CI list) — a 302, not a
+    // route removal, so bookmarks and the API-parity ledger's history stay intact.
+    // Auth still gates first so an unauthenticated caller sees /login, not a
+    // redirect loop through an authed-only destination.
     sink.Get("/inventory", [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = auth_fn_(req, res);
+        if (!session) {
+            res.set_redirect("/login");
+            return;
+        }
+        res.set_redirect("/hardware");
+    });
+
+    // -- Page shell: Software (catalogue + Find) — the nav-split successor to the
+    // old /inventory shell's default landing tab. Devices moved to /hardware.
+    sink.Get("/software", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) {
             res.set_redirect("/login");
@@ -93,13 +107,13 @@ void InventoryRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermF
             for (auto p = html.find(tok); p != std::string::npos; p = html.find(tok, p + val.size()))
                 html.replace(p, tok.size(), val);
         };
-        sub("{{TITLE}}", "Yuzu \xE2\x80\x94 Inventory");
+        sub("{{TITLE}}", "Yuzu \xE2\x80\x94 Software");
         sub("{{FRAGMENT}}", "/fragments/inventory/software");
-        // Mark the Inventory nav item active, Guardian (the shell default) inactive.
+        // Mark the Software nav item active, Guardian (the shell default) inactive.
         sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
             "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-        sub("<a href=\"/inventory\" class=\"nav-link\">Inventory</a>",
-            "<a href=\"/inventory\" class=\"nav-link active\">Inventory</a>");
+        sub("<a href=\"/software\" class=\"nav-link\">Software</a>",
+            "<a href=\"/software\" class=\"nav-link active\">Software</a>");
         res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
         send_html(res, std::move(html));
     });

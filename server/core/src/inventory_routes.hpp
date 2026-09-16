@@ -69,6 +69,20 @@ struct InventoryDeviceRow {
     std::string ci_cpu_cores;   ///< decimal string
     std::string ci_cpu_threads; ///< decimal string
     std::string ci_ram_bytes;   ///< decimal string (bytes)
+
+    // Hardware CI list/record fields (feat/hardware-ci-view). Same sentinel
+    // semantics as the fields above: empty or the literal "unknown" when the
+    // agent hasn't synced yet — render via ci_disp(), never raw.
+    std::int64_t last_seen_ms = -1; ///< server receipt epoch ms; -1 = unknown (sort key).
+                                    ///< An online row carries "now" at render time.
+    std::string ci_manufacturer;
+    std::string ci_cpu_model;
+    std::string ci_os_name;
+    std::string ci_os_version;
+    std::string ci_os_build;
+    std::string ci_arch;
+    std::string ci_domain;
+    std::string ci_primary_mac;
 };
 
 /// Result of the device-CI roster read. `rows` is the roster and is ALWAYS populated

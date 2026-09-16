@@ -250,8 +250,12 @@ std::string inv_style() {
 </style>)css";
 }
 
-// The Software/Devices/Find tab bar. Each tab hx-gets its fragment into the shared
-// shell content container (#guardian-detail) — htmx core attrs only (CSP-safe).
+// The Software/Find tab bar (nav-split: Devices moved to the /hardware CI list).
+// Each tab hx-gets its fragment into the shared shell content container
+// (#guardian-detail) — htmx core attrs only (CSP-safe). The old
+// /fragments/inventory/devices + /fragments/inventory/device routes stay
+// registered (deep links, existing tests) — only this tab bar's link to them
+// is removed; see docs/user-manual/inventory.md for the retirement follow-up.
 std::string inv_subnav(const std::string& active) {
     auto tab = [&](const char* id, const char* href, const char* label) {
         return std::string("<a class=\"") + (active == id ? "on" : "") + "\" hx-get=\"" + href +
@@ -259,7 +263,6 @@ std::string inv_subnav(const std::string& active) {
     };
     return std::string("<div class=\"inv-subnav\">") +
            tab("software", "/fragments/inventory/software", "Software") +
-           tab("devices", "/fragments/inventory/devices", "Devices") +
            tab("find", "/fragments/inventory/find", "Find software") + "</div>";
 }
 
@@ -280,9 +283,10 @@ std::string scope_caveat() {
 
 std::string page_head() {
     return inv_style() +
-           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Inventory</h1>"
-           "<div class=\"inv-sub\">Software &amp; device inventory, synced <b>daily</b> from every "
-           "endpoint (ADR-0016 daily-sync).</div>";
+           "<div class=\"inv-wrap\"><h1 class=\"inv-h1\">Software</h1>"
+           "<div class=\"inv-sub\">Installed-software catalogue, synced <b>daily</b> from every "
+           "endpoint (ADR-0016 daily-sync). Looking for a device? See "
+           "<a href=\"/hardware\">Hardware</a>.</div>";
 }
 
 } // namespace

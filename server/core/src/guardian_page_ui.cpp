@@ -248,7 +248,8 @@ extern const char* const kGuardianDetailPageHtml =
     <a href="/guardian" class="nav-link active">Guardian</a>
     <a href="/dex" class="nav-link">DEX</a>
     <a href="/tar" class="nav-link">TAR</a>
-    <a href="/inventory" class="nav-link">Inventory</a>
+    <a href="/hardware" class="nav-link">Hardware</a>
+    <a href="/software" class="nav-link">Software</a>
     <a href="/viz/fleet" class="nav-link">Fleet Viz</a>
     <a href="/settings" class="nav-link" id="nav-settings-link">Settings</a>
     <span class="nav-spacer"></span>
@@ -422,6 +423,87 @@ extern const char* const kGuardianDetailPageHtml =
         var sl = document.getElementById('nav-settings-link'); if (sl) sl.style.display = 'none';
       }
     }).catch(function () {});
+  </script>
+)HTM"
+    // Chunk 3: the Hardware CI record's generic action runner. Split into its own
+    // literal because chunk 2 above sits at ~14.5 KiB and MSVC caps a single
+    // string literal at 16 KiB (C2026) -- see the sibling warning in
+    // instruction_ui.cpp. Keep prose OUT of this literal; explain here instead.
+    //
+    // hwRunAction(btn): reads the enclosing <form>'s data-plugin/data-action/
+    // data-agent/data-host/data-class + its p_*/kv inputs, confirms (message
+    // keyed by data-class), then POSTs straight to the EXISTING /api/command
+    // route (no new dispatch endpoint -- that route's classify/authorize/
+    // destructive-gate/audit/executions-tracking all apply unmodified). On
+    // success it swaps the form's .hw-result sibling for the poll fragment
+    // /fragments/hardware/ci/result and calls htmx.process() so the injected
+    // hx-get actually fires (htmx only wires attributes it has already scanned).
+    R"HTM(
+  <script>
+    function hwRunAction(btn) {
+      var form = btn.closest('form');
+      if (!form) return;
+      var plugin = form.getAttribute('data-plugin');
+      var action = form.getAttribute('data-action');
+      var agent = form.getAttribute('data-agent');
+      var host = form.getAttribute('data-host') || agent;
+      var cls = form.getAttribute('data-class') || 'Read-only';
+      var msg = 'Run ' + plugin + '.' + action + ' on ' + host + '?';
+      if (cls === 'Destructive') {
+        msg = 'DESTRUCTIVE — may be irreversible on ' + host + '. Run ' + plugin + '.' + action + '?';
+      } else if (cls === 'Mutating') {
+        msg = 'This changes state on ' + host + '. Run ' + plugin + '.' + action + '?';
+      }
+      if (!window.confirm(msg)) return;
+
+      var params = {};
+      form.querySelectorAll('input[name^="p_"],select[name^="p_"]').forEach(function (inp) {
+        var key = inp.name.replace(/^p_/, '');
+        if (inp.value !== '') params[key] = inp.value;
+      });
+      var kv = form.querySelector('textarea[name="kv"]');
+      if (kv && kv.value) {
+        kv.value.split('\n').forEach(function (line) {
+          var i = line.indexOf('=');
+          if (i > 0) {
+            var k = line.slice(0, i).trim();
+            var v = line.slice(i + 1).trim();
+            if (k && !k.startsWith('#')) params[k] = v;
+          }
+        });
+      }
+
+      btn.disabled = true;
+      fetch('/api/command', {
+        method: 'POST',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ plugin: plugin, action: action, agent_ids: [agent], params: params })
+      }).then(function (r) {
+        return r.json().then(function (d) { return { status: r.status, data: d }; });
+      }).then(function (resp) {
+        btn.disabled = false;
+        var resultDiv = form.querySelector('.hw-result');
+        if (resp.status >= 400) {
+          var msg2 = (resp.data.error && resp.data.error.message) || ('Dispatch failed (' + resp.status + ')');
+          if (typeof showToast === 'function') showToast(msg2, 'error');
+          return;
+        }
+        if (resultDiv) {
+          var commandId = resp.data.command_id;
+          resultDiv.innerHTML = '<div hx-get="/fragments/hardware/ci/result?id=' + encodeURIComponent(agent) +
+            '&command_id=' + encodeURIComponent(commandId) + '&plugin=' + encodeURIComponent(plugin) +
+            '&n=1" hx-trigger="load" hx-swap="outerHTML"><span class="gp-mute">Waiting for the device to respond&hellip;</span></div>';
+          if (window.htmx) window.htmx.process(resultDiv);
+        }
+        if (typeof showToast === 'function') {
+          showToast('Sent to ' + (resp.data.agents_reached || 0) + ' agent(s)', 'success');
+        }
+      }).catch(function () {
+        btn.disabled = false;
+        if (typeof showToast === 'function') showToast('Network error — the action may not have applied', 'error');
+      });
+    }
   </script>
 </body>
 </html>

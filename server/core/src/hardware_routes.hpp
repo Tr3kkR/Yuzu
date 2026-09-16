@@ -1,0 +1,202 @@
+#pragma once
+
+/// @file hardware_routes.hpp
+/// /hardware — the ServiceNow-style Configuration-Item (CI) surface: a searchable,
+/// filterable, sortable, paginated CI list and a per-device CI record with lens
+/// tabs (Installed software, Tags). Package A (nav split + read surface) only —
+/// the Actions lens (generic action runner) is added on top of this `Deps` struct
+/// by feat/hardware-ci-actions without touching the routes registered here.
+///
+/// Shares `InventoryDeviceRow`/`InventoryDevicesResult` with `InventoryRoutes` (the
+/// roster shape is identical; the roster's PRODUCTION source is the same
+/// `inv_devices_fn` roster body in server.cpp, extracted so both the Software tab's
+/// existing DevicesFn and this module's unfiltered RosterFn share one build). Query/
+/// sort/paginate/JSON logic lives in `hardware_list_model.hpp` (PURE, no httplib) —
+/// this class only wires HTTP semantics (auth, gates, audit) around it.
+///
+/// AUTH: the list and REST twin gate SOLELY on `FleetReadFn` (admit-then-filter,
+/// ADR-0017 — never stacked with a second permission check for the same
+/// securable:operation, the BLOCKING defect `FleetReadFn`'s own contract exists to
+/// avoid). The CI record and its lenses gate on `scoped_perm_fn(Inventory,Read,id)`
+/// — the tier + management-group chokepoint, same as the Software tab's per-device
+/// drill.
+
+#include "authz_gates.hpp"           // authz::FleetReadGate
+#include "command_capability.hpp"    // CommandCapability, ClassificationError
+#include "dex_routes.hpp"            // DexAgentResponse (ResponsesFn return type)
+#include "hardware_action_form.hpp"  // ActionFormSpec
+#include "hardware_list_model.hpp"
+#include "inventory_routes.hpp"      // InventoryDeviceRow / InventoryDevicesResult reuse
+
+#include <expected>
+#include <unordered_map>
+
+#include <httplib.h>
+
+#include <functional>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace yuzu::server {
+
+class HttpRouteSink;
+
+// ── PURE renderers (implemented in hardware_ui.cpp) ──────────────────────────────
+// Each returns a self-contained fragment. A degraded read renders an honest banner,
+// never an empty table (ADR-0016 §7) — the same contract InventoryRoutes' renderers
+// keep for the Software tab.
+
+/// The CI list: KPI strip, search box, OS/status chips, breadcrumb, sortable table,
+/// pagination. `roster_unavailable` = the RosterFn itself is unwired/failed (distinct
+/// from `ci_degraded`, which only means the CI *columns* are blank on live rows).
+std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
+                                          bool roster_unavailable);
+
+/// The CI record: header (hostname/OS/online/last-seen/agent id) + lens tabs +
+/// the active lens's content. `lens` in {"overview","software","tags"}.
+std::string render_hardware_ci_fragment(const std::string& agent_id, const HardwareCiDetail& detail,
+                                        const std::string& lens, std::int64_t now_secs);
+
+std::string render_hardware_software_lens(const std::string& agent_id,
+                                          const std::optional<std::vector<SoftwareEntry>>& software,
+                                          bool truncated, bool online);
+
+std::string render_hardware_tags_lens(const std::string& agent_id,
+                                      const std::optional<std::vector<DeviceTag>>& tags);
+
+std::string render_hardware_not_found(const std::string& agent_id);
+
+/// One plugin's advertised actions, as reported by a connected agent — a light
+/// mirror of `AgentRegistry::PluginMeta` that keeps gRPC/registry headers out of
+/// this header (only the .cpp wiring in server.cpp touches `AgentRegistry`
+/// directly). Populated by `Deps::ActionsFn`.
+struct HwPluginActions {
+    std::string name;
+    std::string version;
+    std::vector<std::string> actions;
+};
+
+/// One row of the Actions lens's generic action runner. `cap` is `nullopt` when
+/// `plugin.action` fails `CommandCapabilityRegistry::classify` (Unclassified —
+/// not in the compile-time catalogue — or Ambiguous, two fragments claiming the
+/// same pair) — POST /api/command would 400 either case, so the row renders
+/// disabled rather than offering a Run button that can only fail.
+struct HwActionRow {
+    std::string plugin;
+    std::string action;
+    std::string description;
+    std::optional<CommandCapability> cap;
+    bool ambiguous{false};
+    bool bad_ident{false};
+    ActionFormSpec form;
+};
+
+enum class HwActionsState { Ready, Offline, NoExecute, Unavailable };
+
+/// The Actions lens: every `plugin.action` the connected agent reports, grouped by
+/// plugin, class-badged, each with its parameter form (or a free-form key=value
+/// textarea when no schema is published). `Offline` = the agent has no live
+/// session (actions dispatch to a connected agent only); `NoExecute` = the caller
+/// lacks Execution:Execute for this device (the list/CI-record Read gate already
+/// passed — this is a stricter probe, same idiom as the Live-info panel).
+std::string render_hardware_actions_lens(const std::string& agent_id, const std::string& hostname,
+                                         const std::vector<HwActionRow>& rows, HwActionsState state);
+
+/// The Run button's dispatch result panel. Ordering here matches
+/// `device_routes.cpp`'s live-info result idiom: Pending polls again via
+/// `hx-trigger="load delay:700ms"`; a terminal state renders once and stops.
+struct HwActionResultView {
+    enum class Phase { Pending, Rendered, RenderedEmpty, Failed, TimedOut } phase{Phase::Pending};
+    std::string output;
+    std::string error_detail;
+    int attempt{1};
+};
+
+std::string render_hardware_result_pending(const std::string& agent_id, const std::string& command_id,
+                                           const std::string& plugin, int next_attempt);
+
+std::string render_hardware_action_result(const std::string& plugin, const std::string& action,
+                                          const HwActionResultView& view);
+
+/// /hardware route registration. Providers are injected closures (store-decoupled)
+/// so every handler is unit-testable via `TestRouteSink` without a live Postgres —
+/// same discipline as `InventoryRoutes`.
+class HardwareRoutes {
+public:
+    using AuthFn = InventoryRoutes::AuthFn;
+    using ScopedPermFn = InventoryRoutes::ScopedPermFn;
+    using AuditFn = InventoryRoutes::AuditFn;
+
+    /// The route's SOLE authorization gate for the fleet-wide list + its REST twin.
+    /// Same contract as `RestApiV1::FleetReadFn` / `authz::AuthRoutes::require_fleet_read`:
+    /// `admitted == false` means the response is already fully rendered (401/403/503).
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+
+    /// The UNFILTERED CI roster (all agents seen in the last 30 days, every scope) —
+    /// `FleetReadFn`'s returned scope is the SOLE filter, applied by the route via
+    /// `authz::in_scope`. Never pre-filter this closure's output; that would double
+    /// up on `FleetReadFn`'s own scope (silently reconciling two different scope
+    /// predicates is exactly the class of bug `FleetReadFn`'s doc comment warns
+    /// about). Empty closure = route renders "unavailable" and 503s on the REST twin.
+    using RosterFn = std::function<InventoryDevicesResult()>;
+
+    /// The full per-device CI record composition (identity + CI blob + software +
+    /// tags — see `HardwareCiDetail`) — ONE closure shared verbatim with the MCP
+    /// `get_hardware_ci` tool (`mcp_server_->set_hardware_fns`), so the dashboard
+    /// fragment, the REST twin, and the MCP twin can never disagree on what "the CI
+    /// record" contains. The Installed-software and Tags lenses render straight off
+    /// this same struct rather than issuing a second per-lens fetch.
+    using CiDetailFn = std::function<HardwareCiDetail(const std::string& agent_id)>;
+
+    /// One connected agent's advertised plugins/actions — `nullopt` when the agent
+    /// has no live session (actions are dispatch-to-a-connected-agent only, unlike
+    /// the CI record which is offline-survivable).
+    using ActionsFn = std::function<std::optional<std::vector<HwPluginActions>>(const std::string& agent_id)>;
+
+    using ClassifyFn = std::function<std::expected<CommandCapability, ClassificationError>(
+        std::string_view plugin, std::string_view action)>;
+
+    /// Enabled `InstructionDefinition`s' `parameter_schema` for one plugin, keyed by
+    /// action name (object-shaped schemas only — the same filter
+    /// `discover_routes.cpp`'s catalogue join applies). An action with no entry
+    /// renders the free-form key=value textarea.
+    using SchemaFn =
+        std::function<std::unordered_map<std::string, std::string>(const std::string& plugin)>;
+
+    using ResponsesFn = std::function<std::vector<DexAgentResponse>(const std::string& command_id,
+                                                                    const std::string& agent_id)>;
+
+    /// Execute-permission PROBE for one device — a stricter check than the Read
+    /// gate the record/list already passed, run against a throwaway `Response` so
+    /// it never itself writes to the real one (the `dashboard_routes.cpp`
+    /// permission-probe idiom). `true` = the caller may dispatch to this agent.
+    using ExecProbeFn = std::function<bool(const httplib::Request&, const std::string& agent_id)>;
+
+    struct Deps {
+        AuthFn auth_fn;
+        ScopedPermFn scoped_perm_fn;
+        FleetReadFn fleet_read_fn;
+        AuditFn audit_fn;
+        RosterFn roster_fn;
+        CiDetailFn ci_detail_fn;
+        ActionsFn actions_fn;
+        ClassifyFn classify_fn;
+        SchemaFn schema_fn;
+        ResponsesFn responses_fn;
+        ExecProbeFn exec_probe_fn;
+        const std::unordered_map<std::string, std::string>* action_descriptions{nullptr};
+    };
+
+    void register_routes(httplib::Server& svr, Deps deps);
+    void register_routes(HttpRouteSink& sink, Deps deps);
+
+private:
+    Deps deps_;
+};
+
+} // namespace yuzu::server

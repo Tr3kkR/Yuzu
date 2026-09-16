@@ -175,6 +175,7 @@
 #include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
+#include "hardware_routes.hpp"
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
@@ -15959,9 +15960,13 @@ private:
                 return std::to_string(h) + "h ago";
             return std::to_string(h / 24) + "d ago";
         };
-        auto inv_devices_fn = [this, visible_set_fn,
-                               inv_human_age](const std::string& username)
-            -> InventoryDevicesResult {
+        // Extracted so both the Software tab's DevicesFn (scoped to one operator) and
+        // the Hardware tab's RosterFn (unfiltered — the FleetReadGate's own scope is
+        // the sole filter downstream, applied by HardwareRoutes) share ONE roster
+        // build. `visible` is nullopt for the unfiltered call.
+        auto build_hw_roster =
+            [this, inv_human_age](
+                const std::optional<std::set<std::string>>& visible) -> InventoryDevicesResult {
             InventoryDevicesResult result;
             auto& out = result.rows;
             if (!offline_endpoint_store_) {
@@ -15978,7 +15983,6 @@ private:
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
             auto online_ids = registry_.all_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
-            const auto visible = visible_set_fn(username); // nullopt = sees all (global read)
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
@@ -15993,6 +15997,7 @@ private:
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
+                r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
             }
             // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
@@ -16039,6 +16044,81 @@ private:
                 result.ci_degraded = true;
             }
             return result;
+        };
+        auto inv_devices_fn = [visible_set_fn,
+                               build_hw_roster](const std::string& username) -> InventoryDevicesResult {
+            return build_hw_roster(visible_set_fn(username));
+        };
+        auto hw_roster_fn = [build_hw_roster]() -> InventoryDevicesResult {
+            return build_hw_roster(std::nullopt);
+        };
+        // One device's identity row for the Hardware CI record — checks the live
+        // registry first (online, authoritative hostname/OS), else falls back to a
+        // linear scan of the same 30-day offline_endpoint_store_ roster the list
+        // uses. FOLLOW-UP: no point read exists on OfflineEndpointStore yet
+        // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
+        // page (opened far less often than the list re-renders).
+        auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
+            -> std::optional<InventoryDeviceRow> {
+            if (auto sess = registry_.get_session(agent_id)) {
+                InventoryDeviceRow r;
+                r.agent_id = agent_id;
+                r.hostname = sess->hostname;
+                r.os = sess->os;
+                r.online = true;
+                r.last_seen = "now";
+                r.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                return r;
+            }
+            if (!offline_endpoint_store_)
+                return std::nullopt;
+            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            for (const auto& e : eps) {
+                if (e.agent_id != agent_id)
+                    continue;
+                InventoryDeviceRow r;
+                r.agent_id = e.agent_id;
+                r.hostname = e.hostname;
+                r.os = e.os;
+                r.online = false;
+                const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
+                r.last_seen = inv_human_age(age_ms);
+                r.last_seen_ms = e.last_heartbeat_ms;
+                return r;
+            }
+            return std::nullopt;
+        };
+        // The full per-device CI record composition — ONE closure shared verbatim
+        // with the MCP get_hardware_ci tool (mcp_server_->set_hardware_fns below),
+        // so the dashboard fragment / REST twin / MCP twin can never drift on what
+        // "the CI record" means.
+        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
+            HardwareCiDetail detail;
+            detail.identity = hw_identity_fn(agent_id);
+            detail.ci = device_inventory_store_
+                            ? device_inventory_store_->get_device_ci(agent_id)
+                            : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                                  std::unexpected(CiReadError::kDegraded));
+            if (software_inventory_store_) {
+                auto sw = software_inventory_store_->get_agent_software(agent_id);
+                if (sw) {
+                    detail.software_truncated = sw->size() > kHwSoftwareCap;
+                    if (detail.software_truncated)
+                        sw->resize(kHwSoftwareCap);
+                }
+                detail.software = std::move(sw);
+            }
+            if (tag_store_) {
+                auto tags = tag_store_->get_all_tags(agent_id);
+                detail.tags = tags ? std::optional(std::move(*tags)) : std::nullopt;
+            }
+            return detail;
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
@@ -16112,6 +16192,94 @@ private:
                     return std::unexpected(CiReadError::kDegraded);
                 return device_inventory_store_->get_device_ci(id);
             });
+
+        // HardwareRoutes — /hardware (ServiceNow-style CI list + record), the
+        // successor UI to the Inventory tab's Devices sub-tab (nav-split: Software
+        // stays under /inventory's old routes; Hardware is the new CI surface).
+        // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
+        // ADR-0017) — `hw_roster_fn` is deliberately UNFILTERED, matching
+        // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        hardware_routes_ = std::make_unique<HardwareRoutes>();
+        hardware_routes_->register_routes(
+            *web_server_, HardwareRoutes::Deps{
+                             .auth_fn = auth_fn,
+                             .scoped_perm_fn = scoped_perm_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .audit_fn = audit_fn,
+                             .roster_fn = hw_roster_fn,
+                             .ci_detail_fn = hw_ci_detail_fn,
+                             // Actions lens (generic action runner): the connected
+                             // agent's advertised plugins/actions, copied into the
+                             // gRPC-free HwPluginActions shape.
+                             .actions_fn =
+                                 [this](const std::string& id)
+                                     -> std::optional<std::vector<HwPluginActions>> {
+                                     auto sess = registry_.get_session(id);
+                                     if (!sess)
+                                         return std::nullopt;
+                                     std::vector<HwPluginActions> out;
+                                     out.reserve(sess->plugin_meta.size());
+                                     for (const auto& pm : sess->plugin_meta)
+                                         out.push_back({pm.name, pm.version, pm.actions});
+                                     return out;
+                                 },
+                             .classify_fn =
+                                 [this](std::string_view p, std::string_view a) {
+                                     return capability_registry_.classify(p, a);
+                                 },
+                             // Enabled definitions' parameter_schema for one plugin,
+                             // keyed by action — object-shaped schemas only (mirrors
+                             // discover_routes.cpp's catalogue join).
+                             .schema_fn =
+                                 [this](const std::string& plugin)
+                                     -> std::unordered_map<std::string, std::string> {
+                                     std::unordered_map<std::string, std::string> out;
+                                     if (!instruction_store_)
+                                         return out;
+                                     InstructionQuery q;
+                                     q.plugin_filter = plugin;
+                                     q.enabled_only = true;
+                                     q.limit = 500;
+                                     auto defs = instruction_store_->query_definitions(q);
+                                     if (!defs)
+                                         return out;
+                                     for (const auto& d : *defs) {
+                                         auto parsed =
+                                             nlohmann::json::parse(d.parameter_schema, nullptr, false);
+                                         if (!parsed.is_discarded() && parsed.is_object())
+                                             out[d.action] = d.parameter_schema;
+                                     }
+                                     return out;
+                                 },
+                             // Narrow ResponseStore seam for the Actions-lens result poll
+                             // (byte-identical shape to DexRoutes' own — #1634: scope the
+                             // poll read AT THE STORE SEAM).
+                             .responses_fn =
+                                 [this](const std::string& command_id, const std::string& agent_id)
+                                     -> std::vector<DexAgentResponse> {
+                                     std::vector<DexAgentResponse> out;
+                                     if (!response_store_)
+                                         return out;
+                                     ResponseQuery q;
+                                     q.agent_id = agent_id;
+                                     for (const auto& r :
+                                          response_store_->query(command_id, q)
+                                              .value_or(std::vector<StoredResponse>{}))
+                                         out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                                     return out;
+                                 },
+                             // Execute-permission PROBE against a throwaway Response — the
+                             // Read gate above already ran; this is the stricter check
+                             // before offering (or honouring) a dispatch control. Same
+                             // idiom as DeviceRoutes' live-info `can_execute`.
+                             .exec_probe_fn =
+                                 [scoped_perm_fn](const httplib::Request& req,
+                                                  const std::string& id) -> bool {
+                                     httplib::Response probe;
+                                     return scoped_perm_fn(req, probe, "Execution", "Execute", id);
+                                 },
+                             .action_descriptions = &detail::AgentRegistry::action_descriptions(),
+                         });
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
         // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
@@ -18834,6 +19002,7 @@ private:
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
+    std::unique_ptr<HardwareRoutes> hardware_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
