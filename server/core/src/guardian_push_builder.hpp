@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <string>
@@ -21,24 +22,76 @@ namespace yuzu::server::guardian {
 // returns true: fail OPEN so a guard is never silently dropped, matching the
 // pre-M4 send-all posture (the agent marks an inapplicable guard errored). Match
 // is otherwise by canonical OS token: BOTH sides are normalised (`normalize_os` —
-// lowercased and mapped to a canonical token such as "windows"/"linux"/"macos")
-// and then compared for EQUALITY, so a verbose agent platform string ("Windows 11
-// Pro") still matches the target "windows" without the false positives a raw
-// substring test would admit (e.g. "win" inside "darwin").
+// lower-cased and darwin mapped to macos) and then compared for EQUALITY, so a
+// short/ambiguous target like "win" can never spuriously match "darwin" (a raw
+// substring test would admit it). NOTE: `agent_os` is always the RAW kAgentOs
+// token ("windows" | "linux" | "darwin"), never verbose free text —
+// `normalize_os` does NOT parse a string like "Windows 11 Pro" down to
+// "windows"; it only lower-cases and maps darwin to macos. An earlier version
+// of this comment claimed otherwise; that claim was false (#4252).
 bool os_target_matches(std::string_view target, std::string_view agent_os);
 
-// True iff the agent-side Guardian engine actually ARMS guards on `agent_os`.
-// Today that is Windows only: RegistryGuard::start() / FileGuard::start() are
-// compiled no-ops on macOS and Linux (agents/core/src/guard_registry.cpp,
-// guard_file.cpp), so a guard "deployed" to a Mac/Linux box enforces nothing.
-// The server must therefore report those agents as "not yet implemented" rather
-// than letting them fold into the offline "unknown" bucket and read as armed —
-// an operator must never mistake a no-op platform for a protected one. `agent_os`
-// is the RAW token the agent reports (kAgentOs: "windows" | "linux" | "darwin");
-// it is normalised before comparison. An empty `agent_os` (unknown — disconnect
-// race / partial registration) returns true so we never mislabel it unimplemented.
-// THIS is the single switch to flip as Linux/macOS guard support lands.
-bool guardian_enforced_on_platform(std::string_view agent_os);
+// True iff the agent-side Guardian engine actually ARMS a guard of spark type
+// `spark_type` on `agent_os`. NOT a blanket OS check — support is PER GUARD
+// TYPE (#4252 fixed a dashboard double-count caused by treating it as one):
+//   registry-change / file-change  -> Windows only. RegistryGuard::start() /
+//                                      FileGuard::start() are compiled no-ops
+//                                      on macOS and Linux
+//                                      (agents/core/src/guard_registry.cpp,
+//                                      guard_file.cpp).
+//   service-status-change          -> Windows AND Linux. SystemdServiceGuard
+//                                      (agents/core/src/guard_systemd.cpp's
+//                                      make_service_guard()) arms on Linux
+//                                      today (observe-only; enforce is
+//                                      deliberately deferred) — NOT a no-op,
+//                                      unlike Registry/File on Linux. macOS
+//                                      still falls to the no-op ServiceGuard
+//                                      stub. See docs/os-capability-matrix.md's
+//                                      Guardian rows and docs/user-manual/
+//                                      guaranteed-state.md's Service section.
+//   unknown / missing / non-string  -> falls back to the Windows-only rule,
+//   spark_type                         so a malformed row or a guard type
+//                                      this function doesn't yet recognise
+//                                      can never silently regress
+//                                      Registry/File support.
+// The server must therefore report an unsupported (agent, rule) pair as "not
+// yet implemented" rather than letting it fold into the offline "unknown"
+// bucket and read as armed — an operator must never mistake a no-op platform
+// for a protected one. Just as important, a caller MUST first check whether
+// the pair already owns a REAL status row before treating "unsupported" as
+// "the agent never reported" — Linux Service now legitimately reports real
+// status, so skipping that check double-counts the pair (the #4252 bug); see
+// the shared exclusion predicate in guardian_routes.cpp. `agent_os` is the RAW
+// token the agent reports (kAgentOs: "windows" | "linux" | "darwin"); it is
+// normalised before comparison. An empty `agent_os` (unknown — disconnect
+// race / partial registration) returns true so we never mislabel it
+// unimplemented, for any spark_type. THIS is the single place to extend as
+// more guard types/platforms gain support.
+bool guardian_guard_supported_on_platform(std::string_view agent_os,
+                                          std::string_view spark_type);
+
+// The 3 guard-type ("spark.type") tokens this matrix explicitly distinguishes.
+// Single source shared with guardian_routes.cpp's platform-matrix-stale
+// detectability counter's closed Prometheus label set (that counter now
+// aliases this array directly — no third copy), and cross-checked against the
+// published schema catalog's "spark"-kind entries by
+// test_guardian_resilience_schema.cpp's CROSS-CHECK test (governance Gate 4
+// finding, #4252 consolidated round) — so the schema catalog and this array
+// can no longer drift out of sync silently.
+//
+// What that cross-check does NOT bind (governance Gate 8 re-review,
+// architect + consistency-auditor): guardian_guard_supported_on_platform's
+// if-chain above is a set of STRING LITERALS, not a lookup over this array —
+// adding a 4th entry here and to the schema catalog, with no corresponding
+// branch in that function, leaves the cross-check green while the actual
+// platform-support decision silently falls through to the Windows-only
+// default. test_guardian_push_builder.cpp's platform test pins this array's
+// entries against that function's literal branches directly (an
+// unrecognised entry there fails loudly); update BOTH tests, and this
+// function's branch, when adding a spark type — the schema-registry side is
+// guardian_schema_registry.cpp's build_catalog().
+inline constexpr std::array<std::string_view, 3> kKnownGuardSparkTypes = {
+    "registry-change", "file-change", "service-status-change"};
 
 // Human-facing label for a raw agent platform token, for dashboard copy:
 // "darwin" -> "macOS", "windows" -> "Windows", "linux" -> "Linux"; an

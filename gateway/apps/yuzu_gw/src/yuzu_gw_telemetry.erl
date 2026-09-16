@@ -41,6 +41,10 @@
     [yuzu, gw, guardian, forward_accepted],
     [yuzu, gw, guardian, forward_dropped],
 
+    %% Mgmt-plane peer authorization (#1422)
+    [yuzu, gw, mgmt_auth, rejected],
+    [yuzu, gw, mgmt_auth, pin_unresolved],
+
     %% Cluster
     [yuzu, gw, cluster, node_up],
     [yuzu, gw, cluster, node_down],
@@ -154,6 +158,23 @@ handle_event([yuzu, gw, guardian, forward_dropped], #{count := N}, Meta, _Config
     Reason = maps:get(reason, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_guardian_forward_dropped_total, [Reason], N);
 
+%% Mgmt-plane peer authorization (#1422). `rejected` counts every peer the
+%% :50063 auth_fun turned away, labeled by the closed reason-atom set from
+%% yuzu_gw_authz:reject/1 (never certificate contents — an authenticated-but-
+%% unauthorized peer must not control label cardinality). A sustained non-zero
+%% rate is either probing (a CA-cert holder that is not the server) or a
+%% misrotated pin killing command forwarding. `pin_unresolved` counts auth
+%% attempts during which at least one CONFIGURED pin entry failed to resolve —
+%% the pre-staged-rotation-typo signal (a dead pin is otherwise silent while
+%% another pin still admits the server).
+handle_event([yuzu, gw, mgmt_auth, rejected], #{count := N}, Meta, _Config) ->
+    Reason = maps:get(reason, Meta, unknown),
+    prometheus_counter:inc(yuzu_gw_mgmt_auth_rejected_total,
+                           [atom_to_binary(Reason, utf8)], N);
+
+handle_event([yuzu, gw, mgmt_auth, pin_unresolved], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_mgmt_auth_pin_unresolved_total, [], N);
+
 handle_event([yuzu, gw, cluster, node_up], _Measurements, Meta, _Config) ->
     Node = maps:get(node, Meta, <<"unknown">>),
     prometheus_counter:inc(yuzu_gw_cluster_events_total, [<<"node_up">>, Node], 1);
@@ -247,6 +268,19 @@ declare_metrics() ->
         {help, "Guardian drift-event forwards dropped before delivery "
                "(reason: circuit_open | at_capacity). Best-effort; durable "
                "buffering is Guardian A3."}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_mgmt_auth_rejected_total},
+        {labels, [reason]},
+        {help, "Mgmt-plane (:50063) peers rejected by the #1422 SPKI peer pin, "
+               "by reason atom (closed set; no certificate contents). Sustained "
+               "non-zero = probing by a CA-cert holder, or a misrotated pin "
+               "killing server command forwarding"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_mgmt_auth_pin_unresolved_total},
+        {labels, []},
+        {help, "Mgmt-plane auth attempts during which >=1 configured "
+               "mgmt_peer_pins entry failed to resolve (typo'd fingerprint, "
+               "unreadable cert file) - the pre-staged-rotation-typo signal"}]),
 
     %% Histograms
     Buckets = [1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 10000],

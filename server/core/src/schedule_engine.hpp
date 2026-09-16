@@ -1,12 +1,35 @@
 #pragma once
 
-#include <sqlite3.h>
+/// @file schedule_engine.hpp
+/// Postgres-backed recurring-schedule store (ADR-0009/0065). Schema
+/// `schedule_engine`, one table (`schedules`).
+///
+/// Posture (ADR-0012 §1): AUTHORITATIVE/fail-hard construction — a
+/// reachable database whose schema can't migrate/open is a fatal startup
+/// error (`startup_failed_`), a posture UPGRADE from the SQLite era, where
+/// migration failure was log-only and no caller ever checked an
+/// availability flag (there wasn't one). Runtime reads/writes keep their
+/// pre-migration plain-container/`std::expected<std::string,std::string>`
+/// shapes — this store's consumers (`ScheduleRoutes`, `mcp_server.cpp`,
+/// `ScheduleRunner`) are unaffected by this migration by design.
+///
+/// Backfill: NONE (ADR-0009's 2026-08-25 fresh-start-by-default amendment —
+/// no production fleet has ever run a pre-Postgres build of any Yuzu
+/// store). The legacy `instructions.db` (shared with the ExecutionTracker/
+/// ApprovalManager siblings, ADR-0065) is never read for data; construction
+/// logs a one-time "fresh start, no legacy backfill" line, and the caller
+/// (`server.cpp`) runs `legacy_sqlite_probe::warn_if_legacy_rows()` over
+/// the legacy file so an environment where "no production fleet" turns out
+/// to be locally wrong gets a loud signal instead of silent loss.
 
 #include <cstdint>
 #include <expected>
-#include <shared_mutex>
 #include <string>
 #include <vector>
+
+namespace yuzu::server::pg {
+class PgPool;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
 
@@ -27,6 +50,12 @@ struct InstructionSchedule {
     int execution_count{0};
     std::string created_by;
     int64_t created_at{0};
+    // Canonical JSON object (PR1.5a, schedule_params_parsers.hpp), sorted
+    // keys, scalar values only. create_schedule() defaults an empty value to
+    // "{}" and re-canonicalizes whatever is supplied, so a row read back
+    // from storage always carries a validated canonical blob — never the raw
+    // caller-supplied text and never truly empty.
+    std::string parameter_values;
 };
 
 struct ScheduleQuery {
@@ -34,18 +63,53 @@ struct ScheduleQuery {
     bool enabled_only{false};
 };
 
+/// Honest counterpart to the older `query_schedules()` (kept as-is for the
+/// pre-existing dashboard fragment): `std::unexpected` distinguishes a real
+/// store failure (engine not open / pool exhausted / query error) from a
+/// genuinely empty table, which the older method collapses into the same
+/// empty vector either way. #4030 review finding: REST v1 `GET
+/// /api/v1/schedules` and MCP `list_schedules` were built on the older
+/// method and could not tell their caller "the store failed" from "there are
+/// no schedules" — see docs/user-manual/rest-api.md's schedules section.
+///
+/// `truncated` is a second, independent #4030 review finding: the query is
+/// hard-capped at `kScheduleListCap` rows (schedule_engine.cpp) with no
+/// caller-visible limit/cursor, so a fleet with more schedules than the cap
+/// silently loses the alphabetical tail. `truncated` tells REST/MCP callers
+/// when that happened so they can say so (precedent: MCP query_responses's
+/// `result_truncated_by_cap`) instead of presenting the capped count as the
+/// true total.
+struct ScheduleListResult {
+    std::vector<InstructionSchedule> schedules;
+    bool truncated{false};
+};
+
 class ScheduleEngine {
 public:
-    explicit ScheduleEngine(sqlite3* db);
+    explicit ScheduleEngine(pg::PgPool& pool);
     ~ScheduleEngine() = default;
 
     ScheduleEngine(const ScheduleEngine&) = delete;
     ScheduleEngine& operator=(const ScheduleEngine&) = delete;
 
-    void create_tables();
+    [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// Idempotent no-op kept for call-site compatibility — migration now
+    /// runs unconditionally inside the constructor (PgMigrationRunner),
+    /// unlike the SQLite era where callers invoked this explicitly.
+    void create_tables() {}
     void stop();
 
     std::vector<InstructionSchedule> query_schedules(const ScheduleQuery& q = {}) const;
+
+    /// #4030 review finding (blocking): the machine-facing REST v1/MCP
+    /// twins need to distinguish "the store failed" from "there are no
+    /// schedules" — `query_schedules()` above cannot, by design, for its
+    /// existing HTML-fragment caller (a human viewing "No schedules
+    /// configured" tolerates the ambiguity a machine consumer cannot).
+    std::expected<ScheduleListResult, std::string>
+    query_schedules_checked(const ScheduleQuery& q = {}) const;
+
     std::expected<std::string, std::string> create_schedule(const InstructionSchedule& sched);
 
     /// Owner-scoped delete (M-01, #1806): `created_by` is REQUIRED (no
@@ -65,17 +129,8 @@ public:
     void advance_schedule(const std::string& id);
 
 private:
-    sqlite3* db_;
-    // M-03 (#1806): the poller thread (ScheduleRunner::tick(), on a
-    // background thread) now calls evaluate_due()/advance_schedule()
-    // concurrently with REST-handler threads calling query/create/delete/
-    // set_enabled. SQLITE_OPEN_FULLMUTEX only serializes individual sqlite3
-    // C-API calls; it does NOT make a read-modify-write sequence spanning
-    // several calls (advance_schedule's SELECT-then-UPDATE) atomic with
-    // respect to another thread's interleaved statements on the same
-    // connection. Every public method takes this lock: mutators take it
-    // exclusively, the const query methods take it shared.
-    mutable std::shared_mutex mtx_;
+    pg::PgPool& pool_;
+    bool open_{false};
 };
 
 } // namespace yuzu::server

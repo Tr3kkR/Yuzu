@@ -108,24 +108,32 @@ all_agents() ->
 all_agent_pids() ->
     pg:get_members(?PG_SCOPE, all_agents).
 
-%% @doc Return {AgentId, RegisterRequest} for every currently-registered
-%% agent. Used by yuzu_gw_upstream to re-proxy registrations when the
-%% upstream connection re-establishes. Because this reads straight from
-%% ETS at call time, an agent that deregistered during the outage is
-%% already absent — it will not be replayed.
+%% @doc Return {AgentId, SessionId, RegisterRequest} for every
+%% currently-registered agent. Used by yuzu_gw_upstream to re-proxy
+%% registrations when the upstream connection re-establishes. Because
+%% this reads straight from ETS at call time, an agent that
+%% deregistered during the outage is already absent — it will not be
+%% replayed.
+%%
+%% SessionId (HA WS-4 4.1) is the session the agent originally
+%% registered with; the replay carries it as `x-yuzu-session-id`
+%% metadata on the re-proxied ProxyRegister so the server can treat the
+%% replay as a re-announce of an existing session rather than minting a
+%% new one. `undefined` for an agent registered without a session (the
+%% register_agent/5 back-compat path, e.g. routing-focused tests).
 %%
 %% Returns [] if the table does not exist (registry not started, or
 %% torn down) — same defensive contract as agent_count/0, so a caller
 %% on the reconnect path never crashes just because the registry is
 %% momentarily absent.
--spec all_register_reqs() -> [{binary(), map()}].
+-spec all_register_reqs() -> [{binary(), binary() | undefined, map()}].
 all_register_reqs() ->
     case ets:info(?TABLE, size) of
         undefined ->
             [];
         _ ->
-            [{AgentId, RegisterReq}
-             || {AgentId, _, _, _, _, _, _, RegisterReq} <- ets:tab2list(?TABLE)]
+            [{AgentId, SessionId, RegisterReq}
+             || {AgentId, _, _, SessionId, _, _, _, RegisterReq} <- ets:tab2list(?TABLE)]
     end.
 
 %% @doc Return pids of agents that have a specific plugin loaded.
@@ -203,13 +211,30 @@ store_pending(SessionId, Info) ->
     ets:insert(?PENDING_TABLE, {SessionId, Info, erlang:system_time(millisecond)}),
     ok.
 
-%% @doc Atomically retrieve and delete pending registration info.
-%% Returns the info map or undefined if not found / expired.
+%% @doc Atomically retrieve-and-delete pending registration info.
+%% Returns the info map, or undefined if not found or already taken (by a
+%% concurrent consumer). NOTE: TTL expiry is enforced by the periodic
+%% `sweep_pending' handler, NOT here — this call does not inspect the stored
+%% timestamp, so an entry within up to one sweep interval past its TTL may still
+%% be returned. That admission leniency is deliberate and benign (the pending
+%% row is session-id-bound; a late Register→Subscribe handshake simply completes).
+%%
+%% Uses `ets:take/2' — a SINGLE atomic retrieve-and-delete BIF — NOT a
+%% lookup-then-delete pair. `?PENDING_TABLE' is `public', and this is called
+%% directly from `yuzu_gw_agent_service:subscribe/2', which grpcbox runs as an
+%% independent process per incoming stream, so two concurrent `Subscribe's
+%% presenting the SAME session id race here with zero serialization. A
+%% lookup-then-delete let BOTH win — each spawning an agent process and each
+%% emitting its own `CONNECTED(S)', which is exactly the "more than one
+%% CONNECTED(S) per session" producer that would break the HA WS-4 routing
+%% directory's once-per-session invariant (see ADR-2002 §7 #4246 #4 / #4324).
+%% `ets:take/2' guarantees exactly one concurrent caller receives the object
+%% for a given key (all others get `[]'); the once-per-session property is
+%% pinned by the concurrent-barrier test in yuzu_gw_registry_tests.erl.
 -spec take_pending(binary()) -> map() | undefined.
 take_pending(SessionId) ->
-    case ets:lookup(?PENDING_TABLE, SessionId) of
+    case ets:take(?PENDING_TABLE, SessionId) of
         [{_, Info, _}] ->
-            ets:delete(?PENDING_TABLE, SessionId),
             Info;
         [] ->
             undefined
@@ -269,6 +294,17 @@ handle_info({'DOWN', MonRef, process, _Pid, _Reason},
     end;
 
 handle_info(sweep_pending, State) ->
+    %% PRE-EXISTING narrow race (NOT introduced by the take_pending atomicity
+    %% fix; tracked as #4326): this collects expired keys then deletes each
+    %% by key in a separate pass, without re-checking the timestamp at delete
+    %% time. `store_pending/2' is a bare `ets:insert' from the (concurrent)
+    %% stream process, so a re-store of the SAME session id landing between the
+    %% foldl scan and the per-key delete would be swept. It is benign today —
+    %% the stock agent never re-Registers the same session id (reconnect mints a
+    %% fresh S', ADR-2002 §7), the window is the scan→delete gap, and the effect
+    %% is one recoverable NOT_FOUND that triggers a re-Register. A tighter delete
+    %% (ets:select_delete with a StoredAt guard) is the fix if a same-session
+    %% re-Register path is ever added.
     Now = erlang:system_time(millisecond),
     Expired = ets:foldl(fun({SessionId, _, StoredAt}, Acc) ->
         case Now - StoredAt > ?PENDING_TTL_MS of

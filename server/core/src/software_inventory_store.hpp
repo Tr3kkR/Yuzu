@@ -227,8 +227,11 @@ public:
     /// (the "building" sentinel), so a successful read always returns a value.
     [[nodiscard]] std::optional<CatalogRollupMeta> catalog_rollup_meta();
 
-    /// Drop an agent's software inventory (e.g. on agent removal). Best-effort.
-    void delete_agent(std::string_view agent_id);
+    /// Drop an agent's software inventory (e.g. on agent removal). Returns true
+    /// iff the transaction committed both deletes; false on a closed store, a
+    /// lease timeout, or a SQL failure — so the decommission cascade records the
+    /// store Failed rather than a false "erased".
+    [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
     /// KEYSET-paged enumeration of the agent_ids that have reported a given
     /// `source` (`inventory_state.source`). Returns up to `limit` ids with

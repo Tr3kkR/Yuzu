@@ -1,7 +1,7 @@
 #include "sync_source_app_perf.hpp"
 
 #include "local_dispatcher.hpp"
-#include "sync_source_installed_software.hpp" // sha256_hex (shared agent util)
+#include "sync_canonical.hpp" // sha256_hex (shared agent util)
 
 #include <yuzu/version_string.hpp>
 

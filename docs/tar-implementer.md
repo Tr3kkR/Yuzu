@@ -61,7 +61,9 @@ collect_slow    │ enumerate_services()            │       service_live
 rollup          │   tar_aggregator runs SQL       │
   (15min) ────► │   INSERT INTO ..._hourly        │ ───►  *_hourly / *_daily / *_monthly
                 │   from each lower tier          │
-                │ retention_sql() per table       │ ───►  prunes oldest rows
+                │ run_retention():                │
+                │   retention_sql() row-count     │ ───►  trims to a row ceiling
+                │   guarded capped DELETE (time)  │ ───►  paced, clock-guarded
                 └─────────────────────────────────┘
 ```
 
@@ -116,8 +118,9 @@ patterns to `kDefaultRedactionPatterns` in `tar_collectors.hpp` rather
 than scrubbing per-callsite.
 
 **Schema versioning.** `tar_db.cpp` runs an idempotent migration at open
-time. Current schema version is 3 (legacy `tar_events` retired in PR
-M14; see the migration in `apply_migrations`). Bumps go in the same
+time. Current schema version is **5** (legacy `tar_events` was retired at v3 in
+PR M14, but `kCreateSchema` kept recreating it on every open — v5 stops that and
+drops it from already-migrated databases, #2093). Bumps go in the same
 function, never in `applies_*` collectors.
 
 ---
@@ -327,6 +330,21 @@ header):
    works-council posture. A source MAY also ship `default_enabled = false` as a
    cautious roll-out default even when it carries no PII (e.g. `software` —
    machine-scope asset inventory), letting an operator opt in per host.
+
+   **Amended (Wave 6, operator ruling 2026-09-04).** `power` and `removable`
+   ship `default_enabled = true` — the first *works-council-class* sources to do
+   so (the five machine-scope sources `process`/`tcp`/`service`/`user`/`perf`
+   have always been on; of the eight added since 1.5 under the opt-in
+   posture, every one defaults off) — and, as the
+   roadmap brings each existing source in for change, that source moves to
+   default-on too. The works-council reasoning above is NOT withdrawn: it now
+   attaches to the `<name>_lookback_seconds` control (`0` = forward-only)
+   rather than to the enable flag, and it applies **at upgrade** rather than at
+   an operator's opt-in, which is a stronger obligation, not a weaker one. A
+   default-on source MUST therefore state the divergence plainly in its
+   user-manual page, its changelog fragment, and the SOC 2 data inventory —
+   never only in a code comment. Do not read the paragraph above as licence to
+   ship a new source opt-in without asking; the ruling is the current posture.
 6. **`tar_plugin.cpp`** — add a leg in `collect_fast_impl` (or `collect_slow_impl`)
    gated on `source_enabled(*db_, "<source>")`: enumerate → diff → insert →
    `set_state` (advance the diff baseline **only on insert success**). For an
@@ -347,3 +365,63 @@ header):
     OS rows; opt-in sources in the `default_enabled=false` cross-check),
     `test_tar_diff.cpp` (appeared/removed + cap), `test_tar_warehouse.cpp` (DDL +
     `$`-name translation + authorizer), and add a `test_tar_<source>.cpp`.
+
+**`usage` is not an example of this pattern.** It is a DERIVED source (a fold over
+`process_live`, `tar_usage.cpp`/`tar_usage.hpp`) — no `enumerate_<source>()`, no
+`compute_<source>_events()` diff, no collector `.cpp` of its own. Its lifecycle
+(`usage_set_enabled`/`usage_ensure_baselined`, tar_usage.cpp) runs on a
+`Disabled`/`PendingBaseline`/`Active` state machine, not the diff/poll cadence
+above. It still gets a `CaptureSourceDef` row in `build_sources()` (step 5) so
+the schema/`$Name_Tier` translation/queryable-table allowlist machinery applies
+uniformly, but a new capture source should follow the numbered steps above, not
+`tar_usage.*`.
+
+### 8.1 Streaming sources and the `ProcStreamCollector` contract
+
+Most sources are snapshot-and-diff pollers (above). A **streaming source**
+instead consumes a live kernel event feed (ETW, Endpoint Security, an nstat
+kctl socket). The standing rule is: a streaming source implements the
+`ProcStreamCollector` lifecycle contract — `start()` returns false → caller
+degrades to the poll; `drain()` moves buffered events out each fast tick;
+`dropped()`/`kernel_dropped()` for backpressure visibility; `stalled()` +
+idle-fallback; `method_name()` for the status field — reusing the shared
+`EventRing<T>` bounded ring, **never a hand-rolled parallel ring/retry path**.
+
+The interface is **not required to be `ProcStreamCollector` itself** when the
+drained event type is not `ProcEvent`. The established precedent is
+`ImageStreamCollector` (module loads, `docs/tar-module-loads.md` §M1): a
+**sibling interface with the identical lifecycle contract**, because its
+drained type is `ModuleEvent`. The contract, not the base class, is the
+invariant.
+
+**`BoundedPendingQueue<Event>` (`tar_cursor.hpp`, Wave 6) is a third bounded
+buffer in this plugin and a deliberate exception to "reuse `EventRing<T>`.**
+It exists because a cursor source's drain must be NON-DESTRUCTIVE: entries stay
+queued until the event+cursor transaction commits, and are then released by
+SEQUENCE, so a failed insert retries the same batch and an overflow eviction
+between snapshot and ack cannot destroy an entry that was never committed.
+`EventRing<T>`'s `drain()` removes on read, which cannot express that. Use
+`EventRing<T>` for a stream whose loss is acceptable and counted; use
+`BoundedPendingQueue` when the events are forensic and the sink is
+transactional. Do not add a fourth.
+
+**`NstatClient` (`tar_netqual_nstat.*`) is the second such case and a
+deliberate, documented exception to a literal `ProcStreamCollector` subclass:**
+
+- Its drained lifecycle type is `NstatFlowEvent` (a TCP 4-tuple open/close),
+  not `ProcEvent`, so — exactly like `ImageStreamCollector` — it cannot be a
+  `ProcStreamCollector` subclass without templating that base on its event
+  type.
+- It carries **one extra verb the streaming contract has no room for**:
+  `snapshot_quality()`, a repeatable live-table read (no drain) that feeds the
+  `netqual` quality leg. One kctl socket backs **two** consumer surfaces (the
+  tcp lifecycle stream *and* the netqual snapshot), which the single-stream
+  `ProcStreamCollector` shape does not model.
+- It nonetheless **honours the contract verbatim**: `EventRing<NstatFlowEvent>`
+  reused (not forked), the same `start()/drain()/dropped()/kernel_dropped()/
+  stalled()/method_name()` surface, the same degrade-to-poll fallback. It adds
+  no parallel backpressure or retry idiom.
+
+If a future streaming source's drained type *is* `ProcEvent`, subclass
+`ProcStreamCollector` — do not add a third parallel interface. A new sibling
+interface is justified only by a genuinely different drained type, as here.

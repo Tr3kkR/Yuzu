@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <thread>
 
@@ -65,6 +66,35 @@ public:
         /// Event/sink debounce window (ms) — collapses rapid drift events into a
         /// count (shared convention with RegistryGuard). 0 = emit every drift.
         std::uint64_t event_debounce_ms{1000};
+        /// #4021: fired EXACTLY ONCE, on the run() worker thread, the moment
+        /// `expected_hash.empty() && !baseline_set` captures a fresh baseline (never
+        /// again for this FileGuard instance — mirrors the source guard above's own
+        /// `!baseline_set` gate; a seeded, non-empty `expected_hash` never enters
+        /// that branch at all). Optional — null is a no-op. The callback runs on
+        /// THIS worker thread: it must not block meaningfully and must not reach
+        /// back into anything owned by the engine that constructed this guard
+        /// (GuardianEngine's own contract for every guard-worker callback — see
+        /// emit_guard_event's doc — applies here too); the production wiring
+        /// (guardian_engine.cpp) captures only a raw KvStore* by value, never
+        /// `this`/GuardianEngine&.
+        ///
+        /// Resource Ledger (Gate 3 governance, cpp-safety — recorded here since
+        /// this branch has no PR body yet): new callback context, a movable
+        /// value member (RAII, no manual cleanup). Owner: whichever
+        /// `FileGuard::Config` holds it, moved into the `FileGuard` ctor at
+        /// construction (guardian_engine.cpp's start_guard_for_rule_locked).
+        /// Acquired: assignment of the lambda at arm time. Released: `~FileGuard()`
+        /// -> `stop()` -> worker thread join (the callback, if mid-execution, has
+        /// always fully returned by the time the join completes, since it runs
+        /// synchronously inside the same worker's call stack — see run()).
+        /// Transfer: none beyond the initial move into the guard; no ownership
+        /// hand-off elsewhere. Captured resource: a BORROWED, non-owning
+        /// `KvStore*` (owner: `AgentImpl::kv_store_`, agent.cpp — declared before
+        /// `guardian_`, so it destructs AFTER every guard thread is joined via
+        /// `GuardianEngine::stop()`'s `stop_all_guards_locked()`, which runs
+        /// before either unique_ptr tears down). Failure cleanup: none needed —
+        /// nothing owned by the callback itself requires it.
+        std::function<void(const std::string& hash)> on_baseline;
     };
 
     FileGuard(Config cfg, GuardSink sink);

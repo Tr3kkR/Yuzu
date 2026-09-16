@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dispatch_confined_arms.hpp" // #3424/#3511: ConfinedDispatchOutcome -- DispatchFn/CommandDispatchFn return type
+
 /// @file dex_routes.hpp
 /// DEX (Digital Employee Experience) dashboard — the RELIABILITY lens over the
 /// 110-signal catalogue (crashes, hangs, service failures, device stability,
@@ -42,12 +44,16 @@ namespace yuzu::server {
 
 class GuaranteedStateStore;
 struct GuardianObservationRow;
+struct DexSignalCount; // guaranteed_state_store.hpp -- forward decl only, see DexFamilyRollup below
 class HttpRouteSink;
 
 /// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
-/// registry (NOT the crash store). `windows_online` is the coverage-honest
-/// denominator (only the OS with a crash collector today); `total_online` is
-/// context. A struct (not a registry dep) keeps render pure + testable.
+/// registry (NOT the crash store). `windows_online` remains the established
+/// headline crash-rate denominator (and the "all" catalogue lens's denominator,
+/// kept for continuity); macOS and Linux crash/reliability collectors now exist
+/// too, and the per-OS counters below denominate the catalogue's single-OS
+/// lenses. `total_online` is context. A struct (not a registry dep) keeps
+/// render pure + testable.
 struct DexFleet {
     int64_t windows_online{0};
     int64_t total_online{0};
@@ -60,6 +66,14 @@ struct DexFleet {
     /// build the experience distribution AND groups by os for the segment breakdown.
     /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
     std::vector<std::pair<std::string, std::string>> connected_agents;
+    /// Per-OS online-agent denominators (#1746) — the same coverage-honest count as
+    /// windows_online, split by platform, so the Catalogue's single-OS filter can
+    /// score a family against THAT OS's own online count instead of borrowing
+    /// windows_online. APPENDED here (not alongside windows_online) so the many
+    /// positional aggregate initializers of this struct across the test suite keep
+    /// compiling unchanged — trailing members default-init to 0.
+    int64_t linux_online{0};
+    int64_t macos_online{0};
 };
 
 /// One display family of the server-side signal catalogue. PUBLIC since F1:
@@ -77,6 +91,10 @@ const std::vector<DexSignalGroup>& dex_signal_groups();
 /// Total catalogued display types (sum over the groups).
 std::size_t dex_catalogued_type_count();
 
+/// obs_type -> index into dex_signal_groups(), or -1 when uncatalogued. Shared
+/// by the Trends fragment's family x day matrix and (#4035) its REST/MCP twin.
+int dex_family_index(const std::string& obs_type);
+
 /// Friendly display label for an obs_type; unknown types fall back to the
 /// HTML-escaped raw obs_type (forward-compatible, render-safe).
 std::string dex_signal_label(const std::string& obs_type);
@@ -89,6 +107,13 @@ std::string dex_signal_label(const std::string& obs_type);
 /// internal helpers so REST and HTMX can never drift on the window vocabulary.
 int dex_window_to_days(const std::string& window);
 std::string dex_iso_since(int days);
+
+/// Normalises a REST/MCP `os` filter param to a store-ready platform token:
+/// "windows"/"linux"/"macos" pass through; anything else (including "all" or
+/// empty) returns "" = all-OS. The single source of truth so the machine
+/// surfaces' DEX OS-scoping stays identical to the dashboard drilldown (A1
+/// dashboard-parity, #C-DEX-1 follow-up).
+std::string dex_normalize_os_filter(const std::string& os);
 
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS
@@ -114,6 +139,44 @@ std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
 /// null. The fleet-scale path (heartbeat rollup) is a follow-up.
 int dex_device_score(const GuaranteedStateStore* store, const std::string& agent_id,
                      const std::string& since);
+
+/// One family's rolled-up signal counts (events/active-types/peak-signal-devices/
+/// top signal) — the shared basis both the Catalogue grid and the health-score
+/// deduction read. External linkage already (defined outside dex_routes.cpp's
+/// anonymous namespace); declared here so `dex_read_model.cpp` can call it
+/// without a second copy (#4035, Rule 1).
+struct DexFamilyRollup {
+    int64_t events = 0;
+    int active = 0;
+    int total = 0;
+    int64_t max_signal_devices = 0; ///< #1374: max of member signals, not the family union
+    const DexSignalCount* top = nullptr;
+    bool benign = false;
+};
+DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
+                                  const std::vector<DexSignalCount>& signals);
+
+/// One family's health deduction (the per-family term of dex_compute_health,
+/// "default" preset) — the same number the Catalogue's per-card score shows.
+double dex_family_health_deduction(const DexSignalGroup& g,
+                                   const std::vector<DexSignalCount>& signals, int64_t N);
+
+/// The composite-health result: score (100 − Σ deductions; -1 when N<=0, no
+/// reporting agents to score) + the per-family deduction breakdown.
+struct DexHealthResult {
+    double score = -1.0;
+    struct Ded {
+        std::string name, sev;
+        double deduction = 0.0;
+    };
+    std::vector<Ded> deds;
+};
+
+/// PURE: the shared health-score computation — the Health page and the
+/// Overview hub's health teaser both call this (`weighting` = one of the
+/// allowlisted presets default/stability/productivity/security).
+DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
+                                   const std::string& preset);
 
 /// Catalogue View 1 — the 13 family cards (mockup dex-catalogue-coverage.html).
 /// COVERAGE-first: a family lights when a CONNECTED platform (scoped by `os_filter`:
@@ -351,7 +414,7 @@ public:
     /// A4: dispatch a plugin command to specific agents (same 5-param shape as
     /// DashboardRoutes' DispatchFn). Used ONLY for the canned `tar.sql` device
     /// perf query. May be empty → the perf panel renders "unavailable".
-    using DispatchFn = std::function<std::pair<std::string, int>(
+    using DispatchFn = std::function<yuzu::server::ConfinedDispatchOutcome(
         const std::string& plugin, const std::string& action,
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters)>;
@@ -400,6 +463,24 @@ public:
                          GroupListFn group_list_fn = {});
 
 private:
+    /// Deny a service-scoped API token on a fleet-wide fragment that names more
+    /// than one agent_id — the SEC-2/SEC-3 confinement-gap class:
+    /// `resolve_visible`'s VisibleSetFn is username-keyed and does not confine
+    /// a service token whose principal resolves to an unscoped grant. Writes the
+    /// 403 FIRST (mirrors GuardianRoutes::deny_service_scoped_ — a throwing
+    /// audit_fn_ must not be able to suppress the 403), audits after via the
+    /// shared try_persist_audit kernel. `target_type` defaults to
+    /// "GuaranteedState" (every caller but the per-signal fragment, whose
+    /// dex.signal.view contract — the REST/MCP twins, and audit-log.md — uses
+    /// "ObsType"; gov Gate 4 consistency review: the denial row must match its
+    /// own verb's established target_type, not silently diverge from it).
+    /// Returns true iff denied (caller returns immediately); false means the
+    /// caller should proceed to perm_fn_.
+    [[nodiscard]] bool deny_service_scoped_(const httplib::Request& req, httplib::Response& res,
+                                            const std::string& action,
+                                            const std::string& audit_detail,
+                                            const std::string& target_type = "GuaranteedState") const;
+
     AuthFn auth_fn_;
     PermFn perm_fn_;
     ScopedPermFn scoped_perm_fn_;

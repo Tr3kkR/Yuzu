@@ -1,15 +1,23 @@
 %%%-------------------------------------------------------------------
 %%% @doc Operator-facing gRPC service — implements ManagementService.
 %%%
-%%% Serves commands from dashboards and CLI tools. Most operations are
-%%% handled entirely by the gateway (which knows connected agents);
-%%% only QueryInventory is proxied to the C++ server.
+%%% Serves commands from dashboards and CLI tools. Every operation is
+%%% handled entirely by the gateway (which knows connected agents) —
+%%% nothing on this plane reaches the upstream C++ server or its RBAC.
 %%%
 %%% - SendCommand: fans out via yuzu_gw_router
 %%% - ListAgents:  answered from ETS routing table
 %%% - GetAgent:    answered from agent process state
 %%% - WatchEvents: gateway-native lifecycle event stream
-%%% - QueryInventory: proxied to C++ server
+%%% - QueryInventory: answered from the local registry
+%%%
+%%% AUTHORIZATION lives at the listener, not here: none of these handlers
+%%% inspects the caller (grpcbox hands unary handlers no socket/peer-cert
+%%% access), so the :50063 listener's grpcbox auth_fun
+%%% (yuzu_gw_authz:check_mgmt_peer/1, #1422) is the ONLY gate between an
+%%% mTLS-admitted peer and fleet-wide command fan-out. A new listener
+%%% serving this module MUST wire that auth_fun; the yuzu_gw_app boot
+%%% guard refuses a non-loopback management_pb listener without it.
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_mgmt_service).

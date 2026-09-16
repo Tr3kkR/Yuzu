@@ -37,19 +37,9 @@
 
 namespace yuzu::server {
 
-/// Max length of an operator-supplied app/version/group identifier across every
-/// app-perf surface (REST, MCP, dashboard) — one cap so the surfaces agree.
-inline constexpr std::size_t kAppPerfParamCap = 512;
-
-/// PURE: validate an operator-supplied app/version/group identifier before it
-/// reaches a store binding. Rejects oversize (> `kAppPerfParamCap`) or any C0
-/// control byte INCLUDING NUL — a NUL truncates a libpq text parameter, so the
-/// store would silently query a DIFFERENT key than supplied (a cross-surface
-/// semantic divergence, not injection — everything is bound). Does NOT reject
-/// empty: `version=""` is the all-versions sentinel; callers reject an empty
-/// `app`/`group_id` themselves. The ONE validator the three surfaces share so they
-/// cannot drift on the accepted charset/cap.
-[[nodiscard]] bool app_perf_param_valid(std::string_view s);
+/// `kAppPerfParamCap` / `app_perf_param_valid` moved to `app_perf_compare.hpp`
+/// (ADR-0031 WS-A4 #4250) — still visible here transitively via this file's own
+/// `#include "app_perf_compare.hpp"` above, so no existing caller changes.
 
 /// A percentile read off a fixed-bucket histogram. `value` is the LOWER EDGE of
 /// the bucket the percentile falls in (bucket-resolution approximation, not an

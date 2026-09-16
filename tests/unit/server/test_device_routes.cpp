@@ -13,9 +13,13 @@
 
 #include "device_routes.hpp"
 #include "guaranteed_state_store.hpp"
+#include "pg/pg_pool.hpp"
 #include "test_route_sink.hpp"
 
+#include "../test_helpers.hpp"
+
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <optional>
@@ -26,8 +30,19 @@
 #include <vector>
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgPool;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp): every test
+// below constructs its own GuaranteedStateStore against a clone of this schema
+// (ADR-0038 migration).
+yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    GuaranteedStateStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("guardianstate template: store failed to migrate");
+}};
 
 // A live-route harness: stub fns + a registered DeviceRoutes over a TestRouteSink.
 struct LiveHarness {
@@ -44,6 +59,7 @@ struct LiveHarness {
     bool allow_execute = true;
     bool audit_ok = true;      // #1647: flip to drop the evidence row (audit_fn → false)
     bool audit_throws = false; // #1647: flip to throw a bad_alloc-class fault from audit_fn
+    std::string device_os;     // K-4: lookup_fn returns a DeviceRow with this os when non-empty
 
     LiveHarness() {
         auto okAuth = [](const httplib::Request&, httplib::Response&) {
@@ -58,18 +74,25 @@ struct LiveHarness {
             return op == "Execute" ? allow_execute : true;
         };
         auto devices = [](const std::string&) { return std::vector<DeviceRow>{}; };
-        auto lookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
+        auto lookup = [this](const std::string& id) -> std::optional<DeviceRow> {
+            if (device_os.empty())
+                return std::nullopt; // default: exercise the content-sniff fallback
+            DeviceRow d;
+            d.agent_id = id;
+            d.os = device_os;
+            return d;
+        };
         auto dispatch = [this](const std::string& plugin, const std::string& action,
                                const std::vector<std::string>& ids, const std::string&,
                                const std::unordered_map<std::string, std::string>&)
-            -> std::pair<std::string, int> {
+            -> yuzu::server::ConfinedDispatchOutcome {
             ++dispatched;
             seen_plugin = plugin;
             seen_action = action;
             seen_id = ids.empty() ? "" : ids.front();
             seen_dispatches.emplace_back(plugin, action);
             // command_id prefix MUST be <plugin>- so the result route accepts it.
-            return {plugin + "-test", fake_sent};
+            return {.sent = fake_sent, .command_id = plugin + "-test"};
         };
         auto responses = [this](const std::string& cmd, const std::string& /*agent_id*/) {
             // #1634: production scopes by agent_id at the store seam; the stub returns
@@ -305,6 +328,64 @@ TEST_CASE("device live result: output renders, server survives the poll", "[devi
     }
 }
 
+// #1703: the RESULT poll — where the real process-tree/DNS/connections/users PII
+// actually reaches the operator — must funnel through the behavioural-PII audit
+// chokepoint, not only the /run dispatch. These assert the audit fires when
+// output is served, stays silent on the error/failure/timeout notes, and adopts
+// the dashboard set-and-proceed posture (renders anyway, raises Sec-Audit-Failed).
+TEST_CASE("device live result: rendering PII audits at the result chokepoint",
+          "[device][routes][audit]") {
+    SECTION("real output audits device.live.<kind>|rendered and renders") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 0, "uptime_display|2d 2h 29m", ""}};
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("2d 2h 29m") != std::string::npos);
+        CHECK(h.audited == "device.live.uptime|rendered|a-1");
+        CHECK(r->get_header_value("Sec-Audit-Failed").empty());
+    }
+    SECTION("terminal success-empty output audits device.live.<kind>|rendered_empty") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "", ""}}; // SUCCESS, no output
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=processes-test&agent_id=a-1&kind=processes&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("No processes returned") != std::string::npos);
+        CHECK(h.audited == "device.live.processes|rendered_empty|a-1");
+    }
+    SECTION("a dropped audit row on a result poll still renders but sets Sec-Audit-Failed") {
+        LiveHarness h;
+        h.audit_ok = false; // audit_fn → false (evidence row dropped)
+        h.fake_rows = {{"a-1", 0, "uptime_display|2d 2h 29m", ""}};
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("2d 2h 29m") != std::string::npos);          // set-and-proceed
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("a throwing audit_fn on a result poll is caught, still renders") {
+        LiveHarness h;
+        h.audit_throws = true;
+        h.fake_rows = {{"a-1", 0, "uptime_display|2d 2h 29m", ""}};
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1"));
+        REQUIRE(r);
+        CHECK(r->body.find("2d 2h 29m") != std::string::npos);
+        CHECK(r->get_header_value("Sec-Audit-Failed") == "true");
+    }
+    SECTION("the error/failure/timeout notes render NO PII and are not audited") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 0, "error|boom", ""}}; // agent error payload
+        auto r = h.sink.Get(
+            "/fragments/device/live/result?command_id=os_info-test&agent_id=a-1&kind=uptime&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("reported an error") != std::string::npos);
+        CHECK(h.audited.empty()); // no PII served -> no result-chokepoint audit
+    }
+}
+
 // The expanded live-snapshot kinds each map to ONE real plugin action with its own
 // audit verb. process_tree additionally dual-dispatches its connection join.
 TEST_CASE("device live run: expanded kinds map to the right plugin/action + audit",
@@ -412,6 +493,57 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         CHECK(r->body.find("running") != std::string::npos); // status, from f[3]
         CHECK(r->body.find("1 run") != std::string::npos);   // counted as running (not the PID)
     }
+    SECTION("services macOS 5-field svc|label|pid|status|startup: honest startup, PID not the name (C-1.12, P10 fix)") {
+        LiveHarness h;
+        // A macOS agent's OS is authoritative in production (the device record
+        // exists), so drive the OS-authoritative path (K-4) rather than the
+        // sniff — which for a 5-field row with an unknown OS now defaults to
+        // Windows (UP-5). The fixture is the real macOS shape.
+        h.device_os = "darwin";
+        // Stopped launchd rows report pid "-" (not a number) per launchctl list's
+        // real output -- the fixture must exercise that, not an impossible
+        // running-style numeric PID on a stopped row.
+        h.fake_rows = {{"a-1", 1, "svc|com.apple.mdworker|1234|running|automatic\n"
+                                  "svc|com.example.helper|-|stopped|disabled", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("com.apple.mdworker") != std::string::npos);
+        CHECK(r->body.find("com.example.helper") != std::string::npos); // not misrendered as "-"
+        CHECK(r->body.find("1234") == std::string::npos); // PID never rendered as the display name
+        CHECK(r->body.find("running") != std::string::npos);  // status, from f[3]
+        CHECK(r->body.find("automatic") != std::string::npos); // startup, from f[4]
+        CHECK(r->body.find("disabled") != std::string::npos);
+        CHECK(r->body.find("1 run") != std::string::npos); // only the running row counted
+    }
+    SECTION("services Windows 5-field with an all-digit display name: OS-authoritative, not PID-sniffed (K-4)") {
+        // A Windows service whose display name is purely numeric (e.g. "3389")
+        // would trip the content-sniff heuristic into the macOS branch and drop
+        // the display name. With the agent's OS known to be Windows, the display
+        // name must render.
+        LiveHarness h;
+        h.device_os = "windows";
+        h.fake_rows = {{"a-1", 1, "svc|TermService|3389|Running|Automatic", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("3389") != std::string::npos);   // display name rendered, not dropped
+        CHECK(r->body.find("Running") != std::string::npos); // status from f[3]
+        CHECK(r->body.find("1 run") != std::string::npos);
+    }
+    SECTION("services macOS 5-field: OS-authoritative keeps PID out of the name column (K-4)") {
+        // The mirror case: OS known to be darwin, a numeric pid must not become
+        // the display name even though the sniff would also have got this right.
+        LiveHarness h;
+        h.device_os = "darwin";
+        h.fake_rows = {{"a-1", 1, "svc|com.apple.mdworker|1234|running|automatic", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=services-test"
+                            "&agent_id=a-1&kind=services&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("com.apple.mdworker") != std::string::npos);
+        CHECK(r->body.find("1234") == std::string::npos);   // PID never the display name
+        CHECK(r->body.find("automatic") != std::string::npos);
+    }
     SECTION("services Linux 4-field svc|name|status|desc: State shows status") {
         LiveHarness h;
         h.fake_rows = {{"a-1", 1, "svc|sshd|running|OpenSSH server", ""}};
@@ -422,13 +554,13 @@ TEST_CASE("device live result: table kinds parse + render", "[device][routes]") 
         CHECK(r->body.find("running") != std::string::npos);
         CHECK(r->body.find("1 run") != std::string::npos);
     }
-    SECTION("arp non-Windows error payload -> honest error note, not silent blank") {
+    SECTION("arp non-Windows not_available sentinel -> honest empty-state note, not an error") {
         LiveHarness h;
-        h.fake_rows = {{"a-1", 1, "error|arp not available on this platform", ""}};
+        h.fake_rows = {{"a-1", 1, "arp|not_available", ""}};
         auto r = h.sink.Get("/fragments/device/live/result?command_id=network_config-test"
                             "&agent_id=a-1&kind=arp&n=1");
         REQUIRE(r);
-        CHECK(r->body.find("reported an error") != std::string::npos);
+        CHECK(r->body.find("reported an error") == std::string::npos);
         CHECK(r->body.find("not available on this platform") != std::string::npos);
     }
     SECTION("listening rows render with proto/port/pid") {
@@ -485,8 +617,10 @@ TEST_CASE("device live capture_sources: tar status -> read-only source table", "
 // The DEX/Guardian device lenses render per-device behavioral/compliance PII, so
 // they must gate GuaranteedState:Read and audit-on-open (parity with the sibling
 // /fragments/dex/device). Governance Gate-2/3/4 BLOCKING.
-TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
-    GuaranteedStateStore store(":memory:");
+TEST_CASE("device lenses: Read-gated + audited on open", "[pg][device][routes]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };
@@ -578,8 +712,10 @@ TEST_CASE("device lenses: Read-gated + audited on open", "[device][routes]") {
 // scoped_perm_fn_ is the chokepoint (here it denies "other-team", allows "mine");
 // the list provider is already per-operator scoped.
 TEST_CASE("device routes: out-of-scope device is not listed/openable/live-queryable",
-          "[device][routes][scope]") {
-    GuaranteedStateStore store(":memory:");
+          "[pg][device][routes][scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
     auto okAuth = [](const httplib::Request&, httplib::Response&) {
         return std::optional<auth::Session>(auth::Session{});
     };
@@ -617,9 +753,9 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
     auto dispatch = [&dispatched](const std::string& plugin, const std::string&,
                                   const std::vector<std::string>&, const std::string&,
                                   const std::unordered_map<std::string, std::string>&)
-        -> std::pair<std::string, int> {
+        -> yuzu::server::ConfinedDispatchOutcome {
         ++dispatched;
-        return {plugin + "-x", 1};
+        return {.sent = 1, .command_id = plugin + "-x"};
     };
     auto responses = [](const std::string&, const std::string&) {
         return std::vector<DexAgentResponse>{};
@@ -681,4 +817,56 @@ TEST_CASE("device routes: out-of-scope device is not listed/openable/live-querya
         REQUIRE(list);
         CHECK(list->body.find("ancestor-child") == std::string::npos);
     }
+}
+
+// SEC-2/SEC-3 confinement-gap class (found during a docs sweep): devices_fn_
+// on /fragments/devices/list is username-keyed and does not confine a
+// service-scoped API token whose principal resolves to an unscoped grant —
+// the full device roster would still be fleet-wide.
+TEST_CASE("device routes: /fragments/devices/list denies a service-scoped "
+          "token, denial audited",
+          "[pg][device][routes][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    auto serviceScopedAuth = [](const httplib::Request&, httplib::Response&) {
+        auth::Session s;
+        s.token_scope_service = "printers";
+        return std::optional<auth::Session>(s);
+    };
+    auto perm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                   const std::string&) { return true; };
+    auto devices = [](const std::string&) {
+        DeviceRow d;
+        d.agent_id = "mine";
+        d.hostname = "mine-host";
+        return std::vector<DeviceRow>{d};
+    };
+    std::vector<std::string> audit_log;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string&, const std::string&, const std::string&) -> bool {
+        audit_log.push_back(a + "|" + r);
+        return true;
+    };
+    DeviceRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink, serviceScopedAuth, perm, /*scoped_perm_fn=*/{}, devices,
+                           /*lookup_fn=*/{}, &store, /*dispatch_fn=*/{}, /*responses_fn=*/{},
+                           audit);
+
+    auto r = sink.Get("/fragments/devices/list");
+    REQUIRE(r);
+    CHECK(r->status == 403);
+    CHECK(r->body.find("mine-host") == std::string::npos);
+    // #3167: no `.permission` (no grant admits a service-scoped caller here —
+    // naming one is a false self-remediation claim), and header/body
+    // correlation-id parity.
+    auto body = nlohmann::json::parse(r->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body["error"].contains("permission"));
+    CHECK_FALSE(body["error"]["correlation_id"].get<std::string>().empty());
+    CHECK(r->get_header_value("X-Correlation-Id") ==
+         body["error"]["correlation_id"].get<std::string>());
+    REQUIRE(audit_log.size() == 1);
+    CHECK(audit_log[0] == "device.list.view|denied");
 }

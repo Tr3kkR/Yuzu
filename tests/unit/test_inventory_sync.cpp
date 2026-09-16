@@ -5,6 +5,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "local_dispatcher.hpp"
+#include "sync_canonical.hpp" // sha256_hex
 #include "sync_scheduler.hpp"
 #include "sync_source_installed_software.hpp"
 

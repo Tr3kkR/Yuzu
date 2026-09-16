@@ -18,6 +18,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -46,7 +47,7 @@ struct TestTarDb {
 };
 
 static TestTarDb make_test_db() {
-    auto tmp = yuzu::test::unique_temp_path("tar_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_");
     auto result = TarDatabase::open(tmp);
     REQUIRE(result.has_value());
     return TestTarDb{std::move(*result), tmp};
@@ -141,6 +142,40 @@ TEST_CASE("TarDatabase: purge_source drops ALL tiers for one source, leaves othe
     CHECK(count("process_monthly") == 0);
     CHECK(count("tcp_live") == 1);   // a different source is untouched...
     CHECK(count("tcp_hourly") == 1); // ...across all of its tiers
+}
+
+TEST_CASE("TarDatabase: purge_source(usage) also erases usage_daily_user",
+          "[tar][store][purge][usage]") {
+    // usage_daily_user (Wave 7 PR7.2b) has no tier of its own in the schema
+    // registry -- the generic per-tier purge loop above never reaches it, so
+    // this is a REGRESSION test for the dedicated branch in purge_source, not
+    // a duplicate of the generic case just above.
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily (day_ts, exe_key, run_count, total_seconds, first_seen, "
+        "last_seen, distinct_users, superseded_runs, expired_runs) VALUES "
+        "(86400, 'a.exe', 1, 10, 1000, 1010, 1, 0, 0)"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_daily_user (day_ts, exe_key, user) VALUES (86400, 'a.exe', 'alice')"));
+    REQUIRE(t.db.execute_sql(
+        "INSERT INTO usage_live (ts, snapshot_id, action, pid, exe_key, user, start_ts) VALUES "
+        "(1000, 0, 'open', 1, 'a.exe', 'alice', 1000)"));
+
+    auto count = [&](const std::string& table) {
+        auto r = t.db.execute_query("SELECT COUNT(*) FROM " + table);
+        REQUIRE(r.has_value());
+        return std::stoi(r->rows[0][0]);
+    };
+    REQUIRE(count("usage_daily") == 1);
+    REQUIRE(count("usage_daily_user") == 1);
+    REQUIRE(count("usage_live") == 1);
+
+    auto res = t.db.purge_source("usage");
+    REQUIRE(res.has_value());
+    CHECK(*res == 3); // usage_daily + usage_live (registered tiers) + usage_daily_user
+    CHECK(count("usage_daily") == 0);
+    CHECK(count("usage_daily_user") == 0); // the regression this test pins
+    CHECK(count("usage_live") == 0);
 }
 
 TEST_CASE("TarDatabase: purge_source rejects an unknown source", "[tar][store][purge]") {
@@ -1215,7 +1250,7 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     // tar.db — inserts then failed every 30 s. The fix runs the idempotent
     // IF-NOT-EXISTS DDL on EVERY open. Simulate the upgrade by dropping a
     // "new" table from a closed v3 DB, then reopening.
-    auto tmp = yuzu::test::unique_temp_path("tar_upg_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_upg_");
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
@@ -1246,6 +1281,153 @@ TEST_CASE("TarDatabase: missing warehouse tables are re-created on reopen (upgra
     fs::remove(fs::path{tmp.string() + "-shm"}, ec);
 }
 
+TEST_CASE("TarDatabase: a fresh open creates no tar_events table (#760 UP-8)",
+          "[tar][store][lifecycle][tar-events]") {
+    // is_queryable_table() excludes tar_events specifically so that its "no such
+    // table" error cannot become an existence oracle distinct from the generic
+    // authorizer denial. That reasoning only holds while the table is genuinely
+    // absent, so pin it: kCreateSchema must never create it again. It used to,
+    // and the v3 migration dropped it a few statements later — which left it
+    // PRESENT on any database already at schema_version>=3, since that branch is
+    // then skipped.
+    const char* count_sql = "SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR name "
+                            "LIKE 'idx_tar_events%'";
+    auto t = make_test_db();
+    auto q = t.db.execute_query(count_sql);
+    REQUIRE(q.has_value());
+    REQUIRE(q->rows.size() == 1);
+    CHECK(q->rows[0][0] == "0");
+
+    // The case that actually bit: a REOPEN. kCreateSchema runs on every open,
+    // but the v3 DROP is gated on schema_version()==2 — so once a database has
+    // reached v3+, re-running the create resurrected the table with nothing left
+    // to remove it. Every agent restart did this.
+    { TarDatabase discard = std::move(t.db); }
+    auto reopened = TarDatabase::open(t.path);
+    REQUIRE(reopened.has_value());
+    CHECK(reopened->schema_version() == 6);
+    auto q2 = reopened->execute_query(count_sql);
+    REQUIRE(q2.has_value());
+    CHECK(q2->rows[0][0] == "0");
+    t.db = std::move(*reopened); // hand back so TestTarDb's destructor cleans up
+}
+
+TEST_CASE("TarDatabase: a pre-v3 database still has tar_events dropped on open",
+          "[tar][store][lifecycle][tar-events]") {
+    // The other half of the same invariant: field databases created before v3
+    // DO carry the table, and the migration must still retire it. Seed the exact
+    // pre-v3 shape by hand (same technique as the v4 ALTER test below).
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v2_");
+    {
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
+        const char* seed = R"(
+            CREATE TABLE tar_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
+            INSERT INTO tar_config (key, value) VALUES ('schema_version', '2');
+            CREATE TABLE tar_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER NOT NULL,
+                event_type TEXT NOT NULL, event_action TEXT NOT NULL,
+                detail_json TEXT NOT NULL DEFAULT '{}', snapshot_id INTEGER NOT NULL DEFAULT 0);
+            CREATE INDEX idx_tar_events_ts ON tar_events(timestamp);
+            INSERT INTO tar_events (timestamp, event_type, event_action)
+                VALUES (1000, 'process', 'started');
+        )";
+        REQUIRE(sqlite3_exec(raw, seed, nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 6); // the 2→3→4→5→6 walk ran
+        auto q =
+            db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' OR "
+                              "name LIKE 'idx_tar_events%'");
+        REQUIRE(q.has_value());
+        CHECK(q->rows[0][0] == "0");
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: schema v5 drops tar_events from an ALREADY-MIGRATED database",
+          "[tar][store][lifecycle][tar-events]") {
+    // The installed-base case, and the reason removing the DDL is not enough on
+    // its own. Every agent in the field reached v3/v4 while kCreateSchema was
+    // still recreating tar_events on each open, so those databases carry it
+    // NOW. The v3 drop is gated on schema_version()==2 and will never fire for
+    // them again — only the v5 bump reaches them. Without it a fresh install and
+    // an upgraded endpoint would hold permanently divergent schemas.
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v5_");
+    {
+        // A v4 database that already carries the resurrected table, exactly as a
+        // pre-fix binary would have left it.
+        auto seeded = TarDatabase::open(tmp);
+        REQUIRE(seeded.has_value());
+        REQUIRE(seeded
+                    ->execute_query("CREATE TABLE tar_events (id INTEGER PRIMARY KEY "
+                                    "AUTOINCREMENT, timestamp INTEGER NOT NULL)")
+                    .has_value());
+        REQUIRE(seeded->execute_query("CREATE INDEX idx_tar_events_ts ON tar_events(timestamp)")
+                    .has_value());
+        REQUIRE(seeded->set_config("schema_version", "4"));
+    }
+
+    {
+        auto db = TarDatabase::open(tmp);
+        REQUIRE(db.has_value());
+        CHECK(db->schema_version() == 6);
+        auto q = db->execute_query("SELECT COUNT(*) FROM sqlite_master WHERE name = 'tar_events' "
+                                   "OR name LIKE 'idx_tar_events%'");
+        REQUIRE(q.has_value());
+        CHECK(q->rows[0][0] == "0");
+    }
+
+    std::error_code ec;
+    fs::remove(tmp, ec);
+    fs::remove(fs::path{tmp.string() + "-wal"}, ec);
+    fs::remove(fs::path{tmp.string() + "-shm"}, ec);
+}
+
+TEST_CASE("TarDatabase: create_warehouse_tables joins a transaction the caller already holds",
+          "[tar][store][lifecycle][ddl-batch]") {
+    // exec_ddl_batch wraps the DDL in its own transaction for cost and
+    // atomicity, but create_warehouse_tables() is public and a caller may
+    // already hold one. It must then run the batch unwrapped and JOIN that
+    // transaction rather than failing or nesting, and must leave the
+    // connection's autocommit state undisturbed either way.
+    auto t = make_test_db();
+    auto process_live_tables = [&] {
+        auto r = t.db.execute_query(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='process_live'");
+        REQUIRE(r.has_value());
+        return r->rows[0][0];
+    };
+
+    // Drop a table so the nested call has real work to do, then roll the
+    // CALLER's transaction back. Had create_warehouse_tables opened and
+    // committed a transaction of its own, the re-created table would SURVIVE
+    // that rollback; joining the caller's transaction means it must not. This is
+    // what makes the test discriminating rather than merely green.
+    REQUIRE(t.db.execute_query("DROP TABLE process_live").has_value());
+    REQUIRE(process_live_tables() == "0");
+
+    REQUIRE(t.db.execute_sql("BEGIN IMMEDIATE"));
+    CHECK(t.db.create_warehouse_tables());
+    CHECK(process_live_tables() == "1"); // recreated inside the caller's txn
+    REQUIRE(t.db.execute_sql("ROLLBACK"));
+    CHECK(process_live_tables() == "0"); // ...and discarded with it
+
+    // The ordinary un-nested path commits on its own and leaves a usable handle.
+    CHECK(t.db.create_warehouse_tables());
+    CHECK(process_live_tables() == "1");
+    auto q = t.db.execute_query("SELECT COUNT(*) FROM process_live");
+    REQUIRE(q.has_value());
+}
+
 TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf tier (upgrade path)",
           "[tar][store][lifecycle][procperf]") {
     // The deployment-critical path the fresh-DB tests never exercise: an
@@ -1253,7 +1435,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     // schema_version=3, so create_warehouse_tables' IF-NOT-EXISTS leaves them
     // alone and the v4 block's ALTER TABLE ADD COLUMN must run. Seed that exact
     // pre-v4 shape by hand, then open and prove the ALTER fired.
-    auto tmp = yuzu::test::unique_temp_path("tar_v4_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_v4_");
     {
         sqlite3* raw = nullptr;
         REQUIRE(sqlite3_open(tmp.string().c_str(), &raw) == SQLITE_OK);
@@ -1274,7 +1456,7 @@ TEST_CASE("TarDatabase: schema v4 ALTERs version onto a pre-existing procperf ti
     {
         auto db = TarDatabase::open(tmp);
         REQUIRE(db.has_value());
-        CHECK(db->schema_version() == 4); // the v3→v4 walk ran
+        CHECK(db->schema_version() == 6); // the v3→v4→v5→v6 walk ran
 
         // Both tiers now carry `version` (added by the ALTER, not the DDL).
         for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
@@ -1358,7 +1540,7 @@ TEST_CASE("TarDatabase: insert and query dns events (ADR-0015)", "[tar][store][c
 
 TEST_CASE("TarDatabase: a corrupt tar.db is quarantined and re-initialised fresh (#559)",
           "[tar][store][lifecycle][corruption]") {
-    auto tmp = yuzu::test::unique_temp_path("tar_corrupt_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_corrupt_");
 
     // 1. Create a real DB and persist a deliberately-paused source. This is the
     //    forensic-preservation state a corrupt read must NOT silently undo.
@@ -1414,7 +1596,7 @@ TEST_CASE("TarDatabase: a second corruption never overwrites the first quarantin
     // that would shred preserved forensic evidence. Drive two corrupt-open
     // cycles back-to-back (same second) and assert TWO distinct `.corrupt-*`
     // files survive.
-    auto tmp = yuzu::test::unique_temp_path("tar_collide_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_collide_");
     const std::string prefix = tmp.filename().string() + ".corrupt-";
 
     auto corrupt_then_open = [&]() {
@@ -1454,7 +1636,7 @@ TEST_CASE("TarDatabase: a valid DB opens cleanly with no quarantine and preserve
     // The happy path: integrity_ok returns true, so a previously-written DB is
     // re-opened in place with its data intact and NO `.corrupt-*` sidecar minted
     // (guards against an integrity_ok that wrongly fails every open).
-    auto tmp = yuzu::test::unique_temp_path("tar_valid_");
+    auto tmp = yuzu::test::unique_temp_path("yuzu_test_tar_valid_");
     {
         auto opened = TarDatabase::open(tmp);
         REQUIRE(opened.has_value());
@@ -1491,7 +1673,7 @@ TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primar
         SKIP("root bypasses directory permissions; cannot make the rename fail");
     }
 
-    auto dir = yuzu::test::unique_temp_path("tar_unmovable_");
+    auto dir = yuzu::test::unique_temp_path("yuzu_test_tar_unmovable_");
     REQUIRE(fs::create_directory(dir));
     // RAII: re-add write perms and remove the dir even if an assertion throws,
     // so a read-only temp dir never leaks onto a CI box that reuses workspaces.
@@ -1539,3 +1721,237 @@ TEST_CASE("TarDatabase: a corrupt-and-unmovable tar.db fails closed (#559 primar
     // dir_guard restores perms + removes the dir.
 }
 #endif // _WIN32
+
+// =============================================================================
+// checked_transaction (Wave 7 PR7.2b commit 1: strict TAR transaction executor)
+// =============================================================================
+//
+// Fault-injection idiom matches TAR #2361's execute_atomic_batch tests
+// (test_tar_aggregator.cpp): a `RAISE(ABORT, ...)` trigger leaves the
+// transaction intact (a statement-preserving fault); `RAISE(ROLLBACK, ...)`
+// aborts it. Both are real SQLite behaviour, not a mock.
+
+namespace {
+
+int64_t row_count(TarDatabase& db, const std::string& table) {
+    auto r = db.execute_query("SELECT COUNT(*) FROM " + table);
+    REQUIRE(r.has_value());
+    REQUIRE(!r->rows.empty());
+    return std::stoll(r->rows[0][0]);
+}
+
+} // namespace
+
+TEST_CASE("checked_transaction: happy path commits every statement together",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (2,1,'started',2,0,'b.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK(result.has_value());
+    CHECK(row_count(t.db, "process_live") == 2);
+}
+
+TEST_CASE("checked_transaction: a fault on the FIRST statement commits nothing",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        // Never reached in a correct implementation -- but written anyway to
+        // prove the SECOND statement is not what stops the commit; poisoning
+        // is what does, whether or not the callback keeps going.
+        h.exec("INSERT INTO tar_config (key,value) VALUES ('canary','1')");
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(row_count(t.db, "process_live") == 0);
+    CHECK(t.db.get_config("canary", "") == ""); // the "second statement" never committed either
+}
+
+TEST_CASE("checked_transaction: a fault on a MIDDLE statement commits nothing, "
+          "not even the earlier statements in the same transaction",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_cfg BEFORE INSERT ON tar_config "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO tar_config (key,value) VALUES ('mid','1')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (2,1,'started',2,0,'b.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    // This is the property execute_atomic_batch does NOT have: the first
+    // statement here would be durable under that primitive (it precedes the
+    // failure and the batch's data segment is tolerant). checked_transaction
+    // has no such segment -- the whole thing is one all-or-nothing unit.
+    CHECK(row_count(t.db, "process_live") == 0);
+}
+
+TEST_CASE("checked_transaction: a fault on the LAST statement commits nothing",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_cfg BEFORE INSERT ON tar_config "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        if (!h.exec("INSERT INTO tar_config (key,value) VALUES ('last','1')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(row_count(t.db, "process_live") == 0);
+}
+
+TEST_CASE("checked_transaction: a statement-preserving fault (RAISE ABORT) leaves the "
+          "connection usable, and a retry without the fault applies exactly once",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+                             "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    auto first = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(first.has_value());
+    CHECK(t.db.is_open()); // statement-preserving -- the store is NOT taken offline
+    REQUIRE(row_count(t.db, "process_live") == 0);
+
+    REQUIRE(t.db.execute_sql("DROP TRIGGER block_ins"));
+
+    auto retry = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK(retry.has_value());
+    CHECK(row_count(t.db, "process_live") == 1); // applied exactly once, not twice
+}
+
+TEST_CASE("checked_transaction: a transaction-aborting fault (RAISE ROLLBACK) stops the "
+          "operation from issuing further statements",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("CREATE TRIGGER block_ins BEFORE INSERT ON process_live "
+                             "BEGIN SELECT RAISE(ROLLBACK, 'aborted'); END;"));
+
+    int exec_attempts = 0;
+    auto result = t.db.checked_transaction(
+        [&exec_attempts](TransactionHandle& h) -> std::expected<void, std::string> {
+            ++exec_attempts;
+            h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                   "VALUES (1,1,'started',1,0,'a.exe','','u')"); // aborts the transaction
+            ++exec_attempts;
+            // poisoned() now true -- this exec() must no-op, never touch SQLite,
+            // never insert the canary row.
+            CHECK(h.poisoned());
+            const bool second_ran =
+                h.exec("INSERT INTO tar_config (key,value) VALUES ('canary','1')");
+            CHECK_FALSE(second_ran);
+            return {}; // deliberately ignored by the callback -- proves poisoning
+                       // wins over a callback that forgets to check
+        });
+    CHECK_FALSE(result.has_value());
+    CHECK(exec_attempts == 2); // both exec() CALLS were attempted by the callback...
+    CHECK(t.db.get_config("canary", "") == ""); // ...but the second never touched the DB
+    CHECK(row_count(t.db, "process_live") == 0);
+}
+
+TEST_CASE("checked_transaction: an already-offline store refuses immediately, no crash",
+          "[tar][store][checked_transaction]") {
+    // Rollback-fails-with-transaction-still-open (the path that actually
+    // TAKES a store offline) needs a disk-level fault this harness cannot
+    // induce -- same limitation TAR #2361's "a closed store skips the pass"
+    // test documents for execute_atomic_batch's identical wedge path
+    // (test_tar_aggregator.cpp). This test covers the downstream behaviour:
+    // checked_transaction against an ALREADY-offline connection (db_ ==
+    // nullptr, simulated via move exactly as that test does) must refuse via
+    // the `if (!db_)` pre-check, never attempt BEGIN, never crash.
+    auto t = make_test_db();
+    TarDatabase live = std::move(t.db); // t.db is now the closed store
+
+    auto result =
+        t.db.checked_transaction([](TransactionHandle&) -> std::expected<void, std::string> {
+            FAIL("operation must not run against an offline store");
+            return {};
+        });
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error() == "database not open");
+}
+
+TEST_CASE("checked_transaction: an exception thrown from the operation still rolls back",
+          "[tar][store][checked_transaction]") {
+    auto t = make_test_db();
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        throw std::runtime_error("simulated fault mid-operation");
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("simulated fault mid-operation") != std::string::npos);
+    CHECK(row_count(t.db, "process_live") == 0); // the pre-throw INSERT did not survive
+    CHECK(t.db.is_open()); // an exception is not a wedge -- the connection stays usable
+
+    // And the connection genuinely still works afterward.
+    auto retry = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        if (!h.exec("INSERT INTO process_live (ts,snapshot_id,action,pid,ppid,name,cmdline,user) "
+                    "VALUES (1,1,'started',1,0,'a.exe','','u')"))
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK(retry.has_value());
+    CHECK(row_count(t.db, "process_live") == 1);
+}
+
+TEST_CASE("checked_transaction: every statement individually succeeding does not imply "
+          "success -- a COMMIT-time failure (deferred FK) still rolls back",
+          "[tar][store][checked_transaction]") {
+    // The one failure class none of the per-statement triggers above can
+    // reach: every exec() in the operation returns true, so nothing pokes
+    // poisoned() -- the failure only exists at COMMIT. A deferred foreign key
+    // is real SQLite behaviour that manifests exactly there, so this proves
+    // checked_transaction's own COMMIT check is load-bearing and not
+    // redundant with poisoned().
+    auto t = make_test_db();
+    REQUIRE(t.db.execute_sql("PRAGMA foreign_keys=ON"));
+    REQUIRE(t.db.execute_sql("CREATE TABLE fk_parent (id INTEGER PRIMARY KEY)"));
+    REQUIRE(t.db.execute_sql(
+        "CREATE TABLE fk_child (id INTEGER PRIMARY KEY, parent_id INTEGER "
+        "REFERENCES fk_parent(id) DEFERRABLE INITIALLY DEFERRED)"));
+
+    auto result = t.db.checked_transaction([](TransactionHandle& h) -> std::expected<void, std::string> {
+        // Every exec() below returns true -- the FK violation is deferred to
+        // COMMIT, not caught here.
+        if (!h.exec("INSERT INTO fk_child (id, parent_id) VALUES (1, 999)")) // no such parent
+            return std::unexpected(h.error());
+        return {};
+    });
+    CHECK_FALSE(result.has_value());
+    CHECK(result.error().find("COMMIT failed") != std::string::npos);
+    CHECK(row_count(t.db, "fk_child") == 0);
+}

@@ -97,6 +97,29 @@ public:
         /// connection (NAT/firewall reap) as a failed statement instead of an
         /// indefinite hang. 0 leaves libpq defaults.
         int keepalives_idle_s = 30;
+        /// TCP_USER_TIMEOUT (ms, libpq 12+ — a no-op where the platform lacks
+        /// the socket option, e.g. macOS). Linux support is confirmed against
+        /// this project's vendored libpq (`fe-connect.c` sets `TCP_USER_TIMEOUT`
+        /// under `__linux__`). **Windows is unconfirmed, not confirmed
+        /// unsupported** — Gate 3 review (#2703) produced disagreeing reads
+        /// of libpq's own Windows conditional compilation and neither could be
+        /// fully settled from available evidence; treat it as a documented
+        /// open question rather than an established fact either way until
+        /// someone verifies against a live Windows build. Injected as
+        /// `tcp_user_timeout=`
+        /// unless the conninfo sets its own. Distinct from keepalives_idle
+        /// above: keepalives only start probing once the connection goes
+        /// IDLE (no traffic either direction) and, with `keepalives_interval`/
+        /// `keepalives_count` left at OS defaults, total detection can run to
+        /// several minutes; this bounds how long UNACKNOWLEDGED data (e.g. a
+        /// query already sent, awaiting a reply that a dead network path will
+        /// never deliver) may sit before the OS gives up, independent of any
+        /// keepalive cycle. Does NOT race statement_timeout on a live
+        /// connection — TCP ACKs happen at the transport layer regardless of
+        /// how long the server takes to produce a response, so this only
+        /// fires on a genuinely dark path, never on an alive-but-slow query.
+        /// 0 leaves libpq defaults (unbounded).
+        int tcp_user_timeout_ms = 10000;
         /// Connect-failure circuit breaker (#1368 cheap-idle): after a failed
         /// connect, suppress further connect attempts for an
         /// exponentially-growing window (`base × 2^(failures-1)`, capped, with
@@ -215,6 +238,37 @@ public:
     bool with_txn_for(std::chrono::milliseconds timeout,
                       const std::function<bool(PGconn*)>& fn);
 
+    /// As `with_txn`/`with_txn_for`, but the caller supplies an ALREADY-ACQUIRED lease
+    /// instead of this call doing its own acquire. Exists so a caller can tell apart "the
+    /// connection was never acquired, nothing ambiguous" from "a connection was held and the
+    /// transaction itself reported failure" — the two `with_txn*` overloads collapse both into
+    /// one `false`, which is fine for callers that only need to know success/failure, but is
+    /// NOT safe for a caller whose failure-handling includes a DESTRUCTIVE step (e.g. undoing
+    /// prior side effects): a lost COMMIT response after Postgres actually committed reports
+    /// `false` here exactly like a genuine rollback does, and destructive failure-handling built
+    /// on the WRONG assumption ("false always means nothing landed") can delete data that is
+    /// actually there (gov Gate 5 CHAOS-1, #3481 — `ProductPackStore::install`'s compensating
+    /// rollback is the first consumer: acquire via `try_acquire_for` first, and only treat a
+    /// subsequent `with_txn_on` failure as "safe to compensate" after CONFIRMING via
+    /// `pg_xact_status()` (see `ProductPackStore::check_transaction_outcome`) — NOT via a
+    /// fresh row-existence read, which CHAOS-1b (gov Gate 8) found is itself unreliable: the
+    /// client-observed connection failure that triggers this check is not ordered relative to
+    /// the backend's own commit progress, so row-absence can mean "aborted" OR "not yet
+    /// committed" — the exact ambiguity this whole mechanism exists to resolve).
+    ///
+    /// Gov Gate 8 review (architect): unlike `with_txn_for`, the bounded-acquire discipline
+    /// (ADR-0012 §2a) is NOT baked into this call — it depends entirely on the CALLER acquiring
+    /// via `try_acquire_for` immediately beforehand, with nothing in between. Three rules for
+    /// any new caller: (1) acquire the lease via `try_acquire_for`, never the blocking
+    /// `acquire()` — this call has no timeout of its own to fall back on; (2) do NOTHING between
+    /// the acquire and this call — no I/O, no other store call, nothing that could block or run
+    /// its own transaction on the same lease first (a nested `BEGIN` on a connection already
+    /// mid-transaction only WARNs and silently continues the EXISTING transaction — this call's
+    /// COMMIT would then sweep in whatever was left uncommitted); (3) never reuse `lease` after
+    /// passing it here — it is consumed by value and MUST be a connection this call alone owns
+    /// for its lifetime.
+    bool with_txn_on(Lease lease, const std::function<bool(PGconn*)>& fn);
+
     /// False when the conninfo failed to parse at construction.
     [[nodiscard]] bool valid() const noexcept { return valid_; }
 
@@ -264,10 +318,12 @@ private:
     int statement_timeout_ms_{30000};
     int lock_timeout_ms_{10000};
     int keepalives_idle_s_{30};
+    int tcp_user_timeout_ms_{10000};
     bool valid_{false};
     bool conninfo_has_timeout_{false};
     bool conninfo_has_options_{false};
     bool conninfo_has_keepalives_{false};
+    bool conninfo_has_tcp_user_timeout_{false};
     Observer observer_;
 
     mutable std::mutex mu_;

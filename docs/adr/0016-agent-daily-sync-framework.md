@@ -164,8 +164,11 @@ Therefore we **coexist, not replace**:
   enumerates every user profile + carries usernames. So no end-user PII and no
   works-council co-determination trigger. The Windows `HKCU` and the macOS
   user-domain context are benign **by run identity**: the agent runs as a service
-  account (`NT SERVICE\YuzuAgent` / `_yuzu`) or root, never the console user, so
-  neither crawls a logged-in user's hive / `~/Applications`. (If macOS ever moves
+  account or root, never the console user, so neither crawls a logged-in user's
+  hive / `~/Applications`. (On Windows the account is **LocalSystem** today, not
+  the intended virtual `NT SERVICE\YuzuAgent` — tracked as #1442. That deviation
+  does not weaken this argument: LocalSystem's own profile is no more an end
+  user's than the virtual account's. Linux/macOS are `_yuzu` / root as stated.) (If macOS ever moves
   to a console-scoped account, re-evaluate.) Per-user enumeration is a later,
   gated, pseudonymized addition if needed.
 - Reuse the existing `installed_apps` plugin (already 3-OS) **in-process via
@@ -195,6 +198,16 @@ Therefore we **coexist, not replace**:
 > only" until the admit-then-filter list gate lands. See **ADR-0017** (the decision +
 > gate design), **#1716** (doc-honesty), and **#1713/#1676** (the inventory
 > effective-vs-inert UAT).
+
+> **Update (2026-08-20, #3290):** the effective-vs-inert gap above is closed for both
+> read surfaces. `query_installed_software` and `GET /api/v1/inventory/software`
+> migrated onto `AuthRoutes::require_fleet_read` (ADR-0017's admit-then-filter
+> primitive, composed with service-scope confinement) as their sole authorization
+> gate — a management-group-confined operator now gets a genuinely filtered result
+> instead of a 403, and a service-scoped token gets a filtered result instead of a
+> blanket deny. This closes ADR-0017's PR-D backlog item for these two surfaces; the
+> `/inventory` dashboard Find tab is unmigrated and stays global-gate-only for now.
+> See `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`.
 
 ## Consequences
 

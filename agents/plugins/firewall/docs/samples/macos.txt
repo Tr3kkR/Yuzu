@@ -1,0 +1,10 @@
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 · leg-hash 8ef7b004fc8a
+== action=state
+backend|appfirewall
+state|disabled
+pf|unknown
+[result_status] UNDECLARED / UNKNOWN / 
+
+== action=rules
+[result_status] UNDECLARED / UNKNOWN / 
+
