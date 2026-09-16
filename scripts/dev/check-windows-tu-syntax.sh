@@ -57,6 +57,7 @@ tus=(
     agents/plugins/autoruns/src/autoruns_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/core/src/dism_bounded_call.cpp
+    agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 
