@@ -513,10 +513,12 @@ disable checkbox) were already secure-by-default.
 
 **Agent CA auto-discovery.** The agent connects over TLS by default. With no
 `--ca-cert` it checks the standard install-CA path
-(`/etc/yuzu/certs/default-ca.pem`, or the Windows ProgramData path) **before**
-grpc falls back to the system trust store — a Yuzu self-signed CA is not in the
-system roots, so without this an agent pointed at a default-cert server silently
-fails the handshake.
+(`/etc/yuzu/certs/default-ca.pem`, or the Windows ProgramData path) — plus,
+for a non-root agent on macOS,
+`~/Library/Application Support/Yuzu/certs/default-ca.pem` — **before** grpc
+falls back to the system trust store — a
+Yuzu self-signed CA is not in the system roots, so without this an agent
+pointed at a default-cert server silently fails the handshake.
 
 **Fail-closed when no CA can be pinned (#1303).** If neither an explicit `--ca-cert`
 nor a discovered install CA is present, the agent **refuses to start** (logs the
