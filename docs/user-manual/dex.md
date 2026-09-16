@@ -198,14 +198,22 @@ numbers match.
   see below), or the cross-link above: each version of an application
   gets its own row with avg/p95 CPU, a CPU sparkline, avg working set, and the
   reporting device count, over the retained fleet window (≤180 days) or, when a
-  management group is selected, that group's on-the-fly aggregate (≤31 days,
-  sub-10-device points suppressed to a count only). A **version filter**
+  management group **or a device model** is selected, that cohort's on-the-fly
+  aggregate (≤31 days, sub-10-device points suppressed to a count only — the
+  same floor either way, since a named tag-value cohort is a set of specific
+  devices exactly like a management group). The two cohort selectors
+  (**Scope**, by management group, and **Model**, by device-tag value) are
+  **mutually exclusive**: picking one clears the other, and a management
+  group takes precedence if a URL somehow names both. Choosing a model calls
+  the same trend read the `GET /api/v1/dex/perf/tag` / `get_dex_tag_app_perf`
+  endpoints expose. A **version filter**
   narrows the trend to one version at a time (the same `version` parameter the
-  `GET /api/v1/dex/perf/app` / `/perf/group` endpoints already accept); "all
+  `GET /api/v1/dex/perf/app` / `/perf/group` / `/perf/tag` endpoints already
+  accept); "all
   versions" is the default. Per-version crash/hang counts are not shown here
   yet (a separate central crash-store join, still deferred) — use the
   per-application crash/hang drill above for those.
-  On the **fleet-wide** view (not a management-group scope), each version row
+  On the **fleet-wide** view (no management-group or device-model scope), each version row
   has a **&#9656; devices** affordance that expands in place to list the
   devices behind that number — `agent_id`, last-seen day, and that day's CPU /
   working set. This is a **top-N sample, not a census**: it lists devices
@@ -329,6 +337,13 @@ does (agentic-first parity):
   highest-CPU devices are returned.
 - **`GET /api/v1/dex/perf/group?group_id=&app=&version=`** — the same trend for one
   management group's members (on-the-fly over B1, ≤31 days).
+- **`GET /api/v1/dex/perf/tag?key=&value=&app=&version=`** — the same trend
+  for one device-tag-value cohort (default `key=model`, e.g. one device
+  model), on-the-fly over B1, ≤31 days. Same floor as `/perf/group` (a named
+  tag-value cohort is a set of specific devices too); discover valid values
+  for a key via `GET /api/v1/dex/perf/cohorts?key=` (its `cohorts[].cohort`
+  field lists them) — this endpoint answers the trend for one already-known
+  value.
 - **`GET /api/v1/dex/devices/{id}/app-perf?app=`** — one device's retained per-app
   history (behavioral PII; scoped + audited fail-closed, `dex.device.app_perf.view`).
 
@@ -337,12 +352,14 @@ catalogue rollup + per-signal drill-down additionally take the optional `os`
 filter above, `all` when omitted); the
 fleet-now/cohort perf endpoints are now-views (no window), while the
 **application-performance-over-time** endpoints (`/perf/apps`, `/perf/app`,
-`/perf/group`) read **retained Postgres** data (≤180 days fleet / ≤31 days
-group), not a now-view. All are gated on `GuaranteedState:Read`. The per-signal
+`/perf/group`, `/perf/tag`) read **retained Postgres** data (≤180 days fleet /
+≤31 days group or tag cohort), not a now-view. All are gated on
+`GuaranteedState:Read`. The per-signal
 drill-down returns a most-affected **devices** list (behavioral) and is
 **audit-logged** (`dex.signal.view`) on every call, exactly like the dashboard
 view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
-`/perf/cohorts`, `/perf/cohort-diff`, `/perf/apps`, `/perf/app`, `/perf/group`)
+`/perf/cohorts`, `/perf/cohort-diff`, `/perf/apps`, `/perf/app`, `/perf/group`,
+`/perf/tag`)
 are machine-health telemetry / fleet metadata and are not audited — and the
 app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
 10 devices) to a count only. **`/perf/devices` and `/perf/app/devices` are the
@@ -358,7 +375,8 @@ fail-closed). The aggregate reads are exposed as
 MCP tools (`list_dex_signals`,
 `get_dex_signal_scope`, `get_dex_signal_detail`, `get_dex_perf_fleet`,
 `get_dex_perf_cohorts`, `get_dex_perf_cohort_diff`, `list_dex_perf_devices`,
-`list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf`); the
+`list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf`,
+`get_dex_tag_app_perf`); the
 version-row devices drill has its own MCP twin `list_dex_app_perf_devices`
 (same `dex.app_perf.devices.view` audit, set-and-proceed on MCP); the
 per-device app-perf drill is exposed via REST **and** the dashboard device drill

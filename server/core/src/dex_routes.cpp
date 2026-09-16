@@ -3120,6 +3120,12 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
         const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
         const std::string group = req.has_param("group") ? req.get_param_value("group") : "";
+        // Device-model cohort filter (F2c) — a SECOND, mutually-exclusive named
+        // scope alongside `group`; `group` wins if a caller (or a hand-edited
+        // URL) supplies both, matching render_dex_app_perf_trend's own
+        // precedence comment. Same tag key every existing cohort picker on the
+        // live Fleet Performance page defaults to (kDexDefaultCohortKey).
+        const std::string model = req.has_param("model") ? req.get_param_value("model") : "";
         const std::string raw_version =
             req.has_param("version") ? req.get_param_value("version") : "";
         // Shared validator (app_perf_param_valid) — the SAME cap + control-char/NUL
@@ -3128,6 +3134,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         // `version` empty = all versions (unfiltered), same convention as REST.
         if (app.empty() || !app_perf_param_valid(app) ||
             (!group.empty() && !app_perf_param_valid(group)) ||
+            (!model.empty() && !app_perf_param_valid(model)) ||
             (!raw_version.empty() && !app_perf_param_valid(raw_version))) {
             res.status = 400;
             res.set_content(placeholder("Pick an application",
@@ -3151,29 +3158,18 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         const std::vector<DexGroupOption> groups =
             group_list_fn_ ? group_list_fn_() : std::vector<DexGroupOption>{};
 
-        // group empty → fleet B2 (app_perf_fleet_trend); group set → the named-
-        // group on-the-fly B1 aggregate (app_perf_group_trend, sub-floor
-        // suppression at the SAME kDexCohortFloor the REST group endpoint uses).
+        // group set → the named-group on-the-fly B1 aggregate
+        // (app_perf_group_trend, sub-floor suppression at the SAME
+        // kDexCohortFloor the REST group endpoint uses); else model set → the
+        // SAME B1-aggregate shape via the device-model tag cohort (identical
+        // floor treatment — it is the same "named set of specific devices"
+        // case the floor exists for, see AppPerfTagCohortFn's own doc comment);
+        // else fleet B2 (app_perf_fleet_trend). group and model are mutually
+        // exclusive — group wins if a caller supplies both (matches
+        // render_dex_app_perf_trend's own precedence comment).
         std::optional<std::vector<AppPerfFleetRow>> rows;
         std::vector<AppPerfVersionSummary> versions;
-        if (group.empty()) {
-            if (!app_perf_providers_.fleet) {
-                res.set_content(placeholder("Application performance unavailable",
-                                            "This server has no fleet app-perf store wired."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            rows = app_perf_providers_.fleet(app, version);
-            if (!rows) {
-                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
-                // already counted the degrade. (REST twin stays fail-closed.)
-                res.set_content(placeholder("Application performance unavailable",
-                                            "The app-perf store could not be read right now."),
-                                "text/html; charset=utf-8");
-                return;
-            }
-            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
-        } else {
+        if (!group.empty()) {
             if (!app_perf_providers_.group) {
                 res.set_content(placeholder("Group performance unavailable",
                                             "This server has no group app-perf reader wired."),
@@ -3190,9 +3186,52 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 return;
             }
             versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+        } else if (!model.empty()) {
+            if (!app_perf_providers_.tag_cohort) {
+                res.set_content(placeholder("Model performance unavailable",
+                                            "This server has no device-model cohort reader wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.tag_cohort(kDexDefaultCohortKey, model, app, version);
+            if (!rows) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the tag
+                // cohort provider already counted the degrade (a failed
+                // TagStore read fails the whole lookup closed).
+                res.set_content(placeholder("Model performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_group_trend(*rows, kDexCohortFloor));
+        } else {
+            if (!app_perf_providers_.fleet) {
+                res.set_content(placeholder("Application performance unavailable",
+                                            "This server has no fleet app-perf store wired."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            rows = app_perf_providers_.fleet(app, version);
+            if (!rows) {
+                // 200 not 503 — dashboard htmx drops 4xx/5xx bodies; the store
+                // already counted the degrade. (REST twin stays fail-closed.)
+                res.set_content(placeholder("Application performance unavailable",
+                                            "The app-perf store could not be read right now."),
+                                "text/html; charset=utf-8");
+                return;
+            }
+            versions = app_perf_version_summaries(app_perf_fleet_trend(*rows));
         }
+        // Model-selector values — best-effort: an unwired/degraded tag_values
+        // provider just hides the selector (empty vector), same convention as
+        // an empty `groups` list above; it never blocks the page render.
+        const std::vector<std::string> model_values =
+            app_perf_providers_.tag_values
+                ? app_perf_providers_.tag_values(kDexDefaultCohortKey).value_or(
+                      std::vector<std::string>{})
+                : std::vector<std::string>{};
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
-                                                  window_days, version),
+                                                  window_days, version, model_values, model),
                         "text/html; charset=utf-8");
     });
 

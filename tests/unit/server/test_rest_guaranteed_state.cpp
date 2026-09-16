@@ -497,6 +497,11 @@ struct RestGsHarness {
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
             };
+            app_perf_providers_.tag_cohort =
+                [](std::string_view, std::string_view, std::string_view, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+                return std::vector<yuzu::server::AppPerfFleetRow>{};
+            };
             // ADR-0031 WS-A4 #4250: the shared VerifyApi seam (replaces the
             // retired AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort
             // provider) — a FnVerifyApi wraps the SAME `cohort_read_` fixture
@@ -2823,6 +2828,67 @@ TEST_CASE("REST dex/perf/group: ordinary session still reaches the route",
     auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
     REQUIRE(res);
     CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/tag: service-scoped token → 403, denial audited",
+          "[pg][rest][dex][app_perf][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.perf.tag.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+}
+
+TEST_CASE("REST dex/perf/tag: ordinary session still reaches the route",
+          "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floor "
+          "echoed, key defaults to model",
+          "[pg][rest][dex][app_perf][route]") {
+    SECTION("missing value → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("missing app → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("invalid key → 400") {
+        RestGsHarness h;
+        auto res =
+            h.sink.Get("/api/v1/dex/perf/tag?key=bad%20key%21&value=x&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("provider absent → 503") {
+        RestGsHarness h(true, true, false);
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("present provider, key omitted → 200, floor echoed, key defaults to model") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["key"].get<std::string>() == "model");
+        CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
+    }
 }
 
 TEST_CASE("REST dex/perf/compare: service-scoped token → 403, denied under the "

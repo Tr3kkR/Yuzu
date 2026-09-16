@@ -15699,6 +15699,42 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
+        // Device-model (tag) cohort trend for the app-perf page — same
+        // ManagementGroupStore->AppPerfGroupReader composition as `.group`
+        // above, just resolving membership via TagStore instead. A degraded
+        // tag read fails the WHOLE lookup closed (nullopt), never "no match".
+        app_perf_providers.tag_cohort =
+            [this](std::string_view tag_key, std::string_view tag_value, std::string_view app,
+                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_group_reader_ || !tag_store_)
+                return std::nullopt;
+            auto agents = tag_store_->agents_with_tag(std::string(tag_key), std::string(tag_value));
+            if (!agents)
+                return std::nullopt; // fail closed on a degraded tag read (TagStore contract)
+            return app_perf_group_reader_->get_group_trend(*agents, app, version);
+        };
+        app_perf_providers.tag_values =
+            [this](std::string_view tag_key) -> std::optional<std::vector<std::string>> {
+            if (!tag_store_)
+                return std::nullopt;
+            auto values = tag_store_->get_distinct_values(std::string(tag_key));
+            if (!values)
+                return std::nullopt;
+            return *values;
+        };
+        // The version-row "which devices" drill (B1, fleet-wide only — see the
+        // dashboard route's own registration comment for the documented v1
+        // group-scope gap). `visible_agent_ids` is threaded straight through
+        // from the caller's own require_fleet_read scope, never widened.
+        app_perf_providers.version_devices =
+            [this](std::string_view app, std::string_view version,
+                   const std::optional<std::vector<std::string>>& visible_agent_ids,
+                   bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
+            if (!app_perf_daily_store_)
+                return std::nullopt;
+            return app_perf_daily_store_->list_devices_for_version(app, version, visible_agent_ids,
+                                                                    truncated);
+        };
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
         // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
@@ -15827,7 +15863,11 @@ private:
             // scoped and the device-id lists never enumerate out-of-scope agents.
             scoped_perm_fn, visible_set_fn,
             // F2b app-perf-over-time providers + the scope-selector group list.
-            app_perf_providers, dex_group_list_fn);
+            app_perf_providers, dex_group_list_fn,
+            // The devices-by-version drill's sole gate (ADR-0017) — the SAME
+            // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
+            // surfaces resolve visibility identically.
+            fleet_read_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).

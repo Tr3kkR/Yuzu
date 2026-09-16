@@ -53,12 +53,24 @@ std::string render_dex_app_perf_picker(const std::vector<AppPerfAppSummary>& app
 /// candidate values are exactly the rows already on screen): each version row's
 /// label links to `?version=<v>`, narrowing; a filtered view shows a single row
 /// plus an "All versions" link back to `?version=` cleared.
+///
+/// `model_values` (distinct device-model tag values, F2c) populates a SECOND,
+/// independent scope selector alongside the management-group one — empty hides
+/// it, same convention as `groups`. `active_model` mirrors `scope_group_id`'s
+/// convention (empty = unfiltered). The two scopes are MUTUALLY EXCLUSIVE in
+/// this slice (group takes precedence — see dex_routes.cpp's route handler);
+/// selecting one clears the other via the emitted links so a caller can never
+/// land on a URL naming both from this UI (a hand-edited URL naming both is
+/// still handled: the route resolves it to the group scope, never silently
+/// combining the two).
 std::string render_dex_app_perf_trend(const std::string& app_name,
                                       const std::vector<AppPerfVersionSummary>& versions,
                                       const std::string& scope_group_id,
                                       const std::vector<DexGroupOption>& groups,
                                       std::int64_t group_floor, int window_days,
-                                      const std::string& active_version = "");
+                                      const std::string& active_version = "",
+                                      const std::vector<std::string>& model_values = {},
+                                      const std::string& active_model = "");
 
 /// PURE: the version-row "which devices" drill — one row per device that
 /// reported `(app_name, version)` among its retained top-N resource consumers,

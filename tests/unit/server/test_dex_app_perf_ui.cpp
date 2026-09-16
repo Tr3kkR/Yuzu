@@ -271,6 +271,82 @@ TEST_CASE("render_dex_app_perf_trend: filtered (active_version set) — banner, 
     }
 }
 
+// The device-model cohort filter (F2c): a SECOND named-scope selector,
+// independent of and mutually exclusive with the management-group one above.
+TEST_CASE("render_dex_app_perf_trend: device-model cohort filter — selector, "
+          "header, floor wording, devices-cell suppression",
+          "[dex][app_perf][ui]") {
+    AppPerfVersionSummary v1;
+    v1.version = "124.0";
+    v1.latest_day = 200;
+    v1.device_count = 4;
+    v1.cpu_mean = 3.0;
+
+    AppPerfVersionSummary v2; // sub-floor cohort slice → suppressed
+    v2.version = "125.0";
+    v2.latest_day = 200;
+    v2.device_count = 2;
+    v2.suppressed = true;
+
+    std::vector<DexGroupOption> groups; // no management groups on this server
+    std::vector<std::string> models = {"Latitude 5420", "OptiPlex 7090"};
+
+    SECTION("no model selected — selector present, 'Whole fleet' selected, no cohort "
+            "wording") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 30, "",
+                                                  models, "");
+        CHECK(has(h, "name=\"model\""));
+        CHECK(has(h, ">Whole fleet</option>"));
+        CHECK(has(h, ">Latitude 5420</option>"));
+        CHECK(has(h, ">OptiPlex 7090</option>"));
+        CHECK(has(h, "the whole fleet"));
+        CHECK_FALSE(has(h, "named cohort"));
+        CHECK_FALSE(has(h, "hx-on")); // CSP
+    }
+
+    SECTION("model selected — header names it, floor caption says 'device model', "
+            "sub-floor row still suppressed, devices-cell affordance omitted (v1 gap)") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1, v2}, "", groups, 10, 30, "",
+                                                  models, "Latitude 5420");
+        CHECK(has(h, "selected>Latitude 5420</option>"));
+        CHECK(has(h, "devices modeled Latitude 5420"));
+        CHECK(has(h, "named cohort of specific devices"));
+        CHECK(has(h, "(device model)"));
+        CHECK(has(h, "n too small")); // v2 still floors
+        // Fleet-only devices-cell affordance must NOT appear for a model cohort
+        // (same v1 gap as the management-group scope).
+        CHECK_FALSE(has(h, "&#9656; devices"));
+    }
+
+    SECTION("model selected — per-row narrow link carries model=, not group=") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 30, "",
+                                                  models, "Latitude 5420");
+        CHECK(has(h, "&amp;model=Latitude%205420"));
+        CHECK_FALSE(has(h, "&amp;group="));
+    }
+
+    SECTION("both group and model supplied — group wins (mutual exclusion), no model "
+            "wording") {
+        std::vector<DexGroupOption> g = {{.id = "g1", .name = "Eng"}};
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "g1", g, 10, 30, "", models,
+                                                  "Latitude 5420");
+        CHECK(has(h, "Eng"));
+        CHECK_FALSE(has(h, "devices modeled"));
+    }
+
+    SECTION("no model values available — selector omitted entirely") {
+        const auto h =
+            render_dex_app_perf_trend("chrome.exe", {v1}, "", groups, 10, 30, "", {}, "");
+        CHECK_FALSE(has(h, "name=\"model\""));
+    }
+
+    SECTION("model cohort with zero versions — honest empty state names the model scope") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {}, "", groups, 10, 30, "", models,
+                                                  "Latitude 5420");
+        CHECK(has(h, "No device of this model reported"));
+    }
+}
+
 TEST_CASE("render_dex_device_app_perf: empty state", "[dex][app_perf][ui]") {
     const auto h = render_dex_device_app_perf({});
     CHECK(has(h, "No application performance history for this device"));

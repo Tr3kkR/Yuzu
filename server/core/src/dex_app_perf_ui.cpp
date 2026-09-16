@@ -261,9 +261,12 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       const std::string& scope_group_id,
                                       const std::vector<DexGroupOption>& groups,
                                       std::int64_t group_floor, int window_days,
-                                      const std::string& active_version) {
+                                      const std::string& active_version,
+                                      const std::vector<std::string>& model_values,
+                                      const std::string& active_model) {
     const std::string w = dex_window_token(window_days);
     const bool is_group = !scope_group_id.empty();
+    const bool is_model = !is_group && !active_model.empty();
     const bool is_filtered = !active_version.empty();
     std::string h;
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
@@ -280,6 +283,8 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                 scope_name = esc(g.name);
                 break;
             }
+    } else if (is_model) {
+        scope_name = "devices modeled " + esc(active_model);
     }
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(app_name) +
          " <span class=\"gp-mute\" style=\"font-weight:400;font-size:.85rem\">&mdash; by version, "
@@ -293,9 +298,14 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
     // server-side via the SAME `version` param the REST twin (`GET
     // /dex/perf/app?version=`) accepts, an exact/canonicalized match — never a
     // client-side slice of a wider fetch.
+    // Named-cohort query-string suffix shared by every link below (version
+    // filter, scope-empty back-link, per-row narrow) — group and model are
+    // mutually exclusive so exactly one (or neither) is ever appended.
+    const std::string cohort_qs = is_group ? "&amp;group=" + url_encode(scope_group_id)
+                                  : is_model ? "&amp;model=" + url_encode(active_model)
+                                             : "";
     if (is_filtered) {
-        const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
-                                   (is_group ? "&amp;group=" + url_encode(scope_group_id) : "");
+        const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w + cohort_qs;
         h += "<div class=\"gp-note\">Filtered to version <span style=\"font-family:var(--mono)\">" +
              esc(active_version) + "</span> &mdash; " +
              drill("/fragments/dex/perf/app?" + all_qs, "all versions &rarr;") + "</div>";
@@ -330,16 +340,39 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         h += "</select></div>";
     }
 
+    // Device-model cohort selector — independent of, and mutually exclusive
+    // with, the management-group one above (see this function's header
+    // comment): its own `hx-get` base carries no `group=`, so picking a model
+    // value always drops any active group scope, and vice versa.
+    if (!model_values.empty()) {
+        std::string mbase = "/fragments/dex/perf/app?app=" + url_encode(app_name) +
+                            "&amp;window=" + w;
+        if (is_filtered)
+            mbase += "&amp;version=" + url_encode(active_version);
+        h += "<div class=\"gp-note\">Model: <select name=\"model\" hx-get=\"" + mbase +
+             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
+             "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
+             "border-radius:.35rem;padding:.15rem .4rem;\">";
+        h += "<option value=\"\"" + std::string(is_model ? "" : " selected") +
+             ">Whole fleet</option>";
+        for (const auto& mv : model_values) {
+            const bool on = is_model && mv == active_model;
+            h += "<option value=\"" + esc(mv) + "\"" + (on ? " selected" : "") + ">" + esc(mv) +
+                 "</option>";
+        }
+        h += "</select></div>";
+    }
+
     if (versions.empty()) {
         std::string empty_sub =
             is_group ? "No member of this group reported retained performance for this "
                        "application in the window."
+            : is_model ? "No device of this model reported retained performance for this "
+                        "application in the window."
                      : "No device reported retained performance for this application in the "
                        "window.";
         if (is_filtered) {
-            const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
-                                       (is_group ? "&amp;group=" + url_encode(scope_group_id)
-                                                 : "");
+            const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w + cohort_qs;
             h += "<div class=\"gp-note\">" +
                  drill("/fragments/dex/perf/app?" + all_qs, "&larr; all versions") + "</div>";
         }
@@ -370,8 +403,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
             ver = "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>";
         } else {
             std::string qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
-                             "&amp;version=" + url_encode(v.version) +
-                             (is_group ? "&amp;group=" + url_encode(scope_group_id) : "");
+                             "&amp;version=" + url_encode(v.version) + cohort_qs;
             ver = drill("/fragments/dex/perf/app?" + qs,
                         "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>");
         }
@@ -383,9 +415,10 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                  "withheld)</td><td>" + std::to_string(v.device_count) + "</td></tr>";
             continue;
         }
-        // Devices-cell click-to-expand: fleet-wide ONLY (is_group false). A
-        // group-scoped trend does not (yet) narrow the version-devices drill to
-        // the group's own members — showing the affordance there would silently
+        // Devices-cell click-to-expand: fleet-wide ONLY (neither is_group nor
+        // is_model). A named-cohort-scoped trend (management group OR device
+        // model) does not (yet) narrow the version-devices drill to the
+        // cohort's own members — showing the affordance there would silently
         // widen what "devices" means for that row (see dex_routes.cpp's route
         // registration comment for the v1-scope reason), so it is omitted
         // rather than shown-but-wrong. `hx-target="closest tr" hx-swap="afterend"`
@@ -394,7 +427,7 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         // means a second click is a no-op (reveal-only, no collapse — matches
         // this row's own "latest tag" simplicity bar).
         std::string devices_cell = std::to_string(v.device_count);
-        if (!is_group) {
+        if (!is_group && !is_model) {
             // `version=` with an EXPLICITLY EMPTY value is unambiguous here (unlike
             // the trend's own version-filter link above): this route requires
             // `version` PRESENT (not merely non-empty) and treats "" as the valid
@@ -423,13 +456,14 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         "histogram (device p95s can't be averaged), shown as &ldquo;&ge; value&rdquo; when it "
         "lands in the open top bucket. <b>CPU trend</b> is the daily mean over the retained "
         "history. Per-version crashes/hangs are deferred (a separate crash store).";
-    if (is_group)
-        foot += " This is a <b>named group of specific devices</b>, so any version whose latest "
-                "day covers fewer than " +
+    if (is_group || is_model)
+        foot += " This is a <b>named cohort of specific devices</b>" +
+                std::string(is_model ? " (device model)" : " (management group)") +
+                ", so any version whose latest day covers fewer than " +
                 std::to_string(group_floor) +
-                " devices shows its count only (works-council co-determination). Group scope reads "
+                " devices shows its count only (works-council co-determination). Cohort scope reads "
                 "the per-device store (up to <b>31 days</b>); the whole-fleet view covers the full "
-                "<b>180-day</b> aggregate, so a group series is shorter for the same app.";
+                "<b>180-day</b> aggregate, so a cohort series is shorter for the same app.";
     else
         foot += " &ldquo;&#9656; devices&rdquo; on a version row lists the devices where this "
                 "exact version was among the device's own top resource consumers — not a full "

@@ -3956,6 +3956,7 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
                                                "list_dex_perf_apps",
                                                "get_dex_app_perf",
                                                "get_dex_group_app_perf",       // B1/B2 discovery pin
+                                               "get_dex_tag_app_perf",         // device-model cohort pin
                                                "compare_app_perf_versions",    // /auto VERIFY discovery pin
                                                "get_network_fleet",
                                                "list_network_devices",         // N1: A2 discovery pin
@@ -8273,6 +8274,11 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
         return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)};
     };
+    ts.app_perf_providers_for_test.tag_cohort =
+        [mk_row](std::string_view, std::string_view, std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)};
+    };
     ts.start("readonly");
 
     auto apps = mcp_tool_payload(
@@ -8298,6 +8304,28 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     CHECK(group["floor"] == yuzu::server::kDexCohortFloor); // floor echoed
     REQUIRE(group["points"].size() == 1);
     CHECK(group["points"][0]["device_count"] == 20);
+
+    auto tag = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":83,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"Latitude 5420","app":"chrome.exe"}}})")
+            ->body);
+    CHECK(tag["key"] == "model"); // default key when omitted
+    CHECK(tag["value"] == "Latitude 5420");
+    CHECK(tag["floor"] == yuzu::server::kDexCohortFloor);
+    REQUIRE(tag["points"].size() == 1);
+    CHECK(tag["points"][0]["device_count"] == 20);
+
+    auto tag_missing_value = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_dex_tag_app_perf","arguments":{"app":"chrome.exe"}}})");
+    auto tmv_body = nlohmann::json::parse(tag_missing_value->body);
+    REQUIRE(tmv_body.contains("error"));
+    CHECK(tmv_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    auto tag_bad_key = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_dex_tag_app_perf","arguments":{"key":"bad key!","value":"x","app":"chrome.exe"}}})");
+    auto tbk_body = nlohmann::json::parse(tag_bad_key->body);
+    REQUIRE(tbk_body.contains("error"));
+    CHECK(tbk_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
 }
 
 TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential, no verdict)",
@@ -8412,6 +8440,32 @@ TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
 
     for (const auto& a : ts.audit_log)
         CHECK(a != "dex.perf.group.view|success");
+}
+
+TEST_CASE("MCP get_dex_tag_app_perf: still denies a service-scoped token via "
+          "perm_fn (same GuaranteedState:Read gate as get_dex_group_app_perf)",
+          "[mcp][integration][dex][app_perf][security]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.tag_cohort =
+        [](std::string_view, std::string_view, std::string_view,
+           std::string_view) -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{};
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "GuaranteedState" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"Latitude 5420","app":"chrome.exe"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403); // denied at the same GuaranteedState:Read gate as the sibling test
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "dex.perf.tag.view|success");
 }
 
 TEST_CASE("MCP compare_app_perf_versions: denies a service-scoped token, denied under "
