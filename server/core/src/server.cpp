@@ -158,6 +158,7 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
 #include "mcp_jsonrpc.hpp"
 #include "auth_routes.hpp"
@@ -1323,6 +1324,16 @@ public:
         for (const auto reason : yuzu::server::mcp::kExecInstrBoundReasons) {
             metrics_.counter("yuzu_mcp_tool_args_too_large_total",
                              {{"tool", "execute_instruction"}, {"reason", std::string(reason)}});
+        }
+        // #4353 follow-up (Gate 2 finding on #4364): the 19 kFieldBoundTools
+        // share the SAME counter as execute_instruction above but a single
+        // fixed reason ("arg_too_large") - see mcp_server.cpp's
+        // reject_field_too_large comment for why these 19 don't get
+        // execute_instruction's per-field reason breakdown. Iterated from that
+        // one array for the same emitted-but-unseeded reason as above.
+        for (const auto tool : yuzu::server::mcp::kFieldBoundTools) {
+            metrics_.counter("yuzu_mcp_tool_args_too_large_total",
+                             {{"tool", std::string(tool)}, {"reason", "arg_too_large"}});
         }
         // #2500 REST targeting refusals. Deliberately NOT the MCP counter above:
         // these are different surfaces with different gates, and folding them into
@@ -18537,6 +18548,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
         yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
+        yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
     };
     /// Shared Postgres connection pool — the server storage substrate (ADR-0006/
     /// 0007). Constructed in the ctor BEFORE any Postgres-backed store (fail
