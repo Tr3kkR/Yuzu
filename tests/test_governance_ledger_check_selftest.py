@@ -26,6 +26,7 @@ import ast
 import importlib.util
 import inspect
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -419,6 +420,92 @@ print("OK", len(findings))
            f"round 8's shipped Decimal-based version crashed under, exercised through the "
            f"actual call path rather than calling _frac_key directly "
            f"(got exit={probe.returncode}, stdout={probe.stdout!r}, stderr={probe.stderr[:200]!r})")
+
+    # round-11 review should-fix (Fable + Sol, independently converged then
+    # cross-confirmed): the two round-10 locks above only ask "does it
+    # crash", never "does it produce the RIGHT ordering". Both reviewers
+    # independently constructed a plain, non-adversarial mutant that evades
+    # both: aliasing `float` under an innocuous name (`coerce = float`) and
+    # using `coerce(...)` in place of the real fractional key. The AST lock
+    # finds nothing (the callee is named `coerce`, not `Decimal`/`int`/
+    # `float`); the crash-safety probe PASSES (`float()` truncates silently
+    # rather than raising like `Decimal`/`int()` do on a very long digit
+    # string) - but it silently reintroduces a FALSE TIE for two fractions
+    # differing only beyond float's ~15-17-significant-digit precision,
+    # exactly the round-8 escalation-loss mechanism, one precision order
+    # down. This is a correctness gap in the LOCK, not the shipped code
+    # (verified: the real _frac_key is pure string comparison with no
+    # precision limit) - a discriminating assertion through the real
+    # _order_key/merged_view path, with pass_ordinal deliberately REVERSED
+    # (mirroring the existing F1/sub-microsecond tests' own technique), so a
+    # false-tie-driven fallback to pass_ordinal picks the WRONG row.
+    prec_a = "3" * 20 + "1"  # 21 significant digits: any float-based key collapses this...
+    prec_b = "3" * 20 + "2"  # ...and this to the IDENTICAL float, despite b > a as real numbers
+    prec_rows = [
+        {"finding_id": "pf", "run_id": "9-precfloat.X", "pass_ordinal": 9,
+         "recorded_at": f"2026-09-15T10:00:00.{prec_a}Z", "disposition": "open"},
+        {"finding_id": "pf", "run_id": "9-precfloat.X", "pass_ordinal": 1,
+         "recorded_at": f"2026-09-15T10:00:00.{prec_b}Z", "disposition": "fixed"},
+    ]
+    # round-11 confirmation-pass minor (FortitudeEtc/Kimi+Sol synthesis): on
+    # an interpreter where fromisoformat rejects a >6-digit fraction
+    # outright, BOTH rows above would fall through _instant's None path to
+    # the legacy (file-order) sort key - the assertion below would then pass
+    # VACUOUSLY (by file order, never touching _frac_key's comparison at
+    # all), silently un-exercising exactly the round-8 false-tie class this
+    # test exists to catch, rather than failing loudly. Assert the
+    # precondition explicitly so a too-old interpreter fails LOUDLY here
+    # instead of silently skipping the real check.
+    expect(M._instant(prec_rows[0]["recorded_at"]) is not None,
+           "precondition: this interpreter parses a 21-digit fraction (required for the "
+           "float-precision assertion below to actually exercise _frac_key, not file order)")
+    prec_ordered = sorted(((i, r) for i, r in enumerate(prec_rows)), key=M._order_key)
+    expect(M.merged_view(prec_ordered).get("disposition") == "fixed",
+           "fractional precision beyond float's significant-digit limit still orders correctly "
+           "(a float-based key would tie these and fall through to the deliberately-reversed "
+           "pass_ordinal, picking the wrong row)")
+
+    # round-11 CONFIRMATION-pass finding (Sol): the 21-digit assertion above
+    # is specific to float's ~15-17-significant-digit precision and does NOT
+    # close a sibling mutant - `coerce = int; coerce((_frac_key(ra) + "0"*64)
+    # [:64])` - that pads/truncates to a FIXED 64-digit width before
+    # converting, passing the AST lock (callee named `coerce`), the 5000-
+    # digit crash-safety probe (only 64 digits are ever converted, so int()'s
+    # cap is never approached), AND the 21-digit correctness assertion above
+    # (64 digits is more than enough precision for a 21-digit difference) -
+    # while still ties-and-inverts two fractions differing ONLY past digit
+    # 64. This is the round-8 fixed-width-truncation defect again, at a
+    # different (much larger) width. No single "big enough" width closes
+    # this in principle - a mutant can always pick a width one digit larger
+    # than whatever this test checks. Matching this file's own established
+    # judgment call elsewhere (round-9/10 reviews explicitly treated
+    # sufficiently-contrived dynamic-construction bypasses as unreasonable
+    # adversarial stretches rather than open-ended obligations): a
+    # correctness check at a width far beyond any plausible REAL fixed-width
+    # constant a future edit might pick (64, 128, 256, 1024 are all
+    # "reasonable-looking" numbers; 5000+ is not) makes the remaining gap a
+    # bounded-but-absurd residual, not a realistic one - and it reuses the
+    # exact width the crash-safety probe already established as the
+    # profile's outer edge, so there is no new magic number to justify.
+    huge_prec_a = "9" * 4999 + "1"
+    huge_prec_b = "9" * 4999 + "2"
+    huge_prec_rows = [
+        {"finding_id": "hpf", "run_id": "9-hugeprecfloat.X", "pass_ordinal": 9,
+         "recorded_at": f"2026-09-15T10:00:00.{huge_prec_a}Z", "disposition": "open"},
+        {"finding_id": "hpf", "run_id": "9-hugeprecfloat.X", "pass_ordinal": 1,
+         "recorded_at": f"2026-09-15T10:00:00.{huge_prec_b}Z", "disposition": "fixed"},
+    ]
+    # round-11 confirmation-pass minor: same precondition, for the same
+    # reason, at the 5000-digit width.
+    expect(M._instant(huge_prec_rows[0]["recorded_at"]) is not None,
+           "precondition: this interpreter parses a 5000-digit fraction (required for the "
+           "huge-precision assertion below to actually exercise _frac_key, not file order)")
+    huge_prec_ordered = sorted(((i, r) for i, r in enumerate(huge_prec_rows)), key=M._order_key)
+    expect(M.merged_view(huge_prec_ordered).get("disposition") == "fixed",
+           "fractional precision at 5000 digits, differing only in the LAST digit, still orders "
+           "correctly - closing any fixed-width numeric-conversion scheme up to that width "
+           "(a bounded truncate-then-convert mutant would tie these and fall through to the "
+           "deliberately-reversed pass_ordinal, picking the wrong row)")
 
     # round-8 CONFIRMATION-pass finding (Sol): "-00:00" is valid RFC 3339
     # syntax but its EXACT spelling is reserved (section 4.3) to mean "local
@@ -1030,6 +1117,18 @@ print("OK", len(findings))
             {"finding_id": "sf", "run_id": "9-subfrac.X", "pass_ordinal": 1,
              "recorded_at": "2026-09-15T10:00:00.0000002Z", "disposition": "fixed"},
         ]
+        # round-11 confirmation-pass finding (Fable): this is the ORIGINAL
+        # round-8 lock the two round-11 precision assertions elsewhere in
+        # this file exist to strengthen - it has the IDENTICAL vacuous-pass
+        # exposure on an interpreter that rejects a >6-digit fraction
+        # outright (both rows would fall to _order_key's file-order path and
+        # 'fixed', at index 1, would win by accident rather than by the
+        # precision comparison this test means to exercise). Guarding its
+        # two descendants but not this one would leave the class only
+        # partially closed.
+        expect(M._instant(subfrac_rows[0]["recorded_at"]) is not None,
+               "precondition: this interpreter parses a 7-digit fraction (required for the "
+               "sub-microsecond assertion below to actually exercise _frac_key, not file order)")
         subfrac_ordered = sorted(((i, r) for i, r in enumerate(subfrac_rows)), key=M._order_key)
         expect(M.merged_view(subfrac_ordered).get("disposition") == "fixed",
                "sub-microsecond fractional precision orders correctly even though fromisoformat's "
@@ -1124,6 +1223,76 @@ print("OK", len(findings))
         expect("invalid-json" in _rules(dup_fid_findings),
                f"a duplicate finding_id (silently re-homing a row to the wrong merge group) "
                f"is also caught as invalid-json (got {_rules(dup_fid_findings)})")
+
+        # round-11 review should-fix (Fable + Sol): a duplicate JSON member
+        # name spelled as a lone Unicode surrogate (\ud800, reachable via a
+        # JSON \uXXXX escape with no matching low surrogate) is decoded fine
+        # by json.loads, but printing it to a normal UTF-8 stdout raised
+        # UnicodeEncodeError uncaught, mid-report - under --all, every
+        # fragment after the offending one, and the summary line, never
+        # printed. check_fragment() itself was always correct (it returned
+        # the right invalid-json finding); the crash was purely in the CLI
+        # report step. Verify BOTH: the in-process finding is produced, AND
+        # the CLI (which actually prints it) doesn't crash.
+        surrogate_line = '{"a": 1, "\\ud800": 2, "\\ud800": 3}'
+        surrogate_path = Path(d) / "9-surrogate.X.jsonl"
+        surrogate_path.write_text(surrogate_line + "\n", encoding="utf-8")
+        surrogate_findings = M.check_fragment(str(surrogate_path))
+        expect("invalid-json" in _rules(surrogate_findings),
+               f"a duplicate lone-surrogate JSON member name is caught as invalid-json "
+               f"(got {_rules(surrogate_findings)})")
+        cli_surrogate = subprocess.run([sys.executable, str(_SCRIPT), "--files", str(surrogate_path)],
+                                        capture_output=True, text=True)
+        expect(cli_surrogate.returncode == 1 and "Traceback" not in cli_surrogate.stderr,
+               f"CLI on a duplicate lone-surrogate key name exits 1 with a finding, never a "
+               f"UnicodeEncodeError traceback (got exit={cli_surrogate.returncode}, "
+               f"stderr={cli_surrogate.stderr[:200]!r})")
+
+        # round-11 CONFIRMATION-pass finding (Fable): the surrogate-name fix
+        # above only patched ONE interpolation site - the fragment's own
+        # FILENAME can carry the identical shape. A non-UTF-8 byte in a
+        # filename decodes (via the OS's surrogateescape handler) into a
+        # lone surrogate character Python can hold in memory but cannot
+        # ENCODE to a normal UTF-8 stream - `main()`'s findings-report loop
+        # printed `f.path` raw and crashed on this exact input, uncaught.
+        # Fixed at the STREAM (stdout/stderr reconfigured with
+        # errors="backslashreplace" in main()), not by patching yet another
+        # individual interpolation site - this closes the WHOLE class
+        # (filenames, any future row-controlled string, everything) rather
+        # than requiring every future print site to remember `!r`.
+        # round-11 confirmation-pass minor (Fable/FortitudeEtc, both external
+        # reviewers found-by-both): `os.fsdecode` on an arbitrary raw byte
+        # string assumes the POSIX bytes-based path model - Windows paths
+        # are natively UTF-16, so this raises UnicodeDecodeError itself on
+        # Windows, before the fixture even runs. Not merge-blocking (the
+        # Governance-ledger linter self-test step in docs-lint.yml is
+        # ubuntu-24.04-only, confirmed by the reviewer's own check of the
+        # workflow file), but guarding it costs one line and keeps this
+        # fixture from becoming a landmine if a Windows leg is ever added.
+        if os.name != "nt":
+            bad_name = os.fsdecode(b"9-badname\xff.X.jsonl")
+            bad_name_path = Path(d) / bad_name
+            bad_name_path.write_bytes(b'{"a": 1}\n')
+            cli_badname = subprocess.run([sys.executable, str(_SCRIPT), "--files", str(bad_name_path)],
+                                          capture_output=True, text=True, errors="backslashreplace")
+            expect(cli_badname.returncode == 1 and "Traceback" not in cli_badname.stderr,
+                   f"CLI on a fragment whose FILENAME contains a non-UTF-8 byte exits 1 with a "
+                   f"finding, never a UnicodeEncodeError traceback "
+                   f"(got exit={cli_badname.returncode}, stderr={cli_badname.stderr[:200]!r})")
+
+        # round-11 review minor (Fable + Sol): json.loads accepts Python's
+        # non-standard NaN/Infinity/-Infinity literals (RFC 8259 section 6
+        # permits ONLY finite numbers) with no diagnostic by default.
+        # Format-hygiene rather than an escalation-loss path (every merge/
+        # severity-governing field with a type check already fires a loud
+        # downstream finding on one of these), but a one-line close.
+        for const, label in (("NaN", "NaN"), ("Infinity", "Infinity"), ("-Infinity", "-Infinity")):
+            const_path = Path(d) / f"9-const{label}.X.jsonl"
+            const_path.write_text(f'{{"pass_ordinal": {const}}}\n', encoding="utf-8")
+            const_findings = M.check_fragment(str(const_path))
+            expect("invalid-json" in _rules(const_findings),
+                   f"the non-standard JSON constant {label} is rejected as invalid-json, not "
+                   f"silently accepted (got {_rules(const_findings)})")
 
         # round-9 review should-fix (Fable + Sol): json.loads()'s except
         # clause caught only json.JSONDecodeError - a JSON integer literal
