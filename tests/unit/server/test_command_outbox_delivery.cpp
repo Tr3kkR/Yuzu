@@ -263,6 +263,68 @@ TEST_CASE("CommandOutboxDelivery[pg]: a malformed payload fails the occurrence, 
     CHECK(fx.raw_state("occ-bad") == "failed");
 }
 
+// json-dump-depth-guard fix (#2437-class): `c.parameters` is sourced from
+// ScheduleRunner's `parameter_values`. Schedule CREATION already guards this
+// text (schedule_routes.cpp:94), but a row written before that write-side
+// guard shipped, or via any other write path that bypasses it, still reaches
+// this READ path on every tick with no operator action in the loop at all.
+TEST_CASE("CommandOutboxDelivery[pg]: a parameters payload nested past the depth guard fails "
+          "the occurrence; another pending occurrence in the same tick still delivers normally",
+          "[command_outbox][pg][delivery][depth]") {
+    DeliveryPg fx;
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth. kMcpMaxJsonDepth is 32; the 40-deep array below is
+    // comfortably past it and still trivially safe to construct/parse/dump
+    // directly in this test process, orders of magnitude short of the
+    // ~100,000-level depth that actually SIGSEGVs the real background worker
+    // this guard exists to protect.
+    auto poisoned = fx.req("occ-depth", "cmd-depth");
+    poisoned.parameters = R"({"nested":)" + std::string(40, '[') + std::string(40, ']') + R"(})";
+    REQUIRE(fx.store().claim_and_enqueue(poisoned, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    // A second, healthy occurrence enqueued right after: the tick must not
+    // stop processing the rest of the batch just because one occurrence up
+    // front is poisoned.
+    auto healthy = fx.req("occ-depth-ok", "cmd-depth-ok");
+    REQUIRE(fx.store().claim_and_enqueue(healthy, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    probe.next.sent = 1;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+    loop.tick();
+
+    CHECK(fx.raw_state("occ-depth") == "failed");  // marked failed, never dispatched
+    CHECK(fx.raw_state("occ-depth-ok") == "sent");  // the OTHER occurrence still delivered
+    CHECK(probe.calls == 1);                        // only the healthy occurrence dispatched
+    CHECK(probe.last_command_id == "cmd-depth-ok");
+}
+
+TEST_CASE("CommandOutboxDelivery[pg]: a repeated tick against the same depth-poisoned "
+          "occurrence behaves identically each time, no crash, no re-drive",
+          "[command_outbox][pg][delivery][depth]") {
+    DeliveryPg fx;
+    auto poisoned = fx.req("occ-depth-repeat", "cmd-depth-repeat");
+    poisoned.parameters = R"({"nested":)" + std::string(40, '[') + std::string(40, ']') + R"(})";
+    REQUIRE(fx.store().claim_and_enqueue(poisoned, fx.lock(), fx.epoch()) ==
+            OutboxEnqueueOutcome::Enqueued);
+
+    DispatchProbe probe;
+    auto loop = fx.make_delivery(probe, /*arming_allow=*/true);
+
+    // mark_failed is a PERMANENT transition (mirrors the malformed-payload
+    // case above): once failed, list_pending no longer returns it, so a
+    // second/third tick must not re-process, re-count, or re-dispatch it (no
+    // unbounded retry loop for this failure class).
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        INFO("attempt " << attempt);
+        loop.tick();
+        CHECK(fx.raw_state("occ-depth-repeat") == "failed");
+        CHECK(probe.calls == 0);  // never dispatched, on any attempt
+    }
+}
+
 TEST_CASE("CommandOutboxDelivery[pg]: does nothing when this replica is not leader",
           "[command_outbox][pg][delivery]") {
     DeliveryPg fx;
