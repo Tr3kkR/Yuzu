@@ -16,6 +16,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth — shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -9122,6 +9123,14 @@ void RestApiV1::register_routes(
             auto session = auth_fn(req, res);
             if (!session)
                 return;
+            // #2437-class guard: check nesting on the RAW body BEFORE parse.
+            // A parsed-then-dumped subtree still crashes on the dump - the
+            // check has to run before any allocation, on the text itself
+            // (mirrors mcp_jsonrpc.hpp's own parse_request ordering).
+            if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                return;
+            }
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded() || !body.is_object()) {
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9435,6 +9444,12 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
+                      // #2437-class guard: raw-text depth check before parse — see
+                      // the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9499,6 +9514,12 @@ void RestApiV1::register_routes(
                           return;
                       if (!instruction_store || !instruction_store->is_open()) {
                           rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      // #2437-class guard: raw-text depth check before parse — see
+                      // the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
