@@ -24547,6 +24547,60 @@ TEST_CASE("MCP reevaluate_result_set: a params object smuggled past create_resul
     }
 }
 
+// json-dump-depth-guard fix (#2437-class): reevaluate_result_set used to
+// parse-then-dump orig->source_payload with no bound on its nesting depth.
+// nlohmann::json::dump() is unboundedly recursive, so a row poisoned via any
+// write path (past or future) would SIGSEGV the process on the eventual
+// dump() call. Seeded directly in the store, the same "unwired caller_fn"
+// pattern used above, since no creation path should ever be asked to build a
+// row this way. kMcpMaxJsonDepth is 32; the source_payload below nests 40
+// levels - trivially safe to construct/dump in this test process, and many
+// orders of magnitude short of the ~100,000-level depth that actually
+// crashes the real dump() call.
+TEST_CASE("MCP reevaluate_result_set: a stored source_payload nested past the depth "
+          "limit is refused, never dispatched",
+          "[pg][mcp][integration][result-sets][security][depth]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "poisoned";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth.
+    cr.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("nests too deeply") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+}
+
 // Gate 6 sre finding (#4364 re-review): the params-bound recheck just above
 // ran AFTER the instruction_store availability gate, unlike every sibling
 // ordering fix in this same PR - during a concurrent instruction_store

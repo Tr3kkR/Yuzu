@@ -288,6 +288,19 @@ std::string make_instruction(InstructionStore& s) {
     return *id;
 }
 
+// A valid JSON value nested `depth` levels deep, built as a flat bracket
+// chain ("[[[...]]]") rather than a constructed nlohmann::json object.
+// json-dump-depth-guard fix: kMcpMaxJsonDepth is 32, and the REAL attack
+// depth this guard exists for is roughly 100,000 levels - many orders of
+// magnitude past what any test here should ever build. depth values in the
+// tens (as used below) are trivially safe to construct and dump() directly
+// in this test process; this helper exists so no test accidentally reaches
+// for a constructed nlohmann::json object at a dangerous depth instead.
+std::string nested_array(int depth) {
+    return std::string(static_cast<std::size_t>(depth), '[') +
+          std::string(static_cast<std::size_t>(depth), ']');
+}
+
 } // namespace
 
 TEST_CASE("from-tar-query: 202 pending, dispatch to __all__ when no parent",
@@ -1111,4 +1124,138 @@ TEST_CASE("owner-scoped result-set routes: an ordinary session is unaffected "
     CHECK(res->status == 200);
     for (const auto& a : h.audits)
         CHECK(a.action != "result_set.list.access_denied");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. These bodies are otherwise-VALID, otherwise-ACCEPTED
+// requests (every required field present and well-typed) with one extra
+// deeply-nested field, so on unguarded code the request proceeds all the way
+// to a store write / dispatch, and only the new depth check tells fixed and
+// unfixed code apart - a bare non-object body would 400 on BOTH (the
+// "body must be a JSON object" check), which would prove nothing.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("POST /api/v1/result-sets: a body nested past the depth limit is rejected "
+          "before any store write",
+          "[pg][result_set][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    // The deep structure lives inside "source_payload" itself - the exact
+    // field this handler calls .dump() on - not just a decoy field elsewhere.
+    const std::string body =
+        R"({"name":"deep","device_ids":["dev-1"],"source_payload":{"junk":)" +
+        nested_array(40) + "}}";
+    h.post("/api/v1/result-sets", body, status);
+    CHECK(status == 400);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
+          "[pg][result_set][async][tar][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    const std::string body = R"({"sql":"SELECT 1","junk":)" + nested_array(40) + "}";
+    h.post("/api/v1/result-sets/from-tar-query", body, status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("from-tar-query: depth guard boundary, 32 levels passes and 33 is rejected",
+          "[pg][result_set][async][tar][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    // The wrapping object contributes one level, so N nested arrays inside it
+    // reach depth 1+N: 31 arrays -> depth 32 (== kMcpMaxJsonDepth, allowed);
+    // 32 arrays -> depth 33 (rejected). Proves the guard isn't over-tightened.
+    SECTION("exactly at the limit is accepted") {
+        AsyncHarness h(pool);
+        int status = 0;
+        const std::string body = R"({"sql":"SELECT 1","junk":)" + nested_array(31) + "}";
+        h.post("/api/v1/result-sets/from-tar-query", body, status);
+        CHECK(status == 202);
+        CHECK(h.calls.size() == 1);
+    }
+    SECTION("one level past the limit is rejected") {
+        AsyncHarness h(pool);
+        int status = 0;
+        const std::string body = R"({"sql":"SELECT 1","junk":)" + nested_array(32) + "}";
+        h.post("/api/v1/result-sets/from-tar-query", body, status);
+        CHECK(status == 400);
+        CHECK(h.calls.empty());
+    }
+}
+
+TEST_CASE("from-instruction-result: a params value nested past the depth limit is "
+          "rejected before dispatch",
+          "[pg][result_set][async][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto def_id = make_instruction(*h.instr);
+    int status = 0;
+    // Nests the deep structure inside "params", the exact field whose
+    // non-string values this handler's params-building loop calls .dump() on.
+    const std::string body = R"({"instruction_id":")" + def_id + R"(","params":{"deep":)" +
+                             nested_array(40) + "}}";
+    h.post("/api/v1/result-sets/from-instruction-result", body, status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("from-inventory-query: a body nested past the depth limit is rejected before "
+          "any dependency or validation check reads it",
+          "[pg][result_set][async][security][depth]") {
+    // #4373-class gap found while implementing the three named routes: this
+    // handler also does cr.source_payload = body.dump() a few lines below.
+    // No InventoryStore is wired here on purpose - proves the depth check
+    // runs ahead of the "inventory store not available" 503, not merely
+    // ahead of the store write.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    const std::string body = R"({"name":"deep","junk":)" + nested_array(40) + "}";
+    h.post("/api/v1/result-sets/from-inventory-query", body, status);
+    CHECK(status == 400);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("re-eval: a stored source_payload nested past the depth limit is refused, "
+          "never re-dispatched",
+          "[pg][result_set][async][reeval][security][depth]") {
+    // Mirrors "re-eval: an oversized SQL smuggled onto an existing row is
+    // refused" above: seeded directly in the store, since no CREATION path
+    // (guarded or not) should ever be asked to build a row this way - the
+    // row is poisoned as if it had been written before this guard existed,
+    // or via any other path past or future.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-poisoned";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth.
+    cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
 }
