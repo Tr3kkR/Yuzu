@@ -28,6 +28,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <sys/stat.h> // umask()
+#include <unistd.h>   // geteuid()
 #endif
 
 namespace yuzu::server::auth {
@@ -163,7 +164,13 @@ std::filesystem::path default_config_path() {
 #ifdef _WIN32
     return R"(C:\ProgramData\Yuzu\yuzu-server.cfg)";
 #elif defined(__APPLE__)
-    // Use per-user Application Support when not running as root
+    // Use per-user Application Support when not running as root. Gated on
+    // euid (not just __APPLE__) for the same reason as default_cert_dir()
+    // below: macOS sudo preserves $HOME by default, so an unqualified $HOME
+    // fallback would send "sudo yuzu-server" to the invoking user's home
+    // instead of the shared system config path.
+    if (::geteuid() == 0)
+        return "/etc/yuzu/yuzu-server.cfg";
     if (const char* home = std::getenv("HOME")) {
         return std::filesystem::path(home) / "Library/Application Support/Yuzu/yuzu-server.cfg";
     }
@@ -177,7 +184,22 @@ std::filesystem::path default_cert_dir() {
 #ifdef _WIN32
     return R"(C:\ProgramData\Yuzu\certs)";
 #elif defined(__APPLE__)
-    return "/etc/yuzu/certs";
+    // Root keeps the shared /etc/yuzu/certs convention (matches Linux, matches
+    // every doc/runbook/script that names it, and matches a packaged/privileged
+    // install). A non-root run falls back to per-user Application Support, same
+    // as default_config_path() above: /etc/yuzu is root-owned, so a native
+    // macOS server run as a dev (start-UAT.sh, no --ca-dir) previously refused
+    // to generate default-ca.pem / the secrets KEK with EACCES. Gating on euid
+    // (not just __APPLE__) matters because macOS sudo preserves $HOME by
+    // default (no -H) — an unqualified $HOME fallback would make "sudo
+    // yuzu-server" write CA/KEK key material into the invoking user's home
+    // instead of /etc/yuzu/certs.
+    if (::geteuid() == 0)
+        return "/etc/yuzu/certs";
+    if (const char* home = std::getenv("HOME")) {
+        return std::filesystem::path(home) / "Library/Application Support/Yuzu/certs";
+    }
+    return "/Library/Application Support/Yuzu/certs";
 #else
     return "/etc/yuzu/certs";
 #endif
