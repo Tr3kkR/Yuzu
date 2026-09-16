@@ -88,6 +88,7 @@ constexpr std::string_view kDexSignals[] = {
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
+                                         "list_dex_app_perf_devices",
                                          "get_dex_group_app_perf",   "compare_app_perf_versions",
                                          "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices"};

@@ -26,6 +26,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 using namespace yuzu::server;
@@ -2236,6 +2237,183 @@ TEST_CASE("DEX device app-perf drill: gating, audit verb, and three read states"
         REQUIRE(r);
         CHECK(audited.empty()); // denied before the behavioural-PII audit fires
         CHECK(r->body.find("chrome.exe") == std::string::npos);
+    }
+}
+
+TEST_CASE("DEX version-devices drill fragment: gate, param validation, audit, "
+          "visible-set threading",
+          "[dex][app_perf][routes][rbac]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto fleet = []() { return DexFleet{1, 1}; };
+    std::string audited;
+    std::string audited_result;
+    auto audit = [&](const httplib::Request&, const std::string& a, const std::string& r,
+                     const std::string& ttype, const std::string& tid, const std::string& d) -> bool {
+        audited = a + "|" + r + "|" + ttype + "|" + tid + "|" + d;
+        audited_result = r;
+        return true;
+    };
+
+    std::optional<std::vector<std::string>> seen_visible_ids;
+    bool seen_visible_ids_set = false;
+    bool degrade = false;
+    AppPerfProviders providers;
+    providers.version_devices =
+        [&](std::string_view app, std::string_view version,
+            const std::optional<std::vector<std::string>>& visible_ids,
+            bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
+        CHECK(app == "chrome.exe");
+        seen_visible_ids = visible_ids;
+        seen_visible_ids_set = true;
+        truncated = false;
+        if (degrade)
+            return std::nullopt;
+        (void)version;
+        AppPerfVersionDeviceRow r;
+        r.agent_id = "WS-1";
+        r.last_day = 1'700'000'000;
+        r.samples = 5;
+        r.cpu_avg = 42.0;
+        r.ws_avg_bytes = 100;
+        return std::vector<AppPerfVersionDeviceRow>{r};
+    };
+
+    auto admit_unfiltered = [](const httplib::Request&, httplib::Response&, const std::string&,
+                               const std::string&) {
+        return authz::FleetReadGate{.admitted = true, .scope = std::nullopt};
+    };
+    auto admit_scoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                           const std::string&) {
+        return authz::FleetReadGate{
+            .admitted = true,
+            .scope = authz::VisibleSet{std::unordered_set<std::string>{"WS-1"}}};
+    };
+    auto deny = [](const httplib::Request&, httplib::Response& res, const std::string&,
+                   const std::string&) {
+        res.status = 403;
+        return authz::FleetReadGate{.admitted = false};
+    };
+
+    SECTION("gate unwired -> 200 note, no read, no audit (fails closed, never falls back)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}); // fleet_read_fn = {} (unwired)
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("authorization gate not configured") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set); // provider never called
+        CHECK(audited.empty());
+    }
+
+    SECTION("gate denies -> the gate's own status stands, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, deny);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 403);
+        CHECK_FALSE(seen_visible_ids_set);
+        CHECK(audited.empty());
+    }
+
+    SECTION("missing app -> 200 note, gate never called, no read, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("missing version (absent, not empty) -> 200 note -- omission is NOT "
+            "'all versions' on this route") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("Missing or invalid") != std::string::npos);
+        CHECK_FALSE(seen_visible_ids_set);
+    }
+
+    SECTION("EMPTY version (present, explicit) IS accepted -- the unknown-version bucket") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(seen_visible_ids_set); // reached the provider — "" was accepted
+        CHECK(r->body.find("WS-1") != std::string::npos);
+    }
+
+    SECTION("nullopt gate scope (unfiltered) threads through as nullopt, not an empty vector") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        CHECK_FALSE(seen_visible_ids.has_value()); // unfiltered, not deny-all
+        CHECK(r->body.find("WS-1") != std::string::npos);
+        CHECK(r->body.find("42.0%") != std::string::npos);
+        // Audit fires AFTER the read with the real device count.
+        CHECK(audited.find("dex.app_perf.devices.view|success|GuaranteedState|") == 0);
+        CHECK(audited.find("devices=1") != std::string::npos);
+    }
+
+    SECTION("engaged gate scope threads through the EXACT set (ADR-0017 push-into-query)") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_scoped);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        REQUIRE(seen_visible_ids_set);
+        REQUIRE(seen_visible_ids.has_value());
+        REQUIRE(seen_visible_ids->size() == 1);
+        CHECK((*seen_visible_ids)[0] == "WS-1");
+    }
+
+    SECTION("store degrade -> 200 honest note, audit fires with result=failure") {
+        degrade = true;
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               providers, {}, admit_unfiltered);
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("could not be read") != std::string::npos);
+        CHECK(audited_result == "failure");
+    }
+
+    SECTION("no provider wired -> graceful note, no audit") {
+        test::TestRouteSink sink;
+        DexRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, nullptr, fleet, audit, {}, {}, {}, {}, {},
+                               {}, {}, admit_unfiltered); // app_perf_providers = {}
+        auto r = sink.Get("/fragments/dex/perf/app/devices?app=chrome.exe&version=1.0");
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("no app-perf device provider wired") != std::string::npos);
+        CHECK(audited.empty());
     }
 }
 

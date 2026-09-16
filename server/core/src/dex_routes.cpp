@@ -2635,21 +2635,24 @@ void DexRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
+                                FleetReadFn fleet_read_fn) {
     // Production adapter: wrap the httplib server in the route-sink seam and
     // delegate to the testable overload (mirrors GuardianRoutes / RestApiV1).
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), store, std::move(fleet_fn),
                     std::move(audit_fn), std::move(dispatch_fn), std::move(responses_fn),
                     std::move(perf_fn), std::move(scoped_perm_fn), std::move(visible_set_fn),
-                    std::move(app_perf_providers), std::move(group_list_fn));
+                    std::move(app_perf_providers), std::move(group_list_fn),
+                    std::move(fleet_read_fn));
 }
 
 void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
                                 GuaranteedStateStore* store, FleetFn fleet_fn, AuditFn audit_fn,
                                 DispatchFn dispatch_fn, ResponsesFn responses_fn, PerfFn perf_fn,
                                 ScopedPermFn scoped_perm_fn, VisibleSetFn visible_set_fn,
-                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn) {
+                                AppPerfProviders app_perf_providers, GroupListFn group_list_fn,
+                                FleetReadFn fleet_read_fn) {
     auth_fn_ = std::move(auth_fn);
     perm_fn_ = std::move(perm_fn);
     scoped_perm_fn_ = std::move(scoped_perm_fn);
@@ -2661,6 +2664,7 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     responses_fn_ = std::move(responses_fn);
     perf_fn_ = std::move(perf_fn);
     app_perf_providers_ = std::move(app_perf_providers);
+    fleet_read_fn_ = std::move(fleet_read_fn);
     group_list_fn_ = std::move(group_list_fn);
 
     // Resolve the visible-agent set for filtering device-id-rendering lists so an
@@ -3189,6 +3193,117 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
         }
         res.set_content(render_dex_app_perf_trend(app, versions, group, groups, kDexCohortFloor,
                                                   window_days, version),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- F2b version-drill: "which devices" (#4250-family follow-on) -----------
+    //
+    // The click-to-expand companion to the trend table above: one version row
+    // names the devices that reported it among their top-N resource consumers.
+    // Unlike the picker/trend routes just above, this route's rows carry
+    // agent_id — an identified, fleet-wide fan-out read — so the bare
+    // `perm_fn_("GuaranteedState","Read")` those routes use is WRONG here (no
+    // service-scope confinement, no per-agent visible-set narrowing). This route
+    // uses `fleet_read_fn_` (AuthRoutes::require_fleet_read, ADR-0017) as its
+    // SOLE gate instead — never stacked with perm_fn_ (the identical BLOCKING
+    // defect require_fleet_read's own doc comment warns against) — and pushes
+    // the gate's resolved VisibleSet into the STORE QUERY (AppPerfDailyStore::
+    // list_devices_for_version), never a post-fetch filter, so a present-empty
+    // scope yields zero rows rather than an unfiltered page. Deliberately does
+    // NOT use `resolve_visible` (this file's pre-existing username-keyed
+    // VisibleSetFn) — that seam is keyed on Infrastructure:Read and resolves to
+    // nullopt (unfiltered) when unwired, the exact anti-pattern this route must
+    // avoid.
+    //
+    // No statistical floor (kDexCohortFloor does not apply): every row already
+    // names an agent_id, so a named-group-sized list protects nothing a floor
+    // would add (precedent: the per-device drill above and VERIFY's compare are
+    // both floor-free for the identical reason). The audited access IS the
+    // control instead.
+    //
+    // Fleet-wide only in this slice: a group-scoped trend's version rows do NOT
+    // render this affordance (see render_dex_app_perf_trend's own comment) —
+    // narrowing this drill to a named group's members needs its own provider
+    // composition (member resolution + this query) and is deferred, not an
+    // oversight.
+    sink.Get("/fragments/dex/perf/app/devices", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        // The trigger link (below, render_dex_app_perf_trend) uses
+        // `hx-target="closest tr" hx-swap="afterend"`, so EVERY response here —
+        // including every error/empty note — must be a well-formed `<tr>` to
+        // insert as a table row; colspan=6 matches the trend table's own column
+        // count (Version/Avg CPU/p95 CPU/CPU trend/Avg working set/Devices).
+        auto row = [](const std::string& inner) {
+            return "<tr><td colspan=\"6\">" + inner + "</td></tr>";
+        };
+        const auto cid = detail::make_correlation_id();
+        // No `window` param: this drill reads each device's MOST RECENT
+        // reporting day for the exact version, independent of the trend's
+        // display window — see the route comment above and the store method's
+        // own doc comment (app_perf_daily_store.hpp).
+        const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+        // `version` is REQUIRED-PRESENT here (unlike the trend route's "" =
+        // all-versions convention): this drill is always scoped to ONE exact
+        // version, and Linux's procperf emits "" for EVERY app
+        // (tar_proc_perf.cpp) — treating a missing `version` as "all versions"
+        // would silently collapse to the single Linux bucket instead of
+        // surfacing a genuine parameter error.
+        if (!req.has_param("version") || app.empty() || !app_perf_param_valid(app) ||
+            !app_perf_param_valid(req.get_param_value("version"))) {
+            res.set_content(row("<div class=\"gp-note\">Missing or invalid app/version.</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        const std::string version = yuzu::util::canon_version(req.get_param_value("version"));
+        if (!fleet_read_fn_) {
+            // Unwired gate = misconfiguration, never "no filter" — but a
+            // fragment stays at 200 (htmx drops 4xx/5xx bodies) and says so
+            // plainly rather than silently falling back to a weaker check.
+            res.set_content(row("<div class=\"gp-note\">Device list unavailable on this server "
+                                "(authorization gate not configured).</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
+        if (!gate.admitted)
+            return; // the gate already wrote 401/403/503 (not a <tr> — the accepted
+                    // denial shape for this gate everywhere else it's used)
+        if (!app_perf_providers_.version_devices) {
+            res.set_content(row("<div class=\"gp-note\">Device list unavailable on this server "
+                                "(no app-perf device provider wired).</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // gate.scope: nullopt = unfiltered; engaged (incl. empty) = restrict to
+        // exactly these agent_ids. Converted to the provider's vector shape —
+        // still pushed into the STORE query by the provider, never post-filtered
+        // here.
+        std::optional<std::vector<std::string>> visible_ids;
+        if (gate.scope)
+            visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
+        bool truncated = false;
+        auto rows = app_perf_providers_.version_devices(app, version, visible_ids, truncated);
+        if (!rows) {
+            // Store degrade — audit the attempted access (CC7.2), set-and-proceed
+            // (this fragment is not the fail-closed surface; the REST twin is).
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
+                "app=" + app + " version=" + version + " store degraded; cid=" + cid);
+            res.set_content(row("<div class=\"gp-note\">The app-perf store could not be read "
+                                "right now. Retry shortly.</div>"),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        // Audit AFTER the read (so the detail carries the real device count) but
+        // BEFORE rendering — set-and-proceed: a persist failure only flags the
+        // gap (Sec-Audit-Failed is a REST-only header; the dashboard has no
+        // equivalent signal short of the note itself), it never blanks the
+        // dashboard.
+        (void)detail::try_persist_audit(
+            audit_fn_, req, "dex.app_perf.devices.view", "success", "GuaranteedState", "",
+            "app=" + app + " version=" + version + " devices=" + std::to_string(rows->size()) +
+                " cid=" + cid);
+        res.set_content(row(render_dex_app_perf_version_devices(*rows, truncated)),
                         "text/html; charset=utf-8");
     });
 

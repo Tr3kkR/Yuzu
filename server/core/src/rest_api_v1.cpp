@@ -1196,6 +1196,9 @@ const std::string& openapi_spec() {
     "/dex/perf/app": {
       "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale}). A sub-floor (<10 devices) point carries suppressed=true with device_count only."}, "400": {"description": "missing app, or app/version invalid (too long or control characters)"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
     },
+    "/dex/perf/app/devices": {
+      "get": {"summary": "Which devices reported one app version (version-row drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_fleet_read (ADR-0017 admit-then-filter — the SOLE gate on this route, never stacked with a bare permission check). Unlike GET /dex/perf/app above, each row here names an agent_id — a fleet-wide fan-out of identified per-device data — so the caller's management-group/service-scope confinement is pushed into the underlying SQL query itself (never a post-fetch filter): a confined caller sees exactly their visible devices, never an unfiltered page. version is REQUIRED and matched EXACTLY (omit-means-'all-versions' does NOT apply here, unlike /dex/perf/app — pass an empty string for the unknown-version bucket; Linux procperf reports every app under this empty bucket today). Each row is that device's MOST RECENT reported day for this exact (app, version) among its retained daily top-N resource-significant app-versions — NOT a census of every device with this app-version installed (see /api/v1/inventory/software for the census). Rows are ordered by descending cpu_avg and capped; truncated=true means only the highest-CPU devices are shown. Per-device (B1) data retains only 31 days, shorter than this trend's 180-day (B2) retention, so a version last seen >31 days ago legitimately returns zero devices even though GET /dex/perf/app still shows aggregate history for it. Individual-identifying, so every call emits a dex.app_perf.devices.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Exact version, canonicalized and matched exactly; empty string = the unknown-version bucket, NOT 'all versions'."}], "responses": {"200": {"description": "{data:{app, version, truncated, devices[].{agent_id, last_day, samples, cpu_avg, ws_avg_bytes}}}"}, "400": {"description": "missing/invalid app or version (version must be present, even if empty)"}, "403": {"description": "caller lacks GuaranteedState:Read"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.app_perf.devices.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+    },
     "/dex/perf/group": {
       "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (10) of devices is returned with suppressed=true and device_count only — its means/percentiles are withheld (a small named-group aggregate is de-facto individual behaviour). Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped RBAC principal does not pass the global check and cannot use this endpoint — no cross-operator exposure on THAT axis. A service-scoped API token is a separate axis, though: it holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so it could otherwise supply any group_id, including one outside its own service — denied outright (403), and the deny is audited (dex.perf.group.view) though an ordinary successful read is not.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "403": {"description": "Service-scoped API token — this management-group read cannot be confined to the token's service (a management-group-scoped RBAC grant is a different axis and is excluded by the global permission gate; a service-scoped token holds a global grant regardless)."}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
     },
@@ -12596,6 +12599,159 @@ void RestApiV1::register_routes(
                                              .str()),
                                  "application/json");
              });
+
+    // GET /dex/perf/app/devices?app=<name>&version=<v> — the version-row "which
+    // devices" drill: unlike the aggregate above, each row names an agent_id, a
+    // fleet-wide fan-out of identified per-device data. That single difference
+    // changes the authorization posture entirely (routed-concerns.md's DEX row):
+    // the aggregate above is correctly gated on a bare perm_fn (no agent_id to
+    // confine); THIS route uses `fleet_read_fn` (AuthRoutes::require_fleet_read,
+    // ADR-0017) as its SOLE gate instead — never stacked with perm_fn (the
+    // BLOCKING defect require_fleet_read's own doc comment warns against) — so a
+    // management-group- or service-scoped caller gets the real, narrowed
+    // agent_id set rather than either an unfiltered fleet-wide read or an
+    // outright deny. The gate's VisibleSet is pushed into the STORE QUERY
+    // (AppPerfDailyStore::list_devices_for_version), never a post-fetch filter —
+    // present-empty yields zero rows, not an unfiltered page.
+    //
+    // No statistical floor: every row already names an agent_id, so a
+    // named-group-sized list protects nothing a floor would add (same reasoning
+    // as the per-device drill GET /dex/devices/{id}/app-perf and VERIFY's
+    // compare, both floor-free). The audit trail is the control instead.
+    //
+    // `version` is REQUIRED-PRESENT (distinct from this file's `app` route's
+    // "" = all-versions convention above): this drill is always scoped to ONE
+    // exact version, and Linux procperf emits "" for every app
+    // (tar_proc_perf.cpp) — an omitted `version` would otherwise silently read
+    // as "all versions" and collapse to the single Linux bucket.
+    //
+    // FAIL-CLOSED audit (dex.app_perf.devices.view, distinct from every other
+    // dex.perf.*/dex.app_perf.* verb so this identified-device access stays
+    // independently countable, works-council precedent: dex.app_perf.compare.drill):
+    // the read happens first (so the audit detail can carry the real device
+    // count), and the RESPONSE is withheld — 503 + Sec-Audit-Failed — if that
+    // audit row fails to persist, matching GET /dex/devices/{id}/app-perf's
+    // posture exactly (this route just moves the read earlier so the detail is
+    // honest instead of generic).
+    sink.Get(
+        "/api/v1/dex/perf/app/devices",
+        [fleet_read_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("dex.app_perf.devices.view: fleet_read_fn unwired — misconfigured "
+                              "call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+            if (app.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'app'", cid,
+                                          "supply ?app=<name>; discover names via GET "
+                                          "/api/v1/dex/perf/apps"),
+                    "application/json");
+                return;
+            }
+            if (!app_perf_param_valid(app)) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "invalid parameter 'app'", cid,
+                                          "'app' must be <= 512 bytes with no control "
+                                          "characters"),
+                    "application/json");
+                return;
+            }
+            if (!req.has_param("version")) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'version'", cid,
+                                          "supply ?version=<exact version>, or ?version= for "
+                                          "the unknown-version bucket; discover versions via "
+                                          "GET /api/v1/dex/perf/app"),
+                    "application/json");
+                return;
+            }
+            const std::string raw_version = req.get_param_value("version");
+            if (!app_perf_param_valid(raw_version)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid parameter 'version'", cid),
+                                "application/json");
+                return;
+            }
+            const std::string version = yuzu::util::canon_version(raw_version);
+            // require_fleet_read is the SOLE gate — see the comment above the route
+            // registration for why it must never be stacked with perm_fn.
+            auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
+            if (!gate.admitted)
+                return;
+            if (!app_perf_providers.version_devices) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            std::optional<std::vector<std::string>> visible_ids;
+            if (gate.scope)
+                visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
+            bool truncated = false;
+            auto rows = app_perf_providers.version_devices(app, version, visible_ids, truncated);
+            if (!rows) { // AUTHORITATIVE read degrade
+                (void)detail::try_persist_audit(
+                    audit_fn, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
+                    "app=" + audit_token(app) + " version=" + audit_token(version) +
+                        " store degraded; cid=" + cid);
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf store read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            // Audit AFTER the read (so the detail carries the real device count) but
+            // BEFORE the response is composed/sent — FAIL CLOSED: withhold the data
+            // if the evidence row is known-lost, exactly like GET
+            // /dex/devices/{id}/app-perf, just with a richer detail string.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "dex.app_perf.devices.view", "success", "GuaranteedState",
+                    "",
+                    "app=" + audit_token(app) + " version=" + audit_token(version) +
+                        " devices=" + std::to_string(rows->size()) + " cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("dex.app_perf.devices.view audit fail-closed (503) cid={}", cid);
+                return;
+            }
+            JArr arr;
+            for (const auto& d : *rows) {
+                arr.add(JObj()
+                            .add("agent_id", d.agent_id)
+                            .add("last_day", d.last_day)
+                            .add("samples", d.samples)
+                            .add("cpu_avg", d.cpu_avg)
+                            .add("ws_avg_bytes", d.ws_avg_bytes));
+            }
+            res.set_content(ok_json(JObj()
+                                        .add("app", app)
+                                        .add("version", version)
+                                        .add("truncated", truncated)
+                                        .raw("devices", arr.str())
+                                        .str()),
+                            "application/json");
+        });
 
     // GET /dex/perf/group?group_id=<id>&app=<name>&version=<v> — the management-
     // group trend: the same fleet-trend shape, aggregated on-the-fly over ONE

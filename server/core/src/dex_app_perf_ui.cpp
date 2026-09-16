@@ -383,10 +383,36 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                  "withheld)</td><td>" + std::to_string(v.device_count) + "</td></tr>";
             continue;
         }
+        // Devices-cell click-to-expand: fleet-wide ONLY (is_group false). A
+        // group-scoped trend does not (yet) narrow the version-devices drill to
+        // the group's own members — showing the affordance there would silently
+        // widen what "devices" means for that row (see dex_routes.cpp's route
+        // registration comment for the v1-scope reason), so it is omitted
+        // rather than shown-but-wrong. `hx-target="closest tr" hx-swap="afterend"`
+        // inserts the server's returned `<tr>` immediately below THIS row with
+        // no pre-existing placeholder and no client JS; `hx-trigger="click once"`
+        // means a second click is a no-op (reveal-only, no collapse — matches
+        // this row's own "latest tag" simplicity bar).
+        std::string devices_cell = std::to_string(v.device_count);
+        if (!is_group) {
+            // `version=` with an EXPLICITLY EMPTY value is unambiguous here (unlike
+            // the trend's own version-filter link above): this route requires
+            // `version` PRESENT (not merely non-empty) and treats "" as the valid
+            // "unknown version" bucket, never "unfiltered" — so the `(no version)`
+            // row gets the affordance too (the ONLY bucket Linux procperf ever
+            // reports, tar_proc_perf.cpp).
+            const std::string devices_qs =
+                "app=" + url_encode(app_name) + "&amp;version=" + url_encode(v.version);
+            devices_cell += " <a style=\"cursor:pointer;font-size:.68rem\" class=\"gp-mute\" "
+                            "hx-get=\"/fragments/dex/perf/app/devices?" +
+                            devices_qs +
+                            "\" hx-target=\"closest tr\" hx-swap=\"afterend\" "
+                            "hx-trigger=\"click once\">&#9656; devices</a>";
+        }
         h += "<tr><td>" + ver + tag + "</td><td>" + fmt_pct(v.cpu_mean) + "</td><td>" +
              pctile_cell(v.cpu_p95) + "</td><td>" + spark(v.cpu_series) + "</td><td>" +
-             fmt_bytes(static_cast<double>(v.ws_mean)) + "</td><td>" +
-             std::to_string(v.device_count) + "</td></tr>";
+             fmt_bytes(static_cast<double>(v.ws_mean)) + "</td><td>" + devices_cell +
+             "</td></tr>";
     }
     h += "</tbody></table>";
 
@@ -404,7 +430,48 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                 " devices shows its count only (works-council co-determination). Group scope reads "
                 "the per-device store (up to <b>31 days</b>); the whole-fleet view covers the full "
                 "<b>180-day</b> aggregate, so a group series is shorter for the same app.";
+    else
+        foot += " &ldquo;&#9656; devices&rdquo; on a version row lists the devices where this "
+                "exact version was among the device's own top resource consumers — not a full "
+                "inventory of every device running it, and per-device data is retained only 31 "
+                "days (shorter than this 180-day trend), so an old version row can legitimately "
+                "list none.";
     h += "<div class=\"gp-note\">" + foot + "</div>";
+    return h;
+}
+
+std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersionDeviceRow>& devices,
+                                                bool truncated) {
+    if (devices.empty()) {
+        // Two independent, equally-legitimate reasons collapse to the identical
+        // empty state (deliberately combined rather than guessed apart — see
+        // this fn's own doc comment in dex_app_perf_ui.hpp): the top-N sampling
+        // simply never named this app-version, OR the per-device (B1, 31-day)
+        // data has aged out even though the fleet trend (B2, 180-day) still
+        // shows it.
+        return "<div class=\"gp-note\">No device reported this exact app/version among its "
+               "retained top resource consumers. Either the device's daily top-N sampling "
+               "(procperf) never picked this app-version as resource-significant on any "
+               "reporting device, or this version's per-device data has aged past the "
+               "<b>31-day</b> retention window even though the fleet trend above covers up to "
+               "<b>180 days</b> &mdash; the two stores retain independently.</div>";
+    }
+    std::string h = "<table class=\"gp-table\" style=\"margin:.3rem 0 0 1.2rem;width:auto\">"
+                    "<thead><tr><th>Device</th><th>Last seen</th><th>CPU</th>"
+                    "<th>Working set</th></tr></thead><tbody>";
+    for (const auto& d : devices) {
+        h += "<tr><td style=\"font-family:var(--mono);font-size:.78rem\">" + esc(d.agent_id) +
+             "</td><td>" + ymd(d.last_day) + "</td><td>" + fmt_pct(d.cpu_avg) + "</td><td>" +
+             fmt_bytes(static_cast<double>(d.ws_avg_bytes)) + "</td></tr>";
+    }
+    h += "</tbody></table>";
+    h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">Devices where this exact "
+         "app-version was among the device's own top resource consumers &mdash; <b>not a full "
+         "inventory</b> of every device running it. &ldquo;Last seen&rdquo; is this version's "
+         "most recent reported day within the 31-day per-device retention.</div>";
+    if (truncated)
+        h += "<div class=\"gp-note\" style=\"margin-left:1.2rem\">List capped &mdash; showing "
+             "the highest-CPU devices only; more devices reported this version than shown.</div>";
     return h;
 }
 

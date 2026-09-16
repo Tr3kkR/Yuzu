@@ -103,7 +103,7 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 |---|---:|---:|---:|
 | devices | 10 | 7 | 3 |
 | inventory | 6 | 1 | 5 |
-| dex | 25 | 17 | 8 |
+| dex | 26 | 18 | 8 |
 | guardian | 16 | 6 | 10 |
 | tar | 12 | 4 | 8 |
 | auto-preflight | 4 | 1 | 3 |
@@ -124,9 +124,9 @@ plus `$ref` validity) - the #842 companion to this whole-tree script.
 | ota | 15 | 0 | 15 |
 | enrollment | 19 | 5 | 14 |
 | other | 74 | 7 | 67 |
-| **Total** | **278** | **72** | **206** |
+| **Total** | **279** | **73** | **206** |
 
-Registered `/api/vN/*` routes: 225. OpenAPI `paths` entries: 224. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 174.
+Registered `/api/vN/*` routes: 226. OpenAPI `paths` entries: 225. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 175.
 
 Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 206.
 

@@ -261,12 +261,30 @@ using AppPerfCohortFn = std::function<std::optional<CohortRead>(
     std::string_view group_id, std::string_view app_name, std::string_view baseline_version,
     std::string_view candidate_version, int window_days)>;
 
+/// The version-row "which devices" drill: devices reporting `(app_name, version)`
+/// among their retained top-N daily summaries, one row per device at its most
+/// recent reporting day for that EXACT version. Mirrors
+/// `AppPerfDailyStore::list_devices_for_version` (nullopt = degrade; `truncated`
+/// out-param set when the cap clipped the list to the highest-CPU devices).
+/// `visible_agent_ids` mirrors the ADR-0017 admit-then-filter contract: nullopt =
+/// unfiltered, engaged (including empty) = restrict to exactly these agent_ids —
+/// the caller (route layer) resolves this from its OWN `require_fleet_read`
+/// scope and MUST pass it through unchanged, never widen it to nullopt. Deliberately
+/// fleet-wide only in this slice — a management-group-scoped trend does not
+/// additionally narrow this drill to the group's members (see the dashboard
+/// route's own registration comment for why that is a documented v1 gap, not an
+/// oversight).
+using AppPerfVersionDevicesFn = std::function<std::optional<std::vector<AppPerfVersionDeviceRow>>(
+    std::string_view app_name, std::string_view version,
+    const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated)>;
+
 struct AppPerfProviders {
     AppPerfFleetFn fleet;
     AppPerfAppListFn apps;
     AppPerfDeviceFn device;
     AppPerfGroupFn group;
     AppPerfCohortFn cohort; ///< VERIFY before/after compare (cohort-paired)
+    AppPerfVersionDevicesFn version_devices; ///< the version-row "which devices" drill
 };
 
 } // namespace yuzu::server

@@ -365,3 +365,84 @@ TEST_CASE("render_dex_device_app_perf: a day-tie tags both newest versions",
     }
     CHECK(n == 2);
 }
+
+// The version-row "which devices" click-to-expand affordance: fleet-wide ONLY
+// (never on a group-scoped trend, which does not yet narrow the drill to the
+// group's own members — see dex_routes.cpp's registration comment), CSP-safe
+// (hx-get/hx-target/hx-trigger, never hx-on), and present even for the
+// "(no version)" bucket (version="" is unambiguous on this route, unlike the
+// trend's own version-filter link).
+TEST_CASE("render_dex_app_perf_trend: version-devices click-to-expand affordance",
+          "[dex][app_perf][ui]") {
+    AppPerfVersionSummary v1;
+    v1.version = "124.0.0.0";
+    v1.latest_day = 200;
+    v1.device_count = 12;
+    v1.cpu_mean = 6.0;
+
+    AppPerfVersionSummary unknown; // Linux's "(no version)" bucket
+    unknown.version = "";
+    unknown.latest_day = 200;
+    unknown.device_count = 4;
+    unknown.cpu_mean = 3.0;
+
+    SECTION("fleet scope: affordance present, targets the clicked row, CSP-safe") {
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "", {}, 10, 7);
+        CHECK(has(h, "/fragments/dex/perf/app/devices?app=chrome.exe&amp;version=124.0.0.0"));
+        CHECK(has(h, "hx-target=\"closest tr\""));
+        CHECK(has(h, "hx-swap=\"afterend\""));
+        CHECK(has(h, "hx-trigger=\"click once\""));
+        CHECK_FALSE(has(h, "hx-on")); // CSP: no eval-compiled handlers
+    }
+
+    SECTION("the unknown-version (\"\") bucket also gets the affordance") {
+        const auto h = render_dex_app_perf_trend("linuxapp", {unknown}, "", {}, 10, 7);
+        CHECK(has(h, "/fragments/dex/perf/app/devices?app=linuxapp&amp;version="));
+    }
+
+    SECTION("group scope: affordance is OMITTED (v1 does not narrow the drill to the group)") {
+        std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
+        const auto h = render_dex_app_perf_trend("chrome.exe", {v1}, "g1", groups, 10, 7);
+        CHECK_FALSE(has(h, "/fragments/dex/perf/app/devices"));
+    }
+
+    SECTION("a suppressed (sub-floor group) row never gets the affordance either") {
+        AppPerfVersionSummary suppressed;
+        suppressed.version = "125.0";
+        suppressed.latest_day = 200;
+        suppressed.device_count = 3;
+        suppressed.suppressed = true;
+        std::vector<DexGroupOption> groups = {{.id = "g1", .name = "Eng"}};
+        const auto h = render_dex_app_perf_trend("chrome.exe", {suppressed}, "g1", groups, 10, 7);
+        CHECK_FALSE(has(h, "/fragments/dex/perf/app/devices"));
+    }
+}
+
+TEST_CASE("render_dex_app_perf_version_devices: empty state, populated rows, truncation note",
+          "[dex][app_perf][ui]") {
+    // Empty: an honest COMBINED explanation (top-N never named it, OR the
+    // per-device 31-day retention aged out even though the 180-day trend still
+    // shows it) — never a bare "no data".
+    const auto empty = render_dex_app_perf_version_devices({}, false);
+    CHECK(has(empty, "top-N"));
+    CHECK(has(empty, "31-day"));
+    CHECK(has(empty, "180 days"));
+
+    AppPerfVersionDeviceRow d1;
+    d1.agent_id = "agent-hi";
+    d1.last_day = 1'700'000'000;
+    d1.samples = 10;
+    d1.cpu_avg = 42.5;
+    d1.ws_avg_bytes = 1024LL * 1024 * 500; // 500 MB
+
+    const auto h = render_dex_app_perf_version_devices({d1}, /*truncated=*/false);
+    CHECK(has(h, "agent-hi"));
+    CHECK(has(h, "42.5%"));
+    CHECK(has(h, "500 MB"));
+    CHECK(has(h, "not a full inventory")); // top-N caveat always present
+    CHECK_FALSE(has(h, "capped"));
+
+    const auto trunc = render_dex_app_perf_version_devices({d1}, /*truncated=*/true);
+    CHECK(has(trunc, "capped"));
+    CHECK(has(trunc, "highest-CPU"));
+}

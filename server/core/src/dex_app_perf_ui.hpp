@@ -60,6 +60,25 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       std::int64_t group_floor, int window_days,
                                       const std::string& active_version = "");
 
+/// PURE: the version-row "which devices" drill — one row per device that
+/// reported `(app_name, version)` among its retained top-N resource consumers,
+/// its most recent CPU/working-set sample and last-seen day. NOT a census (see
+/// the file-level top-N caveat on the trend table's own foot note) — a device
+/// absent here may still run this exact app-version, just not among its top
+/// resource consumers that day. An empty `devices` renders an honest combined
+/// explanation covering BOTH reasons a version-row drill can legitimately be
+/// empty: no device's top-N ever named it, OR this version's per-device (B1)
+/// data has aged past its 31-day retention even though the fleet trend (B2)
+/// covers up to 180 days — the two stores retain independently, so a >31-day
+/// trend point returning zero devices is expected, not a bug. `truncated` adds
+/// the honest cap note (the highest-CPU devices are kept, the rest dropped).
+/// Returned content is a bare block (no outer `<table>`/`<tr>` wrapper) — the
+/// caller (dex_routes.cpp) wraps it in whatever shell its own htmx swap target
+/// needs (today: a `<tr><td colspan>` row inserted after the clicked version
+/// row).
+std::string render_dex_app_perf_version_devices(const std::vector<AppPerfVersionDeviceRow>& devices,
+                                                bool truncated);
+
 /// PURE: the per-DEVICE app-perf drill (B1) — one application per group, its
 /// versions as sub-rows, with a CPU-over-time sparkline and window aggregates.
 /// Sits inline inside the device drill's perf panel (in-place swap, no back-link —

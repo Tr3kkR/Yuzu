@@ -40,6 +40,12 @@ constexpr std::chrono::milliseconds kQueryAcquireTimeout{3000};
 // table growth: 31 days × top-N(~20) × a few versions is ~1k; this is generous
 // headroom so the store can never allocate an unbounded result set.
 constexpr int kQueryRowCap = 100000;
+// Hard ceiling on DEVICES a single "which devices ran (app,version)" drill will
+// materialise. Backs an interactive UI table (not a bulk export), so a much
+// tighter cap than kQueryRowCap above is appropriate; ordering by descending
+// cpu_avg before the cap keeps the highest resource consumers even when a
+// wildly popular version is truncated.
+constexpr int kVersionDevicesRowCap = 2000;
 // Defensive cap on rows accepted from one apply (a legit agent sends ~tens — the
 // 2-day window × top-N). Bounds memory + the upsert batch against a misbehaving
 // agent; the ingest seam's blob cap is the primary bound, this is depth.
@@ -102,6 +108,38 @@ const std::vector<pg::PgMigration>& migrations() {
          // is safe here — this table is born-on-Pg alongside B2, so it is empty at
          // first migration (no ACCESS EXCLUSIVE stall, no CONCURRENTLY needed).
          "CREATE INDEX app_perf_daily_day_idx ON app_perf_daily (day, app_name, version);"},
+        {3,
+         // Version-drill index (DEX app-perf-over-time "which devices" drill):
+         // list_devices_for_version filters WHERE app_name=$1 AND version=$2
+         // [AND agent_id = ANY($3)] then DISTINCT ON (agent_id) ... ORDER BY
+         // agent_id, day DESC. v2's (day, app_name, version) index is LEADING on
+         // day, so it does not serve an (app_name, version)-led lookup (it would
+         // scan every day-bucket for a match instead of pruning directly).
+         // Leading (app_name, version) here serves the WHERE equality; trailing
+         // (agent_id, day DESC) serves the DISTINCT ON's per-agent grouping and
+         // ordering without a separate sort.
+         //
+         // Plain (non-CONCURRENT) CREATE INDEX, unlike v2 above: this table is
+         // NOT born-empty at this migration (daily-sync ingestion has been live
+         // since v1/v2 shipped), and the PgMigrationRunner has no
+         // non-transactional migration kind yet (`CREATE INDEX CONCURRENTLY`
+         // cannot run inside the runner's per-migration transaction — see
+         // pg_migration_runner.hpp's "Future-evolution note"), so a plain build
+         // takes this table's ACCESS EXCLUSIVE lock for its duration. Two things
+         // bound the blast radius rather than merely excuse it: (1) apply_daily
+         // (the sole writer) is explicitly fail-soft — a lease/SQL failure
+         // during the lock window returns false without blocking the gRPC
+         // thread, and the agent re-sends its 2-day window next daily-sync
+         // cycle (this file's own header "Failure posture" contract), so a
+         // stalled write here is NOT a durable loss, it silently self-heals;
+         // (2) steady-state table size is bounded by fleet size x top-N(~20) x
+         // 31 days, not unbounded growth. A fleet large enough to make the lock
+         // window operator-visible should apply this migration in a
+         // maintenance window; a genuinely non-transactional migration kind is
+         // the durable fix, tracked in pg_migration_runner.hpp's own
+         // future-evolution note, and is out of this change's scope.
+         "CREATE INDEX app_perf_daily_version_devices_idx ON app_perf_daily "
+         "(app_name, version, agent_id, day DESC);"},
     };
     return kMigrations;
 }
@@ -411,6 +449,90 @@ AppPerfDailyStore::get_agent_app_perf(std::string_view agent_id) {
         r.cpu_max = to_double(PQgetvalue(res.get(), i, 6));
         r.ws_avg_bytes = to_i64(PQgetvalue(res.get(), i, 7));
         r.ws_max_bytes = to_i64(PQgetvalue(res.get(), i, 8));
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<std::vector<AppPerfVersionDeviceRow>>
+AppPerfDailyStore::list_devices_for_version(
+    std::string_view app_name, std::string_view version,
+    const std::optional<std::vector<std::string>>& visible_agent_ids, bool& truncated) {
+    truncated = false;
+    // AUTHORITATIVE read: a degrade returns nullopt, never a silent empty.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("AppPerfDailyStore: list_devices_for_version degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    std::vector<AppPerfVersionDeviceRow> out;
+    if (app_name.empty())
+        return out; // precondition miss, not a degrade (version="" is the valid unknown bucket)
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("AppPerfDailyStore: list_devices_for_version degraded — no connection "
+                         "({}) (occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+
+    std::vector<std::string> params;
+    params.emplace_back(app_name);
+    params.emplace_back(version);
+    // ADR-0017: the caller's visible-agent set is pushed into the WHERE clause
+    // (never applied post-fetch) so it composes correctly with the LIMIT below —
+    // a present-but-empty set binds an empty text[] literal, and
+    // `agent_id = ANY('{}'::text[])` is false for every row, yielding zero rows
+    // (deny-all) with no special-casing needed.
+    std::string sql =
+        "SELECT agent_id, day, samples, cpu_avg, ws_avg_bytes FROM ("
+        "  SELECT DISTINCT ON (agent_id) agent_id, day, samples, cpu_avg, ws_avg_bytes "
+        "  FROM app_perf_daily_store.app_perf_daily "
+        "  WHERE app_name = $1 AND version = $2";
+    if (visible_agent_ids) {
+        std::vector<std::string_view> views(visible_agent_ids->begin(), visible_agent_ids->end());
+        params.push_back(pg::to_text_array(views));
+        sql += " AND agent_id = ANY($3::text[])";
+    }
+    sql += "  ORDER BY agent_id, day DESC"
+           ") t ORDER BY cpu_avg DESC, agent_id LIMIT " +
+           std::to_string(kVersionDevicesRowCap);
+
+    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
+    if (res.status() != PGRES_TUPLES_OK) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("AppPerfDailyStore: list_devices_for_version degraded — query failed: "
+                         "{} (occurrence {})",
+                         PQerrorMessage(lease.get()), d.occurrence);
+        return std::nullopt;
+    }
+    const int n = PQntuples(res.get());
+    if (n >= kVersionDevicesRowCap) {
+        // The cap sits on the OUTER (cpu_avg DESC) ordering, so the dropped rows
+        // are the LOWEST-cpu devices past the ceiling — a truncated read still
+        // surfaces the highest resource consumers, never an arbitrary subset.
+        truncated = true;
+        if (metrics_)
+            metrics_->counter("yuzu_app_perf_version_devices_cap_hit_total", {}).increment();
+        spdlog::warn("AppPerfDailyStore: list_devices_for_version hit the {}-row cap for "
+                     "app='{}' version='{}' — the device list is truncated to the highest-CPU "
+                     "devices",
+                     kVersionDevicesRowCap, app_name, version);
+    }
+    out.reserve(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+        AppPerfVersionDeviceRow r;
+        r.agent_id = PQgetvalue(res.get(), i, 0);
+        r.last_day = to_i64(PQgetvalue(res.get(), i, 1));
+        r.samples = to_i64(PQgetvalue(res.get(), i, 2));
+        r.cpu_avg = to_double(PQgetvalue(res.get(), i, 3));
+        r.ws_avg_bytes = to_i64(PQgetvalue(res.get(), i, 4));
         out.push_back(std::move(r));
     }
     return out;

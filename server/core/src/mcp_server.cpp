@@ -1549,6 +1549,35 @@ static const ToolDef kTools[] = {
      R"j(},"required":["version","day","device_count","suppressed"]}})j"
      R"j(},"required":["app","version","points"]})j"},
 
+    {"list_dex_app_perf_devices",
+     "The version-row 'which devices' drill for get_dex_app_perf: unlike that aggregate "
+     "trend, each row here names an agent_id -- a fleet-wide fan-out of identified "
+     "per-device data -- so this tool is confined to the caller's own management-group/"
+     "service-scope visibility (pushed into the store query itself, never a post-fetch "
+     "filter: a confined caller never sees an unfiltered page). version is REQUIRED and "
+     "matched EXACTLY (omit-means-all-versions does NOT apply here, unlike "
+     "get_dex_app_perf) -- pass an empty string for the unknown-version bucket (the ONLY "
+     "bucket Linux procperf ever reports today). Each row is that device's MOST RECENT "
+     "reported day for this exact (app, version) among its retained daily top-N "
+     "resource-significant app-versions -- NOT a census of every device with this "
+     "app-version installed (use query_installed_software for the census). Rows are "
+     "ordered by descending cpu_avg and capped; truncated=true means only the "
+     "highest-CPU devices are shown. Per-device data retains only 31 days, shorter than "
+     "get_dex_app_perf's 180-day trend, so a version last reported >31 days ago "
+     "legitimately returns zero devices even though the trend still shows aggregate "
+     "history for it. Individual-identifying -- every call is audit-logged "
+     "(dex.app_perf.devices.view). Mirrors GET /api/v1/dex/perf/app/devices. Requires "
+     "GuaranteedState:Read.",
+     R"j({"type":"object","properties":{)j"
+     R"j("app":{"type":"string","maxLength":512,"description":"App name; discover via list_dex_perf_apps"},)j"
+     R"j("version":{"type":"string","maxLength":512,"description":"Exact version, canonicalized and matched exactly; empty string = the unknown-version bucket, NOT 'all versions'"})j"
+     R"j(},"required":["app","version"]})j",
+     R"j({"type":"object","properties":{"app":{"type":"string"},"version":{"type":"string"},"truncated":{"type":"boolean"},)j"
+     R"j("devices":{"type":"array","items":{"type":"object","properties":{)j"
+     R"j("agent_id":{"type":"string"},"last_day":{"type":"string"},"samples":{"type":"integer"},"cpu_avg":{"type":"number"},"ws_avg_bytes":{"type":"integer"}},)j"
+     R"j("required":["agent_id","last_day","samples","cpu_avg","ws_avg_bytes"]}}},)j"
+     R"j("required":["app","version","truncated","devices"]})j"},
+
     {"get_dex_group_app_perf",
      "App performance-over-time for ONE management group: the get_dex_app_perf fleet "
      "trend aggregated over a single group's members (computed on-the-fly from the "
@@ -3462,6 +3491,11 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"compare_app_perf_versions", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_dex_perf_cohort_diff", {"GuaranteedState", "Read"}},
     {"list_dex_perf_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
+    // Same real downstream mechanism as query_installed_software above
+    // (require_fleet_read's own composed VisibleSet, ADR-0017) -- `confined` is
+    // honest here because that scope genuinely narrows the served rows, unlike
+    // a label with no mechanism behind it.
+    {"list_dex_app_perf_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     {"get_network_fleet", {"GuaranteedState", "Read"}},
     {"list_network_devices", {"GuaranteedState", "Read", ServiceScopeClass::confined}},
     // Implemented write tools
@@ -4021,6 +4055,8 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"list_inventory_tables", {ToolEffect::ReadOnly, true, "List inventory tables"}},
     {"get_agent_inventory", {ToolEffect::ReadOnly, true, "Get agent inventory"}},
     {"query_installed_software", {ToolEffect::ReadOnly, true, "Query installed software"}},
+    {"list_dex_app_perf_devices",
+     {ToolEffect::ReadOnly, true, "List devices reporting an app version"}},
     {"get_tags", {ToolEffect::ReadOnly, true, "Get tags"}},
     {"search_agents_by_tag", {ToolEffect::ReadOnly, true, "Search agents by tag"}},
     {"list_policies", {ToolEffect::ReadOnly, true, "List policies"}},
@@ -14416,6 +14452,124 @@ McpServer::HandlerFn McpServer::build_handler(
                 mcp_audit("success");
                 res.set_content(success_response(id, tool_result(payload, kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // ── Version-row "which devices" drill (parity with GET /api/v1/dex/perf/
+            // app/devices) ── Unlike the three DEX app-perf tools just above (fleet
+            // aggregates, no agent_id, generic mcp.<tool> audit only), each row here
+            // names an agent_id — a fleet-wide fan-out of identified per-device data.
+            // That single difference changes the authorization posture entirely:
+            // this tool uses fleet_read_fn_ (AuthRoutes::require_fleet_read,
+            // ADR-0017) as its SOLE gate — never stacked with tier_allows/perm_fn
+            // (the BLOCKING defect require_fleet_read's own doc comment warns
+            // against; require_fleet_read already covers mcp_tier internally, same
+            // precedent as query_installed_software above) — and mints its own
+            // dedicated audit verb (dex.app_perf.devices.view) so this
+            // identified-device access stays independently countable, works-council
+            // precedent dex.app_perf.compare.drill.
+            if (tool_name == "list_dex_app_perf_devices") {
+                if (!fleet_read_fn_) {
+                    spdlog::error("list_dex_app_perf_devices: fleet_read_fn_ unwired — "
+                                  "misconfigured call site; failing closed");
+                    res.set_content(error_response(id, kInternalError, "service unavailable"),
+                                    "application/json");
+                    return;
+                }
+                const auto app = param_str(args, "app");
+                if (app.empty()) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "missing required parameter 'app'",
+                                 "supply app=<name>; discover names via list_dex_perf_apps"),
+                        "application/json");
+                    return;
+                }
+                if (!app_perf_param_valid(app)) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "invalid parameter 'app'",
+                                 "app must be <= 512 bytes, no control chars"),
+                        "application/json");
+                    return;
+                }
+                // `version` is REQUIRED-PRESENT (distinct from get_dex_app_perf's ""
+                // = all-versions convention above): this drill is always scoped to
+                // ONE exact version, and Linux procperf emits "" for every app
+                // (tar_proc_perf.cpp) — an omitted `version` would otherwise
+                // silently collapse to that single bucket instead of surfacing a
+                // genuine parameter error.
+                if (!args.contains("version") || !args["version"].is_string()) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "missing required parameter 'version'",
+                                 "supply version=<exact version>, or version=\"\" for the "
+                                 "unknown-version bucket"),
+                        "application/json");
+                    return;
+                }
+                const auto raw_version = args["version"].get<std::string>();
+                if (!app_perf_param_valid(raw_version)) {
+                    res.set_content(
+                        a4_error(kInvalidParams, "invalid parameter 'version'",
+                                 "version must be <= 512 bytes, no control chars"),
+                        "application/json");
+                    return;
+                }
+                const auto version = yuzu::util::canon_version(raw_version);
+                // require_fleet_read is the SOLE gate — see this block's own header
+                // comment for why it must never be stacked with tier_allows/perm_fn.
+                auto gate = fleet_read_fn_(req, res, "GuaranteedState", "Read");
+                if (!gate.admitted)
+                    return; // the gate already wrote its own JSON-RPC error body
+                if (!app_perf_providers.version_devices) {
+                    res.set_content(
+                        a4_error(kInternalError, "service unavailable", "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpProviderWarmupRetryMs),
+                        "application/json");
+                    return;
+                }
+                std::optional<std::vector<std::string>> visible_ids;
+                if (gate.scope)
+                    visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
+                bool truncated = false;
+                auto rows =
+                    app_perf_providers.version_devices(app, version, visible_ids, truncated);
+                if (!rows) { // AUTHORITATIVE read degrade
+                    mcp_audit("failure", "app-perf store read degraded; app=" + app +
+                                             " version=" + version);
+                    res.set_content(
+                        a4_error(kInternalError, "app-perf store read degraded", "retry shortly",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultShortRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Dedicated verb AFTER the read (so the detail carries the real
+                // device count) — set-and-proceed, matching this codebase's MCP
+                // convention for behavioral-PII tools (no Sec-Audit-Failed
+                // equivalent on MCP; the persist bool is surfaced in-body instead).
+                const bool audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "dex.app_perf.devices.view", "success", "GuaranteedState", "",
+                    "app=" + app + " version=" + version +
+                        " devices=" + std::to_string(rows->size()) + " via MCP "
+                        "list_dex_app_perf_devices");
+                mcp_audit("success", "app=" + app + " version=" + version);
+                JArr arr;
+                for (const auto& d : *rows) {
+                    arr.add(JObj()
+                                .add("agent_id", d.agent_id)
+                                .add("last_day", d.last_day)
+                                .add("samples", d.samples)
+                                .add("cpu_avg", d.cpu_avg)
+                                .add("ws_avg_bytes", d.ws_avg_bytes));
+                }
+                JObj result_obj;
+                result_obj.add("app", app)
+                    .add("version", version)
+                    .add("truncated", truncated)
+                    .raw("devices", arr.str());
+                if (!audit_ok)
+                    result_obj.add("audit_persisted", false);
+                res.set_content(
+                    success_response(id, tool_result(result_obj.str(), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
