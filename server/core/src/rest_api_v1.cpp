@@ -10839,6 +10839,20 @@ void RestApiV1::register_routes(
                             "application/json");
             return;
         }
+        // #2437-class guard: check nesting on the RAW body BEFORE parse. A
+        // parsed-then-dumped spark/assertion/remediation subtree still
+        // crashes on derive_rule_spec's spec.dump() below - the check has to
+        // run before any allocation, on the text itself (mirrors
+        // mcp_jsonrpc.hpp's own parse_request ordering and the result-set
+        // creation routes above).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "request body nests too deeply", cid,
+                                                  "flatten the request body; spark/assertion/"
+                                                  "remediation blocks may nest at most 32 levels deep"),
+                            "application/json");
+            return;
+        }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
@@ -11132,6 +11146,23 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const GuaranteedStateRuleRow& existing_rule = **existing;
+                 // #2437-class guard: check nesting on the RAW body BEFORE
+                 // parse, same ordering and rationale as the create handler
+                 // above - a metadata-only PUT never reaches derive_rule_spec
+                 // (it re-validates the EXISTING stored spec instead), but any
+                 // body actually supplying spark/assertion/remediation still
+                 // reaches derive_rule_spec's spec.dump() below.
+                 if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "request body nests too deeply", cid,
+                                               "flatten the request body; spark/assertion/"
+                                               "remediation blocks may nest at most 32 levels deep"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "request body nests too deeply");
+                     return;
+                 }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
