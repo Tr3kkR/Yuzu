@@ -22,6 +22,11 @@
 #include <filesystem>
 #include <fstream>
 
+#if defined(__APPLE__)
+#include <cstdlib>
+#include <unistd.h> // geteuid()
+#endif
+
 namespace fs = std::filesystem;
 using namespace yuzu::agent;
 
@@ -122,3 +127,77 @@ TEST_CASE("discover_install_ca_path() default overload scans the standard instal
         SUCCEED("no install CA on this host — expected in the test sandbox");
     }
 }
+
+#if defined(__APPLE__)
+namespace {
+struct ScopedEnv {
+    std::string name;
+    bool had_prev = false;
+    std::string prev;
+    ScopedEnv(std::string n, const std::string& v) : name(std::move(n)) {
+        if (const char* cur = std::getenv(name.c_str())) {
+            had_prev = true;
+            prev = cur;
+        }
+        ::setenv(name.c_str(), v.c_str(), 1);
+    }
+    ~ScopedEnv() {
+        if (had_prev)
+            ::setenv(name.c_str(), prev.c_str(), 1);
+        else
+            ::unsetenv(name.c_str());
+    }
+};
+} // namespace
+
+// A root agent must never fall back to a per-user path: macOS `sudo` preserves
+// $HOME by default, so an unqualified fallback would let a root process adopt
+// a CA planted in an unprivileged user's home as its pinned trust anchor.
+TEST_CASE("discover_install_ca_path(): root ignores the per-user HOME candidate",
+          "[agent][pki][cert-discovery][macos]") {
+    if (::geteuid() != 0) {
+        SUCCEED("test process is not root — covered by the non-root case below");
+        return;
+    }
+    yuzu::test::TempDir home;
+    fs::create_directories(home.path / "Library/Application Support/Yuzu/certs");
+    std::ofstream f(home.path / "Library/Application Support/Yuzu/certs/default-ca.pem");
+    f << "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    f.close();
+    ScopedEnv env{"HOME", home.path.string()};
+
+    auto found = discover_install_ca_path();
+    // /etc/yuzu/certs/default-ca.pem is the only candidate considered as root;
+    // it is expected absent in the test sandbox, so this must NOT resolve to
+    // the planted per-user file.
+    if (found.has_value())
+        REQUIRE(*found != home.path / "Library/Application Support/Yuzu/certs/default-ca.pem");
+}
+
+// A non-root agent falls back to the per-user Application Support path when
+// the shared /etc/yuzu/certs convention has nothing (dev/UAT rig — this is
+// where server::auth::default_cert_dir() writes for a non-root native macOS
+// server run).
+TEST_CASE("discover_install_ca_path(): non-root finds the per-user HOME candidate",
+          "[agent][pki][cert-discovery][macos]") {
+    if (::geteuid() == 0) {
+        SUCCEED("test process is root — covered by the root case above");
+        return;
+    }
+    yuzu::test::TempDir home;
+    auto ca_dir = home.path / "Library/Application Support/Yuzu/certs";
+    fs::create_directories(ca_dir);
+    auto ca_path = ca_dir / "default-ca.pem";
+    std::ofstream f(ca_path);
+    f << "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+    f.close();
+    ScopedEnv env{"HOME", home.path.string()};
+
+    auto found = discover_install_ca_path();
+    // /etc/yuzu/certs/default-ca.pem is expected absent in the test sandbox
+    // (and takes precedence if present), so a found result must be the
+    // planted per-user file.
+    REQUIRE(found.has_value());
+    REQUIRE(*found == ca_path);
+}
+#endif // __APPLE__

@@ -1501,8 +1501,10 @@ public:
                     if (!cfg_.tls_allow_system_trust) {
                         spdlog::error(
                             "TLS is enabled but no CA could be pinned: --ca-cert was not given "
-                            "and no install CA was found at the standard path "
-                            "(/etc/yuzu/certs/default-ca.pem). Refusing to connect with the "
+                            "and no install CA was found at the standard path(s) "
+                            "(/etc/yuzu/certs/default-ca.pem, plus "
+                            "~/Library/Application Support/Yuzu/certs/default-ca.pem for a "
+                            "non-root agent on macOS). Refusing to connect with the "
                             "SYSTEM trust store, which does NOT trust a Yuzu self-signed install "
                             "CA — that would be a fail-open MITM posture. Fix one of: provide "
                             "--ca-cert; ensure the install CA exists at that path; pass "
