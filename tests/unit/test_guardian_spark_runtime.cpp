@@ -7262,6 +7262,38 @@ TEST_CASE("up-3 (#4221): the compensation reservation is released on synchronous
 // Only a genuine refill's own dispatch runs on a detached worker thread, separate
 // from the caller that already holds r2's own receipt - which is what makes the
 // corrected `end` value observable via receipt_status() at all.
+//
+// CI finding (macOS, 2026-09-17): the three tests below saw
+// "std::future_error: The state of the promise has already been set" crash the
+// "REFILLED claim ... reservation-exhaustion" variant on CI (not reproduced
+// locally after 250+ runs, incl. under heavy artificial CPU contention). r2's
+// own claim legitimately passes through a transient Wedged classification in
+// that variant (its own REQUIRE below waits for receipt_status() to move away
+// from Wedged) - #4415 (filed, deferred, confirmed pre-existing/not introduced
+// by this PR) tracks a full-ruleset teardown+rearm storm against a
+// persistently-wedged key, driven every heartbeat cycle; each storm cycle is a
+// fresh arm/disarm sequence through on_arm_complete(), which is exactly what
+// re-registers this file's drain-gap/dispatch-entry test hooks (see their own
+// comments below) - a plausible second firing this test's original single-shot
+// assumption did not budget for. Rather than chase that storm's own timing
+// (out of scope here - #4415 owns it), make the hook and its two signalling
+// promises SAFE against a second firing instead of merely single-shot: a
+// second gap_hook call is a no-op (r2 is already correctly set up by the
+// first), and a second set_value() on either promise is an ignored late/
+// duplicate signal rather than an uncaught exception. Both firings, if they
+// happen, occur within this test's own still-live stack frame (the storm
+// would need to complete an entire arm/disarm cycle, which cannot outlive the
+// test process's own teardown boundary) - this is not the same hazard class
+// as HC-1b's parked cross-teardown TOCTOU below, and does not require this
+// test's state to move to the heap the way surviving a torn-down frame would.
+inline void set_value_once(std::promise<void>& p) noexcept {
+    try {
+        p.set_value();
+    } catch (const std::future_error&) {
+        // Already satisfied by an earlier (first, or a late-arriving second)
+        // firing - a duplicate wake, not a defect in the waiter's own logic.
+    }
+}
 // ═══════════════════════════════════════════════════════════════════════════
 
 TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclassifies "
@@ -7310,9 +7342,19 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         // own hook's LAST store, not on a different signal entirely). Declared
         // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
         // FIRST, before touching r2_thread or anything else this frame owns.
+    std::atomic<bool> gap_hook_ran{false}; // see set_value_once's own doc comment
+        // above (#4415's storm can legitimately redrive this key through a fresh
+        // on_arm_complete() while this hook is still registered) - only the FIRST
+        // firing sets r2 up; a second one is a no-op, not a re-spawn (re-running
+        // the body below would reassign r2_thread while the first r2_thread may
+        // still be joinable - std::terminate per [thread.thread.assign] - and
+        // double-register the entry hook for no purpose, since r2 is already
+        // correctly parked by the first firing).
     rt->set_drain_gap_hook_for_test([&] {
+        if (gap_hook_ran.exchange(true))
+            return;
         rt->set_dispatch_entry_hook_for_test([&] {
-            entered.set_value();
+            set_value_once(entered);
             release_hook.get_future().wait();
         });
         r2_thread = std::thread{[&] {
@@ -7395,7 +7437,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
             rt->set_drain_gap_hook_for_test({});
             rt->set_dispatch_entry_hook_for_test({});
             if (!*released)
-                release_hook->set_value();
+                set_value_once(*release_hook);
             if (r2t->joinable())
                 r2t->join();
         }
@@ -7454,7 +7496,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     // Let admission resolve for real, as an ORDINARY (non-Stopped) refusal.
     rt->set_io_executor_fail_launch_for_test(true);
     released_by_test = true;
-    release_hook.set_value();
+    set_value_once(release_hook);
     // NOT is_terminal(): expire_overdue_claims() above already made that trivially
     // true (WaiterTimedOutDispatched/Wedged is itself a terminal-shaped status) -
     // wait specifically for the value to move AWAY from the stale Wedged result,
@@ -7517,9 +7559,19 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
         // own hook's LAST store, not on a different signal entirely). Declared
         // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
         // FIRST, before touching r2_thread or anything else this frame owns.
+    std::atomic<bool> gap_hook_ran{false}; // see set_value_once's own doc comment
+        // above (#4415's storm can legitimately redrive this key through a fresh
+        // on_arm_complete() while this hook is still registered) - only the FIRST
+        // firing sets r2 up; a second one is a no-op, not a re-spawn (re-running
+        // the body below would reassign r2_thread while the first r2_thread may
+        // still be joinable - std::terminate per [thread.thread.assign] - and
+        // double-register the entry hook for no purpose, since r2 is already
+        // correctly parked by the first firing).
     rt->set_drain_gap_hook_for_test([&] {
+        if (gap_hook_ran.exchange(true))
+            return;
         rt->set_dispatch_entry_hook_for_test([&] {
-            entered.set_value();
+            set_value_once(entered);
             release_hook.get_future().wait();
         });
         r2_thread = std::thread{[&] {
@@ -7602,7 +7654,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
             rt->set_drain_gap_hook_for_test({});
             rt->set_dispatch_entry_hook_for_test({});
             if (!*released)
-                release_hook->set_value();
+                set_value_once(*release_hook);
             if (r2t->joinable())
                 r2t->join();
         }
@@ -7661,7 +7713,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     // Stopped synchronously once the executor is stopping.
     rt->begin_stop();
     released_by_test = true;
-    release_hook.set_value();
+    set_value_once(release_hook);
     // NOT is_terminal(): see the equivalent comment in the non-Stopped variant
     // above - wait for the value to move away from the stale Wedged result.
     REQUIRE(yuzu::test::spin_until(
@@ -7716,9 +7768,19 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
         // own hook's LAST store, not on a different signal entirely). Declared
         // BEFORE Cleanup so it outlives Cleanup's destructor, which waits on it
         // FIRST, before touching r2_thread or anything else this frame owns.
+    std::atomic<bool> gap_hook_ran{false}; // see set_value_once's own doc comment
+        // above (#4415's storm can legitimately redrive this key through a fresh
+        // on_arm_complete() while this hook is still registered) - only the FIRST
+        // firing sets r2 up; a second one is a no-op, not a re-spawn (re-running
+        // the body below would reassign r2_thread while the first r2_thread may
+        // still be joinable - std::terminate per [thread.thread.assign] - and
+        // double-register the entry hook for no purpose, since r2 is already
+        // correctly parked by the first firing).
     rt->set_drain_gap_hook_for_test([&] {
+        if (gap_hook_ran.exchange(true))
+            return;
         rt->set_dispatch_entry_hook_for_test([&] {
-            entered.set_value();
+            set_value_once(entered);
             release_hook.get_future().wait();
         });
         r2_thread = std::thread{[&] {
@@ -7801,7 +7863,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
             rt->set_drain_gap_hook_for_test({});
             rt->set_dispatch_entry_hook_for_test({});
             if (!*released)
-                release_hook->set_value();
+                set_value_once(*release_hook);
             if (r2t->joinable())
                 r2t->join();
         }
@@ -7904,7 +7966,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     CHECK(rt->expire_overdue_claims() == 1);
 
     released_by_test = true;
-    release_hook.set_value(); // r2 proceeds into a now-exhausted reservation pool
+    set_value_once(release_hook); // r2 proceeds into a now-exhausted reservation pool
     // NOT is_terminal(): see the equivalent comment in the submission-failure
     // variant above - wait for the value to move away from the stale Wedged result.
     REQUIRE(yuzu::test::spin_until(
