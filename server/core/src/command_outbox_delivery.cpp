@@ -4,6 +4,7 @@
 #include "command_outbox_store.hpp"
 #include "execution_tracker.hpp"
 #include "leader_elector.hpp" // kServerBackgroundLeaderLock, LeaderElector::epoch()
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 
 #include <yuzu/metrics.hpp>
 
@@ -144,6 +145,43 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
             if (d_.execution_tracker && !c.execution_id.empty())
                 (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
             audit(c, "denied", "authority_denied_at_delivery");
+        }
+        return;
+    }
+
+    // #2437-class guard: depth-check the raw stored `parameters` text BEFORE
+    // decode_payload() ever parses or, worse, dumps it. `c.parameters` is
+    // sourced from ScheduleRunner's `parameter_values` (schedule CREATION is
+    // already guarded, schedule_routes.cpp:94), but a row written before that
+    // write-side guard shipped, or via any other write path that bypasses it,
+    // still reaches this read path, and decode_payload()'s `.dump()` of a
+    // non-string parameter value is unboundedly recursive. This tick processes
+    // EVERY pending row on EVERY tick with no operator action in the loop at
+    // all, so an unguarded poisoned row here would crash-loop this background
+    // worker on every restart, not just fail once. Checked on the RAW text,
+    // never on a parsed/re-dumped value (mirrors json_exceeds_depth's own
+    // "never construct the deep tree" rationale, mcp_jsonrpc.hpp).
+    //
+    // Treated exactly like the decode-failure path immediately below (same
+    // mark_failed/audit mechanism, same fencing/counting shape), so it looks
+    // like a normal permanent failure to every other part of this file's state
+    // machine. "payload_depth_exceeded" is a distinct reason (not lumped into
+    // "payload_decode_failed") so an operator can tell "too deep to safely
+    // parse" apart from genuinely malformed JSON in the audit trail.
+    if (!c.parameters.empty() &&
+        mcp::json_exceeds_depth(c.parameters, mcp::kMcpMaxJsonDepth)) {
+        count("yuzu_server_command_outbox_deliver_decode_failed_total");
+        spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) parameters "
+                      "nested past the depth guard (max {}), marking failed: cannot be safely "
+                      "parsed",
+                      c.occurrence_id, c.command_id, mcp::kMcpMaxJsonDepth);
+        // CDX-P1-02: own-the-mark gating, same as every other terminal path here.
+        auto marked =
+            d_.outbox->mark_failed(c.occurrence_id, lock_name, epoch, "payload_depth_exceeded");
+        if (marked.has_value() && *marked) {
+            if (d_.execution_tracker && !c.execution_id.empty())
+                (void)d_.execution_tracker->mark_cancelled(c.execution_id, c.principal);
+            audit(c, "failure", "payload_depth_exceeded");
         }
         return;
     }
