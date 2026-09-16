@@ -156,8 +156,7 @@ struct ScopedEnv {
 TEST_CASE("discover_install_ca_path(): root ignores the per-user HOME candidate",
           "[agent][pki][cert-discovery][macos]") {
     if (::geteuid() != 0) {
-        SUCCEED("test process is not root — covered by the non-root case below");
-        return;
+        SKIP("test process is not root — covered by the non-root case below");
     }
     yuzu::test::TempDir home;
     fs::create_directories(home.path / "Library/Application Support/Yuzu/certs");
@@ -181,8 +180,16 @@ TEST_CASE("discover_install_ca_path(): root ignores the per-user HOME candidate"
 TEST_CASE("discover_install_ca_path(): non-root finds the per-user HOME candidate",
           "[agent][pki][cert-discovery][macos]") {
     if (::geteuid() == 0) {
-        SUCCEED("test process is root — covered by the root case above");
-        return;
+        SKIP("test process is root — covered by the root case above");
+    }
+    if (fs::exists("/etc/yuzu/certs/default-ca.pem")) {
+        // /etc/yuzu/certs takes precedence by design (root-owned convention
+        // over per-user fallback — see the precedence comment above), so a
+        // real install CA already on this host would shadow the planted
+        // per-user file and make the REQUIRE below fail for a reason that
+        // has nothing to do with this diff. Same tolerance the pre-existing
+        // "default overload scans the standard install path" test documents.
+        SKIP("a real install CA already exists at the standard path on this host");
     }
     yuzu::test::TempDir home;
     auto ca_dir = home.path / "Library/Application Support/Yuzu/certs";
@@ -194,10 +201,41 @@ TEST_CASE("discover_install_ca_path(): non-root finds the per-user HOME candidat
     ScopedEnv env{"HOME", home.path.string()};
 
     auto found = discover_install_ca_path();
-    // /etc/yuzu/certs/default-ca.pem is expected absent in the test sandbox
-    // (and takes precedence if present), so a found result must be the
-    // planted per-user file.
     REQUIRE(found.has_value());
     REQUIRE(*found == ca_path);
+}
+
+// With HOME unset, a non-root agent has only the /etc/yuzu/certs candidate —
+// it does NOT also check the HOME-independent
+// /Library/Application Support/Yuzu/certs path that default_cert_dir() falls
+// back to server-side in the same state. This is a known, accepted asymmetry
+// (governance 977b24ed8 Gate 3/4 review): closing it would need a non-root
+// process with no $HOME at all, an environment unusual enough on macOS that
+// the extra candidate wasn't judged worth the complexity. This test pins the
+// CURRENT behaviour so a future change to it is deliberate, not accidental.
+TEST_CASE("discover_install_ca_path(): non-root with HOME unset only checks "
+          "/etc/yuzu/certs",
+          "[agent][pki][cert-discovery][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — HOME-unset behaviour is a non-root-only path");
+    }
+    bool had_prev = false;
+    std::string prev;
+    if (const char* cur = std::getenv("HOME")) {
+        had_prev = true;
+        prev = cur;
+    }
+    ::unsetenv("HOME");
+
+    auto found = discover_install_ca_path();
+    // /etc/yuzu/certs/default-ca.pem is expected absent in the test sandbox
+    // (per the pre-existing default-overload test's own documented
+    // assumption), so this must find nothing — never fall through to some
+    // other candidate, since none should have been added.
+    if (!fs::exists("/etc/yuzu/certs/default-ca.pem"))
+        REQUIRE_FALSE(found.has_value());
+
+    if (had_prev)
+        ::setenv("HOME", prev.c_str(), 1);
 }
 #endif // __APPLE__

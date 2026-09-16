@@ -170,9 +170,13 @@ struct ScopedEnv {
 } // namespace
 
 TEST_CASE("default_cert_dir: root always resolves to /etc/yuzu/certs", "[auth][paths][macos]") {
+    // This project's self-hosted macOS CI runner never runs as root
+    // (deploy/macos/README.md), so this branch is SKIPPED, not passed, on
+    // every real CI run today — SKIP is reported distinctly from a passing
+    // REQUIRE, unlike SUCCEED, so the root path stays visibly unverified
+    // rather than silently green (governance false-green floor, qe Gate 3).
     if (::geteuid() != 0) {
-        SUCCEED("test process is not root — covered by the non-root case below");
-        return;
+        SKIP("test process is not root — covered by the non-root case below");
     }
     yuzu::test::TempDir home;
     ScopedEnv env{"HOME", home.path.string()};
@@ -182,8 +186,7 @@ TEST_CASE("default_cert_dir: root always resolves to /etc/yuzu/certs", "[auth][p
 TEST_CASE("default_cert_dir: non-root falls back to per-user Application Support",
           "[auth][paths][macos]") {
     if (::geteuid() == 0) {
-        SUCCEED("test process is root — covered by the root case above");
-        return;
+        SKIP("test process is root — covered by the root case above");
     }
     yuzu::test::TempDir home;
     ScopedEnv env{"HOME", home.path.string()};
@@ -191,11 +194,28 @@ TEST_CASE("default_cert_dir: non-root falls back to per-user Application Support
             home.path / "Library/Application Support/Yuzu/certs");
 }
 
+TEST_CASE("default_cert_dir: non-root with HOME unset falls back to the fixed "
+          "Application Support path",
+          "[auth][paths][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — HOME-unset fallback is a non-root-only path");
+    }
+    bool had_prev = false;
+    std::string prev;
+    if (const char* cur = std::getenv("HOME")) {
+        had_prev = true;
+        prev = cur;
+    }
+    ::unsetenv("HOME");
+    REQUIRE(default_cert_dir() == fs::path{"/Library/Application Support/Yuzu/certs"});
+    if (had_prev)
+        ::setenv("HOME", prev.c_str(), 1);
+}
+
 TEST_CASE("default_config_path: root always resolves to /etc/yuzu/yuzu-server.cfg",
           "[auth][paths][macos]") {
     if (::geteuid() != 0) {
-        SUCCEED("test process is not root — covered by the non-root case below");
-        return;
+        SKIP("test process is not root — covered by the non-root case below");
     }
     yuzu::test::TempDir home;
     ScopedEnv env{"HOME", home.path.string()};
@@ -205,13 +225,31 @@ TEST_CASE("default_config_path: root always resolves to /etc/yuzu/yuzu-server.cf
 TEST_CASE("default_config_path: non-root falls back to per-user Application Support",
           "[auth][paths][macos]") {
     if (::geteuid() == 0) {
-        SUCCEED("test process is root — covered by the root case above");
-        return;
+        SKIP("test process is root — covered by the root case above");
     }
     yuzu::test::TempDir home;
     ScopedEnv env{"HOME", home.path.string()};
     REQUIRE(default_config_path() ==
             home.path / "Library/Application Support/Yuzu/yuzu-server.cfg");
+}
+
+TEST_CASE("default_config_path: non-root with HOME unset falls back to the fixed "
+          "Application Support path",
+          "[auth][paths][macos]") {
+    if (::geteuid() == 0) {
+        SKIP("test process is root — HOME-unset fallback is a non-root-only path");
+    }
+    bool had_prev = false;
+    std::string prev;
+    if (const char* cur = std::getenv("HOME")) {
+        had_prev = true;
+        prev = cur;
+    }
+    ::unsetenv("HOME");
+    REQUIRE(default_config_path() ==
+            fs::path{"/Library/Application Support/Yuzu/yuzu-server.cfg"});
+    if (had_prev)
+        ::setenv("HOME", prev.c_str(), 1);
 }
 #endif // __APPLE__
 
