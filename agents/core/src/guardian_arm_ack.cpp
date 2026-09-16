@@ -201,6 +201,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         case S::Withdrawn:
         case S::Stopped:
             ++current_->resolved_failed;
+            current_->resolved_statuses_for_test.push_back(status);
             if (failed_out)
                 ++*failed_out; // UP-3: feeds GuardianEngine::arm_failures_ (see caller)
             // rung 9c PR-2 Unit 6: the only place this can be logged - reconcile_rule_locked's
@@ -238,6 +239,12 @@ std::size_t GuardianArmAckLedger::applied_count() const {
 
 std::size_t GuardianArmAckLedger::pending_count_for_test() const {
     return current_ ? current_->pending.size() : 0;
+}
+
+std::vector<GuardianSparkRuntime::ReceiptStatus>
+GuardianArmAckLedger::resolved_statuses_for_test() const {
+    return current_ ? current_->resolved_statuses_for_test
+                    : std::vector<GuardianSparkRuntime::ReceiptStatus>{};
 }
 
 std::optional<GuardianArmStats> GuardianArmAckLedger::arm_stats() const {

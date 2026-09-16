@@ -12,10 +12,10 @@
 #include <yuzu/agent/spark.hpp>
 
 #include "test_helpers.hpp" // yuzu::test::spin_until
-#include "test_log_capture.hpp" // yuzu::test::LogCapture
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -648,10 +648,10 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
     ledger.add_pending("r1", receipt);
 
     std::size_t failed_out = 0;
-    yuzu::test::LogCapture logs;
     const std::size_t drained = ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out);
-    logs.stop();
-    CHECK(logs.text().find("status=Wedged") != std::string::npos);
+    const auto statuses = ledger.resolved_statuses_for_test();
+    CHECK(std::find(statuses.begin(), statuses.end(),
+                    GuardianSparkRuntime::ReceiptStatus::Wedged) != statuses.end());
     CHECK(drained == 1);
     CHECK(failed_out == 1);
     {
@@ -701,11 +701,12 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (ti
     ledger.add_pending("r2", r2_receipt);
 
     std::size_t failed_out = 0;
-    yuzu::test::LogCapture logs;
     const std::size_t drained = ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out);
-    logs.stop();
-    CHECK(logs.text().find("status=Wedged") != std::string::npos);
-    CHECK(logs.text().find("status=CongestionExpired") != std::string::npos);
+    const auto statuses = ledger.resolved_statuses_for_test();
+    CHECK(std::find(statuses.begin(), statuses.end(),
+                    GuardianSparkRuntime::ReceiptStatus::Wedged) != statuses.end());
+    CHECK(std::find(statuses.begin(), statuses.end(),
+                    GuardianSparkRuntime::ReceiptStatus::CongestionExpired) != statuses.end());
     CHECK(drained == 2);
     CHECK(failed_out == 2);
     {

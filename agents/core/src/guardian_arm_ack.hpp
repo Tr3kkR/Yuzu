@@ -52,6 +52,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <yuzu/plugin.h>
 
@@ -193,6 +194,20 @@ public:
     /// caller.
     std::size_t pending_count_for_test() const;
 
+    /// TEST-ONLY: every ReceiptStatus this application's receipts have resolved to
+    /// via drain_locked(), in resolution order (empty if there is no current
+    /// application). Plain object state, not captured log text - a captured-log
+    /// assertion is unreliable here because drain_locked()'s own logging call is
+    /// compiled into libyuzu_agent_core, a SEPARATE shared library from the test
+    /// binary on macOS: the default-logger swap test_log_capture.hpp performs
+    /// happens in the test binary's own image and does not reach spdlog calls
+    /// made from the library's image there (see that header's own doc comment -
+    /// the same class of hazard already forced #2238's LogCapture use out of
+    /// this codebase once, tracked unfixed for a second instance as #3355; this
+    /// accessor exists so a third never needs LogCapture at all). No production
+    /// caller.
+    std::vector<GuardianSparkRuntime::ReceiptStatus> resolved_statuses_for_test() const;
+
     /// rung 9c PR-3: a re-statable snapshot of the current application's pending
     /// and resolved-failed counts (see guardian_arm_heartbeat.hpp's
     /// GuardianArmStats for the full field-by-field semantics). nullopt when there
@@ -272,6 +287,7 @@ private:
         std::size_t resolved_armed{0};
         std::size_t resolved_failed{0};
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> pending;
+        std::vector<GuardianSparkRuntime::ReceiptStatus> resolved_statuses_for_test;
     };
     std::unique_ptr<Application> current_;
 };
