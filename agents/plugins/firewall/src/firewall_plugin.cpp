@@ -176,6 +176,27 @@ void do_state_windows(yuzu::CommandContext& ctx) {
             break;
         }
     }
+
+    // Rule count: INetFwRules::get_Count is locale-independent (unlike
+    // shelling out to `netsh` or PowerShell and parsing localized text) and
+    // reuses the ComInit already live above. Same S_FALSE-is-not-success
+    // contract as classify_fw_hr -- a NotFound or Error classification both
+    // read as failure here, per the acceptance contract.
+    ComPtr<INetFwRules> rules_for_count;
+    HRESULT rules_hr = policy->get_Rules(rules_for_count.put());
+    if (SUCCEEDED(rules_hr) && rules_for_count) {
+        LONG rule_count = 0;
+        HRESULT count_hr = rules_for_count->get_Count(&rule_count);
+        if (classify_fw_hr(count_hr) == FwHrResult::Ok) {
+            ctx.write_output(std::format("ruleset|{}", static_cast<long long>(rule_count)));
+        } else {
+            ctx.write_output(
+                std::format("error|rules_count:0x{:08x}", static_cast<uint32_t>(count_hr)));
+        }
+    } else {
+        ctx.write_output(
+            std::format("error|rules_count:0x{:08x}", static_cast<uint32_t>(rules_hr)));
+    }
 }
 
 void do_rules_windows(yuzu::CommandContext& ctx) {
@@ -212,6 +233,7 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
 
     int count = 0;
     bool truncated = false;
+    bool enum_failed = false;
     for (;;) {
         VARIANT v;
         VariantInit(&v);
@@ -220,8 +242,21 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
         // IEnumVARIANT::Next returns S_FALSE (SUCCEEDED, fetched==0) at
         // end-of-enumeration — checked via `fetched == 0`, never a bare
         // SUCCEEDED(hr), so end-of-list is never mistaken for "another rule".
+        //
+        // FAILED(hr) mid-loop is a DIFFERENT exit than clean end-of-
+        // enumeration -- distinguished so the trailing ruleset| row below
+        // never presents a partial `count` as though it were the whole
+        // list (governance Gate 4 consistency-auditor finding: the two
+        // cases used to share one break with no signal, and this diff's
+        // new ruleset| line is what first made that ambiguity user-
+        // visible and authoritative-looking).
         hr = enum_var->Next(1, &v, &fetched);
-        if (FAILED(hr) || fetched == 0) {
+        if (FAILED(hr)) {
+            VariantClear(&v);
+            enum_failed = true;
+            break;
+        }
+        if (fetched == 0) {
             VariantClear(&v);
             break;
         }
@@ -304,6 +339,17 @@ void do_rules_windows(yuzu::CommandContext& ctx) {
                                      action_s, profiles_mask));
         ++count;
     }
+    // A mid-enumeration COM failure means `count` is a PARTIAL tally, not
+    // the ruleset size -- report it as such (error| + ruleset|unknown)
+    // rather than presenting a truncated count as though it were complete.
+    // Every `rule|` row already emitted above stayed emitted; this only
+    // changes what the trailing summary claims about them.
+    if (enum_failed) {
+        ctx.write_output(std::format("error|enum_next:0x{:08x}", static_cast<uint32_t>(hr)));
+        ctx.write_output("ruleset|unknown");
+        return;
+    }
+    ctx.write_output(std::format("ruleset|{}", count));
     if (truncated)
         ctx.write_output("truncated|true");
 }
@@ -330,17 +376,90 @@ void do_state_macos(yuzu::CommandContext& ctx) {
         run_bounded_subprocess({"/sbin/pfctl", "-s", "info"}, SubprocessOptions{.deadline = kAcqDeadline});
     ctx.write_output(std::format(
         "pf|{}", yuzu::firewall::to_string(yuzu::firewall::parse_pf_status(pf_res.output))));
+
+    // Anchors: emit anchor|<name> rows only from a cleanly-completed read --
+    // honour tool_ran/exit_code/timed_out/output_truncated so a refused or
+    // partial `pfctl -s Anchors` read yields no anchor rows rather than
+    // presenting a partial anchor set as the whole (review R7).
+    auto anchors_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "Anchors"},
+                                              SubprocessOptions{.deadline = kAcqDeadline});
+    if (anchors_res.tool_ran && anchors_res.exit_code == 0 && !anchors_res.timed_out &&
+        !anchors_res.output_truncated) {
+        for (const auto& anchor : yuzu::firewall::parse_pf_anchors(anchors_res.output)) {
+            ctx.write_output(std::format("anchor|{}", sanitize_field(anchor)));
+        }
+    }
+
+    // Ruleset count: emit the numeric count only under the same
+    // completeness gate on `pfctl -s rules` -- count_pf_rules returns 0 for
+    // empty input, which a refused/partial read must not be confused with a
+    // genuine 0-rule pf (see count_pf_rules's own comment). A failed spawn
+    // (tool_ran==false) or non-clean completion reads unknown, never empty.
+    auto rules_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "rules"},
+                                            SubprocessOptions{.deadline = kAcqDeadline});
+    if (rules_res.tool_ran && rules_res.exit_code == 0 && !rules_res.timed_out &&
+        !rules_res.output_truncated) {
+        ctx.write_output(
+            std::format("ruleset|{}", yuzu::firewall::count_pf_rules(rules_res.output)));
+    } else {
+        ctx.write_output("ruleset|unknown");
+    }
 }
 
 void do_rules_macos(yuzu::CommandContext& ctx) {
+    // App rows: socketfilterfw --listapps is unprivileged; trustworthy only
+    // when the read completed cleanly, otherwise emit no app rows rather
+    // than presenting a partial app set as the whole (review R7).
+    // AlfDecision::unknown is emitted as the literal `unknown` third field,
+    // never dropped or coerced (review R6).
+    auto listapps_res = run_bounded_subprocess(
+        {"/usr/libexec/ApplicationFirewall/socketfilterfw", "--listapps"},
+        SubprocessOptions{.deadline = kAcqDeadline});
+    if (listapps_res.tool_ran && listapps_res.exit_code == 0 && !listapps_res.timed_out &&
+        !listapps_res.output_truncated) {
+        for (const auto& app : yuzu::firewall::parse_alf_listapps(listapps_res.output)) {
+            const char* decision = app.decision == yuzu::firewall::AlfDecision::allow ? "allow"
+                                   : app.decision == yuzu::firewall::AlfDecision::block ? "block"
+                                                                                        : "unknown";
+            ctx.write_output(std::format("app|{}|{}", sanitize_field(app.path), decision));
+        }
+    }
+
+    // rule| rows and the trailing ruleset| count share ONE completeness gate
+    // -- a truncated or timed-out pfctl read must not publish whatever
+    // partial lines it captured as though they were the whole rule set,
+    // with only the trailing sentinel hinting otherwise (adversarial-review
+    // r1, C1: rows were previously written unconditionally, ahead of the
+    // gate that only protected ruleset|). Matches every other completeness-
+    // gated emission in this function (app|, anchor|) and the honest-status
+    // invariant documented in README.md's "How it works".
     auto res = run_bounded_subprocess({"/sbin/pfctl", "-s", "rules"},
                                       SubprocessOptions{.deadline = kAcqDeadline});
-    std::istringstream iss(res.output);
-    std::string line;
-    while (std::getline(iss, line)) {
-        if (!line.empty()) {
-            ctx.write_output(std::format("rule|{}", line));
+    if (res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated) {
+        std::istringstream iss(res.output);
+        std::string line;
+        while (std::getline(iss, line)) {
+            if (!line.empty()) {
+                ctx.write_output(std::format("rule|{}", sanitize_field(line)));
+            }
         }
+    }
+
+    auto anchors_res = run_bounded_subprocess({"/sbin/pfctl", "-s", "Anchors"},
+                                              SubprocessOptions{.deadline = kAcqDeadline});
+    if (anchors_res.tool_ran && anchors_res.exit_code == 0 && !anchors_res.timed_out &&
+        !anchors_res.output_truncated) {
+        for (const auto& anchor : yuzu::firewall::parse_pf_anchors(anchors_res.output)) {
+            ctx.write_output(std::format("anchor|{}", sanitize_field(anchor)));
+        }
+    }
+
+    // Trailing ruleset|<n>-or-unknown under the same completeness gate,
+    // reusing the `pfctl -s rules` result already captured above.
+    if (res.tool_ran && res.exit_code == 0 && !res.timed_out && !res.output_truncated) {
+        ctx.write_output(std::format("ruleset|{}", yuzu::firewall::count_pf_rules(res.output)));
+    } else {
+        ctx.write_output("ruleset|unknown");
     }
 }
 
@@ -920,7 +1039,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
 class FirewallPlugin final : public yuzu::Plugin {
 public:
     std::string_view name() const noexcept override { return "firewall"; }
-    std::string_view version() const noexcept override { return "0.4.0"; }
+    std::string_view version() const noexcept override { return "0.5.0"; }
     std::string_view description() const noexcept override {
         return "Firewall status and rule listing";
     }
