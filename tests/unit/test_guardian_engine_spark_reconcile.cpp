@@ -3169,11 +3169,16 @@ TEST_CASE("rung 9c PR-2 Unit 6: a same-generation retry while the prior push's a
     pusher.join();
 }
 
-// Advisor round (b): the one synchronous Failed path GuardianSparkRuntime::
-// attach_core() can still take post-cutover is the stopping_ race, which apply_rules()
-// can never observe under mtx_ (stop() holds it across begin_stop()) - so a genuine
-// per-rule synchronous ReconcileOutcome::Failed is not exercisable here. What IS still
-// reachable, and still had no test, is apply_rules()'s OWN full_sync-teardown throw
+// Advisor round (b): at the time this was written, the one synchronous Failed path
+// GuardianSparkRuntime::attach_core() could take post-cutover was the stopping_ race,
+// which apply_rules() can never observe under mtx_ (stop() holds it across
+// begin_stop()) - so a genuine per-rule synchronous ReconcileOutcome::Failed was not
+// exercisable here at the time. STALE as of rung 9c PR-5c (#4221 up-2): the
+// wedged-key refusal added a second synchronous Failed path, reachable through an
+// ordinary attach_rule(NonWaiting, ...) call - see the "governance UP-1 residual
+// round 2" test below, which drives exactly that outcome through apply_rules().
+// What was ALSO still reachable, and still had no test, is apply_rules()'s OWN
+// full_sync-teardown throw
 // (guardian_spark_runtime.cpp's detach_all()/detach_rule_locked() "the claim allocation
 // threw" seam, the same one that file's own rung 9c R5.2 adversarial-review-r2-C1 test
 // exercises directly against the runtime) - reconcile_failures > 0 latches the
@@ -3346,4 +3351,104 @@ TEST_CASE("rung 9c PR-2 governance hardening: an IDENTICAL repeat push recovers 
 
     engine.stop();
     spark_engine.stop();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Governance UP-1 residual, round 2 (#4221, rung 9c PR-5c follow-up governance
+// round 2): round 1 fixed GuardianSparkRuntime::attach_core() itself (see the
+// raw-API-level "governance UP-1" test in test_guardian_spark_runtime.cpp) so a
+// retarget refused onto a wedged key leaves the calling rule's PRIOR generation
+// untouched. But the PRODUCTION CALLER, GuardianEngine::reconcile_rule_locked(),
+// undid that fix one call later: its own defensive `spark_runtime_->
+// detach_rule(rule.rule_id())` used to run UNCONDITIONALLY on every Failed
+// result, on the (round-1-stale) premise "attach_rule leaves nothing on
+// failure" - true for every OTHER Failed path, but false for exactly the one
+// round 1 introduced. detach_rule() looks up rule_id's CURRENT key via the
+// index - which, after a round-1-only refusal, still resolves to the calling
+// rule's real, committed, untouched arm on its OWN key - and tears it down for
+// real, reproducing UP-1's "zero live arms, no recovery" defect one function
+// call downstream of where round 1 closed it. The raw GuardianSparkRuntime-level
+// test never catches this because it calls attach_rule() directly, never
+// through reconcile_rule_locked() - this test closes that coverage gap by
+// driving the identical scenario through the real GuardianEngine::apply_rules()
+// production entry point instead of the raw runtime API.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("governance UP-1 residual, round 2 (#4221): retargeting a rule onto an "
+          "already-Wedged key held by a DIFFERENT rule, driven through "
+          "GuardianEngine::apply_rules()/reconcile_rule_locked() rather than the "
+          "raw GuardianSparkRuntime API, must not let the CALLER's own defensive "
+          "cleanup tear down the calling rule's real, still-live arm",
+          "[spark][guardian][reconcile][liveness]") {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds(50)};
+
+    // (1) R arms normally on K1 ("Spooler") through an ordinary push - a real,
+    // committed, working arm.
+    f.apply(make_service_rule("R", true, "Spooler"));
+    REQUIRE(f.engine->spark_armed_rule_count() == 1);
+    REQUIRE(f.engine->spark_runtime_for_test()->armed_key_count() == 1);
+    REQUIRE(f.mechanism->watching_count() == 1);
+
+    // (2) Hang the next watch(), then push R2 - a genuinely DIFFERENT rule_id -
+    // onto K2 ("Notepad") as an ordinary incremental push. rung 9c PR-2 Unit 6:
+    // apply_rules() -> attach_rule(NonWaiting, ...) dispatches the backend arm()
+    // call off-lock and returns as soon as it is ACCEPTED, so this push (and the
+    // watch() call it kicks off on a detached executor worker) returns without
+    // ever blocking THIS thread - no separate pusher thread is needed, unlike the
+    // concurrent-stop() characterisation tests above. Uses dispatch_raw(), not
+    // apply() - apply()'s own settle loop waits for active_io_workers() == 0,
+    // which this hung watch() deliberately keeps above zero until release_hang()
+    // below, well after the assertions this test cares about.
+    f.mechanism->hang_next_watch();
+    const auto dr2 = f.dispatch_raw(make_service_rule("R2", true, "Notepad"), /*full_sync=*/false);
+    REQUIRE(dr2.exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+    // Safety net for any REQUIRE/CHECK failure below unwinding past a still-parked
+    // worker - matches this file's own established idiom (e.g. ArmerGuard above).
+    // release_hang() is idempotent (see its own doc comment), so the explicit
+    // release_hang() call near the end of the happy path below and this
+    // destructor's own call never conflict.
+    struct Cleanup {
+        FakeServiceMechanism* mech;
+        ~Cleanup() { mech->release_hang(); }
+    } cleanup{f.mechanism};
+
+    // (3) K2's head goes Wedged - claimed by R2, not R. expire_overdue_claims() is
+    // the same test-only seam the raw GuardianSparkRuntime-level UP-1 test uses,
+    // reached here through GuardianEngine's own borrowed runtime
+    // (spark_runtime_for_test()), not a separate fixture.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(f.engine->spark_runtime_for_test()->expire_overdue_claims() == 1);
+
+    // (4) R retargets from K1 onto the now-Wedged K2 (owned by R2, a genuinely
+    // different rule_id) - through the REAL apply_rules()/reconcile_rule_locked()
+    // production path, never GuardianSparkRuntime::attach_rule() directly. Must be
+    // refused synchronously; the push itself is not an error (only R's own
+    // reconcile fails) - same "not an error at the push level" contract the
+    // "a spark arm failure is errored" test above already establishes.
+    const auto dr3 = f.dispatch_raw(make_service_rule("R", true, "Notepad"), /*full_sync=*/false);
+    CHECK(dr3.exit_code == 0);
+    CHECK(f.engine->spark_runtime_for_test()->wedged_refusals() == 1);
+
+    // THE FIX (round 2): R's ORIGINAL arm on K1 is still live all the way through
+    // reconcile_rule_locked()'s OWN defensive-cleanup branch, not merely inside
+    // attach_core() itself. Before the round-2 fix, reconcile_rule_locked()'s
+    // unconditional spark_runtime_->detach_rule("R") on this exact Failed result
+    // found R's real, round-1-preserved arm on K1 and tore it down for real - both
+    // counts below would already read 0 here, and R's real subscription would
+    // already have been handed to a disarm.
+    CHECK(f.engine->spark_armed_rule_count() == 1);                    // still just R
+    CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1); // still K1
+    CHECK(f.mechanism->watching_count() == 1);                         // K1's real watch untouched
+
+    // R2's own hung, wedged claim still recovers normally once released - nobody
+    // ever adopted it (no live follower was ever queued behind it for K2, and R's
+    // own refused retarget never queued one either), so it self-disarms the
+    // ordinary way, the ONLY disarm this whole scenario ever produces.
+    f.mechanism->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return f.mechanism->watching_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(f.engine->spark_armed_rule_count() == 1); // still just R, on K1, throughout
+    CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1);
 }

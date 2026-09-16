@@ -1476,7 +1476,7 @@ bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
     return receipt_status(receipt) != ReceiptStatus::Pending;
 }
 
-std::expected<GuardianSparkRuntime::ArmOutcome, std::string>
+std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError>
 GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
@@ -1517,7 +1517,12 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = core.generation,
                           .receipt = {}};
     case AttachCoreState::Failed:
-        return std::unexpected(std::move(core.error));
+        // rung 9c PR-5c round 2 (#4221): carry attach_core()'s own
+        // prior_state_preserved bit through to the caller - see ArmError's doc
+        // comment. GuardianEngine::reconcile_rule_locked() MUST check it before
+        // running its own defensive detach_rule() cleanup on this failure.
+        return std::unexpected(ArmError{.message = std::move(core.error),
+                                        .prior_state_preserved = core.prior_state_preserved});
     case AttachCoreState::Pending:
         break; // fall through: inspect below, without waiting
     case AttachCoreState::Reobserved:
@@ -1569,7 +1574,13 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         if (outcome)
             return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = *outcome,
                               .receipt = {}};
-        return std::unexpected(std::move(outcome).error());
+        // This call's own NEW claim (attach_core() already ran
+        // detach_rule_locked(rule_id) on rule_id's prior generation to create it)
+        // resolved to a failure by the time we re-checked - rule_id has nothing
+        // left either way, so prior_state_preserved is false, unchanged from
+        // before rung 9c PR-5c round 2 (#4221).
+        return std::unexpected(ArmError{.message = std::move(outcome).error(),
+                                        .prior_state_preserved = false});
     }
     // Still unresolved: hand off to runtime-owned state, never abandon it. True for
     // every Pending claim reaching here regardless of Queued/Dispatching/Dispatched -
@@ -1742,6 +1753,13 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
     return expired_count;
 }
 
+bool GuardianSparkRuntime::is_retained_wedge(const KeyClaim& head) noexcept {
+    return head.kind == ClaimKind::Arm &&
+           (head.dispatch == ClaimDispatch::Dispatching ||
+            head.dispatch == ClaimDispatch::Dispatched) &&
+           head.waiter_abandoned && head.end == ClaimEnd::WaiterTimedOutDispatched;
+}
+
 GuardianSparkRuntime::AttachCoreResult
 GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge,
@@ -1778,8 +1796,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
     {
         std::unique_lock<std::mutex> lk{registry_mu_};
         if (stopping_)
+            // rung 9c PR-5c round 2 (#4221): before detach_rule_locked(rule_id) ever
+            // runs below - rule_id's prior state, if any, is untouched.
             return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
-                                    .error = "stopping", .claim = nullptr};
+                                    .error = "stopping", .prior_state_preserved = true,
+                                    .claim = nullptr};
 
         // UP-1 fix (#4221, rung 9c PR-5c follow-up governance - confirmed HIGH,
         // newly-reachable by this PR's own Reobserved/immediate-refusal design):
@@ -1799,38 +1820,39 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         //
         // Safe to evaluate here, before detach_rule_locked runs: nothing between
         // taking registry_mu_ above and this point mutates claims_, and
-        // detach_rule_locked(rule_id) can only ever touch `key`'s own claims_
-        // entry if `rule_id`'s OWN active generation already lives at `key` - in
-        // which case ITS claim would already be this same FIFO's front with a
-        // MATCHING rule_id, taking the Reobserved branch below instead of this
-        // one (so this branch and detach_rule_locked's effect on `key` are
-        // mutually exclusive by construction). And even when detach_rule_locked
-        // does run (the fall-through case, `rule_id`'s active generation sits on
-        // a DIFFERENT key or not at all), its Case 0 branch only ever withdraws
-        // an entry whose OWN rule_id matches the rule being detached - it can
-        // never touch or reorder a front claim owned by a different rule_id, so
-        // the answer computed here cannot change out from under the later,
-        // unchanged retained_wedge check below.
+        // detach_rule_locked(rule_id) can only ever touch `key`'s own claims_ FIFO
+        // via its Case 0 branch, which withdraws only an entry whose OWN rule_id
+        // matches the rule being detached - it can never touch or reorder a front
+        // claim owned by a DIFFERENT rule_id. So this early return fires whenever
+        // the FRONT (computed right here, before any detach) belongs to a
+        // different rule_id, full stop - independent of whether rule_id's own
+        // active generation exists elsewhere in this same FIFO as a queued,
+        // non-front follower (it can: "Live followers CAN exist behind a wedged
+        // head", the up-2 comment below); this branch does not depend on rule_id's
+        // own generation being the front, only on someone ELSE's being it. The
+        // one case this early return does NOT cover - rule_id's own generation
+        // already IS the front, wedged - falls through to detach_rule_locked
+        // (which skips a waiter_abandoned claim, leaving that front unchanged)
+        // and then the Reobserved branch below, unaffected by this check.
         //
-        // Deliberately duplicates part of that later check rather than
-        // restructuring it: this is the ONLY sub-case that must run before the
-        // detach. Leaving the Reobserved (same rule_id, same spec) sub-case at
-        // its ORIGINAL position, completely unchanged, keeps that path's own
-        // proven behavior - including its interaction with detach_rule_locked's
-        // Case 0, which explicitly skips a waiter_abandoned claim - exactly as
-        // it was.
+        // Deliberately duplicates part of that later check's Failed branch rather
+        // than restructuring it (both now share is_retained_wedge() - rung 9c
+        // PR-5c round 2 governance fold): this is the ONLY sub-case that must run
+        // before the detach. Leaving the Reobserved (same rule_id, same spec)
+        // sub-case at its ORIGINAL position, completely unchanged, keeps that
+        // path's own proven behavior - including its interaction with
+        // detach_rule_locked's Case 0, which explicitly skips a waiter_abandoned
+        // claim - exactly as it was.
         if (const auto pre_cit = claims_.find(key);
             io_class && pre_cit != claims_.end() && !pre_cit->second.fifo.empty()) {
             const auto& pre_head = pre_cit->second.fifo.front();
-            const bool pre_retained_wedge =
-                pre_head->kind == ClaimKind::Arm &&
-                (pre_head->dispatch == ClaimDispatch::Dispatching ||
-                 pre_head->dispatch == ClaimDispatch::Dispatched) &&
-                pre_head->waiter_abandoned && pre_head->end == ClaimEnd::WaiterTimedOutDispatched;
-            if (pre_retained_wedge && pre_head->rule_id != rule_id) {
+            if (is_retained_wedge(*pre_head) && pre_head->rule_id != rule_id) {
                 wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
+                // detach_rule_locked(rule_id) has NOT run yet - rule_id's prior
+                // state, if any, is untouched (rung 9c PR-5c round 2, #4221).
                 return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
-                                        .error = std::string{kSparkKeyWedged}, .claim = nullptr};
+                                        .error = std::string{kSparkKeyWedged},
+                                        .prior_state_preserved = true, .claim = nullptr};
             }
         }
 
@@ -1931,11 +1953,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             // Compare the underlying ClaimEnd/ClaimDispatch fields directly, never
             // the public receipt_status() accessor - it acquires registry_mu_
             // itself, and this locked block already holds it.
-            const bool retained_wedge =
-                head->kind == ClaimKind::Arm &&
-                (head->dispatch == ClaimDispatch::Dispatching ||
-                 head->dispatch == ClaimDispatch::Dispatched) &&
-                head->waiter_abandoned && head->end == ClaimEnd::WaiterTimedOutDispatched;
+            const bool retained_wedge = is_retained_wedge(*head);
             // Do NOT require index_held == false to recognize this state -
             // abandonment releases the index unconditionally in the ordinary case,
             // but the existing fault seam can make that release fail and leave
@@ -1958,17 +1976,24 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 //
                 // UP-1 fix (#4221): the hoisted pre-check above already refuses
                 // (and returns) every call that would land here - it runs the
-                // identical condition on the identical FIFO front BEFORE
+                // identical condition (now is_retained_wedge(), rung 9c PR-5c
+                // round 2 governance fold) on the identical FIFO front BEFORE
                 // detach_rule_locked, and detach_rule_locked can never touch a
                 // front owned by a rule_id other than the one it was called
                 // with. This branch is kept, unchanged, as defense-in-depth
                 // rather than removed: it still fires correctly (redundantly)
                 // if it were ever reached, and removing it would make the
                 // Reobserved branch above stand alone in a way that is easy to
-                // accidentally break on a future edit.
+                // accidentally break on a future edit. Unlike the hoisted
+                // pre-check, detach_rule_locked(rule_id) already ran earlier in
+                // THIS call by the time we reach here - rule_id has nothing left
+                // to preserve, so prior_state_preserved is (explicitly) false: a
+                // caller's defensive cleanup on this Failed result is a genuine
+                // no-op, not a live-arm teardown (rung 9c PR-5c round 2, #4221).
                 wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
                 return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
-                                        .error = std::string{kSparkKeyWedged}, .claim = nullptr};
+                                        .error = std::string{kSparkKeyWedged},
+                                        .prior_state_preserved = false, .claim = nullptr};
             }
         }
 
@@ -2043,9 +2068,13 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             };
             auto armed = backend_->arm(spec); // may THROW -> rollback + index_add_rollback undo it
             if (!armed)
-                // rollback + index_add_rollback undo it
+                // rollback + index_add_rollback undo it. detach_rule_locked(rule_id)
+                // already ran earlier in this call, and this attempt's own new state
+                // is fully rolled back above - rule_id has nothing left either way,
+                // so prior_state_preserved stays false (rung 9c PR-5c round 2, #4221).
                 return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
-                                        .error = armed.error(), .claim = nullptr};
+                                        .error = armed.error(),
+                                        .prior_state_preserved = false, .claim = nullptr};
             sub = *armed;
             armed_here = true;
             pk = std::make_shared<PerKey>();

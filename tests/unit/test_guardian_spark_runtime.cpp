@@ -7285,7 +7285,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     // compensating disarm is submitted (its own doc comment: "the ONE gap where a
     // key's outcome is decided but its claims are still unpublished") - queue r2
     // and install our own entry hook for ITS eventual (genuine) refill dispatch.
-    std::expected<GuardianSparkRuntime::ArmOutcome, std::string> res2;
+    std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError> res2;
     std::thread r2_thread;
     std::promise<void> entered;
     std::promise<void> release_hook;
@@ -7373,7 +7373,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     a_thread.join();
     REQUIRE_FALSE(gen_r1.has_value());
 
-    std::expected<GuardianSparkRuntime::ArmOutcome, std::string> res2;
+    std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError> res2;
     std::thread r2_thread;
     std::promise<void> entered;
     std::promise<void> release_hook;
@@ -7453,7 +7453,7 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     // r2 is queued and parked at its own dispatch entry - BEFORE it ever reaches
     // the reservation check - from inside the drain-gap hook, same as the other
     // two tests above.
-    std::expected<GuardianSparkRuntime::ArmOutcome, std::string> res2;
+    std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError> res2;
     std::thread r2_thread;
     std::promise<void> entered;
     std::promise<void> release_hook;
@@ -7638,7 +7638,12 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_
     auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
                                 file_exists_rule("r2"), true);
     REQUIRE_FALSE(res2.has_value());
-    CHECK(res2.error() == "spark key wedged");
+    CHECK(res2.error().message == "spark key wedged");
+    // rung 9c PR-5c round 2 (#4221): this refusal fires at the hoisted pre-check,
+    // before any detach_rule_locked("r2") could run - prior_state_preserved is
+    // true, matching every hoisted-check refusal regardless of whether "r2" had
+    // any prior state to begin with (it didn't, here).
+    CHECK(res2.error().prior_state_preserved);
     CHECK(rt->wedged_refusals() == 1);
     CHECK(rt->wedged_reobservations() == 0);
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 1); // no new claim queued
@@ -7695,7 +7700,8 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a refused new claimant does not disturb a
     auto res3 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r3", file_spec("/a"),
                                 file_exists_rule("r3"), true);
     REQUIRE_FALSE(res3.has_value());
-    CHECK(res3.error() == "spark key wedged");
+    CHECK(res3.error().message == "spark key wedged");
+    CHECK(res3.error().prior_state_preserved); // hoisted pre-check, rung 9c PR-5c round 2
     CHECK(rt->wedged_refusals() == 1);
 
     // r2, the live follower, is exactly as it was - unaffected by r3's refusal.

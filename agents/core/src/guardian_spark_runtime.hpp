@@ -1143,6 +1143,20 @@ private:
         AttachCoreState state{AttachCoreState::Failed};
         std::uint64_t generation{0};      ///< valid iff state == Armed
         std::string error;                ///< valid iff state == Failed
+        /// rung 9c PR-5c round 2 (#4221, UP-1 residual): valid iff state == Failed.
+        /// True iff THIS return happened BEFORE detach_rule_locked(rule_id) ran
+        /// anywhere in this call - i.e. rule_id's prior committed/claimed state (if
+        /// it had any) is untouched, exactly as it was when this call started.
+        /// False means detach_rule_locked(rule_id) already ran earlier in this same
+        /// call (and, on the inline-type backend-failure path, this attempt's own
+        /// newly-created state was also fully rolled back) - rule_id has nothing
+        /// left either way, so a caller's defensive cleanup afterward is a genuine
+        /// no-op. A caller MUST skip that defensive cleanup when this is true:
+        /// rule_id's real, still-live arm would otherwise be torn down one call
+        /// later by cleanup that assumes (the now-stale premise) "attach_rule
+        /// leaves nothing on failure" - see attach_rule(NonWaiting, ...)'s ArmError
+        /// and GuardianEngine::reconcile_rule_locked()'s own comment.
+        bool prior_state_preserved{false};
         /// valid iff state == Pending OR Reobserved. An OBSERVATION handle only
         /// (rung 9c PR-2, Astra opine review 2026-09-12): destroying it must never
         /// withdraw the rule or abandon its operation - ownership of cancellation
@@ -1209,6 +1223,22 @@ public:
         ArmReceipt receipt;          ///< valid iff kind == Accepted
     };
 
+    /// rung 9c PR-5c round 2 (#4221, UP-1 residual): the non-waiting attach_rule()
+    /// overload's failure result. `message` is the same diagnostic text the
+    /// blocking overload returns as a bare std::string. `prior_state_preserved`
+    /// carries attach_core()'s own AttachCoreResult::prior_state_preserved bit
+    /// straight through (see its doc comment for the full contract) - true means
+    /// rule_id's prior live state, if it had any, was left completely untouched by
+    /// this failure. GuardianEngine::reconcile_rule_locked(), the production
+    /// caller, MUST check this bit before running its own defensive
+    /// spark_runtime_->detach_rule(rule_id) cleanup: skip that call when this is
+    /// true, or a real, still-live arm on a DIFFERENT key gets torn down one call
+    /// later - reproducing the exact defect this bit exists to prevent.
+    struct ArmError {
+        std::string message;
+        bool prior_state_preserved{false};
+    };
+
     /// Non-waiting counterpart to attach_rule() above: shares the identical
     /// preparation/dispatch/commit/cleanup path (attach_core(), the same
     /// claim_rollback pattern and #3831 shape - see the blocking overload's own doc
@@ -1227,9 +1257,13 @@ public:
     /// branch. That receipt is already terminal; nothing further resolves it.
     ///
     /// GuardianEngine::reconcile_rule_locked() is the production caller as of Unit 6.
-    std::expected<ArmOutcome, std::string> attach_rule(NonWaiting, std::string rule_id,
-                                                       SparkSpec spec, RuleAssertion assertion,
-                                                       bool emit_compliant_edge);
+    /// Failure is reported as ArmError (rung 9c PR-5c round 2, #4221), not a bare
+    /// std::string, specifically so that caller can distinguish a refusal that
+    /// preserved rule_id's prior state from one that already tore it down - see
+    /// ArmError's own doc comment.
+    std::expected<ArmOutcome, ArmError> attach_rule(NonWaiting, std::string rule_id,
+                                                     SparkSpec spec, RuleAssertion assertion,
+                                                     bool emit_compliant_edge);
 
     /// rung 9c PR-2 Unit 2 (Astra opine review Blocker 2 / coordinator ruling
     /// 2026-09-12): registry-locked expiry transition, callable directly - nobody is
@@ -1290,6 +1324,18 @@ private:
     AttachCoreResult attach_core(const std::string& key, std::string rule_id, SparkSpec spec,
                                  RuleAssertion assertion, bool emit_compliant_edge,
                                  std::shared_ptr<KeyClaim>& arm_claim);
+
+    /// rung 9c PR-5c round 2 governance fold (#4221): the retained-wedge
+    /// classification - a claim kind==Arm, dispatch in {Dispatching, Dispatched},
+    /// waiter_abandoned, and end==WaiterTimedOutDispatched - used to be duplicated
+    /// verbatim across attach_core()'s hoisted UP-1 pre-check and its original,
+    /// now-largely-superseded post-detach check (kept as defense-in-depth, not
+    /// removed). A future edit to one copy without the other could silently
+    /// reintroduce a UP-1-class bug, so both now read this one definition. Pure
+    /// read of `head`'s own fields - registry_mu_ held is the caller's
+    /// responsibility (both current call sites already hold it), not this
+    /// function's, since it never touches shared state itself.
+    [[nodiscard]] static bool is_retained_wedge(const KeyClaim& head) noexcept;
 
     // Helpers (all assume the documented lock discipline; see the .cpp).
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the
