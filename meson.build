@@ -279,6 +279,39 @@ else
   cli11_dep = dependency('CLI11', method: 'cmake', modules: ['CLI11::CLI11'],
     required: true, include_type: 'system')
 endif
+
+# RE2 — already vendored transitively via grpc++ (grpc's own build depends
+# on it) on every supported platform, but the blocks above only wire it as
+# a *private* link dependency of grpcpp_dep, not a standalone consumable
+# dependency(). The pii_scan plugin (agents/plugins/pii_scan) is the first
+# consumer needing RE2 directly (guaranteed linear-time regex matching —
+# no ReDoS risk from a user-authored pattern — see its pii_matcher.hpp),
+# and the shared agent test binary (tests/meson.build) links its pure
+# logic headers directly too. Declared once here, purely additive next to
+# the block above, rather than duplicated per-consumer: same
+# Windows-hand-wired / Linux-macOS-cmake-then-pkgconfig split as
+# grpcpp_dep/protobuf_dep just above, for the same #375-class reason.
+if host_machine.system() == 'windows'
+  _re2_lib = cxx.find_library('re2', dirs: [_vcpkg_lib_win], required: true)
+  # re2.lib alone under-links on MSVC static linkage: re2's own object
+  # files reference abseil's log_internal (LogMessage) and
+  # container_internal (raw_hash_set erase internals) symbols directly,
+  # which only resolve if the full abseil lib set is linked alongside it
+  # — exactly why grpcpp_dep above also appends `+ _absl_deps` rather than
+  # relying on transitive resolution (Windows static linking doesn't
+  # chain the way Linux's dynamic linker does).
+  re2_dep = declare_dependency(
+    include_directories: _vcpkg_inc_win,
+    dependencies: [_re2_lib] + _absl_deps,
+  )
+else
+  re2_dep = dependency('re2', method: 'cmake', modules: ['re2::re2'], required: false,
+    include_type: 'system')
+  if not re2_dep.found()
+    re2_dep = dependency('re2', method: 'pkg-config', required: true, include_type: 'system')
+  endif
+endif
+
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')
 nlohmann_dep    = dependency('nlohmann_json', required: true, include_type: 'system')
@@ -483,6 +516,7 @@ if build_agent
   subdir('agents/plugins/antivirus')
   subdir('agents/plugins/bitlocker')
   subdir('agents/plugins/vuln_scan')
+  subdir('agents/plugins/pii_scan')
   subdir('agents/plugins/tags')
   subdir('agents/plugins/asset_tags')
   subdir('agents/plugins/quarantine')

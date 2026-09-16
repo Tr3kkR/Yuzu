@@ -1,0 +1,209 @@
+# 04-drivers-licenses-intl.yaml — Driver's licence formats outside the US
+# (Canada provinces/territories, UK DVLA, Australia states/territories).
+# See 00-manifest.yaml for the checksum algorithm registry.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-drivers-licenses-intl
+  version: 0.2.0-draft
+  description: Non-US driver's licence number formats.
+
+# ── Canada ───────────────────────────────────────────────────────────────
+# Primary source: Microsoft Purview's Canada Driver's License Number SIT
+# definition (learn.microsoft.com/en-us/purview/sit-defn-canada-drivers-license-number)
+# EXPLICITLY states "Checksum: No" for every province — Microsoft's own DLP
+# engine, which has commercial incentive to implement checksums where they
+# exist, implements none for any Canadian province. Cross-validated against
+# a community regex compilation whose author states NWT/Yukon formats were
+# confirmed via direct government contact.
+canada:
+  - province: "ON"
+    name: Ontario
+    pattern: '[A-Z]\d{4}-?\d{5}\d[0156]\d[0123]\d'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: >
+      Format: HIGH confidence. 1 letter + 14 digits (15 chars): surname
+      initial + 4-digit surname phonetic code + 5-digit given-name/
+      middle code+birth-year + MMDD-like tail with a sex offset (+50 to
+      month tens digit for female) + final digit.
+      ENCODING ALGORITHM DETAIL: MEDIUM/LOW confidence. The commonly
+      repeated public description of how the 4-digit surname code and
+      3-digit given-name code are derived is a proprietary phonetic
+      (Soundex-like) substitution table that Ontario's MTO has NOT
+      published — every source describing it is reverse-engineered, none
+      cite an official MTO document with the full table. The
+      month+50-if-female offset rule IS widely and consistently
+      corroborated. RECOMMENDATION: implement the shape regex + the
+      sex/month structural constraint only; do not fabricate the
+      surname/given-name encoding table, and do not implement a
+      checksum for the (likely-present but undocumented) final digit.
+    sources:
+      - "https://learn.microsoft.com/en-us/purview/sit-defn-canada-drivers-license-number"
+      - "https://gist.github.com/lipe-dev/4468b0fcc4c85acaa7bca9db534a9779"
+
+  - province: QC
+    name: Quebec
+    pattern: '[A-Z]\d{12}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: BC
+    name: "British Columbia"
+    pattern: '\d{8}'
+    legacyPattern: '\d{7}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "Since 2023-07-24: 8 digits, new numbers start with '3'; legacy 7-digit numbers zero-padded to 8."
+    sources:
+      - "https://icbc.com/about-icbc/newsroom/2023-feb06-DLnumbers"
+
+  - province: AB
+    name: Alberta
+    pattern: '(\d{6}-\d{3}|\d{5,9})'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "Two coexisting legacy formats."
+
+  - province: MB
+    name: Manitoba
+    pattern: '[A-Z]{2}-?[A-Z]{2}-?[A-Z]{2}-?[A-Z]\d{3}[A-Z]{2}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: SK
+    name: Saskatchewan
+    pattern: '\d{8}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: NS
+    name: "Nova Scotia"
+    pattern: '[A-Z]{5}-?[0-3][0-9][01]\d{6}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: NB
+    name: "New Brunswick"
+    pattern: '\d{5,7}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: NL
+    name: "Newfoundland and Labrador"
+    pattern: '[A-Z]\d{9}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: PE
+    name: "Prince Edward Island"
+    pattern: '\d{5,6}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - province: YT
+    name: Yukon
+    pattern: '\d{1,6}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Government-confirmed per the gist author's account, but not independently corroborated by a second source."
+
+  - province: NT
+    name: "Northwest Territories"
+    pattern: '\d{6}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Same single-source caveat as Yukon."
+
+  - province: NU
+    name: Nunavut
+    pattern: null
+    checksum: null
+    sourceConfidence: NONE
+    notes: "No credible public source states Nunavut's format — no pattern shipped, deliberately, rather than guessing."
+
+# ── United Kingdom ───────────────────────────────────────────────────────
+unitedKingdom:
+  - id: gb.dvla_driving_licence
+    displayName: "UK Driving Licence Number (DVLA, Great Britain only)"
+    pattern: '[A-Z9]{5}[0-9](0[1-9]|1[0-2]|5[1-9]|6[0-2])(0[1-9]|[12][0-9]|3[01])[0-9][A-Z9]{2}[0-9][A-Z0-9]{2}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: >
+      16 characters, applies to GREAT BRITAIN licences only — Northern
+      Ireland uses an unrelated 8-digit sequential number, do not
+      conflate the two.
+      Field layout: pos 1-5 = surname (first 5 letters, '9'-padded if
+      shorter); pos 6 = birth-decade digit; pos 7-8 = birth month (+50 if
+      female, so 01-12=male, 51-62=female); pos 9-10 = birth day; pos 11
+      = birth-year units digit; pos 12-13 = first+middle forename
+      initials ('9'-padded if no middle name); pos 14 = arbitrary
+      computer-assigned discriminator disambiguating identical
+      name+DOB; pos 15-16 = check characters.
+      CHECK-CHARACTER ALGORITHM (positions 15-16) IS NOT PUBLICLY
+      DOCUMENTED. A 2015 Freedom of Information request (ref FOIR4709)
+      asking DVLA to disclose the algorithm was formally refused, and no
+      reverse-engineering write-up or validator library was found that
+      implements or credibly claims one. DO NOT build a checksum
+      verifier for these two characters — ship shape-match only.
+      Surname/DOB/initials encoding (positions 1-13) is HIGH confidence,
+      convergent across sources and matches a real worked example
+      (MORGA657054SM9IJ). The discriminator (position 14) is LOW
+      confidence on its exact semantics.
+    sources:
+      - "https://en.wikipedia.org/wiki/Driving_licence_in_the_United_Kingdom"
+      - "https://www.whatdotheyknow.com/request/dvla_driving_licence_check_digi (FOIR4709 refusal)"
+
+# ── Australia ────────────────────────────────────────────────────────────
+# No state publishes a checksum for its driver's licence number. Regexes
+# overlap heavily across states (e.g. an 8-digit number could plausibly be
+# NSW/QLD/VIC/WA) — do not attempt state disambiguation from the number
+# alone; these are shape-only candidate detectors.
+australia:
+  - state: NSW
+    pattern: '\d{8}'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: VIC
+    pattern: '\d{8,10}'
+    checksum: null
+    sourceConfidence: LOW
+    notes: "Digit-count range varies by source."
+
+  - state: QLD
+    pattern: '0\d{7}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "8 digits, always starts with 0."
+
+  - state: WA
+    pattern: '\d{7,8}'
+    checksum: null
+    sourceConfidence: LOW
+
+  - state: SA
+    pattern: '[A-Z]\d{6}'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: TAS
+    pattern: '\d{6,8}'
+    checksum: null
+    sourceConfidence: LOW
+
+  - state: ACT
+    pattern: '\d{9}'
+    checksum: null
+    sourceConfidence: LOW
+
+  - state: NT
+    pattern: null
+    checksum: null
+    sourceConfidence: NONE
+    notes: "No fixed pattern documented — no pattern shipped."
+
+australiaSources:
+  - "https://clearwater.com.au/code/tfn/"
+  - "https://lookuptax.com/docs/how-to-verify/australia-drivers-license-format"

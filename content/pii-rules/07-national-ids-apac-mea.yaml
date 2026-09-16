@@ -1,0 +1,343 @@
+# 07-national-ids-apac-mea.yaml — National identifier / tax-ID formats for
+# Asia-Pacific, Middle East, and Africa. See 00-manifest.yaml for the
+# checksum algorithm registry.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-national-ids-apac-mea
+  version: 0.2.0-draft
+  description: National identifier / tax-ID formats for Asia-Pacific, Middle East, and Africa.
+
+countries:
+  - country: JP
+    countryName: Japan
+    rules:
+      - id: jp.my_number
+        displayName: "My Number (個人番号)"
+        category: national_id
+        pattern: '\d{12}'
+        checksum: jp_my_number_weighted
+        confidenceKeywords: ["my number", "個人番号", "マイナンバー"]
+        severity: high
+        complianceTags: [APPI]
+        sourceConfidence: MEDIUM
+        notes: "12 digits, randomly assigned (no embedded meaning), reissued if compromised. Validate the two-band weighted checksum against a known-good test vector before production use — no official English-language primary source located."
+
+  - country: CN
+    countryName: China
+    rules:
+      - id: cn.resident_id
+        displayName: "Resident Identity Card Number"
+        category: national_id
+        pattern: '\d{17}[0-9Xx]'
+        checksum: iso7064_mod11_2
+        confidenceKeywords: ["resident identity", "身份证"]
+        severity: high
+        complianceTags: [PIPL]
+        sourceConfidence: HIGH
+        notes: "18 chars = 6-digit region code + 8-digit YYYYMMDD DOB + 3-digit sequence (odd=male/even=female) + 1 check char, per GB 11643-1999. Legacy 15-digit format (pre-1999) has NO check digit — treat as a separate, lower-confidence pattern if needed."
+
+  - country: KR
+    countryName: "South Korea"
+    rules:
+      - id: kr.rrn
+        displayName: "Resident Registration Number (RRN)"
+        category: national_id
+        pattern: '\d{6}-?[1-4]\d{6}'
+        checksum: kr_rrn_weighted_mod11
+        confidenceKeywords: ["rrn", "resident registration", "주민등록번호"]
+        severity: high
+        complianceTags: [PIPA]
+        sourceConfidence: HIGH
+        notes: "S-digit (century/sex): 1/2=1900s M/F, 3/4=2000s M/F, 5/6=2000s foreign-resident M/F, 9/0=1800s M/F. A checksum FAIL is inconclusive (not proof of invalidity) for numbers plausibly issued after ~2020, since post-2020 registrations increasingly randomize digits 7-13."
+
+  - country: IN
+    countryName: India
+    rules:
+      - id: in.aadhaar
+        displayName: "Aadhaar Number"
+        category: national_id
+        pattern: '[2-9]\d{11}'
+        checksum: verhoeff
+        exclusions: "Never starts with 0 or 1."
+        confidenceKeywords: ["aadhaar", "uidai"]
+        severity: high
+        complianceTags: [DPDP Act 2023]
+        sourceConfidence: HIGH
+
+      - id: in.pan
+        displayName: "Permanent Account Number (PAN)"
+        category: tax_id
+        pattern: '[A-Z]{5}\d{4}[A-Z]'
+        checksum: null
+        confidenceKeywords: ["pan", "permanent account number"]
+        severity: high
+        complianceTags: [DPDP Act 2023]
+        sourceConfidence: HIGH
+        notes: "Char 4 = entity type (P=individual, C=company, H=HUF, F=firm, A=AOP, T=trust, B=BOI, L=local authority, J=artificial juridical person, G=govt). Char 5 = first letter of surname/entity name. CONFIRMED no officially published checksum for the final check letter — reverse-engineered claims exist but are inconsistent across sources and the Income Tax Department has never published a formula. Format + entity-type-letter validation only."
+
+  - country: SG
+    countryName: Singapore
+    rules:
+      - id: sg.nric_fin
+        displayName: "NRIC / FIN"
+        category: national_id
+        pattern: '[STFGM]\d{7}[A-Z]'
+        checksum: sg_nric_weighted
+        confidenceKeywords: ["nric", "fin"]
+        severity: high
+        complianceTags: [PDPA]
+        sourceConfidence: HIGH
+        notes: "S/T and F/G check-letter tables are long-documented (HIGH). M-series table (introduced 2022-01-01) is MEDIUM confidence — fewer independent sources given its recency."
+
+  - country: AU
+    countryName: Australia
+    rules:
+      - id: au.tfn
+        displayName: "Tax File Number (TFN)"
+        category: tax_id
+        pattern: '\d{8,9}'
+        checksum: au_tfn_weighted_mod11
+        confidenceKeywords: ["tfn", "tax file number"]
+        severity: high
+        complianceTags: ["Privacy Act 1988"]
+        sourceConfidence: MEDIUM
+        notes: "ATO does not officially publish this algorithm (deliberately, to hinder synthetic-TFN generation) but it's extremely consistently documented across independent developer/compliance sources."
+
+      - id: au.medicare
+        displayName: "Medicare Number"
+        category: national_id
+        pattern: '\d{4}[ -]?\d{5}[ -]?\d{1}'
+        checksum: au_medicare_weighted
+        confidenceKeywords: ["medicare"]
+        severity: high
+        complianceTags: ["Privacy Act 1988"]
+        sourceConfidence: HIGH
+        notes: "Checksum covers only the first 9 digits (identifier + check digit); the separately-printed Individual Reference Number (10th digit) is not covered."
+
+  - country: NZ
+    countryName: "New Zealand"
+    rules:
+      - id: nz.ird
+        displayName: "IRD Number"
+        category: tax_id
+        pattern: '\d{2,3}-?\d{3}-?\d{3}'
+        checksum: null
+        checksumNotes: "Primary weights 3,2,7,6,5,4,3,2 over 8 base digits, remainder=sum mod 11, check=(remainder==0?0:11-remainder). If check==10, RETRY with secondary weights 7,4,3,2,5,2,7,6 using the same remainder/check rule. If secondary also yields 10, the number is invalid. Named 'nz_ird_weighted' — add to the manifest registry if implementing."
+        confidenceKeywords: ["ird number"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        sources: ["IRD Non-Resident/Resident Withholding Tax Specification 2016"]
+
+  - country: ZA
+    countryName: "South Africa"
+    rules:
+      - id: za.id_number
+        displayName: "South African ID Number"
+        category: national_id
+        pattern: '\d{6}[0-4]\d{3}[01]\d{2}'
+        checksum: luhn
+        confidenceKeywords: ["id number", "sa id"]
+        severity: high
+        complianceTags: [POPIA]
+        sourceConfidence: HIGH
+        notes: "13 digits YYMMDD SSSS C A Z: DOB(6) + gender-sequence(4, female 0000-4999/male 5000-9999) + citizenship(1: 0=citizen,1=permanent resident) + legacy race digit (1, historical, fixed at 8 in modern cards) + Luhn check digit."
+
+  - country: ID
+    countryName: Indonesia
+    rules:
+      - id: id.nik
+        displayName: "Nomor Induk Kependudukan (NIK)"
+        category: national_id
+        pattern: '\d{16}'
+        checksum: null
+        confidenceKeywords: ["nik", "nomor induk kependudukan"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "16 digits: province+regency+district(6) + DOB DDMMYY with day+40 if female(6) + serial(4). No checksum documented — validate the day-of-month sub-range (01-31 or 41-71) as a separate post-match check, not in-regex (RE2 alternation for this gets unreadable)."
+
+  - country: PH
+    countryName: Philippines
+    rules:
+      - id: ph.psn
+        displayName: "PhilSys Number (PSN)"
+        category: national_id
+        pattern: '\d{4}-\d{4}-\d{4}'
+        checksum: null
+        confidenceKeywords: ["psn", "philsys number"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "12 digits, confidential, microprinted on card back. No public checksum documented."
+
+      - id: ph.pcn
+        displayName: "PhilSys Card Number (PCN)"
+        category: national_id
+        pattern: '\d{16}'
+        checksum: null
+        confidenceKeywords: ["pcn", "philsys card number"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "16 digits, printed on card front, used for verification. No public checksum documented."
+
+  - country: VN
+    countryName: Vietnam
+    rules:
+      - id: vn.cccd
+        displayName: "Căn cước công dân (National ID)"
+        category: national_id
+        pattern: '\d{12}'
+        checksum: null
+        confidenceKeywords: ["căn cước công dân", "can cuoc cong dan", "cccd"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "12 digits: province/country code(3) + century+sex code(1) + birth year(2) + sequential(6). No checksum documented — purely sequential/allocated."
+
+  - country: TH
+    countryName: Thailand
+    rules:
+      - id: th.national_id
+        displayName: "Thai National ID"
+        category: national_id
+        pattern: '\d-?\d{4}-?\d{5}-?\d{2}-?\d'
+        checksum: null
+        checksumNotes: "Weights 13,12,11,10,9,8,7,6,5,4,3,2 over digits 1-12, mod 11. check=(11-remainder) mod 10, must equal digit 13. Named 'th_national_id_weighted' — add to the manifest registry if implementing."
+        confidenceKeywords: ["thai national id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "13 digits: type(1) + office code(4) + sequential(5) + check digit(1). Matches Microsoft Purview's own SIT definition for this identifier."
+        sources: ["learn.microsoft.com/en-us/purview/sit-defn-thai-population-identification-code"]
+
+  - country: MY
+    countryName: Malaysia
+    rules:
+      - id: my.nric_mykad
+        displayName: "MyKad / NRIC Number"
+        category: national_id
+        pattern: '\d{6}-?\d{2}-?\d{4}'
+        checksum: null
+        confidenceKeywords: ["mykad", "nric"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "12 digits YYMMDD-PB-###G: DOB(6) + state/birthplace code(2, 01-16=Malaysian states, 60+=foreign-born) + serial+gender(4, last digit odd=male/even=female). NO OFFICIALLY PUBLISHED checksum — JPN (National Registration Department) has never disclosed one. Third-party-claimed algorithms are explicitly flagged unofficial/unverified by their own authors — do NOT implement any of them as a hard filter; a mismatch is not proof of an invalid number."
+
+  - country: IL
+    countryName: Israel
+    rules:
+      - id: il.teudat_zehut
+        displayName: "Teudat Zehut (ID Number)"
+        category: national_id
+        pattern: '\d{9}'
+        checksum: luhn
+        confidenceKeywords: ["teudat zehut", "israeli id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Historically issued as up to 8 digits + check digit; zero-pad to 9 on the left before validating."
+
+  - country: SA
+    countryName: "Saudi Arabia"
+    rules:
+      - id: sa.national_id
+        displayName: "National ID / Iqama Number"
+        category: national_id
+        pattern: '[12]\d{9}'
+        checksum: luhn
+        confidenceKeywords: ["iqama", "national id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "First digit 1=Saudi national, 2=resident (Iqama holder). Luhn usage is consistently reported across sources, but the Ministry of Interior's own published spec could not be located — treat as 'commonly implemented as Luhn', not officially confirmed."
+
+  - country: AE
+    countryName: "United Arab Emirates"
+    rules:
+      - id: ae.emirates_id
+        displayName: "Emirates ID Number"
+        category: national_id
+        pattern: '784-?\d{4}-?\d{7}-?\d'
+        checksum: null
+        confidenceKeywords: ["emirates id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "15 digits: fixed 784 (UAE ISO country prefix) + 4-digit birth year + 7-digit sequential + 1 'verification' digit. NO PUBLIC checksum documented for the final digit — the issuing authority (ICA) has not published the algorithm."
+
+  - country: EG
+    countryName: Egypt
+    rules:
+      - id: eg.national_id
+        displayName: "National ID Number"
+        category: national_id
+        pattern: '[23]\d{13}'
+        checksum: null
+        confidenceKeywords: ["egyptian national id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "14 digits: century digit(1: 2=1900s,3=2000s) + YYMMDD DOB(6) + governorate code(2, 01-27, 88=born abroad) + sequential(4, odd=male/even=female) + check digit(1). NO PUBLIC formula documented for the check digit — several independent OSS validators implement a candidate function but each explicitly states the government's algorithm is proprietary/undisclosed and their implementation is best-effort/unverified. Treat any such formula as unverified."
+
+  - country: NG
+    countryName: Nigeria
+    rules:
+      - id: ng.nin
+        displayName: "National Identification Number (NIN)"
+        category: national_id
+        pattern: '\d{11}'
+        checksum: null
+        confidenceKeywords: ["nin", "national identification number"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "11 digits, randomly generated/non-intelligible (no embedded DOB/region/sex). NIMC has not published a checksum — digits are opaque random allocations."
+
+  - country: KE
+    countryName: Kenya
+    rules:
+      - id: ke.national_id_legacy
+        displayName: "National ID (legacy)"
+        category: national_id
+        pattern: '\d{7,8}'
+        checksum: null
+        confidenceKeywords: ["kenyan national id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "Sequential, no embedded meaning, no checksum."
+
+      - id: ke.maisha_namba
+        displayName: "Maisha Namba (UPI)"
+        category: national_id
+        pattern: '\d{14}'
+        checksum: null
+        confidenceKeywords: ["maisha namba", "unique personal identifier"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "14-digit Unique Personal Identifier, rolled out 2023-24 replacing Huduma Namba, assigned at birth. Rollout is recent/still transitioning — digit count confirmed across sources but internal sub-field structure not published. No checksum documented."
+
+  - country: TR
+    countryName: Turkey
+    rules:
+      - id: tr.kimlik_no
+        displayName: "T.C. Kimlik No"
+        category: national_id
+        pattern: '[1-9]\d{10}'
+        checksum: null
+        checksumNotes: >
+          Two documented check digits, distinct formulas:
+          d10 = ((d1+d3+d5+d7+d9)*7 - (d2+d4+d6+d8)) mod 10
+          d11 = (d1+d2+d3+d4+d5+d6+d7+d8+d9+d10) mod 10
+          Named 'tr_kimlik_check' — add to the manifest registry if implementing.
+        confidenceKeywords: ["t.c. kimlik", "turkish id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "11 digits, first digit cannot be 0. Well-documented, matches multiple independent OSS implementations and Wikipedia's algorithm description."

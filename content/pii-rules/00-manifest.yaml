@@ -1,0 +1,616 @@
+# 00-manifest.yaml — PII/Sensitive-Data-Discovery Ruleset (research-backed draft)
+#
+# Built 2026-09-16 for a prospective Yuzu `pii_scan` plugin. Six parallel
+# research passes (US driver's licenses; ICAO passport MRZ; EU/UK national
+# IDs; Americas; APAC/MEA; generic financial/device identifiers) gathered
+# and cross-checked this data against official government sources, ISO
+# standards, and — critically — the python-stdnum open-source library
+# (github.com/arthurdejong/python-stdnum), which ships reference
+# implementations for dozens of national identifier checksums and caught
+# several errors in the original draft (see "Corrections" below).
+#
+# THIS IS STILL A DRAFT. Every entry carries a `sourceConfidence` field
+# (HIGH/MEDIUM/LOW) and, where relevant, a `notes` field flagging gaps.
+# LOW-confidence entries and any entry with `checksum: null` because no
+# algorithm was found should be treated as format-only candidate matches,
+# not proof of a real identifier — pair with confidenceKeywords / human
+# review, never auto-fail compliance on these alone.
+#
+# Files in this ruleset:
+#   00-manifest.yaml                 — this file: legend, checksum registry, corrections log
+#   01-generic.yaml                  — cards, IBAN, email, phone, VIN, IMEI, NPI, MBI, ABA, SWIFT, crypto, UK sort code
+#   02-passports.yaml                — ICAO 9303 MRZ (TD1/TD2/TD3) + non-MRZ passport number formats
+#   03-drivers-licenses-us.yaml      — all 50 US states + DC (PR explicitly unverified, no rule shipped)
+#   04-drivers-licenses-intl.yaml    — Canada (13 provinces/territories), UK DVLA, Australia (8 states/territories)
+#   05-national-ids-europe.yaml      — EU-27 + UK + Switzerland + Norway (27 jurisdictions)
+#   06-national-ids-americas.yaml    — US, Canada, Mexico, Brazil, Argentina, Chile, Colombia, Peru, Venezuela
+#   07-national-ids-apac-mea.yaml    — Japan, China, Korea, India, Singapore, Australia, NZ, Indonesia,
+#                                       Philippines, Vietnam, Thailand, Malaysia, Israel, Saudi Arabia,
+#                                       UAE, Egypt, Nigeria, Kenya, Turkey, South Africa
+#
+# ── Confidence legend ───────────────────────────────────────────────────
+#   sourceConfidence: HIGH   — algorithm confirmed by official government
+#                              spec, ISO standard, or an independent
+#                              open-source reference implementation
+#                              (usually python-stdnum), often with a
+#                              worked example verified during research.
+#   sourceConfidence: MEDIUM — consistent across 2+ independent secondary
+#                              sources, no single primary/official doc
+#                              located, or one detail within an otherwise-
+#                              HIGH entry is unconfirmed (see notes).
+#   sourceConfidence: LOW    — single-source, conflicting sources, or
+#                              explicitly flagged as unverified by the
+#                              research itself. Format-only; do not gate
+#                              on any associated checksum.
+#
+# ── Finding-confidence model (runtime, distinct from sourceConfidence
+#    above — this is about a SPECIFIC MATCH, not the RULE definition) ──
+#   HIGH   — shape match + checksum pass (where a checksum exists and
+#            sourceConfidence is HIGH/MEDIUM)
+#   MEDIUM — shape match, checksum fails/unavailable, but a
+#            confidenceKeyword was found nearby
+#   LOW    — shape match only, no checksum, no nearby keyword
+#
+# ── Engine implementation notes ─────────────────────────────────────────
+# - RE2, not a backtracking engine: every `pattern` below is written to be
+#   RE2-compatible — no backreferences, no lookahead/lookbehind. Anywhere
+#   the original identifier spec needs "same digit repeats" or similar
+#   backreference-shaped logic (Germany Steuer-ID's digit-uniqueness rule,
+#   Indonesia NIK's DOB-in-range constraint), it is captured in `notes` as
+#   a post-match code-level check instead.
+# - Checksums are NAMED here and implemented as pure functions in the
+#   detector engine, not embedded in regex. The registry below is the
+#   single source of truth for each named algorithm's exact math — every
+#   per-jurisdiction file just references the name plus any
+#   jurisdiction-specific parameters (weight sets, tables) inline.
+# - NEVER store/log the raw matched value. Findings should carry
+#   ruleId + file + line/offset + sourceConfidence + findingConfidence
+#   only, with the matched text masked (e.g. show last 4 chars).
+#
+# ── Corrections made during research (kept here for audit trail) ───────
+# The original hand-drafted ruleset (v0.1.0-draft, 2026-09-15) got these
+# wrong; python-stdnum and official sources corrected them before this
+# version was written:
+#   - Bulgaria EGN: sex digit is EVEN=male/ODD=female (draft had it backwards)
+#   - Bulgaria EGN: the century trick applies to the MONTH field, not the year
+#   - Slovenia EMŠO: century digits are 8=1800s/9=1900s/0=2000s (draft: 9/0/1)
+#   - Slovenia EMŠO: only ONE mod-11→mod-10 wrap case exists, not two
+#   - Latvia (post-2017 format): 2nd digit is random 2-9, not fixed "2"
+#   - Denmark CPR: checksum was ABOLISHED in 2007 for exhausted date cohorts
+#     — do not gate on it; format + date-plausibility only
+#   - Ireland PPS: the 2nd letter of the suffix DOES affect the checksum
+#     (weight 9) — some secondary sources incorrectly claim it doesn't
+#   - Finland HETU: the 2023 reform did NOT widen the 900-999 individual
+#     number range (that's a pre-existing rule); it only added new century
+#     characters
+#   - Estonia/Lithuania: draft omitted the 7/8 = 2100s century-digit case
+#
+# ── Checksum algorithm registry ─────────────────────────────────────────
+checksumAlgorithms:
+
+  - name: luhn
+    description: >
+      Standard Luhn / mod-10. From the rightmost digit moving left, double
+      every second digit; if the doubled result > 9, subtract 9 (equivalent
+      to summing its own digits). Sum all digits (doubled + undoubled).
+      Valid iff sum mod 10 == 0.
+    usedBy: [generic credit cards, Canada SIN, Sweden personnummer (compact
+      form), South Africa ID, Israel Teudat Zehut, Saudi Arabia national ID
+      (MEDIUM confidence), Greece AMKA, IMEI, Luxembourg matricule C1]
+    sourceConfidence: HIGH
+
+  - name: iban_mod97
+    description: >
+      ISO 7064 MOD 97-10 as used for IBAN (ISO 13616). Move the first 4
+      characters to the end of the string. Convert letters to numbers
+      (A=10 ... Z=35), digits unchanged. Interpret the result as one large
+      decimal integer. Valid iff integer mod 97 == 1.
+    usedBy: [IBAN]
+    sourceConfidence: HIGH
+
+  - name: iso7064_mod11_10
+    description: >
+      ISO 7064 MOD 11-10 running-remainder form. m=10. For each digit d
+      (left to right, excluding the check digit): m = (d + m) mod 10; if
+      m == 0, m = 10; m = (2*m) mod 11. Final check digit = 11 - m; if that
+      equals 10, check digit = 0.
+      (Croatia's OIB uses an equivalent recurrence seeded check=5; see
+      07-national-ids... no, see 05-national-ids-europe.yaml Croatia entry
+      for the exact form used there — same algorithm family, different
+      canonical presentation.)
+    usedBy: [Germany Steuer-ID]
+    sourceConfidence: HIGH
+
+  - name: iso7064_mod11_10_hr
+    description: >
+      Croatia OIB's presentation of ISO 7064 MOD 11-10 (equivalent math to
+      iso7064_mod11_10, different iteration form — verbatim from
+      python-stdnum). check = 5 (seed). For each of the 11 digits n:
+      check = (((check or 10) * 2) mod 11 + n) mod 10. Valid iff the final
+      check value, after processing ALL 11 digits (including the check
+      digit itself), equals 1.
+    usedBy: [Croatia OIB]
+    sourceConfidence: HIGH
+
+  - name: iso7064_mod11_2
+    description: >
+      ISO 7064 MOD 11-2, as used for China's Resident Identity Card.
+      Weights on positions 1-17 (left to right): 7,9,10,5,8,4,2,1,6,3,7,9,
+      10,5,8,4,2. remainder = (sum of digit*weight) mod 11. Map remainder
+      to check character via table: {1:'0', 0:'1', 10:'X', 9:'2', 8:'3',
+      7:'4', 6:'5', 5:'6', 4:'7', 3:'8', 2:'9'}.
+    usedBy: [China Resident Identity Card]
+    sourceConfidence: HIGH
+
+  - name: verhoeff
+    description: >
+      Verhoeff checksum — a dihedral-group (D5) algorithm using
+      multiplication, permutation, and inverse tables (not a simple
+      weighted sum; implement via the standard published tables). Valid
+      iff running total, after processing all digits including the check
+      digit, equals 0.
+    usedBy: [India Aadhaar, Luxembourg matricule C2]
+    sourceConfidence: HIGH
+
+  - name: mod23_pps
+    description: >
+      Ireland PPS Number. Weights 8,7,6,5,4,3,2 applied to the 7 digits.
+      IMPORTANT (corrected during research): the 2nd suffix letter, if
+      present, ALSO contributes — weight 9, mapped through the alphabet
+      order W,A,B,C,D,E,F,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V (W/blank=0,
+      A=1 ... V=22). total = (weighted digit sum) + (9 * second-letter
+      value). check_letter = same W..V alphabet indexed by (total mod 23).
+    usedBy: [Ireland PPS Number]
+    sourceConfidence: HIGH
+
+  - name: fr_nir_mod97
+    description: >
+      France NIR/INSEE. Corsica department substitution: 2A -> 19, 2B -> 18
+      (applied to the department digits before the arithmetic). Treat the
+      13-digit body (sex+YY+MM+dept+commune+order, with the substitution
+      applied) as one integer N. check = 97 - (N mod 97). Two check digits
+      are printed; remainder 0 maps to key "97" (not a rejection).
+    usedBy: [France NIR / INSEE]
+    sourceConfidence: HIGH
+    notes: "Overseas department range 977-989 unconfirmed (971-976 solid)."
+
+  - name: es_dni_nie_mod23
+    description: >
+      Spain DNI/NIE. For NIE, first convert the leading letter to a digit:
+      X=0, Y=1, Z=2, then proceed as DNI. N = the resulting 8-digit
+      integer. check_letter = table[N mod 23] where
+      table = "TRWAGMYFPDXBNJZSQVHLCKE" (0-indexed).
+    usedBy: [Spain DNI, Spain NIE]
+    sourceConfidence: HIGH
+
+  - name: it_codice_fiscale_check
+    description: >
+      Italy Codice Fiscale. For each of the first 15 characters, look up a
+      value from an ODD-position table (if 1-indexed position is odd) or
+      an EVEN-position table (if even), then sum all 15 values, mod 26,
+      map 0-25 to A-Z for the 16th (check) character.
+      Odd-position table (chars/digits -> value): 0=1 1=0 2=5 3=7 4=9 5=13
+      6=15 7=17 8=19 9=21 A=1 B=0 C=5 D=7 E=9 F=13 G=15 H=17 I=19 J=21 K=2
+      L=4 M=18 N=20 O=11 P=3 Q=6 R=8 S=12 T=14 U=16 V=10 W=22 X=25 Y=24 Z=23
+      Even-position table: digits = face value (0-9); letters A=0 ... Z=25.
+    usedBy: [Italy Codice Fiscale]
+    sourceConfidence: HIGH
+    notes: "Omocodia (digit-substitution for duplicate codes) not covered — a real Codice Fiscale may substitute letters for digits in the numeric fields to disambiguate collisions; this regex/checksum handles the non-omocodia case only."
+
+  - name: nl_elfproef
+    description: >
+      Netherlands "11-test". Weights 9,8,7,6,5,4,3,2,-1 applied to the 9
+      digits (last weight is negative — i.e. subtract that term). Valid
+      iff sum mod 11 == 0. No digit substitution on failure — strict
+      pass/fail.
+    usedBy: [Netherlands BSN]
+    sourceConfidence: HIGH
+
+  - name: no_fodselsnummer_mod11
+    description: >
+      Norway Fødselsnummer, two check digits (K1, K2).
+      K1: weights 3,7,6,1,8,9,4,5,2 over positions 1-9.
+          K1 = (11 - (sum mod 11)) mod 11.
+      K2: weights 5,4,3,2,7,6,5,4,3,2 over positions 1-9 plus K1 (10 values).
+          K2 = (11 - (sum mod 11)) mod 11.
+      EDGE CASE: if either computed value is 10, the number was never
+      issued (hard rejection — no digit substitution exists for this case).
+    usedBy: [Norway Fødselsnummer]
+    sourceConfidence: HIGH
+
+  - name: pl_pesel_weighted
+    description: >
+      Poland PESEL. Weights 1,3,7,9,1,3,7,9,1,3 over the first 10 digits.
+      check = (10 - (sum mod 10)) mod 10.
+    usedBy: [Poland PESEL]
+    sourceConfidence: HIGH
+
+  - name: se_personnummer_luhn
+    description: >
+      Sweden Personnummer. Strip the century prefix if present and the
+      separator (- or +), leaving a 10-digit compact form (6-digit date +
+      4-digit serial incl. check digit). Apply standard Luhn to this
+      10-digit string.
+    usedBy: [Sweden Personnummer]
+    sourceConfidence: HIGH
+
+  - name: dk_cpr_abolished
+    description: >
+      Denmark CPR. Legacy weights 4,3,2,7,6,5,4,3,2,1, sum mod 11 == 0 —
+      BUT this checksum was OFFICIALLY ABOLISHED in 2007 for numbers
+      issued against exhausted date-of-birth cohorts (confirmed via
+      cpr.dk). Do not hard-fail on checksum mismatch; treat as advisory
+      only, or skip checksum validation entirely and rely on format +
+      date-plausibility.
+    usedBy: [Denmark CPR]
+    sourceConfidence: HIGH
+    notes: "Exact abolition date (Oct 2007) is MEDIUM confidence (secondary source); the fact of abolition is HIGH confidence (official cpr.dk statement)."
+
+  - name: au_tfn_weighted_mod11
+    description: >
+      Australia Tax File Number. Weights 1,4,3,7,5,8,6,9,10 over 9 digits
+      (8-digit legacy TFNs are left-padded with a leading 0, weight 1).
+      Valid iff sum mod 11 == 0.
+    usedBy: [Australia TFN]
+    sourceConfidence: MEDIUM
+    notes: "ATO does not officially publish this algorithm (deliberately, to hinder synthetic-TFN generation) — extremely consistent across independent developer/compliance sources, but no primary-source citation exists."
+
+  - name: au_medicare_weighted
+    description: >
+      Australia Medicare Number. Weights 1,3,7,9,1,3,7,9 over the first 8
+      digits. check_digit = (sum) mod 10, must equal the 9th digit. The
+      separately-printed Individual Reference Number (10th digit) is not
+      covered by this checksum.
+    usedBy: [Australia Medicare Number]
+    sourceConfidence: HIGH
+
+  - name: br_cpf_weighted
+    description: >
+      Brazil CPF, two sequential check digits.
+      Digit 10 (Y): weights 10,9,8,7,6,5,4,3,2 over digits 1-9.
+        r = sum mod 11. If r < 2, Y = 0; else Y = 11 - r.
+      Digit 11 (Z): weights 11,10,9,8,7,6,5,4,3,2 over digits 1-10 (incl Y).
+        Same r<2 -> 0 / else 11-r rule.
+      Also reject 11 identical repeated digits (e.g. 111.111.111-11) —
+      these pass the arithmetic but are administratively invalid.
+    usedBy: [Brazil CPF]
+    sourceConfidence: HIGH
+
+  - name: br_cnpj_weighted
+    description: >
+      Brazil CNPJ, two sequential check digits (same <2->0/else-11-r rule
+      as CPF, different weights).
+      Digit 13: weights 5,4,3,2,9,8,7,6,5,4,3,2 over first 12 chars.
+      Digit 14: weights 6,5,4,3,2,9,8,7,6,5,4,3,2 over first 13 chars (incl digit 13).
+      Alphanumeric variant (2026+ SEFAZ update): character value = ASCII
+      code - 48 (digits keep 0-9; letters A-Z map to 17-42). Same
+      weight/mod-11 logic applied to these values instead of raw digits.
+    usedBy: [Brazil CNPJ]
+    sourceConfidence: HIGH
+
+  - name: jp_my_number_weighted
+    description: >
+      Japan My Number. Two-band weights over the first 11 digits:
+      positions 1-5 weights 6,5,4,3,2; positions 6-11 weights
+      7,6,5,4,3,2. remainder = (sum) mod 11. check = 11 - remainder; if
+      check > 9, check = 0.
+    usedBy: [Japan My Number]
+    sourceConfidence: MEDIUM
+    notes: "No official English-language Cabinet Order text located; formula cross-confirmed via independent validator write-ups and one OSS validator (kufu/tsubaki), but not against an official test vector. Validate against a known-good number before production use."
+
+  - name: kr_rrn_weighted_mod11
+    description: >
+      South Korea RRN. Weights 2,3,4,5,6,7,8,9,2,3,4,5 over digits 1-12.
+      check = (11 - (sum mod 11)) mod 10.
+    usedBy: [South Korea Resident Registration Number]
+    sourceConfidence: HIGH
+    notes: "Post-2020 registrations increasingly randomize digits 7-13, degrading checksum reliability for newly issued numbers. Treat a PASS as a strong signal; treat a FAIL as inconclusive (not proof of invalidity) for numbers plausibly issued after ~2020."
+
+  - name: sg_nric_weighted
+    description: >
+      Singapore NRIC/FIN. Weights 2,7,6,5,4,3,2 over the 7 digits -> sum.
+      Add prefix-specific offset: +4 if prefix letter is T or G; +3 if
+      prefix is M; +0 if S or F. remainder = (sum + offset) mod 11.
+      Map remainder (0-10) to a check letter via a PREFIX-SPECIFIC table:
+        S/T series: J,Z,I,H,G,F,E,D,C,B,A  (index 0-10)
+        F/G series: X,W,U,T,R,Q,P,N,M,L,K
+        M series:   T,R,Q,P,N,J,L,K,X,W,U
+    usedBy: [Singapore NRIC/FIN]
+    sourceConfidence: HIGH
+    notes: "S/T and F/G tables are long-documented and HIGH confidence. M-series table (introduced Jan 2022) and its +3 offset are MEDIUM confidence — fewer independent sources."
+
+  - name: mx_curp_check
+    description: >
+      Mexico CURP. Character-value table (index = value):
+      "0123456789ABCDEFGHIJKLMNÑOPQRSTUVWXYZ" (digits 0-9 map to
+      themselves; A=10 ... N=23, Ñ=24, O=25 ... Z=36). Weights: descending
+      19 down to 3 applied to the first 17 characters (position 1 = weight
+      19 ... position 17 = weight 3). sum = total of value*weight.
+      checkDigit = 10 - (sum mod 10); if result == 10, checkDigit = 0.
+    usedBy: [Mexico CURP]
+    sourceConfidence: HIGH
+
+  - name: ar_cuil_weighted
+    description: >
+      Argentina CUIL/CUIT. Weights 5,4,3,2,7,6,5,4,3,2 over the first 10
+      digits (2-digit type prefix + 8-digit body). r = sum mod 11.
+      checkDigit = 11 - r; if checkDigit == 11, checkDigit = 0.
+      EDGE CASE: a computed checkDigit of 10 means the number as given is
+      administratively invalid — AFIP avoids this at issuance time by
+      substituting the type-prefix and recomputing (e.g. individual male
+      20->23), it does not emit a literal digit "10". For validation
+      purposes, computed==10 should be treated as FAIL.
+    usedBy: [Argentina CUIL/CUIT]
+    sourceConfidence: HIGH
+
+  - name: cl_rut_mod11
+    description: >
+      Chile RUT/RUN. Take the body digits RIGHT TO LEFT, multiply each by
+      cyclical weights 2,3,4,5,6,7 (restart at 2 after reaching 7). r =
+      (sum) mod 11. checkValue = 11 - r. If checkValue == 11, check digit
+      = '0'. If checkValue == 10, check digit = 'K'. Otherwise check digit
+      = checkValue as a literal digit.
+    usedBy: [Chile RUT/RUN]
+    sourceConfidence: HIGH
+
+  - name: pe_dni_weighted
+    description: >
+      Peru DNI. Weights 3,2,7,6,5,4,3,2 applied left-to-right to the 8
+      digits. r = sum mod 11. checkValue = (r == 0) ? 0 : (11 - r). This
+      arithmetic stage is HIGH confidence (independently re-verified
+      against a worked example: DNI 17801146 -> checkValue 4).
+      FINAL CHARACTER MAPPING (checkValue 0-10 -> printed verification
+      character) is LOW confidence — sources disagree/appear to contain
+      transcription errors. DO NOT implement the final substitution table;
+      ship the mod-11 arithmetic only as an advisory signal, not a hard
+      checksum gate.
+    usedBy: [Peru DNI]
+    sourceConfidence: MEDIUM
+
+  - name: be_nrn_mod97
+    description: >
+      Belgium Rijksregisternummer. N = the 9-digit integer YYMMDDSSS.
+      Born on/before 1999: check = 97 - (N mod 97).
+      Born 2000 or later: prepend digit '2' to N (making a 10-digit N'),
+      check = 97 - (N' mod 97).
+      (Confirmed verbatim from official RRN circular IT000.)
+    usedBy: [Belgium Rijksregisternummer]
+    sourceConfidence: HIGH
+
+  - name: at_vnr_weighted
+    description: >
+      Austria Sozialversicherungsnummer. Format is NNNC DDMMYY — the check
+      digit is at POSITION 4 (unusual mid-number placement). Weights
+      3,7,9,5,8,4,2,1,6 applied to the 9 NON-check digits (positions
+      1,2,3,5,6,7,8,9,10 of the full 10-char string), mod 11 = check digit.
+    usedBy: [Austria Sozialversicherungsnummer]
+    sourceConfidence: HIGH
+    notes: "Whether a computed remainder of 10 is ever issued (needing rejection/substitution) is MEDIUM confidence — unverified against a primary/legal source."
+
+  - name: pt_nif_weighted
+    description: >
+      Portugal NIF. Weights 9,8,7,6,5,4,3,2 over digits 1-8. r = sum mod
+      11. check = 0 if r is 0 or 1, else check = 11 - r.
+    usedBy: [Portugal NIF, Portugal Cartão de Cidadão digit 9]
+    sourceConfidence: HIGH
+    notes: "The category meaning of the leading digit (1,2=individual; 5=company are HIGH confidence; 3/6/8/9 are disputed across sources — do not hard-gate on a category table)."
+
+  - name: fi_hetu_mod31
+    description: >
+      Finland Henkilötunnus. Treat DDMMYY+III (9 digits) as one integer.
+      check = table[integer mod 31] where table (31 chars, G/I/O/Q
+      omitted) = "0123456789ABCDEFHJKLMNPRSTUVWXY".
+    usedBy: [Finland Henkilötunnus]
+    sourceConfidence: HIGH
+
+  - name: cz_sk_rc_mod11
+    description: >
+      Czech Republic / Slovakia Rodné číslo. Strip the separator (if
+      present), giving a 9 or 10-digit string. If 10 digits: full number
+      mod 11 must equal the 10th digit (remainder 0 -> check digit 0).
+      Pre-1954-born citizens have a 9-digit RC with NO checksum at all.
+      PRE-1985 EXCEPTION (Czech, ended per FSÚ regulation 2898/1985):
+      numbers whose remainder computed to 10 were assigned check digit 0
+      instead of being rejected — MEDIUM-HIGH confidence, secondary
+      sources only.
+      Slovakia uses the identical base algorithm (its stdnum module
+      literally imports Czech's) but did NOT adopt the Czech 2004 "+20/+70
+      month offset for exhausted date pools" rule (separate legislature
+      since 1993) — MEDIUM confidence, single secondary source.
+    usedBy: [Czech Republic Rodné číslo, Slovakia Rodné číslo]
+    sourceConfidence: HIGH
+
+  - name: ro_cnp_weighted
+    description: >
+      Romania CNP. Weights 2,7,9,1,4,6,3,5,8,2,7,9 over digits 1-12, mod
+      11. If remainder == 10, check digit = 1 (substitution — confirmed
+      by 2 independent sources, not a rejection case).
+    usedBy: [Romania CNP]
+    sourceConfidence: HIGH
+
+  - name: hu_taj_weighted
+    description: >
+      Hungary TAJ (health-insurance number, 9 digits, no embedded DOB).
+      Odd positions (1,3,5,7) weight 3; even positions (2,4,6,8) weight 7.
+      check = sum mod 10. (Verified via worked example: 673457015 -> check
+      digit 5, matches.)
+      Hungary's separate "személyi azonosító" (renamed from személyi szám
+      after a 1991 Constitutional Court ruling) has NO verified checksum —
+      described algorithms are LOW confidence, absent from python-stdnum
+      entirely. Format-only detection recommended for that identifier.
+    usedBy: [Hungary TAJ]
+    sourceConfidence: HIGH
+
+  - name: ch_ahv_ean13
+    description: >
+      Switzerland AHV/AVS number. Standard, UNMODIFIED EAN-13/GS1 mod-10
+      checksum (python-stdnum's Swiss module literally delegates to the
+      generic EAN module — no Swiss-specific variant exists). Odd
+      positions (1,3,5,7,9,11) weight 1; even positions (2,4,6,8,10,12)
+      weight 3. check = (10 - (sum mod 10)) mod 10.
+    usedBy: [Switzerland AHV/AVS]
+    sourceConfidence: HIGH
+
+  - name: bg_egn_weighted
+    description: >
+      Bulgaria EGN. Weights 2,4,8,5,10,9,7,3,6 over the first 9 digits.
+      check = ((sum) mod 11) mod 10 (the outer mod 10 naturally maps a
+      mod-11 remainder of 10 down to 0 — no separate substitution branch
+      needed). CORRECTED during research: sex digit is EVEN=male,
+      ODD=female; the century trick (add/subtract 20/40 for 1800s/2000s)
+      applies to the MONTH field, not the year field.
+    usedBy: [Bulgaria EGN]
+    sourceConfidence: HIGH
+
+  - name: lu_matricule_dual
+    description: >
+      Luxembourg national matricule. TWO independent check digits computed
+      over the same 11-digit prefix (AAAAMMJJXXX, 4-digit year):
+      C1 = standard Luhn over the 11-digit prefix.
+      C2 = standard Verhoeff over the 11-digit prefix.
+      (Confirmed directly from an official CCSS PDF including a reference
+      Java implementation — the strongest-sourced entry in the whole set.)
+    usedBy: [Luxembourg national matricule]
+    sourceConfidence: HIGH
+
+  - name: si_emso_weighted
+    description: >
+      Slovenia EMŠO (and the pre-2009 JMBG family shared with Serbia/
+      Bosnia/North Macedonia — Croatia diverged to its own OIB in 2009,
+      see iso7064_mod11_10_hr). Weights 7,6,5,4,3,2,7,6,5,4,3,2 over the
+      first 12 digits. check = (11 - (sum mod 11)) mod 11 mod 10 — i.e.
+      only ONE mod-11-to-mod-10 wrap case exists (corrected during
+      research; do not implement two separate "10 or 11" branches).
+      Century digit table (CORRECTED): 8=1800s, 9=1900s, 0=2000s.
+    usedBy: [Slovenia EMŠO]
+    sourceConfidence: HIGH
+    notes: "The JMBG-family identity of this algorithm for Serbia/Bosnia/North Macedonia specifically is MEDIUM confidence — community sources only, no government/stdnum-grade source located for those three countries individually."
+
+  - name: baltic_two_pass_mod11
+    description: >
+      Estonia Isikukood / Lithuania Asmens kodas (Lithuania's algorithm is
+      confirmed identical — its stdnum module imports directly from
+      Estonia's). Two-pass weighted mod-11 over the first 10 digits:
+      Pass 1 weights: 1,2,3,4,5,6,7,8,9,1. If pass1 result == 10, run
+      Pass 2 weights: 3,4,5,6,7,8,9,1,2,3, and check = pass2 mod 10
+      (naturally absorbs a second-10 case via the outer mod 10 — no extra
+      branch needed). Else check = pass1 mod 10.
+      Leading digit (century+sex): 1/2=1800s, 3/4=1900s, 5/6=2000s,
+      7/8=2100s (odd=M, even=F) — corrected during research, the draft
+      omitted the 7/8=2100s case.
+    usedBy: [Estonia Isikukood, Lithuania Asmens kodas]
+    sourceConfidence: HIGH
+
+  - name: lv_old_weighted
+    description: >
+      Latvia Personas kods, PRE-JULY-2017 format only (post-reform numbers
+      have no checksum — see 05-national-ids-europe.yaml). Weights
+      1,6,3,7,9,10,5,8,4,2 over the 10 digits (date + century digit +
+      serial). Z = (1 - sum) mod 11 mod 10.
+    usedBy: [Latvia Personas kods (pre-2017)]
+    sourceConfidence: MEDIUM
+    notes: "Cross-validated via two independent open-source libraries (PEAR Validate_LV), no government-primary formula located."
+
+  - name: wa_dl_legacy_mod10
+    description: >
+      Washington State legacy driver's licence (issued before 2018-09-04).
+      Each of 12 positions is mapped through a published letter/digit-value
+      table (position-specific alphabets — surname letters, encoded
+      birth-year/month/day fields). checksum = (a1-a2+a3-a4+a5-a6+a7-a8+
+      a9-a11+a12) mod 10, compared against the printed check character
+      (position 10 in the 12-char body). One of the very few US states
+      with a genuinely documented, non-name/DOB-only checksum.
+    usedBy: [Washington State driver's licence, legacy format only]
+    sourceConfidence: HIGH
+    notes: "Current format (2018-09-04+) is 'WDL' + 9 random alphanumeric chars excluding vowels and Q/V — no checksum, purely random."
+
+  - name: us_soundex_dob_sex_encoding
+    description: >
+      NOT a checksum — a deterministic STRUCTURAL encoding shared by
+      several US states' (historical or current) driver's-licence numbers:
+      Soundex(surname, 4 chars) + first-name/middle-initial code (3
+      digits) + 2-digit birth year + ((birth_month-1)*40 + birth_day +
+      (500 if female)) (3 digits) [+ 1-2 digit overflow/collision
+      counter for duplicate collisions]. Confirms the number is
+      STRUCTURALLY plausible (decodes to a valid Soundex + valid date) but
+      is not a pass/fail arithmetic checksum — treat a successful decode
+      as boosting confidence, not as definitive validation.
+    usedBy: [Florida (legacy, pre-2024-07-31), Illinois, Wisconsin,
+      Michigan, Minnesota (pre-Dec-2004), Maryland (legacy Soundex format)]
+    sourceConfidence: HIGH
+    notes: "Maryland's CURRENT format (post-2016 rollout) and Florida's CURRENT format (post-2024-07-31) abandoned this scheme for random assignment — both legacy and current shapes remain live in production data since old cards stay valid until renewal."
+
+  - name: icao_mrz_check_digit
+    description: >
+      ICAO Doc 9303 MRZ check digit (used for TD1/TD2/TD3 passport/ID
+      machine-readable zones). Character values: 0-9 = 0-9; A-Z = 10-35;
+      '<' (filler) = 0. Weights cyclic 7,3,1 applied left to right over
+      the target substring. digit = (sum of value*weight) mod 10. A
+      composite check digit is computed the same way over a concatenation
+      of several field substrings (each including its own check digit
+      character) — the exact substrings differ by TD1/TD2/TD3, see
+      02-passports.yaml.
+    usedBy: [ICAO 9303 MRZ — all TD1/TD2/TD3 passports and ID cards]
+    sourceConfidence: HIGH
+
+  - name: us_aba_routing_weighted
+    description: >
+      US ABA bank routing number (9 digits). Weights 3,7,1 repeating over
+      positions 1-9. Valid iff sum mod 10 == 0.
+    usedBy: [US ABA routing number]
+    sourceConfidence: HIGH
+
+  - name: vin_iso3779_weighted
+    description: >
+      Vehicle Identification Number (17 chars), ISO 3779 / US 49 CFR 565.
+      Transliteration table (I, O, Q excluded from the VIN alphabet
+      entirely): A=1 B=2 C=3 D=4 E=5 F=6 G=7 H=8 J=1 K=2 L=3 M=4 N=5 P=7
+      R=9 S=2 T=3 U=4 V=5 W=6 X=7 Y=8 Z=9. Position weights 1-17: 8,7,6,5,
+      4,3,2,10,0,9,8,7,6,5,4,3,2 (position 9 = weight 0, it IS the check
+      digit). r = (sum of transliterated_value*weight) mod 11. check =
+      'X' if r==10 else str(r). Valid iff VIN[8] (0-indexed position 9)
+      equals check.
+    usedBy: [Vehicle Identification Number]
+    sourceConfidence: HIGH
+
+  - name: imei_luhn
+    description: >
+      IMEI (15 digits): standard Luhn over all 15 digits (check digit =
+      position 15). IMEISV (16-digit variant) replaces the check digit
+      with a 2-digit software-version field and carries NO checksum — do
+      not apply Luhn to a 16-digit value.
+    usedBy: [IMEI]
+    sourceConfidence: HIGH
+
+  - name: us_npi_luhn_prefixed
+    description: >
+      US National Provider Identifier (10 digits). Prepend the fixed
+      string "80840" to the first 9 digits (14-digit string). Apply
+      standard Luhn: the resulting check digit must equal the 10th
+      (last) digit of the NPI.
+    usedBy: [US National Provider Identifier]
+    sourceConfidence: HIGH
+
+  - name: none_structural_only
+    description: >
+      No checksum exists or has been publicly documented for this
+      identifier. Detection is regex-shape-only; pair with
+      confidenceKeywords and, where applicable, denylist known
+      administrative-invalidity patterns (e.g. all-same-digit strings).
+      A regex match alone should register at most MEDIUM finding
+      confidence, never HIGH.
+    usedBy: [many — see individual entries' `checksum: null`]
+    sourceConfidence: HIGH
+
+# ── UK bank modulus checking — explicitly NOT a simple algorithm ───────
+# UK sort code (6 digits) + account number (8 digits) validation has NO
+# single generic formula. Pay.UK/Vocalink publish three named algorithm
+# families (Standard MOD-10, Standard MOD-11, Double Alternate/DBLAL),
+# and WHICH family plus WHICH weight vector applies is selected by the
+# sort code itself via an official lookup table (~1,151 distinct weight
+# rules as of the 2026-02-10 edition, with per-bank exceptions). A correct
+# implementation requires ingesting that published table as data, not a
+# formula. Ship structural-only detection (regex) for UK sort code /
+# account number; do not fabricate a generic checksum.
+# Source: Vocalink "Validating Account Numbers: UK Modulus Checking" v8.70
+# (2026-02-10), https://www.vocalink.com/media/irllndih/validating-account-numbers-uk-modulus-checking-v870.pdf

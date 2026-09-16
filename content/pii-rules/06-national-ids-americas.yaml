@@ -1,0 +1,200 @@
+# 06-national-ids-americas.yaml — National identifier / tax-ID formats for
+# the Americas. See 00-manifest.yaml for the checksum algorithm registry.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-national-ids-americas
+  version: 0.2.0-draft
+  description: National identifier / tax-ID formats for North, Central, and South America.
+
+countries:
+  - country: US
+    countryName: "United States"
+    rules:
+      - id: us.ssn
+        displayName: "Social Security Number (SSN)"
+        category: national_id
+        pattern: '(?!000|666|9\d{2})\d{3}[- ]?(?!00)\d{2}[- ]?(?!0000)\d{4}'
+        checksum: null
+        exclusions: "Area 000/666/900-999 invalid; group 00 invalid; serial 0000 invalid."
+        confidenceKeywords: ["ssn", "social security"]
+        severity: high
+        complianceTags: [CCPA, HIPAA]
+        sourceConfidence: HIGH
+
+      - id: us.itin
+        displayName: "Individual Taxpayer Identification Number (ITIN)"
+        category: tax_id
+        pattern: '9\d{2}[- ]?(7\d|8[0-8]|9[0-2,4-9])[- ]?\d{4}'
+        checksum: null
+        confidenceKeywords: ["itin", "taxpayer id"]
+        severity: high
+        complianceTags: [CCPA]
+        sourceConfidence: HIGH
+
+  - country: CA
+    countryName: Canada
+    rules:
+      - id: ca.sin
+        displayName: "Social Insurance Number (SIN)"
+        category: national_id
+        pattern: '\d{3}[- ]?\d{3}[- ]?\d{3}'
+        checksum: luhn
+        exclusions: "First digit 0 is not assigned; first digit 9 denotes temporary resident."
+        confidenceKeywords: ["sin", "social insurance"]
+        severity: high
+        complianceTags: [PIPEDA]
+        sourceConfidence: HIGH
+
+  - country: MX
+    countryName: Mexico
+    rules:
+      - id: mx.curp
+        displayName: "Clave Única de Registro de Población (CURP)"
+        category: national_id
+        pattern: '[A-Z][AEIOU][A-Z]{2}\d{2}(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])[HM](AS|BC|BS|CC|CL|CM|CS|CH|DF|DG|GT|GR|HG|JC|MC|MN|MS|NT|NL|OC|PL|QO|QR|SP|SL|SR|TC|TL|TS|VZ|YN|ZS|NE)[B-DF-HJ-NP-TV-Z]{3}[A-Z\d]\d'
+        checksum: mx_curp_check
+        confidenceKeywords: ["curp"]
+        severity: high
+        complianceTags: [LFPDPPP]
+        sourceConfidence: HIGH
+        notes: "State-code alternation list above should be double-checked against RENAPO's official 32-code table before shipping. Position-2 letter is forced to 'X' if positions 1-4 spell a word on RENAPO's offensive-word blocklist — a substitution rule, not part of the checksum math."
+        sources: ["comunidadvfp.blogspot.com worked walkthrough", "todocurp.org.mx"]
+
+      - id: mx.rfc_persona_fisica
+        displayName: "Registro Federal de Contribuyentes (RFC) — individual"
+        category: tax_id
+        pattern: '[A-Z&Ñ]{4}\d{6}[A-Z0-9]{3}'
+        checksum: null
+        confidenceKeywords: ["rfc", "registro federal de contribuyentes"]
+        severity: high
+        complianceTags: [LFPDPPP]
+        sourceConfidence: LOW
+        notes: "Structural shape only. The 3-char 'homoclave' checksum genuinely exists (documented in SAT's Anexo 10 / Resolución Miscelánea Fiscal) but the exact letter-value and lookup tables could not be located in any freely accessible source — only paid commercial calculators claim to implement it without publishing it. Do not fabricate this table."
+
+      - id: mx.rfc_persona_moral
+        displayName: "Registro Federal de Contribuyentes (RFC) — entity"
+        category: tax_id
+        pattern: '[A-Z&Ñ]{3}\d{6}[A-Z0-9]{3}'
+        checksum: null
+        confidenceKeywords: ["rfc"]
+        severity: high
+        complianceTags: [LFPDPPP]
+        sourceConfidence: LOW
+
+  - country: BR
+    countryName: Brazil
+    rules:
+      - id: br.cpf
+        displayName: "Cadastro de Pessoas Físicas (CPF)"
+        category: tax_id
+        pattern: '\d{3}\.?\d{3}\.?\d{3}-?\d{2}'
+        checksum: br_cpf_weighted
+        confidenceKeywords: ["cpf"]
+        severity: high
+        complianceTags: [LGPD]
+        sourceConfidence: HIGH
+        notes: "Also reject 11-identical-repeated-digit values (e.g. 111.111.111-11) even though they pass the arithmetic."
+
+      - id: br.cnpj
+        displayName: "Cadastro Nacional da Pessoa Jurídica (CNPJ)"
+        category: tax_id
+        pattern: '\d{2}\.?\d{3}\.?\d{3}/?\d{4}-?\d{2}'
+        checksum: br_cnpj_weighted
+        confidenceKeywords: ["cnpj"]
+        severity: medium
+        complianceTags: [LGPD]
+        sourceConfidence: HIGH
+        notes: "Entity identifier, not individual PII per se, but frequently co-located with individual owner data in the same records. 2026+ SEFAZ update introduces an alphanumeric variant (letters allowed in positions 1-12) — see br_cnpj_weighted for the alphanumeric checksum handling."
+
+      - id: br.rg
+        displayName: "Registro Geral (RG)"
+        category: national_id
+        pattern: null
+        checksum: null
+        confidenceKeywords: ["rg", "registro geral"]
+        severity: high
+        complianceTags: [LGPD]
+        sourceConfidence: NONE
+        notes: "NO NATIONAL FORMAT EXISTS — each Brazilian state's Secretaria de Segurança Pública sets its own numbering scheme (typically 7-9 digits + optional check letter, but materially different between e.g. São Paulo and Rio de Janeiro). Do not encode a single national regex/checksum — this would be a false generalization. Treat RG detection as keyword-anchored only, or build a genuine per-state table separately if needed."
+
+  - country: AR
+    countryName: Argentina
+    rules:
+      - id: ar.dni
+        displayName: "Documento Nacional de Identidad (DNI)"
+        category: national_id
+        pattern: '\d{1,2}\.?\d{3}\.?\d{3}'
+        checksum: null
+        confidenceKeywords: ["dni", "documento nacional"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "7-8 raw digits (current issuance is 8, older DNIs may be 7). Confirmed NO checksum — it's a sequential administrative number; a check digit only appears once DNI is embedded into CUIL/CUIT."
+
+      - id: ar.cuil_cuit
+        displayName: "CUIL/CUIT"
+        category: tax_id
+        pattern: '(20|23|24|27|30|33|34)-?\d{8}-?\d'
+        checksum: ar_cuil_weighted
+        confidenceKeywords: ["cuil", "cuit"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+
+  - country: CL
+    countryName: Chile
+    rules:
+      - id: cl.rut
+        displayName: "Rol Único Tributario (RUT/RUN)"
+        category: national_id
+        pattern: '\d{1,2}\.?\d{3}\.?\d{3}-?[\dkK]'
+        checksum: cl_rut_mod11
+        confidenceKeywords: ["rut", "run"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Worked example verified: RUT 30.686.957 -> check digit 4."
+
+  - country: CO
+    countryName: Colombia
+    rules:
+      - id: co.cedula
+        displayName: "Cédula de Ciudadanía / NUIP"
+        category: national_id
+        pattern: '\d{6,10}'
+        checksum: null
+        confidenceKeywords: ["cédula", "cedula", "nuip"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "Format genuinely varies by era: pre-2004 up to 8 digits; post-2004 NUIP standardized to 10 digits starting at 1,000,000,000. Cédula de Extranjería (foreigners, a different document) is 6-7 digits — do not conflate. No checksum documented anywhere — confirmed sequential/administrative. Consider requiring >=8 digits to cut false-positive rate against generic numeric strings, at the cost of missing older short cédulas."
+
+  - country: PE
+    countryName: Peru
+    rules:
+      - id: pe.dni
+        displayName: "Documento Nacional de Identidad (DNI)"
+        category: national_id
+        pattern: '\d{8}'
+        checksum: pe_dni_weighted
+        confidenceKeywords: ["dni"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "The mod-11 arithmetic stage is HIGH confidence; the FINAL character-mapping table (checkValue -> printed verification char) is LOW confidence (sources disagree/appear to contain transcription errors) — do not implement that final substitution, treat the arithmetic as advisory only."
+
+  - country: VE
+    countryName: Venezuela
+    rules:
+      - id: ve.cedula
+        displayName: "Cédula de Identidad"
+        category: national_id
+        pattern: '[VEve]-?\d{6,8}'
+        checksum: null
+        confidenceKeywords: ["cédula de identidad", "cedula"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "V=Venezuelan, E=foreign resident prefix (HIGH confidence). No checksum found in any source — sequential SAIME administrative number. Digit-count bounds (6-8) are inferred from population-scale reasoning, not an authoritative SAIME technical spec (MEDIUM confidence on the exact bounds)."
