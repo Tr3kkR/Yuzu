@@ -9228,6 +9228,16 @@ void RestApiV1::register_routes(
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      // Found during this fix, not named in the original triage:
+                      // this handler also does `cr.source_payload = body.dump()`
+                      // a few lines below on caller-supplied JSON, same crash
+                      // shape as the three named creation routes.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
