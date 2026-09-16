@@ -1927,7 +1927,13 @@ to close rather than a contradiction to adjudicate.
    otherwise vanish from the merge with nothing else able to surface it. (A
    lowercase `z` UTC suffix, which RFC 3339 §5.6 also permits, is accepted
    like `Z` — Python's `fromisoformat` only recognizes the uppercase form
-   natively.) On top of the merge it separately checks, PER ROW,
+   natively.) BELOW the merge, every line is parsed with a duplicate-object-member
+   check: standard JSON parsers (Python's `json.loads`, jq, JavaScript's
+   `JSON.parse`) all silently keep only the LAST value for a repeated key with
+   no diagnostic, so a row whose raw text states a merge-governing field twice
+   can lose its real value before ANY of the checks above ever run — reported
+   as `invalid-json: duplicate object member(s): ...`, never silently resolved.
+   On top of the merge it separately checks, PER ROW,
    that a row participating in the post-#2619 regime — carrying ANY field
    #2619 introduced (`schema_version`, `source`, `reporter_ref`,
    `reviewed_at_sha`, `recorded_at`, `recorded_by`, `adjudication_rationale`,

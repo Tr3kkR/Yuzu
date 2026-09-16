@@ -387,7 +387,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.2 Windows Installer (MSI) Package Inventory :white_check_mark: `T1`
 
-`msi_packages` plugin (Windows MSI / macOS pkgutil).
+`msi_packages` plugin (Windows MSI / macOS pkgutil). Distinct from `windows_optional_features`: MSI inventories installed software packages, `windows_optional_features` reports the state of built-in Windows OS features (DISM) — neither reads the other's data.
 
 ### 7.3 SCCM Integration :white_check_mark: `T2`
 
@@ -1581,6 +1581,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
 | wmi | Y | - | - | System Config |
+| windows_optional_features | Y | - | - | System Config |
 | script_exec | Y | Y | Y | Execution |
 | content_dist | Y | Y | Y | Content Dist |
 | http_client | Y | Y | Y | Content Dist |
