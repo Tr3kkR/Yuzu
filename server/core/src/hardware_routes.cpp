@@ -188,7 +188,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         if (!deps_.roster_fn) {
             (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices", "failure",
-                                            "Inventory", "", "hardware roster provider unwired");
+                                            "Inventory", "fleet", "hardware roster provider unwired");
             send_html(res, "<div class=\"gp-placeholder\"><b>Hardware roster unavailable.</b> No "
                           "provider is wired on this server.</div>");
             return;
@@ -213,7 +213,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
 
         const bool persisted = detail::emit_behavioral_audit(
-            deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "",
+            deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
                 " omitted=" + std::to_string(omitted));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
@@ -338,7 +338,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 res.set_content(detail::a4_error(res, "body must be a JSON object"), "application/json");
                 return;
             }
-            source = body.value("source", "all");
+            // A present-but-non-string "source" (e.g. {"source":123}) used to reach
+            // body.value<string>(), which THROWS nlohmann::json::type_error on a type
+            // mismatch — an uncaught throw here skips the audit call entirely and
+            // degrades to a bare 500 with no A4 envelope (governance Gate 4
+            // unhappy-path finding). Type-check first and audit it the same as any
+            // other malformed body, never let the JSON library throw past this route.
+            const auto it = body.find("source");
+            if (it != body.end() && !it->is_string()) {
+                (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "denied",
+                                                "Agent", id, "source field is not a string");
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "source must be a string"), "application/json");
+                return;
+            }
+            source = (it != body.end()) ? it->get<std::string>() : "all";
         }
         static constexpr std::string_view kSources[] = {"installed_software", "app_perf", "device_ci",
                                                         "software_licensing", "all"};
@@ -398,8 +412,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const auto r = deps_.sync_dispatch_fn(id, source);
         if (!r.sent) {
-            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "no_agents",
-                                            "Agent", id, "registry refused source=" + source);
+            // No second audit row here — matching the /api/v1/dex/devices/{id}/live
+            // precedent this route otherwise follows: the pre-dispatch "requested"
+            // row above is the durable evidence that the operator asked; whether an
+            // agent was actually reached is reported by the response itself, never
+            // a duplicate post-dispatch audit for the same request (governance
+            // Gate 4 consistency finding — this route used to double-audit).
             res.status = 503;
             res.set_content(detail::a4_error(res, "agent is not reachable right now",
                                              {.retry_after_ms = 30000}),
@@ -430,7 +448,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         if (!deps_.roster_fn) {
             (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices", "failure",
-                                            "Inventory", "", "hardware roster provider unwired");
+                                            "Inventory", "fleet", "hardware roster provider unwired");
             res.status = 503;
             res.set_content(detail::a4_error(res, "hardware roster unavailable"), "application/json");
             return;
@@ -452,7 +470,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
 
         const bool persisted = detail::emit_behavioral_audit(
-            deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "",
+            deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list (REST): devices=" + std::to_string(page.total_matching) +
                 " omitted=" + std::to_string(omitted));
         if (!persisted) {
@@ -487,8 +505,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const std::string agent_id = req.matches[1].str();
         if (!authz::in_scope(gate.scope, agent_id)) {
             // Out-of-scope collapses to the same "not found" as a genuinely
-            // nonexistent id — the existence-oracle closure `/api/v1/devices/{id}`
-            // uses (rest_api_v1.cpp).
+            // nonexistent id — the SAME 404 existence-oracle closure
+            // `/api/v1/devices/{id}` uses (rest_api_v1.cpp). Audit posture
+            // deliberately DIFFERS from that sibling, though: this route DOES
+            // audit on success below (the CI blob carries ADR-0016
+            // GDPR-classified serial/UUID/MAC), where /api/v1/devices/{id} does
+            // not (device identity/tags alone are machine metadata) — the parity
+            // claim here is scoped to the 404 shape only.
             res.status = 404;
             res.set_content(detail::a4_error(res, "not found"), "application/json");
             return;

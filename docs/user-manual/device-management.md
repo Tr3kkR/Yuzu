@@ -204,13 +204,13 @@ These fields are used by the [Scope Engine](scope-engine.md) for device targetin
 
 ### Dashboard
 
-The **Devices** page (`/devices`) lists the **currently-connected** agents and requires the **`Infrastructure:Read`** permission — the same gate as the agent list (`/api/agents`). It uses the same visibility provider, so an operator without `Infrastructure:Read` cannot reach it; note that, exactly like `/api/agents`, an operator who *does* hold `Infrastructure:Read` sees the whole connected fleet here (per-team **list** filtering beyond that gate is not applied today — the per-team control is enforced per device, below). Each row shows hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page. **DEX scoring is per-render, never fleet-wide:** a device-page open scores that one device, and the list scores only the rows actually rendered after filtering (`devices_fn` is identity-only) — no page load may trigger a whole-fleet scoring pass.
+**`/devices` now 302-redirects to `/hardware`** (the Hardware CI list — round-3, see `docs/user-manual/inventory.md`) — the old standalone Devices page no longer renders directly; a bookmarked `/devices` link still works, since browsers follow the redirect transparently. Hardware's own list requires **`Inventory:Read`** rather than the old page's `Infrastructure:Read`; every seeded built-in role holding one also holds the other, so no default-role regression, but a custom role granted `Infrastructure:Read` alone loses list access via the old URL. Each row shows hostname, OS, architecture, online status, and per-device DEX score, plus (new) agent version, claimed IP, and tags. Filter by OS or search by name; click any row to open that device's Hardware CI record. **DEX scoring is per-render, never fleet-wide:** opening a record scores that one device, and the list scores only the rows actually rendered after filtering — no page load may trigger a whole-fleet scoring pass.
 
 > The list is sourced from the live connection registry, so it shows connected devices only (there is no offline/status filter). Enrolled-but-offline devices and real last-seen times arrive with the persistent device-inventory slice.
 
-#### Device page (`/device?id=`)
+#### Device page (`/device?id=`, redirects to `/hardware/ci?id=`)
 
-The per-device page is the shared entity view reached from any dashboard, organised into lens tabs:
+The per-device page is the shared entity view reached from any dashboard, organised into lens tabs — the same lens-tab machinery renders both the legacy device page's tabs and the Hardware CI record's Overview/DEX/Guardian tabs:
 
 Every per-device route is scoped to the device's management group (a global grant **or** a role assigned on the device's group / an ancestor): opening a device outside your scope returns *forbidden*, never its data.
 

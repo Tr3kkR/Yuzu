@@ -409,6 +409,25 @@ TEST_CASE("route: POST .../sync — bad source is a 400, denied+audited, never d
     REQUIRE(denied);
 }
 
+TEST_CASE("route: POST .../sync — non-string source is a 400, not an uncaught throw "
+          "(governance Gate 4)",
+          "[hardware][route][rest]") {
+    // {"source":123} used to reach nlohmann::json::value<string>(), which THROWS on
+    // a type mismatch — an uncaught exception here degraded to a bare 500 with no
+    // A4 envelope and no audit row at all (worse than the ordinary bad-source path).
+    HwHarness h;
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":123})");
+    REQUIRE(res);
+    REQUIRE(res->status == 400);
+    REQUIRE(contains(res->body, "must be a string"));
+    REQUIRE(h.sync_dispatch_calls == 0);
+    bool denied = false;
+    for (const auto& a : h.audits)
+        if (a == "inventory.sync.request|denied")
+            denied = true;
+    REQUIRE(denied);
+}
+
 TEST_CASE("route: POST .../sync — agent below the sync-now version floor is 409",
           "[hardware][route][rest]") {
     // READ hardware_routes.cpp: this branch sets res.status = 409 (not the brief's
@@ -427,7 +446,7 @@ TEST_CASE("route: POST .../sync — agent below the sync-now version floor is 40
     REQUIRE(denied);
 }
 
-TEST_CASE("route: POST .../sync — offline/unwired agent is a 503, audited no_agents",
+TEST_CASE("route: POST .../sync — offline agent or refused dispatch is a 503",
           "[hardware][route][rest]") {
     {
         // No live session: agent_version_fn returns nullopt.
@@ -444,20 +463,27 @@ TEST_CASE("route: POST .../sync — offline/unwired agent is a 503, audited no_a
         REQUIRE(no_agents);
     }
     {
-        // Registry refuses the dispatch (sent=false) — same "no_agents" result,
-        // per the actual code (a distinct branch from the offline-version-fn case
-        // above, both landing on 503/no_agents).
+        // Registry refuses the dispatch (sent=false) — a DIFFERENT branch from the
+        // offline-version-fn case above: this one already passed the pre-dispatch
+        // "requested" audit (audit-then-act), so there is no SECOND audit row for
+        // the dispatch failure itself — the 503 response is the only signal for
+        // "not reached" here, matching the /api/v1/dex/devices/{id}/live precedent
+        // (governance Gate 4 consistency fix: this route used to double-audit).
         HwHarness h;
         h.sync_result = HardwareRoutes::HwSyncDispatchResult{false, ""};
         auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "");
         REQUIRE(res);
         REQUIRE(res->status == 503);
         REQUIRE(contains(res->body, "not reachable"));
-        bool no_agents = false;
-        for (const auto& a : h.audits)
+        bool requested = false, no_agents = false;
+        for (const auto& a : h.audits) {
+            if (a == "inventory.sync.request|requested")
+                requested = true;
             if (a == "inventory.sync.request|no_agents")
                 no_agents = true;
-        REQUIRE(no_agents);
+        }
+        REQUIRE(requested);
+        REQUIRE_FALSE(no_agents);
     }
     {
         // sync-on-demand entirely unwired on this deployment -> 503, audited

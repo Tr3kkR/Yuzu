@@ -556,6 +556,13 @@ extern const char* const kGuardianDetailPageHtml =
         if (resp.status >= 400) { btn.disabled = false;
           showToast((resp.data.error && resp.data.error.message) || ('Sync request failed (' + resp.status + ')'), 'error'); return; }
         var d = resp.data.data; showToast('Sync requested (' + d.source + ')', 'success');
+        // The header instance of this button lives OUTSIDE #hw-ci-lens and is never
+        // replaced by the lens re-render below, so it needs its own explicit
+        // re-enable here (governance Gate 4 happy-path finding: it was stuck
+        // disabled after every successful header sync). The two in-lens instances
+        // get a fresh, already-enabled button when the poll below replaces their
+        // markup, so this is a harmless no-op for them.
+        btn.disabled = false;
         var lensDiv = document.getElementById('hw-ci-lens'); if (!lensDiv) return;
         // Round-3 item 4: first poll at 1s (was a flat 2s) \u2014 the poll ladder's
         // 1s/1s/2s\u2026 cadence continues from render_hardware_sync_pending
