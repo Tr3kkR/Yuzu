@@ -405,11 +405,18 @@ HardwareListPage build_hardware_list_page(std::vector<InventoryDeviceRow> roster
                 // Unlike the string-valued blank checks above, an empty `ips` makes
                 // `.front()` UB below — a both-offline pair (`ab && bb`) is everyday
                 // fleet data, not a crafted input (governance Gate 3, CRITICAL: this
-                // used to fall through to `.front()` on that pair). Handle BOTH the
-                // mixed and both-blank cases here, before either `.front()` call.
-                if (ab || bb) return !ab && bb; // no live claim sorts last; both-blank ties
-                const std::string am = fold(a.ips.front()), bm = fold(b.ips.front());
-                lt = am < bm; gt = am > bm;
+                // used to fall through to `.front()` on that pair).
+                if (ab != bb) return !ab; // no live claim sorts last — independent of desc
+                if (!ab) {
+                    // Both non-blank: only case where .front() is safe.
+                    const std::string am = fold(a.ips.front()), bm = fold(b.ips.front());
+                    lt = am < bm; gt = am > bm;
+                }
+                // Both blank: lt/gt stay false (initialized above) — falls through to
+                // the shared name/agent_id tie-break below instead of a bare tie with
+                // unspecified relative order (governance Gate 8 cpp-safety: every
+                // other sort key's both-blank case reaches that same tie-break; this
+                // one used to short-circuit past it).
                 break;
             }
         }

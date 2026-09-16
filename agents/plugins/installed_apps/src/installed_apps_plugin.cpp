@@ -956,7 +956,17 @@ InvCollection get_inventory_macos() {
         lk.unlock();
         return fresh_result;
     } catch (...) {
-        lk.lock();
+        // `lk` may already be held here: the assignments above (cache.signature = sig,
+        // cache.result = fresh_result) can themselves throw bad_alloc AFTER lk.lock()
+        // succeeded but BEFORE the unlock below — an unconditional lk.lock() in that
+        // case would call unique_lock::lock() on an already-owned mutex, which THROWS
+        // system_error(EDEADLK) per libc++'s precondition check, masking the real
+        // exception and skipping notify_all() entirely (governance Gate 8 cpp-safety:
+        // the exact wedge this try/catch exists to prevent, just relocated to a
+        // narrower window). owns_lock() makes this correct regardless of where the
+        // throw originated.
+        if (!lk.owns_lock())
+            lk.lock();
         cache.refilling = false;
         cache.result.reset();
         cache.cv.notify_all();

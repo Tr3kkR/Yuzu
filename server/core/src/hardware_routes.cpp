@@ -334,6 +334,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!req.body.empty()) {
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded() || !body.is_object()) {
+                // Counted and audited like every other refusal in this family
+                // (command_routes.cpp's equivalent malformed-body check) — this path
+                // used to return 400 with no audit row at all (governance Gate 8).
+                (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "denied",
+                                                "Agent", id, "malformed JSON body");
                 res.status = 400;
                 res.set_content(detail::a4_error(res, "body must be a JSON object"), "application/json");
                 return;

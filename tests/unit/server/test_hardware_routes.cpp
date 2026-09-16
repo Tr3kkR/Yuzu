@@ -395,6 +395,21 @@ TEST_CASE("route: GET /api/v1/hardware/{id} — CI-record tags/agent_version nul
 
 // ───────────────────────── POST /api/v1/hardware/{id}/sync — route matrix ──────
 
+TEST_CASE("route: POST .../sync — malformed JSON body is a 400, denied+audited "
+          "(governance Gate 8)",
+          "[hardware][route][rest]") {
+    HwHarness h;
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", "{not json");
+    REQUIRE(res);
+    REQUIRE(res->status == 400);
+    REQUIRE(contains(res->body, "body must be a JSON object"));
+    bool denied = false;
+    for (const auto& a : h.audits)
+        if (a == "inventory.sync.request|denied")
+            denied = true;
+    REQUIRE(denied);
+}
+
 TEST_CASE("route: POST .../sync — bad source is a 400, denied+audited, never dispatched",
           "[hardware][route][rest]") {
     HwHarness h;
