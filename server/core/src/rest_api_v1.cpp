@@ -2106,6 +2106,17 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                       return;
                   }
+                  // #2437-class guard: raw-text depth check before parse, same
+                  // ordering as the result-set creation routes above - a
+                  // parsed-then-dumped "steps" subtree still crashes on the
+                  // dump below (validate_bundle_steps(body["steps"].dump())),
+                  // so the check has to run on the raw text before any parse.
+                  if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                                      "application/json");
+                      return;
+                  }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
                   if (body.is_discarded()) {
                       res.status = 400;
