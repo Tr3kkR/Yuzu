@@ -18,7 +18,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
+#include <iterator>
+#include <optional>
 #include <string>
+#include <string_view>
 
 // Shared full-page shell (defined at GLOBAL scope in guardian_page_ui.cpp).
 extern const char* const kGuardianDetailPageHtml;
@@ -124,6 +127,26 @@ scoped_roster(const InventoryDevicesResult& all, const authz::VisibleSet& scope)
 
 } // namespace
 
+HwCiAffordances HardwareRoutes::affordances_for(const httplib::Request& req, const std::string& id,
+                                                const HardwareCiDetail& detail) const {
+    HwCiAffordances aff;
+    using S = HwSyncAffordance::State;
+    const bool online = detail.identity && detail.identity->online;
+    const bool can_exec = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Execution", "Execute", id);
+    if (detail.agent_version)
+        aff.sync.agent_version = *detail.agent_version;
+    if (!online || !detail.agent_version)
+        aff.sync.state = S::Offline;
+    else if (!can_exec)
+        aff.sync.state = S::NoExecute;
+    else if (!agent_supports_sync_now(*detail.agent_version))
+        aff.sync.state = S::Unsupported;
+    else
+        aff.sync.state = S::Ready;
+    aff.can_write_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Write", id);
+    return aff;
+}
+
 void HardwareRoutes::register_routes(httplib::Server& svr, Deps deps) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(deps));
@@ -200,22 +223,165 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
         const std::string lens = req.has_param("lens") ? req.get_param_value("lens") : "overview";
+        const bool lens_only = req.has_param("lens_only") && req.get_param_value("lens_only") == "1";
         if (!deps_.ci_detail_fn) {
             res.status = 503;
             send_html(res, "<div class=\"gp-placeholder\">Hardware CI record unavailable on this "
                           "server.</div>");
             return;
         }
+        // Sync-now poll parameters (round 2): await_since = the SERVER clock at request
+        // time; n = attempt (1..30); command_id must be a __sync__- id so a guessed
+        // id can't read another dispatch's result through this route.
+        std::optional<std::int64_t> await_since;
+        int attempt = 1;
+        std::string command_id;
+        if (req.has_param("await_since")) {
+            try { await_since = std::stoll(req.get_param_value("await_since")); } catch (...) {}
+            if (req.has_param("n")) {
+                try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 30); } catch (...) {}
+            }
+            if (req.has_param("command_id")) {
+                command_id = req.get_param_value("command_id");
+                if (command_id.size() > 64 || !command_id.starts_with("__sync__-")) {
+                    res.status = 400;
+                    send_html(res, "bad request");
+                    return;
+                }
+            }
+        }
+
         const HardwareCiDetail detail = deps_.ci_detail_fn(id);
+        const HwCiAffordances aff = affordances_for(req, id, detail);
 
         std::string verb = "inventory.device.ci";
         std::string state = !detail.ci.has_value() ? "store degraded"
                             : !detail.ci->has_value() ? "absent" : "found";
         if (lens == "software") verb = "inventory.device.software";
-        (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, verb, "success", "Agent", id,
-                                            "hardware CI lens=" + lens + " state=" + state);
+        (void)detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, verb, "success", "Agent", id,
+            "hardware CI lens=" + lens + " state=" + state +
+                (await_since ? " await=" + std::to_string(attempt) : ""));
 
-        send_html(res, render_hardware_ci_fragment(id, detail, lens, now_secs()));
+        if (await_since) {
+            bool newer = true;
+            if (lens == "overview" || lens.empty())
+                newer = detail.ci.has_value() && detail.ci->has_value() &&
+                        (**detail.ci).last_seen > *await_since;
+            else if (lens == "software")
+                newer = detail.software_last_seen && *detail.software_last_seen > *await_since;
+            if (!newer) {
+                // Early exit on an explicit refusal from the agent (e.g. a release 0.13.0
+                // agent answering "plugin not found", or --inventory-disable).
+                if (!command_id.empty() && deps_.responses_fn) {
+                    for (const auto& r : deps_.responses_fn(command_id, id)) {
+                        if (r.agent_id != id) continue;
+                        if (r.status >= 2) {
+                            send_html(res, render_hardware_sync_terminal(
+                                               id, lens, r.output.empty() ? r.error_detail : r.output, false));
+                            return;
+                        }
+                    }
+                }
+                if (attempt >= 30) {
+                    send_html(res, render_hardware_sync_terminal(id, lens, "", true));
+                    return;
+                }
+                send_html(res, render_hardware_sync_pending(id, lens, *await_since, attempt + 1, command_id));
+                return;
+            }
+        }
+
+        if (lens_only)
+            send_html(res, render_hardware_lens_body(id, detail, lens, now_secs(), aff));
+        else
+            send_html(res, render_hardware_ci_fragment(id, detail, lens, now_secs(), aff));
+    });
+
+    // -- REST v1: POST /api/v1/hardware/{id}/sync — operator-requested sync-on-demand --
+    // Gate = Execution:Execute scoped to the device (the same probe the Actions lens
+    // uses: "make the agent run a collection now" is a device action, not an
+    // inventory edit). Dispatch = SyncDispatchFn (system-reserved push, the Guardian
+    // path). 202 means REQUESTED — the poll on /fragments/hardware/ci is the truth.
+    sink.Post(R"(/api/v1/hardware/([^/]+)/sync)", [this](const httplib::Request& req,
+                                                        httplib::Response& res) {
+        detail::ensure_correlation_id(res);
+        const std::string id = req.matches[1].str();
+        if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) return;
+
+        std::string source = "all";
+        if (!req.body.empty()) {
+            auto body = nlohmann::json::parse(req.body, nullptr, false);
+            if (body.is_discarded() || !body.is_object()) {
+                res.status = 400;
+                res.set_content(detail::a4_error(res, "body must be a JSON object"), "application/json");
+                return;
+            }
+            source = body.value("source", "all");
+        }
+        static constexpr std::string_view kSources[] = {"installed_software", "app_perf", "device_ci",
+                                                        "software_licensing", "all"};
+        if (std::find(std::begin(kSources), std::end(kSources), source) == std::end(kSources)) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "denied",
+                                            "Agent", id, "bad source=" + source);
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "source must be one of installed_software, app_perf, "
+                                                  "device_ci, software_licensing, all"),
+                            "application/json");
+            return;
+        }
+        if (!deps_.sync_dispatch_fn || !deps_.agent_version_fn) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "failure",
+                                            "Agent", id, "sync dispatch unwired");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "sync-on-demand is unavailable on this server",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+        const auto version = deps_.agent_version_fn(id);
+        if (!version) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "no_agents",
+                                            "Agent", id, "agent_offline");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "agent is not connected — sync needs a live session",
+                                             {.retry_after_ms = 30000}),
+                            "application/json");
+            return;
+        }
+        if (!agent_supports_sync_now(*version)) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "denied",
+                                            "Agent", id,
+                                            "agent_version=" + *version + " predates sync-on-demand");
+            res.status = 409;
+            res.set_content(detail::a4_error(res, "agent " + *version +
+                                                      " predates sync-on-demand (needs 0.13.1 or "
+                                                      "later); restart or upgrade the agent"),
+                            "application/json");
+            return;
+        }
+        const auto r = deps_.sync_dispatch_fn(id, source);
+        if (!r.sent) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "no_agents",
+                                            "Agent", id, "registry refused source=" + source);
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "agent is not reachable right now",
+                                             {.retry_after_ms = 30000}),
+                            "application/json");
+            return;
+        }
+        (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.sync.request",
+                                            "dispatched", "Agent", id,
+                                            "source=" + source + " command_id=" + r.command_id);
+        nlohmann::json out = {
+            {"data", {{"command_id", r.command_id},
+                      {"source", source},
+                      {"agents_reached", 1},
+                      {"requested_at", now_secs()}}},
+            {"meta", {{"api_version", "v1"}}},
+        };
+        res.status = 202;
+        res.set_content(out.dump(), "application/json");
     });
 
     // -- REST v1: GET /api/v1/hardware --
@@ -339,7 +505,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (id.empty()) { res.status = 400; send_html(res, "bad request"); return; }
         if (!deps_.scoped_perm_fn(req, res, "Inventory", "Read", id)) return;
 
-        if (!deps_.exec_probe_fn || !deps_.exec_probe_fn(req, id)) {
+        if (!deps_.scoped_probe_fn || !deps_.scoped_probe_fn(req, "Execution", "Execute", id)) {
             send_html(res, render_hardware_actions_lens(id, id, {}, HwActionsState::NoExecute));
             return;
         }
@@ -353,16 +519,23 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        const std::string hostname = [&] {
-            auto ident = deps_.ci_detail_fn ? deps_.ci_detail_fn(id).identity : std::nullopt;
-            return ident && !ident->hostname.empty() ? ident->hostname : id;
-        }();
+        std::string hostname = id;
+        std::string agent_os;
+        if (deps_.ci_detail_fn) {
+            auto ident = deps_.ci_detail_fn(id).identity;
+            if (ident) {
+                if (!ident->hostname.empty()) hostname = ident->hostname;
+                agent_os = ident->os;
+            }
+        }
 
         std::vector<HwActionRow> rows;
         for (const auto& plugin : *plugins) {
             std::unordered_map<std::string, std::string> schemas =
                 deps_.schema_fn ? deps_.schema_fn(plugin.name)
                                 : std::unordered_map<std::string, std::string>{};
+            const std::optional<std::string> manifest =
+                deps_.manifest_fn ? deps_.manifest_fn(plugin.name) : std::nullopt;
             for (const auto& action : plugin.actions) {
                 HwActionRow row;
                 row.plugin = plugin.name;
@@ -382,6 +555,11 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                     auto s_it = schemas.find(action);
                     if (s_it != schemas.end())
                         row.form = parse_action_form_spec(s_it->second);
+                    // Parameter hints (round 2): the plugin-docs manifest's inputs[] +
+                    // captured example. Also supplies typed fields when this deployment's
+                    // store has no enabled definition for the action.
+                    if (manifest)
+                        apply_manifest_hints(row.form, *manifest, action, agent_os);
                 }
                 rows.push_back(std::move(row));
             }
@@ -411,7 +589,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (req.has_param("n")) {
             try { attempt = std::clamp(std::stoi(req.get_param_value("n")), 1, 50); } catch (...) {}
         }
-        if (!deps_.exec_probe_fn || !deps_.exec_probe_fn(req, id)) {
+        if (!deps_.scoped_probe_fn || !deps_.scoped_probe_fn(req, "Execution", "Execute", id)) {
             send_html(res, "<div class=\"gp-placeholder\">Running actions needs the "
                           "<b>Execute</b> permission for this device.</div>");
             return;

@@ -93,6 +93,36 @@ std::string field_html(const ActionFormField& f) {
     return h;
 }
 
+// The "what do I type here" guide beside every action form (round-2 item 4):
+// the manifest-documented inputs (name/type/required/default/constraints/
+// description) and a captured example invocation. Honest when nothing is
+// documented — the 11 definition-less catalogue actions say so plainly.
+std::string syntax_block(const ActionFormSpec& form) {
+    std::string h = "<div class=\"hw-syntax\">";
+    if (!form.inputs.empty()) {
+        h += "<table><thead><tr><th>Input</th><th>Type</th><th>Req</th><th>Default</th>"
+             "<th>Constraints</th><th>Description</th></tr></thead><tbody>";
+        for (const auto& in : form.inputs) {
+            h += "<tr><td><code>" + esc(in.name) + "</code></td><td>" + esc(in.type) + "</td><td>" +
+                 (in.required ? "yes" : "no") + "</td><td>" + esc(in.default_value) + "</td><td>" +
+                 esc(in.constraints) + "</td><td>" + esc(in.description) + "</td></tr>";
+        }
+        h += "</tbody></table>";
+    }
+    if (!form.example.empty())
+        h += "<div>Example: <code>" + esc(form.example) + "</code></div>";
+    if (form.inputs.empty() && form.example.empty()) {
+        h += form.schema_usable
+                 ? "<div>Inputs above come from this deployment's instruction definition.</div>"
+                 : "<div>No documented parameters &mdash; this action takes none, or accepts "
+                   "<code>key=value</code> pairs; see the plugin README.</div>";
+    } else if (!form.schema_usable) {
+        h += "<div>Syntax: one <code>key=value</code> per line.</div>";
+    }
+    h += "</div>";
+    return h;
+}
+
 } // namespace
 
 std::string render_hardware_actions_lens(const std::string& agent_id, const std::string& hostname,
@@ -118,6 +148,18 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
   .hw-result pre{background:var(--bg,#0d1729);border:1px solid var(--border,#2d4068);border-radius:.4rem;padding:.5rem;overflow:auto;max-height:320px;font-size:.72rem}
   .hw-result table{width:100%;border-collapse:collapse;font-size:.72rem}
   .hw-result th,.hw-result td{border-bottom:1px solid var(--border,#2d4068);padding:.25rem .4rem;text-align:left}
+  .hw-syntax{margin:.35rem 0 .2rem;font-size:.66rem;color:var(--muted,#8fa3bd);border-left:2px solid var(--border,#2d4068);padding-left:.5rem}
+  .hw-syntax table{border-collapse:collapse;font-size:.64rem;margin-top:.2rem}
+  .hw-syntax th,.hw-syntax td{padding:.1rem .45rem .1rem 0;text-align:left;vertical-align:top;border:0}
+  .hw-syntax th{color:var(--muted,#8fa3bd);font-weight:600;text-transform:uppercase;letter-spacing:.04em;font-size:.56rem}
+  .hw-syntax code{font-family:'JetBrains Mono',Consolas,monospace;color:var(--lightblue,#a5d6ff)}
+  .hw-rtool{display:flex;gap:.4rem;align-items:center;flex-wrap:wrap;margin:.3rem 0}
+  .hw-rtool input[type=text]{background:var(--bg,#0d1729);border:1px solid var(--border,#2d4068);border-radius:.35rem;color:var(--fg,#cfdbe8);padding:.22rem .45rem;font-size:.72rem;min-width:200px}
+  .hw-rtool input.bad{border-color:var(--red,#ff5765)}
+  .hw-rtool label{font-size:.66rem;color:var(--muted,#8fa3bd)}
+  .hw-rtool .cnt{font-size:.66rem;color:var(--muted,#8fa3bd);margin-left:auto}
+  .hw-line{display:block}
+  .hw-line.hit{background:rgba(0,188,235,.12)}
 </style>)css";
 
     if (state == HwActionsState::Offline)
@@ -174,9 +216,13 @@ std::string render_hardware_actions_lens(const std::string& agent_id, const std:
                 for (const auto& f : row.form.fields)
                     h += field_html(f);
             } else {
+                const std::string ph = row.form.example.empty()
+                    ? std::string("key=value")
+                    : row.form.example;
                 h += "<div class=\"hw-fld\"><label>Parameters (key=value, one per line)</label>"
-                     "<textarea name=\"kv\" rows=\"2\" placeholder=\"key=value\"></textarea></div>";
+                     "<textarea name=\"kv\" rows=\"2\" placeholder=\"" + esc(ph) + "\"></textarea></div>";
             }
+            h += syntax_block(row.form);
             h += "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwRunAction(this)\">Run"
                  "</button>";
             h += "<div class=\"hw-result\"></div>";
@@ -214,8 +260,8 @@ std::string render_output_table_from_json_array(const nlohmann::json& arr) {
     h += "</tr></thead><tbody>";
     std::size_t n = 0;
     for (const auto& row : arr) {
-        if (n++ >= 500) { h += "<tr><td colspan=\"" + std::to_string(keys.size()) +
-                              "\">&hellip; truncated</td></tr>"; break; }
+        if (n++ >= 20000) { h += "<tr><td colspan=\"" + std::to_string(keys.size()) +
+                              "\">&hellip; truncated at 20000 rows</td></tr>"; break; }
         h += "<tr>";
         for (const auto& k : keys) {
             std::string v;
@@ -269,8 +315,26 @@ std::string render_action_output(const std::string& plugin, const std::string& o
             return h;
         }
     }
-    std::string capped = output.size() > 65536 ? output.substr(0, 65536) + "\n… truncated" : output;
-    return "<pre>" + html_escape(capped) + "</pre>";
+    // One span per line so the client-side filter can hide non-matching lines and
+    // count hits; the store already caps a response at 2 MiB (kMaxIngestBytes), so
+    // the only cap here is the same 2 MiB defensive ceiling.
+    constexpr std::size_t kMaxRender = 2ull * 1024 * 1024;
+    std::string_view v = output.size() > kMaxRender ? std::string_view(output).substr(0, kMaxRender)
+                                                     : std::string_view(output);
+    std::string h = "<pre>";
+    std::size_t start = 0;
+    while (start <= v.size()) {
+        const auto nl = v.find('\n', start);
+        const std::string_view line = v.substr(start, nl == std::string_view::npos ? std::string_view::npos : nl - start);
+        h += "<span class=\"hw-line\">" + html_escape(std::string(line)) + "</span>";
+        if (nl == std::string_view::npos)
+            break;
+        start = nl + 1;
+    }
+    if (output.size() > kMaxRender)
+        h += "<span class=\"hw-line\">… truncated at 2 MiB</span>";
+    h += "</pre>";
+    return h;
 }
 
 } // namespace
@@ -283,10 +347,20 @@ std::string render_hardware_action_result(const std::string& plugin, const std::
             h += "<span class=\"gp-mute\">Waiting&hellip;</span>";
             break;
         case HwActionResultView::Phase::Rendered:
-            if (view.output.rfind("error|", 0) == 0)
+            if (view.output.rfind("error|", 0) == 0) {
                 h += "<div class=\"gp-err\">" + html_escape(agent_error_display(view.output)) + "</div>";
-            else
-                h += render_action_output(plugin, view.output);
+            } else {
+                // Search / regex / CSV toolbar (round-2 items 7 and 8) — client-side over
+                // the rendered rows or lines; export honours the current filter.
+                h += "<div class=\"hw-rtool\">"
+                     "<input type=\"text\" placeholder=\"Search output\u2026\" oninput=\"hwFilterResult(this)\">"
+                     "<label><input type=\"checkbox\" onchange=\"hwFilterResult(this)\"> regex</label>"
+                     "<button type=\"button\" class=\"gp-btn\" data-name=\"" + html_escape(plugin + "-" + action) +
+                     "\" onclick=\"hwExportCsv(this)\">Export CSV</button>"
+                     "<button type=\"button\" class=\"gp-btn\" onclick=\"hwCopyResult(this)\">Copy</button>"
+                     "<span class=\"cnt\"></span></div>";
+                h += "<div class=\"hw-rbody\">" + render_action_output(plugin, view.output) + "</div>";
+            }
             break;
         case HwActionResultView::Phase::RenderedEmpty:
             h += "<span class=\"gp-mute\">" + html_escape(plugin + "." + action) +

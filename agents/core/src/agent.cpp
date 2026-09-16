@@ -2197,7 +2197,16 @@ public:
                                 need.push_back(n);
                             return need;
                         };
-                        SyncScheduler scheduler(cfg_.agent_id, kv_get, kv_set, sender);
+                        auto scheduler_ptr =
+                            std::make_shared<SyncScheduler>(cfg_.agent_id, kv_get, kv_set, sender);
+                        SyncScheduler& scheduler = *scheduler_ptr;
+                        // Clear the sync-on-demand handle on EVERY exit of this thread
+                        // (normal stop, or a throw out of tick()) so the command loop
+                        // never arms a scheduler whose thread is gone.
+                        ScopeExit clear_sync_handle{[this]() {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sync_scheduler_.reset();
+                        }};
                         scheduler.add_source(make_installed_software_source(ia_descriptor));
                         // DEX app-perf-over-time B1. Rides the same daily-sync thread +
                         // transport; collection is further gated by procperf_enabled (an
@@ -2233,6 +2242,12 @@ public:
                             scheduler.add_source(make_software_licensing_source(
                                 license_descriptor, std::move(lic_cfg)));
                         }
+                        // Publish AFTER the last add_source: request_now() reads sources_
+                        // without the mutex on the append-only-before-publication contract.
+                        {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sync_scheduler_ = scheduler_ptr;
+                        }
                         spdlog::info("Daily-sync thread started (sources=4: installed_software, "
                                      "app_perf, device_ci, software_licensing)");
                         while (!should_stop()) {
@@ -2242,6 +2257,11 @@ public:
                             auto sleep = scheduler.tick(now_secs);
                             auto remaining = sleep;
                             while (remaining.count() > 0 && !should_stop()) {
+                                // __sync__.now: re-tick immediately; the drain at the top of
+                                // tick() fires the requested source(s). Checked before the
+                                // first sleep so a request landing mid-tick is not lost.
+                                if (sync_wake_.exchange(false, std::memory_order_acq_rel))
+                                    break;
                                 auto step = std::min(remaining, std::chrono::seconds{2});
                                 std::this_thread::sleep_for(step);
                                 remaining -= step;
@@ -3033,6 +3053,68 @@ public:
                             .counter("yuzu_agent_commands_executed_total",
                                      {{"plugin", "__guard__"}})
                             .increment();
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(resp, grpc::WriteOptions());
+                        continue;
+                    }
+
+                    // Reserved-name dispatch #2: `__sync__.now` — operator-triggered
+                    // sync-on-demand (ADR-0016 update). Arms the daily-sync scheduler
+                    // to run one source (or all) in its next pass and breaks its
+                    // sleep, so the report lands in seconds instead of ≤24h. Unlike
+                    // __guard__ this command IS dedup-claimed (the claim above exempts
+                    // only the literal "__guard__"), so its terminal MUST be recorded
+                    // before the write or a server re-send answers RUNNING forever.
+                    if (cmd.plugin() == "__sync__") {
+                        pb::CommandResponse resp;
+                        resp.set_command_id(cmd.command_id());
+                        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                        resp.mutable_sent_at()->set_millis_epoch(epoch_ms);
+                        std::string source{SyncScheduler::kAllSources};
+                        if (auto it = cmd.parameters().find("source");
+                            it != cmd.parameters().end() && !it->second.empty())
+                            source = it->second;
+                        std::shared_ptr<SyncScheduler> sched;
+                        {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sched = sync_scheduler_;
+                        }
+                        if (cmd.action() != "now") {
+                            resp.set_status(pb::CommandResponse::FAILURE);
+                            resp.set_exit_code(2);
+                            resp.set_output("unknown __sync__ action: " + cmd.action());
+                        } else if (!sched) {
+                            resp.set_status(pb::CommandResponse::FAILURE);
+                            resp.set_exit_code(1);
+                            resp.set_output(cfg_.inventory_disable
+                                                ? "daily-sync disabled (--inventory-disable)"
+                                                : "daily-sync not running (not connected)");
+                        } else if (auto armed = sched->request_now(source); armed.empty()) {
+                            std::string valid;
+                            for (const auto& n : sched->source_names())
+                                valid += (valid.empty() ? "" : ",") + n;
+                            resp.set_status(pb::CommandResponse::FAILURE);
+                            resp.set_exit_code(2);
+                            resp.set_output("unknown sync source '" + source +
+                                            "' — expected one of " + valid + " or all");
+                        } else {
+                            sync_wake_.store(true, std::memory_order_release);
+                            std::string names;
+                            for (const auto& n : armed)
+                                names += (names.empty() ? "" : ",") + n;
+                            resp.set_status(pb::CommandResponse::SUCCESS);
+                            resp.set_exit_code(0);
+                            resp.set_output("requested|" + names);
+                        }
+                        resp.set_plugin("__sync__");
+                        resp.set_action(cmd.action());
+                        metrics_
+                            .counter("yuzu_agent_commands_executed_total",
+                                     {{"plugin", "__sync__"}})
+                            .increment();
+                        record_command_terminal(cmd.command_id(), resp);
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(resp, grpc::WriteOptions());
                         continue;
@@ -3915,6 +3997,14 @@ private:
 
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
+    // Sync-on-demand (`__sync__.now`, ADR-0016 update): the command read loop
+    // arms the scheduler through this handle and breaks the sync thread's sleep.
+    // sync_scheduler_ is null under --inventory-disable and between connections
+    // (published by the 4b-sync thread after its sources are registered, cleared
+    // by that same thread on exit) — the intercept answers FAILURE, never blocks.
+    std::atomic<bool> sync_wake_{false};
+    std::mutex sync_sched_mu_;
+    std::shared_ptr<SyncScheduler> sync_scheduler_;
     std::atomic<bool> keepalive_stop_{false}; // CHAOS-TTL-1 keepalive thread stop flag
     // Consecutive session-rejection-forced re-registrations (#1894). A successful
     // Register resets the normal reconnect backoff, so a server that reaps every

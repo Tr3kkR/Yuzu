@@ -17,7 +17,9 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <mutex>
 #include <optional>
+#include <string_view>
 #include <string>
 #include <utility>
 #include <vector>
@@ -63,6 +65,23 @@ public:
     /// [`kMinTickSeconds`, `kMaxTickSeconds`]).
     std::chrono::seconds tick(std::int64_t now_secs);
 
+    /// Operator-triggered sync-on-demand (the `__sync__.now` reserved command).
+    /// `source_or_all` is one source name or `kAllSources`. Thread-safe: it only
+    /// touches the mutex-guarded pending list — never sources_/states_/kv/sender —
+    /// so it may be called from a thread other than the one that ticks (the
+    /// command read loop). Returns the source names that will be forced (empty =
+    /// unknown name). Drained at the top of the next tick(): next_fire = now,
+    /// force_full = true, needfull_streak = 0, persisted; that same tick then
+    /// fires them. `add_source` must not be called after the ticking thread
+    /// starts (sources_ is read here without the mutex — append-only before
+    /// publication, as agent.cpp does).
+    [[nodiscard]] std::vector<std::string> request_now(std::string_view source_or_all);
+
+    /// Registered source names, in registration order (for the agent's error text).
+    [[nodiscard]] std::vector<std::string> source_names() const;
+
+    static constexpr std::string_view kAllSources{"all"};
+
     /// Hard floor: even with hash-skip, send a full payload at least this often
     /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4).
     static constexpr std::chrono::seconds kFullFloor{7 * 24 * 60 * 60};
@@ -90,6 +109,9 @@ private:
         bool loaded{false};
     };
 
+    /// Apply every pending request_now() arm to its State (on the ticking thread).
+    void drain_pending(std::int64_t now_secs);
+
     std::string kv_key(const std::string& source, const char* field) const;
     State& load_state(std::size_t idx, std::int64_t now_secs);
     void save_state(const SyncSource& src, const State& st);
@@ -102,6 +124,11 @@ private:
     SenderFn sender_;
     std::vector<SyncSource> sources_;
     std::vector<State> states_; // parallel to sources_
+
+    // request_now() (any thread) -> drain_pending() (ticking thread). Indices into
+    // sources_; deduplicated on insert. The ONLY cross-thread state in this class.
+    std::mutex pending_mu_;
+    std::vector<std::size_t> pending_;
 };
 
 } // namespace yuzu::agent

@@ -269,9 +269,30 @@ std::string row_html(const InventoryDeviceRow& d) {
 std::string device_lens_tab(const char* key, const char* label, const std::string& agent_id,
                             const std::string& active) {
     const std::string on = (active == key) ? " on" : "";
+    // lens_only=1: the route answers with ONLY the lens body, so swapping it into
+    // #hw-ci-lens never nests a second header + tab bar (round-2 item 6).
     return std::string("<a class=\"") + on + "\" hx-get=\"/fragments/hardware/ci?id=" +
-           url_encode(agent_id) + "&lens=" + key + "\" hx-target=\"#hw-ci-lens\" hx-swap=\"innerHTML\">" +
-           label + "</a>";
+           url_encode(agent_id) + "&lens=" + key + "&lens_only=1\" hx-target=\"#hw-ci-lens\" "
+           "hx-swap=\"innerHTML\">" + label + "</a>";
+}
+
+std::string sync_button(const std::string& agent_id, const char* source, const char* lens,
+                        const HwSyncAffordance& sync, const char* label) {
+    using S = HwSyncAffordance::State;
+    if (sync.state == S::Ready)
+        return std::string("<button type=\"button\" class=\"gp-btn accent\" data-agent=\"") +
+               esc(agent_id) + "\" data-lens=\"" + lens + "\" onclick=\"hwSyncNow(this,'" + source +
+               "')\">" + label + "</button>";
+    const char* note = sync.state == S::Offline      ? "sync needs a connected agent"
+                       : sync.state == S::NoExecute  ? "needs the Execute permission"
+                                                     : "predates sync-on-demand (0.13.1+)";
+    std::string h = std::string("<button type=\"button\" class=\"gp-btn\" disabled>") + label +
+                    "</button> <span class=\"hw-mono\">";
+    if (sync.state == S::Unsupported && !sync.agent_version.empty())
+        h += "agent " + esc(sync.agent_version) + " ";
+    h += note;
+    h += "</span>";
+    return h;
 }
 
 } // namespace
@@ -339,52 +360,17 @@ std::string render_hardware_not_found(const std::string& agent_id) {
            "'" + esc(agent_id) + "' has not been seen in the last 30 days, or does not exist.</div></div>";
 }
 
-std::string render_hardware_ci_fragment(const std::string& agent_id, const HardwareCiDetail& detail,
-                                        const std::string& lens, std::int64_t now_secs) {
-    if (!detail.identity && !detail.ci.has_value())
-        return render_hardware_not_found(agent_id);
-    if (!detail.identity && detail.ci.has_value() && !detail.ci->has_value())
-        return render_hardware_not_found(agent_id);
-
-    const std::string hostname = detail.identity && !detail.identity->hostname.empty()
-                                      ? detail.identity->hostname
-                                      : agent_id;
-    const std::string os = detail.identity ? detail.identity->os : "";
+std::string render_hardware_lens_body(const std::string& agent_id, const HardwareCiDetail& detail,
+                                      const std::string& lens, std::int64_t now_secs,
+                                      const HwCiAffordances& aff) {
     const bool online = detail.identity && detail.identity->online;
-    const std::string last_seen = detail.identity ? detail.identity->last_seen : "unknown";
-
-    std::string h = hw_style();
-    h += "<div class=\"hw-wrap\">";
-    h += "<div class=\"hw-hdr\">";
-    h += "<span class=\"hw-dot\" style=\"background:" + std::string(online ? "#4ed27e" : "#6f86a6") +
-         "\"></span>";
-    h += "<h1 class=\"hw-h1\" style=\"margin:0\">" + esc(hostname) + "</h1>";
-    if (!os.empty())
-        h += "<span class=\"hw-pill " + std::string(os_cls(os)) + "\">" + os_label(os) + "</span>";
-    h += "<span class=\"hw-mono\">" + esc(agent_id) + "</span>";
-    h += "<span class=\"hw-mono\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
-    h += "</div>";
-
-    if (detail.tags && !detail.tags->empty()) {
-        h += "<div class=\"hw-hdr\">";
-        for (const auto& t : *detail.tags)
-            h += "<span class=\"hw-tag\">" + esc(t.key) + "=" + esc(t.value) + "</span>";
-        h += "</div>";
-    }
-
-    const std::string active_lens = lens.empty() ? "overview" : lens;
-    h += "<div class=\"hw-lens\">";
-    h += device_lens_tab("overview", "Overview", agent_id, active_lens);
-    h += device_lens_tab("software", "Installed software", agent_id, active_lens);
-    h += device_lens_tab("tags", "Tags", agent_id, active_lens);
-    h += device_lens_tab("actions", "Actions", agent_id, active_lens);
-    h += "</div><div id=\"hw-ci-lens\">";
-
-    if (active_lens == "software") {
-        h += render_hardware_software_lens(agent_id, detail.software, detail.software_truncated, online);
-    } else if (active_lens == "tags") {
-        h += render_hardware_tags_lens(agent_id, detail.tags);
-    } else if (active_lens == "actions") {
+    std::string h;
+    if (lens == "software") {
+        h += render_hardware_software_lens(agent_id, detail.software, detail.software_truncated, online,
+                                           aff.sync);
+    } else if (lens == "tags") {
+        h += render_hardware_tags_lens(agent_id, detail.tags, aff.can_write_tags);
+    } else if (lens == "actions") {
         // The route swaps this placeholder for the real actions lens on load —
         // rendering the lens itself needs actions_fn/classify_fn/schema_fn, which
         // the CiDetailFn composition (built for the other three lenses) doesn't
@@ -400,7 +386,9 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
                  "&mdash; reads here are authoritative. Retry shortly.</div>";
         } else if (!detail.ci->has_value()) {
             h += "<div class=\"hw-empty\">No CI record synced yet for this device (device-CI daily "
-                 "sync, ADR-0016 &mdash; a freshly enrolled agent populates within ~24h).</div>";
+                 "sync, ADR-0016 &mdash; a freshly enrolled agent populates within ~24h, or on "
+                 "demand).<div style=\"margin-top:.5rem\">" +
+                 sync_button(agent_id, "device_ci", "overview", aff.sync, "Sync now") + "</div></div>";
         } else {
             const DeviceCiRecord& r = **detail.ci;
             auto field = [](const char* label, const std::string& val) {
@@ -446,21 +434,97 @@ std::string render_hardware_ci_fragment(const std::string& agent_id, const Hardw
             h += "</div></div>";
         }
     }
+    return h;
+}
+
+std::string render_hardware_ci_fragment(const std::string& agent_id, const HardwareCiDetail& detail,
+                                        const std::string& lens, std::int64_t now_secs,
+                                        const HwCiAffordances& aff) {
+    if (!detail.identity && !detail.ci.has_value())
+        return render_hardware_not_found(agent_id);
+    if (!detail.identity && detail.ci.has_value() && !detail.ci->has_value())
+        return render_hardware_not_found(agent_id);
+
+    const std::string hostname = detail.identity && !detail.identity->hostname.empty()
+                                      ? detail.identity->hostname
+                                      : agent_id;
+    const std::string os = detail.identity ? detail.identity->os : "";
+    const bool online = detail.identity && detail.identity->online;
+    const std::string last_seen = detail.identity ? detail.identity->last_seen : "unknown";
+    const std::string active_lens = lens.empty() ? "overview" : lens;
+
+    std::string h = hw_style();
+    h += "<div class=\"hw-wrap\">";
+    h += "<div class=\"hw-hdr\"><a class=\"gp-btn\" href=\"/hardware\">&larr; Hardware</a></div>";
+    h += "<div class=\"hw-hdr\">";
+    h += "<span class=\"hw-dot\" style=\"background:" + std::string(online ? "#4ed27e" : "#6f86a6") +
+         "\"></span>";
+    h += "<h1 class=\"hw-h1\" style=\"margin:0\">" + esc(hostname) + "</h1>";
+    if (!os.empty())
+        h += "<span class=\"hw-pill " + std::string(os_cls(os)) + "\">" + os_label(os) + "</span>";
+    h += "<span class=\"hw-mono\">" + esc(agent_id) + "</span>";
+    h += "<span class=\"hw-mono\">last seen " + esc(last_seen.empty() ? "?" : last_seen) + "</span>";
+    h += "<span style=\"flex:1\"></span>";
+    h += sync_button(agent_id, "all", active_lens.c_str(), aff.sync, "Sync now");
+    h += "</div>";
+
+    if (detail.tags && !detail.tags->empty()) {
+        h += "<div class=\"hw-hdr\">";
+        for (const auto& t : *detail.tags)
+            h += "<span class=\"hw-tag\">" + esc(t.key) + "=" + esc(t.value) + "</span>";
+        h += "</div>";
+    }
+
+    h += "<div class=\"hw-lens\">";
+    h += device_lens_tab("overview", "Overview", agent_id, active_lens);
+    h += device_lens_tab("software", "Installed software", agent_id, active_lens);
+    h += device_lens_tab("tags", "Tags", agent_id, active_lens);
+    h += device_lens_tab("actions", "Actions", agent_id, active_lens);
+    h += "</div><div id=\"hw-ci-lens\">";
+    h += render_hardware_lens_body(agent_id, detail, active_lens, now_secs, aff);
     h += "</div></div>";
     return h;
 }
 
-std::string render_hardware_software_lens(const std::string& /*agent_id*/,
+std::string render_hardware_sync_pending(const std::string& agent_id, const std::string& lens,
+                                         std::int64_t await_since, int next_attempt,
+                                         const std::string& command_id) {
+    return "<div hx-get=\"/fragments/hardware/ci?id=" + url_encode(agent_id) + "&lens=" +
+           url_encode(lens) + "&lens_only=1&await_since=" + std::to_string(await_since) +
+           "&n=" + std::to_string(next_attempt) + "&command_id=" + url_encode(command_id) +
+           "\" hx-trigger=\"load delay:2s\" hx-swap=\"outerHTML\"><span class=\"gp-mute\">Sync "
+           "requested &mdash; waiting for the device to report (" + std::to_string(next_attempt - 1) +
+           "/30)&hellip;</span></div>";
+}
+
+std::string render_hardware_sync_terminal(const std::string& agent_id, const std::string& lens,
+                                          const std::string& refusal_output, bool timed_out) {
+    std::string h = "<div class=\"hw-degrade\">";
+    if (!refusal_output.empty())
+        h += "<b>The device refused the sync request:</b> " + esc(refusal_output);
+    else if (timed_out)
+        h += "<b>Still waiting.</b> The device may be slow, or the report failed &mdash; check the "
+             "agent log for <span class=\"hw-mono\">sync:</span> lines.";
+    h += " <a class=\"gp-btn\" hx-get=\"/fragments/hardware/ci?id=" + url_encode(agent_id) + "&lens=" +
+         url_encode(lens) + "&lens_only=1\" hx-target=\"#hw-ci-lens\" hx-swap=\"innerHTML\">Reload</a>";
+    h += "</div>";
+    return h;
+}
+
+std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
-                                          bool truncated, bool online) {
+                                          bool truncated, bool online, const HwSyncAffordance& sync) {
     if (!software)
         return "<div class=\"hw-degrade\"><b>Installed software unavailable.</b> The software "
                "inventory store could not be read. Retry shortly.</div>";
     if (software->empty()) {
-        return online
-            ? "<div class=\"hw-empty\">No installed-software inventory synced yet for this device.</div>"
-            : "<div class=\"hw-empty\">No installed-software inventory on record (device is offline "
-              "and has not synced).</div>";
+        if (!online)
+            return "<div class=\"hw-empty\">No installed-software inventory on record (device is "
+                   "offline and has not synced).</div>";
+        return "<div class=\"hw-empty\">No installed-software inventory synced yet for this device."
+               "<div style=\"margin-top:.5rem\">" +
+               sync_button(agent_id, "installed_software", "software", sync, "Sync now") +
+               "</div></div>";
     }
     std::string h = "<table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
                     "<th>Install date</th></tr></thead><tbody>";
@@ -475,18 +539,37 @@ std::string render_hardware_software_lens(const std::string& /*agent_id*/,
     return h;
 }
 
-std::string render_hardware_tags_lens(const std::string& /*agent_id*/,
-                                      const std::optional<std::vector<DeviceTag>>& tags) {
+std::string render_hardware_tags_lens(const std::string& agent_id,
+                                      const std::optional<std::vector<DeviceTag>>& tags,
+                                      bool can_write) {
     if (!tags)
         return "<div class=\"hw-degrade\"><b>Tags unavailable.</b> The tag store could not be read. "
                "Retry shortly.</div>";
-    if (tags->empty())
-        return "<div class=\"hw-empty\">No tags set on this device.</div>";
-    std::string h = "<table class=\"hw-tbl\"><thead><tr><th>Key</th><th>Value</th><th>Source</th>"
-                    "</tr></thead><tbody>";
-    for (const auto& t : *tags)
+    std::string h;
+    if (can_write) {
+        // Posts JSON to the EXISTING /api/tags/set (scoped Tag:Write, audited tag.set)
+        // via hwTagSet — no new route. Key rules mirror TagStore::validate_key.
+        h += "<form class=\"hw-hdr\" data-agent=\"" + esc(agent_id) + "\" onsubmit=\"return false\">"
+             "<input class=\"hw-search\" name=\"key\" placeholder=\"key (e.g. owner)\" "
+             "pattern=\"[A-Za-z0-9_.:-]{1,64}\" maxlength=\"64\" style=\"min-width:160px\">"
+             "<input class=\"hw-search\" name=\"value\" placeholder=\"value\" maxlength=\"448\">"
+             "<button type=\"button\" class=\"gp-btn accent\" onclick=\"hwTagSet(this)\">Add tag</button>"
+             "</form>";
+    }
+    if (tags->empty()) {
+        h += "<div class=\"hw-empty\">No tags set on this device.</div>";
+        return h;
+    }
+    h += "<table class=\"hw-tbl\"><thead><tr><th>Key</th><th>Value</th><th>Source</th>" +
+         std::string(can_write ? "<th></th>" : "") + "</tr></thead><tbody>";
+    for (const auto& t : *tags) {
         h += "<tr><td class=\"hw-name\">" + esc(t.key) + "</td><td class=\"hw-mono\">" + esc(t.value) +
-             "</td><td class=\"hw-mono\">" + esc(t.source) + "</td></tr>";
+             "</td><td class=\"hw-mono\">" + esc(t.source) + "</td>";
+        if (can_write)
+            h += "<td><a class=\"gp-btn\" data-agent=\"" + esc(agent_id) + "\" data-key=\"" + esc(t.key) +
+                 "\" onclick=\"hwTagDelete(this)\">remove</a></td>";
+        h += "</tr>";
+    }
     h += "</tbody></table>";
     return h;
 }

@@ -4,7 +4,9 @@
 #include "hardware_list_model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <limits>
 #include <unordered_set>
 
 namespace yuzu::server {
@@ -389,6 +391,33 @@ nlohmann::json hardware_list_json(const HardwareListPage& page, bool ci_degraded
     };
 }
 
+bool agent_supports_sync_now(std::string_view agent_version) noexcept {
+    // Cut the +build suffix; split on '.', at most 3 numeric components.
+    const auto plus = agent_version.find('+');
+    std::string_view v = plus == std::string_view::npos ? agent_version : agent_version.substr(0, plus);
+    if (v.empty())
+        return false;
+    std::array<int, 3> parts{0, 0, 0};
+    std::size_t idx = 0;
+    std::size_t start = 0;
+    while (start <= v.size() && idx < 3) {
+        const auto dot = v.find('.', start);
+        const std::string_view comp = v.substr(start, dot == std::string_view::npos ? std::string_view::npos
+                                                                                      : dot - start);
+        if (comp.empty())
+            return false;
+        int n = 0;
+        const auto res = std::from_chars(comp.data(), comp.data() + comp.size(), n);
+        if (res.ec != std::errc{} || res.ptr != comp.data() + comp.size() || n < 0)
+            return false; // non-numeric (incl. "-rc1") → fail closed
+        parts[idx++] = n;
+        if (dot == std::string_view::npos)
+            break;
+        start = dot + 1;
+    }
+    return parts >= kSyncNowMinAgentVersion; // lexicographic on {major, minor, patch}
+}
+
 nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*now_secs*/) {
     nlohmann::json out;
     if (detail.identity) {
@@ -451,6 +480,10 @@ nlohmann::json hardware_ci_json(const HardwareCiDetail& detail, std::int64_t /*n
                             {"updated_at", t.updated_at}});
         out["tags"] = std::move(tags);
     }
+    out["agent_version"] = detail.agent_version ? nlohmann::json(*detail.agent_version) : nullptr;
+    out["sync_supported"] = detail.agent_version && agent_supports_sync_now(*detail.agent_version);
+    out["software_last_seen"] =
+        detail.software_last_seen ? nlohmann::json(*detail.software_last_seen) : nullptr;
     return out;
 }
 

@@ -54,17 +54,47 @@ class HttpRouteSink;
 std::string render_hardware_list_fragment(const HardwareListPage& page, bool ci_degraded,
                                           bool roster_unavailable);
 
-/// The CI record: header (hostname/OS/online/last-seen/agent id) + lens tabs +
-/// the active lens's content. `lens` in {"overview","software","tags"}.
+/// What the CI record may OFFER the caller beyond reading — computed by the route
+/// (online state, agent version floor, Execute / Tag:Write probes) and passed to
+/// the PURE renderers, so a renderer never decides authorization itself.
+struct HwSyncAffordance {
+    enum class State { Ready, Offline, Unsupported, NoExecute } state{State::Offline};
+    std::string agent_version; // for the Unsupported note
+};
+struct HwCiAffordances {
+    HwSyncAffordance sync;
+    bool can_write_tags{false}; // Tag:Write probe passed → Add/remove tag controls render
+};
+
+/// The CI record: back link + header (hostname/OS/online/last-seen/agent id/Sync now)
+/// + lens tabs + the active lens's body. `lens` in {"overview","software","tags","actions"}.
 std::string render_hardware_ci_fragment(const std::string& agent_id, const HardwareCiDetail& detail,
-                                        const std::string& lens, std::int64_t now_secs);
+                                        const std::string& lens, std::int64_t now_secs,
+                                        const HwCiAffordances& aff);
+
+/// ONLY the active lens's body (what the lens tabs and the sync poll swap into
+/// `#hw-ci-lens`) — never the header, so a tab click can't nest a second one.
+std::string render_hardware_lens_body(const std::string& agent_id, const HardwareCiDetail& detail,
+                                      const std::string& lens, std::int64_t now_secs,
+                                      const HwCiAffordances& aff);
+
+/// Sync-now poll: re-fetches the lens body every 2 s until the store's freshness
+/// stamp passes `await_since` (the server clock at request time) or `n` reaches 30.
+std::string render_hardware_sync_pending(const std::string& agent_id, const std::string& lens,
+                                         std::int64_t await_since, int next_attempt,
+                                         const std::string& command_id);
+/// Terminal states of that poll: the agent refused (its own message, escaped), or
+/// the wait budget ran out.
+std::string render_hardware_sync_terminal(const std::string& agent_id, const std::string& lens,
+                                          const std::string& refusal_output, bool timed_out);
 
 std::string render_hardware_software_lens(const std::string& agent_id,
                                           const std::optional<std::vector<SoftwareEntry>>& software,
-                                          bool truncated, bool online);
+                                          bool truncated, bool online, const HwSyncAffordance& sync);
 
 std::string render_hardware_tags_lens(const std::string& agent_id,
-                                      const std::optional<std::vector<DeviceTag>>& tags);
+                                      const std::optional<std::vector<DeviceTag>>& tags,
+                                      bool can_write);
 
 std::string render_hardware_not_found(const std::string& agent_id);
 
@@ -171,11 +201,30 @@ public:
     using ResponsesFn = std::function<std::vector<DexAgentResponse>(const std::string& command_id,
                                                                     const std::string& agent_id)>;
 
-    /// Execute-permission PROBE for one device — a stricter check than the Read
-    /// gate the record/list already passed, run against a throwaway `Response` so
-    /// it never itself writes to the real one (the `dashboard_routes.cpp`
-    /// permission-probe idiom). `true` = the caller may dispatch to this agent.
-    using ExecProbeFn = std::function<bool(const httplib::Request&, const std::string& agent_id)>;
+    /// Per-device permission PROBE — a stricter check than the Read gate the
+    /// record/list already passed, run against a throwaway `Response` so it never
+    /// itself writes to the real one (the `dashboard_routes.cpp` permission-probe
+    /// idiom). Used for `Execution:Execute` (actions, sync) and `Tag:Write` (tag
+    /// controls). `true` = the caller holds `type:op` for this agent.
+    using ScopedProbeFn = std::function<bool(const httplib::Request&, const std::string& securable_type,
+                                             const std::string& operation, const std::string& agent_id)>;
+
+    struct HwSyncDispatchResult {
+        bool sent{false};
+        std::string command_id;
+    };
+    /// Dispatch `__sync__.now {source}` to ONE connected agent as a system-reserved
+    /// push (server.cpp: build_classified_command(system) + send_system_reserved +
+    /// forward_gateway_pending — the Guardian-push path, never dispatch_confined,
+    /// which would withhold `__sync__` as an unknown plugin). `sent=false` == the
+    /// registry refused (no live session / stream write failed).
+    using SyncDispatchFn = std::function<HwSyncDispatchResult(const std::string& agent_id,
+                                                              const std::string& source)>;
+    /// The live session's self-reported agent_version; nullopt == no live session.
+    using AgentVersionFn = std::function<std::optional<std::string>(const std::string& agent_id)>;
+    /// One plugin's pre-serialised plugin-docs manifest JSON (`plugin_docs_manifest`),
+    /// nullopt when no manifest documents that plugin.
+    using ManifestFn = std::function<std::optional<std::string>(const std::string& plugin)>;
 
     struct Deps {
         AuthFn auth_fn;
@@ -188,14 +237,22 @@ public:
         ClassifyFn classify_fn;
         SchemaFn schema_fn;
         ResponsesFn responses_fn;
-        ExecProbeFn exec_probe_fn;
+        ScopedProbeFn scoped_probe_fn;
         const std::unordered_map<std::string, std::string>* action_descriptions{nullptr};
+        ManifestFn manifest_fn;           // parameter hints (R2.5)
+        SyncDispatchFn sync_dispatch_fn;  // Sync now (R2.3)
+        AgentVersionFn agent_version_fn;  // Sync now version floor (R2.3)
     };
 
     void register_routes(httplib::Server& svr, Deps deps);
     void register_routes(HttpRouteSink& sink, Deps deps);
 
 private:
+    /// What the CI record may offer THIS caller for THIS device (sync button state,
+    /// tag controls) — probes run here, in the route layer, never in a renderer.
+    HwCiAffordances affordances_for(const httplib::Request& req, const std::string& id,
+                                    const HardwareCiDetail& detail) const;
+
     Deps deps_;
 };
 

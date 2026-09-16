@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <mutex>
 #include <optional>
 
 namespace yuzu::agent {
@@ -96,7 +97,56 @@ void SyncScheduler::save_state(const SyncSource& src, const State& st) {
     kv_set_(kv_key(src.name, "nf_streak"), std::to_string(st.needfull_streak));
 }
 
+std::vector<std::string> SyncScheduler::request_now(std::string_view source_or_all) {
+    std::vector<std::size_t> idx;
+    for (std::size_t i = 0; i < sources_.size(); ++i)
+        if (source_or_all == kAllSources || sources_[i].name == source_or_all)
+            idx.push_back(i);
+    std::vector<std::string> names;
+    if (idx.empty())
+        return names;
+    std::lock_guard<std::mutex> lk(pending_mu_);
+    for (std::size_t i : idx) {
+        if (std::find(pending_.begin(), pending_.end(), i) == pending_.end())
+            pending_.push_back(i);
+        names.push_back(sources_[i].name);
+    }
+    return names;
+}
+
+std::vector<std::string> SyncScheduler::source_names() const {
+    std::vector<std::string> out;
+    out.reserve(sources_.size());
+    for (const auto& s : sources_)
+        out.push_back(s.name);
+    return out;
+}
+
+void SyncScheduler::drain_pending(std::int64_t now_secs) {
+    std::vector<std::size_t> armed;
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        armed.swap(pending_);
+    }
+    for (std::size_t i : armed) {
+        if (i >= sources_.size())
+            continue;
+        State& st = load_state(i, now_secs); // must run first so a never-loaded source is real
+        st.next_fire = now_secs;
+        st.force_full = true;
+        // An operator click deliberately beats the need_full backoff ladder (UP-5):
+        // the ladder exists to stop a FLEET stampeding a cold server, not to
+        // hold one device an operator is looking at.
+        st.needfull_streak = 0;
+        save_state(sources_[i], st); // persisted BEFORE the send: a failed RPC retries full
+        spdlog::info("sync: source '{}' forced by request_now", sources_[i].name);
+    }
+}
+
 std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
+    // Operator-forced sources first, so they are due in THIS pass.
+    drain_pending(now_secs);
+
     // Gather every due source's hash (always) + blob (only when sending full).
     std::vector<std::pair<std::string, std::string>> hashes;
     std::vector<std::pair<std::string, std::string>> blobs;

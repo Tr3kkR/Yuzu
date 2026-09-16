@@ -16101,6 +16101,8 @@ private:
         auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
             HardwareCiDetail detail;
             detail.identity = hw_identity_fn(agent_id);
+            if (auto sess = registry_.get_session(agent_id))
+                detail.agent_version = sess->agent_version; // immutable identity field, lock-free
             detail.ci = device_inventory_store_
                             ? device_inventory_store_->get_device_ci(agent_id)
                             : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
@@ -16113,6 +16115,8 @@ private:
                         sw->resize(kHwSoftwareCap);
                 }
                 detail.software = std::move(sw);
+                detail.software_last_seen =
+                    software_inventory_store_->source_last_seen(agent_id, "installed_software");
             }
             if (tag_store_) {
                 auto tags = tag_store_->get_all_tags(agent_id);
@@ -16272,13 +16276,56 @@ private:
                              // Read gate above already ran; this is the stricter check
                              // before offering (or honouring) a dispatch control. Same
                              // idiom as DeviceRoutes' live-info `can_execute`.
-                             .exec_probe_fn =
-                                 [scoped_perm_fn](const httplib::Request& req,
-                                                  const std::string& id) -> bool {
+                             .scoped_probe_fn =
+                                 [scoped_perm_fn](const httplib::Request& req, const std::string& type,
+                                                  const std::string& op, const std::string& id) -> bool {
                                      httplib::Response probe;
-                                     return scoped_perm_fn(req, probe, "Execution", "Execute", id);
+                                     return scoped_perm_fn(req, probe, type, op, id);
                                  },
                              .action_descriptions = &detail::AgentRegistry::action_descriptions(),
+                             // Parameter hints: the embedded plugin-docs manifest (pre-serialised,
+                             // byte-identical to /api/v1/discover/plugin-docs/{name}).
+                             .manifest_fn =
+                                 [](const std::string& plugin) -> std::optional<std::string> {
+                                     const auto* doc = plugin_docs_manifest(plugin);
+                                     if (!doc)
+                                         return std::nullopt;
+                                     return doc->json;
+                                 },
+                             // Sync-on-demand: system-reserved push, the Guardian-push path
+                             // (build_classified_command(system) + send_system_reserved +
+                             // forward_gateway_pending) — NOT dispatch_confined, which would
+                             // withhold `__sync__` as a plugin no agent advertises (#3511).
+                             .sync_dispatch_fn =
+                                 [this](const std::string& id, const std::string& source)
+                                     -> HardwareRoutes::HwSyncDispatchResult {
+                                     const auto now_s =
+                                         std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                                     const auto command_id =
+                                         "__sync__-now-" + std::to_string(now_s) + "-" +
+                                         auth::AuthManager::bytes_to_hex(
+                                             auth::AuthManager::random_bytes(8));
+                                     auto classified = build_classified_command(
+                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
+                                         "now", command_id, /*parameters=*/{{"source", source}});
+                                     if (!classified)
+                                         return {};
+                                     const bool ok = send_system_reserved(
+                                         id, *classified,
+                                         yuzu::server::SystemReservedPush::inventory_sync_now);
+                                     if (ok)
+                                         forward_gateway_pending(); // gateway agents are only QUEUED
+                                     return {ok, command_id};
+                                 },
+                             .agent_version_fn =
+                                 [this](const std::string& id) -> std::optional<std::string> {
+                                     auto sess = registry_.get_session(id);
+                                     if (!sess)
+                                         return std::nullopt;
+                                     return sess->agent_version;
+                                 },
                          });
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the

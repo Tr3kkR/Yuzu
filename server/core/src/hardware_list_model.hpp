@@ -18,6 +18,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <cstdint>
 #include <expected>
 #include <optional>
@@ -118,9 +119,23 @@ struct HardwareCiDetail {
     std::optional<std::vector<SoftwareEntry>> software; // nullopt = store degraded/unwired
     bool software_truncated{false};                     // capped at kHwSoftwareCap
     std::optional<std::vector<DeviceTag>> tags;          // nullopt = tag store degraded/unwired
+    /// The live session's self-reported agent_version; nullopt = no live session.
+    std::optional<std::string> agent_version;
+    /// `inventory_state.last_seen` (server receipt epoch-secs) for the
+    /// installed_software source; nullopt = store degraded/unwired, 0 = never synced.
+    std::optional<std::int64_t> software_last_seen;
 };
 
 inline constexpr std::size_t kHwSoftwareCap = 2000;
+
+/// Sync-on-demand (`__sync__.now`) shipped in the 0.13.1 dev line; a release
+/// 0.13.0 agent answers the command with "plugin not found". True iff the
+/// `major.minor.patch` prefix of `agent_version` is >= 0.13.1 — the `+build`
+/// suffix (kFullVersionString = "@PROJECT_VERSION@+@YUZU_BUILD_NUMBER@") is
+/// ignored, missing components read as 0, and anything empty / non-numeric /
+/// pre-release-tagged fails CLOSED (false).
+inline constexpr std::array<int, 3> kSyncNowMinAgentVersion{0, 13, 1};
+[[nodiscard]] bool agent_supports_sync_now(std::string_view agent_version) noexcept;
 
 /// `ci_state` in the output is one of "found" | "absent" | "degraded" — never
 /// inferred by the reader from a blank field.

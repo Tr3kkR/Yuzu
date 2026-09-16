@@ -185,6 +185,13 @@ public:
     [[nodiscard]] std::optional<std::vector<SoftwareEntry>>
     get_agent_software(std::string_view agent_id);
 
+    /// `inventory_state.last_seen` for one (agent, source) — the SERVER receipt
+    /// epoch-seconds of the last ACCEPTED report (full or hash-only touch).
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade; `0` = no
+    /// row yet (never synced). Backs the Hardware CI record's "Sync now" poll.
+    [[nodiscard]] std::optional<std::int64_t> source_last_seen(std::string_view agent_id,
+                                                               std::string_view source);
+
     /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
     /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure
     /// (degraded — NEVER a silent empty; ADR-0016 §7). An empty value = no matches.

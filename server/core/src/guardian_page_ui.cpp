@@ -505,6 +505,129 @@ extern const char* const kGuardianDetailPageHtml =
       });
     }
   </script>
+)HTM"
+    // Chunk 4: Hardware CI record helpers (round 2). Own literal for the same
+    // MSVC 16 KiB reason as chunk 3. Prose stays here, not in the literal.
+    //
+    // hwSyncNow(btn, source): POST /api/v1/hardware/{id}/sync, then swap the
+    // lens body for the 2s poll fragment (await_since = the SERVER's requested_at).
+    // hwTagSet / hwTagDelete: JSON to the EXISTING /api/tags/set and
+    // /api/tags/delete, then reload the whole CI record (header chips + lens).
+    // hwFilterResult(el): free-text or regex filter over a result's table rows
+    // / pre lines, with a hit counter; an invalid regex marks the box red and
+    // filters nothing. hwExportCsv(btn): RFC 4180 CSV of the VISIBLE rows
+    // (pre output → one "line" column) via a Blob + temporary <a download>.
+    // hwCopyResult(btn): visible text to the clipboard.
+    R"HTM(
+  <script>
+    function hwReloadCi(agent, lens) {
+      var mount = document.getElementById('guardian-detail'); if (!mount || !window.htmx) return;
+      window.htmx.ajax('GET', '/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens || 'overview'), { target: '#guardian-detail', swap: 'innerHTML' });
+    }
+    function hwSyncNow(btn, source) {
+      var agent = btn.getAttribute('data-agent'), lens = btn.getAttribute('data-lens') || 'overview';
+      btn.disabled = true;
+      fetch('/api/v1/hardware/' + encodeURIComponent(agent) + '/sync', { method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ source: source }) })
+      .then(function (r) { return r.json().then(function (d) { return { status: r.status, data: d }; }); })
+      .then(function (resp) {
+        if (resp.status >= 400) { btn.disabled = false;
+          showToast((resp.data.error && resp.data.error.message) || ('Sync request failed (' + resp.status + ')'), 'error'); return; }
+        var d = resp.data.data; showToast('Sync requested (' + d.source + ')', 'success');
+        var lensDiv = document.getElementById('hw-ci-lens'); if (!lensDiv) return;
+        lensDiv.innerHTML = '<div hx-get="/fragments/hardware/ci?id=' + encodeURIComponent(agent) + '&lens=' + encodeURIComponent(lens) +
+          '&lens_only=1&await_since=' + d.requested_at + '&n=1&command_id=' + encodeURIComponent(d.command_id) +
+          '" hx-trigger="load delay:2s" hx-swap="outerHTML"><span class="gp-mute">Sync requested \u2014 waiting for the device to report\u2026</span></div>';
+        if (window.htmx) window.htmx.process(lensDiv);
+      }).catch(function () { btn.disabled = false; showToast('Sync request failed', 'error'); });
+    }
+    function hwPostJson(url, body, ok) {
+      return fetch(url, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+        .then(function (r) { return r.text().then(function (t) { return { status: r.status, text: t }; }); })
+        .then(function (resp) {
+          if (resp.status >= 400) {
+            var msg = 'Request failed (' + resp.status + ')';
+            try { var j = JSON.parse(resp.text); msg = (j.error && j.error.message) || j.error || msg; } catch (e) { if (resp.text && resp.text.length < 200) msg = resp.text; }
+            showToast(msg, 'error'); return;
+          }
+          ok();
+        }).catch(function () { showToast('Network error', 'error'); });
+    }
+    function hwTagSet(btn) {
+      var form = btn.closest('form'); if (!form) return;
+      var agent = form.getAttribute('data-agent');
+      var key = (form.querySelector('input[name="key"]').value || '').trim();
+      var value = (form.querySelector('input[name="value"]').value || '').trim();
+      if (!key) { showToast('Tag key is required', 'error'); return; }
+      if (!/^[A-Za-z0-9_.:-]{1,64}$/.test(key)) { showToast('Tag key: letters, digits, _ . : - (max 64)', 'error'); return; }
+      btn.disabled = true;
+      hwPostJson('/api/tags/set', { agent_id: agent, key: key, value: value }, function () {
+        showToast('Tag ' + key + ' set', 'success'); hwReloadCi(agent, 'tags');
+      }).then(function () { btn.disabled = false; });
+    }
+    function hwTagDelete(a) {
+      var agent = a.getAttribute('data-agent'), key = a.getAttribute('data-key');
+      if (!window.confirm('Remove tag ' + key + '?')) return;
+      hwPostJson('/api/tags/delete', { agent_id: agent, key: key }, function () {
+        showToast('Tag ' + key + ' removed', 'success'); hwReloadCi(agent, 'tags');
+      });
+    }
+    function hwFilterResult(el) {
+      var tool = el.closest('.hw-rtool'); if (!tool) return;
+      var body = tool.nextElementSibling; if (!body) return;
+      var input = tool.querySelector('input[type="text"]');
+      var useRe = tool.querySelector('input[type="checkbox"]').checked;
+      var q = (input.value || '').trim(), test = null;
+      input.classList.remove('bad');
+      if (q) {
+        if (useRe) { try { var re = new RegExp(q, 'i'); test = function (t) { return re.test(t); }; } catch (e) { input.classList.add('bad'); } }
+        else { var lq = q.toLowerCase(); test = function (t) { return t.toLowerCase().indexOf(lq) !== -1; }; }
+      }
+      var items = body.querySelectorAll('tbody tr, .hw-line'), shown = 0;
+      for (var i = 0; i < items.length; i++) {
+        var hit = !test || test(items[i].textContent || '');
+        items[i].style.display = hit ? '' : 'none';
+        if (items[i].classList.contains('hw-line')) items[i].classList.toggle('hit', !!(test && hit));
+        if (hit) shown++;
+      }
+      var cnt = tool.querySelector('.cnt'); if (cnt) cnt.textContent = shown + ' / ' + items.length + (items[0] && items[0].tagName === 'TR' ? ' rows' : ' lines');
+    }
+    function hwCsvCell(v) { v = String(v == null ? '' : v); return /[",\r\n]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; }
+    function hwExportCsv(btn) {
+      var tool = btn.closest('.hw-rtool'); if (!tool) return;
+      var body = tool.nextElementSibling; if (!body) return;
+      var rows = [], table = body.querySelector('table');
+      if (table) {
+        var ths = table.querySelectorAll('thead th'); var hdr = [];
+        for (var h = 0; h < ths.length; h++) hdr.push(hwCsvCell(ths[h].textContent));
+        rows.push(hdr.join(','));
+        var trs = table.querySelectorAll('tbody tr');
+        for (var i = 0; i < trs.length; i++) { if (trs[i].style.display === 'none') continue;
+          var tds = trs[i].querySelectorAll('td'), cells = [];
+          for (var j = 0; j < tds.length; j++) cells.push(hwCsvCell(tds[j].textContent));
+          rows.push(cells.join(',')); }
+      } else {
+        rows.push('line');
+        var lines = body.querySelectorAll('.hw-line');
+        for (var k = 0; k < lines.length; k++) { if (lines[k].style.display === 'none') continue; rows.push(hwCsvCell(lines[k].textContent)); }
+      }
+      var csv = rows.join('\r\n'), name = (btn.getAttribute('data-name') || 'result') + '.csv';
+      var blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+      var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = name;
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(a.href); }, 2000);
+      showToast('Exported ' + (rows.length - 1) + ' row(s)', 'success');
+    }
+    function hwCopyResult(btn) {
+      var tool = btn.closest('.hw-rtool'); if (!tool) return;
+      var body = tool.nextElementSibling; if (!body) return;
+      var parts = [], items = body.querySelectorAll('tbody tr, .hw-line');
+      for (var i = 0; i < items.length; i++) if (items[i].style.display !== 'none') parts.push(items[i].textContent);
+      var text = parts.length ? parts.join('\n') : (body.textContent || '');
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(function () { showToast('Copied', 'success'); }, function () { showToast('Copy failed', 'error'); });
+      else showToast('Clipboard unavailable', 'error');
+    }
+  </script>
 </body>
 </html>
 )HTM";

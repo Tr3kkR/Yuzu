@@ -562,6 +562,46 @@ InventoryIngestOutcome SoftwareInventoryStore::apply_installed_software(
     return InventoryIngestOutcome::kStored;
 }
 
+std::optional<std::int64_t> SoftwareInventoryStore::source_last_seen(std::string_view agent_id,
+                                                                     std::string_view source) {
+    // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent 0.
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen degraded — store not open "
+                         "(occurrence {})",
+                         d.occurrence);
+        return std::nullopt;
+    }
+    if (agent_id.empty() || source.empty())
+        return 0;
+    auto lease = pool_.try_acquire_for(kQueryAcquireTimeout);
+    if (!lease) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonPoolTimeout, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen degraded — no connection ({}) "
+                         "(occurrence {})",
+                         pool_.last_error(), d.occurrence);
+        return std::nullopt;
+    }
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT last_seen FROM software_inventory_store.inventory_state "
+        "WHERE agent_id = $1 AND source = $2",
+        std::vector<std::string>{std::string(agent_id), std::string(source)});
+    if (!res.ok()) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("SoftwareInventoryStore: source_last_seen degraded — query failed: {} "
+                         "(occurrence {})",
+                         PQresultErrorMessage(res.get()), d.occurrence);
+        return std::nullopt;
+    }
+    if (PQntuples(res.get()) == 0)
+        return 0;
+    return std::strtoll(PQgetvalue(res.get(), 0, 0), nullptr, 10);
+}
+
 std::optional<std::vector<SoftwareEntry>>
 SoftwareInventoryStore::get_agent_software(std::string_view agent_id) {
     // AUTHORITATIVE read (ADR-0016 §7): a degrade returns nullopt, never a silent
