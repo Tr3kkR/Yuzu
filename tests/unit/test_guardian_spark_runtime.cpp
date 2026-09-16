@@ -7916,6 +7916,81 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): re-observation still works when the "
                                    std::chrono::seconds(10)));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Governance UP-1 (this governance run's finding, #4221 rung 9c PR-5c follow-up -
+// NOT the PR's own "up-1/piece-1" Dispatching-window race above, a different
+// finding that happens to share the "UP-1" label): retargeting a rule from a
+// working key onto an already-Wedged key held by a DIFFERENT rule_id must not
+// tear down the calling rule's own live arm before refusing - attach_core()
+// used to call detach_rule_locked(rule_id) UNCONDITIONALLY, before the up-2
+// wedge check even ran, so a retarget onto a wedged key left the calling rule
+// with ZERO live arms and no automatic recovery path (the sticky-Wedged design
+// means a same-rule retry never un-wedges the target key by itself, and a
+// different-claimant refusal never creates a claim of its own).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("governance UP-1 (#4221 rung 9c PR-5c follow-up): retargeting a rule onto an "
+          "already-Wedged key held by a DIFFERENT rule_id is refused WITHOUT tearing "
+          "down the calling rule's own pre-existing live arm on its previous key",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    // (1) R attaches normally on K1 (/a) - a real, committed, working arm. Not
+    // hung: hang_next_arm defaults false, so this arms synchronously.
+    auto gen1 = rt->attach_rule("R", file_spec("/a"), file_exists_rule("R"), true);
+    REQUIRE(gen1.has_value());
+    REQUIRE(rt->rule_count() == 1);
+    REQUIRE(rt->armed_key_count() == 1);
+    REQUIRE(b->disarms.load() == 0);
+
+    // (2) Hang the next arm, then R2 attaches on K2 (/b) - parks Dispatching.
+    b->hang_next_arm.store(true);
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "R2", file_spec("/b"),
+                                file_exists_rule("R2"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res2.has_value());
+    REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+
+    // (3) K2's head goes Wedged - claimed by R2, not R.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // (4) R retargets from K1 onto the now-Wedged K2 (a genuinely different
+    // rule_id's wedge - R2, not R) - must be refused synchronously.
+    auto gen3 = rt->attach_rule("R", file_spec("/b"), file_exists_rule("R"), true);
+    REQUIRE_FALSE(gen3.has_value());
+    CHECK(gen3.error() == "spark key wedged");
+    CHECK(rt->wedged_refusals() == 1);
+    CHECK(rt->wedged_reobservations() == 0);
+
+    // The fix: R's ORIGINAL arm on K1 is still live - rule_count()/
+    // armed_key_count() did not drop, and K1's real subscription was never
+    // handed to a disarm. Pre-fix, detach_rule_locked("R") ran unconditionally
+    // BEFORE the wedge check, synchronously erasing rules_["R"] and keys_[K1]
+    // (and queuing K1's disarm) well before this call ever returned - both
+    // counts would already read 0 here.
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->disarms.load() == 0); // K1's subscription was never torn down
+
+    // R2's own hung, wedged claim still recovers normally once released - its
+    // late arm is self-disarmed (nobody adopted it), and that is the ONLY
+    // disarm this whole scenario ever produces.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 1); // still just R, on K1, throughout
+    CHECK(rt->armed_key_count() == 1);
+}
+
 TEST_CASE("up-4 (#4221): a Queued, withdrawn head with no outcome (a double-fault residue) "
           "is reaped by expire_overdue_claims' new terminal-recovery pass - the CONFIRMED "
           "real defect (Fable review), reached here via genuine allocation-failure seams, "

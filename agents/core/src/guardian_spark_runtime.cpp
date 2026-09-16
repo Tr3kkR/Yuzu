@@ -1751,6 +1751,59 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
                                     .error = "stopping", .claim = nullptr};
 
+        // UP-1 fix (#4221, rung 9c PR-5c follow-up governance - confirmed HIGH,
+        // newly-reachable by this PR's own Reobserved/immediate-refusal design):
+        // if the TARGET key `key`'s FIFO front is a retained wedge belonging to a
+        // genuinely DIFFERENT rule_id, refuse right here - BEFORE
+        // detach_rule_locked(rule_id) below unconditionally tears down whatever
+        // generation `rule_id` itself currently holds (armed, dispatching, or
+        // still queued elsewhere). Without this early check, the unconditional
+        // detach followed by the immediate refusal further down would leave
+        // `rule_id` with ZERO live arms and no automatic recovery path: the
+        // sticky-Wedged design means a same-rule retry never un-wedges `key` by
+        // itself, and a different-claimant refusal never creates a claim of its
+        // own, so nothing is left in `key`'s FIFO to later adopt a late success
+        // either. This is a regression from pre-PR-5c behavior, where a retry
+        // queued behind a busy key at least had a chance of late-success recovery
+        // if the head eventually resolved.
+        //
+        // Safe to evaluate here, before detach_rule_locked runs: nothing between
+        // taking registry_mu_ above and this point mutates claims_, and
+        // detach_rule_locked(rule_id) can only ever touch `key`'s own claims_
+        // entry if `rule_id`'s OWN active generation already lives at `key` - in
+        // which case ITS claim would already be this same FIFO's front with a
+        // MATCHING rule_id, taking the Reobserved branch below instead of this
+        // one (so this branch and detach_rule_locked's effect on `key` are
+        // mutually exclusive by construction). And even when detach_rule_locked
+        // does run (the fall-through case, `rule_id`'s active generation sits on
+        // a DIFFERENT key or not at all), its Case 0 branch only ever withdraws
+        // an entry whose OWN rule_id matches the rule being detached - it can
+        // never touch or reorder a front claim owned by a different rule_id, so
+        // the answer computed here cannot change out from under the later,
+        // unchanged retained_wedge check below.
+        //
+        // Deliberately duplicates part of that later check rather than
+        // restructuring it: this is the ONLY sub-case that must run before the
+        // detach. Leaving the Reobserved (same rule_id, same spec) sub-case at
+        // its ORIGINAL position, completely unchanged, keeps that path's own
+        // proven behavior - including its interaction with detach_rule_locked's
+        // Case 0, which explicitly skips a waiter_abandoned claim - exactly as
+        // it was.
+        if (const auto pre_cit = claims_.find(key);
+            io_class && pre_cit != claims_.end() && !pre_cit->second.fifo.empty()) {
+            const auto& pre_head = pre_cit->second.fifo.front();
+            const bool pre_retained_wedge =
+                pre_head->kind == ClaimKind::Arm &&
+                (pre_head->dispatch == ClaimDispatch::Dispatching ||
+                 pre_head->dispatch == ClaimDispatch::Dispatched) &&
+                pre_head->waiter_abandoned && pre_head->end == ClaimEnd::WaiterTimedOutDispatched;
+            if (pre_retained_wedge && pre_head->rule_id != rule_id) {
+                wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
+                return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
+                                        .error = std::string{kSparkKeyWedged}, .claim = nullptr};
+            }
+        }
+
         // PR #3821 review (fjarvis, cpp-safety re-review): armed BEFORE
         // prior_disarm is even populated below, not after - fn is a std::function
         // ASSIGNMENT (a separate throwing operation from this guard's own
@@ -1872,6 +1925,17 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 // spark_key() canonically encodes the full spec into the key
                 // itself, so two different specs on the same rule_id can never
                 // reach this branch with the SAME key in the first place).
+                //
+                // UP-1 fix (#4221): the hoisted pre-check above already refuses
+                // (and returns) every call that would land here - it runs the
+                // identical condition on the identical FIFO front BEFORE
+                // detach_rule_locked, and detach_rule_locked can never touch a
+                // front owned by a rule_id other than the one it was called
+                // with. This branch is kept, unchanged, as defense-in-depth
+                // rather than removed: it still fires correctly (redundantly)
+                // if it were ever reached, and removing it would make the
+                // Reobserved branch above stand alone in a way that is easy to
+                // accidentally break on a future edit.
                 wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
                 return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
                                         .error = std::string{kSparkKeyWedged}, .claim = nullptr};
