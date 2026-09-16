@@ -768,14 +768,20 @@ SoftwareInventoryStore::software_catalog(const SoftwareCatalogQuery& q) {
                          pool_.last_error(), d.occurrence);
         return std::nullopt;
     }
-    // Cheap read of the rollup. ILIKE '%'||$n||'%' is the optional case-insensitive title
-    // filter; over a small (one-row-per-title) table the scan+sort is trivial.
+    // Cheap read of the rollup. ILIKE '%'||$n||'%' is the optional case-insensitive
+    // filter, matched against EITHER title or publisher (round-3 item 8 — a search
+    // for "adobe" should surface every Adobe title, not just ones with "adobe" in
+    // the name) — ONE bind reused in both arms (Postgres allows repeating a
+    // parameter placeholder), never two separate params for the same input. Over a
+    // small (one-row-per-title) table the scan+sort is trivial either way.
     std::string sql = "SELECT name, publisher, device_count, version_count "
                       "FROM software_inventory_store.catalog_rollup ";
     std::vector<std::string> params;
     int p = 0;
     if (!q.name_filter.empty()) {
-        sql += "WHERE name ILIKE '%' || $" + std::to_string(++p) + " || '%' ";
+        const std::string ph = "$" + std::to_string(++p);
+        sql += "WHERE (name ILIKE '%' || " + ph + " || '%' OR publisher ILIKE '%' || " + ph +
+              " || '%') ";
         params.push_back(q.name_filter);
     }
     sql += "ORDER BY device_count DESC, name LIMIT $" + std::to_string(++p) + "::bigint";

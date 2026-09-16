@@ -10,6 +10,7 @@
 
 #include "web_utils.hpp"
 
+#include <cctype>
 #include <charconv>
 #include <string>
 #include <vector>
@@ -19,6 +20,16 @@ namespace yuzu::server {
 namespace {
 
 std::string esc(const std::string& s) { return html_escape(s); }
+
+// Lowercase, for a data-gpname search key — gpSearch (guardian_page_ui.cpp)
+// lowercases the QUERY but not the stored attribute, so the attribute must
+// already be lowercase for a case-insensitive match (same contract as
+// device_ui.cpp's / inventory_ui.cpp's own lc()).
+std::string lc(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return s;
+}
 
 std::string url_encode(const std::string& s) {
     static const char* kHex = "0123456789ABCDEF";
@@ -719,12 +730,22 @@ std::string render_hardware_software_lens(const std::string& agent_id,
                sync_button(agent_id, "installed_software", "software", sync, "Sync now") +
                "</div></div>";
     }
-    std::string h = "<table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
-                    "<th>Install date</th></tr></thead><tbody>";
-    for (const auto& e : *software)
-        h += "<tr><td class=\"hw-name\">" + esc(e.name) + "</td><td class=\"hw-mono\">" +
-             ci_disp(e.version) + "</td><td class=\"hw-mono\">" + ci_disp(e.publisher) +
-             "</td><td class=\"hw-mono\">" + ci_disp(e.install_date) + "</td></tr>";
+    // Round-3 item 3: a searchable text filter over this device's own installed-
+    // software table (gpSearch, group "hwsw" — self-contained to this lens, no
+    // server round-trip needed since a per-device list is small).
+    std::string h = "<input class=\"hw-search\" style=\"margin-bottom:.5rem\" "
+                    "placeholder=\"Filter installed software…\" oninput=\"gpSearch(this)\" "
+                    "data-gpf=\"hwsw\">";
+    h += "<table class=\"hw-tbl\"><thead><tr><th>Name</th><th>Version</th><th>Publisher</th>"
+         "<th>Install date</th><th>Signature</th><th>Ecosystem</th></tr></thead><tbody>";
+    for (const auto& e : *software) {
+        const std::string searchable = lc(e.name + " " + e.version + " " + e.publisher);
+        h += "<tr data-gpf=\"hwsw\" data-gpname=\"" + esc(searchable) + "\"><td class=\"hw-name\">" +
+             esc(e.name) + "</td><td class=\"hw-mono\">" + ci_disp(e.version) +
+             "</td><td class=\"hw-mono\">" + ci_disp(e.publisher) + "</td><td class=\"hw-mono\">" +
+             ci_disp(e.install_date) + "</td><td class=\"hw-mono\">" + ci_disp(e.signature_status) +
+             "</td><td class=\"hw-mono\">" + ci_disp(e.ecosystem) + "</td></tr>";
+    }
     h += "</tbody></table>";
     if (truncated)
         h += "<div class=\"hw-page\">List truncated &mdash; showing the first " +

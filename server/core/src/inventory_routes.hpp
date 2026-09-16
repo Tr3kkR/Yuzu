@@ -43,6 +43,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace yuzu::server {
@@ -139,10 +140,16 @@ struct InventoryDevicesResult {
 /// `name_filter` is echoed into the search box; `capped` flags the row-cap; `stale_count`
 /// feeds the stale KPI (nullopt → "—"); `now_secs` lets the pure renderer format the
 /// "as of" relative time without calling the clock itself.
+/// `results_only=true` (round-3 item 8, mirrors hardware_ui.cpp's `results_only`
+/// pattern) renders ONLY the `#sw-results` region (search results table + drill
+/// container) — used by the search box's own hx-get so a re-render never destroys
+/// the input mid-keystroke. `false` renders the full page (sub-nav + KPIs + the
+/// same region).
 std::string render_inventory_software_fragment(
     const std::optional<std::vector<SoftwareCatalogRow>>& catalogue,
     const std::optional<CatalogRollupMeta>& meta, const std::string& name_filter,
-    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs);
+    std::optional<std::int64_t> stale_count, bool capped, std::int64_t now_secs,
+    bool results_only = false);
 
 /// SOFTWARE drill: installs-per-version for one title (the catalogue row click target).
 std::string render_inventory_versions_fragment(
@@ -175,6 +182,19 @@ std::string render_inventory_find_fragment(const std::string& initial_name);
 std::string render_inventory_find_results_fragment(
     const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
     std::size_t devices_omitted);
+
+/// SOFTWARE "devices ›" expansion (round-3 item 8): the same "which devices run
+/// this title" data as the (now-unlinked) Find tab, but rendered as an inline
+/// expansion under a catalogue row instead of a standalone page — Signature and
+/// Ecosystem columns (both already on `SoftwareEntry`, previously unrendered
+/// anywhere) plus a client-side `gpSearch` filter box, since a popular title can
+/// have hundreds of installs. `hostnames` resolves `agent_id -> hostname` (best-
+/// effort; a miss renders the bare agent_id, never blocks the row). `nullopt` rows
+/// = store degrade; `devices_omitted` mirrors the Find results' management-group
+/// drop count.
+std::string render_inventory_software_devices_fragment(
+    const std::string& name, const std::optional<std::vector<SoftwareFleetRow>>& rows, bool hit_cap,
+    std::size_t devices_omitted, const std::unordered_map<std::string, std::string>& hostnames);
 
 /// /inventory routes — the page shell + the read-only HTMX fragments. Providers are
 /// injected closures (store-decoupled) so the handlers are unit-testable via
@@ -236,12 +256,20 @@ public:
                                        const std::string& result, const std::string& target_type,
                                        const std::string& target_id, const std::string& detail)>;
 
+    /// Best-effort agent_id -> hostname resolution for the SOFTWARE "devices ›"
+    /// expansion (round-3 item 8) — a hostname is friendlier than a raw agent_id
+    /// in a devices-per-package table. Whole-map read (not per-agent) so a
+    /// hundred-row expansion costs one call, not N; a miss for a given agent_id
+    /// renders the bare id, never blocks the row. Empty closure = no resolution
+    /// (every row shows its agent_id).
+    using HostnamesFn = std::function<std::unordered_map<std::string, std::string>()>;
+
     void register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                          ScopedPermFn scoped_perm_fn, CatalogFn catalog_fn,
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
                          ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
-                         AgentCiFn agent_ci_fn = {});
+                         AgentCiFn agent_ci_fn = {}, HostnamesFn hostnames_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload wraps + delegates.
@@ -250,7 +278,7 @@ public:
                          CatalogMetaFn catalog_meta_fn, VersionsFn versions_fn,
                          FleetSoftwareFn fleet_fn, AgentSoftwareFn agent_sw_fn, DevicesFn devices_fn,
                          ScopeFn scope_fn = {}, StaleFn stale_fn = {}, AuditFn audit_fn = {},
-                         AgentCiFn agent_ci_fn = {});
+                         AgentCiFn agent_ci_fn = {}, HostnamesFn hostnames_fn = {});
 
 private:
     AuthFn auth_fn_;
@@ -266,6 +294,7 @@ private:
     ScopeFn scope_fn_;
     StaleFn stale_fn_;
     AuditFn audit_fn_;
+    HostnamesFn hostnames_fn_;
 };
 
 } // namespace yuzu::server

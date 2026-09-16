@@ -16247,6 +16247,23 @@ private:
                 if (!device_inventory_store_)
                     return std::unexpected(CiReadError::kDegraded);
                 return device_inventory_store_->get_device_ci(id);
+            },
+            // Round-3 item 8: agent_id -> hostname for the Software page's
+            // "devices ›" expansion. One bulk read per render (never per-row) —
+            // endpoint_state's hostname column is written on every heartbeat
+            // regardless of online/offline, so this single 30-day window read
+            // covers both, mirroring hw_identity_fn's offline-store fallback
+            // tier without needing the registry-first tier here (a stale-by-a-
+            // few-seconds hostname on an online device is immaterial for this
+            // display-only lookup).
+            [this]() -> std::unordered_map<std::string, std::string> {
+                std::unordered_map<std::string, std::string> out;
+                if (!offline_endpoint_store_)
+                    return out;
+                for (auto& e : offline_endpoint_store_->query_stale_within(
+                         std::chrono::hours(24 * 30)))
+                    out.emplace(std::move(e.agent_id), std::move(e.hostname));
+                return out;
             });
 
         // HardwareRoutes — /hardware (ServiceNow-style CI list + record), the

@@ -102,8 +102,10 @@ struct SoftwareVersionCount {
 };
 
 /// Fleet catalogue query. `name_filter` (case-insensitive substring) narrows the
-/// titles; empty matches all. `limit` caps the returned rows (ordered by install
-/// count); the store also enforces a hard ceiling independent of `limit`.
+/// rows by matching EITHER the title OR the publisher (round-3 item 8 — "adobe"
+/// surfaces every Adobe title, not only ones with "adobe" in the name itself);
+/// empty matches all. `limit` caps the returned rows (ordered by install count);
+/// the store also enforces a hard ceiling independent of `limit`.
 struct SoftwareCatalogQuery {
     std::string name_filter;
     int limit{200};
