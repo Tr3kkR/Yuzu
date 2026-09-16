@@ -381,6 +381,21 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
+        // Audit BEFORE dispatch and fail closed on a persist failure — a sync
+        // request has a real side effect on the agent, so it follows the same
+        // audit-then-act, 503-on-degrade contract as every other behavioural-data
+        // route in this file (see GET /api/v1/hardware above), not the "dispatch
+        // first" ordering this route used to have (governance Gate 2, HIGH).
+        const bool persisted = detail::emit_behavioral_audit(deps_.audit_fn, req, res,
+                                                              "inventory.sync.request", "requested",
+                                                              "Agent", id, "source=" + source);
+        if (!persisted) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
         const auto r = deps_.sync_dispatch_fn(id, source);
         if (!r.sent) {
             (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.sync.request", "no_agents",
@@ -391,9 +406,6 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
-        (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.sync.request",
-                                            "dispatched", "Agent", id,
-                                            "source=" + source + " command_id=" + r.command_id);
         nlohmann::json out = {
             {"data", {{"command_id", r.command_id},
                       {"source", source},

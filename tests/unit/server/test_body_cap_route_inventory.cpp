@@ -508,7 +508,6 @@ constexpr DefaultAllow kDefaultIsCorrectFor[] = {
     {"POST", R"body_cap_path(/api/tags/delete)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single agent_id/key tag operation -- small JSON body."},
     {"POST", R"body_cap_path(/api/tags/query)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single key/value tag lookup -- small JSON body."},
     {"POST", R"body_cap_path(/api/tags/set)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: single agent_id/key/value tag operation -- small JSON body."},
-    {"POST", R"body_cap_path(/api/v1/hardware/([^/]+)/sync)body_cap_path", "Round-3 hardware-ci-view sync-on-demand (hardware_routes.cpp): device id from the URL, body is a single optional 'source' enum string ('all'/'installed_software'/etc) -- same small-JSON-single-field shape as the /api/tags/* entries above."},
     {"POST", R"body_cap_path(/fragments/result-sets/(rs_[0-9a-f]+)/delete)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: result-set id from the URL only -- handler never reads req.body."},
     {"POST", R"body_cap_path(/fragments/result-sets/(rs_[0-9a-f]+)/pin)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: result-set id from the URL only -- handler never reads req.body."},
     {"POST", R"body_cap_path(/fragments/result-sets/(rs_[0-9a-f]+)/unpin)body_cap_path", "Newly visible after the F1-F3 scan-coverage fix: result-set id from the URL only -- handler never reads req.body."},

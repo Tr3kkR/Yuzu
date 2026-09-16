@@ -73,6 +73,8 @@ struct HwHarness {
     bool unwire_sync_dispatch = false;
     std::optional<std::string> agent_version{std::string("0.13.1")}; // nullopt = no live session
     bool unwire_agent_version_fn = false;
+    bool audit_should_fail = false; // simulates an audit-store degrade (AuditFn returns false)
+    int sync_dispatch_calls = 0;
 
     std::vector<std::string> audits;        // "action|result"
     std::vector<std::string> audit_full;    // "action|result|target_type|target_id"
@@ -133,7 +135,7 @@ struct HwHarness {
             audits.push_back(a + "|" + r);
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             audit_details.push_back(detail);
-            return true;
+            return !audit_should_fail;
         };
         HardwareRoutes::DexScoreFn dex_fn = [this](const std::string& id) {
             ++dex_calls;
@@ -142,6 +144,7 @@ struct HwHarness {
             return it != dex_score_by_id.end() ? it->second : 42;
         };
         HardwareRoutes::SyncDispatchFn sync_fn = [this](const std::string&, const std::string&) {
+            ++sync_dispatch_calls;
             return sync_result;
         };
         HardwareRoutes::AgentVersionFn version_fn = [this](const std::string&) { return agent_version; };
@@ -473,7 +476,7 @@ TEST_CASE("route: POST .../sync — offline/unwired agent is a 503, audited no_a
 }
 
 TEST_CASE("route: POST .../sync — successful dispatch is 202 with the documented shape, "
-          "audited \"dispatched\"",
+          "audited \"requested\" before dispatch",
           "[hardware][route][rest]") {
     HwHarness h;
     h.sync_result = HardwareRoutes::HwSyncDispatchResult{true, "__sync__-abc123"};
@@ -486,13 +489,27 @@ TEST_CASE("route: POST .../sync — successful dispatch is 202 with the document
     REQUIRE(body["data"]["source"].get<std::string>() == "app_perf");
     REQUIRE(body["data"]["agents_reached"].get<int>() == 1);
     REQUIRE(body["data"].contains("requested_at"));
-    // The audit RESULT string on a successful dispatch is "dispatched", not
-    // "success" — verified against the actual code (a divergence from a literal
-    // reading of "success/denied/failure/no_agents" as an exhaustive enum; see
-    // this file's final summary).
-    bool dispatched = false;
+    // The audit RESULT string is "requested", persisted BEFORE dispatch (governance
+    // Gate 2 fix: the route used to audit "dispatched" AFTER the side effect and
+    // discard the persist result — fail-open on an audit-store degrade). There is
+    // no separate post-dispatch audit row; the command_id is returned to the caller
+    // in the response body only.
+    bool requested = false;
     for (const auto& a : h.audits)
-        if (a == "inventory.sync.request|dispatched")
-            dispatched = true;
-    REQUIRE(dispatched);
+        if (a == "inventory.sync.request|requested")
+            requested = true;
+    REQUIRE(requested);
+}
+
+TEST_CASE("route: POST .../sync — audit-store degrade fails CLOSED, no dispatch (governance Gate 2)",
+          "[hardware][route][rest][security]") {
+    HwHarness h;
+    h.audit_should_fail = true;
+    auto res = h.sink.Post("/api/v1/hardware/agent-1/sync", R"({"source":"app_perf"})");
+    REQUIRE(res);
+    REQUIRE(res->status == 503);
+    REQUIRE(res->get_header_value("Sec-Audit-Failed") == "true");
+    // The whole point of auditing BEFORE dispatch: a degraded audit store must
+    // never let the side effect through.
+    REQUIRE(h.sync_dispatch_calls == 0);
 }
