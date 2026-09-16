@@ -996,7 +996,7 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
         // Merge {"failure": reason} into the payload in C++ rather than relying on
         // a Postgres JSON-validity cast (source_payload is a plain TEXT column,
         // not jsonb, and an operator-supplied string is not guaranteed valid
-        // JSON) — replicates the SQLite json1 `json_set(... CASE WHEN
+        // JSON): replicates the SQLite json1 `json_set(... CASE WHEN
         // json_valid ...)` fallback-to-'{}' behavior.
         try {
             payload = nlohmann::json::parse(raw_payload);

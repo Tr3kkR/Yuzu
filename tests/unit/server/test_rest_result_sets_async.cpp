@@ -1215,7 +1215,7 @@ TEST_CASE("from-instruction-result: a params value nested past the depth limit i
 TEST_CASE("from-inventory-query: a body nested past the depth limit is rejected before "
           "any dependency or validation check reads it",
           "[pg][result_set][async][security][depth]") {
-    // #4373-class gap found while implementing the three named routes: this
+    // #2437-class gap found while implementing the three named routes: this
     // handler also does cr.source_payload = body.dump() a few lines below.
     // No InventoryStore is wired here on purpose - proves the depth check
     // runs ahead of the "inventory store not available" 503, not merely
