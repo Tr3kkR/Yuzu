@@ -152,9 +152,11 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                                       const std::vector<AppPerfVersionSummary>& versions,
                                       const std::string& scope_group_id,
                                       const std::vector<DexGroupOption>& groups,
-                                      std::int64_t group_floor, int window_days) {
+                                      std::int64_t group_floor, int window_days,
+                                      const std::string& active_version) {
     const std::string w = dex_window_token(window_days);
     const bool is_group = !scope_group_id.empty();
+    const bool is_filtered = !active_version.empty();
     std::string h;
     h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/perf/apps?window=" + w +
          "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
@@ -177,11 +179,35 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
          scope_name + "</b>. Each row's trend is the daily mean over the retained history; the "
          "headline is the most recent day.</div></div></div>";
 
+    // Version filter — click-through, not a dropdown: the only valid values are
+    // the versions already on screen, so a filtered version's own row links back
+    // to "All versions" and (below) each unfiltered row links to itself. Narrows
+    // server-side via the SAME `version` param the REST twin (`GET
+    // /dex/perf/app?version=`) accepts, an exact/canonicalized match — never a
+    // client-side slice of a wider fetch.
+    if (is_filtered) {
+        const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
+                                   (is_group ? "&amp;group=" + url_encode(scope_group_id) : "");
+        h += "<div class=\"gp-note\">Filtered to version <span style=\"font-family:var(--mono)\">" +
+             esc(active_version) + "</span> &mdash; " +
+             drill("/fragments/dex/perf/app?" + all_qs, "all versions &rarr;") + "</div>";
+    }
+
+    // Reverse cross-link to the crash/hang blast radius — same process-image key
+    // (app_name), exact match, no normalization (symmetric twin of the forward
+    // link on the Apps-tab detail page).
+    h += "<div class=\"gp-note\">" +
+         drill("/fragments/dex/app?name=" + url_encode(app_name) + "&amp;window=" + w,
+               "Crashes &amp; hangs for this application &rarr;") +
+         "</div>";
+
     // -- Scope selector (CSP-safe: htmx hx-get on change sends the select's
     // name=value, appended to the URL query — the proven cohort-picker idiom).
     if (!groups.empty()) {
-        const std::string base = "/fragments/dex/perf/app?app=" + url_encode(app_name) +
-                                 "&amp;window=" + w;
+        std::string base = "/fragments/dex/perf/app?app=" + url_encode(app_name) +
+                           "&amp;window=" + w;
+        if (is_filtered)
+            base += "&amp;version=" + url_encode(active_version); // preserve the version filter
         h += "<div class=\"gp-note\">Scope: <select name=\"group\" hx-get=\"" + base +
              "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" hx-trigger=\"change\" "
              "style=\"background:var(--surface);color:var(--fg);border:1px solid var(--border);"
@@ -196,12 +222,21 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
         h += "</select></div>";
     }
 
-    if (versions.empty())
-        return h + placeholder("No performance history for this application",
-                               is_group ? "No member of this group reported retained performance "
-                                          "for this application in the window."
-                                        : "No device reported retained performance for this "
-                                          "application in the window.");
+    if (versions.empty()) {
+        std::string empty_sub =
+            is_group ? "No member of this group reported retained performance for this "
+                       "application in the window."
+                     : "No device reported retained performance for this application in the "
+                       "window.";
+        if (is_filtered) {
+            const std::string all_qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
+                                       (is_group ? "&amp;group=" + url_encode(scope_group_id)
+                                                 : "");
+            h += "<div class=\"gp-note\">" +
+                 drill("/fragments/dex/perf/app?" + all_qs, "&larr; all versions") + "</div>";
+        }
+        return h + placeholder("No performance history for this application", empty_sub);
+    }
 
     // The version with the most recent day is tagged "latest" (a factual cue, not
     // a verdict) — compute the max latest_day once.
@@ -217,9 +252,21 @@ std::string render_dex_app_perf_trend(const std::string& app_name,
                 ? " <span style=\"font-size:.62rem;color:#062534;background:var(--accent);"
                   "border-radius:.3rem;padding:.03rem .35rem;font-weight:700\">latest</span>"
                 : "";
-        const std::string ver = v.version.empty() ? "<span class=\"gp-mute\">(no version)</span>"
-                                                  : "<span style=\"font-family:var(--mono)\">" +
-                                                        esc(v.version) + "</span>";
+        // Narrow-to-this-version link — skipped when already filtered (only one
+        // row anyway) or for the "(no version)" bucket, whose empty string can't
+        // be expressed as `?version=` without colliding with "unfiltered".
+        std::string ver;
+        if (v.version.empty()) {
+            ver = "<span class=\"gp-mute\">(no version)</span>";
+        } else if (is_filtered) {
+            ver = "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>";
+        } else {
+            std::string qs = "app=" + url_encode(app_name) + "&amp;window=" + w +
+                             "&amp;version=" + url_encode(v.version) +
+                             (is_group ? "&amp;group=" + url_encode(scope_group_id) : "");
+            ver = drill("/fragments/dex/perf/app?" + qs,
+                        "<span style=\"font-family:var(--mono)\">" + esc(v.version) + "</span>");
+        }
         if (v.suppressed) {
             // Sub-floor named-group slice → count only (works-council floor).
             h += "<tr><td>" + ver + tag +
