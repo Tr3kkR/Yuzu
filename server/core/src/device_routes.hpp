@@ -232,6 +232,17 @@ std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows);
 std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows);
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows);
 
+/// PURE: generic pipe-row renderer (round-3 item 11 -- physical-kit panels) for the ten
+/// hardware-detail live kinds (disks/memory/processors/drivers/battery/thermal/smart/
+/// volumes/adapters/wifi) whose wire format is a flat `<row_prefix>|field1|field2|...`
+/// table with no bespoke typed-row struct. `columns` is the ordered raw column-name
+/// list from live_kinds.hpp's LiveKind::columns (drives both the table header labels
+/// and each row's expected width); `rows` are the already-split, already-padded field
+/// vectors (device_routes.cpp render_live_result, one per matched line, prefix token
+/// dropped). Defined in device_ui.cpp.
+std::string render_device_live_generic(const std::vector<std::string>& columns,
+                                       const std::vector<std::vector<std::string>>& rows);
+
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);
 

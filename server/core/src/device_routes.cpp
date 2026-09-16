@@ -76,6 +76,51 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
         return LiveKind{"tar", "status", "Capture sources", "device.live.capture_sources"};
     if (kind == "disk")
         return LiveKind{"disk_space", "free", "Disk space", "device.live.disk"};
+
+    // round-3 item 11 -- physical-kit panels. Ten NEW cards surfacing physical-hardware
+    // detail, reusing plugin actions that already exist on the agent. Each emits flat
+    // `<row_prefix>|field1|field2|...` lines (see the per-kind plugin doc); the generic
+    // pipe-row renderer (render_device_live_generic, device_ui.cpp) drives all ten off
+    // the `columns` list below rather than a bespoke render_device_live_KIND function.
+    // plugin2/action2 are left empty -- these kinds have no secondary joined dispatch.
+    if (kind == "hw_disks")
+        return LiveKind{"hardware", "disks", "Disks", "device.live.hw_disks",
+                        "", "", "disk", {"index", "model", "size_gb", "media_type", "interface"}};
+    if (kind == "hw_memory")
+        return LiveKind{"hardware", "memory", "Memory", "device.live.hw_memory",
+                        "", "", "dimm", {"slot", "size_mb", "type", "speed_mhz"}};
+    if (kind == "hw_processors")
+        return LiveKind{"hardware", "processors", "Processors", "device.live.hw_processors",
+                        "", "", "cpu", {"index", "model", "cores", "threads", "clock_mhz"}};
+    if (kind == "hw_drivers")
+        return LiveKind{"hardware", "drivers", "Drivers", "device.live.hw_drivers",
+                        "", "", "driver",
+                        {"index", "name", "version", "date", "provider", "device_class"}};
+    if (kind == "battery")
+        return LiveKind{"power_health", "battery", "Battery", "device.live.battery",
+                        "", "", "battery",
+                        {"present", "state", "percent", "time_to_empty_min", "cycle_count",
+                         "health_percent"}};
+    if (kind == "thermal")
+        return LiveKind{"power_health", "thermal", "Thermal", "device.live.thermal",
+                        "", "", "thermal", {"status", "zone_or_detail", "celsius"}};
+    if (kind == "smart")
+        return LiveKind{"disk_actions", "smart", "Disk health (SMART)", "device.live.smart",
+                        "", "", "smart",
+                        {"device", "model", "bus", "media", "health", "pct_used", "spare_pct",
+                         "detail"}};
+    if (kind == "volumes")
+        return LiveKind{"disk_actions", "volumes", "Volumes", "device.live.volumes",
+                        "", "", "volume",
+                        {"volume", "mount_points", "device", "fstype", "total_bytes", "detail"}};
+    if (kind == "adapters")
+        return LiveKind{"network_config", "adapters", "Network adapters", "device.live.adapters",
+                        "", "", "adapter", {"name", "mac", "speed_mbps", "status"}};
+    if (kind == "wifi")
+        return LiveKind{"wifi", "connected", "Wi-Fi", "device.live.wifi",
+                        "", "", "connected",
+                        {"ssid", "signal", "security", "bssid", "interface_or_channel"}};
+
     return std::nullopt;
 }
 
@@ -107,7 +152,7 @@ constexpr std::size_t kMaxLiveRows = 20000;
 // dataset (process_tree's connections). uptime/processes use the shared live_kinds.hpp
 // parsers (REST parity); the rest parse the dashboard-only wire shapes inline. All
 // agent fields are HTML-escaped at render.
-std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
+std::string render_live_result(const std::string& kind, const LiveKind& lk,
                                const std::string& output, const std::string& output2,
                                const std::string& agent_os = "") {
     const auto lines = yuzu::server::live::split_lines(output);
@@ -404,6 +449,28 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
         body += oob("ls-cnt-disk", "ls-cnt", std::to_string(rows.size()));
         body += oob("ls-kpi-disk", "n",
                     worst_used < 0 ? "&mdash;" : std::to_string(100 - worst_used) + "%");
+        return body;
+    }
+
+    // round-3 item 11 -- physical-kit panels. One generic branch handles all 10 new
+    // kinds at once: each is a flat `<row_prefix>|field1|field2|...` table with no
+    // bespoke parsing, so lk.columns (populated only for these kinds, see
+    // resolve_live_kind above) drives a single shared renderer instead of one
+    // render_device_live_KIND function per kind.
+    if (!lk.columns.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        const std::string prefix = lk.row_prefix + "|";
+        for (const auto& l : lines) {
+            if (!l.starts_with(prefix)) continue;
+            auto f = pipe_fields(l);
+            if (f.empty()) continue;
+            f.erase(f.begin()); // drop the prefix token itself
+            f.resize(lk.columns.size()); // pad short / trim long rows to the declared width
+            rows.push_back(std::move(f));
+            if (rows.size() >= kMaxLiveRows) break;
+        }
+        std::string body = render_device_live_generic(lk.columns, rows);
+        body += oob("ls-cnt-" + kind, "ls-cnt", std::to_string(rows.size()));
         return body;
     }
 

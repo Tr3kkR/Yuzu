@@ -401,6 +401,21 @@ TEST_CASE("device live run: expanded kinds map to the right plugin/action + audi
         {"connections", "network_diag", "connections", "device.live.connections"},
         {"capture_sources", "tar", "status", "device.live.capture_sources"},
         {"disk", "disk_space", "free", "device.live.disk"},
+        // Round-3 item 11: ten physical-hardware "generic pipe-row" kinds
+        // (live_kinds.hpp LiveKind::columns/.row_prefix + device_ui.cpp
+        // render_device_live_generic). Same plugin/action/verb mapping as the
+        // canonical kind table — see test_device_live_generic_kinds below for
+        // render-path coverage of hw_disks + thermal.
+        {"hw_disks", "hardware", "disks", "device.live.hw_disks"},
+        {"hw_memory", "hardware", "memory", "device.live.hw_memory"},
+        {"hw_processors", "hardware", "processors", "device.live.hw_processors"},
+        {"hw_drivers", "hardware", "drivers", "device.live.hw_drivers"},
+        {"battery", "power_health", "battery", "device.live.battery"},
+        {"thermal", "power_health", "thermal", "device.live.thermal"},
+        {"smart", "disk_actions", "smart", "device.live.smart"},
+        {"volumes", "disk_actions", "volumes", "device.live.volumes"},
+        {"adapters", "network_config", "adapters", "device.live.adapters"},
+        {"wifi", "wifi", "connected", "device.live.wifi"},
     };
     for (const auto& c : cases) {
         LiveHarness h;
@@ -612,6 +627,95 @@ TEST_CASE("device live capture_sources: tar status -> read-only source table", "
     CHECK(r->body.find("1234") != std::string::npos);                  // live-row count
     CHECK(r->body.find("id=\"ls-cnt-capture_sources\"") != std::string::npos); // OOB "X of N on"
     CHECK(r->body.find("/tar") != std::string::npos);                  // configure-on-TAR link
+}
+
+// Round-3 item 11: the ten new physical-hardware live kinds share ONE generic
+// pipe-row path (live_kinds.hpp LiveKind::columns/.row_prefix -> device_routes.cpp
+// render_live_result's `!lk.columns.empty()` branch -> device_ui.cpp
+// render_device_live_generic) instead of a bespoke render_device_live_KIND
+// function each. hw_disks gets the straightforward well-formed-row case;
+// thermal is the one kind whose row width VARIES (the "no zones" shape omits
+// celsius), so it gets both shapes exercised explicitly, matching the shared
+// renderer's pad-short-rows contract (device_routes.cpp: `f.resize(lk.columns.size())`).
+TEST_CASE("device live: physical-hardware generic-table kinds dispatch + render",
+          "[device][routes]") {
+    SECTION("hw_disks dispatches hardware/disks, audited, polls hardware-<id>") {
+        LiveHarness h;
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=hw_disks");
+        REQUIRE(r);
+        CHECK(h.dispatched == 1);
+        CHECK(h.seen_plugin == "hardware");
+        CHECK(h.seen_action == "disks");
+        CHECK(h.audited == "device.live.hw_disks|dispatched|a-1");
+        CHECK(r->body.find("/fragments/device/live/result?command_id=hardware-test") !=
+              std::string::npos);
+        CHECK(r->body.find("kind=hw_disks") != std::string::npos);
+    }
+    SECTION("hw_disks result: disk|... row renders index/model/size/media/interface") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "disk|0|Samsung 970 EVO|931|SSD|NVMe", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_disks&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<th>Model</th>") != std::string::npos);
+        CHECK(r->body.find("<th>Size (GB)</th>") != std::string::npos);
+        CHECK(r->body.find("<th>Media</th>") != std::string::npos);
+        CHECK(r->body.find("<th>Interface</th>") != std::string::npos);
+        // Full row rendered in column order, no padding/truncation (5 fields in,
+        // 5 declared columns).
+        CHECK(r->body.find("<td>0</td><td>Samsung 970 EVO</td><td>931</td><td>SSD</td>"
+                            "<td>NVMe</td>") != std::string::npos);
+        CHECK(h.audited == "device.live.hw_disks|rendered|a-1"); // #1703 result-poll audit
+    }
+    SECTION("hw_disks: a wrong-prefix row is silently dropped, not rendered as data") {
+        LiveHarness h;
+        // hw_disks' row_prefix is "disk"; a row under any other prefix must never
+        // surface, matching every other kind's `if (!l.starts_with(prefix)) continue;`.
+        h.fake_rows = {{"a-1", 1, "wrongprefix|1|2|3", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_disks&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("wrongprefix") == std::string::npos);
+        CHECK(r->body.find("<table") == std::string::npos); // no data table at all
+        CHECK(r->body.find("table is empty") != std::string::npos); // honest empty note
+    }
+    SECTION("thermal dispatches power_health/thermal, audited, polls power_health-<id>") {
+        LiveHarness h;
+        auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=thermal");
+        REQUIRE(r);
+        CHECK(h.seen_plugin == "power_health");
+        CHECK(h.seen_action == "thermal");
+        CHECK(h.audited == "device.live.thermal|dispatched|a-1");
+        CHECK(r->body.find("/fragments/device/live/result?command_id=power_health-test") !=
+              std::string::npos);
+        CHECK(r->body.find("kind=thermal") != std::string::npos);
+    }
+    SECTION("thermal full 3-field shape (status|zone|celsius) renders every column") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "thermal|ok|CPU|45.2", ""}};
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/device/live/result?command_id=power_health-test"
+                                     "&agent_id=a-1&kind=thermal&n=1"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->body.find("<td>ok</td><td>CPU</td><td>45.2</td>") != std::string::npos);
+        CHECK(r->body.find("gp-mute") == std::string::npos); // every column populated, no dash
+    }
+    SECTION("thermal short 2-field shape (no zones) pads celsius as a blank cell, "
+            "not a truncated row or an exception") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "thermal|unavailable|pdh_query_failed", ""}};
+        std::unique_ptr<httplib::Response> r;
+        CHECK_NOTHROW(r = h.sink.Get("/fragments/device/live/result?command_id=power_health-test"
+                                     "&agent_id=a-1&kind=thermal&n=1"));
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        // Still a full 3-cell row -- the missing celsius field is a blank/em-dash
+        // cell, never a 2-cell truncated row.
+        CHECK(r->body.find("<td>unavailable</td><td>pdh_query_failed</td>"
+                            "<td><span class=\"gp-mute\">&mdash;</span></td>") !=
+              std::string::npos);
+    }
 }
 
 // The DEX/Guardian device lenses render per-device behavioral/compliance PII, so
