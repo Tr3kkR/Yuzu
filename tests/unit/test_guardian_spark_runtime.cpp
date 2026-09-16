@@ -7291,6 +7291,11 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     std::promise<void> release_hook;
     bool released_by_test = false;
     auto entered_fut = entered.get_future();
+    std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
+        // worker thread, not this one) - atomic per this file's own established
+        // pattern for exactly this hook-thread-to-main-thread signal (see
+        // r2_queue_wait_ok a few tests up); see the hook's own comment for why this
+        // can't be a REQUIRE() there directly
     rt->set_drain_gap_hook_for_test([&] {
         rt->set_dispatch_entry_hook_for_test([&] {
             entered.set_value();
@@ -7300,8 +7305,20 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
             res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
                                    file_exists_rule("r2"), true);
         }};
-        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
-                                       std::chrono::seconds(10)));
+        // CI finding (macOS crash, 2026-09-16): Catch2's assertion machinery is NOT
+        // thread-safe from any thread but the one running the test case - this hook
+        // runs on a detached io_executor_ worker (fired from inside
+        // on_arm_complete()'s own drain), not the main test thread. A REQUIRE here
+        // raced Catch2's internal OutputRedirect state under TSan (confirmed) and,
+        // on a genuine failure, throws Catch::TestFailureException with no handler
+        // on this thread - std::terminate (reproduced identically under artificial
+        // CPU contention on Linux: "terminate called after throwing an instance of
+        // 'Catch::TestFailureException'" at this exact line). Capture the result
+        // instead; the real REQUIRE runs after entered_fut proves this hook has
+        // already returned - see below.
+        r2_queued_before_dispatch.store(
+            yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                   std::chrono::seconds(10)));
     });
     struct Cleanup {
         std::promise<void>* release_hook;
@@ -7317,6 +7334,10 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
 
     b->release_hang(); // r1's late arm lands: drain -> gap hook (queues r2) -> compensation
     REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    // Safe here (main thread): entered_fut succeeding proves the drain-gap hook
+    // above has already returned on its own worker thread, so this reads a value
+    // that thread is done writing - not a race, just a same-thread-as-Catch2 rule.
+    REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
     REQUIRE(res2.has_value());
@@ -7379,6 +7400,11 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
     std::promise<void> release_hook;
     bool released_by_test = false;
     auto entered_fut = entered.get_future();
+    std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
+        // worker thread, not this one) - atomic per this file's own established
+        // pattern for exactly this hook-thread-to-main-thread signal (see
+        // r2_queue_wait_ok a few tests up); see the hook's own comment for why this
+        // can't be a REQUIRE() there directly
     rt->set_drain_gap_hook_for_test([&] {
         rt->set_dispatch_entry_hook_for_test([&] {
             entered.set_value();
@@ -7388,8 +7414,20 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
             res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
                                    file_exists_rule("r2"), true);
         }};
-        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
-                                       std::chrono::seconds(10)));
+        // CI finding (macOS crash, 2026-09-16): Catch2's assertion machinery is NOT
+        // thread-safe from any thread but the one running the test case - this hook
+        // runs on a detached io_executor_ worker (fired from inside
+        // on_arm_complete()'s own drain), not the main test thread. A REQUIRE here
+        // raced Catch2's internal OutputRedirect state under TSan (confirmed) and,
+        // on a genuine failure, throws Catch::TestFailureException with no handler
+        // on this thread - std::terminate (reproduced identically under artificial
+        // CPU contention on Linux: "terminate called after throwing an instance of
+        // 'Catch::TestFailureException'" at this exact line). Capture the result
+        // instead; the real REQUIRE runs after entered_fut proves this hook has
+        // already returned - see below.
+        r2_queued_before_dispatch.store(
+            yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                   std::chrono::seconds(10)));
     });
     struct Cleanup {
         std::promise<void>* release_hook;
@@ -7405,6 +7443,10 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race, Stopped variant -
 
     b->release_hang();
     REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    // Safe here (main thread): entered_fut succeeding proves the drain-gap hook
+    // above has already returned on its own worker thread, so this reads a value
+    // that thread is done writing - not a race, just a same-thread-as-Catch2 rule.
+    REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
     REQUIRE(res2.has_value());
@@ -7459,6 +7501,11 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     std::promise<void> release_hook;
     bool released_by_test = false;
     auto entered_fut = entered.get_future();
+    std::atomic<bool> r2_queued_before_dispatch{false}; // set from the hook below (a
+        // worker thread, not this one) - atomic per this file's own established
+        // pattern for exactly this hook-thread-to-main-thread signal (see
+        // r2_queue_wait_ok a few tests up); see the hook's own comment for why this
+        // can't be a REQUIRE() there directly
     rt->set_drain_gap_hook_for_test([&] {
         rt->set_dispatch_entry_hook_for_test([&] {
             entered.set_value();
@@ -7468,8 +7515,20 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
             res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r2", file_spec("/a"),
                                    file_exists_rule("r2"), true);
         }};
-        REQUIRE(yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
-                                       std::chrono::seconds(10)));
+        // CI finding (macOS crash, 2026-09-16): Catch2's assertion machinery is NOT
+        // thread-safe from any thread but the one running the test case - this hook
+        // runs on a detached io_executor_ worker (fired from inside
+        // on_arm_complete()'s own drain), not the main test thread. A REQUIRE here
+        // raced Catch2's internal OutputRedirect state under TSan (confirmed) and,
+        // on a genuine failure, throws Catch::TestFailureException with no handler
+        // on this thread - std::terminate (reproduced identically under artificial
+        // CPU contention on Linux: "terminate called after throwing an instance of
+        // 'Catch::TestFailureException'" at this exact line). Capture the result
+        // instead; the real REQUIRE runs after entered_fut proves this hook has
+        // already returned - see below.
+        r2_queued_before_dispatch.store(
+            yuzu::test::spin_until([&] { return rt->backend_op_queued() == 1; },
+                                   std::chrono::seconds(10)));
     });
     struct Cleanup {
         std::promise<void>* release_hook;
@@ -7488,6 +7547,10 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
                        // refilled -> parked in our hook, before its own reservation
                        // attempt.
     REQUIRE(entered_fut.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    // Safe here (main thread): entered_fut succeeding proves the drain-gap hook
+    // above has already returned on its own worker thread, so this reads a value
+    // that thread is done writing - not a race, just a same-thread-as-Catch2 rule.
+    REQUIRE(r2_queued_before_dispatch.load());
     r2_thread.join();
     rt->set_drain_gap_hook_for_test({});
     REQUIRE(res2.has_value());
@@ -7526,8 +7589,18 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race on a REFILLED clai
     REQUIRE(yuzu::test::spin_until(
         [&] { return b->arm_entries.load() == base_entries + kFillerCount; },
         std::chrono::seconds(10)));
-    b->arm_park.park_every = 0; // stop parking future arrivals - r2 must reach the
-                               // reservation check itself, not get parked in arm()
+    // TSan finding (2026-09-16): arm_entries is bumped at arm() ENTRY, before
+    // maybe_park() takes arm_park.mu (see arm()/maybe_park() above), so a filler
+    // thread can still be racing toward that lock the instant spin_until above
+    // is satisfied. An unguarded write here can interleave with maybe_park()'s
+    // guarded read of park_every. Take the same lock to make this write visible
+    // under the same mutex maybe_park() reads it under.
+    {
+        std::lock_guard<std::mutex> lk(b->arm_park.mu);
+        b->arm_park.park_every = 0; // stop parking future arrivals - r2 must reach
+                                   // the reservation check itself, not get parked
+                                   // in arm()
+    }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(rt->expire_overdue_claims() == 1);
