@@ -490,11 +490,15 @@ constexpr size_t kFileInfoVolumesInfoOffsetField = 0x6C;
 
 // Volume-entry sub-fields, relative to that volume's own entry start (the
 // entry at `volumes_info_offset`) — per libscca's documented Volume
-// Information structure, verified against DOSKEY's real volume-0 entry:
-// offset 0x14 there (absolute 0x15B4) holds 0xA8, and the DWORD at
-// (entry_start + 0xA8) = absolute 0x1648 reads 3 there — matching the 3
-// distinct 8-byte NTFS file references that follow it (absolute
-// 0x1650..0x1667).
+// Information structure, verified against all three of A1's real captures'
+// volume-0 entries: DOSKEY (entry_start 0x15A0) has offset 0x14 (absolute
+// 0x15B4) holding 0xA8, and the DWORD at (entry_start + 0xA8) = absolute
+// 0x1648 reads 3 -- matching the 3 distinct 8-byte NTFS file references
+// that follow it (absolute 0x1650..0x1667). OUTPUT (entry_start 0x1EE8) and
+// REG.EXE (entry_start 0x2318) both hold 0x108 at the same relative 0x14,
+// and both also read 3 at (entry_start + 0x108) -- absolute 0x1FF0 and
+// 0x2420 respectively -- so all three real fixtures independently confirm
+// this same offset field and pin file_ref_count at exactly 3.
 constexpr size_t kVolumeEntryFileRefsOffsetField = 0x14;
 
 inline bool is_supported_prefetch_version(uint32_t v) {

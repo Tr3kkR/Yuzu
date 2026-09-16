@@ -83,7 +83,7 @@
 #endif
 #include <windows.h>
 #include <winternl.h> // NTSTATUS (confined_fs_win.cpp precedent)
-#include <aclapi.h>   // GetNamedSecurityInfoW/GetAclInformation/GetAce (amcache_dest_dir_is_safe)
+#include <aclapi.h>   // GetSecurityInfo/GetAclInformation/GetAce (amcache_dest_dir_is_safe)
 #include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW (amcache_dest_dir DACL)
 
 #include <win_profiles.hpp> // RegKey, PrivilegeScope, offline_hive_mutex, read_reg_value,
@@ -298,8 +298,27 @@ bool sid_is_well_known(PSID sid, WELL_KNOWN_SID_TYPE type) {
     return EqualSid(sid, buf);
 }
 
-/// Verifies a PRE-EXISTING amcache_dest_dir() is safe to reuse for the raw
-/// Amcache.hve copy below.
+/// Opens amcache_dest_dir() as a HANDLE, without FILE_SHARE_DELETE -- this is
+/// what makes the verify-then-use sequence below race-free rather than just
+/// re-checked-and-still-racy: as long as this handle stays open, Windows
+/// itself refuses any delete or rename of the underlying directory OBJECT
+/// (ERROR_SHARING_VIOLATION/ACCESS_DENIED to the would-be deleter), so the
+/// object amcache_dest_dir_is_safe() verifies below is PROVABLY the same
+/// object the raw hive is later copied into -- verifying by path and then
+/// using by path (as an earlier revision of this function did) leaves a
+/// window where the verified directory is deleted and replaced between the
+/// two path resolutions. FILE_FLAG_OPEN_REPARSE_POINT opens a junction/
+/// symlink AS the reparse point itself rather than following it, so the
+/// reparse check below sees the object actually being opened, never its
+/// target.
+ScopedHandle open_amcache_dest_dir_handle(const std::wstring& dir) {
+    return ScopedHandle(CreateFileW(
+        dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+}
+
+/// Verifies an already-open amcache_dest_dir() handle is safe to reuse for
+/// the raw Amcache.hve copy below.
 ///
 /// CreateDirectoryW only applies the caller's SECURITY_ATTRIBUTES when it
 /// actually creates the directory (ERROR_SUCCESS) -- on ERROR_ALREADY_EXISTS
@@ -316,17 +335,25 @@ bool sid_is_well_known(PSID sid, WELL_KNOWN_SID_TYPE type) {
 /// scratch directory has no reason to already exist under a legitimate
 /// install (install-agent-user.ps1 does not provision it) and a refusal
 /// just degrades this one dispatch to `constrained`.
-bool amcache_dest_dir_is_safe(const std::wstring& dir) {
-    const DWORD attrs = GetFileAttributesW(dir.c_str());
-    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT))
-        return false; // gone between create and check, or a junction/symlink.
+///
+/// Takes the HANDLE from open_amcache_dest_dir_handle(), not a path: every
+/// check below (GetFileInformationByHandle, GetSecurityInfo) resolves
+/// against the OPEN OBJECT, never re-resolving the path -- combined with the
+/// caller holding that same handle open through the subsequent copy, this is
+/// what closes the TOCTOU a path-based verify-then-use would otherwise have.
+bool amcache_dest_dir_is_safe(HANDLE dir_handle) {
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(dir_handle, &info))
+        return false;
+    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        return false; // a junction/symlink -- never follow it.
 
     PSECURITY_DESCRIPTOR sd = nullptr;
     PSID owner_sid = nullptr;
     PACL dacl = nullptr;
-    const DWORD rc = GetNamedSecurityInfoW(
-        dir.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-        &owner_sid, nullptr, &dacl, nullptr, &sd);
+    const DWORD rc = GetSecurityInfo(dir_handle, SE_FILE_OBJECT,
+                                     OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                                     &owner_sid, nullptr, &dacl, nullptr, &sd);
     if (rc != ERROR_SUCCESS)
         return false;
     struct SdGuard {
@@ -662,16 +689,33 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
         if (amcache_sd)
             LocalFree(amcache_sd);
 
-        if (!dir_created) {
-            if (dir_create_err != ERROR_ALREADY_EXISTS)
-                return emit_constrained(ctx, "dest_dir_create_" + std::to_string(dir_create_err));
-            // The directory pre-existed, so CreateDirectoryW did NOT apply
-            // the owner-only DACL above (Windows only sets it on a genuine
-            // create) -- verify what's actually there before trusting it
-            // with the raw hive copy below.
-            if (!amcache_dest_dir_is_safe(dest_dir))
-                return emit_constrained(ctx, "dest_dir_acl");
-        }
+        if (!dir_created && dir_create_err != ERROR_ALREADY_EXISTS)
+            return emit_constrained(ctx, "dest_dir_create_" + std::to_string(dir_create_err));
+
+        // Open the directory ONCE, as a handle, and hold it (dest_dir_handle
+        // stays in scope for the rest of this function, spanning the verify
+        // below AND the copy further down) -- see
+        // open_amcache_dest_dir_handle's banner for why a held-open handle,
+        // not a second path-based check right before the copy, is what makes
+        // this sequence race-free: Windows refuses to delete or rename the
+        // underlying object while this handle is open, so the directory
+        // amcache_dest_dir_is_safe() verifies below is provably the same one
+        // the raw hive is copied into further down.
+        ScopedHandle dest_dir_handle = open_amcache_dest_dir_handle(dest_dir);
+        if (!dest_dir_handle)
+            return emit_constrained(ctx, "dest_dir_open_" + std::to_string(GetLastError()));
+
+        // Verify unconditionally, even on the dir_created path -- CreateDirectoryW
+        // applies the owner-only DACL atomically with the create, but a narrow
+        // window still exists between that create returning and the handle open
+        // just above succeeding, during which a principal with FILE_DELETE_CHILD
+        // on the parent could delete and resubstitute the directory (the same
+        // precondition the ERROR_ALREADY_EXISTS path already treats as in-scope).
+        // Trusting dir_created here would skip the one check that catches exactly
+        // that race; the check itself is cheap, so there's no reason not to run it
+        // on both paths uniformly.
+        if (!amcache_dest_dir_is_safe(dest_dir_handle.get()))
+            return emit_constrained(ctx, "dest_dir_acl");
 
         const std::wstring dest_hve = amcache_temp_path(data_dir);
 
