@@ -447,6 +447,18 @@ print("OK", len(findings))
         {"finding_id": "pf", "run_id": "9-precfloat.X", "pass_ordinal": 1,
          "recorded_at": f"2026-09-15T10:00:00.{prec_b}Z", "disposition": "fixed"},
     ]
+    # round-11 confirmation-pass minor (FortitudeEtc/Kimi+Sol synthesis): on
+    # an interpreter where fromisoformat rejects a >6-digit fraction
+    # outright, BOTH rows above would fall through _instant's None path to
+    # the legacy (file-order) sort key - the assertion below would then pass
+    # VACUOUSLY (by file order, never touching _frac_key's comparison at
+    # all), silently un-exercising exactly the round-8 false-tie class this
+    # test exists to catch, rather than failing loudly. Assert the
+    # precondition explicitly so a too-old interpreter fails LOUDLY here
+    # instead of silently skipping the real check.
+    expect(M._instant(prec_rows[0]["recorded_at"]) is not None,
+           "precondition: this interpreter parses a 21-digit fraction (required for the "
+           "float-precision assertion below to actually exercise _frac_key, not file order)")
     prec_ordered = sorted(((i, r) for i, r in enumerate(prec_rows)), key=M._order_key)
     expect(M.merged_view(prec_ordered).get("disposition") == "fixed",
            "fractional precision beyond float's significant-digit limit still orders correctly "
@@ -483,6 +495,11 @@ print("OK", len(findings))
         {"finding_id": "hpf", "run_id": "9-hugeprecfloat.X", "pass_ordinal": 1,
          "recorded_at": f"2026-09-15T10:00:00.{huge_prec_b}Z", "disposition": "fixed"},
     ]
+    # round-11 confirmation-pass minor: same precondition, for the same
+    # reason, at the 5000-digit width.
+    expect(M._instant(huge_prec_rows[0]["recorded_at"]) is not None,
+           "precondition: this interpreter parses a 5000-digit fraction (required for the "
+           "huge-precision assertion below to actually exercise _frac_key, not file order)")
     huge_prec_ordered = sorted(((i, r) for i, r in enumerate(huge_prec_rows)), key=M._order_key)
     expect(M.merged_view(huge_prec_ordered).get("disposition") == "fixed",
            "fractional precision at 5000 digits, differing only in the LAST digit, still orders "
@@ -1100,6 +1117,18 @@ print("OK", len(findings))
             {"finding_id": "sf", "run_id": "9-subfrac.X", "pass_ordinal": 1,
              "recorded_at": "2026-09-15T10:00:00.0000002Z", "disposition": "fixed"},
         ]
+        # round-11 confirmation-pass finding (Fable): this is the ORIGINAL
+        # round-8 lock the two round-11 precision assertions elsewhere in
+        # this file exist to strengthen - it has the IDENTICAL vacuous-pass
+        # exposure on an interpreter that rejects a >6-digit fraction
+        # outright (both rows would fall to _order_key's file-order path and
+        # 'fixed', at index 1, would win by accident rather than by the
+        # precision comparison this test means to exercise). Guarding its
+        # two descendants but not this one would leave the class only
+        # partially closed.
+        expect(M._instant(subfrac_rows[0]["recorded_at"]) is not None,
+               "precondition: this interpreter parses a 7-digit fraction (required for the "
+               "sub-microsecond assertion below to actually exercise _frac_key, not file order)")
         subfrac_ordered = sorted(((i, r) for i, r in enumerate(subfrac_rows)), key=M._order_key)
         expect(M.merged_view(subfrac_ordered).get("disposition") == "fixed",
                "sub-microsecond fractional precision orders correctly even though fromisoformat's "
@@ -1231,15 +1260,25 @@ print("OK", len(findings))
         # individual interpolation site - this closes the WHOLE class
         # (filenames, any future row-controlled string, everything) rather
         # than requiring every future print site to remember `!r`.
-        bad_name = os.fsdecode(b"9-badname\xff.X.jsonl")
-        bad_name_path = Path(d) / bad_name
-        bad_name_path.write_bytes(b'{"a": 1}\n')
-        cli_badname = subprocess.run([sys.executable, str(_SCRIPT), "--files", str(bad_name_path)],
-                                      capture_output=True, text=True, errors="backslashreplace")
-        expect(cli_badname.returncode == 1 and "Traceback" not in cli_badname.stderr,
-               f"CLI on a fragment whose FILENAME contains a non-UTF-8 byte exits 1 with a "
-               f"finding, never a UnicodeEncodeError traceback (got exit={cli_badname.returncode}, "
-               f"stderr={cli_badname.stderr[:200]!r})")
+        # round-11 confirmation-pass minor (Fable/FortitudeEtc, both external
+        # reviewers found-by-both): `os.fsdecode` on an arbitrary raw byte
+        # string assumes the POSIX bytes-based path model - Windows paths
+        # are natively UTF-16, so this raises UnicodeDecodeError itself on
+        # Windows, before the fixture even runs. Not merge-blocking (the
+        # Governance-ledger linter self-test step in docs-lint.yml is
+        # ubuntu-24.04-only, confirmed by the reviewer's own check of the
+        # workflow file), but guarding it costs one line and keeps this
+        # fixture from becoming a landmine if a Windows leg is ever added.
+        if os.name != "nt":
+            bad_name = os.fsdecode(b"9-badname\xff.X.jsonl")
+            bad_name_path = Path(d) / bad_name
+            bad_name_path.write_bytes(b'{"a": 1}\n')
+            cli_badname = subprocess.run([sys.executable, str(_SCRIPT), "--files", str(bad_name_path)],
+                                          capture_output=True, text=True, errors="backslashreplace")
+            expect(cli_badname.returncode == 1 and "Traceback" not in cli_badname.stderr,
+                   f"CLI on a fragment whose FILENAME contains a non-UTF-8 byte exits 1 with a "
+                   f"finding, never a UnicodeEncodeError traceback "
+                   f"(got exit={cli_badname.returncode}, stderr={cli_badname.stderr[:200]!r})")
 
         # round-11 review minor (Fable + Sol): json.loads accepts Python's
         # non-standard NaN/Infinity/-Infinity literals (RFC 8259 section 6
