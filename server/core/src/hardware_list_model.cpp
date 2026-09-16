@@ -349,49 +349,49 @@ HardwareListPage build_hardware_list_page(std::vector<InventoryDeviceRow> roster
             }
             case HwSortKey::Manufacturer: {
                 const bool ab = is_blank_sentinel(a.ci_manufacturer), bb = is_blank_sentinel(b.ci_manufacturer);
-                if (ab != bb) { lt = !ab; gt = !bb; break; } // blanks sort last both directions
+                if (ab != bb) return !ab; // blanks sort last both directions — independent of desc
                 const std::string am = fold(a.ci_manufacturer), bm = fold(b.ci_manufacturer);
                 lt = am < bm; gt = am > bm;
                 break;
             }
             case HwSortKey::Model: {
                 const bool ab = is_blank_sentinel(a.ci_model), bb = is_blank_sentinel(b.ci_model);
-                if (ab != bb) { lt = !ab; gt = !bb; break; }
+                if (ab != bb) return !ab; // blanks sort last both directions — independent of desc
                 const std::string am = fold(a.ci_model), bm = fold(b.ci_model);
                 lt = am < bm; gt = am > bm;
                 break;
             }
             case HwSortKey::Serial: {
                 const bool ab = is_blank_sentinel(a.ci_serial), bb = is_blank_sentinel(b.ci_serial);
-                if (ab != bb) { lt = !ab; gt = !bb; break; }
+                if (ab != bb) return !ab; // blanks sort last both directions — independent of desc
                 const std::string am = fold(a.ci_serial), bm = fold(b.ci_serial);
                 lt = am < bm; gt = am > bm;
                 break;
             }
             case HwSortKey::Cpu: {
                 const bool ab = is_blank_sentinel(a.ci_cpu_model), bb = is_blank_sentinel(b.ci_cpu_model);
-                if (ab != bb) { lt = !ab; gt = !bb; break; }
+                if (ab != bb) return !ab; // blanks sort last both directions — independent of desc
                 const std::string am = fold(a.ci_cpu_model), bm = fold(b.ci_cpu_model);
                 lt = am < bm; gt = am > bm;
                 break;
             }
             case HwSortKey::Ram: {
                 const bool ab = is_blank_sentinel(a.ci_ram_bytes), bb = is_blank_sentinel(b.ci_ram_bytes);
-                if (ab != bb) { lt = !ab; gt = !bb; break; }
+                if (ab != bb) return !ab; // blanks sort last both directions — independent of desc
                 const std::int64_t av = parse_i64_or_min(a.ci_ram_bytes), bv = parse_i64_or_min(b.ci_ram_bytes);
                 lt = av < bv; gt = av > bv;
                 break;
             }
             case HwSortKey::OsVersion: {
                 const bool ab = is_blank_sentinel(a.ci_os_version), bb = is_blank_sentinel(b.ci_os_version);
-                if (ab != bb) { lt = !ab; gt = !bb; break; }
+                if (ab != bb) return !ab; // blanks sort last both directions — independent of desc
                 const std::string am = fold(a.ci_os_version), bm = fold(b.ci_os_version);
                 lt = am < bm; gt = am > bm;
                 break;
             }
             case HwSortKey::Version: {
                 const bool ab = a.agent_version.empty(), bb = b.agent_version.empty();
-                if (ab != bb) { lt = !ab; gt = !bb; break; } // blanks (offline, no report) sort last
+                if (ab != bb) return !ab; // blanks (offline, no report) sort last — independent of desc
                 const auto av = parse_semver3(a.agent_version), bv = parse_semver3(b.agent_version);
                 if (av && bv) { lt = *av < *bv; gt = *av > *bv; break; }
                 // Unparsable version strings fall back to a lexicographic compare so
@@ -402,7 +402,7 @@ HardwareListPage build_hardware_list_page(std::vector<InventoryDeviceRow> roster
             }
             case HwSortKey::Ip: {
                 const bool ab = a.ips.empty(), bb = b.ips.empty();
-                if (ab != bb) { lt = !ab; gt = !bb; break; } // no live claim sorts last
+                if (ab != bb) return !ab; // no live claim sorts last — independent of desc
                 const std::string am = fold(a.ips.front()), bm = fold(b.ips.front());
                 lt = am < bm; gt = am > bm;
                 break;

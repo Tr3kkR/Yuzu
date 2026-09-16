@@ -40,6 +40,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
@@ -3091,33 +3092,22 @@ public:
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
                             sched = sync_scheduler_;
                         }
-                        if (cmd.action() != "now") {
-                            resp.set_status(pb::CommandResponse::FAILURE);
-                            resp.set_exit_code(2);
-                            resp.set_output("unknown __sync__ action: " + cmd.action());
-                        } else if (!sched) {
-                            resp.set_status(pb::CommandResponse::FAILURE);
-                            resp.set_exit_code(1);
-                            resp.set_output(cfg_.inventory_disable
-                                                ? "daily-sync disabled (--inventory-disable)"
-                                                : "daily-sync not running (not connected)");
-                        } else if (auto armed = sched->request_now(source); armed.empty()) {
-                            std::string valid;
-                            for (const auto& n : sched->source_names())
-                                valid += (valid.empty() ? "" : ",") + n;
-                            resp.set_status(pb::CommandResponse::FAILURE);
-                            resp.set_exit_code(2);
-                            resp.set_output("unknown sync source '" + source +
-                                            "' — expected one of " + valid + " or all");
-                        } else {
+                        // Decision logic (unknown action / no scheduler / unknown
+                        // source / success) lives in sync_now_decision.hpp — a pure
+                        // free function unit-tested without gRPC or a live command
+                        // loop (tests/unit/test_agent_sync_command.cpp). Everything
+                        // else about this command (the metrics counter below,
+                        // record_command_terminal-before-write, the stream->Write)
+                        // stays here, unchanged.
+                        auto decision = decide_sync_now(cmd.action(), source, cfg_.inventory_disable,
+                                                         sched.get());
+                        resp.set_status(decision.status == SyncNowDecision::Status::Success
+                                             ? pb::CommandResponse::SUCCESS
+                                             : pb::CommandResponse::FAILURE);
+                        resp.set_exit_code(decision.exit_code);
+                        resp.set_output(std::move(decision.output));
+                        if (decision.status == SyncNowDecision::Status::Success)
                             sync_wake_.store(true, std::memory_order_release);
-                            std::string names;
-                            for (const auto& n : armed)
-                                names += (names.empty() ? "" : ",") + n;
-                            resp.set_status(pb::CommandResponse::SUCCESS);
-                            resp.set_exit_code(0);
-                            resp.set_output("requested|" + names);
-                        }
                         resp.set_plugin("__sync__");
                         resp.set_action(cmd.action());
                         metrics_

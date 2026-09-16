@@ -459,9 +459,21 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
     // render_device_live_KIND function per kind.
     if (!lk.columns.empty()) {
         std::vector<std::vector<std::string>> rows;
+        // A line under any OTHER prefix (e.g. a plugin-emitted "warning|..." or
+        // "error|..." diagnostic alongside its data rows) is preserved verbatim as
+        // an honest raw/diagnostic row rather than silently dropped -- the
+        // originally approved design (parse_generic_rows: "non-prefixed lines
+        // become a single raw cell"). Rendered at the end of the table by
+        // render_device_live_generic. Bounded by the SAME kMaxLiveRows cap,
+        // shared across rows+raw_rows combined (one output-size bound, not two).
+        std::vector<std::string> raw_rows;
         const std::string prefix = lk.row_prefix + "|";
         for (const auto& l : lines) {
-            if (!l.starts_with(prefix)) continue;
+            if (!l.starts_with(prefix)) {
+                if (rows.size() + raw_rows.size() < kMaxLiveRows)
+                    raw_rows.push_back(l);
+                continue;
+            }
             auto f = pipe_fields(l);
             if (f.empty()) continue;
             f.erase(f.begin()); // drop the prefix token itself
@@ -469,8 +481,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             rows.push_back(std::move(f));
             if (rows.size() >= kMaxLiveRows) break;
         }
-        std::string body = render_device_live_generic(lk.columns, rows);
-        body += oob("ls-cnt-" + kind, "ls-cnt", std::to_string(rows.size()));
+        std::string body = render_device_live_generic(lk.columns, rows, raw_rows);
+        body += oob("ls-cnt-" + kind, "ls-cnt", std::to_string(rows.size() + raw_rows.size()));
         return body;
     }
 

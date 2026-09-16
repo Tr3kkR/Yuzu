@@ -4,8 +4,14 @@
 /// PURE model for the /hardware Configuration-Item (CI) list and record — search,
 /// filter, sort, pagination, KPIs, and the JSON shapes shared verbatim by the HTMX
 /// fragment, the REST v1 twin, and the MCP twin (the "one builder" the twin recipe
-/// mandates, docs/api-twin-recipe.md §1). No httplib, no gRPC — this file must stay
-/// includable from a plain unit test with zero network/store dependencies.
+/// mandates, docs/api-twin-recipe.md §1). No gRPC, and nothing in THIS file calls
+/// into httplib — every function here is a pure transform over already-fetched
+/// data (roster/query in, page/JSON out). `inventory_routes.hpp` (below, for
+/// `InventoryDeviceRow`) transitively pulls in `<httplib.h>` for its own route
+/// types, so the symbol is reachable from this TU, but nothing declared in this
+/// file needs it — this header must stay includable from a plain unit test with
+/// zero network/store dependencies, and every function here is callable without
+/// ever touching an httplib type.
 ///
 /// Roster rows are the same `InventoryDeviceRow` the Software/Devices tab already
 /// produces (server.cpp's `inv_devices_fn` roster, endpoint_state + device_ci join);

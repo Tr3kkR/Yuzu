@@ -309,6 +309,8 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
+                                          # from agent.cpp's __sync__.now reserved-command branch
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
@@ -1127,6 +1129,9 @@ if build_server
       'unit/server/test_dex_routes.cpp',
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
+      'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
+      'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam

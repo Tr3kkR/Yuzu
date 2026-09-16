@@ -441,6 +441,12 @@ std::string render_device_live_shell(const std::string& agent_id) {
     // Hidden uptime loader: fills the Uptime KPI (uptime has no card of its own).
     h += "<div style=\"display:none\" hx-get=\"/fragments/device/live/run?id=" + e +
          "&amp;kind=uptime\" hx-trigger=\"load\" hx-swap=\"innerHTML\"></div>";
+    // Each card group (Live cards / Physical) is its own [data-lsgroup] container so
+    // lsToggleAll (guardian_page_ui.cpp) can scope its "expand all" to the button's
+    // OWN group only — a document-wide querySelectorAll would also snap open the
+    // OTHER group's lazy cards, firing every one of their dispatches at once (the
+    // exact storm the lazy toggle-once:closest-details design exists to prevent).
+    h += "<div class=\"ls-group\" data-lsgroup=\"live\">";
     h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Live cards</h2>"
          "<button class=\"ls-toggle\" onclick=\"lsToggleAll(this)\">Expand all</button></div>";
     h += "<div class=\"ls-grid\">";
@@ -483,7 +489,15 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("connections", "Active connections", "", "established");
     h += card("capture_sources", "Capture sources", "", "TAR local capture");
     h += card("disk", "Disk space", "", "system volume only");
-    h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Physical</h2></div>";
+    h += "</div>"; // close .ls-grid (live)
+    h += "</div>"; // close .ls-group[data-lsgroup=live]
+    // Physical cards are lazy (dispatch only on individual expand) — their OWN
+    // "Expand all" reuses lsToggleAll(this), scoped to this group by data-lsgroup
+    // above, so a deliberate click here mass-expands only these 10 (a legitimate,
+    // explicit dispatch of all 10), never as a side effect of the Live-cards button.
+    h += "<div class=\"ls-group\" data-lsgroup=\"physical\">";
+    h += "<div class=\"grp-row\"><h2 class=\"gp-sech\" style=\"margin:0\">Physical</h2>"
+         "<button class=\"ls-toggle\" onclick=\"lsToggleAll(this)\">Expand all</button></div>";
     h += "<div class=\"ls-grid\">";
     h += card("hw_disks", "Disks", "", "model &middot; size &middot; interface", true);
     h += card("hw_memory", "Memory", "", "slots &middot; size &middot; speed", true);
@@ -497,8 +511,9 @@ std::string render_device_live_shell(const std::string& agent_id) {
     h += card("volumes", "Volumes", "Win and macOS", "mounts &middot; filesystem &middot; size", true);
     h += card("adapters", "Network adapters", "", "MAC &middot; speed &middot; status", true);
     h += card("wifi", "Wi-Fi", "", "SSID &middot; signal &middot; security", true);
-    h += "</div>";
-    h += "</div></div>";
+    h += "</div>"; // close .ls-grid (physical)
+    h += "</div>"; // close .ls-group[data-lsgroup=physical]
+    h += "</div>"; // close #device-live-snapshot
     return h;
 }
 
@@ -941,11 +956,19 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
 /// matches the declared column order. Parsing/prefix filtering happens in
 /// device_routes.cpp's render_live_result, NOT here — this function is pure over
 /// already-parsed rows, matching every other render_device_live_* function in
-/// this file.
+/// this file. `raw_rows` are lines that did NOT match the kind's row_prefix
+/// (e.g. a plugin-emitted "warning|..."/"error|..." diagnostic alongside its
+/// data rows) — preserved verbatim rather than silently dropped, rendered as
+/// their own full-width diagnostic row at the end of the table body, muted via
+/// this file's established `gp-mute` convention for a diagnostic/placeholder
+/// cell (see e.g. dex_perf_ui.cpp / dex_app_perf_ui.cpp's `colspan` + `gp-mute`
+/// "n too small" rows) rather than inventing a new one.
 std::string render_device_live_generic(const std::vector<std::string>& columns,
-                                       const std::vector<std::vector<std::string>>& rows) {
-    if (rows.empty())
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows) {
+    if (rows.empty() && raw_rows.empty())
         return "<div class=\"gp-note\">Not available on this platform, or the table is empty.</div>";
+    const std::string colspan = std::to_string(columns.size());
     std::string h = "<table class=\"ls-tbl\"><thead><tr>";
     for (const auto& c : columns) h += "<th>" + esc(column_label(c)) + "</th>";
     h += "</tr></thead><tbody>";
@@ -955,6 +978,9 @@ std::string render_device_live_generic(const std::vector<std::string>& columns,
             h += "<td>" + (cell.empty() ? "<span class=\"gp-mute\">&mdash;</span>" : esc(cell)) + "</td>";
         h += "</tr>";
     }
+    for (const auto& raw : raw_rows)
+        h += "<tr class=\"ls-raw\"><td colspan=\"" + colspan + "\" class=\"gp-mute\">" + esc(raw) +
+             "</td></tr>";
     h += "</tbody></table>";
     return h;
 }

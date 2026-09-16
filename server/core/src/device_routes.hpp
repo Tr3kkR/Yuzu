@@ -239,9 +239,13 @@ std::string render_device_live_capture_sources(const std::vector<LiveCaptureSour
 /// list from live_kinds.hpp's LiveKind::columns (drives both the table header labels
 /// and each row's expected width); `rows` are the already-split, already-padded field
 /// vectors (device_routes.cpp render_live_result, one per matched line, prefix token
-/// dropped). Defined in device_ui.cpp.
+/// dropped). `raw_rows` are lines that did NOT match the row_prefix, preserved
+/// verbatim (full original line text) instead of being silently dropped -- each
+/// renders as its own full-width diagnostic row at the end of the table.
+/// Defined in device_ui.cpp.
 std::string render_device_live_generic(const std::vector<std::string>& columns,
-                                       const std::vector<std::vector<std::string>>& rows);
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows);
 
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);

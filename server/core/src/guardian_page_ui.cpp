@@ -377,7 +377,13 @@ extern const char* const kGuardianDetailPageHtml =
        called from inline onclick/oninput (CSP-safe — 'unsafe-inline' allows attribute
        handlers; only hx-on/new Function is blocked). ── */
     function lsToggleAll(btn) {
-      var cards = document.querySelectorAll('.ls-card');
+      // Scoped to the button's OWN group (device_ui.cpp wraps "Live cards" and
+      // "Physical" each in their own [data-lsgroup] container) so this never
+      // reaches into the OTHER group's cards -- a document-wide query here would
+      // snap open the lazy Physical cards as a side effect of the Live-cards
+      // button (or vice-versa), firing every one of their dispatches at once.
+      var group = btn.closest('[data-lsgroup]');
+      var cards = (group || document).querySelectorAll('.ls-card');
       var anyClosed = Array.prototype.some.call(cards, function (c) { return !c.open; });
       cards.forEach(function (c) { c.open = anyClosed; });
       btn.textContent = anyClosed ? 'Collapse all' : 'Expand all';

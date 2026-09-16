@@ -717,6 +717,7 @@
     "plugin": [
       "agents/plugins/installed_apps/src/installed_apps_inventory.hpp",
       "agents/plugins/installed_apps/src/installed_apps_macos_enrich.hpp",
+      "agents/plugins/installed_apps/src/installed_apps_macos_receipts.hpp",
       "agents/plugins/installed_apps/src/installed_apps_parsers.hpp",
       "agents/plugins/installed_apps/src/installed_apps_plugin.cpp",
       "agents/plugins/installed_apps/src/installed_apps_registry_utf8.hpp"
@@ -726,6 +727,7 @@
       "tests/unit/test_installed_apps_actions.cpp",
       "tests/unit/test_installed_apps_inventory.cpp",
       "tests/unit/test_installed_apps_macos_enrich.cpp",
+      "tests/unit/test_installed_apps_macos_receipts.cpp",
       "tests/unit/test_installed_apps_parsers.cpp",
       "tests/unit/test_installed_apps_registry_utf8.cpp"
     ]

@@ -667,17 +667,41 @@ TEST_CASE("device live: physical-hardware generic-table kinds dispatch + render"
                             "<td>NVMe</td>") != std::string::npos);
         CHECK(h.audited == "device.live.hw_disks|rendered|a-1"); // #1703 result-poll audit
     }
-    SECTION("hw_disks: a wrong-prefix row is silently dropped, not rendered as data") {
+    SECTION("hw_disks: a wrong-prefix row is preserved as a raw diagnostic row, "
+            "not silently dropped") {
         LiveHarness h;
-        // hw_disks' row_prefix is "disk"; a row under any other prefix must never
-        // surface, matching every other kind's `if (!l.starts_with(prefix)) continue;`.
+        // hw_disks' row_prefix is "disk"; a row under any other prefix is not
+        // structured data (matching every other kind's
+        // `if (!l.starts_with(prefix))` branch), but the original approved design
+        // (parse_generic_rows) preserves it verbatim as an honest raw/diagnostic
+        // row -- e.g. a plugin emitting a "warning|..."/"error|..." line alongside
+        // its data rows -- rather than silently discarding it.
         h.fake_rows = {{"a-1", 1, "wrongprefix|1|2|3", ""}};
         auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
                             "&agent_id=a-1&kind=hw_disks&n=1");
         REQUIRE(r);
-        CHECK(r->body.find("wrongprefix") == std::string::npos);
-        CHECK(r->body.find("<table") == std::string::npos); // no data table at all
-        CHECK(r->body.find("table is empty") != std::string::npos); // honest empty note
+        CHECK(r->body.find("<table") != std::string::npos); // a table IS rendered
+        // Full raw line text in a full-width (colspan=5, hw_disks' column count)
+        // muted diagnostic row -- not parsed into data columns.
+        CHECK(r->body.find("<td colspan=\"5\" class=\"gp-mute\">wrongprefix|1|2|3</td>") !=
+              std::string::npos);
+    }
+    SECTION("hw_disks: a well-formed row and a wrong-prefix row both render, "
+            "structured row first then the raw row") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1,
+                        "disk|0|Samsung 970 EVO|931|SSD|NVMe\nwrongprefix|1|2|3", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_disks&n=1");
+        REQUIRE(r);
+        const auto structured_pos =
+            r->body.find("<td>0</td><td>Samsung 970 EVO</td><td>931</td><td>SSD</td>"
+                         "<td>NVMe</td>");
+        const auto raw_pos =
+            r->body.find("<td colspan=\"5\" class=\"gp-mute\">wrongprefix|1|2|3</td>");
+        CHECK(structured_pos != std::string::npos);
+        CHECK(raw_pos != std::string::npos);
+        CHECK(structured_pos < raw_pos); // structured rows render before raw rows
     }
     SECTION("thermal dispatches power_health/thermal, audited, polls power_health-<id>") {
         LiveHarness h;
@@ -973,4 +997,110 @@ TEST_CASE("device routes: /fragments/devices/list denies a service-scoped "
          body["error"]["correlation_id"].get<std::string>());
     REQUIRE(audit_log.size() == 1);
     CHECK(audit_log[0] == "device.list.view|denied");
+}
+
+// Round-3 merge: /devices and /device?id= are retired in favour of the Hardware CI
+// list/record (302, not route removal — bookmarks and the API-parity ledger's
+// history stay intact), plus the bare=1 tab-bar suppression the DEX/Guardian lenses
+// already use when mounted as a lens inside the Hardware CI record.
+TEST_CASE("device routes: /devices + /device redirect to Hardware CI; bare=1 hides "
+          "the lens tab bar",
+          "[device][routes]") {
+    auto okAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(auth::Session{});
+    };
+    auto noAuth = [](const httplib::Request&, httplib::Response&) {
+        return std::optional<auth::Session>(std::nullopt);
+    };
+    auto okPerm = [](const httplib::Request&, httplib::Response&, const std::string&,
+                     const std::string&) { return true; };
+    auto okScoped = [](const httplib::Request&, httplib::Response&, const std::string&,
+                       const std::string&, const std::string&) { return true; };
+    auto noDevices = [](const std::string&) { return std::vector<DeviceRow>{}; };
+    auto noLookup = [](const std::string&) -> std::optional<DeviceRow> { return std::nullopt; };
+
+    SECTION("GET /devices while authed -> 302 /hardware") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        auto r = sink.Get("/devices");
+        REQUIRE(r);
+        CHECK(r->status == 302);
+        CHECK(r->get_header_value("Location") == "/hardware");
+    }
+    SECTION("GET /devices while UNauthed -> 302 /login (auth_fn_ runs first)") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, noAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        auto r = sink.Get("/devices");
+        REQUIRE(r);
+        CHECK(r->status == 302);
+        CHECK(r->get_header_value("Location") == "/login");
+    }
+    SECTION("GET /device?id=a-1 while authed -> 302 /hardware/ci?id=a-1") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        auto r = sink.Get("/device?id=a-1");
+        REQUIRE(r);
+        CHECK(r->status == 302);
+        CHECK(r->get_header_value("Location") == "/hardware/ci?id=a-1");
+    }
+    SECTION("GET /device?id=<space/#> -> Location percent-encodes it") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        // Sent pre-encoded (a raw space/'#' in a URL is themselves ambiguous);
+        // TestRouteSink's parse_query_text decodes it to "a 1#b" exactly as
+        // httplib::Server would, so the assertion below exercises the SAME
+        // re-encoding step device_routes.cpp:552-561 runs in production: alnum/
+        // -/_/./~ pass through literal, everything else becomes uppercase %XX.
+        auto r = sink.Get("/device?id=a%201%23b");
+        REQUIRE(r);
+        CHECK(r->status == 302);
+        CHECK(r->get_header_value("Location") == "/hardware/ci?id=a%201%23b");
+    }
+    SECTION("GET /device with no id -> 302 /hardware/ci (no ?id= suffix)") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        auto r = sink.Get("/device");
+        REQUIRE(r);
+        CHECK(r->status == 302);
+        CHECK(r->get_header_value("Location") == "/hardware/ci");
+    }
+    // bare=1 mounts the fragment as a lens inside the Hardware CI record, which
+    // already renders its own 7-tab bar — the fragment's OWN 3-chip bar
+    // (device_lens_tabs, "Device info"/"DEX"/"Guardian") must not double up.
+    // store=nullptr routes both lenses through render_device_lens_placeholder,
+    // which still threads `tabs` the same way the real DEX/Guardian bodies do.
+    SECTION("dex fragment: bare=1 omits the tab bar; without it, the bar renders") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        auto bare = sink.Get("/fragments/device/dex?id=a-1&bare=1");
+        REQUIRE(bare);
+        CHECK(bare->body.find("Device info") == std::string::npos);
+        auto full = sink.Get("/fragments/device/dex?id=a-1");
+        REQUIRE(full);
+        CHECK(full->body.find("Device info") != std::string::npos);
+    }
+    SECTION("guardian fragment: bare=1 omits the tab bar; without it, the bar renders") {
+        yuzu::server::test::TestRouteSink sink;
+        DeviceRoutes routes;
+        routes.register_routes(sink, okAuth, okPerm, okScoped, noDevices, noLookup,
+                               /*store=*/nullptr);
+        auto bare = sink.Get("/fragments/device/guardian?id=a-1&bare=1");
+        REQUIRE(bare);
+        CHECK(bare->body.find("Device info") == std::string::npos);
+        auto full = sink.Get("/fragments/device/guardian?id=a-1");
+        REQUIRE(full);
+        CHECK(full->body.find("Device info") != std::string::npos);
+    }
 }
