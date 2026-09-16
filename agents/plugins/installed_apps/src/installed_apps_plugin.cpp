@@ -927,20 +927,42 @@ InvCollection get_inventory_macos() {
     }
     cache.refilling = true;
     lk.unlock();
-    InvCollection fresh_result = get_inventory_macos_uncached();
-    lk.lock();
-    cache.refilling = false;
-    if (!fresh_result.degraded) {
-        cache.signature = sig;
-        cache.captured_at = std::chrono::steady_clock::now();
-        cache.result = fresh_result;
-    } else {
-        cache.result.reset(); // never serve a degraded outcome — and don't leave a
-                              // stale-but-good entry silently standing in for it either
+    // get_inventory_macos_uncached() runs WITHOUT the lock held (so concurrent callers
+    // can still check freshness / park on cache.cv while the real system_profiler scan
+    // is in flight) — which means an exception here (bad_alloc, an unexpected parse
+    // failure) unwinds past the re-lock/reset/notify below entirely. Without the
+    // try/catch, `cache.refilling` would stay true FOREVER: every waiter already
+    // parked in cache.cv.wait(lk), and every future caller arriving after this one,
+    // would block indefinitely with nothing left to ever notify them (governance
+    // Gate 6 SRE finding, HIGH — a real state-machine wedge, not hypothetical: this
+    // plugin's own agent-side ThreadPool::quiesce_and_join() does an unconditional
+    // blocking join with no timeout, so a wedge here can also keep the agent process
+    // from exiting on SIGTERM). Reset the same way a degraded result does, notify,
+    // then rethrow — the immediate caller still sees the failure; every OTHER waiter
+    // is freed instead of wedged.
+    try {
+        InvCollection fresh_result = get_inventory_macos_uncached();
+        lk.lock();
+        cache.refilling = false;
+        if (!fresh_result.degraded) {
+            cache.signature = sig;
+            cache.captured_at = std::chrono::steady_clock::now();
+            cache.result = fresh_result;
+        } else {
+            cache.result.reset(); // never serve a degraded outcome — and don't leave a
+                                  // stale-but-good entry silently standing in for it either
+        }
+        cache.cv.notify_all();
+        lk.unlock();
+        return fresh_result;
+    } catch (...) {
+        lk.lock();
+        cache.refilling = false;
+        cache.result.reset();
+        cache.cv.notify_all();
+        lk.unlock();
+        throw;
     }
-    cache.cv.notify_all();
-    lk.unlock();
-    return fresh_result;
 }
 
 // Clears the memo cache — called from InstalledAppsPlugin::shutdown() so a
@@ -951,6 +973,14 @@ void clear_profiler_cache() {
     std::lock_guard<std::mutex> lk(cache.mu);
     cache.result.reset();
     cache.signature.clear();
+    // Defense-in-depth (governance Gate 6 SRE, alongside the get_inventory_macos()
+    // try/catch above): a waiter parked in cache.cv.wait() during a shutdown that
+    // races an ACTIVE scan is otherwise woken only by that scan's own eventual
+    // notify_all() — this gives shutdown its own independent wake, same intent as
+    // dism_bounded_call.hpp's bounded/cancellable wait for a different plugin. Does
+    // NOT touch `refilling`: if a scan is genuinely still in flight, it owns that
+    // flag and will reset it itself when it returns (or throws, now caught above).
+    cache.cv.notify_all();
 }
 #endif
 

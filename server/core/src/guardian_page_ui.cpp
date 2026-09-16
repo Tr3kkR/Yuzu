@@ -511,6 +511,17 @@ extern const char* const kGuardianDetailPageHtml =
           if (typeof showToast === 'function') showToast(msg2, 'error');
           return;
         }
+        var reached = resp.data.agents_reached || 0;
+        if (reached === 0) {
+          // Mirror device_routes.cpp's sent==0 handling for /fragments/device/live/run
+          // (governance Gate 6 enterprise-readiness finding): a 0-agent dispatch used
+          // to show a green "Sent to 0 agent(s)" toast and still start the up-to-28s
+          // result poll, which can only ever time out — an honest warning and no poll
+          // instead.
+          if (typeof showToast === 'function')
+            showToast('Device offline — action needs a connected agent', 'warning');
+          return;
+        }
         if (resultDiv) {
           var commandId = resp.data.command_id;
           resultDiv.innerHTML = '<div hx-get="/fragments/hardware/ci/result?id=' + encodeURIComponent(agent) +
@@ -519,7 +530,7 @@ extern const char* const kGuardianDetailPageHtml =
           if (window.htmx) window.htmx.process(resultDiv);
         }
         if (typeof showToast === 'function') {
-          showToast('Sent to ' + (resp.data.agents_reached || 0) + ' agent(s)', 'success');
+          showToast('Sent to ' + reached + ' agent(s)', 'success');
         }
       }).catch(function () {
         btn.disabled = false;
