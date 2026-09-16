@@ -169,6 +169,14 @@ def run():
            "derive I9/E7 -> INFO (E7 never RAISES a genuinely low-impact finding)")
     expect(M.min_derived_band(["I1"], ["E6", "E7"]) == "LOW",
            "derive I1/E6+E7 -> LOW (E6's stronger cap dominates E7's, either order)")
+    # Locks raise-before-cap ORDERING, not just the cap in isolation: I1's base
+    # HIGH raises to CRITICAL under E1/E2, and only THEN does E7 cap it to
+    # MEDIUM. A regression that capped before raising (HIGH->MEDIUM, then
+    # MEDIUM->HIGH) would pass every assertion above and still be wrong.
+    expect(M.min_derived_band(["I1"], ["E1", "E7"]) == "MEDIUM",
+           "derive I1/E1+E7 -> MEDIUM (raise to CRITICAL applies before E7's cap)")
+    expect(M.min_derived_band(["I1"], ["E2", "E7"]) == "MEDIUM",
+           "derive I1/E2+E7 -> MEDIUM (raise to CRITICAL applies before E7's cap)")
     expect(M.min_derived_band(["I4"], ["E1"]) == "HIGH", "derive I4/E1 -> HIGH (I4 cap, F9)")
     expect(M.min_derived_band([], ["E0"]) == "INFO", "derive empty -> INFO")
     expect(M.min_derived_band(["I1", "I4"], ["E1"]) == "CRITICAL",

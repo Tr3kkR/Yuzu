@@ -1724,7 +1724,7 @@ to close rather than a contradiction to adjudicate.
    | `severity_mapped` | BLOCKING / SHOULD / NICE, derived per the severity rule — so for a conforming writer it always agrees with `impact`/`exposure`. Restate it whenever the facts change: a stale label is read at the stronger of the two and is itself reported |
    | `trigger` | the concrete input/state/config, or `unresolved` |
    | `impact` | every applicable `I1`…`I9` — a list; the strongest gives the band |
-   | `exposure` | every applicable `E0`…`E6`, or `unresolved` — a list, not one value. `E6` is applied last and dominates every raise |
+   | `exposure` | every applicable `E0`…`E7`, or `unresolved` — a list, not one value. `E6` and `E7` are applied last, in that order — `E6`'s LOW cap dominates `E7`'s MEDIUM cap when both apply, and both dominate every raise |
    | `epistemic_status` | `verified` / `likely` / `speculative`. Operates on the GATE, not the band — flipping it to `speculative` converts a blocker into a mandatory investigation without changing the derived band, which is why the de-escalation rule guards it |
    | `independent_reporters` | how many REPORTERS raised it WITHOUT having been shown it — downstream echoes are not confirmations. Counts reporters of every `source`, not agents only: a human colleague finding the same defect independently is the strongest confirmation available, and counting it zero inverts the signal |
    | `policy_floor` (nullable) | the floor hit, if the finding gates as a contract violation rather than by derivation. Null on an ordinary finding, which is most of them |
