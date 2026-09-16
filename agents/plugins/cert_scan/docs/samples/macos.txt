@@ -1,0 +1,3 @@
+captured: macos not built · bare-metal · 2026-09-16 · not measured (capture did not complete) · leg-hash pending
+== action=scan
+[not captured] agent-context: this plugin was developed and built on Windows only in this environment — no macOS build exists to capture against. See docs/samples/windows.txt for why even the Windows leg's capture did not complete.
