@@ -66,3 +66,31 @@ TEST_CASE("parse_launchctl_list: a truncated row with no LABEL field decodes "
     REQUIRE(rows[0].pid.has_value());
     CHECK(*rows[0].pid == 1190);
 }
+
+TEST_CASE("launchd_state_for: listed with a pid resolves Running",
+          "[launchctl_list]") {
+    std::vector<LaunchctlRow> rows = {
+        {"com.apple.progressd", 1190, 0},
+    };
+    CHECK(yuzu::shared::launchd_state_for(rows, "com.apple.progressd")
+          == yuzu::agent::ServiceRunState::Running);
+}
+
+TEST_CASE("launchd_state_for: listed without a pid resolves Stopped",
+          "[launchctl_list]") {
+    std::vector<LaunchctlRow> rows = {
+        {"com.apple.SafariHistoryServiceAgent", std::nullopt, 0},
+    };
+    CHECK(yuzu::shared::launchd_state_for(rows, "com.apple.SafariHistoryServiceAgent")
+          == yuzu::agent::ServiceRunState::Stopped);
+}
+
+TEST_CASE("launchd_state_for: a label absent from the snapshot resolves Stopped, "
+          "never Paused",
+          "[launchctl_list]") {
+    std::vector<LaunchctlRow> rows = {
+        {"com.apple.progressd", 1190, 0},
+    };
+    CHECK(yuzu::shared::launchd_state_for(rows, "com.apple.not.installed")
+          == yuzu::agent::ServiceRunState::Stopped);
+}
