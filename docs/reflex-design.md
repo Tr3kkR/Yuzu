@@ -144,24 +144,40 @@ delivers the content is a dispatch like any other, below.
 ## Two-person approval (D9)
 
 Any Reflex Set deploy whose compiled content contains at least one dangerous Reaction (per the
-chokepoint above) requires approval by a **different principal**, evaluated across every identity
-surface (session, API token, MCP principal), and distinct from **both** the last content editor and
-the deployer. Approval is bound to a **canonical digest**
+chokepoint above) requires approval by a principal representing a **distinct human root**, per
+ADR-0033 §7's identity-resolution rule — not merely "a different principal string": an editor
+approving through their own second API token must not satisfy this gate, and R9's implementation is
+responsible for resolving every identity surface (session, API token, MCP principal) back to the
+underlying human before comparing. Approval is bound to a **canonical digest**
 (`canonical_reflex_digest(spec_json, assignment)`, SHA-256 over key-sorted `spec_json` plus the
-assignment list — not a member-ID list) — editing a Reaction's params or widening the assignment
-invalidates the approval. The digest is **recomputed and compared at every compile**
-(`reflex_push_builder.cpp`), fail-closed on mismatch or absence: a stale/invalid-digest set is
-**skipped** from the push (never silently downgraded), the set's generation is held, and a
-`reflex.set.compile_refused` critical audit event fires. Break-glass (single-principal emergency
-override, mandatory justification, `critical`-severity audit) applies identically to the unified
-`ApprovalManager` flow, using `ApprovalOrigin::kReflexDeploy`; a break-glass approval still binds
-the same digest, so any subsequent edit re-requires approval.
+resolved assignment/device-set — not a member-ID list) — editing a Reaction's params or the
+assignment growing invalidates the approval.
 
-RBAC: Reflex gets its **own dedicated securable** (`Reflex`), with an explicit `Execute` permission
-gating deploy. Per §24's standing invariant, `Push` stays Guardian-only and is never added to the
-`crud_ops[]` cross-seed array — Reflex's grants are explicit, separately seeded. (Exact role
-assignments for `Execute` are finalized and ratified at R7's own review; this document fixes only
-that the permission exists and is never folded into a cross-seeded op.)
+**The approval REQUEST carries the digest the reviewer actually reviewed, and the server rejects on
+drift.** If the content changes between review and approve (an editor saves a new version mid-review),
+the approval call's digest no longer matches the row's *current* digest, and the server returns a
+`409` — approving stale content is not silently accepted as approving the current row. The digest is
+also **recomputed and compared at every compile** (`reflex_push_builder.cpp`), fail-closed on
+mismatch or absence: see "Generation and undeploy semantics" below for the exact push-time refusal
+behavior (a stale/invalid-digest set is never silently downgraded, and a `reflex.set.compile_refused`
+critical audit event fires).
+
+**Break-glass is a NEW `ApprovalManager` capability, not an existing one Reflex merely reuses.**
+Today's `ApprovalManager` has no emergency single-principal override, no `justification` field, and
+no `ApprovalOrigin::kReflexDeploy` value — all three are new work this programme adds to
+`ApprovalManager`, requiring their own security review at R9, not a drop-in reuse of an existing
+mechanism. (AuthDB's login-lockout break-glass is a different control and does not transfer.) Until
+that lands, Reflex deploy has **no** emergency override — a dangerous Reflex Set is blocked on
+ordinary two-person approval with no bypass.
+
+RBAC: Reflex gets its **own dedicated securable** (`Reflex`). Per §24's standing invariant, `Push`
+stays Guardian-only and is never added to the `crud_ops[]` cross-seed array. **`Execute` is
+different: `crud_ops[]` *does* include `Execute`** (it is only `Push` that sits outside it), so
+Reflex's `Execute` permission is auto-granted to Administrator + ITServiceOwner by the existing
+cross-seed loop like every other securable's `Execute` — this document does not claim `Execute`
+is excluded from cross-seeding; it claims only that **`Push` is**, matching every other
+non-Guardian securable. (Exact additional role assignments for `Execute` beyond the cross-seed
+default are finalized and ratified at R7's own review.)
 
 ## Consent gate (D4)
 
