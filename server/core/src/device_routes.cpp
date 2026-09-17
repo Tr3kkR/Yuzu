@@ -35,10 +35,12 @@ std::string to_lower(std::string s) {
 
 bool matches(const DeviceRow& d, const std::string& q) {
     if (q.empty()) return true;
-    // ADR-0031 WS-A4 wave 2: `segment` is gone (never assigned) and `tags` is
-    // always empty post-rewire (DeviceApi has no bulk scopable-tags read) —
-    // search is honestly narrower now (identity fields only). See
-    // device_routes.hpp's DeviceRow doc comment.
+    // ADR-0031 WS-A4 wave 2: `segment` is gone (never assigned). This predicate
+    // is LIST-ONLY — its sole caller is the /fragments/devices/list handler over
+    // `to_device_row` output, whose `tags` is always empty (DeviceApi has no bulk
+    // scopable-tags read), so list search is honestly narrower now (identity
+    // fields only). The single-device page/info path populates `tags` in get_one
+    // and never flows through here. See device_routes.hpp's DeviceRow doc comment.
     std::string hay = to_lower(d.hostname + " " + d.agent_id + " " + d.os + " " + d.arch);
     for (const auto& t : d.tags) hay += " " + to_lower(t);
     return hay.find(q) != std::string::npos;
@@ -576,10 +578,11 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         res.set_redirect(loc.c_str());
     });
 
-    // Convert one DeviceApi row into the dashboard's richer render struct — see
-    // device_routes.hpp's DeviceRow doc comment for exactly what is/isn't
+    // Convert one DeviceApi LIST row into the dashboard's richer render struct —
+    // see device_routes.hpp's DeviceRow doc comment for exactly what is/isn't
     // reproduced (online/last_seen are byte-identical constants; segment is
-    // gone; tags is honestly always empty post-rewire).
+    // gone; `tags` is left empty here — the list path has no per-row tags; the
+    // single-device page/info path populates it separately in get_one).
     auto to_device_row = [](const DeviceListRow& r) {
         DeviceRow d;
         d.agent_id = r.agent_id;

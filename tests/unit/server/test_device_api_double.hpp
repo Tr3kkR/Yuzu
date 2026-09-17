@@ -39,9 +39,15 @@ public:
         return out;
     }
 
+    /// #3564 short-circuit witness: counts backing reads so a test can assert an
+    /// out-of-scope caller triggered ZERO lookup (the consumer denied BEFORE
+    /// reaching the API). Mirrors FakeDeviceApi.lookup_calls on the REST side.
+    mutable int lookup_calls = 0;
+
     [[nodiscard]] std::expected<std::optional<yuzu::server::DeviceDetail>,
                                 yuzu::server::DeviceReadError>
     lookup_device(const std::string& agent_id) const override {
+        ++lookup_calls;
         if (fn_) {
             for (const auto& a : fn_()) {
                 if (a.value("agent_id", "") != agent_id) continue;

@@ -1157,6 +1157,13 @@ struct McpTestServer {
     /// wiring lambda below).
     std::optional<std::set<std::string>> dex_visible_for_test;
 
+    /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
+    /// hoisted to a member (was a start()-local) so a test can read its #3564
+    /// short-circuit witness `lookup_calls` — asserting an out-of-scope
+    /// get_agent_details triggered ZERO backing read (mirrors the REST twin's
+    /// FakeDeviceApi.lookup_calls). Populated in start(); null before then.
+    std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test_;
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -1416,8 +1423,9 @@ private:
         // (copied before agents_fn is moved into build_handler below) so
         // every pre-existing test in this file keeps seeing the identical two
         // agents, byte-identical to the pre-rewire behaviour.
-        auto device_api_for_test =
+        device_api_for_test_ =
             std::make_shared<yuzu::server::test::JsonDeviceApi>(agents_fn);
+        auto device_api_for_test = device_api_for_test_;
 
         // #2384: the engine-credential store rides a setter, not a
         // build_handler param — wire before the handlers are built.
@@ -10417,8 +10425,16 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     auto in_body = nlohmann::json::parse(in_scope->body);
     REQUIRE(in_body.contains("result"));
 
+    // #3564 (security-guardian Gate 8 OBS-2): an out-of-scope id must incur ZERO
+    // backing read — the in_scope gate denies BEFORE lookup_device, so a
+    // tag-store round-trip cannot betray existence by timing. Mirror of the REST
+    // twin's `lookup_calls == 0` assertion. (agent-001 above was in-scope and
+    // DID read, so measure the delta across just this out-of-scope call.)
+    REQUIRE(ts.device_api_for_test_);
+    const int lookups_before_oos = ts.device_api_for_test_->lookup_calls;
     auto out_of_scope = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    CHECK(ts.device_api_for_test_->lookup_calls == lookups_before_oos);
     REQUIRE(out_of_scope);
     CHECK(out_of_scope->status == 200);
     auto out_body = nlohmann::json::parse(out_of_scope->body);

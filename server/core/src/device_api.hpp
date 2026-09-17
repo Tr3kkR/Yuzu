@@ -36,11 +36,14 @@
 /// "nonexistent" is a caller-visible timing oracle (#3564) — the O(1) point
 /// lookup keeps a genuine miss cost-symmetric with a hit at this layer, and
 /// this method itself performs no scoping. The confinement decision belongs to
-/// the consumer, which MUST check `in_scope` on the requested id and deny an
-/// out-of-scope id BEFORE calling this method — so an out-of-scope caller
-/// triggers ZERO backing read here and cannot learn an id exists by timing or
-/// via the degraded (`kDegraded`) branch (governance #3564, security-guardian +
-/// architect). Reaching `lookup_device` implies the caller is in scope.
+/// the consumer, which MUST apply its own confinement gate on the requested id
+/// and deny an out-of-scope id BEFORE calling this method — flat `in_scope` for
+/// the REST and MCP handlers, the ancestor-aware `scoped_perm_fn`
+/// (`require_scoped_permission`) for the dashboard fragment handlers. Whichever
+/// gate applies, an out-of-scope caller triggers ZERO backing read here and
+/// cannot learn an id exists by timing or via the degraded (`kDegraded`) branch
+/// (governance #3564, security-guardian + architect). Reaching `lookup_device`
+/// implies the caller has already cleared its consumer's confinement gate.
 
 #include <expected>
 #include <optional>
