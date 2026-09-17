@@ -1330,11 +1330,24 @@ TEST_CASE("ProxyInventory: a per-source blob nesting past kMcpMaxJsonDepth is re
 
     // Fixed sentinel, never the raw plugin_name: that name is caller-supplied
     // for the generic source family, so labeling on it would let one agent
-    // mint unbounded metric series (see the next TEST_CASE).
+    // mint unbounded metric series (see the next TEST_CASE). outcome is its
+    // OWN "rejected_depth" value, distinct from the whole-report-cap
+    // "rejected" outcome (inventory_ingestion.cpp), so this per-blob
+    // rejection does not page the YuzuInventoryReportRejected alert's
+    // source-map-cap runbook.
+    CHECK(h.metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "__generic__"}, {"outcome", "rejected_depth"}})
+              .value() == 1.0);
+    // Adversarial-review finding: a per-blob depth rejection must NOT also
+    // increment the whole-report-cap outcome, or the YuzuInventoryReportRejected
+    // alert (which sums ALL outcome="rejected" series) fires with the wrong
+    // runbook for a single over-depth blob that never came close to the
+    // report's 64-source cap.
     CHECK(h.metrics
               .counter("yuzu_inventory_ingest_total",
                        {{"source", "__generic__"}, {"outcome", "rejected"}})
-              .value() == 1.0);
+              .value() == 0.0);
 }
 
 TEST_CASE("ProxyInventory: rejecting over-depth blobs under many distinct caller-chosen source "
@@ -1376,7 +1389,7 @@ TEST_CASE("ProxyInventory: rejecting over-depth blobs under many distinct caller
     // bounded sentinel series.
     CHECK(h.metrics
               .counter("yuzu_inventory_ingest_total",
-                       {{"source", "__generic__"}, {"outcome", "rejected"}})
+                       {{"source", "__generic__"}, {"outcome", "rejected_depth"}})
               .value() == 5.0);
 }
 

@@ -168,6 +168,20 @@ std::string verdict_for(const StoredResponse& r, const std::string& policy_id,
     // evaluation over a partially-salvaged shape (which could coincidentally
     // read as compliant depending on the policy's own CEL expression), and
     // never "compliant". Never logs the payload itself, only identifiers.
+    //
+    // Accepted tradeoff: r.output is not guaranteed to BE JSON at all (see
+    // parse_result's raw-text fallback below for genuinely non-JSON output),
+    // and json_exceeds_depth is a raw-text bracket scanner, not a JSON
+    // validator - plain-text output with 33+ net unclosed '['/'{' (rare;
+    // balanced brackets cancel in the depth counter) now reads as "error"
+    // instead of reaching parse_result's raw-text fallback and being
+    // CEL-evaluated. This is a narrowing of what output this evaluator can
+    // interpret, not a correctness or security defect: the direction is
+    // still fail-closed (never "compliant"), so it cannot manufacture a
+    // false-compliant verdict. Checking depth only after confirming valid
+    // JSON would require a second, DOM-based depth check downstream of
+    // parse_result - i.e. exactly the recursive traversal this guard exists
+    // to avoid - so the guard deliberately stays a pre-parse text scan.
     if (yuzu::server::mcp::json_exceeds_depth(r.output, yuzu::server::mcp::kMcpMaxJsonDepth)) {
         spdlog::error("policy_evaluator: policy {} check {} response from agent {} has output "
                      "nested past the depth guard (max {}); treating as evaluation error, "

@@ -405,10 +405,13 @@ and it ends when the lagging side upgrades. Deploy **server first, then agents**
 (the platform's normal order).
 
 **Observability.** The server emits `yuzu_inventory_ingest_total{source,outcome}`
-(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected`,
-the last for a whole report rejected at the source-map cap) — watch the
-`need_full` and `error` rates to spot a fleet whose hash-skip is degrading or
-whose ingest is failing. Four further series sharpen the picture:
+(outcome ∈ `stored` / `touched` / `need_full` / `error` / `dropped` / `rejected` /
+`rejected_depth`: `rejected` is a whole report rejected at the source-map cap,
+`rejected_depth` is a single generic (non-typed) source blob rejected for
+nesting past `kMcpMaxJsonDepth`, kept as its own outcome specifically so it
+does not page the `YuzuInventoryReportRejected` alert's source-map-cap
+runbook) - watch the `need_full` and `error` rates to spot a fleet whose
+hash-skip is degrading or whose ingest is failing. Four further series sharpen the picture:
 
 - `yuzu_inventory_ingest_duration_seconds{source,phase}` (histogram) — how long
   applying one source's report holds a pooled Postgres connection (advisory lock +

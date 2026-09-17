@@ -22,6 +22,7 @@
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
@@ -1064,7 +1065,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
             if (mcp::json_exceeds_depth(json_str, mcp::kMcpMaxJsonDepth)) {
                 spdlog::warn("[gateway] ProxyInventory: rejecting '{}' blob from agent={} - "
                             "nests too deeply (#2437-class)",
-                            plugin_name, agent_id);
+                            onbehalf::sanitize_for_log(plugin_name, 128), agent_id);
                 if (metrics_)
                     // Fixed sentinel, not plugin_name: this map's KEYS are raw,
                     // agent-supplied strings for the generic (non-typed) source
@@ -1073,10 +1074,19 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
                     // submitting over-depth blobs under different made-up
                     // names. Matches validate_inventory_report_source_count's
                     // own "__report__" sentinel a few lines above for the
-                    // same reason.
+                    // same reason. outcome is its OWN "rejected_depth" value,
+                    // not the existing "rejected" - that value is documented
+                    // (docs/user-manual/inventory.md) and alerted on
+                    // (YuzuInventoryReportRejected) as meaning specifically a
+                    // whole report rejected at the source-map cap; reusing it
+                    // here would make a single over-depth blob page an
+                    // operator with the wrong runbook (gov consistency, same
+                    // reasoning as validate_inventory_report_source_count's
+                    // own rejected-vs-dropped distinction in
+                    // inventory_ingestion.cpp).
                     metrics_
                         ->counter("yuzu_inventory_ingest_total",
-                                 {{"source", "__generic__"}, {"outcome", "rejected"}})
+                                 {{"source", "__generic__"}, {"outcome", "rejected_depth"}})
                         .increment();
                 continue;
             }

@@ -1752,7 +1752,7 @@ public:
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
-                          "(stored/touched/need_full/error/dropped/rejected)",
+                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
                           "counter");
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
