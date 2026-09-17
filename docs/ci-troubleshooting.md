@@ -61,21 +61,29 @@ discipline until the next green nightly closes the issue.
 ## 1.2 Trusted execution of a fork pull request
 
 Fork PRs must not run automatically on self-hosted runners. After static
-analysis and maintainer review, use the hosted review workflow first:
+analysis and maintainer review, cut a throwaway quarantine branch for the PR
+from its base (normally `origin/dev`) and use the hosted review workflow first
+on that branch. Both fork workflows refuse any ref other than
+`trusted-fork/pr-<N>[-<sha>]` for that PR (#4471): a `workflow_dispatch` run's
+GitHub Actions cache scope is its dispatch ref, and fork code must never write a
+scope that `main`, `dev`, or any PR restores from.
 
 ```bash
-gh workflow run fork-dynamic-review.yml --ref main \
+git push origin origin/dev:refs/heads/trusted-fork/pr-123
+gh workflow run fork-dynamic-review.yml --ref trusted-fork/pr-123 \
   -f pr_number=123 -f head_sha=<40-character-head-sha>
 gh run watch <review-run-id>
 ```
 
-Only after that run succeeds, dispatch the trusted full gate:
+Only after that run succeeds, dispatch the trusted full gate on the same
+branch, then delete the branch once the run has finished:
 
 ```bash
-gh workflow run trusted-fork-ci.yml --ref main \
+gh workflow run trusted-fork-ci.yml --ref trusted-fork/pr-123 \
   -f pr_number=123 \
   -f head_sha=<40-character-head-sha> \
   -f review_run_id=<successful-review-run-id>
+git push origin --delete trusted-fork/pr-123
 ```
 
 The trusted workflow validates that the PR is still open, the supplied SHA is
@@ -83,10 +91,16 @@ still its current head, and the hosted review run matches the same PR and SHA.
 It passes only `TRUSTED_FORK_CI_GATE` and `RUNNER_INVENTORY_TOKEN` into the
 reusable matrix. The PAT is used by a hosted base-revision control step before
 the fork checkout; build steps do not receive it. The trusted self-hosted legs
-use clean workspaces and private, no-share caches, then purge the checkout.
-This is an explicit trust decision: do not dispatch it for a fork revision that
-has not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret
-is an additional wrapper-only guard and must not be exposed to build steps.
+use clean workspaces and private, no-share caches, then purge the checkout. The
+wrapper's final `purge-quarantine-cache` job deletes every GitHub Actions cache
+entry in the quarantine scope (deleting the branch does not do that by itself).
+If the dispatch is refused with `must be dispatched on
+refs/heads/trusted-fork/pr-<N>`, the `--ref` was wrong — never work around it
+by dispatching on `main`. Two trusted dispatches do not serialise with each
+other and will contend for the self-hosted pools; run them one at a time. This
+is an explicit trust decision: do not dispatch it for a fork revision that has
+not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret is
+an additional wrapper-only guard and must not be exposed to build steps.
 
 ---
 

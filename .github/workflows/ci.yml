@@ -220,6 +220,23 @@ jobs:
             exit 1
           }
 
+          # CWE-349 (#4471): the caller's ref is this run's GitHub Actions
+          # cache scope, and every job below executes the approved fork
+          # revision. Dispatched on main/dev, that code could write cache
+          # entries every later trusted run restores (main is readable from
+          # every ref; dev is every PR's base). The #3543 save gates in the
+          # canary only cover this workflow's OWN save steps. So: confine
+          # the run to a throwaway per-PR trusted-fork/pr-<N>[-<sha>] branch
+          # whose scope nothing trusted ever reads (a run restores only from
+          # its own ref, the default branch, and a PR's base), and let the
+          # wrapper purge that scope afterwards. docs/ci-troubleshooting.md
+          # 1.2 is the runbook. Checked BEFORE the API calls so the hermetic
+          # test (tests/shell/test_trusted_inputs_validate.sh) reaches it.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::trusted-fork-ci must be dispatched on refs/heads/trusted-fork/pr-${PR_NUMBER}[-<sha>] (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
+
           pr_json=$(gh api "repos/$REPOSITORY/pulls/$PR_NUMBER")
           state=$(jq -r '.state' <<<"$pr_json")
           head_sha=$(jq -r '.head.sha' <<<"$pr_json")
@@ -2653,14 +2670,16 @@ jobs:
       # Contrast the ccache save below, which stays on bare `always()` because a
       # partial ccache is simply a smaller ccache.
       - name: Save vcpkg installed packages (canary)
-        # CWE-349 (GHSA cache-poisoning query, #3543): a trusted-fork-ci
-        # dispatch runs untrusted fork content through this same job, but its
-        # workflow_call is invoked in the DEFAULT BRANCH's cache scope (the
-        # dispatch always targets dev/main), unlike a plain pull_request run,
+        # CWE-349 (GHSA cache-poisoning query, #3543/#4471): a trusted-fork-ci
+        # dispatch runs approved fork content through this same job. Its
+        # workflow_call runs in the CALLER's cache scope, which trusted_inputs
+        # confines to a throwaway trusted-fork/pr-<N> branch (#4471) that no
+        # dev/main/PR run can restore from — unlike a plain pull_request run,
         # which the docs' "Cache access for low-trust workflow triggers"
-        # section confines to its own PR-scoped cache namespace. A save here
-        # would let a fork's build output be restored by a later, genuinely
-        # trusted push to dev/main. RESTORE above stays unconditional — reading
+        # section confines to its own PR-scoped cache namespace. This gate is
+        # therefore defence in depth: a mis-scoped dispatch is refused before
+        # this job runs, and even inside the quarantine a fork's build output
+        # is never worth keeping. RESTORE above stays unconditional — reading
         # a pre-existing entry cannot inject anything — only SAVE is gated.
         # Mirrors the existing run-id-scoped `trusted_execution` ternary the
         # self-hosted legs use for VCPKG_DEFAULT_BINARY_CACHE (this job has no

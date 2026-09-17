@@ -393,6 +393,24 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIn("TRUSTED_FORK_CI_GATE: ${{ secrets.TRUSTED_FORK_CI_GATE }}", wrapper)
         self.assertIn("RUNNER_INVENTORY_TOKEN: ${{ secrets.RUNNER_INVENTORY_TOKEN }}", wrapper)
 
+        # #4471 quarantine-ref contract. ci.yml's trusted_inputs step is covered
+        # behaviourally by tests/shell/test_trusted_inputs_validate.sh;
+        # fork-dynamic-review.yml has no extraction harness, so this string pin
+        # is its only net. The wrapper's purge job is the sole actions:write
+        # holder, checks nothing out, and must never hand that grant to the
+        # reusable gate.
+        quarantine = "^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$"
+        review = (ROOT / ".github" / "workflows" / "fork-dynamic-review.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(quarantine, review)
+        self.assertIn(quarantine, self.job("ci.yml", "trusted_inputs"))
+        purge = self.job("trusted-fork-ci.yml", "purge-quarantine-cache")
+        self.assertIn("actions: write", purge)
+        self.assertEqual(wrapper.count("actions: write"), 1)
+        self.assertNotIn("actions/checkout", purge)
+        self.assertIn("if: always()", purge)
+
         # linux + windows carry the full boundary: conditional clean:false
         # (safe only with their branch-switch wipe step + vcpkg sentinel) plus
         # the trusted-fork cache-isolation trio.
@@ -406,6 +424,33 @@ class WorkflowWiringTests(unittest.TestCase):
                 self.assertIn("VCPKG_BINARY_SOURCES=clear", job)
                 self.assertIn("CCACHE_DIR=$cache_root/ccache", job)
                 self.assertIn("Purge trusted-fork workspace", job)
+
+    def test_pr_derived_checkout_refs_stay_in_the_quarantined_workflows(self) -> None:
+        """#4471: CodeQL's actions/cache-poisoning/poisonable-step is excluded in
+        .github/codeql/codeql-config.yml because its model cannot see the
+        trusted-fork/pr-<N> quarantine. This sweep is the in-repo replacement:
+        a workflow that checks out a PR-derived ref must be one of the two that
+        carry the quarantine assertion. Extending the allowlist is a security
+        decision, not a routine edit."""
+        allowed = {"ci.yml", "fork-dynamic-review.yml"}
+        pr_derived = re.compile(
+            r"refs/pull/|github\.event\.pull_request\.head|inputs\.(pr_number|head_sha)"
+            r"|needs\.[A-Za-z0-9_-]+\.outputs\.checkout_ref"
+        )
+        offenders = []
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            # A checkout step's `with:` block: the indented lines after the
+            # `uses:` line (either `- uses:` or `- name:` + `uses:` form) up to
+            # the next `- ` step.
+            for step in re.finditer(
+                r"(?m)^[ \t]*(?:- )?uses: actions/checkout@[^\n]*\n((?:(?![ \t]*- )[ \t]+[^\n]*\n)*)",
+                text,
+            ):
+                ref = re.search(r"(?m)^[ \t]*ref:[ \t]*(.+)$", step.group(1))
+                if ref and pr_derived.search(ref.group(1)) and path.name not in allowed:
+                    offenders.append(f"{path.name}: ref: {ref.group(1).strip()}")
+        self.assertEqual(offenders, [])
 
         # macOS deliberately keeps actions/checkout's default clean:true (a
         # fresh workspace every run is a *stronger* fork-isolation boundary; the

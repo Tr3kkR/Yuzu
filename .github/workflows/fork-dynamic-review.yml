@@ -35,6 +35,15 @@ jobs:
         run: |
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]]
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          # CWE-349 (#4471): this run executes UNREVIEWED fork code in the
+          # dispatch ref's GitHub Actions cache scope. Same quarantine
+          # contract as ci.yml's trusted_inputs step (its comment carries the
+          # full rationale): only a throwaway per-PR trusted-fork/pr-<N>[-<sha>]
+          # branch, never main/dev. Runbook: docs/ci-troubleshooting.md 1.2.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-${PR_NUMBER}(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::fork-dynamic-review must be dispatched on refs/heads/trusted-fork/pr-${PR_NUMBER}[-<sha>] (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
+            exit 1
+          }
 
       - name: Check out exact PR revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
