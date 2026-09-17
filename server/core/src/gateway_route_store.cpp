@@ -191,6 +191,13 @@ CREATE INDEX agent_routes_session_id_idx ON agent_routes (session_id);
         {2, R"(
 CREATE TABLE IF NOT EXISTS route_meta(key TEXT PRIMARY KEY, value TEXT);
 )"},
+        // v3 (#4324): the per-home generation fence. Nullable — a legacy
+        // gateway build (or a row from before this slice) has no home id.
+        // See the file header "SLICE #4324" for the asymmetric deregister
+        // predicate this column enables.
+        {3, R"(
+ALTER TABLE agent_routes ADD COLUMN stream_home_id TEXT;
+)"},
     };
     return kMigrations;
 }
@@ -259,12 +266,14 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "  session_id = EXCLUDED.session_id, "
         "  cluster_id = NULL, "
         "  gateway_node = NULL, "
+        "  stream_home_id = NULL, "
         // A winning re-register is a NEW connection — it must NOT inherit the
         // superseded session's lease. Reset to NULL here; the connection's own
         // announce_connected / first heartbeat renew establishes a fresh lease.
-        // (cluster_id/gateway_node are ALSO reset to NULL above, for the same
-        // reason: both are connection-specific until announce_connected
-        // confirms them.)
+        // (cluster_id/gateway_node/stream_home_id are ALSO reset to NULL
+        // above, for the same reason: all three are connection-specific until
+        // announce_connected confirms them — stream_home_id IS placement,
+        // #4324, same as cluster_id/gateway_node.)
         "  lease_until = NULL, "
         "  updated_at = now() "
         "WHERE EXCLUDED.connection_epoch > agent_routes.connection_epoch "
@@ -296,7 +305,7 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
 std::expected<AnnounceResult, GatewayRouteStoreError>
 GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_view session_id,
                                       std::string_view cluster_id, std::string_view gateway_node,
-                                      int lease_ttl_secs) {
+                                      int lease_ttl_secs, std::string_view stream_home_id) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     auto lease = pool_.try_acquire_for(kWriteTimeout);
@@ -311,18 +320,23 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
     // An EMPTY cluster_id is stored as NULL ("unknown"), never as ''. A gateway
     // build predating WS-4's field 7 sends no cluster_id (proto3 yields ""); a
     // future reader distinguishes "unknown" via IS NULL, and '' would be a third
-    // state it would misclassify during a mixed-version rollout.
+    // state it would misclassify during a mixed-version rollout. `stream_home_id`
+    // (#4324) follows the SAME convention, for the SAME reason (a gateway build
+    // predating #4324, or a caller not yet threading it through, yields "").
     std::optional<std::string> cluster_arg =
         cluster_id.empty() ? std::nullopt : std::optional<std::string>{std::string(cluster_id)};
+    std::optional<std::string> home_id_arg =
+        stream_home_id.empty() ? std::nullopt
+                                : std::optional<std::string>{std::string(stream_home_id)};
     pg::PgResult upd = pg::exec_params(
         lease.get(),
         "UPDATE gateway_route_store.agent_routes SET "
-        "  cluster_id=$3, gateway_node=$4, "
+        "  cluster_id=$3, gateway_node=$4, stream_home_id=$6, "
         "  lease_until = now() + ($5 || ' seconds')::interval, updated_at = now() "
         "WHERE agent_id=$1 AND session_id=$2 RETURNING agent_id",
         std::vector<std::optional<std::string>>{
             std::string(agent_id), std::string(session_id), std::move(cluster_arg),
-            std::string(gateway_node), std::to_string(lease_ttl_secs)});
+            std::string(gateway_node), std::to_string(lease_ttl_secs), home_id_arg});
     if (upd.status() != PGRES_TUPLES_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: update failed: {}",
                       PQresultErrorMessage(upd.get()));
@@ -339,13 +353,14 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
         lease.get(),
         "INSERT INTO gateway_route_store.agent_routes "
         "  (agent_id, cluster_id, gateway_node, connection_epoch, session_id, lease_until, "
-        "   updated_at) "
-        "VALUES ($1, $2, $3, 0, $4, now() + ($5 || ' seconds')::interval, now()) "
+        "   updated_at, stream_home_id) "
+        "VALUES ($1, $2, $3, 0, $4, now() + ($5 || ' seconds')::interval, now(), $6) "
         "ON CONFLICT (agent_id) DO NOTHING",
         std::vector<std::optional<std::string>>{
             std::string(agent_id),
             cluster_id.empty() ? std::nullopt : std::optional<std::string>{std::string(cluster_id)},
-            std::string(gateway_node), std::string(session_id), std::to_string(lease_ttl_secs)});
+            std::string(gateway_node), std::string(session_id), std::to_string(lease_ttl_secs),
+            std::move(home_id_arg)});
     if (ins.status() != PGRES_COMMAND_OK) {
         spdlog::error("GatewayRouteStore::announce_connected: fallback insert failed: {}",
                       PQresultErrorMessage(ins.get()));
@@ -355,7 +370,8 @@ GatewayRouteStore::announce_connected(std::string_view agent_id, std::string_vie
 }
 
 std::expected<DeregisterResult, GatewayRouteStoreError>
-GatewayRouteStore::deregister(std::string_view agent_id, std::string_view session_id) {
+GatewayRouteStore::deregister(std::string_view agent_id, std::string_view session_id,
+                              std::string_view stream_home_id) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     auto lease = pool_.try_acquire_for(kWriteTimeout);
@@ -365,13 +381,29 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     }
     // Session-guarded: a stale DISCONNECTED from a DIFFERENT, superseded session
     // cannot tear down a newer re-home's row (its session_id will not match).
-    // A SAME-session late DISCONNECTED is NOT fenced here — the re-announce path
-    // reuses the session id, so session_id equality alone cannot tell an old
-    // home's teardown from a newer re-home under the same id. That direction is
-    // #4246 #4 / #4324, RE-SCOPED (needs a per-home generation on the wire) and
-    // unreachable under the shipped gateway today (at most one CONNECTED(S) and
-    // one DISCONNECTED(S) per session) — see the header SESSION GUARDS LIMIT and
-    // ADR-2002 §7.
+    // A SAME-session late DISCONNECTED is additionally fenced by `stream_home_id`
+    // (file header SLICE #4324, #4246 #4): the re-announce path reuses the
+    // session id, so session_id equality alone cannot tell an old home's
+    // teardown from a newer re-home under the same id — the ASYMMETRIC
+    // predicate below closes that gap at the store layer. (The RPC-handler
+    // wiring that threads a caller's real `stream_home_id` through is a later
+    // #4324 task — see gateway_route_store.hpp's SLICE #4324 note; until then
+    // every call here passes the default empty string, so behaviour is
+    // unchanged.)
+    //
+    // The predicate is ASYMMETRIC, not the naive symmetric form
+    // (`$3 = '' OR stream_home_id = $3`): an UNSTAMPED (empty `$3`) incoming
+    // DISCONNECTED may ONLY tombstone a row whose STORED `stream_home_id` is
+    // ALSO NULL/unstamped — never a row a stamped CONNECTED has since
+    // re-homed. A stamped `$3` still requires an EXACT match against the
+    // stored value (a stale stamped DISCONNECTED from a superseded home
+    // cannot tear down a different, newer stamped home either). This is what
+    // protects a rolling gateway upgrade (mixed old-build/new-build gateway
+    // nodes is the NORMAL state of one): an old-build node's late unstamped
+    // DISCONNECTED must not tombstone a new-build node's stamped re-home
+    // reusing the same session id, while a legacy DISCONNECTED against a
+    // legacy (never-stamped) row still behaves exactly as before (backward
+    // compatibility with a fleet that has no home-id-aware gateways yet).
     //
     // TOMBSTONE, not DELETE (file header "SLICE 4.2a", closes 4.2 design-doc
     // obligation #5 — late-CONNECTED resurrection, NOT #4). A DELETE lets a late/reordered CONNECTED for this
@@ -389,13 +421,24 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     // strictly higher epoch and always wins the guarded UPSERT regardless of
     // what the tombstoned row's epoch is, so retaining it costs nothing and
     // avoids re-litigating fence state on every deregister/reconnect cycle.
+    //
+    // `home_id_arg` ALWAYS carries a value (never nullopt), even when empty —
+    // unlike announce_connected's cluster/home-id args, which map an empty
+    // input to a stored NULL. Here the empty string must arrive at Postgres
+    // AS an empty string literal, not NULL, because the asymmetric predicate
+    // itself tests `$3 = ''` (a NULL parameter would make that comparison
+    // NULL/falsy and silently disable the legacy-compatibility branch).
+    std::optional<std::string> home_id_arg{std::string(stream_home_id)};
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "UPDATE gateway_route_store.agent_routes SET "
         "  session_id=NULL, lease_until=NULL, cluster_id=NULL, gateway_node=NULL, "
-        "  updated_at=now() "
-        "WHERE agent_id=$1 AND session_id=$2 RETURNING agent_id",
-        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id)});
+        "  stream_home_id=NULL, updated_at=now() "
+        "WHERE agent_id=$1 AND session_id=$2 "
+        "  AND (stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')) "
+        "RETURNING agent_id",
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
+                                                 std::move(home_id_arg)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::error("GatewayRouteStore::deregister: query failed: {}",
                       PQresultErrorMessage(res.get()));
@@ -735,7 +778,7 @@ std::expected<ReapRoutesResult, GatewayRouteStoreError> GatewayRouteStore::reap_
                 c,
                 "UPDATE gateway_route_store.agent_routes SET "
                 "  session_id=NULL, lease_until=NULL, cluster_id=NULL, gateway_node=NULL, "
-                "  updated_at=now() "
+                "  stream_home_id=NULL, updated_at=now() "
                 "WHERE agent_id IN (SELECT agent_id FROM gateway_route_store.agent_routes "
                 "  WHERE lease_until IS NOT NULL "
                 "    AND (extract(epoch FROM lease_until) * 1000)::bigint < $1::bigint "

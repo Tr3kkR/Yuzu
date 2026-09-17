@@ -231,6 +231,27 @@ public:
         return PQntuples(r.get()) > 0;
     }
 
+    // The stored `stream_home_id` column value, or nullopt if NULL — for
+    // asserting announce_connected/register_fresh/deregister's #4324
+    // stream_home_id writes; bypasses lookup_route/RouteRow, which do not
+    // expose the column (#4324 is store-layer-only in this slice — see
+    // gateway_route_store.hpp's SLICE #4324 note).
+    std::optional<std::string> raw_get_stream_home_id(const std::string& agent_id) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* p1 = agent_id.c_str();
+        const char* params[1] = {p1};
+        yuzu::server::pg::PgResult r{PQexecParams(
+            conn.get(),
+            "SELECT stream_home_id FROM gateway_route_store.agent_routes WHERE agent_id=$1", 1,
+            nullptr, params, nullptr, nullptr, 0)};
+        REQUIRE(r.status() == PGRES_TUPLES_OK);
+        REQUIRE(PQntuples(r.get()) == 1);
+        if (PQgetisnull(r.get(), 0, 0))
+            return std::nullopt;
+        return std::string(PQgetvalue(r.get(), 0, 0));
+    }
+
     // Bulk-insert `count` rows with lease_until well in the past, directly
     // via SQL — looping register_fresh/announce_connected `count` times would
     // make the cap test the slow part of the suite (mirrors
@@ -487,6 +508,170 @@ TEST_CASE("GatewayRouteStore[pg]: register_fresh after a tombstone mints a highe
     CHECK((*row)->connection_epoch == r2->epoch);
     REQUIRE((*row)->session_id.has_value());
     CHECK(*(*row)->session_id == "session-new");
+}
+
+// --- #4324: stream_home_id per-home generation fence (store layer) --------
+
+TEST_CASE("GatewayRouteStore[pg]: announce_connected writes stream_home_id on a winning "
+          "placement (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-1", "session-1").value().won);
+    auto ann =
+        fx.store().announce_connected("agent-home-1", "session-1", "c1", "n1", 30, "home-abc");
+    REQUIRE(ann.has_value());
+    CHECK(ann->matched);
+
+    auto home_id = fx.raw_get_stream_home_id("agent-home-1");
+    REQUIRE(home_id.has_value());
+    CHECK(*home_id == "home-abc");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: register_fresh NULLs stream_home_id on a winning re-register, "
+          "same as cluster_id/gateway_node (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-2", "session-S1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-2", "session-S1", "c1", "n1", 30, "home-old")
+                .value()
+                .matched);
+    REQUIRE(fx.raw_get_stream_home_id("agent-home-2").has_value());
+
+    auto r2 = fx.store().register_fresh("agent-home-2", "session-S2");
+    REQUIRE(r2.has_value());
+    CHECK(r2->won);
+
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-2").has_value());
+    // cluster_id/gateway_node are NULLed too (4.2b, pre-existing) — assert
+    // the whole placement, not just the new column, dropped together.
+    auto row = fx.store().lookup_route("agent-home-2");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->cluster_id.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister tombstones when the incoming stream_home_id "
+          "EXACTLY matches the stored one (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-3", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-3", "session-1", "c1", "n1", 30, "home-match")
+                .value()
+                .matched);
+
+    auto out = fx.store().deregister("agent-home-3", "session-1", "home-match");
+    REQUIRE(out.has_value());
+    CHECK(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-3");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-3").has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister does NOT tombstone when the incoming "
+          "stream_home_id is a STALE mismatch against the stored one — the core "
+          "asymmetric-fence case (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-4", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-4", "session-1", "c1", "n1", 30, "home-current")
+                .value()
+                .matched);
+
+    // A stale DISCONNECTED carrying a DIFFERENT (superseded) home id for the
+    // same session must not tear down the row's current placement.
+    auto out = fx.store().deregister("agent-home-4", "session-1", "home-stale");
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-4");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    REQUIRE((*row)->session_id.has_value());
+    CHECK(*(*row)->session_id == "session-1");
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "c1");
+    auto home_id = fx.raw_get_stream_home_id("agent-home-4");
+    REQUIRE(home_id.has_value());
+    CHECK(*home_id == "home-current");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister tombstones a legacy row when neither side ever "
+          "carried a stream_home_id — backward compatibility (#4324)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-5", "session-1").value().won);
+    // Neither call passes stream_home_id — both default to empty ("legacy,
+    // no home id"), so the stored column stays NULL, exactly as it would for
+    // a gateway build predating #4324.
+    REQUIRE(
+        fx.store().announce_connected("agent-home-5", "session-1", "c1", "n1", 30).value().matched);
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-5").has_value());
+
+    auto out = fx.store().deregister("agent-home-5", "session-1");
+    REQUIRE(out.has_value());
+    CHECK(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-5");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+}
+
+TEST_CASE("GatewayRouteStore[pg]: deregister with an EMPTY (old-build gateway) stream_home_id "
+          "does NOT tombstone a row carrying a STAMPED stream_home_id — the asymmetry a naive "
+          "symmetric predicate gets wrong (#4324, rolling gateway upgrade)",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-home-6", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-home-6", "session-1", "c1", "n1", 30, "home-newbuild")
+                .value()
+                .matched);
+
+    // An old-build gateway node's DISCONNECTED for the same session id
+    // carries NO stream_home_id (empty — the pre-#4324 wire shape). It must
+    // not be able to tear down a new-build node's stamped re-home reusing
+    // that session id. The naive symmetric predicate
+    // (`$3 = '' OR stream_home_id = $3`) would wrongly match here; the
+    // shipped asymmetric predicate must not.
+    auto out = fx.store().deregister("agent-home-6", "session-1", "");
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-6");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    REQUIRE((*row)->session_id.has_value());
+    CHECK(*(*row)->session_id == "session-1");
+    REQUIRE((*row)->cluster_id.has_value());
+    CHECK(*(*row)->cluster_id == "c1");
+    auto home_id = fx.raw_get_stream_home_id("agent-home-6");
+    REQUIRE(home_id.has_value());
+    CHECK(*home_id == "home-newbuild");
+}
+
+TEST_CASE("GatewayRouteStore[pg]: reap_stale_routes' expired-lease tombstone sweep clears "
+          "stream_home_id too (#4324)",
+          "[gateway_route][pg][store][reap]") {
+    GatewayRoutePg fx;
+    REQUIRE(fx.store().register_fresh("agent-reap-home-1", "session-1").value().won);
+    REQUIRE(fx.store()
+                .announce_connected("agent-reap-home-1", "session-1", "c1", "n1", 30, "home-x")
+                .value()
+                .matched);
+    fx.raw_set_lease_until_ago("agent-reap-home-1", 200); // past the 180s grace
+
+    auto out = fx.store().reap_stale_routes();
+    REQUIRE(out.has_value());
+    CHECK(out->expired_leases_reaped == 1);
+
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-reap-home-1").has_value());
 }
 
 TEST_CASE("GatewayRouteStore[pg]: renew_leases bumps lease_until only for named sessions, batched",
