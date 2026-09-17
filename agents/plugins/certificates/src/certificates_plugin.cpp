@@ -491,6 +491,14 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
             mark_result_partial(ctx, "cryptoapi:store-enum");
             continue;
         }
+        // Snapshot the fallback stores accumulated from EARLIER iterations,
+        // before this store's own (possible) append below -- if a match
+        // turns up in this store, any name in here fell back to CurrentUser
+        // with no match of its own and would otherwise never get its
+        // disclosure row (the "scan incomplete" summary below is skipped
+        // entirely on an early match-and-return, silently dropping it;
+        // CDX-P1-001).
+        std::string prior_fallback = fallback;
         bool is_fallback = enumeration.location == StoreLocation::kCurrentUser;
         if (is_fallback) {
             append_store(fallback, store_name);
@@ -498,6 +506,18 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
         }
         for (const auto& rec : enumeration.records) {
             if (rec.thumbprint == needle) {
+                if (!prior_fallback.empty()) {
+                    // An earlier store in this scan fell back to CurrentUser
+                    // and didn't match -- its own row-level disclosure was
+                    // never written because the loop moved on without a
+                    // return. Disclose it now, alongside (not instead of)
+                    // the current store's own disclosure below, or the scan
+                    // silently omits a fallback #4377 requires surfaced.
+                    ctx.write_output(std::format(
+                        "not_available|{} store(s) (LocalMachine) could not be opened; rows read "
+                        "from CurrentUser",
+                        prior_fallback));
+                }
                 if (is_fallback) {
                     // Disclosed fallback (#4377), same wording and ordering
                     // as list_certs_win's matching branch: the row about to
