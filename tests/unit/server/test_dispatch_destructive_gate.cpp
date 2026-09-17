@@ -44,6 +44,7 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
 #include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
@@ -421,6 +422,34 @@ TEST_CASE("Inventory ReadOnly row stays NotDestructive — the single-target rul
     CHECK(gate.verdict == DestructiveTargetingVerdict::NotDestructive);
 }
 
+// Wave 7b PR7b.3 — pins the REAL app_usage fragment (not the hand-built
+// kForensicsFixture above) through the same Forensics single-target rule:
+// app_usage's three rows are ReadOnly/AdminOrApproval under the Forensics
+// securable, so they must be targeted exactly as execution_artifacts is.
+TEST_CASE("app_usage.summary (real fragment): Forensics single-target rule — 1 agent Targeted, "
+          "2 agents RefuseUntargeted",
+          "[server][dispatch][security]") {
+    namespace capdecls = yuzu::server::capdecls;
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_app_usage()};
+    auto classified = registry.classify("app_usage", "summary");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable == kForensicsSecurable);
+    CHECK(requires_explicit_targets(*classified));
+
+    const auto targeted = evaluate_destructive_targeting(classified,
+                                                          /*valid_nonempty_agent_ids=*/true,
+                                                          /*scope_key_present=*/false,
+                                                          /*agent_id_count=*/1);
+    CHECK(targeted.verdict == DestructiveTargetingVerdict::Targeted);
+
+    const auto refused = evaluate_destructive_targeting(classified,
+                                                         /*valid_nonempty_agent_ids=*/true,
+                                                         /*scope_key_present=*/false,
+                                                         /*agent_id_count=*/2);
+    CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
+    CHECK(refused.refusal_reason == kReasonForensicUntargeted);
+}
+
 TEST_CASE("Destructive RefuseUntargeted arms carry the Destructive reason/message, not the "
           "Forensics pair",
           "[server][dispatch][security]") {
@@ -519,6 +548,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::plugin_action_catalogue_autoruns(),
+        capdecls::plugin_action_catalogue_app_usage(),
         capdecls::plugin_action_catalogue_execution_artifacts(),
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_printing(),
@@ -570,6 +600,7 @@ TEST_CASE("catalogue-consistency tripwire: the live Destructive row count is 17,
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::plugin_action_catalogue_autoruns(),
+        capdecls::plugin_action_catalogue_app_usage(),
         capdecls::plugin_action_catalogue_execution_artifacts(),
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_printing(),

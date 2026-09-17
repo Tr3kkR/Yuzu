@@ -14,6 +14,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `agent_actions` | ✅ ✅ ✅ | Agent runtime actions — set log level, query agent info | [README](../../agents/plugins/agent_actions/README.md) |
 | `agent_logging` | ✅ ✅ ✅ | Remote agent log access — retrieve log tail, list key agent files | [README](../../agents/plugins/agent_logging/README.md) |
 | `antivirus` | ✅ ✅ ✅ | Antivirus product detection, status, and Defender exclusions | [README](../../agents/plugins/antivirus/README.md) |
+| `app_usage` | ✅ 🟡 ✅ | Read-only machine-scope app usage inventory derived from TAR's usage fold (no pid, command line, or user names in output) | [README](../../agents/plugins/app_usage/README.md) |
 | `asset_tags` | ✅ ✅ ✅ | Structured asset tag awareness — syncs server-assigned tags locally and detects changes | [README](../../agents/plugins/asset_tags/README.md) |
 | `autoruns` | ✅ ✅ ✅ | Enumerates persistence sources (what starts automatically) across Windows, Linux and macOS | [README](../../agents/plugins/autoruns/README.md) |
 | `bitlocker` | ✅ ✅ ✅ | Disk encryption status — BitLocker, LUKS, FileVault | [README](../../agents/plugins/bitlocker/README.md) |

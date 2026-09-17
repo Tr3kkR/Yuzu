@@ -91,6 +91,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
@@ -108,12 +109,15 @@ FRAGMENT_FILES = [
 # off by a further 2 rows for reasons lost to history — 203 is the value
 # re-derived from the fragments themselves, not from reconciling 206.)
 # Wave 7 PR7.1: +2 autoruns (list/catalog).
+# Wave 7b PR7b.3: +3 app_usage (summary/last_used/foreground).
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
 # focused follow-up PR on top of this one.
-# Running total: 194 (base) + 2 + 3 + 2 + 2 = 203.
-EXPECTED_TOTAL_ROWS = 203
+# Running total: 194 (base, already includes __sync__.now — see above) +
+# 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
+# 2 (windows_optional_features) + 2 (printing) = 206.
+EXPECTED_TOTAL_ROWS = 206
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
