@@ -855,7 +855,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `device.network.netstat_list` | netstat | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32 |
 | `device.network_diag.listening` | listening | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, pid:int32 |
 | `device.network_diag.connections` | connections | Q | WLM | *(none)* | proto:string, local_addr:string, remote_addr:string, remote_port:int32, pid:int32 |
-| `device.network.sockwho_list` | sockwho | Q | WLM | *(none)* | pid:int32, process_name:string, proto:string, local_addr:string, remote_addr:string, state:string |
+| `device.network.netstat_attribution` | attribution | Q | WLM | *(none)* | proto:string, local_addr:string, local_port:int32, remote_addr:string, remote_port:int32, state:string, pid:int32, process_name:string, process_path:string |
 | `device.network_actions.flush_dns` | flush_dns | A | WLM | *(none)* | status:string, output:string |
 | `device.network_actions.ping` | ping | A | WLM | host:string (req) | output:string |
 | `device.wifi.list_networks` | wifi scan | Q | WLM | *(none)* | ssid:string, signal:string, security:string |
@@ -883,6 +883,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 |---|---|---|---|---|---|
 | `security.antivirus.products` | products | Q | WLM | *(none)* | name:string, state:string |
 | `security.antivirus.defender_status` | defender | Q | W | *(none)* | realtime_protection:string, definition_version:string, last_update:string |
+| `security.antivirus.xprotect_status` | status | Q | M | *(none)* | definition_version:string, last_update:string, remediator_version:string, mrt_version:string |
 | `security.firewall.state` | state | Q | WLM | *(none)* | profile_or_backend:string, state:string |
 | `security.firewall.rules` | rules | Q | WLM | *(none)* | rule_name:string, enabled:string, direction:string, action:string |
 | `security.certificates.list` | list | Q | WLM | store:string, expiring_within_days:int32 | subject:string, issuer:string, thumbprint:string, not_after:string |
@@ -940,7 +941,8 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | Definition ID | Action | Type | Platforms | Parameters | Result Columns |
 |---|---|---|---|---|---|
 | `windows.registry.get_value` | get_value | Q | W | hive:enum (req), key:string (req), name:string (req) | value:string, type:string |
-| `windows.registry.get_user_value` | get_user_value | Q | W | username:string (req), key:string (req), name:string | username:string, value:string, type:string |
+| `windows.registry.get_user_value` | get_user_value | Q | W | username:string, sid:string, key:string (req), name:string | username:string, value:string, type:string |
+| `windows.registry.list_profiles` | list_profiles | Q | W | (none) | sid:string, profile_name:string, profile_path:string, hive_state:string |
 | `windows.registry.set_value` | set_value | A | W | hive:enum (req), key:string (req), name:string (req), value:string (req), type:enum | status:string |
 | `windows.registry.delete_value` | delete_value | A | W | hive:enum (req), key:string (req), name:string (req) | status:string |
 | `windows.registry.delete_key` | delete_key | A | W | hive:enum (req), key:string (req) | status:string |

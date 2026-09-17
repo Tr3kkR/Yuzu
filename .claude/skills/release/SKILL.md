@@ -299,10 +299,14 @@ After all verification passes:
 
 1. **Bump dev branch to next dev version.** On `dev`:
    ```bash
-   # Update meson.build version to X.Y.(Z+1)-dev or (X+1).Y.0-dev (operator's call)
+   # Update meson.build version to X.Y.(Z+1) or (X+1).Y.0 (operator's call).
+   # PLAIN version only — never a -dev/-rcN suffix. The suffix convention was
+   # tried at 0.13.1-dev and rejected (operator ruling 2026-07-13): it
+   # generated `int kVersionPatch = 1-dev;` via version.hpp.in and red-lined
+   # the entire C++ matrix on dev + every open PR (fixed in fca69e34).
    # (No CHANGELOG step: the promote already left the ## [Unreleased] header +
    # do-not-edit note in place; new entries arrive as changelog.d/ fragments.)
-   git commit -m "chore(post-release): bump dev to X.Y.Z+1-dev"
+   git commit -m "chore(post-release): bump dev to X.Y.Z+1"
    git push origin dev
    ```
 2. **Reconcile main → dev** if the release tag was on a main commit not yet merged into dev (rare on this project — usually dev → main first).
@@ -328,7 +332,7 @@ SHA256SUMS:  verified
 
 Compose Wizard: bundled (or absent — see Phase 5)
 
-Next dev version: X.Y.(Z+1)-dev (operator: bump on dev branch)
+Next dev version: X.Y.(Z+1) (operator: bump on dev branch — plain version, no -dev suffix)
 ```
 
 If anything failed, list the failures + the fix attempted + final status, and explicitly state whether the release is shippable as-is or requires a follow-up patch release.

@@ -21,7 +21,13 @@
 namespace yuzu::server {
 
 [[nodiscard]] inline bool is_typed_inventory_source(std::string_view source) {
-    return source == "installed_software" || source == "app_perf" || source == "device_ci";
+    // software_licensing (ADR-0024 Decision 5): registered in the SAME change
+    // as its seam (software_licensing_ingestion) — omission would double-store
+    // detected-licence rows (incl. `user_ref`) into the generic store on the
+    // gateway path, readable under Infrastructure:Read, i.e. a leak past the
+    // SoftwareLicensing securable.
+    return source == "installed_software" || source == "app_perf" || source == "device_ci" ||
+           source == "software_licensing";
 }
 
 } // namespace yuzu::server

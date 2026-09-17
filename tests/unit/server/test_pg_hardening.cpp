@@ -68,7 +68,7 @@ std::string setting(PGconn* conn, const char* name) {
 
 } // namespace
 
-TEST_CASE("PgPool injects statement_timeout and lock_timeout GUCs", "[pg][hardening]") {
+TEST_CASE("PgPool injects statement_timeout and lock_timeout GUCs", "[pg][hardening][pg-smoke]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(),
                  .size = 2,

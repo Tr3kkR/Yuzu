@@ -13,6 +13,7 @@
 #include <libpq-fe.h>
 
 #include <chrono>
+#include <stdexcept>
 #include <string>
 
 using yuzu::server::OfflineEndpoint;
@@ -22,6 +23,16 @@ using yuzu::server::pg::PgPool;
 using yuzu::server::pg::PgResult;
 
 namespace {
+
+// Pre-migrated template (see PgTestTemplate in test_helpers.hpp). The
+// migration-failure test stays on plain YUZU_REQUIRE_PG_DB — it pre-seeds a
+// conflicting schema and needs the store's schema to NOT exist yet.
+yuzu::test::PgTestTemplate offline_tpl{"offline", [](const std::string& dsn) {
+    PgPool pool{{.conninfo = dsn, .size = 1}};
+    OfflineEndpointStore store{pool};
+    if (!store.is_open())
+        throw std::runtime_error("offline template: store failed to migrate");
+}};
 
 std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -39,7 +50,7 @@ const OfflineEndpoint* find(const std::vector<OfflineEndpoint>& v, const std::st
 } // namespace
 
 TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
 
@@ -89,6 +100,44 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
         auto rows = store.query_stale_within(std::chrono::hours(1));
         CHECK(find(rows, "") == nullptr);
     }
+
+    // Round-3 v2 columns (Devices-page merge, item 1): agent_version/arch.
+    SECTION("v2 round-trip: agent_version and arch persist") {
+        REQUIRE(store.upsert("agent-v2", "host-v2", "windows", t, 0, "1.4.2", "x86_64"));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-v2");
+        REQUIRE(v != nullptr);
+        CHECK(v->agent_version == "1.4.2");
+        CHECK(v->arch == "x86_64");
+    }
+
+    SECTION("v2 blank-preserve: a blank agent_version/arch does not clobber a known value") {
+        REQUIRE(store.upsert("agent-v2b", "host-v2b", "linux", t - 1000, 0, "2.0.0", "arm64"));
+        // A later heartbeat that raced the session lookup supplies blanks —
+        // hostname/os still update unconditionally, but the last-known
+        // version/arch must survive (see upsert()'s CASE WHEN doc comment).
+        REQUIRE(store.upsert("agent-v2b", "host-v2b-renamed", "linux", t, 0, "", ""));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-v2b");
+        REQUIRE(v != nullptr);
+        CHECK(v->hostname == "host-v2b-renamed"); // unconditional field still updates
+        CHECK(v->agent_version == "2.0.0");       // preserved, not blanked
+        CHECK(v->arch == "arm64");                // preserved, not blanked
+    }
+
+    SECTION("v2 pre-migration rows read back as empty version/arch") {
+        // No explicit pre-v1-only fixture is practical here (the template
+        // always migrates through the latest version) — this asserts the
+        // DEFAULT '' on a row that never supplied them, which is the same
+        // observable shape a genuinely pre-v2 row would have after the
+        // ADD COLUMN migration runs.
+        REQUIRE(store.upsert("agent-noversion", "h", "linux", t, 0));
+        auto rows = store.query_stale_within(std::chrono::hours(1));
+        const auto* v = find(rows, "agent-noversion");
+        REQUIRE(v != nullptr);
+        CHECK(v->agent_version.empty());
+        CHECK(v->arch.empty());
+    }
 }
 
 // gov fjarvis B1: a reachable database whose schema migration FAILS must leave
@@ -97,7 +146,7 @@ TEST_CASE("OfflineEndpointStore migrates and upserts", "[pg][offline]") {
 // store's schema with no schema_meta row: the migration runner's schema-drift
 // guard refuses (version 0 but tables exist), so run() returns false.
 TEST_CASE("OfflineEndpointStore reports !is_open on a migration failure", "[pg][offline]") {
-    YUZU_REQUIRE_PG_DB(db);
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
 
     // Pre-seed: create the endpoint_state schema + a conflicting table, but no
     // public.schema_meta row for the store — the drift guard will refuse.

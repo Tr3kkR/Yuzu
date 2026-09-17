@@ -12,6 +12,8 @@
 %%%   - proxy_register returns upstream response
 %%%   - proxy_inventory returns upstream response
 %%%   - notify_stream_status is fire-and-forget (no crash on error)
+%%%   - connect notification advertises the command_dispatch_tag_v1 wire
+%%%     capability (CC-03)
 %%%   - Buffer is retained on flush failure (not silently discarded)
 %%%   - Buffer retention is capped to prevent unbounded growth
 %%% @end
@@ -35,6 +37,7 @@ upstream_test_() ->
       {"proxy_register returns error", fun proxy_register_error/0},
       {"proxy_inventory returns response", fun proxy_inventory_ok/0},
       {"notify_stream_status does not crash on error", fun notify_no_crash/0},
+      {"connect notification advertises command_dispatch_tag_v1", fun notify_advertises_dispatch_tag_capability/0},
       {"buffer retained on flush failure", fun buffer_retained_on_failure/0},
       {"buffer cap prevents unbounded growth", fun buffer_cap_on_failure/0}
      ]}.
@@ -170,6 +173,27 @@ notify_no_crash() ->
     timer:sleep(100),
     %% The upstream process should still be alive.
     ?assert(is_process_alive(whereis(yuzu_gw_upstream))).
+
+%% CC-03: the StreamStatusNotification the gateway sends on the agent's
+%% CONNECTED event — the first message a gateway-connected agent's session
+%% causes the gateway to emit upstream — must advertise the literal
+%% "command_dispatch_tag_v1" in wire_capabilities, proving to the server's
+%% dispatch chokepoint that this gateway build carries
+%% CommandRequest.dispatch_tag = 9 through untouched.
+notify_advertises_dispatch_tag_capability() ->
+    meck:reset(grpcbox_client),
+    meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
+        {ok, #{acknowledged => true}, #{}}
+    end),
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>),
+    timer:sleep(100),
+    Calls = meck:history(grpcbox_client),
+    NotifyReqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,
+                         binary:match(Path, <<"NotifyStreamStatus">>) =/= nomatch],
+    ?assert(length(NotifyReqs) > 0),
+    [LastReq | _] = lists:reverse(NotifyReqs),
+    ?assert(lists:member(<<"command_dispatch_tag_v1">>,
+                         maps:get(wire_capabilities, LastReq, []))).
 
 buffer_retained_on_failure() ->
     %% First drain any existing buffer.

@@ -166,7 +166,8 @@ TEST_CASE("TAR schema: accepted_capture_methods_for_os is OS-specific (#540)",
     CHECK_FALSE(contains(win_ok, "procfs"));
 
     auto mac_ok = accepted_capture_methods_for_os("tcp", "macos");
-    CHECK(contains(mac_ok, "proc_pidfdinfo"));
+    CHECK(contains(mac_ok, "proc_pidfdinfo")); // fallback/seed poll
+    CHECK(contains(mac_ok, "nstat"));          // primary tcp-lifecycle source (roadmap 2.2)
     CHECK_FALSE(contains(mac_ok, "iphlpapi"));
 
     // An unknown OS yields an empty accept-list (everything rejected, fail-safe).
@@ -242,7 +243,12 @@ TEST_CASE("TAR schema: opt-in sources declare default_enabled=false",
         INFO("opt-in source=" << name);
         CHECK_FALSE(source_default_enabled(name));
     }
-    for (const auto* name : {"process", "tcp", "service", "user", "perf"}) {
+    // power/removable are default-ON by the Wave 6 operator ruling — the first
+    // capture sources to ship enabled. They belong in THIS list, not a separate
+    // assertion in the cursor-seam tests: the whole point of this case is that
+    // one file states the enable posture for every source, so a source added
+    // with the wrong default fails here rather than nowhere.
+    for (const auto* name : {"process", "tcp", "service", "user", "perf", "power", "removable"}) {
         INFO("always-on source=" << name);
         CHECK(source_default_enabled(name));
     }
@@ -353,7 +359,9 @@ TEST_CASE("TAR schema: netqual Windows is kSupportedConstrained via estats (ADR-
     REQUIRE(it != sources.end());
 
     // Windows graduated kPlanned -> kSupportedConstrained (elevation-gated, ms
-    // RTT, since-enable lifetimes); Linux stays fully supported; macOS planned.
+    // RTT, since-enable lifetimes); Linux stays fully supported; macOS graduated
+    // kPlanned -> kSupportedConstrained too (roadmap 2.2, nstat — root needed for
+    // system-wide flow visibility).
     for (const auto& os : it->os_support) {
         INFO("netqual os=" << os.os);
         if (os.os == "windows") {
@@ -362,11 +370,15 @@ TEST_CASE("TAR schema: netqual Windows is kSupportedConstrained via estats (ADR-
         } else if (os.os == "linux") {
             CHECK(os.status == OsSupportStatus::kSupported);
         } else {
-            CHECK(os.status == OsSupportStatus::kPlanned);
+            CHECK(os.os == "macos");
+            CHECK(os.status == OsSupportStatus::kSupportedConstrained);
+            CHECK(os.capture_method == "nstat");
         }
     }
     auto win_methods = accepted_capture_methods_for_os("netqual", "windows");
     CHECK(std::find(win_methods.begin(), win_methods.end(), "estats") != win_methods.end());
+    auto mac_methods = accepted_capture_methods_for_os("netqual", "macos");
+    CHECK(std::find(mac_methods.begin(), mac_methods.end(), "nstat") != mac_methods.end());
 
     // live + the per-boot retrospective baseline tier.
     REQUIRE(it->granularities.size() == 2);
@@ -415,4 +427,107 @@ TEST_CASE("TAR schema: netconn source is registered live-only with Windows wevta
                                                "action",     "channel",  "category",
                                                "capability", "iface_kind", "reason_code"};
     CHECK(cols == expected);
+}
+
+// ── Wave-2 registry reconciliation: arp/mapdrive graduations ────────────────
+//
+// b3 (arp) and b2 (mapdrive-macOS) wired their non-Windows legs; this
+// registry-reconciliation package flipped the three rows below from
+// kPlanned to their real status. These pin the flips directly (independent
+// of the dynamic TSV cross-check in test_tar_capability_table.cpp) so a
+// future edit that regresses either side back toward "planned" is caught
+// here even if the TSV mirror were edited in lockstep.
+
+TEST_CASE("TAR schema: arp graduated to supported on Linux (procfs)",
+          "[tar][schema][arp]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "arp"; });
+    REQUIRE(it != sources.end());
+    auto os_it = std::find_if(it->os_support.begin(), it->os_support.end(),
+                              [](const auto& os) { return os.os == "linux"; });
+    REQUIRE(os_it != it->os_support.end());
+    CHECK(os_it->status == OsSupportStatus::kSupported);
+    CHECK(os_it->capture_method == "procfs");
+}
+
+TEST_CASE("TAR schema: arp graduated to constrained on macOS (route_sysctl, "
+         "entry_type always unknown)",
+          "[tar][schema][arp]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "arp"; });
+    REQUIRE(it != sources.end());
+    auto os_it = std::find_if(it->os_support.begin(), it->os_support.end(),
+                              [](const auto& os) { return os.os == "macos"; });
+    REQUIRE(os_it != it->os_support.end());
+    CHECK(os_it->status == OsSupportStatus::kSupportedConstrained);
+    CHECK(os_it->capture_method == "route_sysctl");
+}
+
+TEST_CASE("TAR schema: mapdrive graduated to constrained on macOS (getfsstat, "
+         "outbound-live-only)",
+          "[tar][schema][mapdrive]") {
+    const auto& sources = capture_sources();
+    auto it = std::find_if(sources.begin(), sources.end(),
+                           [](const CaptureSourceDef& s) { return s.name == "mapdrive"; });
+    REQUIRE(it != sources.end());
+    auto os_it = std::find_if(it->os_support.begin(), it->os_support.end(),
+                              [](const auto& os) { return os.os == "macos"; });
+    REQUIRE(os_it != it->os_support.end());
+    CHECK(os_it->status == OsSupportStatus::kSupportedConstrained);
+    CHECK(os_it->capture_method == "getfsstat");
+}
+
+// ── #2204 unification: OsSupportStatus <-> the ABI4 descriptor enum ────────
+//
+// PR1.1 pins OsSupportStatus's four values 1:1 onto YuzuSupportLevel
+// (sdk/include/yuzu/plugin.h) as the single source of truth; do_compatibility()
+// (tar_plugin.cpp) derives its output from support_level_name() rather than
+// keeping its own private switch. These tests anchor that pin so a future
+// edit to either enum can't silently desynchronize the two — that would
+// either misreport a source's status to operators or, worse, break
+// tar_plugin.cpp's do_compatibility() switch silently (a value the switch
+// doesn't expect maps through a shared function, so a compiler would catch
+// an unhandled case at the ONE definition site, not at every call site).
+
+TEST_CASE("TAR schema: OsSupportStatus values are pinned 1:1 to YuzuSupportLevel",
+         "[tar][schema][abi4]") {
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kSupported)) ==
+         static_cast<int>(YUZU_SUPPORT_SUPPORTED));
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kSupportedConstrained)) ==
+         static_cast<int>(YUZU_SUPPORT_CONSTRAINED));
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kPlanned)) ==
+         static_cast<int>(YUZU_SUPPORT_PLANNED));
+    CHECK(static_cast<int>(to_yuzu_support_level(OsSupportStatus::kUnsupported)) ==
+         static_cast<int>(YUZU_SUPPORT_UNSUPPORTED));
+    // The descriptor's own "no data" value is deliberately unreachable from a
+    // registry row — every row always declares one of the four above.
+    CHECK(static_cast<int>(YUZU_SUPPORT_UNDECLARED) == 0);
+}
+
+TEST_CASE("TAR schema: support_level_name matches do_compatibility()'s prior literal strings",
+         "[tar][schema][abi4]") {
+    // These four strings are do_compatibility()'s wire contract (the
+    // `compatibility` action's 3rd column) — pinning them here means a
+    // future edit to support_level_name() that silently changes them is
+    // caught at the single shared definition, not per-call-site.
+    CHECK(support_level_name(OsSupportStatus::kSupported) == "supported");
+    CHECK(support_level_name(OsSupportStatus::kSupportedConstrained) == "constrained");
+    CHECK(support_level_name(OsSupportStatus::kPlanned) == "planned");
+    CHECK(support_level_name(OsSupportStatus::kUnsupported) == "unsupported");
+}
+
+TEST_CASE("TAR schema: every registered source's every OS row round-trips through "
+         "support_level_name without hitting the undeclared fallback",
+         "[tar][schema][abi4]") {
+    // Exercises the real registry data (build_sources()) through the shared
+    // conversion, proving no row's status value has drifted outside the
+    // four declared OsSupportStatus values.
+    for (const auto& src : capture_sources()) {
+        for (const auto& os : src.os_support) {
+            INFO("source=" << src.name << " os=" << os.os);
+            CHECK(support_level_name(os.status) != "undeclared");
+        }
+    }
 }

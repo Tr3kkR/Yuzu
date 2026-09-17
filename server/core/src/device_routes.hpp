@@ -35,9 +35,11 @@
 
 #include <yuzu/server/auth.hpp>
 
-#include "dex_routes.hpp" // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+#include "dex_routes.hpp"      // DexRoutes::DispatchFn/ResponsesFn/AuditFn + DexAgentResponse
+#include "tag_store.hpp"       // DeviceTag — device_agent_detail_json's optional tags
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 
 #include <cstdint>
 #include <functional>
@@ -49,6 +51,43 @@ namespace yuzu::server {
 
 class HttpRouteSink;
 class GuaranteedStateStore;
+
+// ── Shared builders (REST-only today; #4033/#2146 Batch A) ─────────────────
+// PURE JSON builders — no httplib.h, no mcp_jsonrpc.hpp — used TODAY only by
+// REST's GET /api/v1/devices[/{id}]. MCP's pre-existing list_agents/
+// get_agent_details tools independently build an IDENTICAL 5-field shape
+// inline (mcp_server.cpp) — they are NOT refactored onto these by this PR
+// (out of scope; see #4033), so this pair does NOT yet satisfy the twin
+// recipe's Rule 1 (docs/api-twin-recipe.md §1: REST, MCP, and the dashboard
+// fragment must call the SAME function so no two transports can drift).
+// Fixed by adversarial review (#4033 follow-up): an earlier version of this
+// comment claimed Rule 1 was already satisfied across REST+MCP — false; the
+// ledger's `twinned` status for these rows reflects the ledger's own
+// weaker, verified capability-level definition (docs/api-parity-ledger.md:
+// "a twin exists and is verified against the current source" — the 5-field
+// shape IS byte-identical across REST/MCP today), not Rule-1 same-function
+// conformance. Built from a single AgentRegistry JSON entry — the SAME
+// 5-field shape `AgentRegistry::to_json_obj()`/MCP's `agents_fn()` already
+// produce (agent_id/hostname/os/arch/agent_version) — deliberately NOT
+// `DeviceRow` (the dashboard-fragment-only richer shape with online/segment/
+// tags/dex_score; see this file's header). The builders exist so the NEW
+// REST routes match those tools' served shape byte-for-byte from day one,
+// and so a future refactor of the MCP handlers has a function to call
+// instead of a third inline copy.
+
+/// PURE: one device row — `agent_id`/`hostname`/`os`/`arch`/`agent_version`,
+/// defensively extracted (`.value(key, "")`) so a short/malformed source
+/// object degrades to empty fields rather than throwing. Mirrors MCP
+/// `list_agents`'/`get_agent_details`'s existing inline row-building exactly.
+nlohmann::json device_agent_row_json(const nlohmann::json& agent);
+
+/// PURE: the device DETAIL object — `device_agent_row_json`'s fields plus a
+/// `tags` array (`{key,value,source}` per entry). `tags` is `nullptr` when no
+/// TagStore is wired, in which case the `tags` key is OMITTED entirely (never
+/// a synthesised empty array) — mirrors `get_agent_details`'s conditional-tags
+/// posture on a null store.
+nlohmann::json device_agent_detail_json(const nlohmann::json& agent,
+                                        const std::vector<DeviceTag>* tags);
 
 /// One row of the fleet device list / the identity of one device. SLICE 1 carries
 /// only what the thin AgentInfo + registry session provide for real; richer CI /
@@ -87,9 +126,10 @@ std::string render_device_page(const DeviceRow& d);
 
 /// PURE: a lens panel that isn't built yet (DEX/Guardian in slice 1) — renders the
 /// lens tab bar (so switching back works) + an honest "coming in a later slice"
-/// message. `active` is the tab id ("dex" | "guardian").
+/// message. `active` is the tab id ("dex" | "guardian"). `tabs=false` suppresses the
+/// own 3-chip bar (Hardware CI record mounts this lens under its own 7-tab bar).
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message);
+                                           const std::string& message, bool tabs = true);
 
 /// One guard's compliance state on a device (Guardian lens row).
 struct DeviceGuardRow {
@@ -100,12 +140,15 @@ struct DeviceGuardRow {
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
 /// (obs_type → count, already fetched) + a link to the full /dex device drill.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                    const std::vector<std::pair<std::string, std::int64_t>>& signals);
+                                    const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                    bool tabs = true);
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which
@@ -188,6 +231,21 @@ std::string render_device_live_users(const std::vector<LiveUserRow>& rows);
 std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows);
 std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows);
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows);
+
+/// PURE: generic pipe-row renderer (round-3 item 11 -- physical-kit panels) for the ten
+/// hardware-detail live kinds (disks/memory/processors/drivers/battery/thermal/smart/
+/// volumes/adapters/wifi) whose wire format is a flat `<row_prefix>|field1|field2|...`
+/// table with no bespoke typed-row struct. `columns` is the ordered raw column-name
+/// list from live_kinds.hpp's LiveKind::columns (drives both the table header labels
+/// and each row's expected width); `rows` are the already-split, already-padded field
+/// vectors (device_routes.cpp render_live_result, one per matched line, prefix token
+/// dropped). `raw_rows` are lines that did NOT match the row_prefix, preserved
+/// verbatim (full original line text) instead of being silently dropped -- each
+/// renders as its own full-width diagnostic row at the end of the table.
+/// Defined in device_ui.cpp.
+std::string render_device_live_generic(const std::vector<std::string>& columns,
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows);
 
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);

@@ -115,12 +115,25 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"linux",   OsSupportStatus::kSupported,           "procfs",
                  "Reads /proc/net/{tcp,tcp6,udp,udp6}. Connection lifetime "
                  "below the fast interval may be missed."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
+                 "PRIMARY tcp-lifecycle source: com.apple.network.statistics "
+                 "kctl (nstat) SRC_ADDED/SRC_REMOVED, the same client the "
+                 "netqual source uses for its quality leg (roadmap 2.2). "
+                 "System-wide flow visibility needs root; an unprivileged agent "
+                 "sees only its own flows and reports the honest 'none' rather "
+                 "than a partial capture. The wire structs are transcribed from "
+                 "XNU bsd/net/ntstat.h at the 13.3 floor and gated on a runtime "
+                 "length self-check that fails closed to the poll on mismatch. "
+                 "Endpoint Security has NO tcp/inet socket events "
+                 "(NOTIFY_EXEC/EXIT only), so it is not a replacement here."},
                 {"macos",   OsSupportStatus::kSupportedConstrained, "proc_pidfdinfo",
-                 "proc_listallpids + proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via "
-                 "libproc. Inherent TOCTOU between pid enumeration and per-fd "
-                 "query — short-lived sockets that close before the per-fd "
-                 "query may produce empty rows. Endpoint Security framework "
-                 "(kPlanned) is the modern replacement for sub-second fidelity."},
+                 "Fallback/seed poll: proc_listallpids + "
+                 "proc_pidfdinfo(PROC_PIDFDSOCKETINFO) via libproc — always for "
+                 "udp; for tcp only while the nstat event stream above is "
+                 "unavailable (not root, socket/layout failure, or self-failed). "
+                 "Inherent TOCTOU between pid enumeration and per-fd query — "
+                 "short-lived sockets that close before the per-fd query may "
+                 "produce empty rows."},
             },
             .granularities = {
                 {
@@ -442,9 +455,20 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "(sub-ms LAN RTTs read 0); retrans/segs_out count since "
                  "stats-enable, not connection start; lost/ca_state are "
                  "delta-derived approximations of the Linux gauges."},
-                {"macos",   OsSupportStatus::kPlanned,   "nstat",
-                 "per-socket tcp_connection_info via the private nstat / "
-                 "PRIVATE_TCP_INFO path."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "nstat",
+                 "com.apple.network.statistics kctl (nstat) SRC_DESC/SRC_COUNTS "
+                 "per tcp flow, the same client the tcp source's lifecycle leg "
+                 "uses (roadmap 2.2). Constraints: system-wide flow visibility "
+                 "needs root — an unprivileged agent sees only its own flows "
+                 "and netqual_capture_method honestly reports none rather than "
+                 "a partial capture; rtt/rtt_var are believed microseconds "
+                 "already (no *1000, unlike Windows' ms-resolution ESTATS); "
+                 "lost is a per-tick delta off the cumulative retransmit "
+                 "counter, never the lifetime total; a runtime wire-layout "
+                 "self-check falls back to capture_method=none on any mismatch "
+                 "rather than emit a plausible-but-wrong number (the private, "
+                 "unversioned nstat struct layout is this source's largest "
+                 "risk — see the roadmap 2.1 spike memo)."},
             },
             .granularities = {
                 {
@@ -687,7 +711,8 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // binding — a changing entry_type on the same binding is a value update,
         // not churn. Opt-in (default_enabled=false): low-PII infrastructure data
         // but shipped disabled per the standing capture-source posture. Windows
-        // only in this slice; Linux/macOS are kPlanned (see docs/tar-implementer.md
+        // (GetIpNetTable2), Linux (/proc/net/arp) and macOS (NET_RT_FLAGS
+        // sysctl, constrained) are all wired (see docs/tar-implementer.md
         // "Adding a capture source").
         {
             .name = "arp",
@@ -698,13 +723,22 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "GetIpNetTable2(AF_UNSPEC) — the kernel ARP / IPv6 neighbour "
                  "cache. Full interface/ip/mac/entry_type. Polled at the fast "
                  "collector interval."},
-                {"linux",   OsSupportStatus::kPlanned,             "procfs",
-                 "/proc/net/arp — kernel ARP table (IPv4). Wired in the Linux "
-                 "follow-up."},
-                {"macos",   OsSupportStatus::kPlanned,             "route_sysctl",
-                 "sysctl NET_RT_FLAGS / RTF_LLINFO routing-socket dump. MAC is "
-                 "available; entry_type reported 'unknown' (constrained). Wired "
-                 "in the macOS follow-up."},
+                {"linux",   OsSupportStatus::kSupported,           "procfs",
+                 "/proc/net/arp — kernel ARP table (IPv4). Flags column mapped "
+                 "to entry_type (static/dynamic/incomplete/other; ATF_PERM "
+                 "checked before ATF_COM so a permanent+resolved entry reads "
+                 "'static'). Capped at kArpEntryCap=2048 live entries; the "
+                 "truncation warn fires only when an entry is actually dropped, "
+                 "not merely when the count reaches the cap."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "route_sysctl",
+                 "Reuses agents/shared/route_sysctl_arp.hpp's NET_RT_FLAGS / "
+                 "RTF_LLINFO routing-socket dump (the same mechanism native "
+                 "discovery's scan_subnet uses). MAC is available; entry_type "
+                 "is always reported 'unknown' — this source distinguishes "
+                 "neither static/permanent nor dynamic/stale/probe entries, "
+                 "unlike the Windows/Linux legs. No interface field (the "
+                 "shared record carries none). Capped at kArpEntryCap=2048 "
+                 "live entries."},
             },
             .granularities = {
                 {
@@ -862,7 +896,9 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // live-observed, and `historical` rows bypass the live diff entirely.
         // Opt-in (default_enabled=false): rows expose usernames + share paths
         // (identity/usage-class PII), shipped disabled per the standing
-        // capture-source posture (like arp/dns).
+        // capture-source posture (like arp/dns). macOS is outbound-live only
+        // via getfsstat — no inbound, no history (honestly out of reach for
+        // an unprivileged agent; see the macOS os_support row below).
         {
             .name = "mapdrive",
             .dollar_name = "MapDrive",
@@ -883,9 +919,17 @@ const std::vector<CaptureSourceDef>& build_sources() {
                  "installed + read access, degrades to empty otherwise. Inbound "
                  "history: /var/log/samba connect events (bounded tail), journalctl "
                  "-u smbd fallback."},
-                {"macos",   OsSupportStatus::kPlanned,              "getfsstat",
-                 "Outbound via getfsstat / `mount` NFS/SMB entries; inbound via "
-                 "smbutil. Wired in the macOS follow-up (returns empty today)."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "getfsstat",
+                 "Outbound live only: getfsstat(2) mount table filtered to "
+                 "network fstypes {nfs, smbfs, cifs, afpfs, webdav}. The dedicated "
+                 "username column is always blank (getfsstat exposes no separate "
+                 "credential field) — but unlike Linux's /proc/mounts, a "
+                 "credentialed SMB mount source (e.g. //alice@host/share) is "
+                 "surfaced VERBATIM in remote_path, so the account name is still "
+                 "observable there even though the username column is empty. No "
+                 "inbound (no smbutil integration) and no history (getfsstat "
+                 "exposes only the current mount table, nothing historical) — "
+                 "honestly out of reach for an unprivileged agent."},
             },
             .granularities = {
                 {
@@ -917,6 +961,201 @@ const std::vector<CaptureSourceDef>& build_sources() {
                         {"remote_host",  "TEXT"},
                         {"appear_count", "INTEGER"},
                         {"remove_count", "INTEGER"},
+                    },
+                },
+            },
+        },
+
+        // ── power (cursor-model seam, tar_cursor.hpp) — sleep/wake/AC-power
+        // transitions. LIVE TIER ONLY, no rollups (P-008 — a mirror/aggregate
+        // shape was contradictory for a low-volume host-lifecycle source;
+        // netconn's live-only shape is the precedent). Replay idempotence via
+        // the UNIQUE record_key index below (tar_cursor.hpp rule 3), not
+        // cursor arithmetic.
+        //
+        // ALEX RULING 2026-09-04 (overrides peer finding P-005 and the
+        // Architect's prior adoption of it): power AND removable ship
+        // default_enabled = TRUE. NOT the first default-on sources in the
+        // product -- process/tcp/service/user/perf have always been on, as
+        // machine-scope operational telemetry, and this file's own test
+        // (test_tar_schema_registry.cpp) asserts it. These are the first
+        // WORKS-COUNCIL-CLASS sources to ship enabled: of the eight added
+        // since 1.5 under the opt-in posture (procperf, netqual, module,
+        // software, arp, dns, netconn, mapdrive) every one defaults OFF, and
+        // power/removable are the first of THAT class to diverge. That divergence from the
+        // standing works-council opt-in posture is DELIBERATE and must be
+        // documented plainly in the user-manual pages and changelog, not
+        // quietly. The retrospective-reach control is retained:
+        // power_lookback_seconds (default 604800s / 7 days, 0 = forward-only)
+        // still lets an operator suppress historical backfill without
+        // disabling the source outright — same shape as netconn_lookback_
+        // seconds (ADR-0020).
+        //
+        // os_support: mechanisms are the 2026-09-04 measured bindings
+        // (hardware-probe measurement, Wave 6); the collector ships in this
+        // same PR (tar_power_collector.cpp) -- PR #4017 review, minor #12.
+        {
+            .name = "power",
+            .dollar_name = "Power",
+            .default_enabled = true,
+            .unique_key_column = "record_key",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupportedConstrained, "powerbroadcast",
+                 "Suspend/resume + AC transitions via "
+                 "PowerRegisterSuspendResumeNotification / WM_POWERBROADCAST, "
+                 "cursor-model (tar_cursor.hpp)."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "logind",
+                 "systemd-logind PrepareForSleep sd-bus signal + power-supply "
+                 "sysfs/udev, cursor-model. Gated by "
+                 "the optional libsystemd dep (YUZU_HAVE_LIBSYSTEMD)."},
+                {"macos",   OsSupportStatus::kSupported, "pmset_log",
+                 "`pmset -g log` retrospective replay (measured working "
+                 "unprivileged on this Mac 2026-09-04, 9,629 lines: "
+                 "hardware-probe measurement, Wave 6), cursor-model."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 20000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // sleep, wake, ac_attached,
+                                                 // ac_detached, capture_gap
+                        {"detail",      "TEXT"},
+                        {"record_key",  "TEXT"}, // UNIQUE — replay idempotence
+                    },
+                },
+            },
+        },
+
+        // ── removable (cursor-model seam, tar_cursor.hpp) — removable-media
+        // attach/detach transitions, plus exec_from_removable correlation
+        // (process_enum.hpp's ProcessInfo::exec_path, P-004). LIVE TIER ONLY,
+        // no rollups (P-008, same rationale as power above). `image_path` +
+        // `pid` are typed identity-adjacent columns (P-004) — `evidence` and
+        // `record_key` are forensic/value fields only, never identity
+        // carriers. Replay idempotence via the UNIQUE record_key index below.
+        //
+        // Ships default_enabled = TRUE — see the ALEX RULING note on `power`
+        // above; same divergence, same documentation obligation.
+        // removable_lookback_seconds (default 604800s, 0 = forward-only)
+        // governs historical backfill the same way.
+        //
+        // os_support: mechanisms are the 2026-09-04 measured bindings
+        // (hardware-probe measurement, Wave 6); collectors land wave 2.
+        {
+            .name = "removable",
+            .dollar_name = "Removable",
+            .default_enabled = true,
+            .unique_key_column = "record_key",
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "wevtapi",
+                 "EvtQuery over Microsoft-Windows-Partition/Diagnostic (+ "
+                 "Kernel-PnP/Configuration, Storsvc/Diagnostic), channels "
+                 "measured LIVE on the-rig 2026-09-04; the roadmap's "
+                 "DriverFrameworks-UserMode channel is disabled by default "
+                 "and is NOT the binding (hardware-probe measurement, Wave 6)."},
+                {"linux",   OsSupportStatus::kSupportedConstrained, "udev_netlink",
+                 "udev netlink monitor (block subsystem, removable), "
+                 "cursor-model."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "diskarbitration",
+                 "DiskArbitration DADiskAppeared/Disappeared callbacks "
+                 "(headers confirmed in the CLT SDK, hardware-probe measurement, Wave 6), "
+                 "cursor-model."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    .retention_default = 20000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"}, // attached, detached,
+                                                 // present_at_baseline,
+                                                 // exec_from_removable,
+                                                 // capture_gap
+                        {"device_key",  "TEXT"},
+                        {"vendor",      "TEXT"},
+                        {"product",     "TEXT"},
+                        {"serial",      "TEXT"},
+                        {"bus",         "TEXT"},
+                        {"volume",      "TEXT"},
+                        {"size_bytes",  "INTEGER"},
+                        {"image_path",  "TEXT"},    // typed identity column (P-004)
+                        {"pid",         "INTEGER"}, // typed identity column (P-004)
+                        {"evidence",    "TEXT"},    // forensic/value only — not identity
+                        {"record_key",  "TEXT"},    // UNIQUE — replay idempotence
+                    },
+                },
+            },
+        },
+        // ── Usage (Wave 7 PR7.2b) — DERIVED from `process`: a checked_
+        // transaction fold (tar_usage.cpp run_usage_fold) pairs started/
+        // stopped by (pid, exe_key) into runs; usage_live holds OPEN runs
+        // (deleted when closed), usage_daily the per-executable daily
+        // aggregate. No collector, no rollup_sql; the fold is driven from
+        // collect_fast after the process insert and carries its own gap
+        // check against process_live's row-cap prune. DEFAULT-ON per
+        // Alex's 2026-09-04 ruling (see docs/user-manual/tar.md).
+        // usage_daily_user (per-day username membership) and the two
+        // UNIQUE indexes (usage_live(pid, exe_key), usage_daily(day_ts,
+        // exe_key)) are created by tar_db.cpp's v6 migration, NOT here --
+        // usage_daily_user's PRIMARY KEY(day_ts, exe_key, user) shape (no
+        // `id` column) does not fit the generic per-tier layout below.
+        {
+            .name = "usage",
+            .dollar_name = "Usage",
+            .default_enabled = true,
+            .os_support = {
+                {"windows", OsSupportStatus::kSupported, "derived_process",
+                 "Derived from the process source (ETW feeder); names-only, no cmdline."},
+                {"linux",   OsSupportStatus::kSupported, "derived_process",
+                 "Derived from the process source (/proc); comm names are 15-char truncated."},
+                {"macos",   OsSupportStatus::kSupportedConstrained, "derived_process",
+                 "Derived from the process source; inherits its ES-or-poll granularity."},
+            },
+            .granularities = {
+                {
+                    .suffix = "live",
+                    .retention_type = RetentionType::kRowCount,
+                    // Backstop only. The fold bounds the open set itself
+                    // (cap_open_runs, 20000, oldest closed as `capped` and
+                    // ACCOUNTED in expired_runs); this generic prune firing
+                    // would delete open runs unaccounted, so it is set far
+                    // above the fold's cap and must never be the operative bound.
+                    .retention_default = 200000,
+                    .columns = {
+                        {"ts",          "INTEGER"},
+                        {"snapshot_id", "INTEGER"},
+                        {"action",      "TEXT"},
+                        {"pid",         "INTEGER"},
+                        {"exe_key",     "TEXT"},
+                        {"user",        "TEXT"},
+                        {"start_ts",    "INTEGER"},
+                    },
+                },
+                {
+                    .suffix = "daily",
+                    .retention_type = RetentionType::kTimeBased,
+                    .retention_default = 2678400, // 31 days, as process_daily
+                    .columns = {
+                        {"day_ts",          "INTEGER"},
+                        {"exe_key",         "TEXT"},
+                        {"run_count",       "INTEGER"},
+                        {"total_seconds",   "INTEGER"},
+                        {"first_seen",      "INTEGER"},
+                        {"last_seen",       "INTEGER"},
+                        {"distinct_users",  "INTEGER"},
+                        {"superseded_runs", "INTEGER"},
+                        {"expired_runs",    "INTEGER"},
+                        // No fold_hwm replay-guard column (Wave 7 PR7.2's
+                        // original shape): checked_transaction (tar_db.hpp)
+                        // makes a partial commit of this fold structurally
+                        // impossible, so there is nothing for a replay guard
+                        // to guard against -- see tar_usage.cpp's file banner.
                     },
                 },
             },
@@ -966,7 +1205,35 @@ const std::unordered_map<std::string, TableRef>& table_ref_map() {
     return map;
 }
 
-// Get the timestamp column name for a granularity suffix
+} // namespace
+
+// ── Public API ──────────────────────────────────────────────────────────────
+
+// The single mapping from a support level to its operator-facing name.
+// do_compatibility() (tar_plugin.cpp) derives its `compatibility` action
+// output from this instead of keeping a private duplicate switch (#2204
+// unification) — YuzuSupportLevel is the descriptor's own enum, and
+// OsSupportStatus's values are pinned 1:1 to it (see the header comment).
+std::string_view support_level_name(OsSupportStatus status) {
+    switch (to_yuzu_support_level(status)) {
+    case YUZU_SUPPORT_SUPPORTED:
+        return "supported";
+    case YUZU_SUPPORT_CONSTRAINED:
+        return "constrained";
+    case YUZU_SUPPORT_PLANNED:
+        return "planned";
+    case YUZU_SUPPORT_UNSUPPORTED:
+        return "unsupported";
+    case YUZU_SUPPORT_UNDECLARED:
+        break; // never produced by a registry row; fall through to the default below
+    }
+    return "undeclared";
+}
+
+// Get the timestamp column name for a granularity suffix. Public since #2361:
+// the retention clock guard in `run_retention` needs the same column the DDL
+// indexes and `retention_sql`'s time branch filters on, and a second copy of
+// this mapping in the aggregator would be a silent divergence waiting to happen.
 std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "live")    return "ts";
     if (suffix == "hourly")  return "hour_ts";
@@ -974,10 +1241,6 @@ std::string_view ts_column_for_suffix(std::string_view suffix) {
     if (suffix == "monthly") return "month_ts";
     return "ts";
 }
-
-} // namespace
-
-// ── Public API ──────────────────────────────────────────────────────────────
 
 const std::vector<CaptureSourceDef>& capture_sources() {
     return build_sources();
@@ -1042,16 +1305,18 @@ std::vector<std::string> accepted_capture_methods_for_os(std::string_view source
 }
 
 std::string effective_network_capture_method([[maybe_unused]] std::string_view configured) {
-    // Polling is the only wired network capture mechanism on every OS today.
-    // `enumerate_connections()` (the collect_fast network leg) always polls,
+    // The collect_fast NETWORK leg — `enumerate_connections()` — always polls,
     // regardless of the stored `network_capture_method`: the per-OS platform
     // APIs (procfs / iphlpapi / proc_pidfdinfo) ARE the polling implementation,
     // and the kPlanned kernel-event methods (etw / endpoint_security) are
     // accepted for pre-staging but not yet collected. So every configured value
-    // maps to an effective mechanism of "polling". When a kernel-event collector
-    // lands, branch on `configured` (and the live session state, as the process
-    // collector does with `etw_active_`) here -- this is the single source of
-    // truth the `status` action reports (issue #1528).
+    // maps to an effective mechanism of "polling". (This is ONLY the fast
+    // network leg: the separate `tcp` lifecycle and `netqual` sources DO use a
+    // live kernel-event mechanism on macOS — nstat — reported through their own
+    // `*_capture_method` status keys, not this one.) When a kernel-event
+    // collector lands for THIS leg, branch on `configured` (and live session
+    // state, as the process collector does with `etw_active_`) here -- this is
+    // the single source of truth the `status` action reports (issue #1528).
     return "polling";
 }
 
@@ -1104,6 +1369,16 @@ std::string generate_warehouse_ddl() {
                     table_name);
             }
 
+            // Cursor-model replay idempotence (tar_cursor.hpp rule 3): a
+            // source that declares unique_key_column gets a UNIQUE index on
+            // it for the live tier, so INSERT OR IGNORE makes a replayed
+            // event a no-op instead of a duplicate row.
+            if (g.suffix == "live" && !src.unique_key_column.empty()) {
+                ddl << std::format(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS {0}_record_key_uq ON {0}({1});\n",
+                    table_name, src.unique_key_column);
+            }
+
             ddl << "\n";
         }
     }
@@ -1125,7 +1400,12 @@ bool is_queryable_table(std::string_view real_table_name) {
     // its "no such table" error into a weak existence oracle distinct from the
     // generic authorizer denial (#760 UP-8).
     static const std::unordered_set<std::string> allowed = [] {
-        std::unordered_set<std::string> s{"tar_state", "tar_config"};
+        // tar_cursor joins them (S3): without it a wedged cursor source is
+        // entirely unobservable -- no reset path exists, and the only remedy is
+        // deleting tar.db, which destroys every OTHER source's history too.
+        // Reading it exposes a source name, a position and updated_at; the
+        // cursor payload is the source's own bookkeeping, not captured content.
+        std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);
         return s;
@@ -1402,7 +1682,18 @@ std::string retention_sql(const std::string& real_table_name, int64_t now_epoch)
             "(SELECT id FROM {} ORDER BY id DESC LIMIT 1 OFFSET {})",
             real_table_name, real_table_name, gran.retention_default);
     } else {
-        // Delete rows older than the retention window
+        // NEITHER BRANCH'S SQL RUNS IN PRODUCTION as of #2361. `run_retention`
+        // builds both the time-based and the row-count DELETE at the caller so it
+        // can bound them -- the time-based one because an unbounded age delete is
+        // the wipe the clock guard exists to prevent, the row-count one because
+        // the whole batch runs under one held database mutex. This function is
+        // now called ONLY as an `.empty()` probe for "is this a retention-bearing
+        // table?", plus the text these tests pin.
+        //
+        // Kept, and kept byte-identical, because `test_tar_warehouse.cpp` and
+        // `test_tar_perf.cpp` pin this exact SQL text. So a future author who
+        // "fixes" either formula HERE gets a green suite and no behaviour change
+        // whatsoever -- change `run_retention` instead.
         int64_t cutoff = now_epoch - gran.retention_default;
         auto ts_col = ts_column_for_suffix(gran.suffix);
         return std::format(

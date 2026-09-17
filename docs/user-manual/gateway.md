@@ -257,7 +257,14 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     {telemetry_gauge_interval_ms, 10000},
 
     %% Consistent hash ring: virtual nodes per physical node
-    {hash_ring_vnodes, 256}
+    {hash_ring_vnodes, 256},
+
+    %% HA WS-4 4.1 -- the trust-zone/region cluster id this gateway belongs
+    %% to; agents are pinned to one cluster (ADR-2002 §7). Stamped onto
+    %% every StreamStatusNotification sent upstream so the server's
+    %% routing directory can record which cluster owns an agent's live
+    %% stream. Override: YUZU_GW_CLUSTER_ID
+    {cluster_id, <<"default">>}
 ]}
 ```
 
@@ -281,7 +288,7 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 |---|---|---|
 | gateway → server upstream (`:50055`) | **mutual TLS** | `gateway/config/sys.config.prod` `{https,...}` `default_channel`; CA-issued `default-gateway` leaf, TLS 1.2 floor + AEAD/PFS cipher whitelist. |
 | agent → gateway (`:50051`) | **one-way TLS (PR5c)** | Server-authenticated TLS, no client cert required (bootstrap-safe). Enabled on the agent listener in `sys.config.prod` via `transport_opts => #{ssl => true, certfile, keyfile, cacertfile, verify => verify_none, fail_if_no_peer_cert => false}` (needs the vendored `_checkouts/grpcbox`). Shipped composes are plaintext until PR5b wires it + ships the CA to agents. |
-| operator → gateway mgmt (`:50063`) | **plaintext / strict mTLS** | Do NOT one-way-TLS the privileged mgmt plane (would be unauthenticated). Keep on a trusted network, or require client certs via strict mTLS (omit `verify`/`fail_if_no_peer_cert`). |
+| server → gateway mgmt (`:50063`) | **strict mTLS + SPKI peer pin (#1422)** | The privileged command-fan-out plane. Do NOT one-way-TLS it (would be unauthenticated). The secure shape (in `sys.config.prod` / `reference-gateway-sys.config`) is strict mTLS (omit `verify`/`fail_if_no_peer_cert`) **plus** `auth_fun => fun yuzu_gw_authz:check_mgmt_peer/1` with `{yuzu_gw, mgmt_peer_pins}` pinning the server's cert — a CA-issued cert alone (an agent's leaf, the gateway's own leaf) is NOT authorization to command the fleet. The gateway **refuses to boot** with a network-reachable mgmt listener lacking this posture; `{allow_insecure_mgmt, true}` is a lab-rig-only acknowledgement (pair it with an unpublished `:50063`). BYO certs: point `mgmt_peer_pins` at your server cert (`{cert_file, ...}`) or paste its SPKI SHA-256 (`{spki_sha256, "..."}`) — the cert **must carry the `serverAuth` EKU** or the pin rejects it (`missing_server_auth_eku` in the gateway log); list old+new pins to overlap a rotation. Pin-list edits (adding/removing an entry) require a gateway restart; only a `{cert_file, Path}` target's file **content** re-reads live without one. |
 
 TLS is configured **entirely in the `grpcbox` block** (grpcbox reads its own
 config at boot — the old `{tls, [...]}` advisory key under `yuzu_gw` was removed
@@ -499,6 +506,12 @@ Test-only dependencies (loaded in the `test` profile):
 The current gateway runs as a single Erlang node. Planned clustering support
 will enable multiple gateway nodes to form a distributed cluster for
 horizontal scaling and fault tolerance.
+
+> **Note:** the `cluster_id` config key (see [Configuration](#configuration))
+> already exists and is stamped onto every `StreamStatusNotification` as a
+> routing-directory tag (HA WS-4 4.1, ADR-2002 §7) — but multi-node gateway
+> clustering as described below is not yet implemented; today `cluster_id`
+> only labels which trust-zone/region a single gateway node belongs to.
 
 ### Planned Features
 

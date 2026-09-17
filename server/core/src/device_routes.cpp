@@ -11,6 +11,7 @@
 #include "live_kinds.hpp"             // shared live-read kind table + parser (S2)
 #include "guaranteed_state_store.hpp" // dex_device_signal_summary, agent_rule_statuses, list_rules
 #include "http_route_sink.hpp"
+#include "rest_a4_envelope_http.hpp"  // detail::a4_denial
 #include "rest_audit.hpp"             // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"              // html_escape
 
@@ -23,9 +24,6 @@
 #include <utility>
 #include <vector>
 
-// Shared full-page shell (global scope, defined in guardian_page_ui.cpp).
-extern const char* const kGuardianDetailPageHtml;
-
 namespace yuzu::server {
 
 namespace {
@@ -33,22 +31,6 @@ namespace {
 std::string to_lower(std::string s) {
     for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
     return s;
-}
-
-// Render the shared page shell with the title + initial fragment substituted, and
-// the default-active Guardian nav item de-activated (these pages are cross-cutting,
-// not under Guardian). Mirrors NetworkRoutes' shell handling.
-std::string page_shell(const std::string& title, const std::string& fragment_url) {
-    std::string html(kGuardianDetailPageHtml);
-    auto sub = [&](const std::string& tok, const std::string& val) {
-        for (auto p = html.find(tok); p != std::string::npos; p = html.find(tok, p + val.size()))
-            html.replace(p, tok.size(), val);
-    };
-    sub("{{TITLE}}", title);
-    sub("{{FRAGMENT}}", fragment_url);
-    sub("<a href=\"/guardian\" class=\"nav-link active\">Guardian</a>",
-        "<a href=\"/guardian\" class=\"nav-link\">Guardian</a>");
-    return html;
 }
 
 bool matches(const DeviceRow& d, const std::string& q) {
@@ -94,6 +76,51 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
         return LiveKind{"tar", "status", "Capture sources", "device.live.capture_sources"};
     if (kind == "disk")
         return LiveKind{"disk_space", "free", "Disk space", "device.live.disk"};
+
+    // round-3 item 11 -- physical-kit panels. Ten NEW cards surfacing physical-hardware
+    // detail, reusing plugin actions that already exist on the agent. Each emits flat
+    // `<row_prefix>|field1|field2|...` lines (see the per-kind plugin doc); the generic
+    // pipe-row renderer (render_device_live_generic, device_ui.cpp) drives all ten off
+    // the `columns` list below rather than a bespoke render_device_live_KIND function.
+    // plugin2/action2 are left empty -- these kinds have no secondary joined dispatch.
+    if (kind == "hw_disks")
+        return LiveKind{"hardware", "disks", "Disks", "device.live.hw_disks",
+                        "", "", "disk", {"index", "model", "size_gb", "media_type", "interface"}};
+    if (kind == "hw_memory")
+        return LiveKind{"hardware", "memory", "Memory", "device.live.hw_memory",
+                        "", "", "dimm", {"slot", "size_mb", "type", "speed_mhz"}};
+    if (kind == "hw_processors")
+        return LiveKind{"hardware", "processors", "Processors", "device.live.hw_processors",
+                        "", "", "cpu", {"index", "model", "cores", "threads", "clock_mhz"}};
+    if (kind == "hw_drivers")
+        return LiveKind{"hardware", "drivers", "Drivers", "device.live.hw_drivers",
+                        "", "", "driver",
+                        {"index", "name", "version", "date", "provider", "device_class"}};
+    if (kind == "battery")
+        return LiveKind{"power_health", "battery", "Battery", "device.live.battery",
+                        "", "", "battery",
+                        {"present", "state", "percent", "time_to_empty_min", "cycle_count",
+                         "health_percent"}};
+    if (kind == "thermal")
+        return LiveKind{"power_health", "thermal", "Thermal", "device.live.thermal",
+                        "", "", "thermal", {"status", "zone_or_detail", "celsius"}};
+    if (kind == "smart")
+        return LiveKind{"disk_actions", "smart", "Disk health (SMART)", "device.live.smart",
+                        "", "", "smart",
+                        {"device", "model", "bus", "media", "health", "pct_used", "spare_pct",
+                         "detail"}};
+    if (kind == "volumes")
+        return LiveKind{"disk_actions", "volumes", "Volumes", "device.live.volumes",
+                        "", "", "volume",
+                        {"volume", "mount_points", "device", "fstype", "total_bytes", "detail"}};
+    if (kind == "adapters")
+        return LiveKind{"network_config", "adapters", "Network adapters", "device.live.adapters",
+                        "", "", "adapter", {"name", "mac", "speed_mbps", "status"}};
+    if (kind == "wifi")
+        return LiveKind{"wifi", "connected", "Wi-Fi", "device.live.wifi",
+                        "", "", "connected",
+                        {"ssid", "signal", "security", "bssid", "interface_or_channel"}};
+
     return std::nullopt;
 }
 
@@ -125,9 +152,17 @@ constexpr std::size_t kMaxLiveRows = 20000;
 // dataset (process_tree's connections). uptime/processes use the shared live_kinds.hpp
 // parsers (REST parity); the rest parse the dashboard-only wire shapes inline. All
 // agent fields are HTML-escaped at render.
-std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
-                               const std::string& output, const std::string& output2) {
+std::string render_live_result(const std::string& kind, const LiveKind& lk,
+                               const std::string& output, const std::string& output2,
+                               const std::string& agent_os = "") {
     const auto lines = yuzu::server::live::split_lines(output);
+    // The agent's own OS (authoritative, from the device record) disambiguates
+    // same-arity service-row shapes (K-4): "darwin"/"macos" → macOS. Empty when
+    // the lookup was unavailable, in which case the services branch falls back
+    // to content-sniffing the pid column.
+    const std::string os_lc = to_lower(agent_os);
+    const bool os_is_macos = os_lc == "darwin" || os_lc == "macos";
+    const bool os_known = !os_lc.empty();
 
     if (kind == "uptime") { // KPI-only (the shell's hidden loader fills the Uptime KPI)
         const auto u = yuzu::server::live::parse_uptime(output);
@@ -185,23 +220,40 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
         return body;
     }
 
-    if (kind == "services") { // Windows: svc|name|display|status|startup; Linux: svc|name|status|desc
+    if (kind == "services") { // Windows: svc|name|display|status|startup; Linux: svc|name|status|desc; macOS: svc|label|pid|status|startup
         std::vector<LiveService> rows;
         int running = 0;
         for (const auto& l : lines) {
             if (!l.starts_with("svc|")) continue;
             auto f = pipe_fields(l);
             LiveService s;
-            if (f.size() >= 5) { // Windows: svc|name|display|status|startup
-                s.name = f[1]; s.display = f[2]; s.status = f[3]; s.startup = f[4];
+            if (f.size() >= 5) {
+                // Two distinct 5-field shapes share this arity: Windows
+                // svc|name|display|status|startup and macOS (C-1.12, P10 fix)
+                // svc|label|pid|status|startup. Prefer the agent's authoritative
+                // OS (K-4) so a Windows service whose display name is all digits
+                // (or "-") is never misread as a macOS PID. When the OS is
+                // unknown (device record unavailable — rare, transient), default
+                // to Windows rather than content-sniffing the pid column
+                // (UP-5): a 5-field row with a display name is historically the
+                // Windows shape, and the sniff is exactly what dropped a numeric
+                // Windows display name in the K-4 bug.
+                const bool macos = os_known ? os_is_macos : false;
+                s.name = f[1];
+                if (macos) { s.status = f[3]; s.startup = f[4]; }               // svc|label|pid|status|startup
+                else { s.display = f[2]; s.status = f[3]; s.startup = f[4]; }   // svc|name|display|status|startup
             } else if (f.size() == 4) {
                 // Two distinct 4-field shapes share this arity: Linux svc|name|status|description
-                // and macOS svc|label|pid|status. Disambiguate on the numeric pid column so the
-                // macOS State cell shows the status, not the PID (consistency B1).
+                // and macOS svc|label|pid|status. Prefer the agent's authoritative OS (K-4);
+                // fall back to sniffing the pid column when unknown, so the macOS State cell
+                // shows the status, not the PID (consistency B1). A stopped launchd service
+                // reports pid "-", not a number, so the sentinel counts as macOS in the fallback.
                 s.name = f[1];
-                const bool macos = !f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
-                    return std::isdigit(ch) != 0;
-                });
+                const bool macos = os_known
+                    ? os_is_macos
+                    : (f[2] == "-" || (!f[2].empty() && std::all_of(f[2].begin(), f[2].end(), [](unsigned char ch) {
+                          return std::isdigit(ch) != 0;
+                      })));
                 if (macos) { s.status = f[3]; }            // svc|label|pid|status
                 else { s.status = f[2]; s.display = f[3]; } // svc|name|status|description
             } else {
@@ -400,10 +452,68 @@ std::string render_live_result(const std::string& kind, const LiveKind& /*lk*/,
         return body;
     }
 
+    // round-3 item 11 -- physical-kit panels. One generic branch handles all 10 new
+    // kinds at once: each is a flat `<row_prefix>|field1|field2|...` table with no
+    // bespoke parsing, so lk.columns (populated only for these kinds, see
+    // resolve_live_kind above) drives a single shared renderer instead of one
+    // render_device_live_KIND function per kind.
+    if (!lk.columns.empty()) {
+        std::vector<std::vector<std::string>> rows;
+        // A line under any OTHER prefix (e.g. a plugin-emitted "warning|..." or
+        // "error|..." diagnostic alongside its data rows) is preserved verbatim as
+        // an honest raw/diagnostic row rather than silently dropped -- the
+        // originally approved design (parse_generic_rows: "non-prefixed lines
+        // become a single raw cell"). Rendered at the end of the table by
+        // render_device_live_generic. Bounded by the SAME kMaxLiveRows cap,
+        // shared across rows+raw_rows combined (one output-size bound, not two).
+        std::vector<std::string> raw_rows;
+        const std::string prefix = lk.row_prefix + "|";
+        for (const auto& l : lines) {
+            if (!l.starts_with(prefix)) {
+                if (rows.size() + raw_rows.size() < kMaxLiveRows)
+                    raw_rows.push_back(l);
+                continue;
+            }
+            auto f = pipe_fields(l);
+            if (f.empty()) continue;
+            f.erase(f.begin()); // drop the prefix token itself
+            f.resize(lk.columns.size()); // pad short / trim long rows to the declared width
+            rows.push_back(std::move(f));
+            if (rows.size() >= kMaxLiveRows) break;
+        }
+        std::string body = render_device_live_generic(lk.columns, rows, raw_rows);
+        body += oob("ls-cnt-" + kind, "ls-cnt", std::to_string(rows.size() + raw_rows.size()));
+        return body;
+    }
+
     return "<div class=\"gp-note\">Unsupported live result.</div>";
 }
 
 } // namespace
+
+// ── Shared REST+MCP JSON builders (#4033/#2146 Batch A) — see the doc
+// comments in device_routes.hpp. Pure: no httplib.h, no I/O.
+nlohmann::json device_agent_row_json(const nlohmann::json& agent) {
+    return {
+        {"agent_id", agent.value("agent_id", "")},
+        {"hostname", agent.value("hostname", "")},
+        {"os", agent.value("os", "")},
+        {"arch", agent.value("arch", "")},
+        {"agent_version", agent.value("agent_version", "")},
+    };
+}
+
+nlohmann::json device_agent_detail_json(const nlohmann::json& agent,
+                                        const std::vector<DeviceTag>* tags) {
+    auto obj = device_agent_row_json(agent);
+    if (tags) {
+        auto tag_arr = nlohmann::json::array();
+        for (const auto& t : *tags)
+            tag_arr.push_back({{"key", t.key}, {"value", t.value}, {"source", t.source}});
+        obj["tags"] = std::move(tag_arr);
+    }
+    return obj;
+}
 
 void DeviceRoutes::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn perm_fn,
                                    ScopedPermFn scoped_perm_fn, DevicesFn devices_fn,
@@ -432,27 +542,28 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     audit_fn_ = std::move(audit_fn);
 
     // -- /devices page shell (auth-only static chrome) --
+    // Round-3 merge: /devices and /device?id= are retired in favour of the Hardware
+    // CI list and record, which now cover everything these pages showed (DEX score,
+    // agent version, and the DEX/Guardian/Live lenses reuse these very fragments —
+    // see hardware_ui.cpp's render_hardware_lens_body). 302s, not route removal, so
+    // bookmarks and the API-parity ledger's history stay intact; every
+    // /fragments/device/* route below stays registered and gated exactly as before.
     sink.Get("/devices", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res)) {
             res.set_redirect("/login");
             return;
         }
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_content(page_shell("Yuzu \xE2\x80\x94 Devices", "/fragments/devices/list"),
-                        "text/html; charset=utf-8");
+        res.set_redirect("/hardware");
     });
 
-    // -- /device?id= page shell (auth-only) --
     sink.Get("/device", [this](const httplib::Request& req, httplib::Response& res) {
         if (!auth_fn_(req, res)) {
             res.set_redirect("/login");
             return;
         }
         std::string id = req.has_param("id") ? req.get_param_value("id") : "";
-        // The shell hx-loads the page-body fragment (which carries the id forward).
-        std::string frag = "/fragments/device/page";
+        std::string loc = "/hardware/ci";
         if (!id.empty()) {
-            // Minimal query-safe echo; the fragment handler re-reads `id` from params.
             std::string enc;
             static const char* kHex = "0123456789ABCDEF";
             for (unsigned char c : id) {
@@ -460,10 +571,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                     enc += static_cast<char>(c);
                 else { enc += '%'; enc += kHex[c >> 4]; enc += kHex[c & 0x0F]; }
             }
-            frag += "?id=" + enc;
+            loc += "?id=" + enc;
         }
-        res.set_header("Cache-Control", "no-cache, no-store, must-revalidate");
-        res.set_content(page_shell("Yuzu \xE2\x80\x94 Device", frag), "text/html; charset=utf-8");
+        res.set_redirect(loc.c_str());
     });
 
     // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
@@ -474,6 +584,26 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                                                httplib::Response& res) {
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
+        // Fleet-wide identity/inventory disclosure (SEC-2/SEC-3 confinement-gap
+        // class, found during a docs sweep): devices_fn_ below is username-keyed
+        // (DevicesFn) and does not confine a service-scoped API token whose
+        // principal resolves to an unscoped grant — the full device roster
+        // (hostname, agent_id, OS, online state) would still be fleet-wide.
+        if (!session->token_scope_service.empty()) {
+            // Write the 403 FIRST, audit after (normalized — #3167).
+            // `.permission` omitted: kServiceScopeGlobalSafe is
+            // compile-time-empty, so no grant admits a service-scoped caller
+            // here; naming one would be a false self-remediation claim.
+            res.status = 403;
+            res.set_content(
+                detail::a4_denial(
+                    res, 403, "service-scoped tokens may not read the fleet-wide device list"),
+                "application/json");
+            (void)detail::try_persist_audit(
+                audit_fn_, req, "device.list.view", "denied", "Infrastructure", "",
+                "fleet-wide device list denied to a service-scoped token");
+            return;
+        }
         if (!perm_fn_(req, res, "Infrastructure", "Read")) return;
         std::vector<DeviceRow> all =
             devices_fn_ ? devices_fn_(session->username) : std::vector<DeviceRow>{};
@@ -557,13 +687,16 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- DEX lens: per-device score + signal summary (+ link to the full drill) --
     sink.Get("/fragments/device/dex", [this](const httplib::Request& req, httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // bare=1: mounted as a lens inside the Hardware CI record, which already
+        // renders its own 7-tab bar — suppress this fragment's own 3-chip bar.
+        const bool tabs = !req.has_param("bare");
         // Per-device behavioral data (PII): GuaranteedState:Read SCOPED to this
         // device (tier + management group) + audit-on-open. Stronger than the
         // sibling /fragments/dex/device's bare Read gate — closes the cross-scope
         // read of another team's per-device DEX summary.
         if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         if (!store_) {
-            res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable."),
+            res.set_content(render_device_lens_placeholder("dex", id, "DEX store unavailable.", tabs),
                             "text/html; charset=utf-8");
             return;
         }
@@ -580,17 +713,21 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         std::vector<std::pair<std::string, std::int64_t>> sigs;
         for (const auto& s : store_->dex_device_signal_summary(id, since))
             sigs.emplace_back(s.obs_type, s.count);
-        res.set_content(render_device_dex_lens(id, score, sigs), "text/html; charset=utf-8");
+        res.set_content(render_device_dex_lens(id, score, sigs, tabs), "text/html; charset=utf-8");
     });
     // -- Guardian lens: per-guard compliance state for this device --
     sink.Get("/fragments/device/guardian", [this](const httplib::Request& req,
                                                   httplib::Response& res) {
         const std::string id = req.has_param("id") ? req.get_param_value("id") : "";
+        // bare=1: mounted as a lens inside the Hardware CI record — see the dex
+        // fragment above for the same suppression.
+        const bool tabs = !req.has_param("bare");
         // Per-device compliance state: GuaranteedState:Read SCOPED to this device
         // (tier + management group) + audit-on-open (parity with the DEX lens above).
         if (!scoped_perm_fn_(req, res, "GuaranteedState", "Read", id)) return;
         if (!store_) {
-            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable."),
+            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store unavailable.",
+                                                            tabs),
                             "text/html; charset=utf-8");
             return;
         }
@@ -599,11 +736,24 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         (void)detail::emit_behavioral_audit(audit_fn_, req, res, "guardian.device.view", "success",
                                             "Agent", id,
                                             "device Guardian lens (per-guard compliance)");
+        // list_rules / agent_rule_statuses are now type-distinguishable (ADR-0038
+        // catastrophic-read set): a degraded read must render the same "store
+        // unavailable" placeholder as the `!store_` guard above, never a silent
+        // empty/partial guard list (which would misreport a device as having no
+        // guards, or drop live drift verdicts, for the operator viewing this lens).
+        auto rules_result = store_->list_rules();
+        auto statuses_result = store_->agent_rule_statuses();
+        if (!rules_result || !statuses_result) {
+            res.set_content(render_device_lens_placeholder("guardian", id, "Guardian store degraded.",
+                                                            tabs),
+                            "text/html; charset=utf-8");
+            return;
+        }
         std::unordered_map<std::string, std::string> rule_names;
-        for (const auto& r : store_->list_rules())
+        for (const auto& r : *rules_result)
             rule_names[r.rule_id] = r.name;
         std::vector<DeviceGuardRow> guards;
-        for (const auto& st : store_->agent_rule_statuses()) { // all; filter to this agent
+        for (const auto& st : *statuses_result) { // all; filter to this agent
             if (st.agent_id != id)
                 continue;
             DeviceGuardRow g;
@@ -613,7 +763,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
             g.updated_at = st.updated_at;
             guards.push_back(std::move(g));
         }
-        res.set_content(render_device_guardian_lens(id, guards), "text/html; charset=utf-8");
+        res.set_content(render_device_guardian_lens(id, guards, tabs), "text/html; charset=utf-8");
     });
 
     // -- "Get live info": dispatch REAL plugin instructions at the device NOW and
@@ -698,15 +848,17 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
             note(res, "Live device query unavailable on this server.");
             return;
         }
-        const auto [command_id, sent] =
+        const auto dispatch_outcome =
             dispatch_fn_(lk->plugin, lk->action, {id}, "", {});
+        const auto& command_id = dispatch_outcome.command_id;
+        const auto sent = dispatch_outcome.sent;
         // Optional SECONDARY dispatch joined at render (process_tree -> connections).
         // Dispatched to the SAME device; the result route polls it best-effort.
         std::string command_id2;
         if (!lk->plugin2.empty() && sent > 0) {
-            const auto [cid2, sent2] = dispatch_fn_(lk->plugin2, lk->action2, {id}, "", {});
-            if (sent2 > 0)
-                command_id2 = cid2;
+            const auto outcome2 = dispatch_fn_(lk->plugin2, lk->action2, {id}, "", {});
+            if (outcome2.sent > 0)
+                command_id2 = outcome2.command_id;
         }
         // Audit the DISPATCH (post-dispatch "dispatched"/"no_agents"). HIGH-1 (review
         // #1585): AuditFn is bool-returning — surface Sec-Audit-Failed so an audit-store
@@ -799,13 +951,45 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 if (r.agent_id == id && !r.output.empty() && !r.output.starts_with("error|"))
                     output2 = r.output;
         }
+        // Authoritative agent OS for row-shape disambiguation (K-4), resolved
+        // lazily so the pending re-poll path pays nothing; empty when the device
+        // record is unavailable, in which case render_live_result falls back to
+        // content-sniffing.
+        auto agent_os = [this, &id]() -> std::string {
+            return lookup_fn_
+                       ? lookup_fn_(id).transform([](const DeviceRow& d) { return d.os; }).value_or("")
+                       : std::string{};
+        };
+        // Behavioural-PII access-audit chokepoint (#1647/#1703). The RESULT poll
+        // is where the real process-tree / DNS / connections / users output
+        // actually reaches the operator — the /run dispatch audit above records
+        // the request, but only THIS route renders the PII, so the access must be
+        // audited here too or the read is unaccountable (a works-council /
+        // usage-class concern). Dashboard set-and-proceed posture matching /run:
+        // a transient audit-store outage still renders the lens but raises
+        // Sec-Audit-Failed for the SIEM (REST fail-closed is a separate seam).
+        // Only fires on a branch that actually serves rendered output, never on
+        // the error/failure/timeout notes.
+        auto audit_live_result = [&](const char* result) {
+            (void)detail::emit_behavioral_audit(
+                audit_fn_, req, res, lk->audit_action, result, "Agent", id,
+                lk->plugin + "/" + lk->action + " kind=" + kind +
+                    " command_id=" + command_id);
+        };
         if (with_output) {
             if (with_output->output.starts_with("error|")) {
+                // 300, matching the sibling site in tar_tree_routes.cpp. Both
+                // render the SAME `tar status` reply, and the storage-offline
+                // line is 231 chars (287 when the read path is gone too), so a
+                // 200-byte cap truncated it mid-sentence and dropped "Restart
+                // the agent to recover." -- the operator got the problem
+                // without the remedy (#2361 Gate 4, consistency-auditor).
                 note(res, "The device reported an error: " +
-                              html_escape(with_output->output.substr(6, 200)));
+                              html_escape(agent_error_display(with_output->output)));
                 return;
             }
-            res.set_content(render_live_result(kind, *lk, with_output->output, output2),
+            audit_live_result("rendered");
+            res.set_content(render_live_result(kind, *lk, with_output->output, output2, agent_os()),
                             "text/html; charset=utf-8");
             return;
         }
@@ -817,7 +1001,8 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                               html_escape(terminal->error_detail.substr(0, 200)));
                 return;
             }
-            res.set_content(render_live_result(kind, *lk, "", output2), "text/html; charset=utf-8");
+            audit_live_result("rendered_empty");
+            res.set_content(render_live_result(kind, *lk, "", output2, agent_os()), "text/html; charset=utf-8");
             return;
         }
         if (attempt >= kMaxAttempts) {

@@ -181,6 +181,11 @@ streaming(cast, {dispatch, CommandReq, {ReplyTo, FanoutRef}}, Data) ->
                       maps:get(plugin, CommandReq, <<"unknown">>)),
 
     %% Send command to the subscribe handler, which writes it to the HTTP/2 stream.
+    %% CommandReq is forwarded whole — `dispatch_tag` (field 9) rides through
+    %% untouched here exactly like `payload` (field 8) does: neither is read
+    %% or rebuilt on this path, so the stream handler's gpb re-encode is the
+    %% only place either field could be lost, and both are mirrored into the
+    %% gateway's vendored agent.proto for that reason.
     StreamPid ! {send_command, CommandReq},
 
     telemetry:execute([yuzu, gw, command, dispatched],

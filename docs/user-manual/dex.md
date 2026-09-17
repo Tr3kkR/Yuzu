@@ -54,10 +54,15 @@ A **fleet-wide Applications list** ranked by reliability signals — crash count
 and hang counts, keyed on the process image name. Each row links to the existing
 per-application blast-radius drill-down (top subjects, faulting modules,
 most-affected devices). Built on the same `dex_top_apps` aggregation that drives
-the Overview crash cards — no new agent collection. Per-app performance, version
-breakdown, and attribution of repository/install/service signals to the
-originating app are follow-on slices; the Apps tab today scopes to crash and
-hang signals only.
+the Overview crash cards — no new agent collection. The app detail page
+cross-links to per-version CPU & memory performance (the Performance tab's
+application trend), joined on the same process-image key an application's crash
+and perf identity already share on Windows/Linux — an exact match, not a
+name-normalized guess. Attribution of repository/install/service signals to the
+originating app is a follow-on slice; the Apps tab today scopes to crash and
+hang signals only. Per-version crash/hang *counts* on the performance trend
+(as opposed to the per-app crash/hang totals already shown here) remain
+deferred — see "Fleet-wide application performance" under Drill-downs.
 
 ### Catalogue
 
@@ -67,15 +72,24 @@ Performance, File system, Network, Identity & logon, Security & protection,
 Updates & installs, Policy & management, Printing). The Catalogue is
 **coverage-first**: a family card shows how many of its types are **monitored**
 (collected by a connected platform — lit even when nothing has fired) and a
-0–100 **health score** (the family's slice of the fleet health composite). A
+0–100 **health score**. Under **All connected** the score is the family's slice
+of the fleet health composite; under a **single-OS chip** (Windows / Linux /
+macOS) the family is **rescored against that platform's own online agents and
+its own signals**, so a Linux or macOS score is never a Windows-derived number
+read under another OS's heading. A
 monitored type with no events reads as **watched, nothing happened** — real
 information, not a gap; a type that **no connected platform collects** shows
 dimmed as **not collected**, never as healthy. (A type is *not collected* when no
 currently-connected platform in your fleet emits it — e.g. a Linux-only signal on
 an all-Windows fleet; it lights automatically when the first eligible device
 connects, so this is a coverage fact, not a broken collector.) An **OS filter** (All connected /
-Windows / Linux / macOS) narrows coverage to one platform and **persists** when
-you open a family or drill into a type. Opening a family lists **every** type
+Windows / Linux / macOS) narrows coverage to one platform, **rescores each
+family for that platform**, and **persists** when you open a family or drill
+into a type — the drill-down's rollup, per-signal rows, and score all follow
+the selected lens. **Note:** the All connected composite keeps the established
+Windows-online denominator (the coverage-honest fleet composite); on a macOS-
+or Linux-only fleet the default lens can therefore show **—** — click your
+platform's chip for a real per-family score. Opening a family lists **every** type
 with its coverage (which platforms collect it) and, for the ones that fired,
 event and device counts. Each type drills into a per-type view: top subjects,
 the live OS split, the most-affected devices, and an activity trend. Any signal
@@ -152,6 +166,19 @@ numbers match.
 
 - **Per-application** — click an app to see its crash/hang blast radius across
   the fleet: faulting modules, exception codes, and which devices are affected.
+  Cross-links to that app's **fleet-wide performance trend** (below), and the
+  trend links back — same process-image key both directions, exact match.
+- **Fleet-wide application performance** — reached from the Performance tab's
+  application picker, or the cross-link above: each version of an application
+  gets its own row with avg/p95 CPU, a CPU sparkline, avg working set, and the
+  reporting device count, over the retained fleet window (≤180 days) or, when a
+  management group is selected, that group's on-the-fly aggregate (≤31 days,
+  sub-10-device points suppressed to a count only). A **version filter**
+  narrows the trend to one version at a time (the same `version` parameter the
+  `GET /api/v1/dex/perf/app` / `/perf/group` endpoints already accept); "all
+  versions" is the default. Per-version crash/hang counts are not shown here
+  yet (a separate central crash-store join, still deferred) — use the
+  per-application crash/hang drill above for those.
 - **Per-device** — click a device to see its unified signal history (every
   signal type on one timeline, with friendly labels) plus a **device
   performance** panel: CPU, memory, and disk-latency sparklines built from the
@@ -222,11 +249,15 @@ Every aggregation on this page has a machine-readable equivalent under
 does (agentic-first parity):
 
 - **`GET /api/v1/dex/signals`** — the Catalogue rollup (every signal in the
-  window: count, blast radius, last seen).
+  window: count, blast radius, last seen). Optional `os=windows|linux|macos`
+  narrows to one OS's own signals (matching the dashboard's OS filter).
 - **`GET /api/v1/dex/scope`** — the per-OS signal coverage that drives the
   cross-OS captions.
 - **`GET /api/v1/dex/signals/{obs_type}`** — one signal's drill-down (subjects,
-  OS split, most-affected devices, per-day trend).
+  OS split, most-affected devices, per-day trend). Optional
+  `os=windows|linux|macos` scopes the subjects / devices / per-day lists to that
+  OS (the `os` applied is echoed back); the OS-split view stays cross-OS by
+  design, since that is the breakdown itself.
 - **`GET /api/v1/dex/perf/fleet`** — the Performance tab's fleet-now stats
   (avg/p50/p90/max + n per metric, `null` when nobody reported it, plus the
   reporting/online denominators).
@@ -248,18 +279,25 @@ does (agentic-first parity):
 - **`GET /api/v1/dex/devices/{id}/app-perf?app=`** — one device's retained per-app
   history (behavioral PII; scoped + audited fail-closed, `dex.device.app_perf.view`).
 
-The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all`; the
+The signal endpoints take a `window` of `24h`/`7d`/`30d`/`all` (and the
+catalogue rollup + per-signal drill-down additionally take the optional `os`
+filter above, `all` when omitted); the
 fleet-now/cohort perf endpoints are now-views (no window), while the
 **application-performance-over-time** endpoints (`/perf/apps`, `/perf/app`,
 `/perf/group`) read **retained Postgres** data (≤180 days fleet / ≤31 days
 group), not a now-view. All are gated on `GuaranteedState:Read`. The per-signal
 drill-down returns a most-affected **devices** list (behavioral) and is
 **audit-logged** (`dex.signal.view`) on every call, exactly like the dashboard
-view; the rollup, scope and aggregate perf endpoints are aggregates /
-machine-health telemetry and are not audited — and the app-perf aggregates
-suppress any sub-floor `(version, day)` point (fewer than 10 devices) to a count
-only. The per-device app-perf drill IS audited (`dex.device.app_perf.view`,
-fail-closed). The aggregate reads are exposed as MCP tools (`list_dex_signals`,
+view; the rollup, scope, and true aggregate perf endpoints (`/perf/fleet`,
+`/perf/cohorts`, `/perf/cohort-diff`, `/perf/apps`, `/perf/app`, `/perf/group`)
+are machine-health telemetry / fleet metadata and are not audited — and the
+app-perf aggregates suppress any sub-floor `(version, day)` point (fewer than
+10 devices) to a count only. **`/perf/devices` is the exception**: each row
+names an `agent_id` fleet-wide, so unlike its aggregate siblings it IS
+audited (`dex.perf.device.view`, fail-closed) and denies a service-scoped API
+token outright. The per-device app-perf drill IS also audited
+(`dex.device.app_perf.view`, fail-closed). The aggregate reads are exposed as
+MCP tools (`list_dex_signals`,
 `get_dex_signal_scope`, `get_dex_signal_detail`, `get_dex_perf_fleet`,
 `get_dex_perf_cohorts`, `get_dex_perf_cohort_diff`, `list_dex_perf_devices`,
 `list_dex_perf_apps`, `get_dex_app_perf`, `get_dex_group_app_perf`); the
