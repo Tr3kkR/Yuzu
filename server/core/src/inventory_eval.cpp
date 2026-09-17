@@ -168,7 +168,14 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
 
 std::vector<InventoryEvalResult> evaluate_inventory(
     const InventoryEvalRequest& req,
-    const std::vector<std::pair<std::string, std::string>>& records) {
+    const std::vector<std::pair<std::string, std::string>>& records,
+    std::size_t* excluded_by_depth) {
+
+    // #4496: zero the out-param up front (including on the early returns
+    // below) so a caller can never read a garbage/stale count.
+    if (excluded_by_depth) {
+        *excluded_by_depth = 0;
+    }
 
     std::vector<InventoryEvalResult> results;
     // Defense-in-depth backstop (Gate 6 sre BLOCKING fix): every caller MUST
@@ -196,20 +203,26 @@ std::vector<InventoryEvalResult> evaluate_inventory(
 
         // #2437-class guard: data_json is the same generic ADR-0016 blob read by
         // data_inventory_routes.cpp (see its own guard for the write-side
-        // context) - reached here via BOTH evaluate_inventory() callers, the
-        // REST from-inventory-query route and the MCP
+        // context) - reached here via all three evaluate_inventory() callers,
+        // the REST /api/v1/inventory/evaluate route, the REST
+        // from-inventory-query result-set producer, and the MCP
         // create_result_set_from_inventory_query tool. json::parse handles very
         // deep input fine (the catch below guards a genuine parse error, not
         // this), but json_value_to_string's dump() fallback on the parsed tree
         // is unboundedly recursive - a too-deep record would SIGSEGV the whole
-        // process for both callers at once. Check the raw text before parse and
+        // process for every caller at once. Check the raw text before parse and
         // skip this record exactly like a genuine parse error, below. Log
-        // identifiers only, never the payload.
+        // identifiers only, never the payload. #4496: count the exclusion so
+        // callers can signal an incomplete result rather than silently
+        // returning fewer matches than actually exist.
         if (mcp::json_exceeds_depth(data_json, mcp::kMcpMaxJsonDepth)) {
             spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json nests "
                         "too deeply (#2437-class)",
                         onbehalf::sanitize_for_log(record_agent_id, 128),
                         onbehalf::sanitize_for_log(record_plugin, 128));
+            if (excluded_by_depth) {
+                ++(*excluded_by_depth);
+            }
             continue;
         }
 

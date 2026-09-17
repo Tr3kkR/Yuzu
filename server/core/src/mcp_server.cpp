@@ -930,7 +930,9 @@ static const ToolDef kTools[] = {
      "family, a service-scoped API token is admitted and confined here, not denied outright "
      "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
      "the minting token's username, so a service token can mint a set the minter's other "
-     "credentials can later read back. REST v1 twin: POST "
+     "credentials can later read back. If any matched inventory record was excluded for "
+     "nesting past the JSON depth guard, this call refuses (kInternalError) rather than "
+     "materialise a result set narrower than the true match set (#4496). REST v1 twin: POST "
      "/api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
@@ -11458,7 +11460,27 @@ McpServer::HandlerFn McpServer::build_handler(
                         continue;
                     records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                 }
-                auto results = yuzu::server::evaluate_inventory(eval_req, records);
+                // #4496: fold poison-exclusion into the SAME M1
+                // dispatch-targeting-invariant refusal as inv_truncated just
+                // above, rather than a silent flag - this tool MATERIALISES
+                // the matched set into a durable result set other
+                // operators/dispatches consume later, so a narrowed target
+                // set gets the same hard-refuse treatment as a capped read
+                // (see the REST twin, POST /api/v1/result-sets/from-inventory-query,
+                // which makes the identical choice).
+                std::size_t excluded_by_poison = 0;
+                auto results = yuzu::server::evaluate_inventory(eval_req, records, &excluded_by_poison);
+                if (excluded_by_poison > 0) {
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=poison_excluded source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "inventory record(s) excluded for nesting too deeply, refusing "
+                                 "to materialise a result set narrower than the true match set",
+                                 "the excluded record(s) must be corrected or removed at the source"),
+                        "application/json");
+                    return;
+                }
                 std::unordered_set<std::string> seen;
                 std::vector<std::string> members;
                 for (const auto& r : results) {

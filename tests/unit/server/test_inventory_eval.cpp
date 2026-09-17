@@ -708,9 +708,15 @@ TEST_CASE("InventoryEval: malformed JSON skipped", "[inventory_eval][edge]") {
     InventoryEvalRequest req;
     req.conditions = {{"hw", "os", "==", "Linux"}};
 
-    auto results = evaluate_inventory(req, records);
+    // #4496: a genuine parse error is a DIFFERENT failure mode from the
+    // depth-guard exclusion below - excluded_by_depth must stay 0 here, or a
+    // caller surfacing the poison-exclusion signal would fire it on ordinary
+    // malformed input too.
+    std::size_t excluded_by_depth = 999;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
     REQUIRE(results.size() == 1);
     CHECK(results[0].agent_id == "agent-2");
+    CHECK(excluded_by_depth == 0);
 }
 
 // #2437-class guard: data_json nesting past kMcpMaxJsonDepth must be skipped
@@ -726,10 +732,15 @@ TEST_CASE("InventoryEval: malformed JSON skipped", "[inventory_eval][edge]") {
 // real ~100,000-level attack depth - and would spuriously COUNT this record
 // as a match. The guard must exclude it before that call is ever made.
 // Reachability-proxy depth (36 > kMcpMaxJsonDepth's 32), never the real
-// attack depth. This one function backs BOTH evaluate_inventory() callers
-// (the REST from-inventory-query route and the MCP
-// create_result_set_from_inventory_query tool), so this single test covers
-// both transports.
+// attack depth. This one function backs all three evaluate_inventory()
+// callers (REST /api/v1/inventory/evaluate, REST from-inventory-query, and
+// the MCP create_result_set_from_inventory_query tool), so this single test
+// covers all three.
+//
+// #4496: also asserts the exclusion is COUNTED via the out-param, since
+// every production caller now depends on that count to surface a
+// truncation/exclusion signal rather than silently returning fewer matches
+// than actually exist.
 TEST_CASE("InventoryEval: over-deep data_json skipped before it can spuriously match or "
           "reach the dump() fallback, a healthy matching record is still returned",
           "[inventory_eval][edge][security]") {
@@ -742,9 +753,31 @@ TEST_CASE("InventoryEval: over-deep data_json skipped before it can spuriously m
     InventoryEvalRequest req;
     req.conditions = {{"hw", "os", "exists", ""}};
 
-    auto results = evaluate_inventory(req, records);
+    std::size_t excluded_by_depth = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
     REQUIRE(results.size() == 1);
     CHECK(results[0].agent_id == "agent-2");
+    CHECK(excluded_by_depth == 1);
+}
+
+// #4496: the sibling of the test above - no poisoned record present, so the
+// out-param must read back 0, not merely "truthy/absent". A caller building a
+// truncation flag off a garbage/uninitialized count would otherwise report a
+// false positive on perfectly healthy input.
+TEST_CASE("InventoryEval: excluded_by_depth stays zero when no record is poisoned",
+          "[inventory_eval][edge][security]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+        {"agent-2|hw", R"({"os": "Windows"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    REQUIRE(results.size() == 2);
+    CHECK(excluded_by_depth == 0);
 }
 
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {
