@@ -24,6 +24,18 @@
 
 namespace yuzu::agent::macos {
 
+/// Cumulative CPU tick counters since boot, from host_statistics(HOST_CPU_LOAD_INFO).
+/// Mirrors yuzu::agent::lnx::CpuJiffies (dex_linux_proc.hpp), but keeps user/system/
+/// nice separate — host_cpu_load_info reports each as its own CPU_STATE_* bucket
+/// rather than one pre-summed "user" field the way /proc/stat's layout already is.
+struct CpuTicks {
+    bool valid{false};
+    std::uint64_t user{0};
+    std::uint64_t system{0};
+    std::uint64_t nice{0};
+    std::uint64_t idle{0};
+};
+
 /// PURE, saturating: convert `t` mach-absolute-time ticks to 100ns units, given the
 /// host's mach_timebase_info (numer/denom — ticks-to-nanoseconds is `t*numer/denom`;
 /// this then divides by 100 for the wire's 100ns unit, matching ProcCounter::cpu_100ns
@@ -32,5 +44,11 @@ namespace yuzu::agent::macos {
 /// (a corrupt timebase) returns 0, never divides by zero.
 YUZU_EXPORT std::uint64_t mach_abs_to_100ns(std::uint64_t t, std::uint32_t numer,
                                             std::uint32_t denom) noexcept;
+
+/// PURE: busy% over the interval between two CpuTicks readings. nullopt when either
+/// reading is invalid, any individual field regressed (reboot/reset — each field is an
+/// independently monotonic counter here, unlike /proc/stat's single derived total), or
+/// no time elapsed. Clamped to [0,100]. Mirrors yuzu::agent::lnx::cpu_busy_pct.
+YUZU_EXPORT std::optional<double> cpu_busy_pct(const CpuTicks& prev, const CpuTicks& cur);
 
 } // namespace yuzu::agent::macos
