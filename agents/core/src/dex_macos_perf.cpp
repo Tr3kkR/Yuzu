@@ -7,6 +7,7 @@
 #include <mach/mach_host.h>
 #include <mach/mach_init.h>
 #include <mach/machine.h>
+#include <sys/sysctl.h>
 #endif
 
 namespace yuzu::agent::macos {
@@ -103,6 +104,49 @@ CpuTicks read_cpu_ticks() {
 #else
 
 CpuTicks read_cpu_ticks() { return {}; }
+
+#endif // __APPLE__
+
+#if defined(__APPLE__)
+
+namespace {
+
+// Bounded sysctlbyname read into a fixed-size scalar. Same shape as
+// hardware_plugin.cpp's sysctl_value — kept as a private local copy here rather than
+// a shared header, since each file has exactly one call site for it.
+template <typename T> std::optional<T> sysctl_value(const char* name) {
+    T value{};
+    std::size_t len = sizeof(value);
+    if (::sysctlbyname(name, &value, &len, nullptr, 0) != 0)
+        return std::nullopt;
+    return value;
+}
+
+} // namespace
+
+VmSnapshot read_vm_snapshot() {
+    vm_statistics64_data_t vm{};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
+                          &count) != KERN_SUCCESS)
+        return {};
+    vm_size_t page_size = 0;
+    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS)
+        return {};
+    const auto total = sysctl_value<std::uint64_t>("hw.memsize");
+    if (!total)
+        return {}; // any of the three underlying reads failing invalidates the snapshot
+    VmSnapshot out;
+    out.valid = true;
+    out.total_bytes = *total;
+    out.used_bytes = vm_used_bytes(vm.wire_count, vm.internal_page_count, vm.purgeable_count,
+                                   vm.compressor_page_count, static_cast<std::uint64_t>(page_size));
+    return out;
+}
+
+#else
+
+VmSnapshot read_vm_snapshot() { return {}; }
 
 #endif // __APPLE__
 

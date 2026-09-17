@@ -97,4 +97,9 @@ YUZU_EXPORT std::uint64_t vm_used_bytes(std::uint64_t wire, std::uint64_t intern
 /// failure or on every other platform — never a half-filled struct.
 YUZU_EXPORT CpuTicks read_cpu_ticks();
 
+/// Darwin: one host_statistics64(HOST_VM_INFO64) + hw.memsize + host_page_size read,
+/// reduced via vm_used_bytes(). All-invalid on failure (any of the three underlying
+/// calls) or on every other platform.
+YUZU_EXPORT VmSnapshot read_vm_snapshot();
+
 } // namespace yuzu::agent::macos
