@@ -461,16 +461,38 @@ Runtime shape (unchanged claims, restated alongside the semantics above):
   `steady_clock` cadence — time-paced, never wake-paced (§24's journal-maintenance invariant applies
   verbatim; R8's `ReflexOutcomeJournal::maintenance_tick` implements this).
 
+## Chokepoints future routes must clear
+
+Named here so R7/R9/R11/R12 do not have to re-derive which existing gate applies — every future
+Reflex-touching surface clears its **own** applicable set, never a new parallel mechanism:
+
+- **Every new REST/MCP handler** (R7, R9's deploy/undeploy, R11's MCP twins) clears
+  `require_permission`/`require_scoped_permission` (RBAC, including the service-scope confinement
+  table) on the `Reflex` securable, has a `body_cap_policy.hpp` row (pre-auth request-body cap), and
+  responds in the standard A4 envelope shape (`rest_a4_envelope.hpp`) — exactly like every other
+  mutating REST route on the platform; this document does not invent a Reflex-specific exception to
+  any of the three.
+- **The `__reflex__` control leg** clears `CommandDedupStore`'s claim (see "Wire contract" above —
+  claimed by default, `__guard__` is the only bypass) and the two-halves reserved-plugin-name
+  intercept (load-time `plugin_loader.cpp`, dispatch-time `agent.cpp`), mirroring `__guard__`'s own
+  server-side solicited-reply-drop and `get_status`-intercept handling in `agent_service_impl.cpp`.
+- **`push_sets`** additionally clears the system-reserved-dispatch chokepoint (see "Wire contract"
+  above — `SystemReservedPush`, `send_system_reserved`, the quarantine-gated-vs-exempt decision).
+
 ## Executions-history ladder stance
 
 Reflex fire-and-react events are **agent-local automation, not operator-initiated dispatch** — they
-get **no executions-tracker row and no SSE bus publish**. `notify_exec_tracker` (agent-side) and the
-server's ingest path both skip any id carrying the `__reflex__-` (command) or `reflex-` (event)
-prefix, exactly as the existing `polchk-*`/`preflight-*`/`deployment-*` id families are skipped
-today (see `docs/executions-history-ladder.md`). **Any future SSE tile surfacing Reflex activity
-needs its own `classify_reflex_event_for_scope` twin** (mirroring the existing per-consumer
-confined-projection sanitizer pattern) and its own pin test — it must not be bolted onto the
-existing bus consumer set without one.
+get **no executions-tracker row and no SSE bus publish**. `notify_exec_tracker` — **server-side**,
+in `agent_service_impl.cpp` (not agent-side; the agent has no executions-tracker concept to skip) —
+and the server's ingest path both skip any id carrying the `__reflex__-` (command) or `reflex-`
+(event) prefix. This is the **fourth** skipped id family, not a third: the existing set is
+`polchk-*`, `preflight-*`, `deployment-*`, **and `bundle-*`** — `docs/executions-history-ladder.md`
+is the accruing registry of record for the full list; R6/R10 additionally register the
+`reflex-`/`__reflex__-` prefixes there when they land, rather than leaving this document as the
+only place they are written down. **Any future SSE tile surfacing Reflex activity needs its own
+`classify_reflex_event_for_scope` twin** (mirroring the existing per-consumer confined-projection
+sanitizer pattern) and its own pin test — it must not be bolted onto the existing bus consumer set
+without one.
 
 ## Outbox sharing and ingest limits
 
@@ -585,44 +607,55 @@ outcome journal.
 ## Pending routed-concern row (NOT added to `.claude/routed-concerns.md` — see reason below)
 
 `.claude/routed-concerns.md` measures **37,810 of its 40,000-character budget** as of this writing
-(`tests/test_issue_docs.py`) — 2,190 characters of headroom. The row text below runs 2,242
-characters, so it does not fit even on its own (let alone leaving headroom for the next concern),
-and it is independently over the "pay-as-you-go" ~500-character self-funding threshold in
+(`tests/test_issue_docs.py`) — 2,190 characters of headroom, not enough for the row below on its
+own, and independently over the "pay-as-you-go" ~500-character self-funding threshold in
 `docs/instruction-file-standard.md` (a PR that ships no code has nothing else in that file to trim
-to self-fund it). This is a known, called-out possibility in this slice's own brief. The row text
-below is the exact, ready-to-paste content for whoever lands the trim PR that frees headroom in
-that file (or folds this into an existing row) — copy this one so the two files
-never independently drift:
+to self-fund it). This is a known, called-out possibility in this slice's own brief. **R1 owns
+landing this row** — it lands the row text below (kept current against this file, re-copied if this
+file's own consent/dispatch/wire wording has changed since) together with a ≥ 500-character trim
+elsewhere in `.claude/routed-concerns.md` in the **same PR**, not deferred further. Copying this
+text verbatim rather than hand-authoring a new version is the **discipline** that keeps the two
+files aligned — it is not a mechanism that enforces it; no check currently catches the two drifting,
+so treat this file as the correction point if they ever do:
 
-> | Reflex — agent-local Spark→Reaction automated response (ADR-0021 D2/D4/D5/D7/D9/D10). Reflex is
+> | Reflex — agent-local Spark→Reaction automated response (ADR-0021 D2/D4/D5/D6/D7/D8/D9/D10). Reflex is
 > a SIBLING consumer of Spark, never a Guardian specialization (D2) — YAML-authoritative content
 > (D7), deployed only as a Reflex Set (D4), gated on the dedicated `Reflex:Execute` securable (§24's
 > `Push`-is-Guardian-only invariant is unaffected — Reflex never touches `crud_ops[]`/`Push`).
-> CATASTROPHIC: (1) the **consent gate** — a consequential Reaction (dangerous per
-> `dangerous_reactions_in_spec()`, fed by `CommandCapabilityRegistry::classify`) may deploy
-> `proceed`-on-exhaustion escalation only when every resolved target device satisfies
-> `tag:device_class == "server"` (TagStore, ADR-0050 fail-closed) OR an `interaction.*` Reaction
-> gated `on_success` precedes it in the chain — an UNCLASSIFIED device is workstation-class and
-> REFUSED, and an unreadable TagStore is an error, never a silent `true`; (2) **digest-bound
-> two-person approval** (D9) — `ApprovalOrigin::kReflexDeploy`, a different principal from both the
-> last content editor and the deployer, recomputed and compared at every compile, fail-closed on
-> mismatch; (3) Reflex reaction execution is **agent-LOCAL dispatch** (`LocalDispatcher`), authorized
-> ONCE at deploy time by (1)+(2) above — it never passes through the server's
-> `classify_and_authorize_dispatch`/`DispatchCaller` chokepoint, which governs operator-initiated
-> REMOTE dispatch only; do not conflate the two. (4) Outcomes live in a Reflex-only table
-> (`reflex_outcomes`), demuxed at the shared Guardian ingest router by
-> `GuaranteedStateEvent.family=="reflex"` — Guardian's blast-radius/alert-router observers MUST NOT
-> fire on a `family=="reflex"` row. (5) No executions-ladder tracker row / SSE bus entry for
-> `reflex-*`/`__reflex__-*` ids (agent-local, not an operator dispatch) — a future SSE surface needs
-> its own `classify_reflex_event_for_scope` twin. | `docs/reflex-design.md` +
-> `docs/adr/0021-spark-reflex-architecture.md` (Amendments) | `security-guardian` + `cpp-safety` +
-> `docs-writer` on `reflex_*.{hpp,cpp}`, `agents/core/include/yuzu/agent/reflex_engine.hpp`,
-> `proto/yuzu/reflex/v1/reflex.proto`, the `__reflex__` intercept in `agent.cpp`, or
-> `GuaranteedStateEvent.family` handling in `guardian_ingest.cpp` |
+> CATASTROPHIC: (1) the **consent gate** — a dangerous Reaction (per `dangerous_reactions_in_spec()`,
+> a SIBLING chokepoint to `dangerous_enforce_in_spec`, fed by `CommandCapabilityRegistry::classify`)
+> is REFUSED unless chain-consent (an affirmative interaction.* response TOKEN, never a bare rc) or
+> all-server tag-consent (a direct `TagStore` read, byte-exact `"server"`, unclassified/absent =
+> workstation) holds — independent of escalation policy; (2) **digest-bound two-person approval**
+> (D9) from a DISTINCT HUMAN ROOT (ADR-0033 §7), recomputed and compared at every compile, 409 on
+> review-time drift, fail-closed on mismatch — break-glass is a NEW, not-yet-built ApprovalManager
+> capability; (3) Reflex Reaction EXECUTION (never `push_sets`, which IS a dispatch site) is
+> agent-LOCAL (`LocalDispatcher`), authorized ONCE at deploy by (1)+(2) — never
+> `classify_and_authorize_dispatch`/`DispatchCaller`; do not conflate the two. (4) Outcomes live in a
+> Reflex-only table (`reflex_outcomes`), demuxed at the shared Guardian ingest router by a CLOSED-SET
+> `GuaranteedStateEvent.family` (`""`/`"guardian"`/`"reflex"`, unknown value refused) — `rule_id`
+> stays EMPTY for reflex rows, and Guardian's blast-radius/alert-router observers MUST NOT fire on
+> one. (5) No executions-ladder tracker row / SSE bus entry for `reflex-*`/`__reflex__-*` ids — a
+> future SSE surface needs its own `classify_reflex_event_for_scope` twin; `__reflex__` control
+> commands stay CLAIMED through `CommandDedupStore` (`__guard__` is the only bypass). |
+> `docs/reflex-design.md` + `docs/adr/0021-spark-reflex-architecture.md` (Amendments) |
+> `security-guardian` + `cpp-safety` + `docs-writer` on `reflex_*.{hpp,cpp}`,
+> `agents/core/include/yuzu/agent/reflex_engine.hpp`, `proto/yuzu/reflex/v1/reflex.proto`, the
+> `__reflex__` intercept in `agent.cpp`, or `GuaranteedStateEvent.family` handling in
+> `guardian_ingest.cpp` |
 
 ## Cross-references (for the slices that implement this document)
 
 R1 (`__reflex__` reserved name), R2 (Spark-consumer hoists), R3 (`ReflexSetStore` schema), R4 (YAML
 validator + safety/consent chokepoints), R5 (Spark runtime), R6 (executor + outcome mapping), R7
-(REST + RBAC), R8 (agent wiring), R9 (deploy/approval/push), R10 (ingest/outcomes/TTL), R11 (MCP
-twins), R12 (dashboard), R13 (observability), R14 (macOS proof).
+(REST + RBAC — owns `docs/agentic-first-principle.md` A4/A5 for its new REST routes), R8 (agent
+wiring), R9 (deploy/approval/push), R10 (ingest/outcomes/TTL), R11 (MCP twins — owns A4/A5 for its
+new MCP tools), R12 (dashboard), R13 (observability), R14 (macOS proof — Demo A/B end-to-end
+evidence; not yet given its own `docs/roadmap.md` Phase 20 issue number, tracked under the phase as
+a whole until one is filed).
+
+**Slice → roadmap mapping.** All fourteen R-slices above implement this single document; none maps
+1:1 onto `docs/roadmap.md` Phase 20's four Issue rows (20.1-20.4), which group by *capability*, not
+by *slice* — R3/R4 together deliver 20.1, R9 delivers 20.2, R1/R2/R5/R6/R8 together deliver 20.3, and
+R7/R10/R11/R12/R13 together deliver 20.4. R14 (macOS proof) cuts across all four and is not its own
+Issue row.
