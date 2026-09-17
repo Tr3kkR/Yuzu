@@ -3956,6 +3956,7 @@ TEST_CASE("MCP Integration: tools/list returns expected tools", "[mcp][integrati
                                                "list_dex_perf_apps",
                                                "get_dex_app_perf",
                                                "get_dex_group_app_perf",       // B1/B2 discovery pin
+                                               "get_dex_tag_app_perf",         // device-model cohort pin
                                                "compare_app_perf_versions",    // /auto VERIFY discovery pin
                                                "get_network_fleet",
                                                "list_network_devices",         // N1: A2 discovery pin
@@ -8273,6 +8274,11 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
         -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
         return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)};
     };
+    ts.app_perf_providers_for_test.tag_cohort =
+        [mk_row](std::string_view, std::string_view, std::string_view, std::string_view)
+        -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{mk_row(20)};
+    };
     ts.start("readonly");
 
     auto apps = mcp_tool_payload(
@@ -8298,6 +8304,64 @@ TEST_CASE("MCP app-perf: list / fleet / group happy paths", "[mcp][integration][
     CHECK(group["floor"] == yuzu::server::kDexCohortFloor); // floor echoed
     REQUIRE(group["points"].size() == 1);
     CHECK(group["points"][0]["device_count"] == 20);
+
+    auto tag = mcp_tool_payload(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":83,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"Latitude 5420","app":"chrome.exe"}}})")
+            ->body);
+    CHECK(tag["key"] == "model"); // default key when omitted
+    CHECK(tag["value"] == "Latitude 5420");
+    CHECK(tag["floor"] == yuzu::server::kDexCohortFloor);
+    REQUIRE(tag["points"].size() == 1);
+    CHECK(tag["points"][0]["device_count"] == 20);
+
+    auto tag_missing_value = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":84,"params":{"name":"get_dex_tag_app_perf","arguments":{"app":"chrome.exe"}}})");
+    auto tmv_body = nlohmann::json::parse(tag_missing_value->body);
+    REQUIRE(tmv_body.contains("error"));
+    CHECK(tmv_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    auto tag_bad_key = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":85,"params":{"name":"get_dex_tag_app_perf","arguments":{"key":"bad key!","value":"x","app":"chrome.exe"}}})");
+    auto tbk_body = nlohmann::json::parse(tag_bad_key->body);
+    REQUIRE(tbk_body.contains("error"));
+    CHECK(tbk_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // sec-M1: a present-but-empty value must 400, not silently read as "every
+    // value" — matches REST's has_param-then-.empty() check.
+    auto tag_empty_value = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8501,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"","app":"chrome.exe"}}})");
+    auto tev_body = nlohmann::json::parse(tag_empty_value->body);
+    REQUIRE(tev_body.contains("error"));
+    CHECK(tev_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+
+    // A present-but-empty key must 400 too, aligning MCP to REST's
+    // has_param-based behavior instead of silently substituting the default
+    // (the divergence happy-path flagged: REST rejects key="", MCP used to
+    // quietly default it to "model").
+    auto tag_empty_key = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":8502,"params":{"name":"get_dex_tag_app_perf","arguments":{"key":"","value":"Latitude 5420","app":"chrome.exe"}}})");
+    auto tek_body = nlohmann::json::parse(tag_empty_key->body);
+    REQUIRE(tek_body.contains("error"));
+    CHECK(tek_body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP get_dex_tag_app_perf: store degrade (wired provider returns nullopt) "
+          "-> internal error, never a silent empty trend",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.tag_cohort =
+        [](std::string_view, std::string_view, std::string_view,
+           std::string_view) -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::nullopt; // AUTHORITATIVE degrade (tag lookup OR the aggregate read failed)
+    };
+    ts.start("readonly");
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":8503,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"Latitude 5420","app":"chrome.exe"}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
 }
 
 TEST_CASE("MCP compare_app_perf_versions: cohort-paired before/after (evidential, no verdict)",
@@ -8412,6 +8476,32 @@ TEST_CASE("MCP get_dex_group_app_perf: still denies a service-scoped token "
 
     for (const auto& a : ts.audit_log)
         CHECK(a != "dex.perf.group.view|success");
+}
+
+TEST_CASE("MCP get_dex_tag_app_perf: still denies a service-scoped token via "
+          "perm_fn (same GuaranteedState:Read gate as get_dex_group_app_perf)",
+          "[mcp][integration][dex][app_perf][security]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.tag_cohort =
+        [](std::string_view, std::string_view, std::string_view,
+           std::string_view) -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+        return std::vector<yuzu::server::AppPerfFleetRow>{};
+    };
+    ts.mock_token_scope_service = "printers";
+    ts.perm_override_for_test = [](const std::string& sec, const std::string& op) -> bool {
+        return !(sec == "GuaranteedState" && op == "Read");
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":95,"params":{"name":"get_dex_tag_app_perf","arguments":{"value":"Latitude 5420","app":"chrome.exe"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 403); // denied at the same GuaranteedState:Read gate as the sibling test
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "dex.perf.tag.view|success");
 }
 
 TEST_CASE("MCP compare_app_perf_versions: denies a service-scoped token, denied under "
@@ -8544,6 +8634,135 @@ TEST_CASE("MCP app-perf: unavailable provider + missing arg degrade",
         REQUIRE(body.contains("error"));
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams); // missing 'app'
     }
+}
+
+// ── list_dex_app_perf_devices — the version-row "which devices" drill ────────
+// Unlike its siblings above (fleet aggregates, no agent_id), each row here
+// names an agent_id, so this tool gates on fleet_read_fn_ (require_fleet_read,
+// ADR-0017) instead of tier_allows/perm_fn, and mints its own dedicated audit
+// verb (dex.app_perf.devices.view) in addition to the generic mcp.<tool> call
+// audit — mirrors get_dex_device_app_perf's dual-audit shape above.
+
+TEST_CASE("MCP list_dex_app_perf_devices: success shape, scoped visible-set, "
+          "dedicated + generic audit",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    std::optional<std::vector<std::string>> seen_visible;
+    ts.app_perf_providers_for_test.version_devices =
+        [&](std::string_view app, std::string_view version,
+            const std::optional<std::vector<std::string>>& visible_ids,
+            bool& truncated) -> std::optional<std::vector<yuzu::server::AppPerfVersionDeviceRow>> {
+        CHECK(app == "chrome.exe");
+        CHECK(version == "119.0.0.0");
+        seen_visible = visible_ids;
+        truncated = false;
+        yuzu::server::AppPerfVersionDeviceRow r;
+        r.agent_id = "WS-1";
+        r.last_day = 1'700'000'000;
+        r.samples = 12;
+        r.cpu_avg = 33.0;
+        r.ws_avg_bytes = 555;
+        return std::vector<yuzu::server::AppPerfVersionDeviceRow>{r};
+    };
+    // Scoped (not unfiltered) admission — proves the gate's VisibleSet reaches
+    // the provider unchanged (ADR-0017 push-into-query, not a post-filter).
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::unordered_set<std::string>{"WS-1"}};
+    };
+    ts.start("readonly");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":86,"params":{"name":"list_dex_app_perf_devices","arguments":{"app":"chrome.exe","version":"119.0.0.0"}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto p = mcp_tool_payload(res->body);
+    CHECK(p["app"] == "chrome.exe");
+    CHECK(p["version"] == "119.0.0.0");
+    CHECK(p["truncated"] == false);
+    REQUIRE(p["devices"].is_array());
+    REQUIRE(p["devices"].size() == 1);
+    CHECK(p["devices"][0]["agent_id"] == "WS-1");
+    CHECK(p["devices"][0]["samples"].get<int64_t>() == 12);
+    CHECK(std::abs(p["devices"][0]["cpu_avg"].get<double>() - 33.0) < 1e-9);
+
+    REQUIRE(seen_visible.has_value());
+    REQUIRE(seen_visible->size() == 1);
+    CHECK((*seen_visible)[0] == "WS-1");
+
+    bool saw_dedicated = false;
+    for (const auto& a : ts.audit_log)
+        if (a == "dex.app_perf.devices.view|success")
+            saw_dedicated = true;
+    CHECK(saw_dedicated);
+    CHECK(ts.audit_log.back() == "mcp.list_dex_app_perf_devices|success");
+}
+
+TEST_CASE("MCP list_dex_app_perf_devices: version is REQUIRED-PRESENT, not "
+          "\"omit = all versions\"",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts; // provider never reached — rejected at param validation
+    ts.start("readonly");
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":87,"params":{"name":"list_dex_app_perf_devices","arguments":{"app":"chrome.exe"}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+}
+
+TEST_CASE("MCP list_dex_app_perf_devices: unwired fleet_read_fn_ -> fail-closed, "
+          "never a fallback admit",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.fleet_read_fn_for_test = {}; // genuinely empty, matches production's unwired state
+    ts.app_perf_providers_for_test.version_devices =
+        [](std::string_view, std::string_view, const std::optional<std::vector<std::string>>&,
+           bool&) -> std::optional<std::vector<yuzu::server::AppPerfVersionDeviceRow>> {
+        FAIL("provider must never be reached when the gate is unwired");
+        return std::nullopt;
+    };
+    ts.start("readonly");
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":88,"params":{"name":"list_dex_app_perf_devices","arguments":{"app":"chrome.exe","version":""}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+    for (const auto& a : ts.audit_log)
+        CHECK(a != "dex.app_perf.devices.view|success");
+}
+
+TEST_CASE("MCP list_dex_app_perf_devices: store degrade -> dedicated failure audit "
+          "(regression, was silently missing), never success",
+          "[mcp][integration][dex][app_perf]") {
+    McpTestServer ts;
+    ts.app_perf_providers_for_test.version_devices =
+        [](std::string_view, std::string_view, const std::optional<std::vector<std::string>>&,
+           bool&) -> std::optional<std::vector<yuzu::server::AppPerfVersionDeviceRow>> {
+        return std::nullopt; // AUTHORITATIVE degrade
+    };
+    ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response&,
+                                   const std::string&,
+                                   const std::string&) -> yuzu::server::authz::FleetReadGate {
+        return {true, std::nullopt};
+    };
+    ts.start("readonly");
+    auto body = nlohmann::json::parse(
+        ts.call(
+              R"({"jsonrpc":"2.0","method":"tools/call","id":89,"params":{"name":"list_dex_app_perf_devices","arguments":{"app":"chrome.exe","version":"119.0.0.0"}}})")
+            ->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+
+    bool saw_dedicated_failure = false;
+    for (const auto& a : ts.audit_log) {
+        CHECK(a != "dex.app_perf.devices.view|success");
+        if (a == "dex.app_perf.devices.view|failure")
+            saw_dedicated_failure = true;
+    }
+    CHECK(saw_dedicated_failure); // the dedicated verb, not just the generic mcp.<tool> audit
 }
 
 TEST_CASE("MCP network: fleet stats + devices (worst-first sort + limit parity)",

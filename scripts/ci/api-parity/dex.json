@@ -211,6 +211,17 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/dex/perf/app/devices",
+    "capability_id": "get.fragments-dex-perf-app-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/dex/perf/app/devices"
+    },
+    "mcp_twin": "list_dex_app_perf_devices",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/dex/perf/cohort-diff",
     "capability_id": "get.fragments-dex-perf-cohort-diff",
     "rest_v1_twin": {
