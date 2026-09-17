@@ -64,8 +64,8 @@ elif host_machine.system() == 'darwin'
     agent_platform_deps += agent_security_dep
     agent_platform_args += '-DYUZU_HAVE_SECURITY_FRAMEWORK'
   else
-    message('Security.framework not found — macOS bounded keychain read '
-          + '(keychain_read.cpp) built as a stub')
+    message('Security/CoreFoundation/IOKit frameworks not found — macOS bounded '
+          + 'keychain read (keychain_read.cpp) built as a stub')
   endif
   # Endpoint Security (A0): shared top-level probe (meson.build), consumed
   # here for agent-core's pure ES helpers (es_client.hpp). Empty lists on a

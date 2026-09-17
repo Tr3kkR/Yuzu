@@ -23,10 +23,8 @@ namespace yuzu::agent {
 
 /// Resolve the run state of one label from a set of decoded rows: listed
 /// with a pid -> Running; listed without a pid, or the label is absent from
-/// `rows` entirely -> Stopped. Never Paused -- launchd (like systemd) has no
-/// analogue to the Windows SCM's SERVICE_PAUSED terminal state (see
-/// yuzu/agent/spark.hpp's ServiceRunState doc comment, which states this for
-/// Linux and is extended here to macOS by the same reasoning).
+/// `rows` entirely -> Stopped. Never Paused -- see yuzu/agent/spark.hpp's
+/// ServiceRunState doc comment's macOS mapping line for why.
 ///
 /// Precondition: `rows` must be a COMPLETE, exit-0 `launchctl list` snapshot
 /// (yuzu::shared::parse_launchctl_list's LaunchctlParseResult with

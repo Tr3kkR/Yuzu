@@ -27,7 +27,8 @@ namespace yuzu::agent {
 /// NOTIFY-only ES client exposes no liveness API, so prolonged TOTAL silence
 /// is the only "presumed dead" signal available. Sized well beyond any
 /// plausible quiet period so a healthy stream on a legitimately idle host is
-/// not falsely dropped to an inferior poll fallback.
+/// not falsely dropped to an inferior poll fallback. Revisit once a real
+/// liveness signal exists (#1455).
 inline constexpr std::int64_t kEsIdleFallbackSeconds = 3600; // 1 hour with zero events
 
 /// True once TOTAL silence (no event AND no stream start) has lasted longer
