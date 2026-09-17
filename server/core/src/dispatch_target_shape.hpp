@@ -202,6 +202,22 @@ inline constexpr std::string_view kReasonQuarantined{"quarantined"};
 /// a quarantine denial is.
 inline constexpr std::string_view kReasonUnknownPlugin{"unknown_plugin"};
 
+/// #4496: the from-inventory-query result-set producer (REST and its MCP
+/// twin) refused because the underlying inventory read hit its row/byte cap.
+/// Deliberately NOT a member of either array above, same reasoning as
+/// `kReasonQuarantined`/`kReasonUnknownPlugin`: this is a server-side
+/// data-quality refusal on an otherwise well-formed, correctly-targeted
+/// request, not a targeting-shape violation. Unlike its two siblings above,
+/// this reason is NOT excluded from the `YuzuDispatchTargetRejected` alert's
+/// regex - a well-targeted request failing here is exactly the class of
+/// near-miss that alert exists to surface.
+inline constexpr std::string_view kReasonQueryTruncated{"query_truncated"};
+
+/// #4496: same route and same rationale as `kReasonQueryTruncated`, for the
+/// sibling refusal when a candidate inventory record was excluded by the
+/// #2437-class JSON depth guard rather than the row/byte cap.
+inline constexpr std::string_view kReasonPoisonExcluded{"poison_excluded"};
+
 /// Reject a targeting argument that was SUPPLIED but names nothing.
 ///
 /// Both the type and the emptiness arms matter for the same reason: a handler

@@ -1082,7 +1082,12 @@ After upgrading, refusals are counted by
 `absent()` stays meaningful) and audited as `command.dispatch|denied`
 (`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
 (`detail=reason=<reason>`) or `result_set.create|denied`
-(`detail=reason=<reason> source_kind=<kind>`). The
+(`detail=reason=<reason> source_kind=<kind>`). The same action's `failure` result (#4496, the
+`POST /api/v1/result-sets/from-inventory-query` producer and its MCP twin) carries
+`detail=reason=store_degraded|query_truncated|poison_excluded source_kind=inventory_query` - only
+the latter two of those three are counted on `yuzu_server_dispatch_target_rejected_total`
+(`route="result_set_inventory_query"`); `store_degraded` is a store-availability failure, not a
+targeting-shape refusal, so it is not on this series. The
 `YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
@@ -2080,6 +2085,14 @@ A nonzero result means that host's `installed_count` will report a higher number
 **Deprecation window (per `docs/api-versioning-policy.md`).** Announced 2026-09-08. `GET /api/v1/agent/plugin-policy` keeps working for at least 90 days **and** at least one intervening feature release, whichever is longer (so no earlier than 2026-12-07, and not before the next feature release ships) — removal will carry its own `CHANGELOG.md` **Breaking/Removed** entry per the cycle's Step 3, never a silent drop.
 
 **Who this affects, and what to do.** Any script, admin tool, or manual `curl` pipeline reading this route directly. Point it at `/api/v2/agent/plugin-policy` and read `response["data"]["trust_bundle_pem"]` (was `response["trust_bundle_pem"]`) — no CLI flag or configuration change is needed, this is a URL and response-shape change only. No action is required before the removal window closes, but migrating now also picks up the TOCTOU integrity fix.
+
+### vNEXT - a poisoned inventory record now makes two result-set producer routes refuse instead of silently narrowing (#4496) (breaking)
+
+**What changed.** `POST /api/v1/result-sets/from-inventory-query` and the MCP `create_result_set_from_inventory_query` tool now refuse (`503`/`kInternalError`) when a candidate inventory record's stored `data_json` nests past the JSON depth guard (the #2437-class poisoned/over-nested record). Previously the poisoned record was silently skipped with no signal at all, and the call succeeded, materialising a result set that had quietly excluded that agent.
+
+**Who this affects.** Any deployment with an existing stored inventory record (`inventory_store.inventory_data`) whose `data_json` nests deeper than the JSON depth guard allows - most likely a row predating the #2437-class write-side guard. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set.
+
+**How to identify the affected record(s).** There is no SQL-level detection query or purge endpoint for this today - the only current signal is a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json nests too deeply (#2437-class)`, emitted once per excluded record on every call that reaches the guard. Watch the server log for this line following a `503` from either route above to identify which agent/plugin's record needs re-collection at the source.
 
 ---
 

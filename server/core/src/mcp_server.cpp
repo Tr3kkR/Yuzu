@@ -930,10 +930,11 @@ static const ToolDef kTools[] = {
      "family, a service-scoped API token is admitted and confined here, not denied outright "
      "(tracked cross-service-reach gap, #4307) - the created set is still owner-scoped to "
      "the minting token's username, so a service token can mint a set the minter's other "
-     "credentials can later read back. If any matched inventory record was excluded for "
-     "nesting past the JSON depth guard, this call refuses (kInternalError) rather than "
-     "materialise a result set narrower than the true match set (#4496). REST v1 twin: POST "
-     "/api/v1/result-sets/from-inventory-query.",
+     "credentials can later read back. If any candidate inventory record was excluded for "
+     "nesting past the JSON depth guard (the exclusion check runs before condition matching, "
+     "so a record's plugin/fields need not relate to the query's conditions to trigger it), "
+     "this call refuses (kInternalError) rather than materialise a result set narrower than "
+     "the true match set (#4496). REST v1 twin: POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -11456,6 +11457,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     // as a targeting set — the missing tail silently changes
                     // who gets acted on (#2500/#2492 dispatch-targeting
                     // invariant class).
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_inventory_query"},
+                                       {"reason", std::string(kReasonQueryTruncated)}})
+                            .increment();
+                    }
                     (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
                                    "reason=query_truncated source_kind=inventory_query");
                     res.set_content(
@@ -11486,13 +11494,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 std::size_t excluded_by_poison = 0;
                 auto results = yuzu::server::evaluate_inventory(eval_req, records, &excluded_by_poison);
                 if (excluded_by_poison > 0) {
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_inventory_query"},
+                                       {"reason", std::string(kReasonPoisonExcluded)}})
+                            .increment();
+                    }
                     (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
                                    "reason=poison_excluded source_kind=inventory_query");
                     res.set_content(
                         a4_error(kInternalError,
-                                 "inventory record(s) excluded for nesting too deeply, refusing "
+                                 "inventory record(s) excluded for nesting too deeply - refusing "
                                  "to materialise a result set narrower than the true match set",
-                                 "the excluded record(s) must be corrected or removed at the source"),
+                                 "the excluded record(s) must be corrected at the source "
+                                 "(re-reported by the originating agent)"),
                         "application/json");
                     return;
                 }

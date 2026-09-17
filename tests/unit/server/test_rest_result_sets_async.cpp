@@ -1199,7 +1199,7 @@ TEST_CASE("from-inventory-query: no poisoned record present -- matching membersh
 
 TEST_CASE("POST /api/v1/inventory/evaluate: a poisoned record is flagged via "
           "results_excluded_by_poison, a healthy matching agent is still returned",
-          "[pg][result_set][inventory][security]") {
+          "[pg][result_set][inventory][inventory_eval][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
@@ -1246,7 +1246,7 @@ TEST_CASE("POST /api/v1/inventory/evaluate: a poisoned record is flagged via "
 // on this route).
 TEST_CASE("POST /api/v1/inventory/evaluate: no poisoned record present -- "
           "results_excluded_by_poison is absent from the response",
-          "[pg][result_set][inventory][security]") {
+          "[pg][result_set][inventory][inventory_eval][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());

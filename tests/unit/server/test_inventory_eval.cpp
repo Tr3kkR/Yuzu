@@ -780,6 +780,50 @@ TEST_CASE("InventoryEval: excluded_by_depth stays zero when no record is poisone
     CHECK(excluded_by_depth == 0);
 }
 
+// #4496 (Gate 7 fix, quality-engineer SHOULD): the out-param must ACCUMULATE
+// across records, not saturate at 1 - two independently-poisoned records
+// plus a healthy matching record must leave excluded_by_depth at 2, with the
+// healthy record's match still returned.
+TEST_CASE("InventoryEval: excluded_by_depth accumulates across multiple poisoned records",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records = {
+        {"agent-1|hw", poisoned},
+        {"agent-2|hw", poisoned},
+        {"agent-3|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-3");
+    CHECK(excluded_by_depth == 2);
+}
+
+// #4496 (Gate 7 fix, cpp-expert + cpp-safety NICE, independently converged):
+// the out-param is zeroed up front so a caller never reads a garbage/stale
+// count - but that zeroing must also hold on the kMaxInventoryConditions
+// early-return path, not just the normal loop-exit path. Seed a stale
+// nonzero value and confirm this specific backstop path clears it too.
+TEST_CASE("InventoryEval: excluded_by_depth is zeroed on the kMaxInventoryConditions "
+          "early return, not just the loop-exit path",
+          "[inventory_eval][edge]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions.assign(kMaxInventoryConditions + 1, InventoryCondition{"hw", "os", "exists", ""});
+
+    std::size_t excluded_by_depth = 999;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    CHECK(results.empty());
+    CHECK(excluded_by_depth == 0);
+}
+
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {
     Records records = {
         {"badkey_no_pipe", R"({"os": "Linux"})"},

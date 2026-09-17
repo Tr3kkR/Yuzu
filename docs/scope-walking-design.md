@@ -293,7 +293,7 @@ Every state transition writes an `AuditEvent` per `docs/observability-convention
 
 | Action | Result | Notes |
 |---|---|---|
-| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty` |
+| `result_set.create` | `success` / `failure` / `denied` | Includes source_kind, parent_id, device_count. `denied` when a supplied `parent_id` names no parent set (#2500), with `detail=reason=parent_id_type\|parent_id_empty`. `failure` on the inventory-query producer (#4496) with `detail=reason=store_degraded\|query_truncated\|poison_excluded source_kind=inventory_query` |
 | `result_set.live_reeval` | `success` / `failure` | Includes original_id, new_id, device_count_delta |
 | `result_set.pin` / `result_set.unpin` | `success` | |
 | `result_set.delete` | `success` | Pinned sets require explicit unpin first; `delete` of an unpinned set is single-action |

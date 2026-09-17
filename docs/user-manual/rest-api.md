@@ -5716,9 +5716,11 @@ One behavior worth calling out here: when the underlying inventory read hits
 the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
-narrowed. **(#4496)** A matched inventory record excluded by the JSON depth
-guard (a poisoned/over-nested `data_json` row, see json-dump-depth-guard
-above) gets the identical treatment: the route returns **503**
+narrowed. **(#4496)** A candidate inventory record excluded by the JSON depth
+guard (a poisoned/over-nested `data_json` row; the exclusion check runs
+before condition matching, so a record's plugin/fields need not relate to
+the query's conditions to trigger it; see json-dump-depth-guard below) gets
+the identical treatment: the route returns **503**
 ("inventory record(s) excluded for nesting too deeply ... refusing to
 materialise a result set narrower than the true match set") rather than
 silently dropping the poisoned agent from membership: this is a
@@ -5881,10 +5883,12 @@ been read rather than not matching. (The typed software route carries the same
 flag inside `data` — placement alignment is tracked with #2633.)
 
 `results_excluded_by_poison` (integer, optional, #4496): emitted at the same
-top level, present and non-zero when one or more matched inventory records
+top level, present and non-zero when one or more candidate inventory records
 were excluded because their stored `data_json` nested past the JSON depth
-guard (a poisoned/over-nested row, see json-dump-depth-guard above). The
-returned matches may be missing some the caller cannot detect any other way.
+guard (a poisoned/over-nested row; the exclusion check runs before condition
+matching, so a record's plugin/fields need not relate to the query's
+conditions to trigger it; see json-dump-depth-guard below). The returned
+matches may be missing some the caller cannot detect any other way.
 Distinct from `result_truncated_by_cap` (a row/byte cap on the underlying
 read, not a per-record exclusion); either, both, or neither may be present
 on a given response.

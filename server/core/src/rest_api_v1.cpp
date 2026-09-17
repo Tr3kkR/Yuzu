@@ -9419,6 +9419,12 @@ void RestApiV1::register_routes(
                           // dispatch-targeting invariant class). 503 rather
                           // than a partial set; raising the cap / keyset
                           // pagination is the tracked follow-up.
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonQueryTruncated)}})
+                                  .increment();
                           audit_failure("query_truncated");
                           rs_err(res, 503,
                                  "inventory query truncated at the row or byte cap - refusing to "
@@ -9449,6 +9455,12 @@ void RestApiV1::register_routes(
                       std::size_t excluded_by_poison = 0;
                       auto results = evaluate_inventory(eval_req, records, &excluded_by_poison);
                       if (excluded_by_poison > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonPoisonExcluded)}})
+                                  .increment();
                           audit_failure("poison_excluded");
                           rs_err(res, 503,
                                  "inventory record(s) excluded for nesting too deeply - refusing "
