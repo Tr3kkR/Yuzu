@@ -677,6 +677,63 @@ injective - two rules with different `(spark, assertion)` splits of the same
 flat field sequence could hash identically, which `decide_retry()`'s content
 comparison depends on being collision-resistant.
 
+**R5.3 as implemented (rung 9c PR-5d, "Three separate transitions" - arm-recovery
+and wedge-release).** The "arm-recovery (a still-wanted rule's late success
+commits and clears its `arm_failed` entry)" transition named above is built as
+two genuinely separate mechanisms, matching the two concerns ruling 14(b) folds
+together in prose but which do not share one signal in code:
+
+- **Adoption (does the late arm's subscription get committed).**
+  `GuardianSparkRuntime::on_arm_complete()` decides this per claim, not per
+  ledger. A retained-wedge head (`is_retained_wedge()`: dispatched, waiter-
+  abandoned, `ClaimEnd::WaiterTimedOutDispatched`) whose `RuleGeneration::active`
+  is still true is adopted exactly like an ordinary live claim's commit - one
+  watcher, live and enforcing - EXCEPT the claim's own `end`/`outcome` are left
+  untouched: the sticky-Wedged receipt (§R5.2, pinned by test) is a fact about
+  the ORIGINAL episode's timeout, not a live status of the rule, and adoption
+  never revises history. `rg->active` is the desired-state signal: it starts
+  true at attach and is flipped false ONLY by a withdrawal that can actually
+  reach the claim - `detach_rule_locked()`'s ordinary Case 0 FIFO scan
+  deliberately EXCLUDES a `waiter_abandoned` claim (it was already unreachable
+  through `index_`/`rules_` at abandonment time), so a dedicated locator,
+  `wedged_by_rule_` (rule_id -> the currently-wedged claim, populated the
+  instant a claim wedges, non-stopping only), is what lets
+  `detach_rule_locked()`/`detach_all()` find and deactivate it. A genuine
+  reobservation (the SAME rule_id + spec re-attaching onto its own still-wedged
+  head) is hoisted to run BEFORE `detach_rule_locked(rule_id)`'s own
+  unconditional call in `attach_core()` - without that ordering, every
+  reobservation would transit the withdrawal lookup and deactivate its own
+  claim's `rg->active`, since `detach_rule_locked(rule_id)` runs on every
+  `attach_core()` call regardless of what the call turns out to be.
+- **Arm-recovery telemetry (does the CURRENT application's `arm_failed`
+  clear).** `GuardianArmAckLedger` retains the `ArmReceipt` for any receipt
+  `drain_locked()` resolves to `Wedged` specifically (`Application::
+  failed_receipts`, rule_id -> receipt - the only failure status a later
+  adoption can retroactively recover), because `drain_locked()`'s own erase
+  from `pending` otherwise discards the per-rule identity needed to notice a
+  recovery later. Each subsequent `drain_locked()` call re-checks every
+  retained failure via `GuardianSparkRuntime::receipt_recovered()` (does
+  `rules_` currently carry this EXACT (rule_id, generation) incarnation, not
+  merely SOME generation of the rule) and, on a match, decrements
+  `resolved_failed` and drops the entry - clearing `can_advance()`'s block for
+  that application without ever decrementing the cumulative, fleet-visible
+  `arm_failures_` counter (`failed_out` is untouched on recovery; that counter
+  answers "how many arm failures have ever happened", a different question
+  from "does the current application still have one outstanding").
+
+Both mechanisms are **scoped to the current application/claim only** - neither
+is the durable, cross-application "last known arm outcome for every currently-
+desired rule" gauge a fleet-wide dashboard would need; that stronger semantic,
+plus the K-bound retry-then-waive acknowledgment policy and `arm_failed`'s
+reason/phase breakdown, remain rung 9c PR-5e's scope, unbuilt here.
+
+**A late FAILURE (refusal, not success) on a still-desired wedged rule is a
+no-op by construction, not a third mechanism**: the claim was already terminal
+(`Wedged`) at abandonment, `armed_live` is false when the backend eventually
+answers with a failure, and the adoption branch above requires a live
+subscription to commit - nothing new is armed, nothing new fails, and
+`arm_failed` correctly stays set (there is nothing to recover from a failure).
+
 **Telemetry-tag semantics, flagged not specified (SHOULD, Gate 6 sre):**
 `yuzu.guardian_arm_pending`/`yuzu.guardian_arm_failed` (introduced here, wired in
 PR-3) need their gauge-vs-counter semantics stated before PR-3 implements them, not
