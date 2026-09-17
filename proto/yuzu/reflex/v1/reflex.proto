@@ -8,8 +8,8 @@ option cc_enable_arenas = true;
 
 // Reflex wire protocol for the Yuzu Reflex agent-local automated-response
 // system. See docs/reflex-design.md (the canonical, line-by-line contract)
-// and docs/adr/0021-spark-reflex-architecture.md (Decisions 2, 4, 5, 7, 9,
-// 10 and the 2026-09-17 amendment).
+// and docs/adr/0021-spark-reflex-architecture.md (Decisions 2, 4, 5, 6, 7, 8,
+// 9, 10 and the 2026-09-17 amendment).
 //
 // Transport reuses the CommandRequest/CommandResponse bidi stream, on TWO
 // independent legs, both carried as opaque `payload` bytes — NOT the
@@ -25,17 +25,24 @@ option cc_enable_arenas = true;
 //   Agent  -> Server: plugin="__reflex__" action="status"     payload=ReflexSetStatus
 //
 // OUTCOME LEG — Reflex deliberately has NO outcome message in this file.
-// A fired/completed/failed/aborted/suppressed Reflex chain reuses the
-// EXISTING "__guard__"/"event" channel (guaranteed_state.proto
-// GuaranteedStateEvent), discriminated by the new
-// GuaranteedStateEvent.family == "reflex" field, with the ReflexOutcome
-// shape carried as JSON in GuaranteedStateEvent.detail_json (the same
-// generic-detail pattern already used for DEX's "process.crashed"
-// observations). This keeps Reflex on the platform's ONE agent->server
+// A fired/completed/failed/timed_out/aborted/suppressed Reflex chain reuses
+// the EXISTING "__guard__"/"event" channel (guaranteed_state.proto
+// GuaranteedStateEvent), discriminated by the new, CLOSED-SET
+// GuaranteedStateEvent.family field ("" | "guardian" | "reflex" — an
+// unrecognized value is refused at ingest, never silently guardian), with
+// the ReflexOutcome shape carried as JSON in GuaranteedStateEvent.detail_json
+// (the same generic-detail pattern already used for DEX's "process.crashed"
+// observations); GuaranteedStateEvent.rule_id stays EMPTY for family=="reflex"
+// rows (set_id/reflex_id are additive fields there instead — never a
+// rule_id-squat). This keeps Reflex on the platform's ONE agent->server
 // unsolicited-event channel and ONE server-side ingest router chokepoint
-// (ADR-0021 Decision 6) rather than opening a second one — only the
-// eventual storage destination (a Reflex-only `reflex_outcomes` table)
-// forks on `family`. See docs/reflex-design.md "Wire contract".
+// (ADR-0021 Decision 6) rather than opening a second one — only the eventual
+// storage destination (a Reflex-only `reflex_outcomes` table) forks on
+// `family`. Decision 8 ("one versioned per-device document, one generation
+// counter, replacing GuaranteedStatePush") is a SEPARATE, accepted-interim
+// exception this proto's ReflexSetPush/generation knowingly carries — see
+// the 2026-09-17 ADR-0021 amendment. See docs/reflex-design.md "Wire
+// contract".
 
 // One plugin invocation within a Reflex's Reaction chain.
 message ReflexReaction {
@@ -53,27 +60,29 @@ message ReflexReaction {
   uint32 timeout_ms = 5;    // default 10_000, max 120_000 (server-validated)
   bool capture_output = 6;  // default false; captured output capped at 4 KiB
 
-  // Denormalized copy of this (plugin,action) pair's compile-authored
-  // CommandCapabilityRegistry::ExecuteGate classification
-  // (server/core/src/command_capability.hpp), computed server-side at
-  // spec-validate time (reflex_schema_registry.cpp `classify_reaction`)
-  // and re-verified at every compile alongside the digest. NOT a live
-  // dispatch gate: Reflex Reactions execute via the agent's LOCAL
-  // dispatcher, never through the server's classify_and_authorize_dispatch
-  // chokepoint (which governs operator-initiated REMOTE dispatch only —
-  // see docs/reflex-design.md "Safety chokepoint"). Carried on the wire so
-  // the agent's outcome journal can record the classification a dangerous
-  // Reaction was approved under, without needing its own copy of the
-  // capability registry. "" | "none" | "admin_or_approval" |
-  // "always_approval" | "destructive" (mirrors ExecuteGate/DispatchClass).
-  string execute_gate = 7;
+  // Deliberately NOT carried: a wire copy of this pair's
+  // CommandCapabilityRegistry::ExecuteGate/DispatchClass classification. An
+  // earlier draft carried one as a single `execute_gate` string, but
+  // ExecuteGate (Unspecified|None|AdminOrApproval|AlwaysApproval) and
+  // DispatchClass (ReadOnly|Mutating|Destructive) are two independent axes
+  // that do not collapse into one string without losing information (e.g.
+  // AdminOrApproval+Destructive is unrepresentable), and no agent-side
+  // consumer reads it back (R8 confirmed) — dropped rather than shipped
+  // unused and lossy. The classification lives server-side only
+  // (reflex_schema_registry.cpp, not yet landed — R4), consulted once at
+  // compile time by `dangerous_reactions_in_spec()`
+  // (see docs/reflex-design.md "Safety chokepoint").
 }
 
 // The Spark binding for a Reflex: a detection type plus its parameters.
-// `type` and `params` mirror agents/core/include/yuzu/agent/spark.hpp's
-// SparkType vocabulary and per-type param schema (file, service, plist,
-// process, disk, interval, startup) — the published per-type schema lives
-// server-side in reflex_schema_registry.cpp, never on the wire.
+// `type` is an OPEN set published server-side by
+// reflex_schema_registry.cpp's `spark_types()` (not yet landed — R4) — it
+// does NOT mirror agents/core/include/yuzu/agent/spark.hpp's SparkType enum
+// verbatim. Shipped today (agent-side): file, service, disk, interval,
+// startup, registry (Windows-only). Planned, not yet landed: plist (macOS,
+// A6), process (ES-backed, A7). See docs/reflex-design.md "Spark types and
+// per-type facts" for the full table and the per-type {{spark.edge}} list.
+// The published per-type param schema lives server-side, never on the wire.
 message ReflexSparkBlock {
   string type = 1;
   map<string, string> params = 2;
@@ -121,6 +130,13 @@ message ReflexSet {
   // `build_reflex_push(deployed_sets, agent_os, ...)`) — an agent never
   // receives a ReflexSet outside its own OS, so the field would be dead
   // weight on the wire.
+  //
+  // Deliberately NOT carried: assignment[] (group_id/disposition). The
+  // server resolves the assignment to a concrete device set BEFORE building
+  // this message (the same resolved device set the D9 approval digest binds
+  // and the D4 consent gate evaluates against) — the agent receiving a
+  // ReflexSet at all IS the targeting decision; there is nothing for the
+  // agent to do with the raw group membership.
 }
 
 // Server -> Agent: the compiled push for this generation.
@@ -140,11 +156,18 @@ message ReflexStatus {
   google.protobuf.Timestamp last_fired = 6;
 }
 
-// Agent -> Server: reply to "get_status", and piggybacked onto the
-// heartbeat generation reconcile (server/core/src/heartbeat_ingestion.cpp).
+// Agent -> Server: reply to "get_status". NEVER rides the heartbeat itself
+// (HeartbeatRequest has no bytes field and the gateway's gpb has no
+// preserve_unknown_fields, so a field added there would be silently dropped
+// crossing the gateway). The actual flow: the agent's `yuzu.reflex_generation`
+// heartbeat tag (a plain string, which DOES ride the heartbeat) triggers the
+// server's reconcile, which THEN solicits a fresh "get_status" over the
+// control leg above — this message is that reply, correlated on the
+// solicited command's id.
 message ReflexSetStatus {
   string agent_id = 1;
   uint64 generation = 2;
   repeated ReflexStatus reflexes = 3;
-  string platform = 4;  // "windows" | "linux" | "macos"
+  string platform = 4;  // "windows" | "linux" | "darwin" — the agent's own
+                         // platform string (kAgentOs); never "macos"
 }
