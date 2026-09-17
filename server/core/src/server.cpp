@@ -15627,14 +15627,10 @@ private:
                     continue;
                 DexPerfDevice d;
                 d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
-                // match classifies every macOS agent as Windows (G4 UP-1
-                // BLOCKING). Agents report "windows" / "darwin" / "linux"
-                // (agents/core/src/agent.cpp kAgentOs).
-                d.is_windows = os.starts_with("win");
+                // Normalization (incl. the "darwin contains win" G4 UP-1 fix)
+                // is the ONE shared dex_perf_os_from_session — see its doc
+                // comment in dex_perf_rules.hpp for the full rationale.
+                d.os = detail::dex_perf_os_from_session(s->os);
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
