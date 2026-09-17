@@ -219,6 +219,44 @@ std::vector<uint8_t> build_valid_prefetch_v23_blob(uint32_t version) {
     return buf;
 }
 
+// build_valid_prefetch_v23_blob(version) plus N well-formed volume entries at
+// the DOCUMENTATION-DERIVED v23/v26 stride (kVolumeEntryStrideV23V26, 0x68 --
+// libscca, unpinned by any real capture in this repo, per that constant's own
+// comment). Otherwise an exact mirror of
+// build_valid_prefetch_v31_blob_with_volumes above (same field layout, same
+// refs sub-block shape, same file_size/vol_info_size re-stamping discipline)
+// with the 96-byte v30/v31 stride swapped for the 104-byte v23/v26 one --
+// see that function's own comments for the parts not repeated here.
+std::vector<uint8_t> build_valid_prefetch_v23_blob_with_volumes(
+    uint32_t version, const std::vector<uint32_t>& refs_counts) {
+    auto buf = build_valid_prefetch_v23_blob(version);
+    constexpr size_t kVolInfoOff = 0x100;
+    constexpr size_t kEntryStride = kVolumeEntryStrideV23V26;
+    const size_t entries_bytes = refs_counts.size() * kEntryStride;
+
+    put_u32(buf, kFileInfoVolumesInfoCountOffset, static_cast<uint32_t>(refs_counts.size()));
+    put_u32(buf, kFileInfoVolumesInfoOffsetField, static_cast<uint32_t>(kVolInfoOff));
+
+    size_t cursor = entries_bytes;
+    for (size_t i = 0; i < refs_counts.size(); ++i) {
+        const size_t entry = i * kEntryStride;
+        const size_t refs_block_size =
+            kFileRefsBlockHeaderBytes + static_cast<size_t>(refs_counts[i]) * 8;
+        put_u32(buf, kVolInfoOff + entry + kVolumeEntryFileRefsOffsetField,
+                static_cast<uint32_t>(cursor));
+        put_u32(buf, kVolInfoOff + entry + kVolumeEntryFileRefsSizeField,
+                static_cast<uint32_t>(refs_block_size));
+        put_u32(buf, kVolInfoOff + cursor, 3);
+        put_u32(buf, kVolInfoOff + cursor + 4, refs_counts[i]);
+        cursor += refs_block_size;
+    }
+    put_u32(buf, kFileInfoVolumesInfoSizeField, static_cast<uint32_t>(cursor));
+    if (buf.size() < kVolInfoOff + cursor)
+        buf.resize(kVolInfoOff + cursor, 0);
+    put_u32(buf, kPrefetchFileSizeOffset, static_cast<uint32_t>(buf.size()));
+    return buf;
+}
+
 } // namespace
 
 // ─────────────────────────────────────────────────────────── ShimCache ────
@@ -783,6 +821,47 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r->volume_count == 2);
         CHECK(r->file_ref_count == 12);
     }
+
+    // The three SECTIONs below are new coverage for the v23/v26 stride
+    // (kVolumeEntryStrideV23V26, 0x68/104) -- documentation-derived (libscca),
+    // never pinned against a real capture in this repo (no v23/v26 fixture
+    // exists; every real .pf.decompressed this repo has is v31). Before these,
+    // no test ever gave a v23 or v26 blob a nonzero volume_count at all, so the
+    // stride-selection branch and its own bounds/consistency checks had zero
+    // exercise -- these prove both the happy path AND that a wrong stride
+    // still fails closed, exactly as the parser's own header comment claims.
+    SECTION("v23 with a single volume succeeds with the true count, via the 104-byte stride") {
+        auto buf = build_valid_prefetch_v23_blob_with_volumes(23u, {9});
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE(r.has_value());
+        CHECK(r->version == 23u);
+        CHECK(r->volume_count == 1);
+        CHECK(r->file_ref_count == 9);
+    }
+
+    SECTION("v26 two volumes succeed with the SUMMED count -- proves the stride/version "
+            "dispatch isn't hardcoded to the literal 23") {
+        auto buf = build_valid_prefetch_v23_blob_with_volumes(26u, {5, 7});
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE(r.has_value());
+        CHECK(r->version == 26u);
+        CHECK(r->volume_count == 2);
+        CHECK(r->file_ref_count == 12);
+    }
+
+    SECTION("v23 two volumes: entry 0 is well-formed, entry 1's refs-block offset is corrupted "
+            "at the 104-byte stride -- the documentation-derived stride fails closed on entry "
+            "1 exactly like the pinned v30/v31 stride does above, not just on entry 0") {
+        auto buf = build_valid_prefetch_v23_blob_with_volumes(23u, {5, 7});
+        constexpr size_t kEntry1 = kVolumeEntryStrideV23V26; // entry 1 starts one stride in
+        put_u32(buf, 0x100 + kEntry1 + kVolumeEntryFileRefsOffsetField, 0xFFFFFF00u);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "truncated_entry");
+    }
 }
 
 // ============================================================================
@@ -1032,7 +1111,7 @@ TEST_CASE("parse_shimcache: mutation fuzz over the real capture -- truncation sw
 }
 
 TEST_CASE("parse_prefetch: mutation fuzz over A1's three real .pf.decompressed captures -- "
-          "truncation, byte flips, and the four documented count/offset field patches never "
+          "truncation, byte flips, and the five documented count/offset field patches never "
           "throw, and a successful parse only ever reports a version "
           "is_supported_prefetch_version already accepts, with every count bounded",
           "[execution_artifacts][fuzz]") {
@@ -1050,6 +1129,23 @@ TEST_CASE("parse_prefetch: mutation fuzz over A1's three real .pf.decompressed c
         }
     };
 
+    // These five patch positions are used as ABSOLUTE file offsets below, which
+    // is exactly right for the first three and kPrefetchFileSizeOffset -- they
+    // are genuinely top-level file-information-block header fields. It is only
+    // approximately right for kVolumeEntryFileRefsOffsetField (0x14): that
+    // constant is documented as BLOCK-relative (an offset *within* a volume
+    // entry, added to kFileInfoVolumesInfoOffsetField's value elsewhere in this
+    // file), so patching absolute byte 0x14 here actually corrupts an unrelated
+    // header field that happens to share the same small numeric value, not the
+    // volume entry's own refs-offset field. That's still a legitimate generic
+    // robustness case for this test's own invariants (never throws, bounded
+    // counts, typed error) -- corrupting ANY byte must hold those -- so it is
+    // kept rather than removed, but it is not a substitute for a targeted test
+    // of that field's own validation branch. That targeted coverage (plus its
+    // sibling kVolumeEntryFileRefsSizeField, deliberately NOT added here for
+    // the same absolute-vs-relative reason) lives in the "RECONSTRUCTION-only
+    // negatives" TEST_CASE above, which computes each field's real absolute
+    // position inside a synthetic multi-entry blob before patching it.
     static constexpr size_t kDocumentedFields[] = {
         kFileInfoVolumesInfoCountOffset,
         kFileInfoVolumesInfoOffsetField,

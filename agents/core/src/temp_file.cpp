@@ -117,15 +117,25 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
 #ifdef _WIN32
     wchar_t temp_dir_w[MAX_PATH];
     if (!get_temp_dir_w(directory, temp_dir_w, MAX_PATH))
-        return -1;
+        return -1; // MultiByteToWideChar/GetTempPathW already set a meaningful last-error
 
     char hex[33]{};
-    if (!generate_random_hex(hex, sizeof(hex)))
+    if (!generate_random_hex(hex, sizeof(hex))) {
+        // BCryptGenRandom returns an NTSTATUS, not a Win32 error — it never calls
+        // SetLastError, so a caller checking GetLastError() right after this
+        // function returns would otherwise see whatever unrelated code happened
+        // to be left over from an earlier, unrelated Win32 call on this thread.
+        SetLastError(ERROR_GEN_FAILURE);
         return -1;
+    }
 
     auto full_path = build_temp_path_w(temp_dir_w, pfx, hex, sfx);
-    if (full_path.size() >= MAX_PATH)
+    if (full_path.size() >= MAX_PATH) {
+        // A pure C++ string-length check — no Win32 call happened, so
+        // GetLastError() would otherwise be equally stale.
+        SetLastError(ERROR_BUFFER_OVERFLOW);
         return -1;
+    }
 
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
@@ -141,11 +151,18 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
         LocalFree(sd);
 
     if (hFile == INVALID_HANDLE_VALUE)
-        return -1;
+        return -1; // CreateFileW already set a meaningful last-error
+
     CloseHandle(hFile);
 
     if (wide_to_utf8(full_path.c_str(), path_out, path_out_size) != 0) {
+        // Capture wide_to_utf8's real failure code BEFORE DeleteFileW can
+        // overwrite it — a successful cleanup call is not guaranteed to leave
+        // GetLastError() untouched (some Win32 APIs reset it to ERROR_SUCCESS
+        // on success, some don't; MSDN does not document this as reliable).
+        const DWORD saved_err = GetLastError();
         DeleteFileW(full_path.c_str());
+        SetLastError(saved_err);
         return -1;
     }
     return 0;
@@ -189,15 +206,21 @@ YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, 
 #ifdef _WIN32
     wchar_t temp_dir_w[MAX_PATH];
     if (!get_temp_dir_w(directory, temp_dir_w, MAX_PATH))
-        return -1;
+        return -1; // MultiByteToWideChar/GetTempPathW already set a meaningful last-error
 
     char hex[33]{};
-    if (!generate_random_hex(hex, sizeof(hex)))
+    if (!generate_random_hex(hex, sizeof(hex))) {
+        // See yuzu_create_temp_file's identical comment above: BCryptGenRandom
+        // never calls SetLastError, so GetLastError() would otherwise be stale.
+        SetLastError(ERROR_GEN_FAILURE);
         return -1;
+    }
 
     auto full_path = build_temp_path_w(temp_dir_w, pfx, hex, nullptr);
-    if (full_path.size() >= MAX_PATH)
+    if (full_path.size() >= MAX_PATH) {
+        SetLastError(ERROR_BUFFER_OVERFLOW);
         return -1;
+    }
 
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
@@ -207,10 +230,15 @@ YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, 
     if (sd)
         LocalFree(sd);
     if (!ok)
-        return -1;
+        return -1; // CreateDirectoryW already set a meaningful last-error
 
     if (wide_to_utf8(full_path.c_str(), path_out, path_out_size) != 0) {
+        // Capture wide_to_utf8's real failure code before RemoveDirectoryW's
+        // (possibly successful) call can overwrite it -- see the identical
+        // reasoning in yuzu_create_temp_file above.
+        const DWORD saved_err = GetLastError();
         RemoveDirectoryW(full_path.c_str());
+        SetLastError(saved_err);
         return -1;
     }
     return 0;
