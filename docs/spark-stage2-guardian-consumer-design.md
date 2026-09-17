@@ -729,9 +729,22 @@ together in prose but which do not share one signal in code:
   closed). `on_arm_complete`'s own adoption branch additionally verifies,
   rather than merely trusts, that nothing else has taken ownership of the
   rule_id in the meantime: it refuses adoption outright (falling through to
-  the ordinary disarm path, logged at WARN) if `rules_` already holds ANY
-  entry for that rule_id - defense-in-depth against exactly the invariant
-  violation the fault-injection fix above closes.
+  the ordinary disarm path, counted via `wedge_adopt_stale_refused()` and
+  logged at WARN) if `rules_` already holds ANY entry for that rule_id. This
+  is NOT purely defense-in-depth against the fault-injection fix above -
+  governance Gate 8 found (and a regression test now pins) that this branch
+  is independently reachable via entirely ordinary desired-state churn, no
+  fault injection needed: rule R wedges on key A; R is redeployed to key B
+  (commits normally); R is redeployed BACK to key A while the ORIGINAL key-A
+  arm is still in flight - `is_retained_wedge()` never consults `rg->active`,
+  so the Reobserved-restore branch above legitimately reactivates the
+  still-outstanding key-A claim's candidacy even though `rules_[R]` is
+  correctly live on key B throughout. The guard handles both this common
+  churn case and the rarer true invariant-violation case identically and
+  safely (refuse, disarm the stale success, never touch the live generation)
+  - `wedge_adopt_stale_refused()`'s own doc comment states what a SUSTAINED,
+  climbing rate is worth investigating for, since an occasional nonzero count
+  is expected operational noise, not a bug signal.
 - **Arm-recovery telemetry (does the CURRENT application's `arm_failed`
   clear).** `GuardianArmAckLedger` retains the `ArmReceipt` for any receipt
   `drain_locked()` resolves to `Wedged` specifically (`Application::
