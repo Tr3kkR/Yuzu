@@ -31,6 +31,7 @@
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
 #include "capability_decls/plugin_action_catalogue_app_usage.hpp"
+#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "command_capability.hpp"
 
@@ -54,6 +55,7 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_autoruns(),
         capdecls::plugin_action_catalogue_app_usage(),
+        capdecls::plugin_action_catalogue_execution_artifacts(),
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::core_dispatch_capabilities(),
     };

@@ -18,6 +18,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/disk_space/README', slug: 'plugins/disk_space', title: 'disk_space' },
   { file: 'agents/plugins/event_logs/README', slug: 'plugins/event_logs', title: 'event_logs' },
   { file: 'agents/plugins/example/README', slug: 'plugins/example', title: 'example' },
+  { file: 'agents/plugins/execution_artifacts/README', slug: 'plugins/execution_artifacts', title: 'execution_artifacts' },
   { file: 'agents/plugins/filesystem/README', slug: 'plugins/filesystem', title: 'filesystem' },
   { file: 'agents/plugins/filesystem_posture/README', slug: 'plugins/filesystem_posture', title: 'filesystem_posture' },
   { file: 'agents/plugins/firewall/README', slug: 'plugins/firewall', title: 'firewall' },

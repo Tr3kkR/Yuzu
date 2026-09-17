@@ -80,6 +80,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
