@@ -18208,11 +18208,12 @@ private:
             // authorization gate — see rest_api_v1.cpp's route comment for
             // why it must never be stacked with perm_fn.
             fleet_read_fn,
-            // #4033: GET /api/v1/devices[/{id}]'s raw registry snapshot — the
-            // SAME underlying call as the MCP AgentsJsonFn wired into
-            // McpServer below (registry_.to_json_obj()), so the two
-            // transports read from the identical unfiltered source and can
-            // only diverge on the scope filter each applies on top.
+            // Raw registry snapshot for POST /api/v1/scope/preview. (ADR-0031
+            // WS-A4 device seam: GET /api/v1/devices[/{id}] no longer use this
+            // param — they source from DeviceApi::list_devices/lookup_device,
+            // which read the SAME registry_.to_json_obj() underneath, so the
+            // data stays identical; this closure is retained solely for
+            // /scope/preview.)
             [this]() { return registry_.to_json_obj(); },
             // #4033: GET /api/v1/management-groups/agent-count-preview's D3
             // Response:Read scope resolver — the SAME instance passed to

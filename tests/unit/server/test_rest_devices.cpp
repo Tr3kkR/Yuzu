@@ -68,11 +68,16 @@ class FakeDeviceApi : public DeviceApi {
 public:
     std::vector<DeviceListRow> rows;
     std::unordered_map<std::string, DeviceDetail> details;
+    bool degrade = false;         ///< when true, lookup_device returns kDegraded (tag-store outage)
+    mutable int lookup_calls = 0; ///< #3564: assert an out-of-scope id short-circuits BEFORE any read
 
     [[nodiscard]] std::vector<DeviceListRow> list_devices() const override { return rows; }
 
     [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
     lookup_device(const std::string& id) const override {
+        ++lookup_calls;
+        if (degrade)
+            return std::unexpected(DeviceReadError::kDegraded);
         if (auto it = details.find(id); it != details.end())
             return std::optional<DeviceDetail>{it->second};
         return std::optional<DeviceDetail>{std::nullopt};
@@ -293,6 +298,34 @@ TEST_CASE("GET /api/v1/devices/{id} — out-of-scope match collapses to the SAME
     auto res2 = h2.sink.Get("/api/v1/devices/does-not-exist-either");
     REQUIRE(res2 != nullptr);
     CHECK(res2->status == 404);
+}
+
+TEST_CASE("GET /api/v1/devices/{id} — an out-of-scope id is denied with ZERO backing read "
+          "(#3564 timing-oracle closure; security-guardian + architect)",
+          "[rest][devices]") {
+    DeviceRestHarness h;
+    h.fleet_scope = std::unordered_set<std::string>{}; // engaged-empty: nothing in scope
+    h.add_agent("a1", "host1"); // EXISTS in the registry + device_api->details, but out of scope
+    auto res = h.sink.Get("/api/v1/devices/a1");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 404);
+    // The fix: `in_scope` is checked FIRST, so an out-of-scope id short-circuits
+    // to 404 without ever calling lookup_device — no registry/tag-store read, so
+    // an existent-but-out-of-scope id is indistinguishable from a nonexistent one
+    // by TIMING as well as by response. This assertion fails against a
+    // lookup-then-scope ordering (which would read for the existent id).
+    CHECK(h.device_api->lookup_calls == 0);
+}
+
+TEST_CASE("GET /api/v1/devices/{id} — in-scope degraded tag-store read is a 503, not a false 404/200",
+          "[rest][devices]") {
+    DeviceRestHarness h; // fleet_scope defaults to nullopt = in scope
+    h.add_agent("a1", "host1");
+    h.device_api->degrade = true; // tag-store outage on the detail read
+    auto res = h.sink.Get("/api/v1/devices/a1");
+    REQUIRE(res != nullptr);
+    CHECK(res->status == 503);
+    CHECK(h.device_api->lookup_calls == 1); // in-scope DOES reach the lookup (only out-of-scope skips it)
 }
 
 // ── PURE builder coverage: device_agent_row_json / device_agent_detail_json ──

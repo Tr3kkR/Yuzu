@@ -33,10 +33,14 @@
 /// `lookup_device` MUST resolve via an O(1) registry point lookup
 /// (`AgentRegistry::get_session`), NEVER a linear scan over the fleet. A scan
 /// whose length distinguishes "exists but not in your scope" from
-/// "nonexistent" is a caller-visible timing oracle (#3564) — the two
-/// not-found sub-cases must take the identical code path here. The consumer
-/// applies its own `in_scope`/confinement check AFTER this lookup returns;
-/// this method itself performs no scoping.
+/// "nonexistent" is a caller-visible timing oracle (#3564) — the O(1) point
+/// lookup keeps a genuine miss cost-symmetric with a hit at this layer, and
+/// this method itself performs no scoping. The confinement decision belongs to
+/// the consumer, which MUST check `in_scope` on the requested id and deny an
+/// out-of-scope id BEFORE calling this method — so an out-of-scope caller
+/// triggers ZERO backing read here and cannot learn an id exists by timing or
+/// via the degraded (`kDegraded`) branch (governance #3564, security-guardian +
+/// architect). Reaching `lookup_device` implies the caller is in scope.
 
 #include <expected>
 #include <optional>

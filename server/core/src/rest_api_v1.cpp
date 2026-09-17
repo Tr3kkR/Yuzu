@@ -815,7 +815,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
     },
     "/devices/{id}": {
-      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Adds a tags array (key/value/source) when a TagStore is wired; omitted entirely when it is not. Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags?}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
+      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
     },
     "/hardware": {
       "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status/dir token is a 400. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. Audited on success as inventory.devices; a persist failure on the audit fails the request closed (503).", "responses": {"200": {"description": "{data: {rows[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, dir, os, or status token"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster/audit unwired) or audit subsystem degraded"}}}
@@ -7612,16 +7612,16 @@ void RestApiV1::register_routes(
     // genuinely nonexistent one — the existence-oracle closure this pattern
     // exists for.
     //
-    // ADR-0031 WS-A4 wave 2: `device_api->lookup_device(id)` is an O(1) point
-    // lookup (device_api.hpp's #3564 POINT-LOOKUP NOTE), called UNCONDITIONALLY
-    // before the scope check — the two not-found sub-cases now cost the same
-    // single lookup either way (replacing the old scan-the-whole-list-either-
-    // way symmetry). `in_scope` is then applied to the REQUESTED id — computed
-    // independently of what the lookup returned — so it governs disclosure for
-    // EVERY lookup outcome uniformly, including a degraded backing read: an
-    // out-of-scope id collapses to 404 even if the tag-store read for it would
-    // have degraded, never leaking "an agent with this id exists" via a 503
-    // during a store outage.
+    // ADR-0031 WS-A4 wave 2: `in_scope` (a pure fn of the REQUESTED id + caller
+    // scope, reading NO fleet data) is checked FIRST and an out-of-scope id is
+    // denied with 404 BEFORE any backing read — so the out-of-scope path does
+    // ZERO registry/tag-store work and cannot leak "an agent with this id
+    // exists" by timing OR by a 503 during a tag-store outage. Only in-scope ids
+    // reach `device_api->lookup_device(id)`, an O(1) point lookup (device_api.hpp
+    // #3564 note); its miss returns the identical 404, its degrade a 503. This
+    // replaces the old scan-length-symmetry AND closes the tag-read timing gap a
+    // lookup-then-scope ordering would leave (governance #3564, security-guardian
+    // + architect).
     //
     // NOT audited (neither success nor not-found): matches list's posture
     // above and the fragments' (`/fragments/device/page`,
@@ -7655,28 +7655,28 @@ void RestApiV1::register_routes(
                                      "application/json");
                      return;
                  }
-                 const bool in_scope = authz::in_scope(gate.scope, agent_id);
+                 // #3564: deny an out-of-scope id BEFORE any backing read. `in_scope`
+                 // is a pure function of (id, caller scope) and touches no fleet data,
+                 // so an out-of-scope caller performs ZERO registry/tag-store work —
+                 // the not-found response is identical to a genuine miss in body, status
+                 // AND cost, and a degraded tag store cannot distinguish an out-of-scope
+                 // id (it is never read). Only in-scope ids reach lookup_device below.
+                 if (!authz::in_scope(gate.scope, agent_id)) {
+                     spdlog::debug("devices.detail: out-of-scope {} -> 404 before lookup; cid={}",
+                                   agent_id, cid);
+                     res.status = 404;
+                     res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
+                                     "application/json");
+                     return;
+                 }
                  auto result = device_api->lookup_device(agent_id);
-                 if (!result) { // DeviceReadError::kDegraded — the id resolves, tag-store read failed
-                     if (!in_scope) {
-                         spdlog::debug("devices.detail: degraded read for out-of-scope {} "
-                                       "(caller-visible response unchanged)",
-                                       agent_id);
-                         res.status = 404;
-                         res.set_content(
-                             detail::error_json_a4(404, "Device not found: " + agent_id, cid),
-                             "application/json");
-                         return;
-                     }
+                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 if (!*result || !in_scope) {
-                     spdlog::debug("devices.detail: {} for {} (caller-visible response unchanged)",
-                                   (*result && !in_scope) ? "out-of-scope match" : "no match",
-                                   agent_id);
+                 if (!*result) { // genuine miss
                      res.status = 404;
                      res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
                                      "application/json");

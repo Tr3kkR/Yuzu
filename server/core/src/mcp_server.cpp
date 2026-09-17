@@ -7767,64 +7767,41 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // ADR-0031 WS-A4 wave 2: an O(1) point lookup (device_api.hpp's
-                // #3564 POINT-LOOKUP NOTE) replaces the old full-registry scan.
-                // `in_scope` is computed on the REQUESTED id, independent of the
-                // lookup's outcome, and governs disclosure uniformly across
-                // EVERY outcome — miss, hit, or a degraded backing read — so an
-                // out-of-scope agent_id collapses to the SAME "not found"
-                // response as a genuinely nonexistent one (#1700) even during a
-                // tag-store outage (never leaking "an agent with this id
-                // exists" via the degraded branch). The existence probe
-                // (hostname/os disclosure for an agent outside the caller's
-                // confinement) IS the vulnerability this migration closes, so
-                // the response must not distinguish "doesn't exist" from
-                // "exists, not yours".
+                // ADR-0031 WS-A4 wave 2 (+ governance #3564, security-guardian +
+                // architect): `in_scope` (a pure fn of the REQUESTED id + caller
+                // scope, reading NO fleet data) is checked FIRST and an
+                // out-of-scope id is denied BEFORE any backing read — so the
+                // out-of-scope path does ZERO registry/tag work and cannot leak
+                // "an agent with this id exists" by timing OR via a degraded-read
+                // branch. The existence probe (hostname/os disclosure for an agent
+                // outside the caller's confinement) IS the vulnerability this
+                // closes; the out-of-scope denial is byte-identical (same audit
+                // detail string + same kInvalidParams "Agent not found") to a
+                // genuine miss (#1700). Only in-scope ids reach the O(1)
+                // lookup_device (device_api.hpp #3564 note).
                 const bool in_scope = authz::in_scope(gate.scope, agent_id);
+                if (!in_scope) {
+                    spdlog::debug("get_agent_details: out-of-scope {} -> not found before lookup",
+                                  agent_id);
+                    mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
+                                            agent_id);
+                    res.set_content(
+                        error_response(id, kInvalidParams, "Agent not found: " + agent_id),
+                        "application/json");
+                    return;
+                }
                 std::expected<std::optional<DeviceDetail>, DeviceReadError> result{
                     std::optional<DeviceDetail>{std::nullopt}};
                 if (device_api) result = device_api->lookup_device(agent_id);
-                if (!result) { // DeviceReadError::kDegraded — resolves, tag-store read failed
-                    if (!in_scope) {
-                        // Gate 8 / #3564 lesson: the degraded branch must not
-                        // become a NEW existence oracle for an out-of-scope
-                        // caller — collapse to the identical denial as a
-                        // genuine miss, same audit detail string as below.
-                        spdlog::debug("get_agent_details: degraded read for out-of-scope {} "
-                                      "(caller-visible audit unchanged)",
-                                      agent_id);
-                        mcp_audit("denied",
-                                  "agent not found or outside caller's fleet-read scope: " +
-                                      agent_id);
-                        res.set_content(
-                            error_response(id, kInvalidParams, "Agent not found: " + agent_id),
-                            "application/json");
-                        return;
-                    }
+                if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
+                                // (in-scope only reaches here)
                     mcp_audit("failure", agent_id);
                     res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
                                     "application/json");
                     return;
                 }
-                if (!*result || !in_scope) {
-                    // #1700 / Gate 6 sre finding: the RESPONSE never
-                    // distinguishes "genuinely nonexistent" from "exists,
-                    // out of scope" (that collapse IS the fix), but the
-                    // server-side audit trail should -- same Pattern-D
-                    // discipline as every other 404-collapse in this
-                    // codebase, and the scope-drop half mirrors
-                    // query_installed_software's "denied" audit row.
-                    //
-                    // #3564 (external adversarial review, Codex): the detail
-                    // STRING itself must not distinguish the two sub-cases in
-                    // ANY caller-queryable channel (query_audit_log echoes
-                    // `detail` back verbatim to any AuditLog:Read holder) —
-                    // both audit the IDENTICAL detail string; the distinction
-                    // is recorded ONLY server-side, in the log line below,
-                    // which no MCP tool exposes back to a caller.
-                    spdlog::debug("get_agent_details: {} for {} (caller-visible audit unchanged)",
-                                  (*result && !in_scope) ? "out-of-scope match" : "no match",
-                                  agent_id);
+                if (!*result) { // genuine miss (or unwired device_api) — identical denial
+                    spdlog::debug("get_agent_details: no match for {}", agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
                                             agent_id);
                     res.set_content(

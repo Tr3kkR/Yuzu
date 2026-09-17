@@ -128,7 +128,10 @@ struct DeviceRow {
     std::string os;       ///< "windows" | "linux" | "darwin" | "?"
     std::string arch;     ///< "x86_64" | "arm64" | "?"
     std::string agent_version;
-    std::vector<std::string> tags; ///< always empty post-rewire — see struct doc comment
+    std::vector<std::string> tags; ///< EMPTY on the list path (DeviceApi has no bulk
+                                   ///< all-agents tag read); POPULATED "key=value" on the
+                                   ///< single-device page/info path from the detail's
+                                   ///< TagStore tags (see get_one) — struct doc comment
     bool online = false;          ///< has a live Subscribe stream right now
     std::string last_seen;        ///< human-ish ("now", "12m ago") or ISO; "" if unknown
     int dex_score = -1;           ///< per-device DEX experience score 0–100; -1 = n/a

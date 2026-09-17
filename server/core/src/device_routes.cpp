@@ -691,7 +691,16 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto result = api_->lookup_device(id);
         if (!result) return std::unexpected(result.error());
         if (!*result) return std::optional<DeviceRow>{std::nullopt};
-        return std::optional<DeviceRow>{to_device_row((*result)->row)};
+        DeviceRow d = to_device_row((*result)->row);
+        // ADR-0031 WS-A4 (governance happy-path): restore the page/info "Tags"
+        // field from the DeviceApi detail — TagStore-sourced (the seam's chosen
+        // single tag source, a superset of the registry scopable_tags), rendered
+        // "key=value" exactly as the pre-rewire provider did. The LIST path stays
+        // tagless (DeviceApi has no bulk all-agents tag read); only this
+        // single-device path has the detail's tags in hand at zero extra cost.
+        for (const auto& t : (*result)->tags)
+            d.tags.push_back(t.value.empty() ? t.key : (t.key + "=" + t.value));
+        return std::optional<DeviceRow>{std::move(d)};
     };
 
     // -- /fragments/device/page (the full page body: identity + lens tabs + lens) --
