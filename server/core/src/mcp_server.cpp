@@ -1513,7 +1513,9 @@ static const ToolDef kTools[] = {
      R"j("cohort_value":{"type":"string","description":"When present, restrict to this cohort of cohort_key (empty string = untagged residual)"},)j"
      R"j("limit":{"type":"integer","default":50,"maximum":500})j"
      R"j(}})j",
-     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"cohort":{"type":"string"},"cpu_pct":{"type":"number"},"commit_pct":{"type":"number"},"disk_lat_ms":{"type":"number"},"fleet_pctile":{"type":"integer"}},"required":["agent_id","cohort"]}}},"required":["devices"]})j"},
+     R"j({"type":"object","properties":{"devices":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"cohort":{"type":"string"},"cpu_pct":{"type":"number"},"commit_pct":{"type":"number"},"disk_lat_ms":{"type":"number"},"fleet_pctile":{"type":"integer"},)j"
+     // Additive (C1): trailing "os" property; required stays ["agent_id","cohort"].
+     R"j("os":{"type":"string"}},"required":["agent_id","cohort"]}}},"required":["devices"]})j"},
 
     // ── DEX app-perf-over-time tools — parity with /api/v1/dex/perf/app[s] ──
     {"list_dex_perf_apps",
@@ -14353,6 +14355,7 @@ McpServer::HandlerFn McpServer::build_handler(
                             o.add("disk_lat_ms", *r.disk_lat_ms);
                         if (r.fleet_pctile >= 0)
                             o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                        o.add("os", r.os); // additive (C1); trailing
                         arr.add(o);
                     }
                     payload = arr.str();

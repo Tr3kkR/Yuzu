@@ -8122,6 +8122,7 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
               R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})")
             ->body);
     CHECK(all.size() == 16);
+    CHECK(all[0]["os"] == "windows"); // additive (C1); mcp_perf_snapshot's fixture
 
     // cohort_value present-but-empty = the untagged residual (none here).
     auto untagged = mcp_tool_payload(
