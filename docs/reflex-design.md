@@ -106,35 +106,40 @@ persisted record, matching A7's privacy posture and D10's "no SID/username/user 
 
 ## Safety chokepoint — `dangerous_reactions_in_spec()`
 
-Extends the existing `dangerous_*_in_spec` doctrine (`docs/yuzu-guardian-design-v1.1.md` §24) —
-**never a parallel gate.** A Reaction is classified via the existing
-`CommandCapabilityRegistry::classify(plugin, action)` (server-owned, compile-authored;
-`server/core/src/command_capability.hpp`), which yields an `ExecuteGate`
-(`None|AdminOrApproval|AlwaysApproval`) and a `DispatchClass` (`ReadOnly|Mutating|Destructive`). A
-Reaction is **consequential** — and therefore a "dangerous Reaction" for the purposes of D4's
-consent gate and D9's approval gate — iff `execute_gate != None` **or** `dispatch_class ==
-Destructive`. An unclassified or ambiguous `(plugin, action)` pair is a validation **error**, never
-a silent "assume safe."
+A **sibling chokepoint** to `dangerous_enforce_in_spec` (`docs/yuzu-guardian-design-v1.1.md` §24) —
+**not an extension of it**. `dangerous_enforce_in_spec` (`guardian_rule_spec.cpp`) is an
+assertion-type plus a registry-key/service-name allowlist, a distinct mechanism; `dangerous_reactions_in_spec()`
+is a separate classifier over `CommandCapabilityRegistry::classify(plugin, action)` (server-owned,
+compile-authored; `server/core/src/command_capability.hpp`). Both independently follow the
+EXTEND-never-fork doctrine for their own kind of dangerous content; a future unification of the two
+mechanisms is an architect-level decision, not implied by either doc. `classify` yields an
+`ExecuteGate` (`None|AdminOrApproval|AlwaysApproval`) and a `DispatchClass`
+(`ReadOnly|Mutating|Destructive`). A Reaction is **consequential** — and therefore a "dangerous
+Reaction" for the purposes of D4's consent gate and D9's approval gate — iff `execute_gate != None`
+**or** `dispatch_class == Destructive`. An unclassified or ambiguous `(plugin, action)` pair is a
+validation **error**, never a silent "assume safe."
 
-**Reflex Reaction execution is agent-LOCAL dispatch, not server-mediated remote dispatch, and is
-authorized exactly once — at deploy time — by this chokepoint plus the two gates below.** It never
-passes through the server's `classify_and_authorize_dispatch` / `DispatchCaller` chokepoint
-(`agent_registry.hpp`, the "Dispatch-caller approval provenance" routed concern) — that chokepoint
-exists to gate an **operator's live remote command**, and there is no live operator at spark-fire
-time to gate against. `command_capability.hpp`'s classification is reused for its taxonomy only;
-Reflex deploy is explicitly **not** a `DispatchCaller` construction site and stamps no dispatch
-approval provenance (R9 records this as a one-line comment at `dispatch_caller.hpp`, since that
-field's doc comment is a closed, diffed list of stamping sites). Do not conflate the two gates:
+**Reflex Reaction *execution* is agent-LOCAL dispatch, not server-mediated remote dispatch, and is
+authorized exactly once — at deploy time — by this chokepoint plus the two gates below.** This
+ruling is scoped to **Reaction execution only** — it does **not** describe the `__reflex__/push_sets`
+leg that carries a compiled Reflex Set to the agent; see "Wire contract" below, which **is** a
+dispatch site. Reaction execution never passes through the server's `classify_and_authorize_dispatch`
+/ `DispatchCaller` chokepoint (`agent_registry.hpp`, the "Dispatch-caller approval provenance" routed
+concern) — that chokepoint exists to gate an **operator's live remote command**, and there is no live
+operator at spark-fire time to gate against. `command_capability.hpp`'s classification is reused for
+its taxonomy only; a Reaction firing is explicitly **not** a `DispatchCaller` construction site and
+stamps no dispatch approval provenance. Do not conflate the two:
 
 | | Gates | When | Who/what checks |
 |---|---|---|---|
-| Server-mediated remote dispatch (ordinary commands) | `classify_and_authorize_dispatch` / `DispatchCaller` | Every dispatch, live | `agent_registry.hpp` |
-| Reflex Reaction (agent-local) | consent gate (D4) + digest-bound approval (D9) | Once, at Reflex Set deploy | `reflex_set_spec.cpp` + `ApprovalManager` (server); `LocalDispatcher` executes unconditionally on the agent once armed |
+| Server-mediated remote dispatch (ordinary commands, **and** the `push_sets` fan-out — see Wire contract) | `classify_and_authorize_dispatch` / `DispatchCaller` | Every dispatch, live | `agent_registry.hpp` |
+| Reflex Reaction **execution** (agent-local) | consent gate (D4) + digest-bound approval (D9) | Once, at Reflex Set deploy | `reflex_set_spec.cpp` + `ApprovalManager` (server); `LocalDispatcher` executes unconditionally on the agent once armed |
 
 This mirrors existing prior art: Guardian's own in-thread remediation and the pre-Reflex
 `TriggerEngine`-driven local actions (retired by ADR-0021 Decision 5) never re-authorized per fire
 either — authorization for agent-local, pre-declared automation lives at content-authoring/deploy
-time, not at execution time.
+time, not at execution time. This is strictly about *execution*; the server-originated push that
+delivers the content is a dispatch like any other, below.
 
 ## Two-person approval (D9)
 
@@ -222,6 +227,25 @@ Two independent legs, both opaque `payload` bytes on the existing `CommandReques
 | Server → Agent | `__reflex__` | `push_sets` | `ReflexSetPush` |
 | Server → Agent | `__reflex__` | `get_status` | (none) |
 | Agent → Server | `__reflex__` | `status` | `ReflexSetStatus` |
+
+**`push_sets` IS a `DispatchCaller`/system-reserved-dispatch site — it copies the
+`__guard__.push_rules` pattern exactly, never the "Reaction execution is not a dispatch" ruling
+above (that ruling covers agent-local Reaction firing only).** Concretely: the server builds a
+`SystemReservedPush`-class `DispatchCaller{.system = true, .principal_is_admin = true}` (mirroring
+`push_rules`'s construction), carries its own `capdecl` row in the capability declarations so the
+`consteval` sweep classifies it rather than leaving it an unclassified miss, and goes through
+`send_system_reserved` (`dispatch_confined_arms.hpp`) like every other system-originated push. R9
+decides explicitly, at implementation time, whether `push_sets` is **quarantine-gated** (subject to
+the #881 containment gate like an operator dispatch) or **exempt** (like `push_rules`, which is
+itself exempt because a quarantined device must still receive its cached policy) — this document
+does not pre-decide that, but the decision must be recorded, not left implicit.
+
+**`__reflex__` control commands stay CLAIMED through `CommandDedupStore`** — the routed
+dedup row's "dedup is the SAFE DEFAULT for future reserved names" stands, and `__guard__` remains
+the **only** dispatch that bypasses the claim. `push_sets` mints a **per-push unique command id**
+(`"__reflex__-<hex>"`, mirroring Guardian's own `__guard__-reconcile-<gen>-<rand>` minting) so a
+re-push (retry, reconcile) is dedup'd as a genuinely new command, never replayed as the old one;
+`get_status` likewise never reuses a command id across calls.
 
 **Outcome leg — reuses the existing `__guard__`/`event` channel.** Reflex does **not** get its own
 outcome proto message. A fired/completed/failed/aborted/suppressed Reflex chain is reported as an
