@@ -215,9 +215,20 @@ DiskTotals read_disk_totals() {
     return sum_block_storage_stats(it.get());
 }
 
+std::optional<int> read_memorystatus_level() {
+    // Reuses the sysctl_value<T> helper declared above (read_vm_snapshot's block) —
+    // one copy per TU, not one per call site.
+    const auto v = sysctl_value<std::int32_t>("kern.memorystatus_level");
+    if (!v)
+        return std::nullopt;
+    return static_cast<int>(*v);
+}
+
 #else
 
 DiskTotals read_disk_totals() { return {}; }
+
+std::optional<int> read_memorystatus_level() { return std::nullopt; }
 
 #endif // __APPLE__
 

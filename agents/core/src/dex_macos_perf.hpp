@@ -122,4 +122,9 @@ YUZU_EXPORT DiskTotals sum_block_storage_stats(io_iterator_t it);
 /// itself) or on every other platform.
 YUZU_EXPORT DiskTotals read_disk_totals();
 
+/// Darwin: one sysctlbyname("kern.memorystatus_level") read. nullopt on failure or on
+/// every other platform — the raw kernel scale (0..100), NOT yet reduced by
+/// memory_pressure_pct (the caller composes the two).
+YUZU_EXPORT std::optional<int> read_memorystatus_level();
+
 } // namespace yuzu::agent::macos
