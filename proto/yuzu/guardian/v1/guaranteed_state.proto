@@ -103,6 +103,25 @@ message GuaranteedStateEvent {
   // the gateway forwards this field without decoding it — no gpb regen needed
   // (there is no guaranteed_state_pb module on the Erlang side).
   string detail_json = 20;
+
+  // Event-family discriminator (ADR-0021 Decision 6 amendment, R0
+  // 2026-09-17): "" (default, unset) means "guardian" — every pre-Reflex
+  // agent build never sets this field, so absence is backward-compatible;
+  // "reflex" marks an agent-local Reflex chain outcome (fired / completed /
+  // failed / aborted / suppressed_sampled), whose ReflexOutcome shape is
+  // carried as JSON in `detail_json` above rather than a dedicated proto
+  // message (see proto/yuzu/reflex/v1/reflex.proto's header comment and
+  // docs/reflex-design.md "Wire contract"). Server ingest
+  // (guardian_ingest.cpp) demuxes on this field: a "reflex" row inserts
+  // into the Reflex-only `reflex_outcomes` table and MUST skip every
+  // Guardian-only observer (blast-radius / alert-router) — those observers
+  // interpret `rule_id`/`event_type` under the Guardian vocabulary, which a
+  // Reflex row does not follow (`rule_id` is repurposed as
+  // "<set_id>/<reflex_id>"). This keeps Reflex on the SAME single
+  // agent->server unsolicited-event channel and the SAME single ingest
+  // router chokepoint ADR-0021 Decision 6 establishes; only the eventual
+  // storage destination forks on this field.
+  string family = 21;
 }
 
 message GuaranteedStateStatus {
