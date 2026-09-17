@@ -7,14 +7,16 @@
  * Promoted (per docs/testing/unit-test-conventions.md's promote-at-second-use
  * convention) from test_cert_discovery.cpp:138's locally-defined
  * `ScopedEnv` (this type's shape is copied from there verbatim, generalised
- * only to compile off-Apple): test_server_ota_options.cpp:59 also carries
- * its own local, unshared `ScopedEnv`, and test_script_exec_actions.cpp /
+ * only to compile off-Apple): test_server_ota_options.cpp:59 and
+ * server/test_auth.cpp:157 each also carry their own local, unshared
+ * `ScopedEnv`, and test_script_exec_actions.cpp /
  * test_hardware_device_identity_posix_actions.cpp / test_subprocess_runner.cpp
- * all do raw inline setenv/unsetenv with no helper at all -- no shared guard
- * exists across the suite as of this file. This header does not migrate any
- * of those existing local copies (out of scope for this package); it exists
+ * all do raw inline setenv/unsetenv with no helper at all -- at least this
+ * many known local duplicates exist across the suite as of this file (not
+ * necessarily an exhaustive count). This header does not migrate any of
+ * those existing local copies (out of scope for this package); it exists
  * so certificates' own two new TUs share one implementation rather than
- * adding a THIRD hand-copied local struct.
+ * adding a FIFTH hand-copied local struct.
  *
  * Restores whatever the variable held before construction (including "did
  * not exist", via unsetenv), unconditionally in the destructor -- so a
