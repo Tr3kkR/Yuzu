@@ -3,6 +3,12 @@
 #include <algorithm>
 #include <limits>
 
+#if defined(__APPLE__)
+#include <mach/mach_host.h>
+#include <mach/mach_init.h>
+#include <mach/machine.h>
+#endif
+
 namespace yuzu::agent::macos {
 
 namespace {
@@ -76,5 +82,28 @@ std::uint64_t vm_used_bytes(std::uint64_t wire, std::uint64_t internal, std::uin
     const std::uint64_t used_pages = sat_add(sat_add(wire, app), compressor);
     return sat_mul(used_pages, page);
 }
+
+#if defined(__APPLE__)
+
+CpuTicks read_cpu_ticks() {
+    host_cpu_load_info_data_t info{};
+    mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
+    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, reinterpret_cast<host_info_t>(&info),
+                        &count) != KERN_SUCCESS)
+        return {}; // invalid — never a half-filled struct
+    CpuTicks out;
+    out.valid = true;
+    out.user = info.cpu_ticks[CPU_STATE_USER];
+    out.system = info.cpu_ticks[CPU_STATE_SYSTEM];
+    out.idle = info.cpu_ticks[CPU_STATE_IDLE];
+    out.nice = info.cpu_ticks[CPU_STATE_NICE];
+    return out;
+}
+
+#else
+
+CpuTicks read_cpu_ticks() { return {}; }
+
+#endif // __APPLE__
 
 } // namespace yuzu::agent::macos

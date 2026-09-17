@@ -93,4 +93,8 @@ YUZU_EXPORT std::uint64_t vm_used_bytes(std::uint64_t wire, std::uint64_t intern
                                         std::uint64_t purgeable, std::uint64_t compressor,
                                         std::uint64_t page) noexcept;
 
+/// Darwin: one host_statistics(HOST_CPU_LOAD_INFO) read. All-invalid (`CpuTicks{}`) on
+/// failure or on every other platform — never a half-filled struct.
+YUZU_EXPORT CpuTicks read_cpu_ticks();
+
 } // namespace yuzu::agent::macos
