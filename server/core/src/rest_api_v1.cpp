@@ -9610,8 +9610,8 @@ void RestApiV1::register_routes(
         // dispatch and land a new pending row; sync sources are deferred to
         // PR-G (their re-eval needs the inventory evaluator on this path).
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
-                  [auth_fn, perm_fn, rs_err, load_owned, run_async, instruction_store](
-                      const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, perm_fn, rs_err, load_owned, run_async, instruction_store,
+                   result_set_store](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -9639,8 +9639,18 @@ void RestApiV1::register_routes(
                       // guards above; on rejection, never reach run_async (no
                       // re-dispatch of a row we can't safely re-serialise).
                       if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          // #4493: heal the row in place so it is never a live
+                          // grenade for a future read again -- this specific
+                          // re-eval attempt still cannot proceed (the original
+                          // query is unrecoverably gone), but every future read
+                          // of this row (this route included) hits the safe
+                          // placeholder instead of repeating the same
+                          // depth-check dance against the poisoned text forever.
+                          result_set_store->heal_poisoned_payload(id);
                           rs_err(res, 400,
-                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                                 "RESULT_SET_BAD_REQUEST: stored source_payload nested too "
+                                 "deeply and has been discarded; re-eval is unavailable for "
+                                 "this set");
                           return;
                       }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);

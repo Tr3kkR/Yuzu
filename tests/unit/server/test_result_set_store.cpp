@@ -823,3 +823,131 @@ TEST_CASE("ResultSetStore: mark_failed heals a source_payload nested past the "
     CHECK_FALSE(payload.contains("sql"));
     CHECK_FALSE(payload.contains("junk"));
 }
+
+// #4493: mark_failed's SELECT/UPDATE are both gated on status = 'pending' by
+// design (heal_poisoned_payload below is the dedicated path for everything
+// else) -- this pins that scope down so it can't silently widen while other
+// work touches this file.
+TEST_CASE("ResultSetStore: mark_failed is a no-op on a materialized row",
+          "[pg][result_set][mark_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    auto rs = store.create_materialized(req("alice", "already-materialized"), {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    store.mark_failed(rs->id, "should not apply");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK_FALSE(payload.contains("failure"));
+}
+
+// #4493: a Materialized row has NO path through mark_failed, so a poisoned
+// source_payload on one was stuck forever (issue #4493). heal_poisoned_payload
+// is the dedicated, status-agnostic fix: it discards the poisoned blob the
+// same way mark_failed does for a pending row, but -- unlike mark_failed --
+// never rewrites status, since the row's members are real and still
+// scope-walkable regardless of what its provenance blob says.
+TEST_CASE("ResultSetStore: heal_poisoned_payload heals a materialized row's "
+          "poisoned source_payload without touching status or members",
+          "[pg][result_set][heal_poisoned_payload][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-materialized");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    // Same idiom as the poisoned-pending test above: 40 levels, comfortably
+    // past kMcpMaxJsonDepth (32) and orders of magnitude short of the real
+    // attack depth, safe to construct/dump directly in this test process.
+    r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
+                        std::string(40, ']') + "}";
+    auto rs = store.create_materialized(r, {"dev-a", "dev-b"});
+    REQUIRE(rs.has_value());
+    REQUIRE(rs->status == ResultSetStatus::Materialized);
+
+    // Must not crash, and must report that it actually healed something.
+    CHECK(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    // Status is UNCHANGED -- this is the whole point of the dedicated path.
+    CHECK(got->status == ResultSetStatus::Materialized);
+    CHECK(got->device_count == 2);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("failure"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
+
+    // The row's real members are untouched and still scope-walkable --
+    // healing the provenance blob must never touch result_set_members.
+    auto members = member_set_owned_ok(store, rs->id, "alice");
+    CHECK(members == std::unordered_set<std::string>{"dev-a", "dev-b"});
+}
+
+TEST_CASE("ResultSetStore: heal_poisoned_payload is a no-op on a healthy payload",
+          "[pg][result_set][heal_poisoned_payload]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "healthy-materialized");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_materialized(r, {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    CHECK_FALSE(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Materialized);
+    // Byte-identical -- a no-op never rewrites a healthy row's payload.
+    CHECK(got->source_payload == r.source_payload);
+}
+
+// Acceptance criteria "for symmetry": a Failed row can be poisoned by the
+// same class of path (pre-guard write, direct DB manipulation) and had no
+// heal path either, since mark_failed's own predicate never matches a row
+// that is already 'failed'.
+TEST_CASE("ResultSetStore: heal_poisoned_payload also heals an already-failed row",
+          "[pg][result_set][heal_poisoned_payload][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-failed");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-poisoned-failed");
+    REQUIRE(rs.has_value());
+
+    const std::string poisoned = std::string(R"({"failure":"no agents reached","junk":)") +
+                                  std::string(40, '[') + std::string(40, ']') + "}";
+    exec_sql(db.dsn(), "UPDATE result_set_store.result_sets SET status = 'failed', "
+                        "source_payload = '" +
+                            poisoned + "' WHERE id = '" + rs->id + "'");
+
+    CHECK(store.heal_poisoned_payload(rs->id));
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("failure"));
+    CHECK_FALSE(payload.contains("junk"));
+}

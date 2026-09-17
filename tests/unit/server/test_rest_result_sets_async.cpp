@@ -1325,4 +1325,18 @@ TEST_CASE("re-eval: a stored source_payload nested past the depth limit is refus
     h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
+
+    // #4493: this attempt still cannot proceed (the original query is
+    // unrecoverably gone), but the row itself must come out of this call
+    // HEALED so it is never a live grenade for a future read again. Status
+    // stays Materialized (the row's real, empty-but-legitimate membership is
+    // untouched) - only the poisoned payload is replaced.
+    auto healed = get_ok(*h.store, seeded->id);
+    REQUIRE(healed.has_value());
+    CHECK(healed->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse(healed->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
 }

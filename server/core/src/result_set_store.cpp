@@ -138,6 +138,12 @@ constexpr const char* kStoreName = "result_set_store";
 constexpr std::chrono::milliseconds kReadTimeout{2000};
 constexpr std::chrono::milliseconds kWriteTimeout{4000};
 
+// Shared wording for the #2437-class poisoned-payload placeholder (both
+// mark_failed's poisoned branch and heal_poisoned_payload write this same
+// "note" text) so the two heal paths can never drift apart on it.
+constexpr const char* kPoisonedPayloadNote =
+    "original source_payload exceeded the JSON nesting limit and was discarded";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
     // the migration transaction, so `result_sets` et al. land in
@@ -991,10 +997,7 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
     // live grenade for a future read.
     nlohmann::json payload;
     if (mcp::json_exceeds_depth(raw_payload, mcp::kMcpMaxJsonDepth)) {
-        payload = nlohmann::json{
-            {"failure", reason},
-            {"note",
-             "original source_payload exceeded the JSON nesting limit and was discarded"}};
+        payload = nlohmann::json{{"failure", reason}, {"note", kPoisonedPayloadNote}};
     } else {
         // Merge {"failure": reason} into the payload in C++ rather than relying on
         // a Postgres JSON-validity cast (source_payload is a plain TEXT column,
@@ -1018,6 +1021,57 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
         std::vector<std::string>{payload.dump(), id});
     if (upd.status() != PGRES_COMMAND_OK)
         spdlog::error("ResultSetStore::mark_failed: update failed: {}", PQerrorMessage(lease.get()));
+}
+
+bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
+    if (!open_)
+        return false;
+    auto lease = pool_.try_acquire_for(kWriteTimeout);
+    if (!lease) {
+        spdlog::error("ResultSetStore::heal_poisoned_payload: no connection ({})",
+                      pool_.last_error());
+        return false;
+    }
+    // #4493: no status predicate, unlike mark_failed's 'pending'-only SELECT
+    // -- this is the heal path for every status mark_failed cannot reach
+    // (materialized, and failed for symmetry), and is harmless to run
+    // against a pending row too (materialisation reads execution responses,
+    // never source_payload).
+    pg::PgResult sel =
+        pg::exec_params(lease.get(),
+                         "SELECT source_payload FROM result_set_store.result_sets WHERE id = $1",
+                         std::vector<std::string>{id});
+    if (sel.status() != PGRES_TUPLES_OK) {
+        spdlog::error("ResultSetStore::heal_poisoned_payload: read failed: {}",
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    if (PQntuples(sel.get()) == 0)
+        return false; // gone -- nothing to heal
+
+    const std::string raw_payload(PQgetvalue(sel.get(), 0, 0));
+
+    // Re-check the RAW text itself -- never trust a caller's earlier check --
+    // and no-op on a healthy payload so this can never overwrite a row's
+    // genuine provenance. Same #2437-class discipline as mark_failed: the
+    // guard runs on the fetched TEXT before any parse/dump ever touches it.
+    if (!mcp::json_exceeds_depth(raw_payload, mcp::kMcpMaxJsonDepth))
+        return false;
+
+    // Status is deliberately left untouched (see the header doc comment):
+    // a materialized row's members are real and still scope-walkable
+    // (member_set_owned never filters on status), so this only replaces the
+    // poisoned blob, never the row's status.
+    const nlohmann::json payload{{"note", kPoisonedPayloadNote}};
+    pg::PgResult upd = pg::exec_params(
+        lease.get(), "UPDATE result_set_store.result_sets SET source_payload = $1 WHERE id = $2",
+        std::vector<std::string>{payload.dump(), id});
+    if (upd.status() != PGRES_COMMAND_OK) {
+        spdlog::error("ResultSetStore::heal_poisoned_payload: update failed: {}",
+                      PQerrorMessage(lease.get()));
+        return false;
+    }
+    return true;
 }
 
 // ── GC ───────────────────────────────────────────────────────────────────────

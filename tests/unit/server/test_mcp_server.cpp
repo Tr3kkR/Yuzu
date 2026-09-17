@@ -25375,9 +25375,22 @@ TEST_CASE("MCP reevaluate_result_set: a stored source_payload nested past the de
     auto body = nlohmann::json::parse(res->body);
     REQUIRE(body.contains("error"));
     CHECK(body["error"]["code"] == kInvalidParams);
-    CHECK(body["error"]["message"].get<std::string>().find("nests too deeply") !=
-          std::string::npos);
+    CHECK(body["error"]["message"].get<std::string>().find("too deeply") != std::string::npos);
     CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+
+    // #4493: this attempt still cannot proceed (the original query is
+    // unrecoverably gone), but the row itself must come out of this call
+    // HEALED so it is never a live grenade for a future read again. Status
+    // stays Materialized - only the poisoned payload is replaced.
+    auto healed_result = rs_bundle.get()->get(seeded->id);
+    REQUIRE(healed_result.has_value());
+    REQUIRE(healed_result->has_value());
+    CHECK((*healed_result)->status == ResultSetStatus::Materialized);
+    auto payload = nlohmann::json::parse((*healed_result)->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
 }
 
 // Gate 6 sre finding (#4364 re-review): the params-bound recheck just above

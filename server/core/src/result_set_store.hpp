@@ -252,6 +252,25 @@ public:
                                                     const std::vector<std::string>& members);
     void mark_failed(const std::string& id, const std::string& reason);
 
+    /// #4493 heal path for a row `mark_failed` cannot reach: `mark_failed`'s
+    /// SELECT/UPDATE are both gated on `status = 'pending'`, so a
+    /// `materialized` (or `failed`) row whose `source_payload` nests past
+    /// `kMcpMaxJsonDepth` had no way back to a safe, dumpable payload. This
+    /// method is status-agnostic on purpose: unlike `mark_failed`, whose job
+    /// IS the pending -> failed transition, this NEVER writes `status`, since
+    /// a `materialized` row's members are real and still scope-walkable
+    /// (`member_set_owned` never filters on status), so forcing it to
+    /// `failed` would misrepresent a working set as having produced nothing
+    /// to every status-reading consumer (REST/MCP response body, the
+    /// dashboard badge). Re-checks the raw text itself (never trusts a
+    /// caller's prior check) and is a no-op (returns false, writes nothing)
+    /// when the payload is not actually poisoned, so it can never silently
+    /// overwrite a healthy row's provenance. Returns true only when a
+    /// poisoned payload was found and replaced with the same small, fixed,
+    /// trivially-shallow placeholder `mark_failed` writes for its own
+    /// poisoned-pending case.
+    bool heal_poisoned_payload(const std::string& id);
+
     // ── GC ───────────────────────────────────────────────────────────────────
     /// Delete unpinned rows past TTL; cascades to members. Returns count removed.
     int gc_sweep();

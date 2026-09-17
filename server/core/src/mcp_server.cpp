@@ -11745,10 +11745,18 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the STORED text before parse (same ordering as REST's twin
                 // guard on this route); on rejection, never reach rs_run_async.
                 if (json_exceeds_depth(orig->source_payload, kMcpMaxJsonDepth)) {
+                    // #4493: heal the row in place so it is never a live
+                    // grenade for a future read again - this specific re-eval
+                    // attempt still cannot proceed (the original query is
+                    // unrecoverably gone), but every future read of this row
+                    // (this tool included) hits the safe placeholder instead
+                    // of repeating the same depth-check dance forever.
+                    result_set_store_->heal_poisoned_payload(rs_id);
                     res.set_content(
-                        error_response(
-                            id, kInvalidParams,
-                            "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply"),
+                        error_response(id, kInvalidParams,
+                                       "RESULT_SET_BAD_REQUEST: stored source_payload nested "
+                                       "too deeply and has been discarded; re-eval is "
+                                       "unavailable for this set"),
                         "application/json");
                     return;
                 }
