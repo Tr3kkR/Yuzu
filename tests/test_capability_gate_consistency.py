@@ -102,7 +102,7 @@ FRAGMENT_FILES = [
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Hardware CI sync-on-demand: +1 core (__sync__.now).
 # Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
-EXPECTED_TOTAL_ROWS = 201
+EXPECTED_TOTAL_ROWS = 204
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
