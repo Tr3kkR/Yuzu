@@ -289,6 +289,7 @@ agent_test_exe = executable(
     'unit/test_guardian_rule_eval.cpp',
     'unit/test_guardian_drift_event.cpp',
     'unit/test_guardian_scope_guard.cpp',
+    'unit/test_offline_hive_mutex.cpp',       # ScopedOfflineHiveLock RAII/mutual-exclusion contract
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_spark_runtime.cpp',
@@ -309,6 +310,8 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
+                                          # from agent.cpp's __sync__.now reserved-command branch
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
@@ -330,10 +333,12 @@ agent_test_exe = executable(
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
+    'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
     'unit/test_passwd_lookup.cpp',       # #3406: bounded passwd resolution (agent-core seam). The
                                           # load-bearing case injects a NEVER-RETURNING lookup and asserts
                                           # the caller is released inside its budget -- the regression that
                                           # argv-izing the login-keychain read introduced.
+    'unit/test_keychain_read.cpp',        # #3246: bounded SecItem keychain read (agent-core seam); never-returning-read case is the regression test
     'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
@@ -447,6 +452,9 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
+    'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
+                                                # parser against a real captured fixture (macOS-only;
+                                                # a no-op TU elsewhere)
     'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
                                                 # pure winget/apt/yum/softwareupdate/dpkg-query parsers
     'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so/.dll
@@ -465,6 +473,8 @@ agent_test_exe = executable(
     'unit/test_power_health_parsers.cpp',        # Wave 6 PR6.2-a: pure power_health parser/decision tests, fixture-driven, no OS calls
     'unit/test_windows_optional_features_parsers.cpp',           # Wave 9 PR9.2a: DismSlot CAS state machine +
                                                 # row/parameter parsers (agents/shared, agent-core primitive)
+    'unit/test_windows_optional_features_local_dispatcher.cpp',  # Wave 9 PR9.2b: real windows_optional_features
+                                                # dylib/.so/.dll driven end to end via LocalDispatcher
     'unit/test_power_health_local_dispatcher.cpp', # Wave 6 PR6.2-a: real power_health dylib/.so via
                                                 # LocalDispatcher. Deliberately NOT platform-guarded — it
                                                 # runs on every OS, and on a host with no battery it emits an
@@ -474,6 +484,9 @@ agent_test_exe = executable(
     'unit/test_autoruns_win_local.cpp',         # Wave 7 PR7.1: Windows leg (+ OS-independent WMI join tests)
     'unit/test_autoruns_linux_local.cpp',       # Wave 7 PR7.1: Linux leg (+ read_file_bounded internals)
     'unit/test_autoruns_macos_local.cpp',       # Wave 7 PR7.1: macOS leg (CFPropertyList over REAL plists)
+    'unit/test_execution_artifacts_parsers.cpp',   # Wave 7b PR7b.1: pure binary parsers over REAL CAPTURE fixtures + mutation fuzz
+    'unit/test_execution_artifacts_local_dispatcher.cpp',  # Wave 7b PR7b.1: real plugin via LocalDispatcher, unguarded on every OS
+    'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
   ),
@@ -485,7 +498,9 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/windows_optional_features/src'),  # windows_optional_features_plugin.cpp (Wave 9 PR9.2b)
     include_directories('../agents/plugins/autoruns/src'),  # Wave 7 PR7.1
+    include_directories('../agents/plugins/execution_artifacts/src'),  # Wave 7b PR7b.1
     include_directories('../agents/plugins/license_scan/src'),    # licensing_parsers.hpp / licensing_record.hpp (pure, SLE PR1)
     include_directories('../agents/plugins/wifi/src'),            # wifi_corewlan.hpp (pure connected-record formatter)
     include_directories('../agents/plugins/interaction/src'),     # interaction_parsers.hpp (pure helpers)
@@ -623,6 +638,8 @@ agent_test_exe = executable(
                 wifi_plugin_lib,
                 power_health_plugin_lib,
                 autoruns_plugin_lib,  # Wave 7 PR7.1
+                execution_artifacts_plugin_lib,  # Wave 7b PR7b.1
+                windows_optional_features_plugin_lib,  # Wave 9 PR9.2b
                 windows_updates_plugin_lib,
                 ],
 )
@@ -1120,6 +1137,9 @@ if build_server
       'unit/server/test_dex_routes.cpp',
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
+      'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
+      'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
@@ -1206,6 +1226,7 @@ if build_server
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
+      'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
       'unit/server/test_rest_sessions.cpp',
@@ -1267,6 +1288,9 @@ if build_server
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
+      'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2
+      'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
+      'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',
@@ -2208,7 +2232,12 @@ test('plugin readme gate',
   _python3_test,
   args: [files('test_plugin_readmes.py')],
   suite: 'docs',
-  timeout: 60,
+  # Measured ~25-31s standalone; the self-hosted runner pools share one OS
+  # identity across 4 runner agents on one box (CLAUDE.md's documented
+  # shared-runner-under-load invariant), and this test was observed hitting
+  # the old 60s timeout under exactly that kind of concurrent docs-suite
+  # load on this session's own Mac (governance Gate 3, build-ci finding).
+  timeout: 120,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint

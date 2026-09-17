@@ -33,6 +33,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "agent_registry.hpp"
+#include "app_usage_store.hpp"
 #include "audit_store.hpp"
 #include "event_bus.hpp"
 #include "execution_tracker.hpp"
@@ -1237,6 +1238,156 @@ TEST_CASE("ProxyInventory: software_licensing is NOT double-stored into the gene
     REQUIRE(lic_row.has_value());      // not degraded
     CHECK_FALSE(lic_row->has_value()); // not double-stored
     auto custom_row = inv.get("agent-gw-lic", "custom_source");
+    REQUIRE(custom_row.has_value());
+    CHECK(custom_row->has_value()); // generic source still works
+}
+
+namespace {
+// Pre-migrated template covering both stores the app_usage composition tests
+// below need: the generic InventoryStore (mixed-version parity check) and
+// the typed AppUsageStore (Wave 7 PR7.2).
+yuzu::test::PgTestTemplate app_usage_composition_tpl{
+    "agent_svc_app_usage", [](const std::string& dsn) {
+        yuzu::server::pg::PgPool pool{{.conninfo = dsn, .size = 1}};
+        yuzu::server::InventoryStore inv_store{pool};
+        yuzu::server::AppUsageStore usage_store{pool};
+        if (!inv_store.is_open() || !usage_store.is_open())
+            throw std::runtime_error("agent_svc_app_usage template: a store failed to migrate");
+    }};
+
+// One `lu|`-kind app_usage wire blob (records 0x1E-joined, fields 0x1F-joined,
+// kind in field 0) carrying a single executable row — mirrors
+// app_usage_ingestion.cpp's parse_app_usage_blob contract exactly.
+std::string make_app_usage_blob(const std::string& exe_key) {
+    // Adjacent string literals ("\x1f" "1000") deliberately split the hex
+    // escape from the following digits — \x consumes every following hex
+    // digit greedily, so "\x1f1000" would try to parse "1f1000" as one
+    // (out-of-range) hex escape.
+    return "lu\x1f" + exe_key + "\x1f" "1000" "\x1f" "2000" "\x1f" "5" "\x1f" "600";
+}
+} // namespace
+
+TEST_CASE("ReportInventory (direct): reaches ingest_app_usage_report and persists rows",
+          "[pg][agent_service][app_usage]") {
+    using yuzu::server::AppUsageStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, app_usage_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+    h.svc.set_app_usage_store(&usage);
+
+    auto raw = h.auth_mgr.create_enrollment_token("t1", /*max_uses=*/1, std::chrono::hours(1));
+    apb::RegisterRequest req;
+    req.mutable_info()->set_agent_id("agent-direct-usage");
+    req.mutable_info()->set_hostname("host");
+    req.mutable_info()->mutable_platform()->set_os("linux");
+    req.mutable_info()->mutable_platform()->set_arch("x86_64");
+    req.set_enrollment_token(raw);
+    apb::RegisterResponse resp;
+    REQUIRE(h.svc.Register(/*context=*/nullptr, &req, &resp).ok());
+    REQUIRE(resp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(resp.session_id());
+    (*rpt.mutable_content_hashes())["app_usage"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["app_usage"] = make_app_usage_blob("chrome.exe");
+    apb::InventoryAck ack;
+    REQUIRE(h.svc.ReportInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK(ack.received());
+    // A successful full-replace never nacks.
+    CHECK(std::find(ack.need_full().begin(), ack.need_full().end(), "app_usage") ==
+          ack.need_full().end());
+
+    auto rows = usage.get_agent_last_used("agent-direct-usage");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].exe_key == "chrome.exe");
+}
+
+TEST_CASE("ProxyInventory (gateway): reaches ingest_app_usage_report and persists rows",
+          "[pg][agent_service][gateway][app_usage]") {
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::AppUsageStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, app_usage_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+    gateway_svc.set_app_usage_store(&usage);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-usage", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_content_hashes())["app_usage"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["app_usage"] = make_app_usage_blob("notepad.exe");
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    CHECK(std::find(ack.need_full().begin(), ack.need_full().end(), "app_usage") ==
+          ack.need_full().end());
+
+    auto rows = usage.get_agent_last_used("agent-gw-usage");
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK((*rows)[0].exe_key == "notepad.exe");
+}
+
+TEST_CASE("ProxyInventory: app_usage is NOT double-stored into the generic InventoryStore "
+          "(mixed-version parity, adjudication P1)",
+          "[pg][agent_service][gateway][inventory][app_usage]") {
+    // A gateway-proxied report carrying an app_usage blob must leave the
+    // generic InventoryStore with NO app_usage row for that agent — the same
+    // H1 parity/leak-prevention shape as the device_ci and software_licensing
+    // cases above, extended to the newest typed source.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::AppUsageStore;
+    using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, app_usage_composition_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+
+    InventoryStore inv{pool}; // the generic blob store (read on Infrastructure:Read)
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+    AppUsageStore usage{pool};
+    REQUIRE(usage.is_open());
+    gateway_svc.set_app_usage_store(&usage);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-usage-mixed", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    apb::InventoryReport rpt;
+    rpt.set_session_id(rresp.session_id());
+    (*rpt.mutable_content_hashes())["app_usage"] = "claimed-hash";
+    (*rpt.mutable_plugin_data())["app_usage"] = make_app_usage_blob("firefox.exe"); // typed
+    (*rpt.mutable_plugin_data())["custom_source"] = "{\"k\":1}";                    // generic
+    apb::InventoryAck ack;
+    REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+
+    // The typed seam WAS reached (the store has the row)...
+    auto rows = usage.get_agent_last_used("agent-gw-usage-mixed");
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == 1);
+    // ...but the generic store never sees it.
+    auto usage_row = inv.get("agent-gw-usage-mixed", "app_usage");
+    REQUIRE(usage_row.has_value());      // not degraded
+    CHECK_FALSE(usage_row->has_value()); // not double-stored
+    auto custom_row = inv.get("agent-gw-usage-mixed", "custom_source");
     REQUIRE(custom_row.has_value());
     CHECK(custom_row->has_value()); // generic source still works
 }

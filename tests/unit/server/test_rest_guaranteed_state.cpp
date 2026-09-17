@@ -257,6 +257,10 @@ struct RestGsHarness {
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
     std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
+    // Rows the wired tag-cohort provider returns (default empty), same lazy-read
+    // pattern as fleet_rows_ above — lets a test drive GET /dex/perf/tag's
+    // suppression-serialization path (sub-floor cohort) without a harness rebuild.
+    std::vector<yuzu::server::AppPerfFleetRow> tag_cohort_rows_;
 
     // GET /dex/perf/devices and GET /network/devices read seams — always wired
     // present-but-empty (unlike app_perf_providers_ above, no test here needs
@@ -496,6 +500,11 @@ struct RestGsHarness {
                 [](std::string_view, std::string_view, std::string_view)
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
+            };
+            app_perf_providers_.tag_cohort =
+                [this](std::string_view, std::string_view, std::string_view, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+                return tag_cohort_rows_; // settable by a test (default empty)
             };
             // ADR-0031 WS-A4 #4250: the shared VerifyApi seam (replaces the
             // retired AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort
@@ -2937,6 +2946,111 @@ TEST_CASE("REST dex/perf/group: ordinary session still reaches the route",
     auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
     REQUIRE(res);
     CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/tag: service-scoped token → 403, denial audited",
+          "[pg][rest][dex][app_perf][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.perf.tag.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+}
+
+TEST_CASE("REST dex/perf/tag: ordinary session still reaches the route",
+          "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floor "
+          "echoed, key defaults to model",
+          "[pg][rest][dex][app_perf][route]") {
+    SECTION("missing value → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("missing app → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("invalid key → 400") {
+        RestGsHarness h;
+        auto res =
+            h.sink.Get("/api/v1/dex/perf/tag?key=bad%20key%21&value=x&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("present-but-empty value → 400, not treated as 'every value' (sec-M1)") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("present-but-empty key → 400, not silently defaulted (sec-M1)") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?key=&value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("provider absent → 503") {
+        RestGsHarness h(true, true, false);
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("present provider, key omitted → 200, floor echoed, key defaults to model") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["key"].get<std::string>() == "model");
+        CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
+    }
+    SECTION("sub-floor tag-cohort point serializes suppressed, stats omitted") {
+        // Same wiring (app_perf_group_trend) and same floor as the fleet/group
+        // routes' own sub-floor tests — this proves the ROUTE composes it
+        // correctly for a tag-value cohort, not just that the shared model
+        // function floors correctly in isolation (already covered at
+        // test_dex_app_perf_model.cpp's "app_perf_group_trend: sub-floor points
+        // suppress stats, keep device_count").
+        RestGsHarness h;
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "niche.exe";
+        r.version = "1.0";
+        r.day = 1'700'000'000;
+        r.device_count = 3; // < kDexCohortFloor (10)
+        r.cpu_sum = 30.0;
+        r.cpu_max = 10.0;
+        r.ws_sum = 300;
+        r.ws_max = 100;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        h.tag_cohort_rows_ = {r};
+        auto res =
+            h.sink.Get("/api/v1/dex/perf/tag?value=RareModel&app=niche.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j["data"]["points"].size() == 1);
+        const auto& pt = j["data"]["points"][0];
+        CHECK(pt["suppressed"] == true);
+        CHECK(pt["device_count"] == 3);
+        CHECK_FALSE(pt.contains("cpu_mean"));
+    }
 }
 
 TEST_CASE("REST dex/perf/compare: service-scoped token → 403, denied under the "

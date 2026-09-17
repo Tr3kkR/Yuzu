@@ -290,74 +290,122 @@ pagination lands (#1634), narrow the query: pass `agent_id` (`?agent_id=<id>` on
 the `agent_id` arg on MCP) to read a specific device, or a more selective `name`
 filter, so your in-scope rows fit under the cap.
 
-### Dashboard (`/inventory`)
+### Dashboard (`/inventory` → `/hardware` / `/software`)
 
-The **Inventory** dashboard (top-nav **Inventory**) is the point-and-click view of the
-same data, with three tabs:
+The old three-tab **Inventory** dashboard is gone. `/inventory` itself still exists as a
+route, but it now just **302-redirects to `/hardware`** (auth still gates first, so an
+unauthenticated visitor lands on `/login`, never in a redirect loop through an
+authed-only destination) — old bookmarks and links keep working, nothing to change on
+your end beyond expecting a redirect. The top nav carries two separate links in its
+place, **Hardware** and **Software**, each its own page:
 
-- **Software** (default) — the fleet **software list**: each installed-software title
-  rolled up to its **install count** (number of devices carrying it) and its number of
-  distinct **versions**, most-installed first. Click a title to drill into its
-  **installs per version** (how many devices run each version). A title filter narrows
-  the list. **These counts are fleet-wide totals**, gated on the global
-  `Inventory:Read` — they are **not** management-group scoped (the same ADR-0017 caveat
-  as the REST/MCP surfaces: confinement is inert under the global gate, so the counts
-  span all groups; the UI says so inline). A freshness KPI shows the **stale** count
-  (devices that have not synced within two daily cycles). **The catalogue is a
-  precomputed rollup**, not an on-demand query: a background thread recomputes the
-  per-title and per-version counts on a cadence (hourly) and the page reads the small
-  precomputed tables — the underlying installed-software changes only on the daily sync,
-  so recomputing per page-load would be wasteful and would not scale. The KPI strip shows
-  an **"updated N ago"** stamp for the rollup; immediately after a fresh server starts (or
-  before the first refresh) the catalogue shows a **"building"** note until the first
-  recompute lands. This keeps the default tab fast at any fleet size.
-- **Devices** — hostname, OS, online/offline/**stale** status, and last-seen, sourced
-  from the server's persisted endpoint state so a device appears here **even when it is
-  offline** (joined to the live registry for the online flag), **plus a device-CI
-  record** — serial, model, CPU cores/threads, and RAM — sourced from the `device_ci`
-  daily-sync source (ADR-0016 source #3) via `DeviceInventoryStore`. The **list** is
-  gated on the global `Inventory:Read`; management-group confinement of the roster is
-  **designed for, not yet verified effective** (the same inert-list-scoping class as
-  Find software, below — see ADR-0017), and the roster read is audited
-  (`inventory.devices` — the behavioural-PII audit tier, because the list now carries
-  device-persistent identifiers such as serial). **Clicking a device** loads its full CI record plus
-  installed software; that per-device drill is additionally gated by the
-  management-group chokepoint (`Inventory:Read` for the device's group, so an operator
-  only opens a device in their scope) **and is audited** — `inventory.device.software`
-  for the software list, `inventory.device.ci` (also the behavioural-PII tier) for the
-  CI panel (manufacturer, model, serial, system UUID, domain/OU, BIOS, CPU, memory,
-  primary/all MAC addresses, NIC count, OS name/version/build, architecture, and
-  first/last-synced times). An offline device shows its *last daily sync*, clearly
-  labelled; a device that hasn't completed its first `device_ci` sync yet shows an
-  honest "no CI record synced" note rather than blank cells, and an unknown individual
-  field (e.g. a serial-less VM) renders as a placeholder (`—`), never the raw
-  `"unknown"` sentinel. **Disk capacity is deliberately withheld** from the CI panel
-  pending a macOS disk-collection fix, and **owner/location are not shown** — the agent
-  doesn't collect them (a future operator-set CMDB enrichment). A large device list is
-  rendered first-N with the total shown; use the filter to narrow.
-- **Find software** — type an exact title to see **which devices run it** and at which
-  versions. **Unlike the REST/MCP siblings** (migrated onto `require_fleet_read`, #3290
-  Phase 2, with real management-group + service-scope confinement), Find is still gated on
-  the **global `Inventory:Read`** and returns **fleet-wide** results: management-group
-  confinement is **not yet effective** on this list view (the per-row scope filter is a
-  foundation for the ADR-0017 admit-then-filter gate, not effective list-confinement today
-  on this surface — only the per-device drill is scoped; migrating this tab is tracked in
-  `docs/security-reviews/service-scope-phase2-migrations-2026-08.md`). 1000-row cap; a
-  short/zero result under a narrow scope is *incomplete*, not *absent* (keyset paging is the
-  #1634 follow-up).
+- **`/hardware`** — a ServiceNow-style Configuration-Item list and record; the successor
+  to the old **Devices** tab, extended with a generic action runner. The list shows
+  hostname, **IP** (new — read live from the TAR fleet-snapshot cache, so it is honestly
+  blank once a device goes offline rather than a stale last-known address), OS,
+  online/offline/**stale** status, per-page **DEX score**, agent version, last-seen,
+  **Tags** (new — click a chip to filter by that exact `key` or `key=value`, or type
+  `tag=<key>[=<value>]` directly), and the device-CI columns from before (manufacturer,
+  model, serial, CPU model + cores/threads, RAM, OS version). All columns except DEX are
+  sortable; a server-side search box (hostname/serial/model/CPU), OS/status filter
+  chips, a filter breadcrumb, and pagination narrow a large fleet. A new checkbox column
+  plus a sticky bulk-tag bar let you apply or remove one tag across every selected
+  device in one action — under the hood it loops the existing single-device tag routes,
+  so each device still runs its own `Tag:Write` gate and its own `tag.set`/`tag.delete`
+  audit row; nothing is bulk-authorized. The KPI strip (Total CIs / Online / Offline /
+  Stale / CI coverage) is computed over the same rows the table shows. **The list is
+  gated on the global `Inventory:Read`, but — unlike the old Devices tab, whose
+  management-group confinement this doc used to flag as "designed for, not yet verified
+  effective" — it is wired as a live caller of the real ADR-0017 admit-then-filter
+  chokepoint (`require_fleet_read`)**: a management-group-scoped operator's visible
+  rows, and the KPI counts drawn from them, genuinely narrow to their scope, the same
+  confinement class the REST/MCP software-query surfaces use (see above). The roster
+  read is audited as `inventory.devices` (unchanged verb, still the behavioural-PII
+  tier). A store-wide CI or Tags read failure shows its own explicit **"CI columns
+  unavailable"** / **"Tags unavailable"** banner (never silently "no CI"/"no tags") —
+  distinct from a single device that simply hasn't synced yet, which still shows a plain
+  `—` placeholder in just that cell.
 
-**On store degradation** the **Software**, **Find**, and **per-device-software** views —
-the *authoritative* reads — show an explicit **"unavailable"** banner rather than an
-empty table, because an empty table would read as "installed nowhere", the fail-open
-the authoritative-read contract (ADR-0016 §7) forbids. The **Devices roster** (the
-list's host/OS/last-seen columns, plus the CI columns joined onto it) is sourced from
-the deliberately *fail-soft* endpoint-state store and, for CI, a best-effort
-`DeviceInventoryStore` read layered on top — a `DeviceInventoryStore` degrade during the
-list render is indistinguishable from "not yet synced" (both show the `—` placeholder),
-matching the roster's own already-fail-soft posture rather than claiming a new
-authoritative one. The **per-device CI panel** (the drill), by contrast, IS an
-authoritative three-state read: found / genuinely-not-yet-synced ("no CI record synced
-yet") / degraded (an explicit "CI record unavailable" banner) are never conflated.
+  **Click a device** (or visit `/hardware/ci?id=`) for its record — a seven-tab CI
+  record, gated per device on `Inventory:Read` for the device's management group
+  (`scoped_perm_fn`, the same per-device chokepoint the old drill used):
+  - **Overview** — the CI identity block carried over from the old per-device CI panel:
+    manufacturer, model, serial, system UUID, domain/OU, BIOS, CPU, memory, primary/all
+    MAC addresses (each now its own wrapping chip, not one comma-joined line that used
+    to run off the page), NIC count, OS name/version/build, architecture, and
+    first/last-synced times. Audited `inventory.device.ci` (behavioural-PII tier). A
+    **Sync now** button (new) requests an immediate out-of-cycle daily sync — a source
+    picker (or "all") — instead of waiting for the ~24h cadence; the panel then polls
+    until the CI store's freshness stamp passes the request time, with an honest note if
+    the device is offline, its agent predates 0.13.1, or you lack `Execution:Execute`
+    for it (see `inventory.sync.request` in [Audit log](audit-log.md)).
+  - **Installed software** — the same per-device software list as before (audited
+    `inventory.device.software`), now with its own filter box and, for the first time,
+    rendered **Signature** and **Ecosystem** columns. Carries the same **Sync now**
+    affordance, scoped to the `installed_software` source.
+  - **Tags** — inline add/remove via the existing tag routes, shown only when a
+    `Tag:Write` probe passes for the device.
+  - **DEX**, **Guardian**, **Live** — not reimplemented: these mount the *same*
+    `/fragments/device/*` fragments the (now-redirected) device page used, each gated on
+    scoped `GuaranteedState:Read` as before. **Live** additionally carries the ten
+    physical-hardware cards (Disks, Memory, Processors, Drivers, Battery, Thermal, Disk
+    health (SMART), Volumes, Network adapters, Wi-Fi) — see
+    [Device management](device-management.md) for their per-OS availability and audit
+    verbs (`device.live.hw_*` and friends).
+  - **Actions** (new) — the generic action-runner catalogue: every action a connected
+    agent's loaded plugins report, classified by capability (read-only / mutating /
+    destructive, irreversible, approval-gated) from the compile-time capability
+    catalogue, each with a generated parameter form (filled in from the plugin's own
+    documented parameter hints where available) and a dispatch-result panel with
+    free-text/regex search, a hit counter, CSV export, and Copy. Dispatch is **not** a
+    new endpoint — the form posts to the existing `POST /api/command` route, so
+    classification, authorization, the destructive gate, and audit all apply exactly as
+    they do for every other caller of that route. Viewing the catalogue needs
+    `Inventory:Read`; without `Execution:Execute` for the device you see an honest note
+    instead of a form that would only fail on submit. Audited as `hardware.actions.view`
+    (the catalogue was viewed) and `hardware.action.result` (a dispatched action's
+    result reached a terminal state — rendered, empty, failed, or timed out; the verb
+    records that the *result view* was shown to the operator, not whether the
+    underlying action itself succeeded) — see [Audit log](audit-log.md).
+
+- **`/software`** — the fleet software catalogue, unchanged in its rollup mechanics: a
+  background thread still precomputes the per-title/per-version counts hourly, the KPI
+  strip still shows Titles / Devices reporting / Stale / an "updated N ago" (or
+  "building") stamp for the catalogue, and the counts are still **fleet-wide, not
+  management-group scoped** — the same ADR-0017 gap the REST/MCP section above
+  describes. Two things changed:
+  - The search box is now a **real server round-trip matching title OR publisher**
+    (was client-side and title-only), using the same debounced/narrow-swap-target
+    pattern as the Hardware list's search box.
+  - Each row grows a **"devices ›"** control that expands inline — independent of the
+    row's own click-to-drill-into-**installs-per-version** action — to list every device
+    running that title: hostname (linking to its Hardware CI record), version,
+    publisher, install date, signature status, ecosystem, and architecture, with its own
+    client-side filter for a popular title with many installs. This inline expansion is
+    server-scoped the same way the old Find results were (per-row management-group
+    drop, 1000-row cap, `inventory.software.query` audit verb) — a short/zero result
+    under a narrow scope is *incomplete*, not *absent*.
+
+  The expansion replaces the standalone **Find software** tab, which is gone from the
+  sub-nav. Its routes, `/fragments/inventory/find` and `/fragments/inventory/find/results`,
+  are still registered for old bookmarks and deep links, but nothing in the UI links to
+  them any more — treat them as a legacy escape hatch, not a supported feature.
+
+**On store degradation** the **`/software`** catalogue, its **devices ›** expansion, and
+the CI record's **Installed software** lens — the *authoritative* reads — show an
+explicit **"unavailable"** banner rather than an empty table, because an empty table
+would read as "installed nowhere", the fail-open the authoritative-read contract
+(ADR-0016 §7) forbids. The **Hardware list** itself (hostname/OS/status/last-seen/IP/
+DEX/version) is sourced from the deliberately *fail-soft* endpoint-state store, with the
+CI and Tags columns layered on top from a best-effort `DeviceInventoryStore`/tag-store
+read — a *whole-store* degrade there is now its own explicit "CI columns unavailable" /
+"Tags unavailable" banner (an improvement on the old Devices tab, where a
+`DeviceInventoryStore` degrade during the list render was indistinguishable from "not
+yet synced"); the roster read itself being wholly unavailable shows a dedicated "roster
+unavailable" banner rather than an empty table. The **per-device CI record's Overview
+lens**, by contrast, has always been an authoritative three-state read: found /
+genuinely-not-yet-synced ("no CI record synced yet") / degraded (an explicit "CI record
+unavailable" banner) are never conflated.
 
 ## Access control
 
@@ -485,7 +533,7 @@ ingest is failing. Four further series sharpen the picture:
   `/inventory/evaluate` it pairs with `result_truncated_by_cap: true` responses.
 
 
-The **catalogue rollup** (the `/inventory` Software tab's precomputed counts, refreshed
+The **catalogue rollup** (the `/software` page's precomputed counts, refreshed
 hourly by the background `SoftwareCatalogRollup` thread) emits three further series:
 
 - `yuzu_inventory_catalog_rollup_total{outcome}` (counter, outcome ∈ `success` / `error`)
@@ -565,9 +613,9 @@ sync, defeating the hash-skip protocol.
   `serial`/`system_uuid` as the literal `"unknown"` — use `manufacturer`/`model`
   (e.g. "VMware, Inc."/"VMware7,1") to recognise it.
 
-The operator-facing read surface — the `/inventory` **Devices** tab CI columns and
-the per-device CI panel — is live; see the **Devices** bullet above for its columns,
-fields, and audit/degrade posture.
+The operator-facing read surface — the **Hardware** list's CI columns and the CI
+record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
+columns, fields, and audit/degrade posture.
 
 ## See also
 
