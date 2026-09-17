@@ -16,6 +16,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -2126,6 +2127,17 @@ void RestApiV1::register_routes(
                   if (!bundle_orch) {
                       res.status = 503;
                       res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                      return;
+                  }
+                  // #2437-class guard: raw-text depth check before parse, same
+                  // ordering as the result-set creation routes above - a
+                  // parsed-then-dumped "steps" subtree still crashes on the
+                  // dump below (validate_bundle_steps(body["steps"].dump())),
+                  // so the check has to run on the raw text before any parse.
+                  if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                                      "application/json");
                       return;
                   }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9140,6 +9152,14 @@ void RestApiV1::register_routes(
             auto session = auth_fn(req, res);
             if (!session)
                 return;
+            // #2437-class guard: check nesting on the RAW body BEFORE parse.
+            // A parsed-then-dumped subtree still crashes on the dump - the
+            // check has to run before any allocation, on the text itself
+            // (mirrors mcp_jsonrpc.hpp's own parse_request ordering).
+            if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                return;
+            }
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded() || !body.is_object()) {
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9237,6 +9257,16 @@ void RestApiV1::register_routes(
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      // Found during this fix, not named in the original triage:
+                      // this handler also does `cr.source_payload = body.dump()`
+                      // a few lines below on caller-supplied JSON, same crash
+                      // shape as the three named creation routes.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9453,6 +9483,12 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9517,6 +9553,12 @@ void RestApiV1::register_routes(
                           return;
                       if (!instruction_store || !instruction_store->is_open()) {
                           rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9590,6 +9632,17 @@ void RestApiV1::register_routes(
                       auto orig = load_owned(req, id, session->username, res);
                       if (!orig)
                           return;
+                      // #2437-class guard, read side: the row is a SHARED table,
+                      // and a source_payload written before this guard existed
+                      // (or by any other path, past or future) could be poisoned.
+                      // Check the STORED text before parse, same as the write-time
+                      // guards above; on rejection, never reach run_async (no
+                      // re-dispatch of a row we can't safely re-serialise).
+                      if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                          return;
+                      }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
                       // Synthesise the parent so the sibling shares the
                       // original's parent (re-eval re-asks the same question
@@ -10804,6 +10857,20 @@ void RestApiV1::register_routes(
                             "application/json");
             return;
         }
+        // #2437-class guard: check nesting on the RAW body BEFORE parse. A
+        // parsed-then-dumped spark/assertion/remediation subtree still
+        // crashes on derive_rule_spec's spec.dump() below - the check has to
+        // run before any allocation, on the text itself (mirrors
+        // mcp_jsonrpc.hpp's own parse_request ordering and the result-set
+        // creation routes above).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "request body nests too deeply", cid,
+                                                  "flatten the request body; spark/assertion/"
+                                                  "remediation blocks may nest at most 32 levels deep"),
+                            "application/json");
+            return;
+        }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
@@ -11097,6 +11164,23 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const GuaranteedStateRuleRow& existing_rule = **existing;
+                 // #2437-class guard: check nesting on the RAW body BEFORE
+                 // parse, same ordering and rationale as the create handler
+                 // above - a metadata-only PUT never reaches derive_rule_spec
+                 // (it re-validates the EXISTING stored spec instead), but any
+                 // body actually supplying spark/assertion/remediation still
+                 // reaches derive_rule_spec's spec.dump() below.
+                 if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "request body nests too deeply", cid,
+                                               "flatten the request body; spark/assertion/"
+                                               "remediation blocks may nest at most 32 levels deep"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "request body nests too deeply");
+                     return;
+                 }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;

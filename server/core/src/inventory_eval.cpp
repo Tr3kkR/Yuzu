@@ -1,6 +1,10 @@
 #include "inventory_eval.hpp"
 
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+
 #include <nlohmann/json.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <charconv>
@@ -187,6 +191,25 @@ std::vector<InventoryEvalResult> evaluate_inventory(
 
         // If the request targets a specific agent, skip non-matching records
         if (!req.agent_id.empty() && record_agent_id != req.agent_id) {
+            continue;
+        }
+
+        // #2437-class guard: data_json is the same generic ADR-0016 blob read by
+        // data_inventory_routes.cpp (see its own guard for the write-side
+        // context) - reached here via BOTH evaluate_inventory() callers, the
+        // REST from-inventory-query route and the MCP
+        // create_result_set_from_inventory_query tool. json::parse handles very
+        // deep input fine (the catch below guards a genuine parse error, not
+        // this), but json_value_to_string's dump() fallback on the parsed tree
+        // is unboundedly recursive - a too-deep record would SIGSEGV the whole
+        // process for both callers at once. Check the raw text before parse and
+        // skip this record exactly like a genuine parse error, below. Log
+        // identifiers only, never the payload.
+        if (mcp::json_exceeds_depth(data_json, mcp::kMcpMaxJsonDepth)) {
+            spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json nests "
+                        "too deeply (#2437-class)",
+                        onbehalf::sanitize_for_log(record_agent_id, 128),
+                        onbehalf::sanitize_for_log(record_plugin, 128));
             continue;
         }
 

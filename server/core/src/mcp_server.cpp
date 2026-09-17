@@ -11739,6 +11739,19 @@ McpServer::HandlerFn McpServer::build_handler(
                 auto orig = rs_load_owned(rs_id);
                 if (!orig)
                     return;
+                // #2437-class guard, read side: the row is a SHARED table - a
+                // source_payload written before this guard existed, or via any
+                // other path (past or future), could still be poisoned. Check
+                // the STORED text before parse (same ordering as REST's twin
+                // guard on this route); on rejection, never reach rs_run_async.
+                if (json_exceeds_depth(orig->source_payload, kMcpMaxJsonDepth)) {
+                    res.set_content(
+                        error_response(
+                            id, kInvalidParams,
+                            "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply"),
+                        "application/json");
+                    return;
+                }
                 auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
                 // Synthesise the parent so the sibling shares the original's
                 // parent (re-eval re-asks the same question against today's
