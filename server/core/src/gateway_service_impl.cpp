@@ -1066,9 +1066,17 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
                             "nests too deeply (#2437-class)",
                             plugin_name, agent_id);
                 if (metrics_)
+                    // Fixed sentinel, not plugin_name: this map's KEYS are raw,
+                    // agent-supplied strings for the generic (non-typed) source
+                    // family, so using plugin_name as a label here would let a
+                    // single agent mint unbounded metric series just by
+                    // submitting over-depth blobs under different made-up
+                    // names. Matches validate_inventory_report_source_count's
+                    // own "__report__" sentinel a few lines above for the
+                    // same reason.
                     metrics_
                         ->counter("yuzu_inventory_ingest_total",
-                                 {{"source", plugin_name}, {"outcome", "rejected"}})
+                                 {{"source", "__generic__"}, {"outcome", "rejected"}})
                         .increment();
                 continue;
             }

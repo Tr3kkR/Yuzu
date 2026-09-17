@@ -1328,10 +1328,56 @@ TEST_CASE("ProxyInventory: a per-source blob nesting past kMcpMaxJsonDepth is re
     REQUIRE(healthy_row->has_value());
     CHECK((*healthy_row)->data_json == R"({"k":1})"); // healthy sibling stored correctly
 
+    // Fixed sentinel, never the raw plugin_name: that name is caller-supplied
+    // for the generic source family, so labeling on it would let one agent
+    // mint unbounded metric series (see the next TEST_CASE).
     CHECK(h.metrics
               .counter("yuzu_inventory_ingest_total",
-                       {{"source", "poisoned_source"}, {"outcome", "rejected"}})
+                       {{"source", "__generic__"}, {"outcome", "rejected"}})
               .value() == 1.0);
+}
+
+TEST_CASE("ProxyInventory: rejecting over-depth blobs under many distinct caller-chosen source "
+          "names stays on ONE bounded metric series, not one per name (#2437-class cardinality)",
+          "[pg][agent_service][gateway][inventory][security]") {
+    // Gate 8 fix: an earlier version of the write-side guard used the raw,
+    // agent-supplied plugin_name as the metric label - an authenticated agent
+    // could mint an unbounded number of retained series just by resubmitting
+    // an over-depth blob under a different made-up source name each time.
+    using yuzu::server::detail::GatewayUpstreamServiceImpl;
+    using yuzu::server::InventoryStore;
+    YUZU_REQUIRE_PG_DB_TPL(db, inventory_h1_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    GatewayResponseHarness h(pool);
+    GatewayUpstreamServiceImpl gateway_svc{h.registry, h.bus, h.auth_mgr, h.auto_approve,
+                                           &h.metrics};
+    InventoryStore inv{pool};
+    REQUIRE(inv.is_open());
+    gateway_svc.set_inventory_store(&inv);
+
+    auto reg = make_gw_register(h.auth_mgr, "agent-gw-depth-2", /*csr_pem=*/"");
+    apb::RegisterResponse rresp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &reg, &rresp).ok());
+    REQUIRE(rresp.accepted());
+
+    const std::string poisoned = std::string(35, '[') + std::string(35, ']');
+    for (int i = 0; i < 5; ++i) {
+        apb::InventoryReport rpt;
+        rpt.set_session_id(rresp.session_id());
+        (*rpt.mutable_plugin_data())["source_" + std::to_string(i)] = poisoned;
+        apb::InventoryAck ack;
+        REQUIRE(gateway_svc.ProxyInventory(/*context=*/nullptr, &rpt, &ack).ok());
+    }
+
+    // Five distinct source names, all rejected: if the fix still labeled on
+    // the raw name, each would land in its own series and this would read 1,
+    // not 5. Reading 5 is only possible if all five collapsed onto the SAME
+    // bounded sentinel series.
+    CHECK(h.metrics
+              .counter("yuzu_inventory_ingest_total",
+                       {{"source", "__generic__"}, {"outcome", "rejected"}})
+              .value() == 5.0);
 }
 
 TEST_CASE("ProxyRegister: no signer wired → enrolls but issues no cert (graceful degrade)",
