@@ -745,8 +745,15 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
         std::unique_ptr<sqlite3, decltype(&sqlite3_close)> writer{nullptr, &sqlite3_close};
         {
             sqlite3* raw = nullptr;
-            REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+            const int rc = sqlite3_open(db_path.string().c_str(), &raw);
+            // Take ownership BEFORE the REQUIRE, not after -- sqlite3_open
+            // can allocate a handle even when it returns non-OK (same
+            // gap open_readonly's own RAII fix, above in this same
+            // commit, closes in production); resetting unconditionally
+            // first means a failed REQUIRE still unwinds through a live
+            // owner rather than leaking `raw`.
             writer.reset(raw);
+            REQUIRE(rc == SQLITE_OK);
         }
         seed::exec_or_fail(writer.get(),
                            "PRAGMA journal_mode=DELETE"); // single-file, no -wal sidecar
