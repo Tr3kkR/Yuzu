@@ -93,10 +93,15 @@ TEST_CASE("classify_cert_dir_open: ok is always kOpened regardless of err",
     CHECK(classify_cert_dir_open(true, 0) == CertDirOpen::kOpened);
 }
 
-TEST_CASE("classify_cert_dir_open: ENOENT/ENOTDIR mean the store is simply absent",
+TEST_CASE("classify_cert_dir_open: ENOENT means the store is simply absent",
           "[certificates][honesty]") {
     CHECK(classify_cert_dir_open(false, ENOENT) == CertDirOpen::kAbsent);
-    CHECK(classify_cert_dir_open(false, ENOTDIR) == CertDirOpen::kAbsent);
+}
+
+TEST_CASE("classify_cert_dir_open: ENOTDIR is unreadable, not absent -- something "
+          "non-directory sits at the store path",
+          "[certificates][honesty]") {
+    CHECK(classify_cert_dir_open(false, ENOTDIR) == CertDirOpen::kUnreadable);
 }
 
 TEST_CASE("classify_cert_dir_open: EACCES/EPERM/EIO are unreadable, not absent",

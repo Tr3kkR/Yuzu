@@ -87,29 +87,21 @@
 // inside the __APPLE__ region.
 
 #ifdef __linux__
-// confined_fs.hpp declares `namespace yuzu::agent::confined_fs` and
-// scoped_fd.hpp declares `namespace yuzu::agent` -- both MUST be included
-// here, at global scope, before the anonymous namespace below opens, for
-// the exact reason the __APPLE__ block above this one documents in full:
-// including them inside `namespace { ... }` would nest `yuzu::agent` under
-// `(anonymous namespace)::yuzu`, shadowing the global `::yuzu` namespace
-// (from <yuzu/plugin.hpp> above) for every unqualified `yuzu::` lookup in
-// this file, and would give `capture_identity`'s call sites below a
-// declaration in a different, TU-local namespace than the one agent-core
+// certificates_linux_store.hpp declares `namespace yuzu::certificates_linux`
+// and pulls in confined_fs.hpp (`namespace yuzu::agent::confined_fs`) and
+// scoped_fd.hpp (`namespace yuzu::agent`) itself -- included here, at global
+// scope, before the anonymous namespace below opens, for the exact reason
+// the __APPLE__ block above this one documents in full: including it inside
+// `namespace { ... }` would nest `yuzu::agent`/`yuzu::certificates_linux`
+// under `(anonymous namespace)::yuzu`, shadowing the global `::yuzu`
+// namespace (from <yuzu/plugin.hpp> above) for every unqualified `yuzu::`
+// lookup in this file, and would give `capture_identity`'s call sites below
+// a declaration in a different, TU-local namespace than the one agent-core
 // actually exports the symbol from (confirmed via a real compile: GCC 13
 // and Clang both reject or mis-resolve the resulting ambiguous/orphaned
-// `yuzu::agent::confined_fs::capture_identity` reference). The POSIX
-// headers alongside them declare nothing in `yuzu::`, but are kept here
-// too so every Linux-only include this file needs lives in one place.
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-
-#include <climits>
-
-#include <yuzu/agent/confined_fs.hpp>
-#include <yuzu/agent/scoped_fd.hpp>
+// `yuzu::agent::confined_fs::capture_identity` reference).
+#include "certificates_linux_store.hpp"
+using namespace yuzu::certificates_linux;
 #endif
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -573,225 +565,12 @@ bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
 // mutating design); do not read this comment as a claim that bundle files
 // are safe from bulk removal.
 
-/// Outcome of opening the Linux cert-store directory itself (open_cert_dir).
-struct CertDir {
-    yuzu::agent::ScopedFd fd;
-    CertDirOpen state;
-    int err = 0;
-};
-
-/// Opens /etc/ssl/certs ONCE and holds the descriptor for every subsequent
-/// per-entry operation (enumeration, per-entry open/stat, and -- on delete --
-/// the pre-unlink recheck + unlinkat itself) -- the held-dirfd design #3245
-/// depends on: every syscall below is parent-handle-relative, never a fresh
-/// pathname lookup, so a directory swapped for another between two separate
-/// opens cannot make this code enumerate one directory and act on another.
-CertDir open_cert_dir() {
-    // O_NONBLOCK is inert on a directory open (only a FIFO/device open can
-    // block) but is included unconditionally per the "no open in this block
-    // without O_NONBLOCK" rule below, so every open/openat call site is
-    // uniform and the lexical gate has no exception to special-case.
-    //
-    // O_NOFOLLOW refuses a symlinked root, matching confined_fs.hpp's
-    // open_root contract: without it, a swapped /etc/ssl/certs would be
-    // silently followed before the held-dirfd protection above ever
-    // engages. A symlink root fails ELOOP, which classify_cert_dir_open
-    // folds into kUnreadable like any other open failure.
-    int fd = ::open("/etc/ssl/certs",
-                     O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
-    int err = fd < 0 ? errno : 0;
-    return CertDir{yuzu::agent::ScopedFd(fd), classify_cert_dir_open(fd >= 0, err), err};
-}
-
-/// RAII owner for a DIR* opened via fdopendir -- closedir must run on every
-/// exit from for_each_cert_entry below, including a THROWING one (peer
-/// review: `std::string{name}` can throw bad_alloc, and on_name goes on to
-/// call parse_pem_certs / std::string allocation / ctx.write_output; a bare
-/// `::closedir(d)` at the bottom of the loop never runs if any of that
-/// throws, leaking the directory stream and its descriptor).
-struct ScopedDir {
-    DIR* d = nullptr;
-    ScopedDir() = default;
-    explicit ScopedDir(DIR* dir) : d(dir) {}
-    ScopedDir(const ScopedDir&) = delete;
-    ScopedDir& operator=(const ScopedDir&) = delete;
-    ~ScopedDir() {
-        if (d)
-            ::closedir(d);
-    }
-};
-
-/// Enumerates `dirfd` THROUGH THE HELD DESCRIPTOR, never by pathname (peer
-/// review F4: `directory_iterator("/etc/ssl/certs")` opens the path a SECOND
-/// time, which would defeat the whole held-dirfd design -- a directory
-/// swapped between the two opens would be enumerated in one directory and
-/// read/unlinked in another). `fdopendir` takes ownership of the fd it is
-/// given, so this dups first to keep `dirfd` (owned by the caller's CertDir)
-/// alive for the openat/fstatat/unlinkat calls each `on_name` invocation
-/// goes on to make. Returns false on a dup/fdopendir failure OR a readdir
-/// failure mid-enumeration (peer review F5: an errno-bearing nullptr must
-/// not look like a clean end-of-directory) -- callers treat false exactly
-/// like CertDirOpen::kUnreadable: the scan cannot be trusted as complete.
-/// `out_errno`, when given, receives the errno of whichever failure caused
-/// the false return, so callers can report WHY the scan didn't complete,
-/// not just that it didn't.
-template <typename OnName>
-bool for_each_cert_entry(int dirfd, OnName&& on_name, int* out_errno = nullptr) {
-    int dup_fd = ::dup(dirfd);
-    if (dup_fd < 0) {
-        if (out_errno)
-            *out_errno = errno;
-        return false;
-    }
-    DIR* raw = ::fdopendir(dup_fd);
-    if (!raw) {
-        if (out_errno)
-            *out_errno = errno;
-        ::close(dup_fd);
-        return false;
-    }
-    ScopedDir d(raw);
-    bool complete = true;
-    for (;;) {
-        errno = 0;
-        dirent* e = ::readdir(d.d);
-        if (!e) {
-            complete = (errno == 0);
-            if (!complete && out_errno)
-                *out_errno = errno;
-            break;
-        }
-        std::string_view name{e->d_name};
-        if (name == "." || name == "..")
-            continue;
-        if (!is_cert_entry_name(name))
-            continue;
-        on_name(std::string{name});
-    }
-    return complete;
-}
-
-/// Result of reading one directory entry as a candidate certificate.
-struct CertEntryRead {
-    std::optional<yuzu::certificates_x509::CertFields> cert;
-    CertEntryOpen state;
-    std::optional<CertEntryIdentity> identity;
-};
-
-/// Opens and parses ONE cert-store entry, dirfd-relative throughout. O_NONBLOCK
-/// is LOAD-BEARING on every open/openat here (peer review F1): open(2) of a
-/// FIFO with no writer blocks forever, and the S_ISREG check below cannot run
-/// until open returns, so a blocking open would let a crafted FIFO wedge a
-/// worker before the type filter ever gets a chance to reject it. Once fstat
-/// proves S_ISREG the flag is inert (POSIX: reads of a regular file never
-/// block), so no fcntl clear is needed afterward.
-CertEntryRead read_cert_entry(int dirfd, const std::string& name) {
-    CertEntryRead result;
-
-    int fd = ::openat(dirfd, name.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-    int err = fd < 0 ? errno : 0;
-    result.state = classify_cert_entry_open(fd >= 0, err);
-    yuzu::agent::ScopedFd parse_fd(fd);
-
-    std::string link_target;
-    if (result.state == CertEntryOpen::kSymlink) {
-        // ELOOP from the O_NOFOLLOW open above -- this entry is a symlink.
-        // Resolve the link text, then open the TARGET read-only for parsing
-        // only (never for the eventual unlink, which always acts on the
-        // link's own name via unlinkat).
-        char buf[PATH_MAX];
-        ssize_t n = ::readlinkat(dirfd, name.c_str(), buf, sizeof(buf));
-        if (n < 0) {
-            result.state = CertEntryOpen::kUnreadable;
-            return result;
-        }
-        link_target.assign(buf, static_cast<std::size_t>(n));
-
-        int target_fd = !link_target.empty() && link_target.front() == '/'
-                            ? ::open(link_target.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK)
-                            : ::openat(dirfd, link_target.c_str(),
-                                       O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-        int target_err = target_fd < 0 ? errno : 0;
-        if (target_fd < 0) {
-            // A dangling link (target removed) is not a read failure -- it is
-            // simply not a certificate right now; skip it silently like any
-            // other vanished entry. Anything else is a genuine read failure.
-            result.state = (target_err == ENOENT) ? CertEntryOpen::kVanished
-                                                    : CertEntryOpen::kUnreadable;
-            return result;
-        }
-        parse_fd.reset(target_fd);
-    } else if (result.state != CertEntryOpen::kOpened) {
-        return result; // kVanished / kUnreadable: nothing left to read
-    }
-
-    // Applied AFTER the (nonblocking) open, so a FIFO/device/socket cannot be
-    // bypassed by racing a blocking open ahead of this check -- today's
-    // is_regular_file filter, now unconditionally enforced on the parse fd.
-    struct stat st {};
-    if (::fstat(parse_fd.get(), &st) != 0) {
-        // fstat failing on an fd this function just successfully opened is
-        // a genuine I/O error, not "this entry doesn't exist" -- conflating
-        // the two (peer review) would let a transient fstat failure on the
-        // actual delete/details target silently present as kVanished
-        // (skipped, scan_complete stays true) and reach a false
-        // status|not_found instead of an honest unreadable/partial signal.
-        result.state = CertEntryOpen::kUnreadable;
-        return result;
-    }
-    if (!S_ISREG(st.st_mode)) {
-        // A FIFO, device, socket or directory successfully IDENTIFIED as
-        // such is not a read failure -- it is simply not a certificate;
-        // skip it silently like any other non-candidate entry.
-        result.state = CertEntryOpen::kVanished;
-        return result;
-    }
-
-    // Identity capture. For a symlink this binds BOTH the link's own inode
-    // (fstatat AT_SYMLINK_NOFOLLOW, so the link is not followed here) AND the
-    // resolved target's inode (capture_identity of the fd that actually did
-    // the parse) -- peer review F2: a link whose text is unchanged but whose
-    // target was rename-replaced underneath it must be detectable, and text
-    // alone cannot see that. A regular entry's identity is just its own
-    // parsed fd. Any capture failure leaves identity nullopt, which
-    // classify_delete_recheck (certificates_macos_parsers.hpp) treats as
-    // kUnknown -- fail closed, never unlink on missing identity.
-    if (result.state == CertEntryOpen::kOpened) {
-        if (auto id = yuzu::agent::confined_fs::capture_identity(parse_fd.get())) {
-            result.identity = CertEntryIdentity{false, id->dev, id->ino, "", 0, 0};
-        }
-    } else {
-        struct stat link_st {};
-        if (::fstatat(dirfd, name.c_str(), &link_st, AT_SYMLINK_NOFOLLOW) == 0) {
-            if (auto target_id = yuzu::agent::confined_fs::capture_identity(parse_fd.get())) {
-                result.identity =
-                    CertEntryIdentity{true, static_cast<std::uint64_t>(link_st.st_dev),
-                                      static_cast<std::uint64_t>(link_st.st_ino), link_target,
-                                      target_id->dev, target_id->ino};
-            }
-        }
-    }
-
-    std::string contents;
-    char rbuf[65536];
-    for (;;) {
-        ssize_t n = ::read(parse_fd.get(), rbuf, sizeof(rbuf));
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            result.state = CertEntryOpen::kUnreadable;
-            return result;
-        }
-        if (n == 0)
-            break;
-        contents.append(rbuf, static_cast<std::size_t>(n));
-    }
-
-    auto certs = yuzu::certificates_x509::parse_pem_certs(contents);
-    if (!certs.empty())
-        result.cert = std::move(certs.front());
-    return result;
-}
+// CertDir/open_cert_dir/ScopedDir/for_each_cert_entry/CertEntryRead/
+// read_cert_entry/StoreSyscalls/DeleteScan/delete_matching_cert now live in
+// certificates_linux_store.hpp (yuzu::certificates_linux), pulled into scope
+// above via `using namespace yuzu::certificates_linux;` -- moved there so
+// tests/unit/test_certificates_linux_store.cpp can drive a real delete
+// against a TempDir on macOS and Linux alike.
 
 CertRecord read_linux_cert_record(yuzu::CommandContext& ctx, int dirfd, const std::string& name,
                                   const std::string& store_name) {
@@ -847,7 +626,7 @@ void list_certs_linux(yuzu::CommandContext& ctx, std::string_view /*store_filter
                       int expiring_days) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    auto dir = open_cert_dir();
+    auto dir = open_cert_dir(kDefaultCertDir);
     if (dir.state == CertDirOpen::kAbsent) {
         return;
     }
@@ -870,15 +649,15 @@ void list_certs_linux(yuzu::CommandContext& ctx, std::string_view /*store_filter
         },
         &enum_err);
     if (!dir_complete) {
-        ctx.write_output("not_available|/etc/ssl/certs could not be opened");
-        mark_result_partial(ctx, "posix:cert-dir", std::strerror(enum_err));
+        ctx.write_output("not_available|/etc/ssl/certs enumeration incomplete");
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(enum_err));
     }
 }
 
 void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
-    auto dir = open_cert_dir();
+    auto dir = open_cert_dir(kDefaultCertDir);
     if (dir.state == CertDirOpen::kAbsent) {
         ctx.write_output("status|not_found");
         return;
@@ -936,15 +715,15 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
     // the match).
     if (found) {
         if (!dir_complete)
-            mark_result_partial(ctx, "posix:cert-dir", std::strerror(enum_err));
+            mark_result_partial(ctx, "posix:cert-enum", std::strerror(enum_err));
         return;
     }
     if (!dir_complete) {
         // Mirrors the directory-open failure row: an errno-bearing readdir
         // failure mid-scan is exactly as inconclusive as never having opened
         // the directory at all.
-        ctx.write_output("not_available|/etc/ssl/certs could not be opened");
-        mark_result_partial(ctx, "posix:cert-dir", std::strerror(enum_err));
+        ctx.write_output("not_available|/etc/ssl/certs enumeration incomplete");
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(enum_err));
         return;
     }
     if (scan_complete) {
@@ -992,7 +771,7 @@ void details_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint) 
 /// side-effect-free sequence, and is chosen here for exactly that reason.
 bool delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
                        std::string_view /*store*/) {
-    auto dir = open_cert_dir();
+    auto dir = open_cert_dir(kDefaultCertDir);
     if (dir.state == CertDirOpen::kAbsent) {
         ctx.write_output("status|not_found");
         return true;
@@ -1003,121 +782,61 @@ bool delete_cert_linux(yuzu::CommandContext& ctx, std::string_view thumbprint,
         return false;
     }
 
-    auto needle = canonical_thumbprint(thumbprint);
-    bool done = false;
+    auto scan = delete_matching_cert(dir.fd.get(), canonical_thumbprint(thumbprint));
+    if (scan.unreadable_entries > 0) {
+        // Same degraded-read signal read_linux_cert_record gives list/
+        // details -- an unreadable entry here means this scan cannot prove
+        // the target is absent/complete (consistency-auditor Gate-4
+        // BLOCKING finding).
+        mark_result_partial(ctx, "libcrypto:unreadable-file");
+    }
+
     bool ok = true;
-    // See details_cert_linux's identical flag -- a delete request must never
-    // report "not_found" (which idempotent "ensure-absent" remediation
-    // depends on being a definitive negative) when a candidate entry
-    // couldn't actually be inspected.
-    bool scan_complete = true;
-    int enum_err = 0;
-    bool dir_complete = for_each_cert_entry(dir.fd.get(), [&](const std::string& name) {
-        if (done)
-            return;
-        // parity: only the entry's FIRST certificate is a delete target --
-        // see the guard comment above read_cert_entry.
-        auto read = read_cert_entry(dir.fd.get(), name);
-        if (read.state == CertEntryOpen::kVanished)
-            return;
-        if (read.state == CertEntryOpen::kUnreadable || !read.cert) {
-            // Same degraded-read signal read_linux_cert_record gives list/
-            // details -- an unreadable entry here means this scan cannot
-            // prove the target is absent (consistency-auditor Gate-4
-            // BLOCKING finding).
-            mark_result_partial(ctx, "libcrypto:unreadable-file");
-            scan_complete = false;
-            return;
-        }
-        if (canonical_thumbprint(read.cert->thumbprint) != needle)
-            return;
-
-        done = true;
-
-        // Re-check identity immediately before unlink -- #3245's TOCTOU
-        // close. Re-derived independently of `read.identity` (captured at
-        // match time above) rather than reused, so this genuinely observes
-        // the entry's CURRENT state.
-        struct stat st {};
-        std::optional<CertEntryIdentity> at_unlink;
-        if (::fstatat(dir.fd.get(), name.c_str(), &st, AT_SYMLINK_NOFOLLOW) == 0) {
-            if (S_ISLNK(st.st_mode)) {
-                char buf[PATH_MAX];
-                ssize_t n = ::readlinkat(dir.fd.get(), name.c_str(), buf, sizeof(buf));
-                struct stat target_st {};
-                if (n >= 0 && ::fstatat(dir.fd.get(), name.c_str(), &target_st, 0) == 0) {
-                    at_unlink = CertEntryIdentity{
-                        true, static_cast<std::uint64_t>(st.st_dev),
-                        static_cast<std::uint64_t>(st.st_ino),
-                        std::string(buf, static_cast<std::size_t>(n)),
-                        static_cast<std::uint64_t>(target_st.st_dev),
-                        static_cast<std::uint64_t>(target_st.st_ino)};
-                }
-            } else if (S_ISREG(st.st_mode)) {
-                at_unlink = CertEntryIdentity{false, static_cast<std::uint64_t>(st.st_dev),
-                                              static_cast<std::uint64_t>(st.st_ino), "", 0, 0};
-            }
-            // Anything else (removed, or replaced by a non-reg/non-link
-            // type): at_unlink stays nullopt.
-        }
-
-        switch (classify_delete_recheck(read.identity, at_unlink)) {
-        case DeleteRecheck::kProceed:
-            if (::unlinkat(dir.fd.get(), name.c_str(), 0) == 0) {
-                ctx.write_output("status|deleted");
-            } else {
-                int unlink_err = errno;
-                spdlog::warn("certificates: unlinkat('{}') failed (errno={}): {}", name,
-                            unlink_err, std::strerror(unlink_err));
-                ctx.write_output("status|delete_failed");
-                ok = false;
-            }
-            break;
-        case DeleteRecheck::kChanged:
-            ctx.write_output("error|certificate file changed during delete; nothing removed");
-            mark_result_partial(ctx, "posix:delete-recheck",
-                                "identity at unlink time differs from identity at match time");
-            ok = false;
-            break;
-        case DeleteRecheck::kUnknown:
-            ctx.write_output(
-                "error|certificate file could not be re-verified before delete; nothing removed");
-            mark_result_partial(ctx, "posix:delete-recheck",
-                                "identity could not be re-derived immediately before unlink");
-            ok = false;
-            break;
-        }
-    }, &enum_err);
-
-    // `ok` already reflects the outcome this loop wrote for the matched
-    // entry (deleted / delete_failed / changed / unknown) -- checking
-    // dir_complete here would override a real "something happened" outcome
-    // with a false "nothing removed" (a match already mutated, or definitely
-    // failed to mutate, the store; a readdir failure on entries scanned
-    // AFTER that match cannot undo it), so the row and rc already decided
-    // above stand unconditionally. But the store has already been mutated
-    // (or a mutation attempt definitively resolved) by this point, and an
-    // incomplete scan past that point means other entries went unexamined --
-    // still worth surfacing as PARTIAL so it isn't silently lost (reviewer
-    // A3-02: this must be a real signal, not a reason to reverse the rc).
-    if (done) {
-        if (!dir_complete)
-            mark_result_partial(ctx, "posix:cert-dir", std::strerror(enum_err));
-        return ok;
-    }
-    if (!dir_complete) {
-        ctx.write_output("error|/etc/ssl/certs could not be opened; nothing removed");
-        mark_result_partial(ctx, "posix:cert-dir", std::strerror(enum_err));
+    switch (scan.kind) {
+    case DeleteScanKind::kDeleted:
+        ctx.write_output("status|deleted");
+        break;
+    case DeleteScanKind::kUnlinkFailed:
+        spdlog::warn("certificates: unlinkat('{}') failed (errno={}): {}", scan.entry,
+                    scan.unlink_err, std::strerror(scan.unlink_err));
+        ctx.write_output("status|delete_failed");
+        ok = false;
+        break;
+    case DeleteScanKind::kChanged:
+        ctx.write_output("error|certificate file changed during delete; nothing removed");
+        mark_result_partial(ctx, "posix:delete-recheck",
+                            "identity at unlink time differs from identity at match time");
+        ok = false;
+        break;
+    case DeleteScanKind::kUnverifiable:
+        ctx.write_output(
+            "error|certificate file could not be re-verified before delete; nothing removed");
+        mark_result_partial(ctx, "posix:delete-recheck",
+                            "identity could not be re-derived immediately before unlink");
+        ok = false;
+        break;
+    case DeleteScanKind::kEnumerationFailed:
+        ctx.write_output("error|/etc/ssl/certs enumeration incomplete; nothing removed");
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(scan.enum_err));
         return false;
-    }
-    if (scan_complete) {
+    case DeleteScanKind::kUnreadableEntries:
+        ctx.write_output(
+            "error|unreadable file(s) in /etc/ssl/certs prevented a complete scan; "
+            "cannot confirm the certificate is absent");
+        return false;
+    case DeleteScanKind::kNotFound:
         ctx.write_output("status|not_found");
         return true;
     }
-    ctx.write_output(
-        "error|unreadable file(s) in /etc/ssl/certs prevented a complete scan; "
-        "cannot confirm the certificate is absent");
-    return false;
+
+    // A match already decided the row/rc above -- a readdir failure on
+    // entries scanned AFTER that match cannot undo a mutation (or a
+    // definitive non-mutation) that already happened, so this is surfaced
+    // as PARTIAL rather than reversing `ok` (reviewer A3-02: this must be a
+    // real signal, not a reason to reverse the rc).
+    if (scan.enumeration_failed)
+        mark_result_partial(ctx, "posix:cert-enum", std::strerror(scan.enum_err));
+    return ok;
 }
 
 #endif // __linux__
@@ -2376,7 +2095,10 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "delete",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "libcrypto X509 lookup + filesystem remove", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "libcrypto X509 match + held-dirfd openat/fstatat/unlinkat with pre-unlink identity "
+         "recheck",
+         nullptr},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 2, "security delete-certificate via subprocess runner",
          "SystemRootCertificates.keychain is sealed under SIP and rejected outright; only "

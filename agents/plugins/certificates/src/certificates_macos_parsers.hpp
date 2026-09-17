@@ -99,16 +99,18 @@ inline bool is_cert_entry_name(std::string_view name) {
 /// Classifies the outcome of opening the Linux cert-store directory (or a
 /// `readdir(3)` call mid-enumeration, which reports failure the same way:
 /// errno set, nullptr returned). `ok` is whether the open/readdir succeeded;
-/// `err` is the resulting `errno` when it did not. ENOENT/ENOTDIR means the
+/// `err` is the resulting `errno` when it did not. ENOENT alone means the
 /// store simply doesn't exist -- today's "no store" semantics (list emits the
-/// header only; details/delete emit status|not_found). Anything else (EACCES,
-/// EPERM, EIO, ELOOP, ...) is a real, reportable failure to open a store that
+/// header only; details/delete emit status|not_found). Anything else,
+/// INCLUDING ENOTDIR (something non-directory sitting at the store path --
+/// a real, reportable misconfiguration, not "no store") -- EACCES, EPERM,
+/// EIO, ELOOP, ... -- is a real, reportable failure to open a store that
 /// does exist.
 enum class CertDirOpen { kOpened, kAbsent, kUnreadable };
 inline CertDirOpen classify_cert_dir_open(bool ok, int err) {
     if (ok)
         return CertDirOpen::kOpened;
-    if (err == ENOENT || err == ENOTDIR)
+    if (err == ENOENT)
         return CertDirOpen::kAbsent;
     return CertDirOpen::kUnreadable;
 }
