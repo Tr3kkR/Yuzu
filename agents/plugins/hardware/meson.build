@@ -8,9 +8,11 @@ elif host_machine.system() == 'darwin'
   # Wave 3 (#2380/ADR-3002 promotion): the "system" action reads the IOKit
   # IOPlatformExpertDevice registry entry natively (kIOPlatformSerialNumberKey
   # / kIOPlatformUUIDKey) instead of shelling out to `ioreg`. Same dependency
-  # shape as tests/meson.build's agent_test_native_deps (PLAN-08) — agent-core
-  # itself links no IOKit/CoreFoundation on darwin, so this plugin pulls its
-  # own copy.
+  # shape as tests/meson.build's agent_test_native_deps (PLAN-08). As of C0
+  # (dex_macos_perf.cpp) agent-core DOES link IOKit/CoreFoundation on darwin (its own
+  # hard appleframeworks dependency, agents/core/meson.build) — this plugin still pulls
+  # its own copy rather than relying on that transitively, since a plugin target should
+  # not depend on agent-core's dependency staying present for an unrelated reason.
   hardware_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'],
                                include_type: 'system')
 endif

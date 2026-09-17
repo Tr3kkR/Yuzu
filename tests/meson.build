@@ -74,9 +74,12 @@ invalid_name_fixture_plugin = shared_library(
 )
 
 # PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
-# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors;
-# agents/core links no IOKit on darwin, so the test exe must pull the frameworks
-# itself. Darwin-only; empty elsewhere.
+# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors. As of C0
+# (dex_macos_perf.cpp) agents/core DOES link IOKit/CoreFoundation on darwin (its own
+# hard appleframeworks dependency, agents/core/meson.build) — this test exe still pulls
+# its own copy rather than relying on that transitively, since a test target should not
+# depend on a library dependency staying present for an unrelated reason. Darwin-only;
+# empty elsewhere.
 agent_test_native_deps = []
 agent_test_native_args = []
 if host_machine.system() == 'darwin'

@@ -62,9 +62,14 @@ elif host_machine.system() == 'darwin'
   endif
 
   # dex_macos_perf.cpp (C0) needs IOKit (IOBlockStorageDriver walk) + CoreFoundation
-  # (property-dictionary reads). NOTE: A0 (feat/macos-spark-a0-build-prep, not yet
-  # merged) is expected to add this same appleframeworks line independently when it
-  # lands -- reconcile to one copy, do not duplicate.
+  # (property-dictionary reads), called UNCONDITIONALLY (no "if found" guard around
+  # sum_block_storage_stats/read_driver_stats/read_disk_totals) -- IOKit MUST stay a
+  # HARD dependency here (the default: no `required: false`), never folded into the
+  # `agent_security_dep` probe above. NOTE: A0 (feat/macos-spark-a0-build-prep, not yet
+  # merged) is expected to add its own appleframeworks line when it lands, by folding
+  # IOKit into that `required: false` Security probe instead -- reconcile to ONE copy at
+  # merge time, but keep it a hard IOKit dependency exactly as it is here; adopting A0's
+  # optional shape verbatim would let a box without IOKit silently ship a broken build.
   agent_platform_deps += dependency('appleframeworks', modules: ['IOKit', 'CoreFoundation'],
                                      include_type: 'system')
 endif
