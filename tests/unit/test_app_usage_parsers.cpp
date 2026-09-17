@@ -397,6 +397,36 @@ TEST_CASE("run_last_used: RECONSTRUCTION — unknown exe filter returns zero row
     sqlite3_close(db);
 }
 
+// Round-3 review MEDIUM: kLastUsedSqlAll's LIMIT clause must actually bound
+// what SQLite materializes and returns, not merely rely on the shell
+// resizing the vector afterward -- app_usage_plugin.cpp's do_last_used_on
+// truncates to kMaxLastUsedRows regardless of how many rows run_last_used
+// hands it, so a dispatcher-level test asserting the FINAL output size
+// cannot distinguish "the SQL LIMIT worked" from "the SQL returned every
+// one of 5000+ rows and the shell truncated after the fact" -- this test
+// asserts the query layer itself, decoupled from that shell behaviour: it
+// must return AT MOST kMaxLastUsedRows+1 rows (the +1 the shell relies on to
+// detect truncation without a second COUNT(*)) even when far more exist.
+TEST_CASE("run_last_used: unfiltered form never returns more than "
+         "kMaxLastUsedRows+1 rows, even when the table holds far more",
+          "[app_usage][last_used]") {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    seed::create_schema(db);
+    seed::exec_or_fail(db, "BEGIN");
+    const auto over_cap = static_cast<int64_t>(kMaxLastUsedRows) + 50;
+    for (int64_t i = 0; i < over_cap; ++i) {
+        seed::insert_usage_daily(db, 100000, "exe_" + std::to_string(i), 1, 1, 100000, 100000, 0,
+                                 0);
+    }
+    seed::exec_or_fail(db, "COMMIT");
+
+    const auto rows = run_last_used(db, std::nullopt, 0);
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == static_cast<std::size_t>(kMaxLastUsedRows) + 1);
+    sqlite3_close(db);
+}
+
 // ───────────────────────────────────────────────────────── schema check ───
 
 TEST_CASE("usage_daily_table_exists: true with the table, false without", "[app_usage][schema]") {
