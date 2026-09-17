@@ -268,7 +268,7 @@ struct DeniedCopy {
 /// WARN-skips (never a hard SKIP/FAIL) the two denied-copy cases when running
 /// as root -- root bypasses DAC, so chmod 000 would not actually deny
 /// anything and the case would prove nothing.
-bool root_would_bypass_dac() {
+[[nodiscard]] bool root_would_bypass_dac() {
     if (::geteuid() == 0) {
         WARN("running as root -- DAC bypasses the chmod-000 denied copy; skipping");
         return true;
@@ -281,7 +281,7 @@ bool root_would_bypass_dac() {
 /// no-console-user sentinel, so it cannot stand in for a real console
 /// session) or when the resolved name fails yuzu::macos::is_valid_username
 /// (the same injection guard the production argv path enforces).
-std::optional<std::string> console_username_or_skip() {
+[[nodiscard]] std::optional<std::string> console_username_or_skip() {
     if (::geteuid() == 0) {
         WARN("running as root -- \"root\" is the no-console-user sentinel; skipping "
              "console-owner cases");
@@ -639,6 +639,44 @@ TEST_CASE("list: console owner recheck itself fails (unparseable uid) -> not_ava
     auto lines = split_lines(result.captured);
     CHECK(count_lines_containing(lines, "not_available|console user recheck failed") == 1);
     CHECK(count_lines_containing(lines, kInjectedLoginFailLine) == 0);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "login-keychain");
+}
+
+TEST_CASE("list: an empty CONSOLE_OWNER_UID_OVERRIDE is ignored, falling through to the real "
+         "console owner (matches its 4 sibling seams, governance Gate 2 finding)",
+         "[certificates][macos_actions]") {
+    auto plugin = load_certificates_plugin();
+    if (!plugin) {
+        WARN("certificates plugin library not found -- skipping");
+        return;
+    }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
+    yuzu::test::ScopedEnv uid_override("YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE", "");
+    yuzu::test::ScopedEnv fail_override("YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE",
+                                        kInjectedLoginFailToken);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    std::vector<YuzuParam> params{{"store", "login"}};
+    auto result = dispatcher.run(plugin->descriptor, "list", params);
+
+    CHECK(result.rc == 0);
+    auto lines = split_lines(result.captured);
+    // An empty override must behave exactly like the "unchanged" control
+    // case below (real ::stat("/dev/console") matches this process's own
+    // uid, so the recheck passes and the spawn is reached) -- NOT like the
+    // "nope" case above (unparseable -> fail-closed "recheck failed"). Before
+    // db52b5a57 this asserted the wrong (fail-closed) outcome: an empty-but-
+    // set value activated the override branch and forced std::from_chars to
+    // fail, permanently degrading every read.
+    CHECK(count_lines_containing(lines, kInjectedLoginFailLine) == 1);
+    CHECK(count_lines_containing(lines, "console user changed") == 0);
+    CHECK(count_lines_containing(lines, "console user recheck failed") == 0);
     CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance == "login-keychain");
