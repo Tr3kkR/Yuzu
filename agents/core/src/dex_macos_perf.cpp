@@ -92,10 +92,17 @@ std::uint64_t vm_used_bytes(std::uint64_t wire, std::uint64_t internal, std::uin
 
 #if defined(__APPLE__)
 
+namespace {
+// mach_host_self() hands back a fixed send right naming "the host on which this task is
+// running" — it never changes for the life of the process, so every reader in this file
+// shares one cached port rather than each re-fetching it per call.
+const mach_port_t kHostSelf = mach_host_self();
+} // namespace
+
 CpuTicks read_cpu_ticks() {
     host_cpu_load_info_data_t info{};
     mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
-    if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO, reinterpret_cast<host_info_t>(&info),
+    if (host_statistics(kHostSelf, HOST_CPU_LOAD_INFO, reinterpret_cast<host_info_t>(&info),
                         &count) != KERN_SUCCESS)
         return {}; // invalid — never a half-filled struct
     CpuTicks out;
@@ -118,8 +125,10 @@ CpuTicks read_cpu_ticks() { return {}; }
 namespace {
 
 // Bounded sysctlbyname read into a fixed-size scalar. Same shape as
-// hardware_plugin.cpp's sysctl_value — kept as a private local copy here rather than
-// a shared header, since each file has exactly one call site for it.
+// hardware_plugin.cpp's sysctl_value — kept as a private local copy here rather than a
+// shared header: hardware_plugin.cpp has its own single call site, and THIS file has two
+// (hw.memsize below, kern.memorystatus_level in read_memorystatus_level) — duplicating
+// this ~8-line helper is still cheaper than adding a new shared header for it.
 template <typename T> std::optional<T> sysctl_value(const char* name) {
     T value{};
     std::size_t len = sizeof(value);
@@ -133,11 +142,11 @@ template <typename T> std::optional<T> sysctl_value(const char* name) {
 VmSnapshot read_vm_snapshot() {
     vm_statistics64_data_t vm{};
     mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-    if (host_statistics64(mach_host_self(), HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
+    if (host_statistics64(kHostSelf, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
                           &count) != KERN_SUCCESS)
         return {};
     vm_size_t page_size = 0;
-    if (host_page_size(mach_host_self(), &page_size) != KERN_SUCCESS)
+    if (host_page_size(kHostSelf, &page_size) != KERN_SUCCESS)
         return {};
     const auto total = sysctl_value<std::uint64_t>("hw.memsize");
     if (!total)
