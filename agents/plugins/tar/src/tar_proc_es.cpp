@@ -13,7 +13,7 @@
 
 #include "tar_proc_es.hpp"
 
-#include <yuzu/agent/es_client.hpp> // yuzu::agent::es_seq_gap (A0 relocation)
+#include <yuzu/agent/es_client.hpp> // yuzu::agent::{es_seq_gap,es_stream_is_stalled,kEsIdleFallbackSeconds} (A0 relocation)
 
 #include <string>
 
@@ -66,14 +66,6 @@ std::string resolve_uid_cached(std::unordered_map<std::uint32_t, std::string>& c
     return name;
 }
 
-bool es_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts,
-                          std::int64_t now, std::int64_t threshold_seconds) noexcept {
-    const std::int64_t since = (last_event_ts != 0) ? last_event_ts : started_ts;
-    if (since <= 0)
-        return false; // never started / clock uninitialised — don't fall back blindly
-    return (now - since) > threshold_seconds;
-}
-
 } // namespace yuzu::tar
 
 // The real ES client compiles only where the EndpointSecurity framework is
@@ -120,13 +112,6 @@ const char* es_new_client_err(es_new_client_result_t r) {
     default:                                      return "unknown";
     }
 }
-
-// Endpoint Security idle-fallback threshold (see ProcEsCollector::stalled). A
-// NOTIFY-only ES client exposes no liveness API, so prolonged TOTAL silence is the
-// only "presumed dead" signal available. Sized well beyond any plausible quiet
-// period so a healthy stream on a legitimately idle host is not falsely dropped to
-// the inferior poll. Revisit once a real liveness signal exists (#1455).
-constexpr std::int64_t kEsIdleFallbackSeconds = 3600; // 1 hour with zero events
 
 // uid → username via getpwuid_r, with an ERANGE-driven growing buffer (a
 // directory-joined Mac can return a passwd record larger than the initial guess).
@@ -378,9 +363,9 @@ bool ProcEsCollector::stalled() const noexcept {
     // avoid demoting a HEALTHY stream to the inferior poll until the agent restarts.
     // The health atomics are collector-owned, so reading them here is impl_-free.
     const std::int64_t now = static_cast<std::int64_t>(::time(nullptr));
-    return es_stream_is_stalled(last_event_ts_.load(std::memory_order_relaxed),
-                                started_ts_.load(std::memory_order_relaxed),
-                                now, kEsIdleFallbackSeconds);
+    return yuzu::agent::es_stream_is_stalled(last_event_ts_.load(std::memory_order_relaxed),
+                                             started_ts_.load(std::memory_order_relaxed), now,
+                                             yuzu::agent::kEsIdleFallbackSeconds);
 }
 
 } // namespace yuzu::tar

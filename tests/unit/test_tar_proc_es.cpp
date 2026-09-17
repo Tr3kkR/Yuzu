@@ -146,27 +146,6 @@ TEST_CASE("es_sample_to_proc_event preserves the inputs the handler guards on",
     REQUIRE(es_sample_to_proc_event(zero_pid).pid == 0); // handler drops (pid == 0)
 }
 
-TEST_CASE("es_stream_is_stalled measures idle from the later of last-event/start",
-          "[tar][proces]") {
-    using yuzu::tar::es_stream_is_stalled;
-    const std::int64_t threshold = 3600;
-    const std::int64_t start = 1'700'000'000;
-
-    // Fresh start, no event yet (last_event_ts == 0): idle measured from start.
-    REQUIRE_FALSE(es_stream_is_stalled(0, start, start + 100, threshold));  // quiet but young
-    REQUIRE(es_stream_is_stalled(0, start, start + 3601, threshold));       // silent past threshold
-
-    // Once events have arrived, idle is measured from the LAST event, not start.
-    const std::int64_t last = start + 10'000;
-    REQUIRE_FALSE(es_stream_is_stalled(last, start, last + 60, threshold)); // recent event
-    REQUIRE(es_stream_is_stalled(last, start, last + 3601, threshold));     // silent since last
-
-    // Neither set (clock never initialised) → never stalls (no spurious fallback).
-    REQUIRE_FALSE(es_stream_is_stalled(0, 0, 9'999, threshold));
-    // Backward clock step (now < since) → negative delta → not stalled (benign).
-    REQUIRE_FALSE(es_stream_is_stalled(last, start, last - 500, threshold));
-}
-
 TEST_CASE("resolve_uid_cached memoizes and calls the lookup once per uid",
           "[tar][proces]") {
     // The drain-time uid→user resolution is factored behind an injectable lookup so
