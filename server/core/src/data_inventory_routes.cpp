@@ -2,8 +2,11 @@
 
 #include "http_route_sink.hpp"
 #include "inventory_store.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 
 #include <nlohmann/json.hpp>
+
+#include <spdlog/spdlog.h>
 
 namespace yuzu::server::data_inventory {
 
@@ -69,6 +72,27 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const InventoryRecord& rec = **record;
+        // #2437-class guard: data_json is a generic ADR-0016 sync-framework blob
+        // written verbatim off the wire (see ProxyInventory's write-side guard,
+        // gateway_service_impl.cpp) with no depth check until that fix shipped -
+        // a row written before that, or via direct DB manipulation, still reaches
+        // this read. nlohmann::json::parse handles very deep input fine (the
+        // try/catch below guards a genuine parse error, not this), so a
+        // too-deep row would parse cleanly and dump() below - unboundedly
+        // recursive - would SIGSEGV the whole process. Check the raw stored text
+        // BEFORE the parse and answer the same "no data" shape this route
+        // already uses for a genuinely-absent record, rather than a 200 with a
+        // poisoned dump. Log identifiers only, never the payload.
+        if (mcp::json_exceeds_depth(rec.data_json, mcp::kMcpMaxJsonDepth)) {
+            spdlog::warn("GET /api/inventory: excluding agent={} plugin={} - data_json nests "
+                        "too deeply (#2437-class)",
+                        rec.agent_id, rec.plugin);
+            res.status = 404;
+            res.set_content(
+                R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
         nlohmann::json data_obj;
         try {
             data_obj = nlohmann::json::parse(rec.data_json);
@@ -122,6 +146,18 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
         }
         nlohmann::json arr = nlohmann::json::array();
         for (const auto& r : *records) {
+            // #2437-class guard: same hazard as the single-record GET above, but
+            // here inside a loop over every matched record - one poisoned row
+            // must not take down the whole response page. Exclude just this
+            // record and keep processing every other one; log identifiers only,
+            // never the payload. `count` below is `arr.size()` computed AFTER
+            // this loop, so an exclusion here keeps it consistent automatically.
+            if (mcp::json_exceeds_depth(r.data_json, mcp::kMcpMaxJsonDepth)) {
+                spdlog::warn("POST /api/inventory/query: excluding agent={} plugin={} - "
+                            "data_json nests too deeply (#2437-class)",
+                            r.agent_id, r.plugin);
+                continue;
+            }
             nlohmann::json data_obj;
             try {
                 data_obj = nlohmann::json::parse(r.data_json);
