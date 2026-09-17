@@ -1667,7 +1667,7 @@ ConsoleOwnerSnapshot snapshot_console_owner() {
     // same "unknown" answer a failed ::stat produces.
     if (const char* override_uid =
             std::getenv("YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE");
-        override_uid != nullptr) {
+        override_uid != nullptr && override_uid[0] != '\0') {
         ConsoleOwnerSnapshot out;
         std::string_view value(override_uid);
         auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), out.uid);
