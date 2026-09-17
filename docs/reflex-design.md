@@ -267,10 +267,25 @@ re-push (retry, reconcile) is dedup'd as a genuinely new command, never replayed
 outcome proto message. A fired/completed/failed/aborted/suppressed Reflex chain is reported as an
 ordinary `GuaranteedStateEvent` (`plugin="__guard__" action="event"`) with the new
 `GuaranteedStateEvent.family` field set to `"reflex"` (field 21, proto3 default `""` == `"guardian"`
-for backward compatibility with every pre-Reflex agent build, which never sets the field). The
-`ReflexOutcome` struct (R6) is mapped into that message's existing `detail_json` field as JSON
-(`rule_id` repurposed as `<set_id>/<reflex_id>`, `event_type` drawn from
-`reflex.{fired,completed,failed,aborted,suppressed_sampled}`, `event_id` the correlation id below).
+for backward compatibility with every pre-Reflex agent build, which never sets the field). **`family`
+is a CLOSED set at ingest — `{"", "guardian", "reflex"}` — validated at the router
+(`guardian_ingest.cpp`); any other value is refused and counted on an `ingest_errors`-style metric,
+never silently treated as `"guardian"`.** `rule_id` is **empty for every `family=="reflex"` row** —
+it is never repurposed as `<set_id>/<reflex_id>` (that would resurrect exactly the `__observation__`
+rule-id-squatting pattern ADR-0021 Decision 6 retires `family` in order to *stop* doing). `set_id`
+and `reflex_id` are instead **additive fields on `GuaranteedStateEvent`** (own field numbers,
+alongside `family`), carried directly rather than encoded into an overloaded string. `event_type` is
+drawn from `reflex.{fired,completed,failed,aborted,suppressed_sampled}`, `event_id` is the
+correlation id below.
+
+**Upgrade ordering is server-before-agent.** The server must accept `family` (and the additive
+`set_id`/`reflex_id` fields) before any agent build that sets them is rolled out — an old server
+talking to a new agent sees `family=""` never happens by construction (it would see the real value
+and, if not yet upgraded, refuse it per the closed-set rule above rather than silently mis-filing it
+as Guardian drift); a new server talking to an old agent sees `family=""` correctly resolves to
+`"guardian"`. The reverse ordering (agent-before-server) is what the closed-set-at-ingest rule
+exists to make safe *if* it ever happens, but it is not the intended rollout order.
+
 This keeps Reflex on the **same single unsolicited-event channel and the same single server-side
 ingest router chokepoint** that ADR-0021 Decision 6 established — only the event *store* is
 Reflex-specific (`reflex_outcomes`, R3/R10), never the router.
