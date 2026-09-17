@@ -410,6 +410,21 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertEqual(wrapper.count("actions: write"), 1)
         self.assertNotIn("actions/checkout", purge)
         self.assertIn("if: always()", purge)
+        self.assertIn("needs: [trusted-gate]", purge)
+        # The purge job's own scope guard is a separate spelling (no PR number
+        # in scope there); pin it so it cannot drift or vanish unnoticed.
+        self.assertIn("^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$", purge)
+
+    def test_codeql_query_filters_are_exactly_the_documented_two(self) -> None:
+        """#4471: the poisonable-step exclusion is the trade-off that stops
+        alert #5177 re-firing on every preflight step; a query-id rename or an
+        accidental broadening would silently reopen or over-suppress it."""
+        config = (ROOT / ".github" / "codeql" / "codeql-config.yml").read_text(encoding="utf-8")
+        ids = re.findall(r"(?m)^\s*-\s*exclude:\n\s*id:\s*(\S+)\s*$", config)
+        self.assertEqual(
+            ids,
+            ["cpp/poorly-documented-function", "actions/cache-poisoning/poisonable-step"],
+        )
 
         # linux + windows carry the full boundary: conditional clean:false
         # (safe only with their branch-switch wipe step + vcpkg sentinel) plus
@@ -431,11 +446,13 @@ class WorkflowWiringTests(unittest.TestCase):
         trusted-fork/pr-<N> quarantine. This sweep is the in-repo replacement:
         a workflow that checks out a PR-derived ref must be one of the two that
         carry the quarantine assertion. Extending the allowlist is a security
-        decision, not a routine edit."""
+        decision, not a routine edit. Any dispatch input or job output used as a
+        checkout ref counts (deliberately broad). Only `with:` blocks written
+        after the `uses:` line are inspected — every checkout in this repo is
+        written that way."""
         allowed = {"ci.yml", "fork-dynamic-review.yml"}
         pr_derived = re.compile(
-            r"refs/pull/|github\.event\.pull_request\.head|inputs\.(pr_number|head_sha)"
-            r"|needs\.[A-Za-z0-9_-]+\.outputs\.checkout_ref"
+            r"refs/pull/|github\.event\.pull_request\.head|inputs\.|needs\.[A-Za-z0-9_-]+\.outputs\."
         )
         offenders = []
         for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):

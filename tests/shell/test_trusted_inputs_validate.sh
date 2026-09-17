@@ -62,37 +62,12 @@ check() { # check <desc> <expected> <actual>
 
 # ── Extract the step body from ci.yml ────────────────────────────────────────
 # Take the `run: |` block of the `- id: validate` step, de-indent it, and
-# substitute the two `${{ github.* }}` expression the shell cannot evaluate with
+# substitute the two `${{ github.* }}` expressions the shell cannot evaluate with
 # harness-controlled variables. Everything else runs verbatim.
-python3 - "$CI_YML" "$TMP/validate.sh" <<'PY'
-import sys
-src, out = sys.argv[1], sys.argv[2]
-lines = open(src).read().split("\n")
-# Find the validate step, then its `run: |`, then take the body by INDENTATION —
-# every following line that is blank or indented deeper than `run:` itself. Using
-# the next `- ` step as the boundary overshoots into the job's `outputs:` block.
-i = next(n for n, l in enumerate(lines) if l.strip() == "- id: validate")
-r = next(n for n in range(i, len(lines)) if lines[n].strip() == "run: |")
-indent = len(lines[r]) - len(lines[r].lstrip())
-body_indent = indent + 2
-body = []
-for l in lines[r + 1:]:
-    if l.strip() == "":
-        body.append("")
-        continue
-    if len(l) - len(l.lstrip()) < body_indent:
-        break
-    body.append(l[body_indent:])
-body = "\n".join(body)
-assert "checkout_ref=" in body, "extracted body does not look like the validate step"
-# The only GitHub expressions inside the body. Both become harness variables.
-body = body.replace('"${{ github.event_name }}"', '"$GH_EVENT_NAME"')
-body = body.replace('${{ github.event.pull_request.base.sha }}', '$GH_BASE_SHA')
-assert '${{' not in body, "unsubstituted GitHub expression left in the extracted body:\n" + \
-    "\n".join(l for l in body.split("\n") if '${{' in l)
-open(out, "w").write(body)
-PY
-[ -s "$TMP/validate.sh" ] || { echo "extraction produced nothing" >&2; exit 2; }
+python3 "$ROOT/tests/shell/extract_run_block.py" "$CI_YML" "$TMP/validate.sh" --id validate \
+  --subst 'github.event_name=GH_EVENT_NAME' \
+  --subst 'github.event.pull_request.base.sha=GH_BASE_SHA' || exit 2
+grep -q 'checkout_ref=' "$TMP/validate.sh" || { echo "extracted body does not look like the validate step" >&2; exit 2; }
 
 # ── Hermetic `gh` ────────────────────────────────────────────────────────────
 # Answers ONLY the one PR read the trusted path makes, records that it was

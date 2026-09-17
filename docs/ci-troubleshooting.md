@@ -94,6 +94,10 @@ the fork checkout; build steps do not receive it. The trusted self-hosted legs
 use clean workspaces and private, no-share caches, then purge the checkout. The
 wrapper's final `purge-quarantine-cache` job deletes every GitHub Actions cache
 entry in the quarantine scope (deleting the branch does not do that by itself).
+The review workflow has no purge job of its own, so when re-approving a newer
+head on a PR whose branch already ran, name the branch
+`trusted-fork/pr-123-<sha7>` instead of reusing the bare name (both guards accept
+an optional hex suffix).
 If the dispatch is refused with `must be dispatched on
 refs/heads/trusted-fork/pr-<N>`, the `--ref` was wrong — never work around it
 by dispatching on `main`. Two trusted dispatches do not serialise with each
