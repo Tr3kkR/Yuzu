@@ -773,6 +773,21 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r.error().token == "oversize_count");
     }
 
+    SECTION("volume_count > 0, every bound/size check passes, but the refs sub-block's own "
+            "version dword is not the byte-verified constant 3 -- the semantic anchor added "
+            "for the round-3 review's stride-overclaim finding (#4467) must itself be "
+            "load-bearing, not just present") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(5);
+        // The refs sub-block for a single entry at stride kVolumeEntryStrideV30V31 (96)
+        // starts right where the entries region ends -- kVolInfoOff(0x100) + 96 -- and its
+        // version dword is the first 4 bytes of that sub-block.
+        put_u32(buf, 0x100 + kVolumeEntryStrideV30V31, 99u);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "truncated_entry");
+    }
+
     SECTION("two volumes, each individually well under kPrefetchMaxFileRefs, but their SUM "
             "exceeds it -- the running total_refs cap is a separate check from each entry's "
             "own per-entry cap, and mutation-testing confirmed removing it left every existing "
