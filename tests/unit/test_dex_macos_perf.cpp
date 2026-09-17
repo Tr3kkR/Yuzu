@@ -17,6 +17,8 @@
 #include <limits>
 
 #if defined(__APPLE__)
+#include <IOKit/IOKitLib.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
 #include <sys/sysctl.h>
 
 #include <chrono>
@@ -198,10 +200,25 @@ TEST_CASE("read_vm_snapshot's total matches an independent hw.memsize read",
 }
 
 TEST_CASE("read_disk_totals reads real IOBlockStorageDriver counters", "[dex][macos][perf][darwin]") {
-    const auto disk = read_disk_totals();
-    if (!disk.valid || disk.reads == 0) {
+    // Verify driver presence INDEPENDENTLY of read_disk_totals() itself, so SKIP() means
+    // "genuinely nothing to read on this runner" rather than silently masking a real
+    // read_disk_totals defect behind the same call this test is meant to pin.
+    io_iterator_t raw_it{};
+    REQUIRE(IOServiceGetMatchingServices(kIOMainPortDefault,
+                                         IOServiceMatching(kIOBlockStorageDriverClass),
+                                         &raw_it) == KERN_SUCCESS);
+    int driver_count = 0;
+    for (io_object_t raw_obj; (raw_obj = IOIteratorNext(raw_it));) {
+        IOObjectRelease(raw_obj);
+        ++driver_count;
+    }
+    IOObjectRelease(raw_it);
+    if (driver_count == 0) {
         SKIP("no IOBlockStorageDriver rows on this runner (VM/CI host)");
     }
+
+    const auto disk = read_disk_totals();
+    REQUIRE(disk.valid);
     CHECK(disk.reads > 0);
 }
 
