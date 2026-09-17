@@ -31,6 +31,8 @@
 #include <array>
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <span>
 #include <sstream>
@@ -387,6 +389,90 @@ TEST_CASE("Kill switch: an action-level row overrides an inherited plugin-level 
     REQUIRE(entry.has_value());
     CHECK(entry->enabled);
     CHECK(entry->action == "audit");
+}
+
+TEST_CASE("Wave 7: seed_kill_switch_default_off seeds a disabled plugin-level row",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.seed_kill_switch_default_off(
+        "execution_artifacts", "default-off: forensics class (Wave 7); enable per PUT "
+                               "/api/v1/plugin-config/execution_artifacts/kill-switch"));
+
+    CHECK_FALSE(w.store.action_allowed("execution_artifacts", "shimcache"));
+    auto entry = w.store.get_kill_switch("execution_artifacts", "");
+    REQUIRE(entry.has_value());
+    CHECK_FALSE(entry->enabled);
+    CHECK(entry->set_by == "system");
+}
+
+TEST_CASE("Wave 7: seed_kill_switch_default_off is ON CONFLICT DO NOTHING — an operator's "
+          "own enable survives a re-seed",
+          "[pg][store][plugin_config][killswitch]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, plugincfg_tpl);
+    Wired w{db.dsn()};
+    REQUIRE(w.store.seed_kill_switch_default_off("execution_artifacts", "default-off seed"));
+    CHECK_FALSE(w.store.action_allowed("execution_artifacts", "shimcache"));
+
+    // Operator explicitly re-enables it.
+    REQUIRE(w.store
+                .set_kill_switch("execution_artifacts", "", true, "operator re-enable", "bob")
+                .has_value());
+    CHECK(w.store.action_allowed("execution_artifacts", "shimcache"));
+
+    // A later re-seed (e.g. next boot) must NOT clobber the operator's own
+    // decision — ON CONFLICT (scope_key) DO NOTHING.
+    REQUIRE(w.store.seed_kill_switch_default_off("execution_artifacts", "default-off seed"));
+    CHECK(w.store.action_allowed("execution_artifacts", "shimcache"));
+}
+
+// The two tests above prove seed_kill_switch_default_off itself behaves —
+// but nothing here proves ServerImpl's real boot sequence (server.cpp)
+// actually CALLS it, or that a seed failure actually fails the boot closed.
+// A full ServerImpl construction is impractical at the unit level (it needs
+// a live Postgres pool, gRPC service wiring, and dozens of other
+// subsystems — squarely integration-test territory), so this mirrors the
+// established `[source_tripwire]` pattern used elsewhere in this suite
+// (see test_response_execution_scope_authz.cpp's route_block tests): scan
+// the real server.cpp source for the exact call-site shape rather than
+// executing it.
+#ifndef YUZU_SERVER_SRC_DIR
+#error "YUZU_SERVER_SRC_DIR must be injected by tests/meson.build."
+#endif
+
+TEST_CASE("Wave 7: ServerImpl's boot sequence actually calls "
+          "seed_kill_switch_default_off(\"execution_artifacts\", ...) and fails the boot "
+          "closed on a seed error — source tripwire against server.cpp, since a full "
+          "ServerImpl construction is not practical at the unit level",
+          "[server][killswitch][source_tripwire]") {
+    std::ifstream input(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
+    REQUIRE(input.is_open());
+    const std::string source{std::istreambuf_iterator<char>(input),
+                             std::istreambuf_iterator<char>()};
+
+    const auto marker = source.find("seed_kill_switch_default_off(\n");
+    REQUIRE(marker != std::string::npos);
+    // Bound the block to the call's own enclosing braces so the assertions
+    // below can't accidentally match some unrelated later call site.
+    const auto block_end = source.find("\n        }\n", marker);
+    REQUIRE(block_end != std::string::npos);
+    const auto block = source.substr(marker, block_end - marker);
+
+    CHECK(block.find("\"execution_artifacts\"") != std::string::npos);
+
+    // The call is gated on the store existing and the boot not already
+    // having failed — never unconditional.
+    const auto guard_start = source.rfind("if (plugin_config_store_ && !startup_failed_)",
+                                          marker);
+    REQUIRE(guard_start != std::string::npos);
+    CHECK(guard_start < marker);
+
+    // A seed failure sets startup_failed_ = true — the same fail-closed
+    // shape every other boot-time Postgres store initialisation in this
+    // function uses (e.g. plugin_config_store_ itself, a few hundred lines
+    // above). No `default:`/silent-continue escape.
+    CHECK(block.find("startup_failed_ = true;") != std::string::npos);
+    CHECK(block.find("Refusing to start") != std::string::npos);
 }
 
 TEST_CASE("set_kill_switch rejects an invalid reason as InvalidInput",

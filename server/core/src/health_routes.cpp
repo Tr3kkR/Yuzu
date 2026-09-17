@@ -33,6 +33,7 @@
 #include "offload_target_store.hpp"
 #include "patch_manager.hpp"
 #include "pg/pg_pool.hpp"
+#include "plugin_config_store.hpp"
 #include "policy_store.hpp"
 #include "process_health.hpp"
 #include "product_pack_store.hpp"
@@ -740,6 +741,12 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // checked is_open() at all). Load-bearing for every
             // /api/patches/* route now that construction is fail-closed.
             {"patch_manager", deps.patch_manager && deps.patch_manager->is_open()},
+            // Wave 7b PR7b.1 execution_artifacts — PluginConfigStore backs the
+            // plugin kill switch; action_allowed() fails closed when the store
+            // is not open, so a not-open post-boot state silently denies every
+            // kill-switched action with no readiness signal. Same
+            // readyz-vs-healthz drift class the rows above document.
+            {"plugin_config_store", deps.plugin_config_store && deps.plugin_config_store->is_open()},
         };
 
         // Non-gating (governance Gate 2, 2026-08-16): ADR-0049's own construction

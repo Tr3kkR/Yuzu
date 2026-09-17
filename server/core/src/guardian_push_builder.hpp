@@ -11,6 +11,10 @@
 #include "guaranteed_state.pb.h"
 #include "guaranteed_state_store.hpp"  // GuaranteedStateRuleRow
 
+namespace yuzu {
+class MetricsRegistry;
+}
+
 // Pure helpers for building the per-agent Guardian push (M4 / #1209). Kept out
 // of server.cpp's push lambda so the rule-filtering + spec_json→proto marshal is
 // unit-testable without a live AgentRegistry or gRPC stream (M7).
@@ -121,9 +125,20 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
 // Total over arbitrary stored bytes: a rule row with a malformed (present but
 // non-string) spark/assertion/remediation `type` marshals to an inert empty
 // type rather than throwing — the fan-out never aborts on one bad row (#1946).
+// A row whose spec_json nests past kMcpMaxJsonDepth is excluded from the push
+// entirely (logged, not silently dropped) rather than reaching the marshal at
+// all: fill_block's dump() is unboundedly recursive, and the malformed-type
+// backstop above does not cover an oversized document, only a wrong-typed one.
+// The exclusion also increments `yuzu_guardian_push_rule_excluded_total{reason}`
+// when `metrics` is non-null (nullable/defaulted so existing callers/tests need
+// no change), and the log line is rate-limited via a file-local sampler since
+// the row persists in the store and this function runs on every heartbeat
+// reconcile for every connected agent - an unrated log would flood at fleet
+// scale for as long as the poisoned row exists.
 ::yuzu::guardian::v1::GuaranteedStatePush
 build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_view agent_os,
                  const std::function<bool(const std::string& scope_expr)>& in_scope,
-                 bool full_sync, std::uint64_t generation);
+                 bool full_sync, std::uint64_t generation,
+                 ::yuzu::MetricsRegistry* metrics = nullptr);
 
 } // namespace yuzu::server::guardian
