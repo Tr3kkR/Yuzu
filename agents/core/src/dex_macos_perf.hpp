@@ -1,16 +1,27 @@
 #pragma once
 
 /**
- * dex_macos_perf.hpp — pure math + macOS perf readers for the DEX perf primitives
- * (Guardian DEX perf.* breach trio, TAR device/app perf — consumed starting C2/C4).
+ * dex_macos_perf.hpp — pure math + macOS perf readers for the DEX perf primitives:
+ * the "machine-health tier" per docs/dex-signal-catalog.md (Guardian DEX perf.* breach
+ * trio, TAR device/app perf — consumed starting C2/C4).
  *
  * The macOS analogue of dex_linux_proc.hpp: every derivation (busy%, await-ms,
  * pressure%, used-bytes) is PURE — no syscalls, no platform guards — so it is
- * unit-tested on every host exactly like the Linux /proc arithmetic. Only the
- * six `read_*` functions touch the kernel (host_statistics/host_statistics64,
- * IOKit's IOBlockStorageDriver "Statistics" dictionaries, sysctlbyname) and are
- * `#if defined(__APPLE__)`, with an all-invalid stub on every other platform —
- * the net_quality_sampler.cpp / dex_linux_proc.cpp shape.
+ * unit-tested on every host exactly like the Linux /proc arithmetic. Only the FOUR
+ * `read_*` functions (read_cpu_ticks, read_vm_snapshot, read_disk_totals,
+ * read_memorystatus_level) touch the kernel (host_statistics/host_statistics64, IOKit's
+ * IOBlockStorageDriver "Statistics" dictionaries, sysctlbyname) and are
+ * `#if defined(__APPLE__)`, with an all-invalid stub on every other platform — the
+ * net_quality_sampler.cpp / dex_linux_proc.cpp shape. (The IOKit walk itself,
+ * `sum_block_storage_stats`/`read_driver_stats`, is file-private to dex_macos_perf.cpp —
+ * `read_disk_totals` is its only production caller.)
+ *
+ * THREADING CONTRACT: every `read_*` function does blocking OS work (a syscall, an
+ * IOKit/CoreFoundation registry walk) and must be called from a POLL thread — never
+ * inlined on the heartbeat thread (starves the heartbeat interval) or from inside a
+ * Spark mechanism's `watch()`/`unwatch()` (spark_mechanism.hpp's contract: bound OS work
+ * only, never call emit()/fault() synchronously — a blocking read there self-deadlocks,
+ * #4181).
  *
  * Nothing in this file is wired into any collector yet (C0 goal: primitives
  * only). C2 (TAR device perf) and C4 (Guardian perf.* breach trio) are the
@@ -46,14 +57,24 @@ YUZU_EXPORT std::uint64_t mach_abs_to_100ns(std::uint64_t t, std::uint32_t numer
                                             std::uint32_t denom) noexcept;
 
 /// PURE: busy% over the interval between two CpuTicks readings. nullopt when either
-/// reading is invalid, any individual field regressed (reboot/reset — each field is an
-/// independently monotonic counter here, unlike /proc/stat's single derived total), or
-/// no time elapsed. Clamped to [0,100]. Mirrors yuzu::agent::lnx::cpu_busy_pct.
+/// reading is invalid, any individual field regressed, or no time elapsed. Clamped to
+/// [0,100]. Mirrors yuzu::agent::lnx::cpu_busy_pct, but each field is checked for
+/// regression independently here — unlike yuzu::agent::lnx::CpuJiffies's single derived
+/// total. A regression is ordinarily reboot/reset, but host_cpu_load_info's cpu_ticks
+/// are 32-bit `natural_t`, so a field can also wrap on its own after ~497 days of
+/// continuous per-mode accumulation at a 100Hz tick rate — re-baselining on that wrap is
+/// the correct, safe behaviour, not a bug in this check.
 YUZU_EXPORT std::optional<double> cpu_busy_pct(const CpuTicks& prev, const CpuTicks& cur);
 
 /// Aggregate IOBlockStorageDriver "Statistics" counters, summed over every driver
 /// instance in the IOKit registry — the macOS analogue of yuzu::agent::lnx::DiskIoTotals.
-/// Time fields are nanoseconds (kIOBlockStorageDriverStatisticsTotal{Read,Write}TimeKey).
+/// Time fields are nanoseconds from kIOBlockStorageDriverStatisticsTotal{Read,Write}
+/// TimeKey ("Total Time (Read/Write)") — the driver's SERVICE time (svctm: time actually
+/// spent executing the I/O), deliberately NOT
+/// kIOBlockStorageDriverStatisticsLatent{Read,Write}TimeKey ("Latency Time"), which is
+/// queue/wait time and is never read here — disk_await_ms() below is therefore an await
+/// figure built from a service-time source, matching the iostat svctm shape, not the
+/// fuller await = svctm + queue-wait iostat normally reports.
 struct DiskTotals {
     bool valid{false};
     std::uint64_t read_bytes{0};
@@ -74,6 +95,14 @@ YUZU_EXPORT std::optional<double> disk_await_ms(const DiskTotals& prev, const Di
 /// pressure, 100 = plenty of headroom — the scale memory_pressure(1) itself reads).
 /// Pressure is the complement, clamped [0,100] so an out-of-range level (a future
 /// kernel revision, or a bad read) never produces a nonsensical negative/>100 value.
+///
+/// BASIS, not just polarity: this is an AVAILABILITY-basis pressure reading (derived
+/// from free/reclaimable memory headroom), the inverse shape of the existing
+/// `memory_pressure_observation` wording ("commit charge avg X% of limit" — a
+/// COMMIT-basis reading, Windows/Linux). The two are not interchangeable inputs to the
+/// same formula — C4 (Guardian perf.* breach trio) adds a `MemoryBasis` parameter to
+/// `memory_pressure_observation` specifically so macOS's availability-basis number
+/// renders with availability wording, never silently relabelled as a commit-basis one.
 YUZU_EXPORT double memory_pressure_pct(int level) noexcept;
 
 /// One host_statistics64(HOST_VM_INFO64) + hw.memsize snapshot, already reduced to
