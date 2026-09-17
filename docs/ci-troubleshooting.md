@@ -130,6 +130,11 @@ error names the cause:
 - Use a fresh `gh workflow run` dispatch to retry, not GitHub's "Re-run failed
   jobs" button — whether that button re-runs an `if: always()` downstream job
   when only that job (not its `needs`) failed is not documented behavior.
+- A near-500-entry scope costs up to ~506 `gh api` calls to drain (5 list
+  passes + up to 500 deletes + 1 final recount) against the repo-shared
+  `GITHUB_TOKEN` REST budget (1,000/hour). Retrying a large purge repeatedly
+  in a short window is a real, if narrow, way to eat into that hour's headroom
+  alongside ordinary PR CI — space out retries rather than looping immediately.
 
 ---
 
