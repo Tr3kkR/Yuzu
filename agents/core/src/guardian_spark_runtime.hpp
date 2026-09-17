@@ -1756,10 +1756,22 @@ private:
     /// overwritten still names a LIVE, unresolved claim on a DIFFERENT key (an
     /// ordinary flip-flop redeploy can wedge the same rule_id on two keys at
     /// once), an unguarded overwrite orphans that live claim with no way for a
-    /// future withdrawal to ever find it again. The Reobserved-restore branch's
-    /// own insert_or_assign() call now guards against exactly this by
-    /// deactivating any different, still-live claim it is about to displace
-    /// before overwriting its entry - see that call site's own comment.
+    /// future withdrawal to ever find it again. Both of this map's writers now
+    /// guard against exactly this, in OPPOSITE directions, because the claim
+    /// each one is about to insert carries opposite provenance:
+    /// attach_core()'s Reobserved-restore branch inserts `pre_head`, a claim
+    /// just re-observed for the (rule_id, spec) the caller currently wants -
+    /// definitionally the desired claim - so it deactivates whatever DIFFERENT,
+    /// still-live claim it is about to DISPLACE, then overwrites the entry
+    /// unconditionally; abandon_claim_locked()'s wedge branch inserts `claim`, a
+    /// claim that just TIMED OUT and carries no such signal, so instead it
+    /// checks whether the map already names a different, still-live claim (that
+    /// occupant can only have arrived via a LATER attach_core() call, so it is
+    /// provably the fresher generation) and, if so, deactivates the INCOMING
+    /// `claim` and leaves the map's existing entry untouched rather than
+    /// overwriting it. See each call site's own comment for the full
+    /// interleaving and the fallible-first ordering that makes each guard
+    /// retry-safe under an insert-time throw.
     /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
     /// claim alive after claims_ itself has already dropped it (a defensive
     /// belt-and-braces should erasure at (a)/(b)/(c) above ever be missed on

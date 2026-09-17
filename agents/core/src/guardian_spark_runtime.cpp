@@ -321,8 +321,62 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         // discipline (see on_arm_complete's own pre-sizing comment) rather than
         // committing a partial, unrecoverable transition.
         if (!stopping) {
-            wedge_locator_fault_here_for_test(); // seam: "the locator insertion throws"
-            wedged_by_rule_.insert_or_assign(claim->rule_id, claim); // may throw - claim untouched if so
+            // rung 9c PR-5d /governance cross-examination (Gate 2/3, this run: raised by
+            // docs-writer, independently confirmed by security-guardian/cpp-expert/
+            // cpp-safety/architect - the 4th occurrence of the same fail-open class on
+            // this branch, after adversarial-review Blocker 2, governance sec-h1/cs-1,
+            // and the external-review fix at attach_core's Reobserved-restore branch
+            // (1cd9a0772, immediately above at Gate 7/8's own review round). Reachable
+            // interleaving: wedge rule_id on key A; redeploy to key B (detach_rule_locked
+            // deactivates claim A's rg->active AND erases wedged_by_rule_["rule_id"] -
+            // see that function's own wedge lookup); redeploy BACK to key A before B ever
+            // times out (attach_core's Reobserved-restore branch finds the map entry
+            // gone, so its own cross-key guard has nothing to deactivate, and reinstates
+            // claim A: wedged_by_rule_["rule_id"] = claim A, claim A's rg->active = true
+            // again); THEN key B's own arm() call finally times out and reaches HERE,
+            // where the unguarded insert_or_assign would silently overwrite the map with
+            // claim B - orphaning claim A exactly like the Reobserved-restore site's own
+            // bug, just approached from the opposite direction (the SECOND wedge to
+            // settle, not the SECOND redeploy to land, is what clobbers the first).
+            //
+            // The fix direction here is the MIRROR IMAGE of the Reobserved-restore
+            // guard's, not a copy of it - because the claim reaching each site carries
+            // opposite provenance. There, `pre_head` is the claim just re-observed by a
+            // fresh attach for the SAME (rule_id, spec) the caller currently wants -
+            // attach_core() is never called for a rule nobody wants, so `pre_head` is
+            // definitionally the desired claim and any different occupant it displaces
+            // must be the stale one. Here, `claim` just TIMED OUT - a timeout carries no
+            // signal about whether the rule is still desired, so `claim` cannot be
+            // assumed to be the one worth keeping. But the map's CURRENT occupant, if it
+            // names a different, still-live claim at this exact moment, can only have
+            // gotten there via an attach_core() call that ran strictly AFTER `claim` was
+            // created (the map's only other writer) - so that occupant is provably the
+            // FRESHER generation, and `claim` is the superseded one. The fix therefore
+            // deactivates `claim` itself, in place, and leaves the map's existing entry
+            // completely untouched - the opposite of the Reobserved-restore guard, which
+            // deactivates the DISPLACED occupant and then overwrites the map with the
+            // incoming claim.
+            //
+            // Noexcept probe first (map find + weak_ptr::lock() + a pointer comparison,
+            // no allocation) - correct to run unconditionally before the branch below
+            // decides which of the two fallible/irreversible paths to take, matching
+            // this function's existing fallible-first, decide-before-mutate discipline.
+            bool superseded = false;
+            if (const auto wit = wedged_by_rule_.find(claim->rule_id); wit != wedged_by_rule_.end()) {
+                if (const auto current = wit->second.lock(); current && current != claim)
+                    superseded = true;
+            }
+            if (superseded) {
+                // A fresher generation already occupies rule_id's slot - `claim` lost the
+                // race. Deactivate it directly (noexcept) and leave wedged_by_rule_
+                // pointing at the fresher claim exactly as it already did; there is
+                // nothing to insert or roll back here, so no fault seam applies.
+                if (claim->rg)
+                    claim->rg->active = false;
+            } else {
+                wedge_locator_fault_here_for_test(); // seam: "the locator insertion throws"
+                wedged_by_rule_.insert_or_assign(claim->rule_id, claim); // may throw - claim untouched if so
+            }
         }
         release_claim_index_locked(*claim);
         claim->waiter_abandoned = true; // the completion callback finishes this episode
