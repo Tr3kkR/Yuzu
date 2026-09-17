@@ -17,6 +17,7 @@
 
 #include "workflow_engine.hpp"
 
+#include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth (#2437-class depth guard)
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
@@ -75,6 +76,15 @@ StepDispatchFn ok_dispatch_fn() {
               const std::string&) -> std::expected<std::string, std::string> {
         return std::string(R"({"status":"ok"})");
     };
+}
+
+/// Builds a JSON array nested `n` levels deep: `nest(3)` == "[[[]]]". Used only to trip the
+/// #2437-class depth guard (kMcpMaxJsonDepth == 32) at a SAFE test depth -- well above the guard
+/// but nowhere near the ~100,000+ levels that actually SIGSEGVs a process. Never construct or
+/// parse anything near the real attack depth in a test.
+std::string nest(int n) {
+    return std::string(static_cast<std::size_t>(n), '[') +
+           std::string(static_cast<std::size_t>(n), ']');
 }
 
 } // namespace
@@ -485,6 +495,173 @@ TEST_CASE("WorkflowEngine: execute expands a foreach step and aggregates per-ite
     REQUIRE(exec->has_value());
     CHECK((*exec)->status == "completed");
     REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[1].status == "success");
+}
+
+// ── #2437-class depth guard ──────────────────────────────────────────────────
+// StepDispatchFn's documented contract (workflow_engine.hpp) is "returns a JSON
+// result string" with no depth bound. WorkflowEngine::execute's dispatch loop
+// parses that return value and later dumps it (directly, via expand_foreach's
+// array-iteration branch, via its "treat whole result as single item"
+// fallback, and via the step condition evaluator) -- all unboundedly
+// recursive. These pin: a depth-poisoned dispatch result fails the step (and,
+// under the default on_failure=abort, the whole run) via the SAME mechanism
+// an ordinary dispatch failure already uses, and never lets a later step
+// iterate or dispatch over the unparsed poison.
+
+TEST_CASE("WorkflowEngine: a foreach step's shallow array-iteration result still dispatches "
+          "normally (depth-guard positive control)",
+          "[workflow_engine][pg][execute][depth-guard]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: depth-ok-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "    - instruction: inst-2\n"
+                             "      foreach: items\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    bool inst2_dispatched = false;
+    StepDispatchFn dispatch = [&inst2_dispatched](
+                                  const std::string& instruction_id, const std::string&,
+                                  const std::string&) -> std::expected<std::string, std::string> {
+        if (instruction_id == "inst-1")
+            return std::string(R"({"items":["a","b"]})");
+        inst2_dispatched = true;
+        return std::string(R"({"status":"ok"})");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, dispatch);
+    REQUIRE(exec_result.has_value());
+    CHECK(inst2_dispatched);
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "completed");
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[0].status == "success");
+    CHECK((*exec)->step_results[1].status == "success");
+}
+
+TEST_CASE("WorkflowEngine: a foreach step's poisoned array-iteration result fails the step and "
+          "blocks further dispatch",
+          "[workflow_engine][pg][execute][depth-guard]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: depth-array-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "    - instruction: inst-2\n"
+                             "      foreach: items\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    // "items" is itself a deeply nested array (35 levels including the object) -- well past
+    // kMcpMaxJsonDepth (32), nowhere near the ~100,000+ levels that actually crashes a process.
+    const std::string poisoned = R"({"items":)" + nest(33) + "}";
+
+    bool inst2_dispatched = false;
+    StepDispatchFn dispatch = [&inst2_dispatched, &poisoned](
+                                  const std::string& instruction_id, const std::string&,
+                                  const std::string&) -> std::expected<std::string, std::string> {
+        if (instruction_id == "inst-1")
+            return poisoned;
+        inst2_dispatched = true;
+        return std::string(R"({"status":"ok"})");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, dispatch);
+    REQUIRE(exec_result.has_value()); // execute() itself never crashes and still returns an id
+
+    // The C5 analog: the poisoned step's output never drove a further dispatch.
+    CHECK_FALSE(inst2_dispatched);
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "failed"); // whole run failed, not silently completed
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[0].status == "failed"); // step itself failed, not silently skipped
+    CHECK((*exec)->step_results[1].status == "skipped"); // never reached, never dispatched
+}
+
+TEST_CASE("WorkflowEngine: a foreach fallback's poisoned whole-result item fails the step and "
+          "blocks further dispatch (D2)",
+          "[workflow_engine][pg][execute][depth-guard]") {
+    WORKFLOW_ENGINE(engine);
+    // Step 2's foreach field ("items") is absent from step 1's result, so expand_foreach's
+    // "treat whole result as single item" fallback is the branch exercised here, not the
+    // array-iteration branch above.
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: depth-fallback-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "    - instruction: inst-2\n"
+                             "      foreach: items\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    // No "items" field, and the top level is an object (not an array either) -- forces the
+    // fallback. 35 levels total (1 for the object + 34 nested arrays), well past the 32 guard.
+    const std::string poisoned = R"({"x":)" + nest(34) + "}";
+
+    bool inst2_dispatched = false;
+    StepDispatchFn dispatch = [&inst2_dispatched, &poisoned](
+                                  const std::string& instruction_id, const std::string&,
+                                  const std::string&) -> std::expected<std::string, std::string> {
+        if (instruction_id == "inst-1")
+            return poisoned;
+        inst2_dispatched = true;
+        return std::string(R"({"status":"ok"})");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, dispatch);
+    REQUIRE(exec_result.has_value());
+
+    CHECK_FALSE(inst2_dispatched);
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "failed");
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[0].status == "failed");
+    CHECK((*exec)->step_results[1].status == "skipped");
+}
+
+TEST_CASE("WorkflowEngine: on_failure=continue forwards a safe placeholder, never the poisoned "
+          "result, to a dependent step",
+          "[workflow_engine][pg][execute][depth-guard]") {
+    WORKFLOW_ENGINE(engine);
+    const std::string yaml = "kind: Workflow\nmetadata:\n  name: depth-continue-wf\nspec:\n  steps:\n"
+                             "    - instruction: inst-1\n"
+                             "      onFailure: continue\n"
+                             "    - instruction: inst-2\n"
+                             "      foreach: items\n";
+    auto wf_id = *engine.create_workflow(yaml);
+
+    const std::string poisoned = R"({"items":)" + nest(33) + "}";
+
+    std::vector<std::string> inst2_params_seen;
+    StepDispatchFn dispatch = [&inst2_params_seen, &poisoned](
+                                  const std::string& instruction_id, const std::string&,
+                                  const std::string& params) -> std::expected<std::string, std::string> {
+        if (instruction_id == "inst-1")
+            return poisoned;
+        inst2_params_seen.push_back(params);
+        return std::string(R"({"status":"ok"})");
+    };
+
+    auto exec_result = engine.execute(wf_id, {"agent-1"}, dispatch);
+    REQUIRE(exec_result.has_value());
+
+    // on_failure=continue lets step 2 run -- but on the SAFE placeholder foreach's fallback
+    // pushed through, never the poisoned 33-level structure step 1 actually returned.
+    REQUIRE(inst2_params_seen.size() == 1);
+    CHECK(inst2_params_seen[0] ==
+          R"({"error":"dispatch result exceeded maximum JSON nesting depth"})");
+    CHECK_FALSE(yuzu::server::mcp::json_exceeds_depth(inst2_params_seen[0],
+                                                       yuzu::server::mcp::kMcpMaxJsonDepth));
+
+    auto exec = engine.get_execution(*exec_result);
+    REQUIRE(exec.has_value());
+    REQUIRE(exec->has_value());
+    CHECK((*exec)->status == "completed"); // continue policy: step 1 failed, run still completes
+    REQUIRE((*exec)->step_results.size() == 2);
+    CHECK((*exec)->step_results[0].status == "failed");
     CHECK((*exec)->step_results[1].status == "success");
 }
 

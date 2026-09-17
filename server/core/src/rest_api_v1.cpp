@@ -16,6 +16,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -815,7 +816,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
     },
     "/devices/{id}": {
-      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Adds a tags array (key/value/source) when a TagStore is wired; omitted entirely when it is not. Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags?}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
+      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
     },
     "/hardware": {
       "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status/dir token is a 400. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. Audited on success as inventory.devices; a persist failure on the audit fails the request closed (503).", "responses": {"200": {"description": "{data: {rows[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, dir, os, or status token"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster/audit unwired) or audit subsystem degraded"}}}
@@ -1789,7 +1790,7 @@ void RestApiV1::register_routes(
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1806,7 +1807,7 @@ void RestApiV1::register_routes(
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn), std::move(verify_api));
+                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api));
 }
 
 void RestApiV1::register_routes(
@@ -1831,7 +1832,7 @@ void RestApiV1::register_routes(
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2126,6 +2127,17 @@ void RestApiV1::register_routes(
                   if (!bundle_orch) {
                       res.status = 503;
                       res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                      return;
+                  }
+                  // #2437-class guard: raw-text depth check before parse, same
+                  // ordering as the result-set creation routes above - a
+                  // parsed-then-dumped "steps" subtree still crashes on the
+                  // dump below (validate_bundle_steps(body["steps"].dump())),
+                  // so the check has to run on the raw text before any parse.
+                  if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                                      "application/json");
                       return;
                   }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -7562,7 +7574,7 @@ void RestApiV1::register_routes(
     // contract (#4033 acceptance criteria, explicit). require_fleet_read
     // already audits every DENIAL path internally (`auth.fleet_read_required`).
     sink.Get("/api/v1/devices",
-             [fleet_read_fn, agents_fn](const httplib::Request& req, httplib::Response& res) {
+             [fleet_read_fn, device_api](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (!fleet_read_fn) {
@@ -7577,21 +7589,21 @@ void RestApiV1::register_routes(
                  auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
                  if (!gate.admitted)
                      return; // gate already wrote the A4 error body + status.
-                 if (!agents_fn) {
+                 if (!device_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 const auto agents = agents_fn();
+                 const auto devices = device_api->list_devices();
                  JArr arr;
                  std::size_t dropped = 0;
-                 for (const auto& a : agents) {
-                     if (!authz::in_scope(gate.scope, a.value("agent_id", ""))) {
+                 for (const auto& d : devices) {
+                     if (!authz::in_scope(gate.scope, d.agent_id)) {
                          ++dropped;
                          continue;
                      }
-                     arr.add_raw(device_agent_row_json(a).dump());
+                     arr.add_raw(device_agent_row_json(d).dump());
                  }
                  JObj data;
                  data.raw("devices", arr.str());
@@ -7610,13 +7622,18 @@ void RestApiV1::register_routes(
     // same BLOCKING defect its doc comment warns against), and an
     // out-of-scope agent_id collapses to the SAME "not found" response as a
     // genuinely nonexistent one — the existence-oracle closure this pattern
-    // exists for. The scan does NOT early-break on an out-of-scope match
-    // (scan-length symmetry — the #3564/Gate-8 timing-side-channel lesson):
-    // both !found sub-cases are indistinguishable in every caller-visible
-    // channel (response body AND scan length); the distinction is recorded
-    // ONLY server-side (spdlog), never audited with a caller-queryable
-    // detail string (get_agent_details' own #3564 fix note explains why a
-    // per-id audit detail string cannot safely carry it).
+    // exists for.
+    //
+    // ADR-0031 WS-A4 wave 2: `in_scope` (a pure fn of the REQUESTED id + caller
+    // scope, reading NO fleet data) is checked FIRST and an out-of-scope id is
+    // denied with 404 BEFORE any backing read — so the out-of-scope path does
+    // ZERO registry/tag-store work and cannot leak "an agent with this id
+    // exists" by timing OR by a 503 during a tag-store outage. Only in-scope ids
+    // reach `device_api->lookup_device(id)`, an O(1) point lookup (device_api.hpp
+    // #3564 note); its miss returns the identical 404, its degrade a 503. This
+    // replaces the old scan-length-symmetry AND closes the tag-read timing gap a
+    // lookup-then-scope ordering would leave (governance #3564, security-guardian
+    // + architect).
     //
     // NOT audited (neither success nor not-found): matches list's posture
     // above and the fragments' (`/fragments/device/page`,
@@ -7628,8 +7645,7 @@ void RestApiV1::register_routes(
     // emit_behavioral_audit, and take the fragments' unaudited posture as
     // the standard to match rather than MCP's.
     sink.Get(R"(/api/v1/devices/([^/]+))",
-             [fleet_read_fn, agents_fn, tag_store](const httplib::Request& req,
-                                                   httplib::Response& res) {
+             [fleet_read_fn, device_api](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (!fleet_read_fn) {
@@ -7645,50 +7661,41 @@ void RestApiV1::register_routes(
                  if (!gate.admitted)
                      return;
                  const std::string agent_id = req.matches[1].str();
-                 if (!agents_fn) {
+                 if (!device_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 const auto agents = agents_fn();
-                 bool found = false;
-                 bool exists_out_of_scope = false;
-                 nlohmann::json match;
-                 for (const auto& a : agents) {
-                     if (a.value("agent_id", "") != agent_id)
-                         continue;
-                     if (authz::in_scope(gate.scope, agent_id)) {
-                         match = a;
-                         found = true;
-                         break; // only the in-scope match short-circuits the scan.
-                     }
-                     // Keep scanning — see the route's header comment on why an
-                     // out-of-scope match must not break here.
-                     exists_out_of_scope = true;
-                 }
-                 if (!found) {
-                     spdlog::debug("devices.detail: {} for {} (caller-visible response unchanged)",
-                                   exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                 // #3564: deny an out-of-scope id BEFORE any backing read. `in_scope`
+                 // is a pure function of (id, caller scope) and touches no fleet data,
+                 // so an out-of-scope caller performs ZERO registry/tag-store work —
+                 // the not-found response is identical to a genuine miss in body, status
+                 // AND cost, and a degraded tag store cannot distinguish an out-of-scope
+                 // id (it is never read). Only in-scope ids reach lookup_device below.
+                 if (!authz::in_scope(gate.scope, agent_id)) {
+                     spdlog::debug("devices.detail: out-of-scope {} -> 404 before lookup; cid={}",
+                                   agent_id, cid);
                      res.status = 404;
                      res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
                                      "application/json");
                      return;
                  }
-                 std::optional<std::vector<DeviceTag>> tags;
-                 if (tag_store) {
-                     auto t = tag_store->get_all_tags(agent_id);
-                     if (!t) {
-                         res.status = 503;
-                         res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
-                                         "application/json");
-                         return;
-                     }
-                     tags = std::move(*t);
+                 auto result = device_api->lookup_device(agent_id);
+                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
+                                     "application/json");
+                     return;
                  }
-                 res.set_content(
-                     ok_json(device_agent_detail_json(match, tags ? &*tags : nullptr).dump()),
-                     "application/json");
+                 if (!*result) { // genuine miss
+                     res.status = 404;
+                     res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
+                                     "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(device_agent_detail_json(**result).dump()),
+                                 "application/json");
              });
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────
@@ -9145,6 +9152,14 @@ void RestApiV1::register_routes(
             auto session = auth_fn(req, res);
             if (!session)
                 return;
+            // #2437-class guard: check nesting on the RAW body BEFORE parse.
+            // A parsed-then-dumped subtree still crashes on the dump - the
+            // check has to run before any allocation, on the text itself
+            // (mirrors mcp_jsonrpc.hpp's own parse_request ordering).
+            if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                return;
+            }
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded() || !body.is_object()) {
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9242,6 +9257,16 @@ void RestApiV1::register_routes(
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      // Found during this fix, not named in the original triage:
+                      // this handler also does `cr.source_payload = body.dump()`
+                      // a few lines below on caller-supplied JSON, same crash
+                      // shape as the three named creation routes.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9458,6 +9483,12 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9522,6 +9553,12 @@ void RestApiV1::register_routes(
                           return;
                       if (!instruction_store || !instruction_store->is_open()) {
                           rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9595,6 +9632,17 @@ void RestApiV1::register_routes(
                       auto orig = load_owned(req, id, session->username, res);
                       if (!orig)
                           return;
+                      // #2437-class guard, read side: the row is a SHARED table,
+                      // and a source_payload written before this guard existed
+                      // (or by any other path, past or future) could be poisoned.
+                      // Check the STORED text before parse, same as the write-time
+                      // guards above; on rejection, never reach run_async (no
+                      // re-dispatch of a row we can't safely re-serialise).
+                      if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                          return;
+                      }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
                       // Synthesise the parent so the sibling shares the
                       // original's parent (re-eval re-asks the same question
@@ -10809,6 +10857,20 @@ void RestApiV1::register_routes(
                             "application/json");
             return;
         }
+        // #2437-class guard: check nesting on the RAW body BEFORE parse. A
+        // parsed-then-dumped spark/assertion/remediation subtree still
+        // crashes on derive_rule_spec's spec.dump() below - the check has to
+        // run before any allocation, on the text itself (mirrors
+        // mcp_jsonrpc.hpp's own parse_request ordering and the result-set
+        // creation routes above).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "request body nests too deeply", cid,
+                                                  "flatten the request body; spark/assertion/"
+                                                  "remediation blocks may nest at most 32 levels deep"),
+                            "application/json");
+            return;
+        }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
@@ -11102,6 +11164,23 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const GuaranteedStateRuleRow& existing_rule = **existing;
+                 // #2437-class guard: check nesting on the RAW body BEFORE
+                 // parse, same ordering and rationale as the create handler
+                 // above - a metadata-only PUT never reaches derive_rule_spec
+                 // (it re-validates the EXISTING stored spec instead), but any
+                 // body actually supplying spark/assertion/remediation still
+                 // reaches derive_rule_spec's spec.dump() below.
+                 if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "request body nests too deeply", cid,
+                                               "flatten the request body; spark/assertion/"
+                                               "remediation blocks may nest at most 32 levels deep"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "request body nests too deeply");
+                     return;
+                 }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
