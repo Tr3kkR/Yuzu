@@ -4,6 +4,9 @@ This Claude instance is the designated **macOS/Darwin compatibility guardian** f
 
 CLAUDE.md keeps a one-line pointer; this document holds the workflow and the standing pitfalls table.
 
+For the signed ES agent development lane and installed-service acceptance, start
+with [macOS development foundation](macos-development-foundation.md).
+
 ## Standing workflow
 
 When Windows-originated changes land on `origin/dev`, the standing reconciliation workflow is:

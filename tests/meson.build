@@ -2170,6 +2170,12 @@ test('macOS Endpoint Security app packaging',
   suite: 'agent',
   timeout: 30,
 )
+test('macOS development foundation checks',
+  _python3_test,
+  args: [files('test_macos_foundation.py')],
+  suite: 'agent',
+  timeout: 30,
+)
 test('proto gen_proto version check',
   _python3_test,
   args: [files('test_gen_proto_version.py')],

@@ -2,6 +2,25 @@
 
 This guide covers upgrading Yuzu components (server, agent, gateway) between versions.
 
+## macOS Endpoint Security development packages
+
+The opt-in signed-app development lane changes the agent daemon's executable
+location and disables binary OTA replacement to preserve its bundle signature.
+The development `.pkg` is intentionally unsigned; this is not a notarized
+customer-distribution lane. Package upgrades retain agent data and enrollment
+configuration, and stage recovery copies before replacing package-owned code.
+For older loose packages without an ownership manifest, the installer derives
+plugin ownership only from the `com.yuzu.agent` Installer receipt. An unreceipted
+plugin collision stops the upgrade before unloading the existing service; do not
+delete third-party plugins to bypass that check.
+Do not manually overwrite the app executable or remove recovery state after a
+failed installation. Loose-binary and app-bundle installations share these
+installer recovery paths, so check the
+[packaging and recovery runbook](../../deploy/packaging/macos/README.md) before
+switching lanes or upgrading. The
+[macOS development foundation](../macos-development-foundation.md) explains host
+authorization, backups, Full Disk Access, and the targeted post-install smoke check.
+
 ## Version Compatibility
 
 | Server Version | Min Agent Version | Min Gateway Version | Notes |

@@ -36,11 +36,22 @@ trap 'rm -rf "$STAGING" "$SCRIPTS" "$COMPONENT_DIR" "$VALIDATION_DIR"' EXIT
 install -m 755 "$SCRIPT_DIR/preinstall" "$SCRIPTS/preinstall"
 install -m 755 "$SCRIPT_DIR/postinstall" "$SCRIPTS/postinstall"
 install -d "${STAGING}/usr/local/lib/yuzu/.plugins.incoming"
-install -m 755 "$SCRIPT_DIR/merge-launchd-plist.py" "$STAGING/usr/local/lib/yuzu/merge-launchd-plist.py"
+: > "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+install -m 644 "$SCRIPT_DIR/merge-launchd-plist.js" "$STAGING/usr/local/lib/yuzu/merge-launchd-plist.js"
 
 PACKAGE_MODE="loose"
 AGENT_BIN=""
 PLUGIN_COUNT=0
+stage_loose_plugin() {
+    local plugin="$1" name destination
+    name="$(basename "$plugin")"
+    destination="${STAGING}/usr/local/lib/yuzu/.plugins.incoming/$name"
+    [[ "$name" != .* && ! -e "$destination" ]] || {
+        echo "ERROR: duplicate or hidden plugin basename: $name" >&2; return 1; }
+    install -m 755 "$plugin" "$destination"
+    printf 'plugins/%s\n' "$name" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
+    PLUGIN_COUNT=$((PLUGIN_COUNT + 1))
+}
 if [[ -n "$BUNDLE_DIR" ]]; then
     PACKAGE_MODE="bundle"
     APP="$BUNDLE_DIR/YuzuAgent.app"
@@ -120,10 +131,13 @@ else
     if [[ -d "$BIN_DIR/plugins" ]]; then
         for plugin in "$BIN_DIR/plugins"/*.dylib; do
             [[ -f "$plugin" ]] || continue
-            install -m 755 "$plugin" "${STAGING}/usr/local/lib/yuzu/.plugins.incoming/"
-            printf 'plugins/%s\n' "$(basename "$plugin")" >> "${STAGING}/usr/local/lib/yuzu/.package-files.incoming"
-            PLUGIN_COUNT=$((PLUGIN_COUNT + 1))
+            stage_loose_plugin "$plugin"
         done
+    fi
+    if [[ "$PLUGIN_COUNT" -eq 0 && -d "$BIN_DIR/agents/plugins" ]]; then
+        while IFS= read -r -d '' plugin; do
+            stage_loose_plugin "$plugin"
+        done < <(find "$BIN_DIR/agents/plugins" -type f -name '*.dylib' -print0)
     fi
     install -d "${STAGING}/Library/LaunchDaemons"
     install -m 644 "$SCRIPT_DIR/com.yuzu.agent.plist" "${STAGING}/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist"

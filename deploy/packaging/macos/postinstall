@@ -102,14 +102,27 @@ preserve_or_create_directory() {
     chown root:wheel "$path"
 }
 
+ensure_data_directory() {
+    # FDA/EDR policy may intentionally own an existing data root. Never chmod,
+    # chown, or replace it; only create the missing launchd working directory.
+    if [[ -e "$DATA_DIR" || -L "$DATA_DIR" ]]; then
+        [[ -d "$DATA_DIR" && ! -L "$DATA_DIR" ]] || {
+            echo "ERROR: data path is not a real directory" >&2; return 1; }
+        return 0
+    fi
+    require_trusted_directory "$(dirname "$DATA_DIR")" || return 1
+    mkdir -m 750 "$DATA_DIR" || return 1
+    chown root:wheel "$DATA_DIR"
+}
+
 legacy_app_is_managed() {
     local candidate="$1"
     [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
     [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" == "${LEGACY_APP_ID#*.}" ]] || return 1
-    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1
+    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1 || return 1
     [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" == "$LEGACY_TEAM_ID" ]] || return 1
     [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" == "$LEGACY_SIGNING_AUTHORITY" ]] || return 1
-    [[ -f "$candidate/Contents/embedded.provisionprofile" ]]
+    [[ -f "$candidate/Contents/embedded.provisionprofile" ]] || return 1
     [[ "$(shasum -a 256 "$candidate/Contents/embedded.provisionprofile" | awk '{print $1}')" == "$LEGACY_PROFILE_SHA256" ]]
 }
 
@@ -241,11 +254,13 @@ trap 'restore_previous' ERR
 ensure_state_dir
 require_trusted_directory "$APP_ROOT"
 require_trusted_directory "$YUZU_LIB"
+ensure_data_directory
 preserve_or_create_directory "$LOG_DIR" 755
 # Preserve existing operational contents and modes only when their directory is
 # safe for a root daemon.  Fresh installs create the documented external paths.
 preserve_or_create_directory "$CONFIG_DIR" 755
 preserve_or_create_directory "$CERT_DIR" 755
+preserve_or_create_directory "$PLUGIN_DIR" 755
 
 [[ -f "$INCOMING_MODE_FILE" && -f "$INCOMING_PLIST" ]] || {
     echo "ERROR: package payload is missing incoming mode or LaunchDaemon plist" >&2; exit 1; }
@@ -309,7 +324,7 @@ mv "$INCOMING_MODE_FILE" "$MODE_FILE"
 if [[ -f "$recovery/LaunchDaemons/com.yuzu.agent.plist" ]]; then
     merge_args=(--previous "$recovery/LaunchDaemons/com.yuzu.agent.plist" --destination "$INCOMING_PLIST")
     [[ "$MODE" != "bundle" ]] || merge_args+=(--force-no-auto-update)
-    /usr/local/lib/yuzu/merge-launchd-plist.py "${merge_args[@]}"
+    /usr/bin/osascript -l JavaScript /usr/local/lib/yuzu/merge-launchd-plist.js "${merge_args[@]}"
 fi
 mv "$INCOMING_PLIST" "$PLIST"
 

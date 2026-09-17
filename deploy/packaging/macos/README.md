@@ -1,5 +1,8 @@
 # macOS agent packages
 
+For the complete developer workflow and opt-in live smoke check, see
+[macOS development foundation](../../../docs/macos-development-foundation.md).
+
 The default package remains the loose-binary lane:
 
 ```sh
@@ -102,11 +105,48 @@ If the bundle contains CMS sidecars, pass the same build-time
 over the bytes it is about to copy, so a stale or final-byte-modified sidecar
 cannot produce a package.
 
+### Bootstrap final-byte CMS signing (two stages)
+
+For a new build whose inputs do not already carry CMS sidecars, first run
+`build-app.py` normally to publish the Apple-signed app and relocated plugins.
+Keep this staging directory private and do not install/package it yet. Sign every
+**output** `plugins/*.dylib` with the existing
+[Plugin Code Signing workflow](../../../docs/user-manual/agent-plugins.md#plugin-code-signing).
+The signer leaf must have the code-signing EKU and chain to the build trust bundle;
+private keys remain operator-managed, outside this repository. For example:
+
+```sh
+MAC_BUNDLE=/private/tmp/yuzu-signed-stage
+for plugin in "$MAC_BUNDLE"/plugins/*.dylib; do
+    openssl cms -sign -binary -signer /private/path/signer.pem \
+      -inkey /private/path/signer.key -certfile /private/path/signer_chain.pem \
+      -in "$plugin" -outform PEM -out "$plugin.sig" || exit 1
+done
+```
+
+Create `plugins/plugin-signing-policy.json` in that same staging directory:
+
+```json
+{"runtime_plugin_trust_bundle":"/etc/yuzu-agent/certs/plugin-trust.pem"}
+```
+
+Provision the public trust bundle at that absolute runtime path through the
+normal operator-managed configuration; the package does not install trust anchors.
+Now run `build-pkg.sh --bundle-dir "$MAC_BUNDLE" --version <version> --output <dist>
+--plugin-trust-bundle <build-trust.pem>` (on one command line). Packaging verifies
+every final sidecar with the staged agent's shared CMS verifier and embeds the
+require-signature policy in the LaunchDaemon. Missing/mixed/stale signatures fail.
+Do **not** rerun `build-app.py`, re-sign, or edit plugin bytes after CMS signing.
+`--final-plugin-sig-dir` is an import path for already-known final-byte sidecars,
+not the bootstrap procedure. Never delete existing enforced input sidecars to
+bypass policy; use a fresh build for the two-stage workflow.
+
 ## Authorized test-rig lifecycle
 
 Do not run these commands on a development workstation without explicit
 authorization for the target rig. They install and start the root LaunchDaemon.
-For an authorized disposable rig, record the package hash first, then perform a
+For an explicitly authorized Mac (including a developer workstation), record the
+package hash and preserve the existing service configuration first, then perform a
 non-interactive install with:
 
 ```sh
@@ -123,6 +163,14 @@ durable `prepared` or `promoting` phase; a later package invocation discards an
 unused prepared snapshot or restores an interrupted promotion before taking a
 new snapshot. The root-owned recovery state rejects symlinked,
 group/world-writable, or out-of-root pointers rather than using them.
+
+Older loose packages did not ship `package-files.list`. Their first upgrade
+derives that manifest only from the system Installer receipt for `com.yuzu.agent`
+and snapshots it with the old plugin bytes. Missing receipts do not authorize
+overwriting same-named plugins: an unrecognized collision stops before unloading
+the running service. The plugin directory must be root-owned, non-symlinked, and
+not group/world writable. A missing data working directory is created; an existing
+one keeps its owner, mode, and contents.
 
 For an authorized silent uninstall, run:
 

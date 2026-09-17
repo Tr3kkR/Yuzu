@@ -9,6 +9,7 @@ import json
 import os
 import plistlib
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -18,7 +19,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "deploy/packaging/macos/build-app.py"
 PLIST_HELPER = ROOT / "deploy/packaging/macos/generate-launchd-plist.py"
-MERGE_PLIST_HELPER = ROOT / "deploy/packaging/macos/merge-launchd-plist.py"
+MERGE_PLIST_HELPER = ROOT / "deploy/packaging/macos/merge-launchd-plist.js"
 BUILD_PKG = ROOT / "deploy/packaging/macos/build-pkg.sh"
 MACOS_TRIPLET = ROOT / "triplets/arm64-osx.cmake"
 spec = importlib.util.spec_from_file_location("macos_bundle", HELPER)
@@ -47,6 +48,44 @@ def profile(**changes: object) -> dict:
 
 
 class ProfileValidationTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX Bash fixture; native Windows does not use these installers")
+    def test_legacy_classifier_rejects_bad_signature_in_conditional(self) -> None:
+        # Run the real function bodies in the conditional context that disables
+        # Bash errexit. Stub only platform commands, never the classifier logic.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_legacy_app_") as temporary:
+            candidate = Path(temporary) / "YuzuAgent.app"
+            contents = candidate / "Contents"
+            contents.mkdir(parents=True)
+            embedded = contents / "embedded.provisionprofile"
+            embedded.touch()
+            for script in ("preinstall", "postinstall", "uninstall.sh"):
+                source = (BUILD_PKG.parent / script).read_text()
+                start = source.index("legacy_app_is_managed() {")
+                end = source.index("\n}", start) + 2
+                function = source[start:end].replace("/usr/libexec/PlistBuddy", "plist_buddy")
+                harness = r'''
+set -euo pipefail
+LEGACY_APP_ID=TEAM.com.example.yuzu
+LEGACY_TEAM_ID=TEAM
+LEGACY_SIGNING_AUTHORITY='Test Authority'
+LEGACY_PROFILE_SHA256=testdigest
+plist_buddy() { echo com.example.yuzu; }
+codesign() {
+    if [[ "$1" == --verify ]]; then return "$VERIFY_STATUS"; fi
+    printf 'TeamIdentifier=TEAM\nAuthority=Test Authority\n'
+}
+shasum() { echo 'testdigest fixture'; }
+'''
+                harness += function + '\nif legacy_app_is_managed "$1"; then echo MANAGED; else echo REJECTED; fi\n'
+                for status, expected in ((0, "MANAGED"), (1, "REJECTED")):
+                    with self.subTest(script=script, signature_status=status):
+                        result = subprocess.run(
+                            ["bash", "-c", harness, "legacy-contract", str(candidate)],
+                            env={**os.environ, "VERIFY_STATUS": str(status)},
+                            capture_output=True, text=True, check=True,
+                        )
+                        self.assertEqual(result.stdout.strip(), expected)
+
     def test_full_xcode_sdk_layout_requires_es_header_and_linker_stub(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_sdk_") as temporary:
             sdk = Path(temporary)
@@ -62,6 +101,105 @@ class ProfileValidationTests(unittest.TestCase):
             with mock.patch.object(bundle, "run", return_value=str(sdk)):
                 with self.assertRaisesRegex(bundle.BundleError, "linker stub"):
                     bundle.require_es_sdk()
+
+    @unittest.skipIf(os.name == "nt", "POSIX packaging fixture")
+    def test_loose_builder_supports_nested_flat_and_empty_plugin_layouts(self) -> None:
+        for layout in ("nested", "flat", "empty", "duplicate"):
+            with self.subTest(layout=layout), tempfile.TemporaryDirectory(prefix="yuzu_test_loose_pkg_") as temporary:
+                root = Path(temporary)
+                binaries = root / "build"
+                (binaries / "agents/core").mkdir(parents=True)
+                (binaries / "agents/core/yuzu-agent").write_bytes(b"agent fixture")
+                if layout != "empty":
+                    plugins = binaries / ("plugins" if layout == "flat" else "agents/plugins/tar")
+                    plugins.mkdir(parents=True)
+                    (plugins / "tar.dylib").write_bytes(b"plugin fixture")
+                if layout == "duplicate":
+                    other = binaries / "agents/plugins/other"
+                    other.mkdir()
+                    (other / "tar.dylib").write_bytes(b"collision")
+                tools = root / "tools"
+                tools.mkdir()
+                captured = root / "manifest"
+                for name, body in {
+                    "lipo": "#!/bin/sh\necho arm64\n",
+                    "pkgbuild": "#!/bin/sh\nset -eu\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/usr/local/lib/yuzu/.package-files.incoming\" \"$CAPTURED_MANIFEST\"\n: > \"$last\"\n",
+                    "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+                }.items():
+                    tool = tools / name
+                    tool.write_text(body)
+                    tool.chmod(0o755)
+                result = subprocess.run(
+                    ["bash", str(BUILD_PKG), "--bin-dir", str(binaries), "--version", "1.0", "--output", str(root / "dist")],
+                    env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}", "CAPTURED_MANIFEST": str(captured)},
+                    text=True, capture_output=True,
+                )
+                if layout == "duplicate":
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("duplicate", result.stderr)
+                    self.assertFalse(captured.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(captured.read_text(), "" if layout == "empty" else "plugins/tar.dylib\n")
+
+    @unittest.skipIf(os.name == "nt", "POSIX receipt fixture")
+    def test_legacy_plugin_ownership_comes_only_from_exact_receipt_paths(self) -> None:
+        source = (BUILD_PKG.parent / "preinstall").read_text()
+        start = source.index("adopt_receipted_plugins() {")
+        function = source[start:source.index("\n}", start) + 2].replace("/usr/sbin/pkgutil", "pkgutil")
+        for receipt, status, expected in (
+            ("usr/local/lib/yuzu/plugins/tar.dylib\nusr/local/lib/other.dylib\n", 0, "plugins/tar.dylib\n"),
+            ("usr/local/lib/yuzu/plugins/sub/evil.dylib\n", 0, None),
+            ("usr/local/lib/yuzu/plugins/../evil.dylib\n", 0, None),
+            ("usr/local/lib/yuzu/plugins/a\tb.dylib\n", 0, None),
+            ("usr/local/lib/yuzu/plugins/.hidden.dylib\n", 0, None),
+            ("usr/local/lib/yuzu/plugins/tar.dylib\n", 1, None),
+        ):
+            with self.subTest(receipt=receipt, status=status), tempfile.TemporaryDirectory(prefix="yuzu_test_receipt_") as temporary:
+                root = Path(temporary)
+                (root / "plugins").mkdir()
+                (root / "plugins/third-party.dylib").write_bytes(b"unmanaged")
+                harness = '''set -eu
+pkgutil() { [[ "$1" == --files && "$2" == com.yuzu.agent ]] || exit 99; printf '%s' "$RECEIPT"; return "$RECEIPT_STATUS"; }
+''' + function + "\nadopt_receipted_plugins\n"
+                result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
+                                        env={**os.environ, "YUZU_LIB": temporary, "RECEIPT": receipt,
+                                             "RECEIPT_STATUS": str(status)})
+                manifest = root / "package-files.list"
+                self.assertEqual(manifest.read_text() if manifest.exists() else None, expected)
+                self.assertEqual(result.returncode == 0, expected is not None or status == 1)
+                self.assertEqual((root / "plugins/third-party.dylib").read_bytes(), b"unmanaged")
+
+    @unittest.skipIf(os.name == "nt", "POSIX permissions fixture")
+    def test_data_directory_created_when_missing_and_preserved_when_present(self) -> None:
+        source = (BUILD_PKG.parent / "postinstall").read_text()
+        start = source.index("ensure_data_directory() {")
+        function = source[start:source.index("\n}", start) + 2]
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_data_dir_") as temporary:
+            data = Path(temporary) / "data"
+            harness = "set -eu\nrequire_trusted_directory() { return 0; }\nchown() { echo CHOWN; }\n" + function + "\nensure_data_directory\n"
+            def invoke():
+                return subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
+                                      env={**os.environ, "DATA_DIR": str(data)})
+            result = invoke()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(data.stat().st_mode & 0o777, 0o750)
+            self.assertEqual(result.stdout.strip(), "CHOWN")
+            data.chmod(0o710)
+            sentinel = data / "keep"
+            sentinel.write_bytes(b"existing data")
+            before = data.stat()
+            result = invoke()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout, "")
+            self.assertEqual(data.stat().st_uid, before.st_uid)
+            self.assertEqual(data.stat().st_mode, before.st_mode)
+            self.assertEqual(sentinel.read_bytes(), b"existing data")
+            link = Path(temporary) / "link"
+            link.symlink_to(data, target_is_directory=True)
+            result = subprocess.run(["bash", "-c", harness], text=True, capture_output=True,
+                                    env={**os.environ, "DATA_DIR": str(link)})
+            self.assertNotEqual(result.returncode, 0)
 
     def test_provisioning_udid_is_not_substituted_with_hardware_uuid(self) -> None:
         hardware_uuid = "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA"
@@ -127,6 +265,121 @@ class ProfileValidationTests(unittest.TestCase):
 
 
 class PackagingStructureTests(unittest.TestCase):
+    @unittest.skipIf(os.name == "nt", "POSIX recovery fixture")
+    def test_interrupted_plugin_promotion_restores_old_generation_and_allows_retry(self) -> None:
+        pre = (BUILD_PKG.parent / "preinstall").read_text()
+        post = (BUILD_PKG.parent / "postinstall").read_text()
+        def function(source, name):
+            start = source.index(name + "() {")
+            return source[start:source.index("\n}", start) + 2]
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_retry_manifest_") as temporary:
+            root = Path(temporary)
+            for folder in ("lib/plugins", "app", "recovery/yuzu/plugins", "bin", "next-incoming"):
+                (root / folder).mkdir(parents=True)
+            (root / "lib/package-files.list").write_text("plugins/old.dylib\n")
+            (root / "lib/.package-files.incoming").write_text("plugins/old.dylib\nplugins/new.dylib\n")
+            (root / "recovery/package-files.list").write_text("plugins/old.dylib\n")
+            (root / "recovery/yuzu/plugins/old.dylib").write_bytes(b"old generation")
+            (root / "lib/plugins/old.dylib").write_bytes(b"replacement")
+            (root / "lib/plugins/new.dylib").write_bytes(b"new before crash")
+            (root / "lib/plugins/third-party.dylib").write_bytes(b"unmanaged")
+            (root / "next-incoming/new.dylib").write_bytes(b"retry")
+            harness = '''set -eu
+launchctl() { :; }
+require_started() { :; }
+ditto() { if [[ -d "$1" ]]; then cp -R "$1/." "$2/"; else cp "$1" "$2"; fi; }
+'''
+            harness += "\n".join(function(pre, name) for name in ("remove_managed_plugins", "recover_interrupted_promotion"))
+            harness += "\n" + "\n".join(function(post, name) for name in ("was_managed_plugin", "reject_unmanaged_plugin_collisions"))
+            harness = harness.replace("/usr/local/bin", str(root / "bin")).replace("/usr/local/lib", str(root / "lib"))
+            harness += '''
+ROOT="$1"
+YUZU_LIB="$ROOT/lib"
+APP_ROOT="$ROOT/app"
+PLIST="$ROOT/absent.plist"
+LEGACY_APP="$ROOT/absent-legacy.app"
+MANIFEST="$YUZU_LIB/package-files.list"
+PLUGIN_DIR="$YUZU_LIB/plugins"
+INCOMING_PLUGIN_DIR="$ROOT/next-incoming"
+recover_interrupted_promotion "$ROOT/recovery"
+reject_unmanaged_plugin_collisions
+'''
+            result = subprocess.run(["bash", "-c", harness, "recovery-fixture", temporary],
+                                    text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((root / "lib/plugins/new.dylib").exists())
+            self.assertEqual((root / "lib/plugins/old.dylib").read_bytes(), b"old generation")
+            self.assertEqual((root / "lib/plugins/third-party.dylib").read_bytes(), b"unmanaged")
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
+    def test_two_stage_final_output_cms_policy_is_verified_before_publication(self) -> None:
+        # Orchestration fixture, not a cryptographic claim: the verifier double
+        # checks exact final bytes and argv. Real CMS verification is covered by
+        # the agent CMS suite; never bypass it in the builder.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_final_cms_") as temporary:
+            root = Path(temporary)
+            app = root / "bundle/YuzuAgent.app/Contents/MacOS"
+            app.mkdir(parents=True)
+            verifier = app / "yuzu-agent"
+            verifier.write_text('#!/bin/sh\nset -eu\n[ "$1" = --verify-plugin-signature ]\n[ "$3" = --plugin-trust-bundle ]\ncmp "$2" "$2.sig"\n')
+            verifier.chmod(0o755)
+            (app.parent / "Info.plist").write_bytes(plistlib.dumps({"CFBundleShortVersionString": "1.0"}))
+            plugins = root / "bundle/plugins"
+            plugins.mkdir()
+            plugin = plugins / "tar.dylib"
+            plugin.write_bytes(b"final Apple-signed byte fixture")
+            (plugins / "tar.dylib.sig").write_bytes(plugin.read_bytes())
+            (plugins / "plugin-signing-policy.json").write_text(json.dumps(
+                {"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/plugins.pem"}))
+            trust = root / "trust.pem"
+            trust.write_text("fixture trust")
+            tools = root / "tools"
+            tools.mkdir()
+            captured = root / "captured.plist"
+            for name, body in {
+                "codesign": "#!/bin/sh\nexit 0\n",
+                "lipo": "#!/bin/sh\necho arm64\n",
+                "pkgbuild": "#!/bin/sh\nset -eu\nroot=; last=\nwhile [ \"$#\" -gt 0 ]; do case \"$1\" in --root) root=\"$2\"; shift 2 ;; *) last=\"$1\"; shift ;; esac; done\ncp \"$root/Library/LaunchDaemons/.com.yuzu.agent.incoming.plist\" \"$CAPTURED_PLIST\"\n: > \"$last\"\n",
+                "productbuild": "#!/bin/sh\nfor last; do :; done\n: > \"$last\"\n",
+            }.items():
+                tool = tools / name
+                tool.write_text(body)
+                tool.chmod(0o755)
+            for tampered in (False, True):
+                if tampered:
+                    plugin.write_bytes(b"changed after CMS signing")
+                output = root / ("tampered" if tampered else "valid")
+                result = subprocess.run(["bash", str(BUILD_PKG), "--bundle-dir", str(root / "bundle"),
+                                         "--version", "1.0", "--output", str(output),
+                                         "--plugin-trust-bundle", str(trust)], text=True, capture_output=True,
+                                        env={**os.environ, "PATH": f"{tools}:{os.environ['PATH']}",
+                                             "CAPTURED_PLIST": str(captured)})
+                if tampered:
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = plistlib.loads(captured.read_bytes())["ProgramArguments"]
+                    self.assertIn("--plugin-require-signature", args)
+                    self.assertEqual(args[args.index("--plugin-trust-bundle") + 1],
+                                     "/etc/yuzu-agent/certs/plugins.pem")
+
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS plist integration")
+    def test_native_plist_merge_fails_without_replacing_destination(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_plist_native_") as temporary:
+            root = Path(temporary)
+            previous, destination = root / "previous.plist", root / "new.plist"
+            sentinel = plistlib.dumps({"ProgramArguments": ["/new/agent"]})
+            for prior in ({"ProgramArguments": []}, {"ProgramArguments": [42]},
+                          {"ProgramArguments": ["/old/agent"], "EnvironmentVariables": []}):
+                previous.write_bytes(plistlib.dumps(prior))
+                destination.write_bytes(sentinel)
+                result = subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER),
+                                         "--previous", str(previous), "--destination", str(destination)],
+                                        text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(destination.read_bytes(), sentinel)
+
     def test_vcpkg_macos_target_triplet_pins_the_documented_runtime_floor(self) -> None:
         triplet = MACOS_TRIPLET.read_text()
         self.assertIn("set(VCPKG_TARGET_ARCHITECTURE arm64)", triplet)
@@ -182,7 +435,7 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('secure_payload_parent "$APP_ROOT" 755', preinstall)
         self.assertIn('non-package owner', preinstall)
         self.assertNotIn('secure_payload_parent "$DATA_DIR"', preinstall)
-        self.assertNotIn('chown root:wheel "$DATA_DIR"', postinstall)
+        self.assertIn('ensure_data_directory', postinstall)
         self.assertIn('secure_payload_parent "$YUZU_LIB" 755', preinstall)
         self.assertIn('root-owned and not group/world writable', preinstall)
         self.assertIn('ensure_state_dir()', preinstall)
@@ -274,6 +527,7 @@ class PackagingStructureTests(unittest.TestCase):
         self.assertIn('daemon remains unloaded until a later successful package', package_readme)
         self.assertIn('transition, so do not restart it before that inspection', package_readme)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_package_builder_rejects_a_mixed_cms_plugin_set_before_publishing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_mixed_cms_") as temporary:
             root = Path(temporary)
@@ -308,6 +562,7 @@ class PackagingStructureTests(unittest.TestCase):
             self.assertIn("all external plugins must have CMS sidecars", result.stderr)
             self.assertFalse(output.exists())
 
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS stat/permissions integration")
     def test_operational_directory_guard_rejects_untrusted_owner_and_symlink(self) -> None:
         postinstall = (ROOT / "deploy/packaging/macos/postinstall").read_text()
         start = postinstall.index("preserve_or_create_directory()")
@@ -327,6 +582,7 @@ class PackagingStructureTests(unittest.TestCase):
                 self.assertIn("operational path", result.stderr) if path.is_symlink() else \
                     self.assertIn("operational directory must be root-owned", result.stderr)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_package_builder_validates_the_private_plugin_snapshot_after_source_mutation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_package_race_") as temporary:
             root = Path(temporary)
@@ -428,7 +684,7 @@ class PackagingStructureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
             root = Path(temporary)
             destination = root / "output with spaces.plist"
-            result = subprocess.run(["python3", str(PLIST_HELPER), "--source",
+            result = subprocess.run([sys.executable, str(PLIST_HELPER), "--source",
                                      str(ROOT / "deploy/packaging/macos/com.yuzu.agent.plist"), "--output",
                                      str(destination), "--bundle-executable", "/example/YuzuAgent.app/Contents/MacOS/yuzu-agent"],
                                     check=True, capture_output=True, text=True)
@@ -441,6 +697,7 @@ class PackagingStructureTests(unittest.TestCase):
             self.assertEqual(arguments[arguments.index("--plugin-dir") + 1], "/usr/local/lib/yuzu/plugins")
             self.assertIn("--no-auto-update", arguments)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS plist integration")
     def test_bundle_upgrade_preserves_hardened_plugin_policy_and_server_settings(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
             root = Path(temporary)
@@ -458,10 +715,10 @@ class PackagingStructureTests(unittest.TestCase):
                                     "YUZU_PLUGIN_TRUST_BUNDLE": "/etc/yuzu-agent/certs/env-plugins.pem",
                                     "YUZU_PLUGIN_REQUIRE_SIGNATURE": "1",
                                 }}, output)
-            subprocess.run(["python3", str(PLIST_HELPER), "--source",
+            subprocess.run([sys.executable, str(PLIST_HELPER), "--source",
                             str(ROOT / "deploy/packaging/macos/com.yuzu.agent.plist"), "--output",
                             str(destination), "--bundle-executable", "/bundle/yuzu-agent"], check=True)
-            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+            subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER), "--previous", str(previous),
                             "--destination", str(destination)], check=True)
             with destination.open("rb") as output:
                 merged = plistlib.load(output)["ProgramArguments"]
@@ -485,11 +742,11 @@ class PackagingStructureTests(unittest.TestCase):
             policy = root / "plugin-policy.json"
             policy.write_text(json.dumps({"runtime_plugin_trust_bundle": "/etc/yuzu-agent/certs/new.pem"}))
             policy_destination = root / "policy.plist"
-            subprocess.run(["python3", str(PLIST_HELPER), "--source",
+            subprocess.run([sys.executable, str(PLIST_HELPER), "--source",
                             str(ROOT / "deploy/packaging/macos/com.yuzu.agent.plist"), "--output",
                             str(policy_destination), "--bundle-executable", "/bundle/yuzu-agent",
                             "--plugin-signing-policy", str(policy)], check=True)
-            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+            subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER), "--previous", str(previous),
                             "--destination", str(policy_destination)], check=True)
             with policy_destination.open("rb") as output:
                 policy_plist = plistlib.load(output)
@@ -502,6 +759,7 @@ class PackagingStructureTests(unittest.TestCase):
                              "/etc/yuzu-agent/certs/new.pem")
             self.assertIn("--plugin-require-signature", policy_arguments)
 
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS plist integration")
     def test_legacy_upgrade_retains_operator_disabled_ota(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
             root = Path(temporary)
@@ -510,13 +768,13 @@ class PackagingStructureTests(unittest.TestCase):
                 plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent", "--no-auto-update"]}, output)
             with destination.open("wb") as output:
                 plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent"]}, output)
-            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+            subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER), "--previous", str(previous),
                             "--destination", str(destination)], check=True)
             with destination.open("rb") as output:
                 self.assertIn("--no-auto-update", plistlib.load(output)["ProgramArguments"])
             with destination.open("wb") as output:
                 plistlib.dump({"ProgramArguments": ["/usr/local/bin/yuzu-agent"]}, output)
-            subprocess.run(["python3", str(MERGE_PLIST_HELPER), "--previous", str(previous),
+            subprocess.run(["/usr/bin/osascript", "-l", "JavaScript", str(MERGE_PLIST_HELPER), "--previous", str(previous),
                             "--destination", str(destination), "--force-no-auto-update"], check=True)
             with destination.open("rb") as output:
                 self.assertEqual(plistlib.load(output)["ProgramArguments"], ["/usr/local/bin/yuzu-agent"])
@@ -525,10 +783,11 @@ class PackagingStructureTests(unittest.TestCase):
         with mock.patch.object(bundle, "run", return_value="") as run:
             bundle.verify_final_plugin_sidecar(Path("/bundle/yuzu-agent"), Path("/plugins/tar.dylib"),
                                                Path("/trust/plugins.pem"))
-        run.assert_called_once_with(["/bundle/yuzu-agent", "--verify-plugin-signature",
-                                     "/plugins/tar.dylib", "--plugin-trust-bundle",
-                                     "/trust/plugins.pem"])
+        run.assert_called_once_with([str(Path("/bundle/yuzu-agent")), "--verify-plugin-signature",
+                                     str(Path("/plugins/tar.dylib")), "--plugin-trust-bundle",
+                                     str(Path("/trust/plugins.pem"))])
 
+    @unittest.skipUnless(sys.platform == "darwin", "native macOS archive/plist integration")
     def test_packaging_refuses_a_stale_cms_sidecar_before_publishing(self) -> None:
         with tempfile.TemporaryDirectory(prefix="yuzu_test_macos_bundle_") as temporary:
             root = Path(temporary)
@@ -567,6 +826,7 @@ class PackagingStructureTests(unittest.TestCase):
             self.assertEqual(result.returncode, 42, result.stderr)
             self.assertFalse((output / "YuzuAgent-1.0-macos-arm64.pkg").exists())
 
+    @unittest.skipIf(os.name == "nt", "POSIX Bash fixture")
     def test_builder_rejects_ambiguous_lanes_before_invoking_macos_tools(self) -> None:
         result = subprocess.run(["bash", str(BUILD_PKG), "--bin-dir", "x", "--bundle-dir", "y",
                                  "--version", "1.0"], capture_output=True, text=True)

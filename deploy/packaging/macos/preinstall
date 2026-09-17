@@ -95,6 +95,9 @@ write_recovery_phase() {
 # non-package owner. Never change it: stage sealed code in its own trusted root.
 secure_payload_parent "$APP_ROOT" 755
 secure_payload_parent "$YUZU_LIB" 755
+if [[ -e "$YUZU_LIB/plugins" || -L "$YUZU_LIB/plugins" ]]; then
+    require_trusted_directory "$YUZU_LIB/plugins"
+fi
 ensure_state_dir
 
 remove_managed_plugins() {
@@ -116,12 +119,34 @@ copy_if_present() {
     ditto "$source" "$destination"
 }
 
+adopt_receipted_plugins() {
+    local manifest="$YUZU_LIB/package-files.list" receipt relative name temporary
+    [[ ! -e "$manifest" && ! -L "$manifest" ]] || return 0
+    # Older loose packages had no manifest. The root-owned Installer database,
+    # not a plugin-directory scan, establishes their package ownership.
+    receipt="$(/usr/sbin/pkgutil --files com.yuzu.agent 2>/dev/null)" || return 0
+    temporary="$(mktemp "$YUZU_LIB/.legacy-manifest.XXXXXX")"
+    while IFS= read -r relative; do
+        case "$relative" in
+            usr/local/lib/yuzu/plugins/*.dylib)
+                name="${relative#usr/local/lib/yuzu/plugins/}"
+                [[ "$name" != .* && "$name" != */* && "$name" != *[!a-zA-Z0-9_.-]* ]] || {
+                    rm -f "$temporary"
+                    echo "ERROR: unsafe plugin path in legacy Installer receipt" >&2; return 1; }
+                printf 'plugins/%s\n' "$name" >> "$temporary"
+                ;;
+        esac
+    done <<< "$receipt"
+    chmod 644 "$temporary"
+    mv "$temporary" "$manifest"
+}
+
 legacy_app_is_managed() {
     local candidate="${1:-$LEGACY_APP}"
     [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
     [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" \
         == "${LEGACY_APP_ID#*.}" ]] || return 1
-    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1
+    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1 || return 1
     [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" \
         == "$LEGACY_TEAM_ID" ]] || return 1
     [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" \
@@ -152,6 +177,7 @@ recover_interrupted_promotion() {
     local recovery="$1"
     launchctl bootout "system/com.yuzu.agent" >/dev/null 2>&1 || true
     remove_managed_plugins "$YUZU_LIB/package-files.list"
+    remove_managed_plugins "$YUZU_LIB/.package-files.incoming"
     rm -f "$PLIST" "$YUZU_LIB/package-mode" "$YUZU_LIB/package-files.list"
     rm -rf "$APP_ROOT/YuzuAgent.app"
     rm -f /usr/local/bin/yuzu-agent /usr/local/lib/libyuzu_agent_core.dylib
@@ -204,6 +230,7 @@ fi
 RECOVERY="$(mktemp -d "${STATE_DIR}/install-recovery.XXXXXX")"
 chmod 700 "$RECOVERY"
 
+adopt_receipted_plugins
 copy_if_present "$PLIST" "$RECOVERY/LaunchDaemons/com.yuzu.agent.plist"
 copy_if_present "$APP_ROOT/YuzuAgent.app" "$RECOVERY/YuzuAgent.app"
 # Keep the old code tree out of the new data-root policy. The old app remains

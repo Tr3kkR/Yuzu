@@ -7,6 +7,7 @@
 #ifndef _WIN32
 
 #include <yuzu/agent/agent.hpp>
+#include <yuzu/agent/subprocess_runner.hpp>
 #include <yuzu/agent/updater.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -170,17 +171,32 @@ struct LoopbackHarness {
     }
 };
 
-struct AgentStopGuard {
+struct AgentRunner {
     yuzu::agent::Agent& agent;
+    const bool previous_subprocess_cancel{yuzu::agent::subprocess_cancel_requested()};
+    std::thread thread;
 
-    ~AgentStopGuard() { agent.stop(); }
+    explicit AgentRunner(yuzu::agent::Agent& running_agent)
+        : agent{running_agent}, thread{[agent_ptr = &running_agent] { agent_ptr->run(); }} {}
+
+    AgentRunner(const AgentRunner&) = delete;
+    AgentRunner& operator=(const AgentRunner&) = delete;
+
+    ~AgentRunner() {
+        agent.stop();
+        thread.join();
+        // Agent::stop requests process-wide cancellation. Restore only after
+        // every agent worker has joined so later Catch2 cases remain isolated.
+        yuzu::agent::request_subprocess_cancel(previous_subprocess_cancel);
+    }
 };
 
 std::vector<char> read_bytes(const fs::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input)
         throw std::runtime_error{"could not open test sidecar for reading: " + path.string()};
-    std::vector<char> contents{std::istreambuf_iterator<char>{input}, std::istreambuf_iterator<char>{}};
+    std::vector<char> contents{std::istreambuf_iterator<char>{input},
+                               std::istreambuf_iterator<char>{}};
     if (input.bad())
         throw std::runtime_error{"could not read test sidecar completely: " + path.string()};
     return contents;
@@ -191,6 +207,7 @@ void write_bytes(const fs::path& path, const std::vector<char>& contents) {
     if (!output)
         throw std::runtime_error{"could not open test sidecar for writing: " + path.string()};
     output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+    output.close(); // Detect buffered flush/close failures before claiming restoration.
     if (!output)
         throw std::runtime_error{"could not write test sidecar completely: " + path.string()};
 }
@@ -198,26 +215,49 @@ void write_bytes(const fs::path& path, const std::vector<char>& contents) {
 struct FileBackup {
     fs::path path;
     bool existed{false};
-    std::vector<char> contents;
+    fs::path backup_directory;
+    fs::path backup;
+    bool restored{false};
 
-    explicit FileBackup(fs::path input) : path(std::move(input)), existed(fs::exists(path)) {
+    explicit FileBackup(fs::path input)
+        : path(std::move(input)), existed(fs::exists(fs::symlink_status(path))) {
         if (!existed)
             return;
-        contents = read_bytes(path);
+        if (!fs::is_regular_file(fs::symlink_status(path)))
+            throw std::runtime_error{"refusing non-regular test sidecar: " + path.string()};
+        backup_directory = path.parent_path() /
+                           yuzu::test::unique_temp_path("yuzu_test_sidecar_backup_").filename();
+        if (!fs::create_directory(backup_directory))
+            throw std::runtime_error{"test sidecar backup directory already exists"};
+        try {
+            fs::permissions(backup_directory, fs::perms::owner_all);
+            backup = backup_directory / "original";
+            fs::copy_file(path, backup); // Preserve originals on disk before any truncating write.
+        } catch (...) {
+            std::error_code ignored;
+            fs::remove_all(backup_directory, ignored);
+            throw;
+        }
     }
 
     FileBackup(const FileBackup&) = delete;
     FileBackup& operator=(const FileBackup&) = delete;
 
-    void restore() const {
+    void restore() {
+        if (restored)
+            return;
         if (existed) {
-            write_bytes(path, contents);
+            fs::rename(backup,
+                       path); // Same-filesystem atomic replacement, no rewrite/flush window.
+            restored = true;
+            fs::remove(backup_directory);
             return;
         }
         std::error_code error;
         fs::remove(path, error);
         if (error)
             throw std::runtime_error{"could not remove test sidecar: " + path.string()};
+        restored = true;
     }
 
     ~FileBackup() {
@@ -259,6 +299,26 @@ static_assert(!std::is_copy_constructible_v<ExecutableSidecarLock>);
 
 } // namespace
 
+TEST_CASE("OTA sidecar backup retains originals when restoration fails",
+          "[agent][updater][no-auto-update]") {
+    yuzu::test::TempDir temp{"yuzu_test_sidecar_restore_"};
+    fs::create_directories(temp.path);
+    const auto path = temp.path / "sidecar";
+    const std::vector<char> original{'o', 'l', 'd'};
+    write_bytes(path, original);
+    FileBackup backup{path};
+    write_bytes(path, {'n', 'e', 'w'});
+    fs::remove(path);
+    fs::create_directory(path); // Force rename failure without changing process-wide limits.
+    CHECK_THROWS(backup.restore());
+    CHECK(read_bytes(backup.backup) == original);
+    fs::remove(path);
+    backup.restore();
+    CHECK(read_bytes(path) == original);
+    CHECK_FALSE(fs::exists(backup.backup_directory));
+    backup.restore(); // Explicit restoration and destructor are idempotent.
+}
+
 TEST_CASE("disabled OTA survives registration, first command, and reconnect without update RPC",
           "[agent][updater][no-auto-update][grpc]") {
     LoopbackHarness harness;
@@ -293,27 +353,32 @@ TEST_CASE("disabled OTA survives registration, first command, and reconnect with
     REQUIRE(sidecar_lock.locked());
     const auto old_binary = fs::path{executable.string() + ".old"};
     const auto verified_marker = executable.parent_path() / ".yuzu-update-verified";
-    const FileBackup old_backup{old_binary};
-    const FileBackup marker_backup{verified_marker};
-    const std::vector<char> old_sentinel{'o', 'l', 'd', '-', 's', 'e', 'n', 't', 'i', 'n', 'e', 'l'};
-    const std::vector<char> marker_sentinel{'m', 'a', 'r', 'k', 'e', 'r', '-', 's', 'e', 'n', 't', 'i', 'n', 'e', 'l'};
+    FileBackup old_backup{old_binary};
+    FileBackup marker_backup{verified_marker};
+    const std::vector<char> old_sentinel{'o', 'l', 'd', '-', 's', 'e',
+                                         'n', 't', 'i', 'n', 'e', 'l'};
+    const std::vector<char> marker_sentinel{'m', 'a', 'r', 'k', 'e', 'r', '-', 's',
+                                            'e', 'n', 't', 'i', 'n', 'e', 'l'};
     write_bytes(old_binary, old_sentinel);
     write_bytes(verified_marker, marker_sentinel);
 
     auto agent = yuzu::agent::Agent::create(std::move(config));
     REQUIRE(agent);
-    std::jthread runner([&] { agent->run(); });
-    const AgentStopGuard stop_agent{*agent};
+    const bool previous_cancel = yuzu::agent::subprocess_cancel_requested();
+    {
+        const AgentRunner runner{*agent};
 
-    const bool completed = harness.service.wait_for_second_registration();
+        const bool completed = harness.service.wait_for_second_registration();
 
-    REQUIRE(completed);
-    CHECK(harness.service.registration_count() >= 2);
-    CHECK(harness.service.subscription_count() >= 2);
-    CHECK(harness.service.first_command_was_rejected());
-    CHECK(harness.service.update_check_count() == 0);
-    CHECK(read_bytes(old_binary) == old_sentinel);
-    CHECK(read_bytes(verified_marker) == marker_sentinel);
+        REQUIRE(completed);
+        CHECK(harness.service.registration_count() >= 2);
+        CHECK(harness.service.subscription_count() >= 2);
+        CHECK(harness.service.first_command_was_rejected());
+        CHECK(harness.service.update_check_count() == 0);
+        CHECK(read_bytes(old_binary) == old_sentinel);
+        CHECK(read_bytes(verified_marker) == marker_sentinel);
+    }
+    CHECK(yuzu::agent::subprocess_cancel_requested() == previous_cancel);
     old_backup.restore();
     marker_backup.restore();
 }

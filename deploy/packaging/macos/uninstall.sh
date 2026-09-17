@@ -40,7 +40,7 @@ legacy_app_is_managed() {
     [[ -d "$candidate" && ! -L "$candidate" ]] || return 1
     [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$candidate/Contents/Info.plist" 2>/dev/null || true)" \
         == "${LEGACY_APP_ID#*.}" ]] || return 1
-    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1
+    codesign --verify --deep --strict --verbose=2 "$candidate" >/dev/null 2>&1 || return 1
     [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^TeamIdentifier=/{print $2; exit}')" \
         == "$LEGACY_TEAM_ID" ]] || return 1
     [[ "$(codesign -dvv "$candidate" 2>&1 | awk -F= '/^Authority=/{print $2; exit}')" \
@@ -88,6 +88,7 @@ rm -f /usr/local/bin/yuzu-agent /usr/local/bin/.yuzu-agent.incoming \
       "$MODE_FILE" /usr/local/lib/yuzu/.package-mode.incoming \
       "$MANIFEST" /usr/local/lib/yuzu/.package-files.incoming \
       /usr/local/lib/yuzu/merge-launchd-plist.py \
+      /usr/local/lib/yuzu/merge-launchd-plist.js \
       /usr/local/lib/yuzu/plugin-signing-policy.json /usr/local/lib/yuzu/uninstall.sh
 pkgutil --forget com.yuzu.agent >/dev/null 2>&1 || true
 echo "Yuzu Agent code removed. Data, logs, configuration, and trust anchors were preserved."
