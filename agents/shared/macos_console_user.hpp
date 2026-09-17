@@ -185,7 +185,11 @@ inline bool is_valid_uid(std::string_view uid) {
 
 // ── Store -> keychain mapping ────────────────────────────────────────────────
 
-inline constexpr const char* kSystemKeychainPath = "/Library/Keychains/System.keychain";
+// Named kDefault* (not kSystemKeychainPath) -- that identifier collides with
+// a macro of the same name in Security/cssmapple.h
+// (kSystemKeychainPath == kSystemKeychainDir kSystemKeychainName), which
+// mangles this declaration wherever both headers are visible.
+inline constexpr const char* kDefaultSystemKeychainPath = "/Library/Keychains/System.keychain";
 inline constexpr const char* kRootKeychainPath =
     "/System/Library/Keychains/SystemRootCertificates.keychain";
 
@@ -202,7 +206,7 @@ inline std::string system_keychain_path() {
         override_path != nullptr && override_path[0] == '/') {
         return override_path;
     }
-    return kSystemKeychainPath;
+    return kDefaultSystemKeychainPath;
 }
 
 inline std::string root_keychain_path() {
@@ -337,7 +341,7 @@ inline StorePlan resolve_store_plan(std::string_view store, bool has_console_use
 //                                silently redirected.
 //   "all", or any other/unrecognized value -- no single-keychain meaning
 //                                for a destructive op: rejected.
-// Resolves to the LITERAL paths (kRootKeychainPath / kSystemKeychainPath),
+// Resolves to the LITERAL paths (kRootKeychainPath / kDefaultSystemKeychainPath),
 // never the override-aware system_keychain_path()/root_keychain_path()
 // accessors above: destructive resolution stays literal so that a daemon
 // started with a test-only override set can never delete from a substituted
@@ -347,7 +351,7 @@ inline std::optional<std::string> resolve_delete_keychain_path(std::string_view 
     if (store == "root")
         return kRootKeychainPath;
     if (store == "MY" || store == "System")
-        return kSystemKeychainPath;
+        return kDefaultSystemKeychainPath;
     return std::nullopt;
 }
 
