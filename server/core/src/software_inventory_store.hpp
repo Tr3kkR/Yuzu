@@ -102,8 +102,10 @@ struct SoftwareVersionCount {
 };
 
 /// Fleet catalogue query. `name_filter` (case-insensitive substring) narrows the
-/// titles; empty matches all. `limit` caps the returned rows (ordered by install
-/// count); the store also enforces a hard ceiling independent of `limit`.
+/// rows by matching EITHER the title OR the publisher (round-3 item 8 — "adobe"
+/// surfaces every Adobe title, not only ones with "adobe" in the name itself);
+/// empty matches all. `limit` caps the returned rows (ordered by install count);
+/// the store also enforces a hard ceiling independent of `limit`.
 struct SoftwareCatalogQuery {
     std::string name_filter;
     int limit{200};
@@ -184,6 +186,13 @@ public:
     /// that re-opens the fail-open A4 violation this contract closes (gov UP-5).
     [[nodiscard]] std::optional<std::vector<SoftwareEntry>>
     get_agent_software(std::string_view agent_id);
+
+    /// `inventory_state.last_seen` for one (agent, source) — the SERVER receipt
+    /// epoch-seconds of the last ACCEPTED report (full or hash-only touch).
+    /// AUTHORITATIVE read: `std::nullopt` on a store/pool/query degrade; `0` = no
+    /// row yet (never synced). Backs the Hardware CI record's "Sync now" poll.
+    [[nodiscard]] std::optional<std::int64_t> source_last_seen(std::string_view agent_id,
+                                                               std::string_view source);
 
     /// Fleet-wide query ("which agents run X"). Capped at a hard ceiling regardless
     /// of `limit`. AUTHORITATIVE read: `std::nullopt` on a store/pool/query failure

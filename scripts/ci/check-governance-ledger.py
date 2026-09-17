@@ -88,7 +88,12 @@ from pathlib import Path
 LEDGER_DIR = "governance.d"
 
 IMPACTS = frozenset(f"I{i}" for i in range(1, 10))
-EXPOSURES = frozenset({f"E{i}" for i in range(0, 7)} | {"unresolved"})
+# E0-E7: E7 (advisory-artifact + author-controlled-input cap) added
+# 2026-09-16 to SKILL.md's severity-derivation table after PR #4386's own
+# 11-round review history showed the table had no way to discount a finding
+# on author-controlled input to advisory tooling from one on reachable
+# production input - range(0, 8) to include E7.
+EXPOSURES = frozenset({f"E{i}" for i in range(0, 8)} | {"unresolved"})
 MAPPED = frozenset({"BLOCKING", "SHOULD", "NICE"})
 SOURCES = frozenset({"governance-agent", "collaborator", "external-model"})
 ATTESTATION = frozenset({"adjudicated_by", "adjudication_rationale", "refuted_by",
@@ -220,16 +225,20 @@ def min_derived_band(impact, exposure):
     """The FLOOR of the finding's band from the recorded facts alone.
 
     Only the mechanical parts of the derivation are modelled: base band per
-    impact code, the E1/E2 single raise, the E6 LOW cap, and the I4/I7 HIGH
-    cap - applied PER IMPACT CODE before taking the max, so a mixed finding
-    (e.g. I1+I4 under E1) correctly floors at I1's escalated CRITICAL rather
-    than being dragged down to I4's own HIGH ceiling. The CONDITIONAL raises
-    SKILL.md defines (I5(a)-(c), I6 FALSE-ASSURANCE/DORMANT-AUTH, I7-conceals)
-    can only push the true band HIGHER and cannot be evaluated from the fields
+    impact code, the E1/E2 single raise, the E6 LOW cap, the E7 MEDIUM cap
+    (added 2026-09-16 for author-controlled input to advisory tooling - see
+    SKILL.md's severity-derivation table), and the I4/I7 HIGH cap - applied
+    PER IMPACT CODE before taking the max, so a mixed finding (e.g. I1+I4
+    under E1) correctly floors at I1's escalated CRITICAL rather than being
+    dragged down to I4's own HIGH ceiling. The CONDITIONAL raises SKILL.md
+    defines (I5(a)-(c), I6 FALSE-ASSURANCE/DORMANT-AUTH, I7-conceals) can
+    only push the true band HIGHER and cannot be evaluated from the fields
     alone, so this is a lower bound, not the exact band. Used only to catch
     UNDER-grading (a label whose ceiling cannot even reach this floor);
     over-labeling is left alone because it is indistinguishable from a
-    legitimate conditional raise.
+    legitimate conditional raise. E6 and E7 are independent `min()` caps, so
+    applying both in either order gives the same result: E6's LOW dominates
+    E7's MEDIUM whenever both are present, exactly as SKILL.md specifies.
     """
     codes = [i for i in impact if i in _BASE]
     if not codes:
@@ -244,6 +253,8 @@ def min_derived_band(impact, exposure):
     idx = max(_code_band(c) for c in codes)
     if "E6" in exposure:
         idx = min(idx, _ORDER.index("LOW"))
+    if "E7" in exposure:
+        idx = min(idx, _ORDER.index("MEDIUM"))
     return _ORDER[idx]
 
 

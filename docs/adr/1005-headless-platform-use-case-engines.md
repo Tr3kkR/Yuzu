@@ -492,6 +492,34 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
 
      `/fragments/*` surfaces remain under item 1; they carry no migration date — tracked separately.
 
+   - **2026-09-16 — Hardware CI list/record (`GET /api/v1/hardware`,
+     `GET /api/v1/hardware/{id}`, `POST /api/v1/hardware/{id}/sync`, PR
+     `feat/hardware-ci-view`).** REST-only, no MCP twin, and absent from
+     route discovery only in the sense that no `get_hardware_ci`/
+     `list_hardware`/equivalent MCP tool exists yet — the REST routes
+     themselves ARE in `openapi_spec()` and `GET /api/v1/routes` (A2/A3
+     hold for the REST half). A "no" on Decision 1/4's both-surfaces
+     requirement for the MCP half.
+     - **No MCP twin — tracked follow-up, not a permanent exception.** An
+       earlier draft of `hardware_routes.hpp`/`server.cpp` carried a
+       comment claiming a `get_hardware_ci` MCP tool already existed,
+       sharing the CI-detail closure via a `mcp_server_->set_hardware_fns`
+       call — false; no such symbol exists anywhere in the tree, including
+       `mcp_server.cpp`, which this branch never touches (governance Gate 3
+       finding, both external reviewers and two internal domain agents
+       independently confirmed the grep). The false comment was removed in
+       the same PR. The 10 new `device.live.<kind>` physical-kit reads are
+       NOT part of this gap — they reuse the pre-existing generic
+       live-info/bundle dispatch mechanism, which already has its own MCP
+       reachability via `execute_instruction`, unaffected by this row.
+     - Scoping and building the list/detail/sync-dispatch MCP twin is out
+       of scope for this PR; tracked as **#4456**. Until it lands, this row
+       stands as the open exception.
+     - Full design record: the round-3 hardware-ci-view plan
+       (`docs/user-manual/inventory.md`'s Dashboard section describes the
+       shipped REST/HTMX surface); wire reference:
+       `docs/user-manual/rest-api.md`'s Hardware section.
+
 ## Interim rules (until the named follow-ups ship)
 
 - **No engine principal class exists** until the auth-architecture follow-up lands. Until then, integrations authenticate as themselves via existing API tokens, and the server accepts **no** on-behalf-of assertion on any surface — any such header/field is rejected, not ignored.

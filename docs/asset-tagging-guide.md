@@ -149,7 +149,7 @@ curl -s -X DELETE "http://localhost:8080/api/v1/tags/agent-001/location" -b "$CO
 
 ### Via the Dashboard
 
-Tags can also be managed through the HTMX dashboard. Navigate to a device's detail page and use the tag editor to add, update, or remove tags. The `environment` dropdown is pre-populated with the three allowed values.
+Tags can also be managed through the HTMX dashboard. Open the device's Hardware CI record (`/hardware`, click the host, **Tags** tab): operators holding `Tag:Write` for that device see an **Add tag** row (key + value) and a **remove** link per tag. Both post to the same `/api/tags/set` and `/api/tags/delete` routes the API uses, so the same key validation, scoped RBAC gate and `tag.set` / `tag.delete` audit rows apply.
 
 ### Via YAML Instruction Definitions
 

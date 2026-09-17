@@ -447,6 +447,11 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 /// not by itself enough for anyone reviewing the containment surface:
 ///   - `tar_fleet_snapshot` requests a READ-ONLY topology snapshot.
 ///   - `asset_tags_sync` writes device tags. No execution.
+///   - `inventory_sync_now` asks ONE agent to re-run its daily-sync source(s)
+///     and report (`__sync__.now`, ADR-0016 update). Read-only, no execution;
+///     operator-REQUESTED via `POST /api/v1/hardware/{id}/sync` (which gates
+///     the operator on Execution:Execute for that device) but system-DISPATCHED,
+///     so it rides this door. Not quarantine-gated, same as tar_fleet_snapshot.
 ///   - `guardian_push_rules` delivers Guardian baseline rules the agent may
 ///     ENFORCE, and is therefore the one exempt channel that mutates the
 ///     endpoint. It is NOT arbitrary command execution: the assertion
@@ -459,7 +464,12 @@ inline constexpr std::array<std::string_view, 4> kQuarantineGateOutcomes{
 ///     `execute_instruction` is refused — deliberate, since enforcing a
 ///     baseline on a compromised host is the point, but it is the enumerator
 ///     to think hardest about before adding a sibling.
-enum class SystemReservedPush { tar_fleet_snapshot, guardian_push_rules, asset_tags_sync };
+enum class SystemReservedPush {
+    tar_fleet_snapshot,
+    guardian_push_rules,
+    asset_tags_sync,
+    inventory_sync_now,
+};
 
 /// Label for one enumerator. A switch with no `default:` so a new enumerator
 /// fails to compile here rather than silently metering as something else.
@@ -472,6 +482,8 @@ system_reserved_push_label(SystemReservedPush push) {
         return "__guard__.push_rules";
     case SystemReservedPush::asset_tags_sync:
         return "asset_tags.sync";
+    case SystemReservedPush::inventory_sync_now:
+        return "__sync__.now";
     }
     return "unknown"; // unreachable while the switch stays exhaustive
 }
@@ -479,9 +491,9 @@ system_reserved_push_label(SystemReservedPush push) {
 /// Every enumerator, so the boot pre-seed cannot fall out of step with the
 /// call sites — same reason `kQuarantineGateOutcomes` exists. An internal push
 /// that has never fired must read as zero, not as an absent series.
-inline constexpr std::array<SystemReservedPush, 3> kSystemReservedPushes{
+inline constexpr std::array<SystemReservedPush, 4> kSystemReservedPushes{
     SystemReservedPush::tar_fleet_snapshot, SystemReservedPush::guardian_push_rules,
-    SystemReservedPush::asset_tags_sync};
+    SystemReservedPush::asset_tags_sync, SystemReservedPush::inventory_sync_now};
 
 /// The two outcomes a system-reserved push can have at the registry seam.
 /// `sent` means `AgentRegistry::send_to` accepted the frame (for a
