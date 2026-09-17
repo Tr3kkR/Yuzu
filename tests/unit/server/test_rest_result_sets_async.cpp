@@ -430,6 +430,22 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][a
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar][security][4406]") {
+    // #4406 fix: body.value("sql", "") threw on a non-string sql rather than
+    // coercing. Same guard shape as the pre-existing include_empty check
+    // above, now applied to sql too.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":12345})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+}
+
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
           "[pg][result_set][async][tar][targeting][security]") {
     // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
@@ -656,6 +672,45 @@ TEST_CASE("from-instruction-result: unknown instruction_id 404s",
            status);
     REQUIRE(status == 404);
     REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("from-instruction-result: a type-mismatched instruction_id is refused with "
+          "400, never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][instruction][security][4406]") {
+    // #4406 fix: body.value("instruction_id", "") threw on a non-string
+    // instruction_id rather than coercing - it now falls through to the
+    // pre-existing "is required" 400, same as an absent field.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    h.post("/api/v1/result-sets/from-instruction-result", R"({"instruction_id":12345})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+}
+
+TEST_CASE("from-instruction-result: a non-object params is refused with 400, not "
+          "silently dispatched with an empty params map",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // Gate 4 unhappy-path fix: params gated on is_object() skipped every
+    // bound check AND the params-map-build loop, so a string/array/number
+    // params silently dispatched with an EMPTY map while persisting the
+    // wrong-shaped value verbatim and unbounded.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = std::string(4 * 1024 * 1024 - 100, 'A');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("'params' must be a JSON object") !=
+            std::string::npos);
 }
 
 // #4373-class fix, sibling-handler closure (flagged by governance Gate 2's
@@ -932,6 +987,37 @@ TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
     REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: a non-object params smuggled onto an existing instruction_result "
+          "row is refused, not silently re-dispatched with an empty params map",
+          "[pg][result_set][async][reeval][security][4373]") {
+    // Gate 4 unhappy-path fix: the pre-fix code gated every params bound
+    // check (and the params-map-build loop) on is_object(), so a
+    // string/array/number params silently re-dispatched with an EMPTY map.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = std::string(1024, 'A');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-non-object-params";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("'params' must be a JSON object") !=
             std::string::npos);
 }
 

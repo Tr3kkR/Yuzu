@@ -1087,6 +1087,27 @@ After upgrading, refusals are counted by
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
 
+### vNEXT - result-set `instruction_id`/`params` fields are now bound-checked (#4373) (intentional compatibility break, no supported flow affected)
+
+**What changed.** `POST /api/v1/result-sets/from-instruction-result` and `POST
+/api/v1/result-sets/{id}/re-eval` had no bound on the `instruction_id` or `params` fields feeding
+an InstructionDefinition dispatch: an oversized `instruction_id` or an over-keyed/oversized
+`params` object could reach fleet-wide dispatch. Both routes now enforce the same caps MCP's
+`create_result_set_from_instruction_result`/`reevaluate_result_set` tools already enforce:
+`instruction_id` at 256 bytes, `params` at 32 keys / 256-byte keys / 64 KiB values.
+
+**What breaks.** Requests that previously succeeded and now fail:
+
+| Endpoint | Shape | Was | Now |
+|---|---|---|---|
+| `POST /api/v1/result-sets/from-instruction-result` | `instruction_id` over 256 bytes | dispatched | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` | `params` over 32 keys, a key over 256 bytes, or a value over 64 KiB | dispatched | `400` |
+| `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched | `400` |
+
+**Who this affects.** Only a caller already sending a field past these bounds - the same bounds
+MCP's equivalent tools have always enforced. No supported flow constructs an `instruction_id` or
+`params` object anywhere near these limits, so no compliant client is affected.
+
 ### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
 
 A `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and**

@@ -9495,7 +9495,13 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
-                      std::string sql = body.value("sql", "");
+                      // #4406 fix: .value() throws nlohmann::json::type_error on a
+                      // type-mismatched 'sql' (e.g. a number) rather than coercing -
+                      // guard with is_string() first, same as re-eval's identical
+                      // guard on this field and MCP's create_result_set_from_tar_query.
+                      std::string sql =
+                          (body.contains("sql") && body["sql"].is_string()) ? body.value("sql", "")
+                                                                             : "";
                       if (sql.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
                           return;
@@ -9563,7 +9569,18 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
-                      std::string instruction_id = body.value("instruction_id", "");
+                      // Gate 4 unhappy-path finding: the other three near-identical
+                      // instruction_id/sql extractions in this file (re-eval's two
+                      // branches, MCP's own reevaluate_result_set) all guard with
+                      // is_string() first - this one didn't, so a type-mismatched
+                      // instruction_id (e.g. a number or object) threw an uncaught
+                      // nlohmann::json::type_error -> an unguarded HTTP 500 instead of
+                      // a clean 400, on this file's own #2437-class documented "no
+                      // server-wide exception handler" behavior.
+                      std::string instruction_id =
+                          (body.contains("instruction_id") && body["instruction_id"].is_string())
+                              ? body.value("instruction_id", "")
+                              : "";
                       if (instruction_id.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
                           return;
@@ -9586,6 +9603,17 @@ void RestApiV1::register_routes(
                                      "RESULT_SET_BAD_REQUEST: instruction_id must be at most {} "
                                      "bytes",
                                      yuzu::server::mcp::kInstructionIdMaxLen));
+                          return;
+                      }
+                      // Gate 4 unhappy-path finding: a present-but-non-object `params`
+                      // (string/array/number) skipped every check below AND the
+                      // params-map-build loop further down, so it silently dispatched
+                      // with an EMPTY params map while persisting the oversized/wrong-
+                      // shaped value verbatim into source_payload, unbounded and
+                      // re-parsed on every future re-eval. Reject it outright instead
+                      // of silently ignoring it.
+                      if (body.contains("params") && !body["params"].is_object()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'params' must be a JSON object");
                           return;
                       }
                       if (body.contains("params") && body["params"].is_object()) {
@@ -9757,9 +9785,9 @@ void RestApiV1::register_routes(
                           // #4373 fix: re-apply the SAME caps MCP's
                           // create_result_set_from_instruction_result enforces at creation
                           // time (REST's own from-instruction-result route now enforces the
-                          // same caps too, added above in this same change; #4406 is a
-                          // related but distinct type-confusion defect on the two REST
-                          // creation routes), and the SAME fix MCP's reevaluate_result_set
+                          // same caps too, added above in this same change; that route's
+                          // type-confusion defect, #4406, is also fixed above in this
+                          // change), and the SAME fix MCP's reevaluate_result_set
                           // already got (PR #4394) - checked
                           // here ahead of the instruction_store gate below, since a
                           // malformed/oversized field is a permanent client error
@@ -9775,6 +9803,13 @@ void RestApiV1::register_routes(
                                          "RESULT_SET_BAD_REQUEST: instruction_id must be at "
                                          "most {} bytes",
                                          yuzu::server::mcp::kInstructionIdMaxLen));
+                              return;
+                          }
+                          // Gate 4 unhappy-path fix: same present-but-non-object gap
+                          // as the creation route above - reject rather than
+                          // silently dispatch with an empty params map.
+                          if (sp.contains("params") && !sp["params"].is_object()) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'params' must be a JSON object");
                               return;
                           }
                           if (sp.contains("params") && sp["params"].is_object()) {
