@@ -113,7 +113,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Per-executable last/first-seen within TAR's retained usage window (31 days by default, not every run ever recorded) plus a trailing-30-day run_count/total_seconds window, aggregated from TAR's usage_daily table. Optional `exe` parameter narrows the result to one executable, normalised with the same rule TAR uses to write exe_key (lowercased basename, trimmed). Machine scope only — no pid, cmdline, or user name is ever surfaced.",
+      "description": "Per-executable last/first-seen within TAR's retained usage window (31 days by default, not every run ever recorded) plus a trailing-30-day run_count/total_seconds window, aggregated from TAR's usage_daily table. Optional `exe` parameter narrows the result to one executable, normalised with the same rule TAR uses to write exe_key (lowercased basename, trimmed). Machine scope only — no pid, cmdline, or user name is ever surfaced. Reports `constrained|usage_feeder_disabled` (or `usage_feeder_errored`) instead of data when TAR's own usage fold is not actually advancing (its process or usage collector is off), since this action has no separate health row to carry that signal. The unfiltered form is capped at 5000 executables and appends a trailing `constrained|last_used_truncated|<cap>` row if the cap was reached.",
       "display_name": "App Last Used",
       "execute_roles": [
         "endpoint-admin",
@@ -465,9 +465,27 @@
     },
     {
       "completeness": "partial",
+      "provenance": "`usage_feeder_disabled`",
+      "status": "`CONSTRAINED`",
+      "when": "`last_used` only: `tar_config.usage_feeder_enabled` reads `\"false\"` — TAR's own fold has stopped advancing (its `usage`/`process` collector is off), so `usage_daily` would otherwise silently serve a frozen, aging window as if it were live. `summary` surfaces the same signal via its `meta` row's `feeder_enabled` field instead of refusing to run."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`usage_feeder_errored`",
+      "status": "`CONSTRAINED`",
+      "when": "`last_used` only: `tar_config.usage_feeder_enabled` holds a value that is neither `\"true\"` nor `\"false\"`, or the read itself failed to prepare/step — same fail-closed tri-state as `usage_source_errored`, applied to the feeder key."
+    },
+    {
+      "completeness": "partial",
       "provenance": "`tar_db_unavailable`",
       "status": "`UNAVAILABLE`",
-      "when": "`tar.db` failed to open read-only (missing file, lock contention, corruption) — every capture in this package hits this branch, since none of the capture hosts had a live `tar.db` with usage collection enabled at the default path."
+      "when": "`tar.db` failed to open read-only (missing file, permission denied, lock contention) — every capture in this package hits this branch, since none of the capture hosts had a live `tar.db` with usage collection enabled at the default path."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`tar_db_corrupt`",
+      "status": "`UNAVAILABLE`",
+      "when": "`tar.db` opened successfully but failed `PRAGMA quick_check(1)` — a distinct token from `tar_db_unavailable` (governance Gate 6 sre finding) so an operator can tell \"benign, often transient\" apart from \"possible disk corruption, worth investigating\" without parsing the free-text error detail."
     },
     {
       "completeness": "partial",
@@ -480,6 +498,12 @@
       "provenance": "`query_failed`",
       "status": "`UNAVAILABLE`",
       "when": "A prepared statement failed against an otherwise open, enabled, schema-correct db — `read_meta`'s accumulated `open_runs_query_failed`/`days_present_query_failed` reasons (`yuzu::shared::ConstraintAccumulator`), or a raw sqlite error surfaced from `run_summary`/`run_last_used`."
+    },
+    {
+      "completeness": "partial",
+      "provenance": "`last_used_truncated`",
+      "status": "`CONSTRAINED`",
+      "when": "`last_used`, unfiltered form only: the result hit `kMaxLastUsedRows` (5000) distinct executables and was cut off there — a trailing row, not a replacement for the real `last_used` rows already emitted. Bounds an unprivileged-local-user resource-exhaustion path against the LocalSystem/root agent process."
     },
     {
       "completeness": "partial",

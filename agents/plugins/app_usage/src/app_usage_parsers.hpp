@@ -223,12 +223,6 @@ inline constexpr std::string_view kSummarySqlByRunCount =
     "SELECT exe_key, SUM(run_count), SUM(total_seconds), MIN(first_seen), MAX(last_seen), "
     "SUM(superseded_runs), SUM(expired_runs) FROM usage_daily WHERE day_ts >= ? "
     "GROUP BY exe_key ORDER BY SUM(run_count) DESC LIMIT ?";
-inline constexpr std::string_view kDistinctUsersSql =
-    "SELECT exe_key, COUNT(DISTINCT user) FROM usage_daily_user WHERE day_ts >= ? "
-    "GROUP BY exe_key";
-inline constexpr std::string_view kOpenRunsSql = "SELECT COUNT(*) FROM usage_live";
-inline constexpr std::string_view kUsageDailyExistsSql =
-    "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_daily'";
 // A local unprivileged user can create unboundedly many distinct exe_keys
 // (each uniquely-named binary earns its own GROUP BY row in usage_daily),
 // and this query has no window filter on the GROUP BY dimension itself —
@@ -237,6 +231,24 @@ inline constexpr std::string_view kUsageDailyExistsSql =
 // Capped at kMaxLastUsedRows; run_last_used requests one extra row so the
 // shell can detect truncation without a second COUNT(*) query.
 inline constexpr int64_t kMaxLastUsedRows = 5000;
+
+// Sibling of the kLastUsedSqlAll cap above (governance Gate 4 unhappy-path
+// UP-8): run_summary's exe_key set is already bounded to `top` (<=500) by
+// kSummarySqlByRunTime/ByRunCount's own LIMIT, but this query built the
+// FULL distinct_users map unbounded before that LIMIT was ever applied --
+// the identical unprivileged-local-user resource-exhaustion vector the
+// round-3 review's MEDIUM finding named for kLastUsedSqlAll, just on this
+// query instead. Capped at kMaxLastUsedRows (5000), the same generous bound
+// used there -- far larger than any legitimate `top`, so a host with sane
+// exe_key cardinality sees no behavior change; only a host being made to
+// mint unboundedly many exe_keys is affected, and it was already capped on
+// the last_used side.
+inline constexpr std::string_view kDistinctUsersSql =
+    "SELECT exe_key, COUNT(DISTINCT user) FROM usage_daily_user WHERE day_ts >= ? "
+    "GROUP BY exe_key LIMIT ?";
+inline constexpr std::string_view kOpenRunsSql = "SELECT COUNT(*) FROM usage_live";
+inline constexpr std::string_view kUsageDailyExistsSql =
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_daily'";
 
 inline constexpr std::string_view kLastUsedSqlAll =
     "SELECT exe_key, MAX(last_seen), MIN(first_seen), "
@@ -421,6 +433,7 @@ run_summary(sqlite3* db, const WindowParams& w, int64_t since_day_ts) {
         if (!stmt)
             return std::unexpected(QueryError{sqlite3_errmsg(db)});
         sqlite3_bind_int64(stmt.get(), 1, since_day_ts);
+        sqlite3_bind_int64(stmt.get(), 2, kMaxLastUsedRows);
         int rc;
         while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
             distinct_users[detail::col_text(stmt.get(), 0)] = sqlite3_column_int64(stmt.get(), 1);
@@ -514,6 +527,8 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
 // own file comment states -- app_usage_plugin.cpp's open_readonly only OPENS
 // the connection, it does not run SQL of its own.
 [[nodiscard]] inline bool quick_check_ok(sqlite3* db) {
+    if (!db)
+        return false;
     detail::Stmt stmt{db, "PRAGMA quick_check(1)"};
     if (!stmt)
         return false;

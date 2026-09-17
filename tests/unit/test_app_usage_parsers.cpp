@@ -427,6 +427,32 @@ TEST_CASE("run_last_used: unfiltered form never returns more than "
     sqlite3_close(db);
 }
 
+// Governance Gate 4 unhappy-path UP-4: the exact-boundary case (precisely
+// kMaxLastUsedRows rows, not over it) was untested -- both existing tests
+// used +50/+5 over-cap. At exactly the cap, LIMIT kMaxLastUsedRows+1 can
+// only return kMaxLastUsedRows rows (there is nothing to fill the +1 with),
+// so the shell's `size() > kMaxLastUsedRows` truncation check must correctly
+// see this as NOT truncated.
+TEST_CASE("run_last_used: unfiltered form returns exactly kMaxLastUsedRows "
+         "when the table holds precisely that many rows -- the untruncated "
+         "boundary",
+          "[app_usage][last_used]") {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    seed::create_schema(db);
+    seed::exec_or_fail(db, "BEGIN");
+    for (int64_t i = 0; i < static_cast<int64_t>(kMaxLastUsedRows); ++i) {
+        seed::insert_usage_daily(db, 100000, "exe_" + std::to_string(i), 1, 1, 100000, 100000, 0,
+                                 0);
+    }
+    seed::exec_or_fail(db, "COMMIT");
+
+    const auto rows = run_last_used(db, std::nullopt, 0);
+    REQUIRE(rows.has_value());
+    CHECK(rows->size() == static_cast<std::size_t>(kMaxLastUsedRows));
+    sqlite3_close(db);
+}
+
 // ───────────────────────────────────────────────────────── schema check ───
 
 TEST_CASE("usage_daily_table_exists: true with the table, false without", "[app_usage][schema]") {

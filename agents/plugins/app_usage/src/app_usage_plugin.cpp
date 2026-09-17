@@ -126,7 +126,15 @@ private:
 // every dispatch, not once at process start) and stops at the first error
 // rather than enumerating every one; on a genuinely large/corrupt tar.db
 // this still costs a scan, same as any integrity check.
-DbHandle open_readonly(const fs::path& path, std::string& out_err) {
+//
+// `out_token` is set to the distinct wire token the caller should emit --
+// "tar_db_unavailable" (missing file, permission denied, lock contention) or
+// "tar_db_corrupt" (opened fine, failed the integrity gate) -- governance
+// Gate 6 sre finding: both used to collapse into the same token, leaving an
+// operator unable to distinguish "benign, often transient" from "possible
+// disk corruption, worth investigating" without parsing free-text detail.
+DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_view& out_token) {
+    out_token = "tar_db_unavailable";
     sqlite3* db = nullptr;
     const int rc = sqlite3_open_v2(path.string().c_str(), &db,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
@@ -140,6 +148,7 @@ DbHandle open_readonly(const fs::path& path, std::string& out_err) {
     sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
     if (!yuzu::app_usage::quick_check_ok(db)) {
         out_err = "tar.db failed integrity quick_check";
+        out_token = "tar_db_corrupt";
         sqlite3_close(db);
         return DbHandle{};
     }
@@ -354,11 +363,12 @@ private:
     int do_summary(yuzu::CommandContext& ctx, yuzu::Params& params) {
         const auto path = resolve_db_path();
         std::string err;
-        DbHandle db = open_readonly(path, err);
+        std::string_view token;
+        DbHandle db = open_readonly(path, err, token);
         if (!db) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, err);
-            ctx.write_output("constrained|tar_db_unavailable|" + path.string() + "|" + err);
+            ctx.write_output("constrained|" + std::string{token} + "|" + path.string() + "|" + err);
             return 1;
         }
 
@@ -429,11 +439,12 @@ private:
     int do_last_used(yuzu::CommandContext& ctx, yuzu::Params& params) {
         const auto path = resolve_db_path();
         std::string err;
-        DbHandle db = open_readonly(path, err);
+        std::string_view token;
+        DbHandle db = open_readonly(path, err, token);
         if (!db) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, err);
-            ctx.write_output("constrained|tar_db_unavailable|" + path.string() + "|" + err);
+            ctx.write_output("constrained|" + std::string{token} + "|" + path.string() + "|" + err);
             return 1;
         }
 

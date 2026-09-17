@@ -595,7 +595,7 @@ TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and
 // ── round-3 review HIGH: a corrupt tar.db must never be silently served ────
 
 TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check and reports "
-         "constrained|tar_db_unavailable, rc 1, never a fabricated success",
+         "constrained|tar_db_corrupt, rc 1, never a fabricated success",
           "[app_usage][actions][regression]") {
     auto plugin = load_app_usage_plugin();
     if (!plugin) {
@@ -620,7 +620,7 @@ TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check an
     // this round's HIGH finding added (mutation-testing this in isolation
     // confirmed it: neutering the text=="ok" comparison does NOT redden this
     // test). It still correctly proves the outer open_readonly failure path
-    // reports tar_db_unavailable/rc=1 for a garbage file, which is real
+    // reports tar_db_corrupt/rc=1 for a garbage file, which is real
     // coverage -- just not of quick_check's comparison logic. See the
     // sibling test below for that.
     {
@@ -636,7 +636,7 @@ TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check an
     CHECK(last_used.rc == 1);
     const auto rows = captured_rows(last_used.captured);
     REQUIRE(rows.size() == 1);
-    CHECK(rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
+    CHECK(rows.front().rfind("constrained|tar_db_corrupt|", 0) == 0);
 
     plugin->descriptor->shutdown(ctx.get());
 }
@@ -665,10 +665,11 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
     const auto now = static_cast<int64_t>(std::time(nullptr));
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
-    // Enough rows to push usage_daily past SQLite's default 4096-byte page 1
-    // -- corrupting page 1 alone (the schema/sqlite_master page) risks
-    // failing at open/prepare time same as the garbage-bytes test above,
-    // rather than reaching quick_check's per-page scan.
+    // Enough rows to push usage_daily past page 1 -- corrupting page 1 alone
+    // (the schema/sqlite_master page) risks failing at open/prepare time
+    // same as the garbage-bytes test above, rather than reaching
+    // quick_check's per-page scan.
+    int64_t page_size = 0;
     {
         sqlite3* writer = nullptr;
         REQUIRE(sqlite3_open(db_path.string().c_str(), &writer) == SQLITE_OK);
@@ -680,20 +681,32 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
                                      0, 0);
         }
         seed::exec_or_fail(writer, "COMMIT");
+        // Read the ACTUAL page size rather than assuming SQLite's default
+        // (governance Gate 4 consistency-auditor NICE finding) -- a future
+        // vcpkg/platform SQLite built with a different compiled-in default
+        // would otherwise silently corrupt bytes outside real table data,
+        // false-greening this exact regression again.
+        sqlite3_stmt* stmt = nullptr;
+        REQUIRE(sqlite3_prepare_v2(writer, "PRAGMA page_size", -1, &stmt, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
+        page_size = sqlite3_column_int64(stmt, 0);
+        sqlite3_finalize(stmt);
         sqlite3_close(writer);
     }
+    REQUIRE(page_size > 0);
 
     const auto file_size = fs::file_size(db_path, ec);
     REQUIRE_FALSE(ec);
-    REQUIRE(file_size > 8192); // at least a 3rd page exists to corrupt
+    const auto corrupt_offset = page_size * 2; // page 3 (0-indexed byte offset)
+    REQUIRE(file_size > static_cast<uintmax_t>(corrupt_offset)); // a 3rd page exists to corrupt
 
     {
         std::fstream f(db_path, std::ios::binary | std::ios::in | std::ios::out);
         REQUIRE(f.is_open());
-        // Page 3+ (0-indexed byte offset 8192) -- past the schema page (1)
-        // and comfortably into real table data, never the 100-byte file
-        // header sqlite3_open itself parses.
-        f.seekp(8192);
+        // Page 3+ -- past the schema page (1) and comfortably into real
+        // table data, never the 100-byte file header sqlite3_open itself
+        // parses.
+        f.seekp(corrupt_offset);
         std::string garbage(256, '\xFF');
         f.write(garbage.data(), static_cast<std::streamsize>(garbage.size()));
         REQUIRE(f.good());
@@ -707,7 +720,7 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
     CHECK(last_used.rc == 1);
     const auto rows = captured_rows(last_used.captured);
     REQUIRE(rows.size() == 1);
-    CHECK(rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
+    CHECK(rows.front().rfind("constrained|tar_db_corrupt|", 0) == 0);
 
     plugin->descriptor->shutdown(ctx.get());
 }
