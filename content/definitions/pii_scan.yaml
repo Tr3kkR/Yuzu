@@ -1,0 +1,262 @@
+## Sensitive-Data (PII) Discovery Definitions
+## Audits files against a research-backed ruleset of financial, passport,
+## driver's-licence, and national-identifier formats (60 countries) with
+## real checksum validation where one publicly exists. Audit-only, never
+## stores raw matched values (findings carry a masked value only).
+## Plugin: pii_scan | Actions: scan, enable_realtime, disable_realtime
+##
+## Per-team region scoping (e.g. "we only operate in the UK/EU, we don't
+## need Aadhaar/CPF noise") is the `jurisdictions` parameter, not a
+## separate definition — pass country codes ("GB","US"), state-prefixed
+## codes ("US-CA"), or region presets ("EMEA","APAC","AMERICAS"). Applying
+## a scan to "all endpoints" vs. a subset is ordinary Scope targeting on
+## the instruction itself (tag/group/OS-based, same as every other Yuzu
+## instruction) — no PII-specific scoping mechanism is needed.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.pii_scan.scan
+  displayName: Scan Files for Sensitive Data (PII)
+  version: 1.0.0
+  description: >
+    One-shot scan of the given file/directory paths against the pii_scan
+    ruleset (credit cards, IBAN, ICAO passport MRZ, driver's licences,
+    and national identifiers for 60 countries). Structured identifiers
+    with a real checksum are validated (Luhn, IBAN mod-97, Verhoeff,
+    ICAO MRZ composite check digits, and ~30 country-specific
+    algorithms) — a shape match that fails its checksum is dropped, not
+    just downgraded, since a checksum-verifiable identifier that fails
+    its checksum is very unlikely to be a real instance of that type.
+    Plain-text/structured-text files only in this version (binary
+    document formats like PDF/DOCX need format-specific text extraction
+    this plugin does not do). Findings never carry the raw matched value
+    — only a masked form (last 4 characters, e.g. "***********1111").
+  tags: [security, compliance, dlp, pii, data-discovery]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: pii_scan
+    action: scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      paths:
+        type: string
+        description: Comma-separated list of file or directory paths to scan.
+      jurisdictions:
+        type: string
+        description: >
+          Comma-separated filter limiting which countries' rules apply:
+          ISO country codes ("GB","DE"), state-prefixed codes ("US-CA"),
+          or region presets ("EMEA","APAC","AMERICAS"). Empty = no
+          filter, every rule applies. Generic identifiers (credit cards,
+          IBAN, email, ...) always apply regardless of this filter.
+      allExtensions:
+        type: string
+        description: '"true" to scan every file found, ignoring the built-in plain-text extension allowlist.'
+      incremental:
+        type: string
+        description: '"false" to disable the size+mtime fingerprint cache (default: enabled — unchanged files are skipped on repeat scans without re-reading them).'
+    required: [paths]
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: findingConfidence
+        type: string
+      - name: category
+        type: string
+      - name: ruleId
+        type: string
+      - name: filePath
+        type: string
+      - name: line
+        type: int32
+      - name: maskedValue
+        type: string
+      - name: complianceTags
+        type: string
+    aggregation:
+      groupBy: [severity, category]
+      operations: [count]
+
+  visualization:
+    type: pie
+    processor: single_series
+    title: PII findings by severity
+    labelField: 0
+    valueLabel: Findings
+
+  readablePayload: "Scan files for sensitive data (PII)"
+
+  gather:
+    ttlSeconds: 0  # not a cacheable point-in-time status check — always re-run
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin, compliance-officer]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [pii_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.pii_scan.enable_realtime
+  displayName: Enable Realtime PII Scanning
+  version: 1.0.0
+  description: >
+    Registers a filesystem trigger so newly-created or renamed files
+    under `watchPath` are automatically re-scanned. Built on the agent's
+    existing filesystem-trigger primitive (mtime polling on the watched
+    path), which reliably catches new files appearing under a watched
+    directory but NOT in-place content edits to an already-existing
+    file — a directory's own mtime does not change when a file inside
+    it is merely rewritten. True on-write detection of in-place edits
+    would need the agent's Trigger Engine extended with native OS
+    directory-change notifications, tracked as follow-up core-agent
+    work, not covered by this action.
+
+    On-access (on-read, scan-before-open) scanning is deliberately not
+    offered by this plugin at all: true on-access interception needs a
+    kernel-level hook (Windows minifilter driver, Linux fanotify
+    permission events, macOS Endpoint Security AUTH events) — a
+    categorically larger, separately-scoped undertaking that pushes
+    toward the EDR-style capability set Yuzu is deliberately not
+    building.
+  tags: [security, compliance, dlp, pii, data-discovery, realtime]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: pii_scan
+    action: enable_realtime
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      watchPath:
+        type: string
+        description: Directory to watch. New/renamed files under it trigger an automatic scan.
+      jurisdictions:
+        type: string
+        description: Same filter semantics as security.pii_scan.scan's `jurisdictions` parameter.
+    required: [watchPath]
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: findingConfidence
+        type: string
+      - name: category
+        type: string
+      - name: ruleId
+        type: string
+      - name: filePath
+        type: string
+      - name: line
+        type: int32
+      - name: maskedValue
+        type: string
+      - name: complianceTags
+        type: string
+
+  readablePayload: "Enable realtime PII scanning on a watched directory"
+
+  approval:
+    mode: role-gated  # standing background behaviour on the endpoint — not auto-approved like a one-shot scan
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin, compliance-officer]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [pii_scan]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.pii_scan.disable_realtime
+  displayName: Disable Realtime PII Scanning
+  version: 1.0.0
+  description: >
+    Unregisters the filesystem trigger previously registered by
+    security.pii_scan.enable_realtime for the given watchPath.
+  tags: [security, compliance, dlp, pii, data-discovery, realtime]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: pii_scan
+    action: disable_realtime
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      watchPath:
+        type: string
+        description: The directory previously passed to enable_realtime.
+    required: [watchPath]
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: findingConfidence
+        type: string
+      - name: category
+        type: string
+      - name: ruleId
+        type: string
+      - name: filePath
+        type: string
+      - name: line
+        type: int32
+      - name: maskedValue
+        type: string
+      - name: complianceTags
+        type: string
+
+  readablePayload: "Disable realtime PII scanning on a watched directory"
+
+  approval:
+    mode: role-gated  # gated the same as enable_realtime — silently turning off a security-scanning trigger is itself security-relevant (potential detection evasion), not lower-stakes than installing one
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin, compliance-officer]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [pii_scan]
+
+status:
+  phase: active

@@ -1,0 +1,468 @@
+# 03-drivers-licenses-us.yaml — US driver's licence number formats,
+# all 50 states + DC. Puerto Rico explicitly excluded (no verifiable
+# format found — see bottom of file).
+#
+# AAMVA's DL/ID Card Design Standard does NOT mandate a per-state number
+# format — it only defines the machine-readable barcode "Customer ID
+# Number" field (DAQ): max 9 chars, alphanumeric-and-symbol, no mandated
+# checksum. Each state chooses its own length/composition/algorithm.
+# Sources used across this file: Milyli DLP regex reference PDF,
+# DriversAlert.com state-format reference PDF, Alan De Smet's
+# highprogrammer.com pages (FL/IL/WI/MD/MI/MN shared Soundex+DOB
+# algorithm and the WA legacy checksum), Microsoft Purview's US Driver's
+# License Number SIT definition, and state DMV announcements where cited
+# inline. Where two consolidated tables disagree (common, since DMVs
+# reissue formats over decades without invalidating old numbers),
+# sourceConfidence is downgraded and both variants are kept.
+#
+# NO US state publishes a general-purpose arithmetic checksum EXCEPT
+# Washington (legacy format only, see wa_dl_legacy_mod10 in the
+# manifest). Florida/Illinois/Wisconsin/Michigan/Minnesota(legacy)/
+# Maryland(legacy) share a documented STRUCTURAL encoding
+# (us_soundex_dob_sex_encoding — Soundex+first-name-code+DOB+sex) that
+# is not a validating checksum but IS a real, checkable structural rule.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-drivers-licenses-us
+  version: 0.2.0-draft
+  description: US driver's licence number formats, all 50 states + DC.
+
+rules:
+  - state: AL
+    name: Alabama
+    pattern: '\d{7,8}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "8-digit format introduced 2018-12-01; both 7- and 8-digit numbers remain valid."
+
+  - state: AK
+    name: Alaska
+    pattern: '\d{7}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: AZ
+    name: Arizona
+    pattern: '([A-Za-z]\d{8}|[A-Za-z]{2}\d{2,5}|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "9 numeric, OR 1 letter+8 numeric, OR 2 letters+2-5 numeric (legacy)."
+
+  - state: AR
+    name: Arkansas
+    pattern: '\d{4,9}'
+    currentIssuePattern: '9\d{8}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Currently 9 numeric, leading digit typically 9; legacy 4-9 digit forms remain valid."
+
+  - state: CA
+    name: California
+    pattern: '[A-Za-z]\d{7}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: CO
+    name: Colorado
+    pattern: '(\d{9}|[A-Za-z]\d{3,6}|[A-Za-z]{2}\d{2,5})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "9 numeric (current), or legacy 1 letter+3-6 numeric, or 2 letters+2-5 numeric."
+
+  - state: CT
+    name: Connecticut
+    pattern: '\d{9}'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: DE
+    name: Delaware
+    pattern: '\d{1,7}'
+    checksum: null
+    severity: medium
+    sourceConfidence: MEDIUM
+    notes: "Variable length, no documented leading-zero-padding requirement. Severity deliberately lowered from the state-DL default (high): a bare 1-7 digit number with no checksum and no distinguishing structure matches almost any short number (phone extension, zip code, counter) -- HIGH would overstate confidence for what is, without a nearby keyword, a very weak signal."
+
+  - state: DC
+    name: "District of Columbia"
+    pattern: '\d{7}'
+    legacyPattern: '\d{9}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "7 numeric current; 9 numeric seen historically."
+
+  - state: FL
+    name: Florida
+    pattern: '[A-Za-z]\d{12}'
+    checksum: us_soundex_dob_sex_encoding
+    checksumScope: "legacy only (issued before 2024-07-31)"
+    sourceConfidence: HIGH
+    notes: >
+      LEGACY (before 2024-07-31): 1 letter + 12 digits, digits encode
+      Soundex(surname) + first-name/middle-initial code + 2-digit birth
+      year + ((birth_month-1)*40 + birth_day + (500 if female)) + 1-digit
+      collision counter — fully documented algorithm.
+      CURRENT (issued/renewed on/after 2024-07-31): FL statute now
+      requires >=4 of the 12 digits be randomly generated; the old
+      deterministic algorithm no longer applies and no replacement
+      checksum has been published. Both shapes are live in production
+      data (old cards valid until renewal).
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_shared.html"
+      - "https://www.flhsmv.gov/2024/07/19/flhsmv-implements-legislation-requiring-driver-licenses-and-identification-card-numbers-to-change/"
+
+  - state: GA
+    name: Georgia
+    pattern: '\d{7,9}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Two consolidated reference sources internally disagree (one says 'nine' digits but its own example is 8 digits) — flagged, not resolved."
+
+  - state: HI
+    name: Hawaii
+    pattern: '([A-Za-z]\d{8}|\d{9})'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: ID
+    name: Idaho
+    pattern: '([A-Za-z]{2}\d{6}[A-Za-z]|\d{9})'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: IL
+    name: Illinois
+    pattern: '[A-Za-z]\d{11}'
+    checksum: us_soundex_dob_sex_encoding
+    sourceConfidence: HIGH
+    notes: >
+      1 letter + 11 digits (12 chars). Structure: SSSSFFFYYDDD =
+      Soundex(surname,4) + first-name/middle-initial code(3) + 2-digit
+      birth year + ((birth_month-1)*31+birth_day+(600 if female))(3).
+      Explicitly confirmed NO arithmetic check digit; state DB may carry
+      an internal 2-3 digit disambiguator not printed on the card.
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_shared.html"
+      - "http://www.highprogrammer.com/cgi-bin/uniqueid/dl_il"
+
+  - state: IN
+    name: Indiana
+    pattern: '\d{10}'
+    legacyPattern: '([A-Za-z]\d{9}|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "10 numeric current (formatted ####-##-#### or unformatted); legacy 1 letter+9 numeric or plain 9 numeric."
+
+  - state: IA
+    name: Iowa
+    pattern: '(\d{9}|\d{3}[A-Za-z]{2}\d{4})'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "9 numeric, OR 3 numeric+2 letters+4 numeric (legacy county-code format)."
+
+  - state: KS
+    name: Kansas
+    pattern: '([A-Za-z]\d{8}|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Hyphenated variants (1 letter+2+2+4 digits) also seen — strip hyphens before matching."
+
+  - state: KY
+    name: Kentucky
+    pattern: '([A-Za-z]\d{8,9}|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: LA
+    name: Louisiana
+    pattern: '\d{1,9}'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: ME
+    name: Maine
+    pattern: '(\d{7}[A-Za-z]?|\d{8})'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: MD
+    name: Maryland
+    pattern: '([A-Za-z]\d{12}|MD[A-Za-z0-9]{11})'
+    checksum: us_soundex_dob_sex_encoding
+    checksumScope: "legacy Soundex format only"
+    sourceConfidence: HIGH
+    notes: >
+      LEGACY ("Soundex" format): 1 letter + 12 digits = LLLL-FFF-MMM-BBB:
+      Soundex(surname) + coded first name + coded middle name + coded
+      birth day/month (full lookup tables published).
+      CURRENT (rolling out since ~2016, mandatory at next renewal/
+      duplicate): literal "MD" + 11 further randomly-assigned characters
+      (13 total), cross-referenced internally to the retired Soundex
+      number. Whether those 11 chars are letters-only or alphanumeric is
+      AMBIGUOUS in the only source found — verify against a real sample
+      before hard-coding the character class.
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_shared_mmm.html"
+      - "https://www.huffinsurance.com/blog/maryland-drivers-license-number-format-change/"
+
+  - state: MA
+    name: Massachusetts
+    pattern: '([A-Za-z]\d{8}|\d{9})'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: MI
+    name: Michigan
+    pattern: '[A-Za-z]\d{12}'
+    checksum: us_soundex_dob_sex_encoding
+    sourceConfidence: HIGH
+    notes: >
+      1 letter + 12 digits, currently active (corroborated by recent
+      2024-2026 sources, unchanged). Same structure family as MD/MN
+      legacy: Soundex(surname,4) + first-name/middle-initial code(3) +
+      2-digit birth year + coded birth day/month(3) + 1-digit overflow.
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_shared_mmm.html"
+
+  - state: MN
+    name: Minnesota
+    pattern: '[A-Za-z]\d{12}'
+    checksum: us_soundex_dob_sex_encoding
+    checksumScope: "pre-2004-12-13 issuance only"
+    sourceConfidence: HIGH
+    notes: >
+      Same 13-char shape as MD/MI. Pre-2004-12-13: same Soundex/
+      first-name/DOB structural encoding. Post-2004: switched to an
+      uncoded (effectively random) system, same length/shape, no
+      encoding.
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_shared_mmm.html"
+
+  - state: MS
+    name: Mississippi
+    pattern: '\d{9}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "Formatted like an SSN (###-##-####); accept with or without hyphens."
+
+  - state: MO
+    name: Missouri
+    pattern: '[A-Za-z]\d{9}'
+    legacyPattern: '([A-Za-z]\d{5,9}|[A-Za-z]\d{6}R|\d{8}[A-Za-z]{2}|\d{9}[A-Za-z]|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Significant historical variability across at least 6 distinct legacy formats; current issuance is most commonly 1 letter+9 numeric."
+
+  - state: MT
+    name: Montana
+    pattern: '(\d{9}|[A-Za-z]\d{8})'
+    legacyPattern: '(0[1-9]|1[0-2])\d{3}\d{4}41(0[1-9]|[12]\d|3[01])'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Legacy 13-digit format directly encodes DOB: 2-digit birth month + 3 random digits + 4-digit birth year + literal '41' + 2-digit birth day (not a validating checksum, single source)."
+
+  - state: NE
+    name: Nebraska
+    pattern: '[A-Za-z]\d{8}'
+    legacyPattern: '\d{1,7}'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: NV
+    name: Nevada
+    pattern: '(X\d{8}|\d{9}|\d{10}|\d{12})'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: NH
+    name: "New Hampshire"
+    pattern: '(0[1-9]|1[0-2])[A-Za-z]{3}\d{2}(0[1-9]|[12]\d|3[01])\d'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "10 chars: 2-digit birth month + 3 letters (surname first+last letter + given-name initial) + 2-digit birth year + 2-digit birth day + 1 trailing collision-disambiguator digit (not an arithmetic checksum). Single source, no official NH DMV corroboration found."
+
+  - state: NJ
+    name: "New Jersey"
+    pattern: '[A-Za-z]\d{14}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "1 letter (last-name initial) + 14 digits (15 total): 9 assigned digits + final 5 digits encoding birth month+year and an eye-color code (+50 to birth month if female). Single source; the eye-color-code detail specifically is unverified elsewhere."
+
+  - state: NM
+    name: "New Mexico"
+    pattern: '\d{8,9}'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: NY
+    name: "New York"
+    pattern: '\d{9}'
+    legacyPattern: '([A-Za-z]\d{7}|[A-Za-z]\d{18}|\d{8}|\d{16}|[A-Za-z]{8})'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "Current standard is 9 numeric (sometimes grouped ddd ddd ddd), explicitly confirmed 'no checksum' per Microsoft Purview's own DLP entity definition. Legacy/commercial variants (1 letter+7 or +18 digits, 8 or 16 digits, even 8 letters) are LOW confidence, single-source."
+    sources:
+      - "https://learn.microsoft.com/en-us/purview/sit-defn-us-drivers-license-number"
+
+  - state: NC
+    name: "North Carolina"
+    pattern: '\d{8,12}'
+    looseLegacyPattern: '\d{1,12}'
+    checksum: null
+    sourceConfidence: LOW_MEDIUM
+    notes: "Current issuance commonly 12 digits; historically issued as few as 1 digit and not consistently zero-padded. Wide, loosely-sourced range."
+
+  - state: ND
+    name: "North Dakota"
+    pattern: '([A-Za-z]{3}\d{2}\d{4}|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "3 letters (first 3 letters of surname, 'X'-padded if surname is 2 letters) + 2-digit birth year + 4 digits, OR 9 numeric. Structural surname/DOB encoding for the alpha-prefixed form, not an arithmetic checksum."
+
+  - state: OH
+    name: Ohio
+    pattern: '([A-Za-z]{2}\d{6}|[A-Za-z]\d{4,8}|\d{8})'
+    checksum: null
+    sourceConfidence: MEDIUM_HIGH
+    notes: "Current common new-issuance format: 2 letters + 6 numeric (8 chars). Other valid historical forms: 1 letter+4-8 numeric, or plain 8 numeric."
+
+  - state: OK
+    name: Oklahoma
+    pattern: '([A-Za-z]\d{9}|\d{9})'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: OR
+    name: Oregon
+    pattern: '\d{7,9}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Commonly 7 numeric historically; some sources report up to 9 digits for current issuance, optionally +1 trailing letter."
+
+  - state: PA
+    name: Pennsylvania
+    pattern: '\d{8}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "Formatted ## ### ###."
+
+  - state: RI
+    name: "Rhode Island"
+    pattern: '([1-9]{2}\d{5}|[A-Za-z]\d{6})'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "First two digits of the 7-digit numeric form are the 2-digit year of issuance (not a checksum, just a date-of-issue marker)."
+
+  - state: SC
+    name: "South Carolina"
+    pattern: '\d{5,11}'
+    checksum: null
+    sourceConfidence: LOW_MEDIUM
+    notes: "Wide historical range; current typical length not precisely pinned down by available sources."
+
+  - state: SD
+    name: "South Dakota"
+    pattern: '(\d{6,10}|\d{12})'
+    checksum: null
+    sourceConfidence: LOW_MEDIUM
+
+  - state: TN
+    name: Tennessee
+    pattern: '\d{7,9}'
+    checksum: null
+    sourceConfidence: MEDIUM
+    notes: "Current standard issuance is typically 9 digits."
+
+  - state: TX
+    name: Texas
+    pattern: '\d{7,8}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "Current standard issuance is 8 digits."
+
+  - state: UT
+    name: Utah
+    pattern: '\d{4,10}'
+    checksum: null
+    sourceConfidence: LOW_MEDIUM
+    notes: "Sources conflict on whether a 1-letter+8-numeric legacy variant still exists."
+
+  - state: VT
+    name: Vermont
+    pattern: '(\d{8}|\d{7}[Aa])'
+    checksum: null
+    sourceConfidence: HIGH
+
+  - state: VA
+    name: Virginia
+    pattern: '([A-Za-z]\d{8,11}|\d{9})'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: WA
+    name: Washington
+    pattern: 'WDL[ABCDFGHJKLMNPRSTWXYZ0-9]{9}'
+    legacyPattern: '[A-Za-z*]{7}\d{2}[A-Za-z0-9]{2}\d'
+    checksum: null
+    legacyChecksum: wa_dl_legacy_mod10
+    sourceConfidence: HIGH
+    notes: >
+      CURRENT (issued/renewed on/after 2018-09-04): literal "WDL" + 9
+      randomly-assigned alphanumeric characters, deliberately excluding
+      vowels A/E/I/O/U plus Q and V (12 chars total). No checksum.
+      LEGACY (before 2018-09-04): 12 characters — 5-char truncated/
+      asterisk-padded surname + first-initial + middle-initial + 2-digit
+      encoded birth year (100 minus YY) + 1-char mod-10 checksum + 1-char
+      encoded birth month + 1-char encoded birth day. This is one of the
+      VERY FEW US states with a genuinely documented, published weighted
+      checksum — see wa_dl_legacy_mod10 in 00-manifest.yaml.
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_wa.html"
+      - "https://www.king5.com/article/news/local/washington-drivers-license-numbers-to-change-in-september/281-587296223"
+
+  - state: WV
+    name: "West Virginia"
+    pattern: '(\d{7}|[A-Za-z]{1,2}\d{5,6})'
+    checksum: null
+    sourceConfidence: MEDIUM
+
+  - state: WI
+    name: Wisconsin
+    pattern: '[A-Za-z]\d{13}'
+    checksum: us_soundex_dob_sex_encoding
+    sourceConfidence: MEDIUM_HIGH
+    notes: >
+      1 letter + 13 digits (14 chars, formatted L###-####-####-##). Same
+      shared Soundex/DOB/sex algorithm family as FL/IL: Soundex(surname)
+      + first-name/middle-initial code + 2-digit birth year +
+      ((birth_month-1)*40+birth_day+(500 if female)), plus a 2-digit
+      printed overflow/collision counter. Could not confirm from an
+      official current WisDOT source whether this remains the LIVE
+      algorithm today (a 2015-2023 card-redesign note suggests a possible
+      change) — flagged, not confirmed.
+    sources:
+      - "http://www.highprogrammer.com/alan/numbers/dl_us_shared.html"
+
+  - state: WY
+    name: Wyoming
+    pattern: '\d{6}-?\d{3}'
+    checksum: null
+    sourceConfidence: HIGH
+    notes: "9 numeric, formatted ######-###."
+
+  - state: PR
+    name: "Puerto Rico"
+    pattern: null
+    checksum: null
+    sourceConfidence: NONE
+    notes: >
+      FORMAT NOT CONFIDENTLY VERIFIED. No authoritative DTOP
+      (Departamento de Transportación y Obras Públicas) / CESCO
+      specification or reliable secondary compilation with exact
+      length/character-class was found. PR is absent from both
+      consolidated regex references used to build this file. DO NOT
+      deploy a regex for PR without further direct verification against
+      an official DTOP source or a real license sample. No pattern
+      shipped — deliberately, rather than guessing.

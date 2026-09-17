@@ -1,0 +1,255 @@
+# 01-generic.yaml — country-agnostic financial, contact, and device identifiers.
+# See 00-manifest.yaml for the checksum algorithm registry and confidence legend.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-generic
+  version: 0.2.0-draft
+  description: Generic (non-country-specific) financial, contact, and device identifiers.
+
+rules:
+  - id: generic.credit_card.visa
+    displayName: "Credit Card — Visa"
+    category: financial
+    # The declared length is [13, 16, 19] (13 = old short Visa, 16 =
+    # standard, 19 = newer extended range); the trailing group below is
+    # ordered longest-alternative-first so a full 19- or 16-digit number
+    # isn't truncated to a partial 13-digit match (which would run Luhn
+    # against the wrong, truncated digit string and drop a real card).
+    pattern: '4\d{3}[ -]?\d{4}[ -]?\d{4}(?:[ -]?\d{4}[ -]?\d{3}|[ -]?\d{4}|\d)'
+    length: [13, 16, 19]
+    checksum: luhn
+    confidenceKeywords: ["card", "visa", "cvv", "expiry", "exp date"]
+    severity: high
+    complianceTags: [PCI-DSS]
+    sourceConfidence: HIGH
+    knownTestValues: ["4111111111111111", "4012888888881881"]
+
+  - id: generic.credit_card.mastercard
+    displayName: "Credit Card — Mastercard"
+    category: financial
+    pattern: '(5[1-5]\d{2}|222[1-9]|22[3-9]\d|2[3-6]\d{2}|27[01]\d|2720)[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}'
+    length: [16]
+    checksum: luhn
+    confidenceKeywords: ["card", "mastercard", "cvv", "expiry"]
+    severity: high
+    complianceTags: [PCI-DSS]
+    sourceConfidence: HIGH
+    knownTestValues: ["5555555555554444", "2223003122003222"]
+
+  - id: generic.credit_card.amex
+    displayName: "Credit Card — American Express"
+    category: financial
+    pattern: '3[47]\d{2}[ -]?\d{6}[ -]?\d{5}'
+    length: [15]
+    checksum: luhn
+    confidenceKeywords: ["card", "amex", "american express", "cvv"]
+    severity: high
+    complianceTags: [PCI-DSS]
+    sourceConfidence: HIGH
+    knownTestValues: ["378282246310005"]
+
+  - id: generic.credit_card.discover
+    displayName: "Credit Card — Discover"
+    category: financial
+    pattern: '6(?:011|5\d{2})[ -]?\d{4}[ -]?\d{4}[ -]?\d{4}'
+    length: [16]
+    checksum: luhn
+    confidenceKeywords: ["card", "discover", "cvv"]
+    severity: high
+    complianceTags: [PCI-DSS]
+    sourceConfidence: HIGH
+    knownTestValues: ["6011111111111117"]
+
+  - id: generic.iban
+    displayName: "IBAN (International Bank Account Number)"
+    category: financial
+    pattern: '[A-Z]{2}\d{2}[A-Z0-9]{11,30}'
+    length: [15, 34]
+    checksum: iban_mod97
+    confidenceKeywords: ["iban", "bank account", "sort code", "swift"]
+    severity: high
+    complianceTags: [GDPR, PCI-DSS]
+    sourceConfidence: HIGH
+    notes: "Overall length is country-specific; validate the per-country length table below, not just the generic 15-34 range."
+    lengthByCountry:
+      DE: 22
+      FR: 27
+      GB: 22
+      ES: 24
+      IT: 27
+      NL: 18
+      CH: 21
+      AT: 20
+      FI: 18
+      GR: 27
+      BE: 16
+      IE: 22
+      PL: 28
+      SE: 24
+      NO: 15
+      DK: 18
+      PT: 25
+      LU: 20
+      CZ: 24
+      RO: 24
+
+  - id: generic.bic_swift
+    displayName: "SWIFT/BIC Code"
+    category: financial
+    pattern: '[A-Z]{4}[A-Z]{2}[A-Z0-9]{2}([A-Z0-9]{3})?'
+    length: [8, 11]
+    checksum: null
+    confidenceKeywords: ["swift", "bic", "bank identifier"]
+    severity: medium
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+    notes: "Structural only — no checksum defined by ISO 9362."
+
+  - id: generic.bank_routing_aba_us
+    displayName: "US Bank Routing Number (ABA)"
+    category: financial
+    # Word-boundary anchored: an unanchored `\d{9}` can fragment-match the
+    # leading 9 digits of any longer digit string (e.g. a 16-digit card
+    # number), with roughly a 1-in-10 chance of the fragment coincidentally
+    # passing its own mod-10 checksum and being promoted to a HIGH-
+    # confidence, GLBA-tagged false finding.
+    pattern: '\b\d{9}\b'
+    checksum: us_aba_routing_weighted
+    confidenceKeywords: ["routing number", "aba", "wire transfer"]
+    severity: high
+    complianceTags: [GLBA]
+    sourceConfidence: HIGH
+
+  - id: generic.uk_sort_code_account
+    displayName: "UK Sort Code + Account Number"
+    category: financial
+    pattern: '\d{2}-?\d{2}-?\d{2}[ ,]?\d{8}'
+    checksum: null
+    confidenceKeywords: ["sort code", "account number", "uk bank"]
+    severity: high
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+    notes: "NO generic checksum exists — validation requires Vocalink's published per-sort-code weight table (~1,151 rules, three algorithm families: Standard MOD-10, Standard MOD-11, Double Alternate). See 00-manifest.yaml. Structural detection only."
+
+  - id: generic.vin
+    displayName: "Vehicle Identification Number (VIN)"
+    category: device
+    pattern: '[A-HJ-NPR-Z0-9]{17}'
+    checksum: vin_iso3779_weighted
+    confidenceKeywords: ["vin", "vehicle identification"]
+    severity: medium
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+    notes: "VIN identifies a vehicle, not a person directly, but is commonly treated as PII when linkable to a registered owner (GDPR) or bundled in DLP scope. I, O, Q never appear in a valid VIN."
+
+  - id: generic.imei
+    displayName: "IMEI (Mobile Device Identifier)"
+    category: device
+    pattern: '\d{15}'
+    checksum: imei_luhn
+    confidenceKeywords: ["imei", "device id"]
+    severity: low
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+    notes: "16-digit IMEISV variant has no checksum — do not apply Luhn to that form."
+
+  - id: generic.us_npi
+    displayName: "US National Provider Identifier (NPI)"
+    category: identity
+    pattern: '\d{10}'
+    checksum: us_npi_luhn_prefixed
+    confidenceKeywords: ["npi", "national provider identifier"]
+    severity: high
+    complianceTags: [HIPAA]
+    sourceConfidence: HIGH
+
+  - id: generic.us_medicare_beneficiary_id
+    displayName: "US Medicare Beneficiary Identifier (MBI)"
+    category: identity
+    pattern: '[1-9][ACDEFGHJKMNPQRTUVWXY][0-9ACDEFGHJKMNPQRTUVWXY][0-9][ACDEFGHJKMNPQRTUVWXY][0-9ACDEFGHJKMNPQRTUVWXY][0-9][ACDEFGHJKMNPQRTUVWXY]{2}[0-9]{2}'
+    length: [11]
+    checksum: null
+    confidenceKeywords: ["mbi", "medicare beneficiary"]
+    severity: high
+    complianceTags: [HIPAA]
+    sourceConfidence: HIGH
+    notes: "No checksum — purely positional/structural (digit-only, letter-only, and alphanumeric positions are fixed; excluded letters B,I,L,O,S,Z everywhere alpha is allowed to avoid visual ambiguity). Display format adds dashes (1EG4-TE5-MK73) which are cosmetic only."
+
+  - id: generic.email
+    displayName: "Email Address"
+    category: contact
+    pattern: '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    checksum: null
+    confidenceKeywords: []
+    severity: low
+    complianceTags: [GDPR, CCPA]
+    sourceConfidence: HIGH
+    notes: "High shape-specificity on its own; usually LOW severity unless paired with another PII type in the same record."
+
+  - id: generic.phone_e164
+    displayName: "Phone Number (E.164-ish generic)"
+    category: contact
+    pattern: '\+?[1-9]\d{1,3}[ -]?\(?\d{2,4}\)?[ -]?\d{3,4}[ -]?\d{3,4}'
+    checksum: null
+    confidenceKeywords: ["phone", "tel", "mobile", "call", "contact"]
+    severity: low
+    complianceTags: [GDPR, CCPA]
+    sourceConfidence: MEDIUM
+    notes: "Very shape-loose (phone formats vary hugely by country) — keep LOW without a keyword hit; expect false positives against order/reference numbers."
+
+  - id: generic.ipv4
+    displayName: "IPv4 Address"
+    category: device
+    pattern: '\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\b'
+    checksum: null
+    confidenceKeywords: []
+    severity: low
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+    notes: "GDPR treats IP addresses as personal data when linkable to an individual — usually only relevant paired with a username/account context."
+
+  - id: generic.mac_address
+    displayName: "MAC Address"
+    category: device
+    pattern: '([0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}'
+    checksum: null
+    confidenceKeywords: []
+    severity: low
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+
+  - id: generic.date_of_birth
+    displayName: "Date of Birth (context-dependent)"
+    category: identity
+    pattern: '\b(?:0[1-9]|[12]\d|3[01])[/.-](?:0[1-9]|1[0-2])[/.-](?:19|20)\d{2}\b'
+    checksum: null
+    confidenceKeywords: ["dob", "date of birth", "born", "birthdate"]
+    requireKeyword: true
+    severity: medium
+    complianceTags: [GDPR, CCPA]
+    sourceConfidence: HIGH
+    notes: "Extremely weak shape alone (matches any date) — requireKeyword: true means scan_text() DROPS a match entirely (never even at LOW) unless a confidenceKeyword is found on the same line, otherwise expect huge false-positive volume against log timestamps, expiry dates, etc."
+
+  - id: generic.crypto_wallet_btc_legacy
+    displayName: "Bitcoin Address — Legacy (P2PKH/P2SH, Base58Check)"
+    category: financial
+    pattern: '[13][a-km-zA-HJ-NP-Z1-9]{25,34}'
+    checksum: null
+    checksumNotes: "Base58Check embeds a real checksum (first 4 bytes of double-SHA256 of version+payload) — algorithm named, not re-derived in this ruleset; full validation requires implementing Base58Check decode + double-SHA256."
+    confidenceKeywords: ["bitcoin", "btc", "wallet address"]
+    severity: medium
+    complianceTags: [GDPR]
+    sourceConfidence: HIGH
+
+  - id: generic.crypto_wallet_btc_segwit
+    displayName: "Bitcoin Address — Native SegWit (Bech32/Bech32m)"
+    category: financial
+    pattern: 'bc1[a-z0-9]{39,59}'
+    checksum: null
+    checksumNotes: "Bech32 (BIP173, P2WPKH/P2WSH, prefix bc1q) / Bech32m (BIP350, Taproot, prefix bc1p) embed a 6-char BCH-like polymod checksum — algorithm named, not re-derived. Length bounds here reflect real-world mainnet address lengths (~42/~62 chars), not the full range BIP173 technically permits (up to 90)."
+    confidenceKeywords: ["bitcoin", "btc", "segwit", "wallet address"]
+    severity: medium
+    complianceTags: [GDPR]
+    sourceConfidence: MEDIUM

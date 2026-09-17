@@ -33,7 +33,7 @@ Three things checked against the real, integrated tree:
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
      `.plugin`/`.action` pair for, and both must equal EXPECTED_TOTAL_ROWS
-     (4+5+45+55+34+42+2+3+4+2+2 across the eleven fragments) — architect review requirement: a regex that
+     (4+5+45+55+34+42+2+3+4+2+2+4 across the twelve fragments) — architect review requirement: a regex that
      silently fails to associate a gate with its row must read as a hard
      failure, never as an absent gate.
 
@@ -90,6 +90,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_pii_scan.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
@@ -98,7 +99,8 @@ FRAGMENT_FILES = [
 # Wave 7 PR7.1: +2 autoruns (list/catalog).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Hardware CI sync-on-demand: +1 core (__sync__.now).
-EXPECTED_TOTAL_ROWS = 198
+# pii_scan: +4 (scan/enable_realtime/disable_realtime/scan_path).
+EXPECTED_TOTAL_ROWS = 202
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

@@ -1,0 +1,12 @@
+captured: windows 11 Pro (10.0.26200) · bare-metal · 2026-09-16 · not measured (capture did not complete) · leg-hash pending
+== action=scan
+[not captured] agent-context: plugin-capture hangs indefinitely on this development host during yuzu_agent_core.dll static initialization (before any plugin code runs) — reproduced against an unrelated, already-shipped plugin (chargen) with the same tool, confirming this is an environment-level issue with plugin-capture/agent-core startup on this host, not a pii_scan defect. The action itself was verified end-to-end via unit tests (tests/unit/test_pii_matcher.cpp's scan_text coverage) and a real MSVC build/link.
+
+== action=enable_realtime
+[not captured] agent-context: registers a real agent Trigger Engine trigger — plugin-capture's harness does not provide a live TriggerEngine, so this leg cannot be captured by this tool regardless of the startup-hang issue above.
+
+== action=disable_realtime
+[not captured] agent-context: same reason as enable_realtime — needs a live TriggerEngine plugin-capture does not provide.
+
+== action=scan_path
+[not captured] agent-context: same reason as `scan` above (plugin-capture hangs before any plugin code runs on this host) — scan_path routes to the identical run_scan handler `scan` uses, so its own coverage is exercised by the same unit tests.

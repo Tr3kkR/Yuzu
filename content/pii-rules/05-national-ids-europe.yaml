@@ -1,0 +1,463 @@
+# 05-national-ids-europe.yaml — EU-27 + UK + Switzerland + Norway national
+# identifiers. See 00-manifest.yaml for the checksum algorithm registry and
+# the "Corrections made during research" log (several entries here fix
+# errors from the original hand-drafted ruleset).
+#
+# Cross-checked against python-stdnum (github.com/arthurdejong/python-stdnum),
+# an open-source library shipping reference implementations for most of
+# these — the single strongest validation source used across this whole
+# ruleset.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-national-ids-europe
+  version: 0.2.0-draft
+  description: National identifier / tax-ID formats for European countries.
+
+countries:
+  - country: DE
+    countryName: Germany
+    rules:
+      - id: de.steuerid
+        displayName: "Steuerliche Identifikationsnummer (Tax ID)"
+        category: tax_id
+        pattern: '[1-9]\d{10}'
+        checksum: iso7064_mod11_10
+        structuralNote: "Exactly one digit repeats 2-3x among the first 10 digits, all others appear at most once — a real constraint, RE2 can't express it, validate in code alongside the checksum."
+        confidenceKeywords: ["steuer-id", "steuerliche identifikationsnummer", "tax id"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        sources: ["github.com/arthurdejong/python-stdnum (de/idnr.py)"]
+
+  - country: FR
+    countryName: France
+    rules:
+      - id: fr.nir
+        displayName: "Numéro de Sécurité Sociale (NIR / INSEE)"
+        category: national_id
+        pattern: '[1-8]\d{2}(0[1-9]|1[0-2]|[2-9]\d)(0[1-9]|[1-8]\d|9[0-5]|2[AB]|9[78]\d)\d{2,3}\d{3}\d{2}'
+        checksum: fr_nir_mod97
+        confidenceKeywords: ["nir", "numéro de sécurité sociale", "insee"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Variable-width overseas department field — prefer format-match + code-level checksum over a strict single regex."
+
+  - country: ES
+    countryName: Spain
+    rules:
+      - id: es.dni
+        displayName: "Documento Nacional de Identidad (DNI)"
+        category: national_id
+        pattern: '[0-9]{8}[A-Za-z]'
+        checksum: es_dni_nie_mod23
+        confidenceKeywords: ["dni", "documento nacional"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+
+      - id: es.nie
+        displayName: "Número de Identidad de Extranjero (NIE)"
+        category: national_id
+        pattern: '[XxYyZz][0-9]{7}[A-Za-z]'
+        checksum: es_dni_nie_mod23
+        checksumNotes: "Convert leading letter first: X=0, Y=1, Z=2, then apply the same table as DNI."
+        confidenceKeywords: ["nie", "identidad de extranjero"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+
+  - country: IT
+    countryName: Italy
+    rules:
+      - id: it.codice_fiscale
+        displayName: "Codice Fiscale"
+        category: national_id
+        pattern: '[A-Z]{6}[0-9]{2}[ABCDEHLMPRST][0-9]{2}[A-Z][0-9]{3}[A-Z]'
+        checksum: it_codice_fiscale_check
+        confidenceKeywords: ["codice fiscale"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Omocodia (digit-substitution for collision disambiguation) not covered."
+
+  - country: NL
+    countryName: Netherlands
+    rules:
+      - id: nl.bsn
+        displayName: "Burgerservicenummer (BSN)"
+        category: national_id
+        pattern: '[0-9]{9}'
+        checksum: nl_elfproef
+        confidenceKeywords: ["bsn", "burgerservicenummer"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Bare 9-digit shape is weak alone — require keyword proximity or an elfproef pass before HIGH finding confidence."
+
+  - country: PL
+    countryName: Poland
+    rules:
+      - id: pl.pesel
+        displayName: PESEL
+        category: national_id
+        # PESEL is 11 digits (YYMMDD + 4-digit serial + 1 check digit);
+        # this pattern previously captured only 9 (YY + century-encoded-MM
+        # + 5 more), omitting the DD field entirely -- pl_pesel_weighted()
+        # requires exactly 11 digits, so every real PESEL was structurally
+        # undetectable and the truncated 9-digit fragment got matched and
+        # misreported under an unrelated country's rule instead.
+        pattern: '\d{2}(0[1-9]|1[0-2]|2[1-9]|3[0-2]|4[1-9]|5[0-2]|6[1-9]|7[0-2]|8[1-9]|9[0-2])\d{2}\d{5}'
+        checksum: pl_pesel_weighted
+        confidenceKeywords: ["pesel"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Month field encodes century: month//20 -> {0:1900s,1:2000s,2:2100s,3:2200s,4:1800s}, actual month = month%20."
+
+  - country: SE
+    countryName: Sweden
+    rules:
+      - id: se.personnummer
+        displayName: Personnummer
+        category: national_id
+        pattern: '\d{6}[-+]\d{4}'
+        checksum: se_personnummer_luhn
+        confidenceKeywords: ["personnummer"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "'+' separator instead of '-' once the holder is 100+ years old. Sex: 9th digit, odd=M, even=F."
+
+  - country: "NO"
+    countryName: Norway
+    rules:
+      - id: no.fodselsnummer
+        displayName: Fødselsnummer
+        category: national_id
+        pattern: '\d{6}[ ]?\d{5}'
+        checksum: no_fodselsnummer_mod11
+        confidenceKeywords: ["fødselsnummer", "personnummer"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Century derived from a individual-number+year priority table (not a flat split): individual<500 -> 1900+YY; individual<750 & YY>=54 -> 1800+YY; individual<1000 & YY<40 -> 2000+YY; 900<=individual<1000 & YY>=40 -> 1900+YY. Sex: digit 9, odd=M, even=F."
+
+  - country: DK
+    countryName: Denmark
+    rules:
+      - id: dk.cpr
+        displayName: "CPR Number"
+        category: national_id
+        pattern: '\d{6}-?\d{4}'
+        checksum: dk_cpr_abolished
+        confidenceKeywords: ["cpr", "cpr-nummer"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Checksum ABOLISHED since 2007 for exhausted date cohorts — do not gate on it, format+date-plausibility only. Sex: last digit, odd=M, even=F."
+
+  - country: IE
+    countryName: Ireland
+    rules:
+      - id: ie.pps
+        displayName: "Personal Public Service (PPS) Number"
+        category: national_id
+        pattern: '\d{7}[A-W][ABHWTX]?'
+        checksum: mod23_pps
+        confidenceKeywords: ["pps", "personal public service"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "CORRECTED: the 2nd suffix letter, when present, DOES affect the checksum (weight 9) — do not implement it as decorative."
+
+  - country: GB
+    countryName: "United Kingdom"
+    rules:
+      - id: gb.nino
+        displayName: "National Insurance Number (NINO)"
+        category: national_id
+        pattern: '[A-CEGHJ-PR-TW-Z][A-CEGHJ-NPR-TW-Z]\d{6}[A-D]'
+        checksum: null
+        confidenceKeywords: ["nino", "national insurance"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "No checksum (confirmed by absence of a gb/nino.py module in python-stdnum). First/second letter never D,F,I,Q,U,V; second letter also never O. Reserved prefix pairs NEVER issued and must be excluded via a separate denylist check (RE2 can't express pairwise exclusion): BG, GB, KN, NK, NT, TN, ZZ."
+        sources: ["gov.uk HMRC internal manual NIM39110 (official)"]
+
+  - country: BE
+    countryName: Belgium
+    rules:
+      - id: be.nrn
+        displayName: "Rijksregisternummer (National Register Number)"
+        category: national_id
+        pattern: '\d{2}\.?\d{2}\.?\d{2}[-.]?\d{3}\.?\d{2}'
+        checksum: be_nrn_mod97
+        confidenceKeywords: ["rijksregisternummer", "numéro de registre national", "nrn"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        sources: ["ibz.rrn.fgov.be IT000 circular (official)"]
+
+  - country: AT
+    countryName: Austria
+    rules:
+      - id: at.svnr
+        displayName: Sozialversicherungsnummer
+        category: national_id
+        pattern: '\d{4}[ ]?\d{6}'
+        checksum: at_vnr_weighted
+        confidenceKeywords: ["sozialversicherungsnummer", "svnr"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Check digit is at POSITION 4 (unusual mid-number placement), format NNNC DDMMYY."
+
+  - country: PT
+    countryName: Portugal
+    rules:
+      - id: pt.nif
+        displayName: "Número de Identificação Fiscal (NIF)"
+        category: tax_id
+        pattern: '[1-9]\d{8}'
+        checksum: pt_nif_weighted
+        confidenceKeywords: ["nif", "número de identificação fiscal"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Leading-digit category table: 1,2=individual (HIGH), 5=company (HIGH); 3/6/8/9 disputed across sources (LOW) — don't hard-gate on category."
+
+      - id: pt.cartao_cidadao
+        displayName: "Cartão de Cidadão number"
+        category: national_id
+        pattern: '\d{8}[ -]?\d[ ]?[A-Z0-9]{2}\d'
+        checksum: pt_nif_weighted
+        checksumScope: "digit 9 only (same mod-11 weights as NIF, over the 8 civil-ID digits)"
+        confidenceKeywords: ["cartão de cidadão", "cartao de cidadao"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM
+        notes: "12 alphanumeric chars: 8 civil-ID digits + check digit 9 (MEDIUM-HIGH, NIF-style) + 2-char issuance-version code + final check digit (position 12). The FINAL check digit's algorithm is UNVERIFIED — no working primary-source formula located. Do not implement a checksum gate on position 12; shape-match only."
+
+  - country: GR
+    countryName: Greece
+    rules:
+      - id: gr.amka
+        displayName: "ΑΜΚΑ (AMKA — Social Security Number)"
+        category: national_id
+        pattern: '(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])\d{2}\d{4}\d'
+        checksum: luhn
+        confidenceKeywords: ["amka", "αμκα"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "No Greek-government primary source found — HIGH confidence rests on python-stdnum + secondary corroboration only."
+
+  - country: FI
+    countryName: Finland
+    rules:
+      - id: fi.hetu
+        displayName: "Henkilötunnus (HETU)"
+        category: national_id
+        pattern: '(0[1-9]|[12]\d|3[01])(0[1-9]|1[0-2])\d{2}[+UVWXYABCDEF-]\d{3}[0-9ABCDEFHJKLMNPRSTUVWXY]'
+        checksum: fi_hetu_mod31
+        confidenceKeywords: ["henkilötunnus", "hetu"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Century chars (2023 reform confirmed via DVV): 1800s='+'; 1900s='-' plus reform additions Y,X,W,V,U; 2000s='A' plus reform additions B,C,D,E,F. CORRECTED: the 2023 reform did NOT widen the 900-999 individual-number range — that's a separate, pre-existing rule."
+        sources: ["dvv.fi official press release"]
+
+  - country: CZ
+    countryName: "Czech Republic"
+    rules:
+      - id: cz.rodne_cislo
+        displayName: "Rodné číslo (Birth Number)"
+        category: national_id
+        pattern: '[0-9]{2}(0[1-9]|1[0-2]|2[1-9]|3[0-2]|5[0-9]|6[0-2]|7[1-9]|8[0-2])(0[1-9]|[12][0-9]|3[01])/?[0-9]{3,4}'
+        checksum: cz_sk_rc_mod11
+        confidenceKeywords: ["rodné číslo", "rodne cislo"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Month+50 if female; month+20/+70 for post-2004 (Zákon č.53/2004) date-pool overflow. Pre-1954-born citizens have a 9-digit RC with NO checksum. Pre-1985 exception (remainder-10 got check digit 0, ended per FSÚ reg. 2898/1985) is MEDIUM-HIGH confidence."
+
+  - country: SK
+    countryName: Slovakia
+    rules:
+      - id: sk.rodne_cislo
+        displayName: "Rodné číslo (Birth Number)"
+        category: national_id
+        pattern: '[0-9]{2}(0[1-9]|1[0-2]|2[1-9]|3[0-2]|5[0-9]|6[0-2])(0[1-9]|[12][0-9]|3[01])/?[0-9]{3,4}'
+        checksum: cz_sk_rc_mod11
+        confidenceKeywords: ["rodné číslo", "rodne cislo"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Identical base algorithm to Czech (its stdnum module literally imports Czech's). Did NOT adopt the Czech 2004 date-pool-overflow rule (separate legislature since 1993) — MEDIUM confidence, single secondary source."
+
+  - country: RO
+    countryName: Romania
+    rules:
+      - id: ro.cnp
+        displayName: "Cod Numeric Personal (CNP)"
+        category: national_id
+        pattern: '[1-9][0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])(0[1-9]|[1-4][0-9]|5[0-2]|70|8[0-3])[0-9]{3}[0-9]'
+        checksum: ro_cnp_weighted
+        confidenceKeywords: ["cnp", "cod numeric personal"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Sex/century leading digit: 1=M1900s,2=F1900s,3=M1800s,4=F1800s,5=M2000s,6=F2000s,7/8=resident foreigner,9=other."
+
+  - country: HU
+    countryName: Hungary
+    rules:
+      - id: hu.taj
+        displayName: "TAJ (Health Insurance Number)"
+        category: national_id
+        pattern: '[0-9]{3}[-\s]?[0-9]{3}[-\s]?[0-9]{2}[0-9]'
+        checksum: hu_taj_weighted
+        confidenceKeywords: ["taj"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+
+      - id: hu.szemelyi_azonosito
+        displayName: "Személyi azonosító"
+        category: national_id
+        pattern: '[0-9]{11}'
+        checksum: null
+        confidenceKeywords: ["személyi azonosító", "személyi szám"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: LOW
+        notes: "11 digits GYYMMDDXXXC. Renamed from 'személyi szám' after a 1991 Constitutional Court ruling against a single universal ID; still used internally. Described checksum algorithms are LOW confidence and absent from python-stdnum entirely — format-only detection recommended, no checksum gate."
+
+  - country: CH
+    countryName: Switzerland
+    rules:
+      - id: ch.ahv
+        displayName: "AHV/AVS Number"
+        category: national_id
+        pattern: '756\.?[0-9]{4}\.?[0-9]{4}\.?[0-9]{2}'
+        checksum: ch_ahv_ean13
+        confidenceKeywords: ["ahv-nummer", "avs", "sozialversicherungsnummer"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Fixed GS1 prefix 756. Digits 4-12 carry no meaning (post-2008 privacy redesign — no embedded DOB/sex, unlike most other European schemes)."
+
+  - country: BG
+    countryName: Bulgaria
+    rules:
+      - id: bg.egn
+        displayName: "ЕГН (EGN — Unified Civil Number)"
+        category: national_id
+        pattern: '[0-9]{2}(0[1-9]|1[0-2]|2[1-9]|3[0-2]|4[1-9]|5[0-2])[0-9]{2}[0-9]{3}[0-9]'
+        checksum: bg_egn_weighted
+        confidenceKeywords: ["egn", "единен граждански номер"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "CORRECTED: sex digit is EVEN=male/ODD=female (opposite of a common assumption); the century trick applies to the MONTH field, not the year field."
+
+  - country: HR
+    countryName: Croatia
+    rules:
+      - id: hr.oib
+        displayName: "OIB (Personal Identification Number)"
+        category: national_id
+        pattern: '[0-9]{11}'
+        checksum: iso7064_mod11_10_hr
+        confidenceKeywords: ["oib"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "NOT date-encoded — 10 randomly-assigned digits + 1 check digit (post-2009, replaced the JMBG-family scheme)."
+
+  - country: LU
+    countryName: Luxembourg
+    rules:
+      - id: lu.matricule
+        displayName: "National Identification Number (matricule)"
+        category: national_id
+        pattern: '(19|20)[0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{5}'
+        checksum: lu_matricule_dual
+        confidenceKeywords: ["matricule"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "13 digits, 4-digit year (unlike most European schemes' 2-digit year). Strongest-sourced entry in this whole file — official CCSS PDF with a reference Java implementation."
+        sources: ["ccss.public.lu official PDF"]
+
+  - country: SI
+    countryName: Slovenia
+    rules:
+      - id: si.emso
+        displayName: "EMŠO (Unique Master Citizen Number)"
+        category: national_id
+        pattern: '(0[1-9]|[12][0-9]|3[01])(0[1-9]|1[0-2])[0-9]{3}[0-9]{2}[0-9]{3}[0-9]'
+        checksum: si_emso_weighted
+        confidenceKeywords: ["emšo", "emso"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "CORRECTED century table: 8=1800s, 9=1900s, 0=2000s. Sex: block 000-499=M, 500-999=F."
+
+  - country: EE
+    countryName: Estonia
+    rules:
+      - id: ee.isikukood
+        displayName: Isikukood
+        category: national_id
+        pattern: '[1-8][0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{4}'
+        checksum: baltic_two_pass_mod11
+        confidenceKeywords: ["isikukood"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Leading digit: 1/2=1800s, 3/4=1900s, 5/6=2000s, 7/8=2100s (odd=M, even=F) — the 7/8=2100s case was missing from the original draft."
+
+  - country: LT
+    countryName: Lithuania
+    rules:
+      - id: lt.asmens_kodas
+        displayName: "Asmens kodas"
+        category: national_id
+        pattern: '[1-9][0-9]{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])[0-9]{4}'
+        checksum: baltic_two_pass_mod11
+        confidenceKeywords: ["asmens kodas"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Algorithm confirmed identical to Estonia's (its stdnum module imports Estonia's directly). Leading digit 9 = legal-entity/special code, skips birth-date validation."
+
+  - country: LV
+    countryName: Latvia
+    rules:
+      - id: lv.personas_kods_old
+        displayName: "Personas kods (pre-2017 format)"
+        category: national_id
+        pattern: '(0[1-9]|[12][0-9]|3[01])(0[1-9]|1[0-2])[0-9]{2}-[012][0-9]{4}'
+        checksum: lv_old_weighted
+        confidenceKeywords: ["personas kods"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: MEDIUM_HIGH
+        notes: "Still valid if the holder hasn't switched to the new format. Century digit: 0=19th, 1=20th, 2=21st century."
+
+      - id: lv.personas_kods_new
+        displayName: "Personas kods (post-2017 reform)"
+        category: national_id
+        pattern: '3[2-9][0-9]{9}'
+        checksum: null
+        confidenceKeywords: ["personas kods"]
+        severity: high
+        complianceTags: [GDPR]
+        sourceConfidence: HIGH
+        notes: "Reform effective 2017-07-01 (official PMLP source). 11 digits, no hyphen, no date encoding, no checksum. Leading digit fixed '3'; 2nd digit RANDOM 2-9 (corrected — not a fixed '2' as commonly oversimplified)."
+        sources: ["pmlp.gov.lv/en/change-personal-identity-number (official)"]

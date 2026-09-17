@@ -1,0 +1,193 @@
+# 02-passports.yaml — ICAO 9303 Machine Readable Zone (MRZ) + non-MRZ
+# (form-field) passport number formats.
+# See 00-manifest.yaml for the checksum algorithm registry.
+#
+# MRZ detection is the single highest-value addition to this ruleset: it's
+# a genuine international standard (ICAO Doc 9303, 8th ed. 2021, Parts
+# 3-6) with a real, documented check-digit algorithm — unlike national IDs,
+# which vary per country. Source: icao.int/sites/default/files/publications/
+# DocSeries/9303_p3_cons_en.pdf (Part 3, common specs + check-digit algorithm);
+# Part 4 (TD3), Part 5 (TD1), Part 6 (TD2) for field layouts. Cross-verified
+# against the mrz.codes open-source parser and Wikipedia's "Machine-readable
+# passport" article.
+
+apiVersion: yuzu.io/v1alpha1
+kind: PiiDetectionRuleSet
+metadata:
+  name: pii-passports
+  version: 0.2.0-draft
+  description: ICAO 9303 MRZ (TD1/TD2/TD3) and non-MRZ passport number formats.
+
+# ── ICAO 9303 MRZ field layouts ─────────────────────────────────────────
+# Recommended scanner design (mirrors real MRZ parsers and Microsoft
+# Purview): regex identifies a candidate 2- or 3-line block of the right
+# width/alphabet -> a separate function recomputes each field check digit
+# and the composite check digit -> only checksum-PASS results get high
+# finding confidence. RE2 cannot express the composite-check-digit
+# validation itself (it spans multiple fields) — that must be a post-match
+# code-level check, never embedded in the regex.
+mrzFormats:
+  - id: passport.mrz.td3
+    displayName: "MRZ — TD3 (standard passport booklet, 2 lines × 44 chars)"
+    # This top-level `checksum:` field is documentation only -- the
+    # embedding script (embed_pii_rules.py's normalize_passports())
+    # hardcodes "icao_mrz_td3_line2" for line2 specifically (the only
+    # line with a real composite check digit spanning multiple fields;
+    # see pii_checksum.hpp's mrz_td3_line2_valid()) and does not read
+    # this field. Named to match what's actually dispatched so a reader
+    # of this file isn't misled about which algorithm name is live.
+    checksum: icao_mrz_td3_line2
+    severity: critical
+    complianceTags: [GDPR, CCPA]
+    sourceConfidence: HIGH
+    fields:
+      line1:
+        - {pos: "1", len: 1, field: "Document type ('P')"}
+        - {pos: "2", len: 1, field: "Type variant / filler"}
+        - {pos: "3-5", len: 3, field: "Issuing country (ISO 3166-1 alpha-3)"}
+        - {pos: "6-44", len: 39, field: "Name: SURNAME<<GIVEN<NAMES"}
+      line2:
+        - {pos: "1-9", len: 9, field: "Passport number"}
+        - {pos: "10", len: 1, field: "Check digit (over line2 pos 1-9)"}
+        - {pos: "11-13", len: 3, field: "Nationality"}
+        - {pos: "14-19", len: 6, field: "Date of birth YYMMDD"}
+        - {pos: "20", len: 1, field: "Check digit (over line2 pos 14-19)"}
+        - {pos: "21", len: 1, field: "Sex (M/F/< or X)"}
+        - {pos: "22-27", len: 6, field: "Expiry date YYMMDD"}
+        - {pos: "28", len: 1, field: "Check digit (over line2 pos 22-27)"}
+        - {pos: "29-42", len: 14, field: "Personal number (optional, country-defined)"}
+        - {pos: "43", len: 1, field: "Check digit over pos 29-42 ('<' if field unused)"}
+        - {pos: "44", len: 1, field: "COMPOSITE check digit over line2 pos 1-10,14-20,22-43"}
+    pattern:
+      line1: '[A-Z][A-Z<][A-Z]{3}[A-Z<]{39}'
+      line2: '[A-Z0-9<]{9}[0-9][A-Z<]{3}[0-9]{6}[0-9][MFX<][0-9]{6}[0-9][A-Z0-9<]{14}[0-9<][0-9]'
+
+  - id: passport.mrz.td1
+    displayName: "MRZ — TD1 (ID-card-sized document, 3 lines × 30 chars)"
+    checksum: icao_mrz_check_digit
+    severity: critical
+    complianceTags: [GDPR, CCPA]
+    sourceConfidence: HIGH
+    fields:
+      line1:
+        - {pos: "1-2", len: 2, field: "Document code"}
+        - {pos: "3-5", len: 3, field: "Issuing state"}
+        - {pos: "6-14", len: 9, field: "Document number"}
+        - {pos: "15", len: 1, field: "Check digit (over line1 pos 6-14)"}
+        - {pos: "16-30", len: 15, field: "Optional data"}
+      line2:
+        - {pos: "1-6", len: 6, field: "Date of birth YYMMDD"}
+        - {pos: "7", len: 1, field: "Check digit (over line2 pos 1-6)"}
+        - {pos: "8", len: 1, field: "Sex"}
+        - {pos: "9-14", len: 6, field: "Expiry date YYMMDD"}
+        - {pos: "15", len: 1, field: "Check digit (over line2 pos 9-14)"}
+        - {pos: "16-18", len: 3, field: "Nationality"}
+        - {pos: "19-29", len: 11, field: "Optional data"}
+        - {pos: "30", len: 1, field: "COMPOSITE over L1[6-30]+L2[1-7]+L2[9-15]+L2[19-29]"}
+      line3:
+        - {pos: "1-30", len: 30, field: "Name: SURNAME<<GIVEN<NAMES"}
+    pattern:
+      line1: '[A-Z<]{2}[A-Z<]{3}[A-Z0-9<]{9}[0-9][A-Z0-9<]{15}'
+      line2: '[0-9]{6}[0-9][MFX<][0-9]{6}[0-9][A-Z<]{3}[A-Z0-9<]{11}[0-9]'
+      line3: '[A-Z<]{30}'
+
+  - id: passport.mrz.td2
+    displayName: "MRZ — TD2 (2 lines × 36 chars)"
+    checksum: icao_mrz_check_digit
+    severity: critical
+    complianceTags: [GDPR, CCPA]
+    sourceConfidence: HIGH
+    fields:
+      line1:
+        - {pos: "1-2", len: 2, field: "Document code"}
+        - {pos: "3-5", len: 3, field: "Issuing state"}
+        - {pos: "6-36", len: 31, field: "Name"}
+      line2:
+        - {pos: "1-9", len: 9, field: "Document number"}
+        - {pos: "10", len: 1, field: "Check digit (over line2 pos 1-9)"}
+        - {pos: "11-13", len: 3, field: "Nationality"}
+        - {pos: "14-19", len: 6, field: "Date of birth"}
+        - {pos: "20", len: 1, field: "Check digit (over line2 pos 14-19)"}
+        - {pos: "21", len: 1, field: "Sex"}
+        - {pos: "22-27", len: 6, field: "Expiry date"}
+        - {pos: "28", len: 1, field: "Check digit (over line2 pos 22-27)"}
+        - {pos: "29-35", len: 7, field: "Optional data"}
+        - {pos: "36", len: 1, field: "COMPOSITE over L2[1-10]+L2[14-20]+L2[22-35]"}
+    pattern:
+      line1: '[A-Z<]{2}[A-Z<]{3}[A-Z<]{31}'
+      line2: '[A-Z0-9<]{9}[0-9][A-Z<]{3}[0-9]{6}[0-9][MFX<][0-9]{6}[0-9][A-Z0-9<]{7}[0-9]'
+
+# ── Non-MRZ passport number formats (form field / database column) ─────
+# No country in this section publishes a checksum for its plain (non-MRZ)
+# passport number — checksum validation is only reliably available via
+# the MRZ above. Weight these lower than an MRZ match in scoring, and
+# require a keyword-proximity hit ("passport", "passport no.", localized
+# equivalents) to avoid false positives against generic alphanumeric IDs.
+nonMrzFormats:
+  - country: US
+    pattern: '([0-9]{9}|[A-Z][0-9]{8})'
+    notes: "9 numeric digits (pre-2021 books) OR 1 letter + 8 digits (Next-Gen, 2021+); passport CARDS start with 'C'."
+    sourceConfidence: MEDIUM
+
+  - country: GB
+    pattern: '[0-9]{9}'
+    sourceConfidence: HIGH
+
+  - country: CN
+    pattern: 'E([0-9]{8}|[A-HJ-NP-Z][0-9]{7})'
+    notes: "New (post-Apr-2017): E + 1 letter (excl. I,O) + 7 digits. Old: E + 8 digits."
+    sourceConfidence: MEDIUM
+
+  - country: IN
+    pattern: '([A-Z][0-9]{7}|[A-Z]{2}[0-9]{6})'
+    notes: "Standard: 1 letter + 7 digits. Newer 2025 e-passports reportedly 2 letters + 6 digits."
+    sourceConfidence: MEDIUM
+
+  - country: ID
+    pattern: '[A-Z]{1,2}[0-9]{6,7}'
+    sourceConfidence: MEDIUM
+
+  - country: PK
+    pattern: '[A-Z]{2}[0-9]{7}'
+    sourceConfidence: MEDIUM_HIGH
+
+  - country: BR
+    pattern: '[A-Z]{2}[0-9]{6}'
+    sourceConfidence: MEDIUM_HIGH
+
+  - country: NG
+    pattern: '([A-Z]{2}[0-9]{7}|[A-Z][0-9]{8})'
+    sourceConfidence: LOW
+    notes: "Sources disagree on exact format — no official NIS spec found. Weight this entry low or exclude from strict/high-precision deployments."
+
+  - country: BD
+    pattern: '[A-Z]{2}[0-9]{7}'
+    sourceConfidence: LOW
+    notes: "Secondary blogs only — no official MOFA spec located."
+
+  - country: RU
+    pattern: '[0-9]{2}[ -]?[0-9]{7}'
+    notes: "International/travel passport only — distinct from the internal domestic passport."
+    sourceConfidence: MEDIUM_HIGH
+
+  - country: JP
+    pattern: '[A-Z]{2}[0-9]{7}'
+    sourceConfidence: HIGH
+
+  - country: DE
+    pattern: '(?i)[cfghjk][0-9cfghjklmnprtvwxyz]{8}[0-9]?d?'
+    notes: "9-11 chars: leading letter restricted to {C,F,G,H,J,K}; body chars restricted to {0-9,C,F,G,H,J,K,L,M,N,P,R,T,V,W,X,Y,Z} (0,O,I etc. excluded); optional trailing check digit + optional 'D'."
+    sourceConfidence: HIGH
+
+  - country: FR
+    pattern: '[0-9]{2}[A-Z]{2}[0-9]{5}'
+    sourceConfidence: HIGH
+
+  - country: IT
+    pattern: '[A-Z0-9]{2}[0-9]{7}'
+    sourceConfidence: HIGH
+
+  - country: KR
+    pattern: '[MSROD]([0-9]{8}|[0-9]{3}[A-Z][0-9]{4})'
+    notes: "Leading letter restricted to {M,S,R,O,D}; then either 8 digits, or 3 digits+1 letter+4 digits."
+    sourceConfidence: HIGH

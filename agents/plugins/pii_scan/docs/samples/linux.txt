@@ -1,0 +1,12 @@
+captured: linux not built · container · 2026-09-16 · not measured (capture did not complete) · leg-hash pending
+== action=scan
+[not captured] agent-context: this plugin was developed and built on Windows only in this environment — no Linux build exists to capture against. See docs/samples/windows.txt for why even the Windows leg's capture did not complete.
+
+== action=enable_realtime
+[not captured] agent-context: no Linux build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+
+== action=disable_realtime
+[not captured] agent-context: no Linux build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+
+== action=scan_path
+[not captured] agent-context: no Linux build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.
