@@ -26,8 +26,6 @@
  * every host" rule), even though no Windows caller exists today.
  */
 
-#include <yuzu/agent/spark.hpp> // yuzu::agent::ServiceRunState
-
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -104,20 +102,8 @@ parse_launchctl_list(std::span<const std::string> lines) {
     return out;
 }
 
-/// Resolve the run state of one label from a set of decoded rows: listed
-/// with a pid -> Running; listed without a pid, or the label is absent from
-/// `rows` entirely -> Stopped. Never Paused -- launchd (like systemd) has no
-/// analogue to the Windows SCM's SERVICE_PAUSED terminal state (see
-/// yuzu/agent/spark.hpp's ServiceRunState doc comment, which states this for
-/// Linux and is extended here to macOS by the same reasoning).
-[[nodiscard]] inline yuzu::agent::ServiceRunState
-launchd_state_for(std::span<const LaunchctlRow> rows, std::string_view label) noexcept {
-    for (const auto& row : rows) {
-        if (row.label == label)
-            return row.pid.has_value() ? yuzu::agent::ServiceRunState::Running
-                                        : yuzu::agent::ServiceRunState::Stopped;
-    }
-    return yuzu::agent::ServiceRunState::Stopped; // absent from the snapshot -- not running
-}
-
 } // namespace yuzu::shared
+
+// launchd_state_for() moved to agents/core/include/yuzu/agent/launchd_state.hpp
+// (A0 governance fix round: agents/shared/ is a deliberate zero-dependency
+// leaf, and that function needs yuzu::agent::ServiceRunState from spark.hpp).
