@@ -30,30 +30,41 @@ read line-by-line.)
 
 ```yaml
 name: string                      # unique per docs/postgres-store-playbook.md UNIQUE constraint
-version: uint64                   # server-bumped on every update; not author-set
+                                   # version is NOT authored in yaml_source — see note below
 enabled: bool
-os_target: [windows|linux|macos]  # filters server-side before push; never rides the wire
+os_target: [windows|linux|darwin] # filters server-side before push; never rides the wire; the
+                                   # agent's own platform string is "darwin", never "macos"
 reflexes:
   - reflex_id: string             # unique WITHIN this set (not globally)
     name: string
     enabled: bool
     spark:
-      type: file|service|plist|process|disk|interval|startup
+      type: file|service|disk|interval|startup|registry   # open set — see "Spark types" above;
+                                                            # plist/process are PLANNED (A6/A7)
       params: {..type-specific..}   # schema per reflex_schema_registry.cpp spark_types()
     reactions:                      # sequential, <= 4 deep
       - plugin: string
         action: string
         params: {..}
-        gate: always|on_success|on_failure   # first Reaction MUST be "always"
+        gate: always|on_success|on_failure   # first Reaction MUST be "always"; see "Reaction
+                                              # success and timeout" below for what on_success means
         timeout_ms: uint32     # default 10_000, max 120_000
         capture_output: bool   # default false; captured output capped at 4 KiB
     cooldown_ms: uint32         # steady_clock-based per-reflex_id debounce
-    max_per_hour: uint32        # hourly cap per reflex_id (HourlyRateLimiter)
-    fire_on_arm: bool           # default false — an already-true condition fires on arm only if set
+    max_per_hour: uint32        # hourly cap per reflex_id (reuses the existing DexRateLimiter
+                                 # primitive, include/yuzu/agent/dex_rate_limiter.hpp)
+    fire_on_arm: bool           # default false; see "Reaction success and timeout" below for the
+                                 # startup/interval special case
 assignment:
   - group_id: string
-    disposition: string         # same vocabulary as Baseline assignment
+    disposition: include|exclude   # the closed Baseline-assignment vocabulary (baseline_store.hpp)
 ```
+
+**`version` is server-bumped, never author-set, and is stripped from (or rejected in) authored
+`yaml_source`** on submit — it is not part of the round-tripped, YAML-authoritative content D7
+describes; a submitted `yaml_source` that includes a `version` key is either ignored (stripped
+before storage) or rejected outright (R4's implementation picks one and is consistent about it),
+never silently honored as an author-supplied version number.
 
 Bounds, enforced by the R4 validator (`validate_reflex_set`): **at most 32 reflexes per set**, each
 chain **at most 4 Reactions deep**, `reflex_id` unique within the set, `os_target` drawn from the
@@ -63,6 +74,13 @@ closed vocabulary above.
 describes "so many chances over so much time, then act, or don't" as the target shape, but v1 ships
 only the cooldown/hourly-cap primitives above. A future escalation-policy field is additive to this
 grammar; do not treat its absence here as an oversight.
+
+**`fire_on_arm` on a monostate spark type (`interval`, `startup`, and — with no state to compare —
+effectively always-on for `disk`'s threshold check) fires the Reflex once, immediately, the first
+time it is armed** (there is no "prior state" for these types to compare against, so "already true
+at arm time" is trivially the arm event itself); on an edge-producing type (`service`, `plist`,
+`process`) it fires only if the persisted condition is already in the "true" state at arm time,
+exactly as described earlier in this document.
 
 ## Substitution tokens (closed list)
 
@@ -104,6 +122,43 @@ stdout/stderr) is the only per-Reaction content persisted to `reflex_outcomes`; 
 **never** written to the journal or the outcome event — only a basename ever appears in any
 persisted record, matching A7's privacy posture and D10's "no SID/username/user path" rule.
 
+## Spark types and per-type facts (open set)
+
+The Reflex grammar's `spark.type` is an **open set published server-side by
+`reflex_schema_registry::spark_types()`** — it does **not** mirror
+`agents/core/include/yuzu/agent/spark.hpp`'s `SparkType` enum verbatim, and the two must never be
+assumed identical; a future type lands in both together (H2/G9 cross-check doctrine), and this
+document is updated in the same PR that lands it. As of this document, the set is:
+
+- **Shipped today** (present in `SparkType`, agent-side): `file`, `service`, `disk`, `interval`,
+  `startup`, `registry` (Windows-only, gated by `os_target: windows`).
+- **Planned, not yet landed** — tracked by the macOS Spark/Reflex programme: `plist` (macOS, lands
+  at A6), `process` (ES-backed, lands at A7). A Reflex referencing either is a forward declaration
+  the schema registry accepts today only if the underlying slice has actually shipped; until then
+  they are absent from the published set, not silently accepted-but-inert.
+
+**`{{spark.key}}` is the Reflex-authored watch key — it is NOT `spark_key()`'s internal wire
+encoding.** `spark_key()` (agent-side) returns an opaque `"<type>|<params>"` string used purely for
+watcher-table indexing; `{{spark.key}}` is a **per-type target accessor** over the Reflex's own
+`spark.params` (e.g. the `path` param on a `file` spark, the `label` param on a `service` spark) —
+the human-authored value, never the internal encoding. R5's `resolve_facts` implements the
+per-type accessor explicitly.
+
+**`{{spark.edge}}` is a closed, per-type enumeration — most types produce none at all:**
+
+| Spark type | `{{spark.edge}}` values | Notes |
+|---|---|---|
+| `service` | `started` \| `stopped` \| `paused` | |
+| `disk` | `breach` \| `recovery` | a threshold crossing, not a state name |
+| `file` | *(none)* | `SparkData` is monostate for this type; no edge fact exists |
+| `registry` | *(none)* | monostate |
+| `interval` / `startup` | *(none)* | monostate; only `{{spark.key}}` is available |
+| `plist` (planned, A6) | `changed` | provisional, confirmed when A6 lands |
+| `process` (planned, A7) | `started` \| `exited` | provisional, confirmed when A7 lands |
+
+A Reaction referencing `{{spark.edge}}` on a monostate type is a **validation error** at R4 — no
+type-appropriate value exists to substitute, never a silently-empty string.
+
 ## Safety chokepoint — `dangerous_reactions_in_spec()`
 
 A **sibling chokepoint** to `dangerous_enforce_in_spec` (`docs/yuzu-guardian-design-v1.1.md` §24) —
@@ -140,6 +195,18 @@ This mirrors existing prior art: Guardian's own in-thread remediation and the pr
 either — authorization for agent-local, pre-declared automation lives at content-authoring/deploy
 time, not at execution time. This is strictly about *execution*; the server-originated push that
 delivers the content is a dispatch like any other, below.
+
+### Reaction success and timeout
+
+A Reaction's **success**, for `gate: on_success`/`on_failure` chain evaluation, is the plugin
+action's own **typed result** (its structured status, not a bare process exit code) resolving to a
+non-error outcome — matching how every other plugin-dispatch result is already judged elsewhere on
+the platform, never a Reflex-specific redefinition. **A timeout counts as failure** — a Reaction
+that exceeds `timeout_ms` never gate-admits a subsequent `on_success` step, and the chain's terminal
+outcome for that Reaction is `timed_out`, distinct from both `completed` and an in-plugin `failed`.
+The consent-gate's stricter "affirmative response TOKEN" rule (see "Consent gate" above) is a
+*further* restriction specific to `interaction.*` Reactions gating a *dangerous* Reaction — it is
+not a redefinition of "success" for ordinary chain gating in general, which this paragraph defines.
 
 ## Two-person approval (D9)
 
@@ -275,8 +342,26 @@ it is never repurposed as `<set_id>/<reflex_id>` (that would resurrect exactly t
 rule-id-squatting pattern ADR-0021 Decision 6 retires `family` in order to *stop* doing). `set_id`
 and `reflex_id` are instead **additive fields on `GuaranteedStateEvent`** (own field numbers,
 alongside `family`), carried directly rather than encoded into an overloaded string. `event_type` is
-drawn from `reflex.{fired,completed,failed,aborted,suppressed_sampled}`, `event_id` is the
+drawn from `reflex.{fired,completed,failed,timed_out,aborted,suppressed_sampled}`, `event_id` is the
 correlation id below.
+
+**`severity`/`guard_type`/`guard_category` on a `family=="reflex"` row.** Unlike the
+`rule_id="__observation__"` DEX sentinel — whose own doc comment states its severity-enrich is a
+no-op specifically because it has no rule to enrich against — a Reflex row is **not** exempted from
+these fields; the ingest router populates `severity` from the fired Reaction's own classification
+(a dangerous Reaction's `fired`/`failed` outcome carries at least `medium`; a non-dangerous
+Reaction's outcome carries `low`), `guard_type` is the literal string `"reflex"` (distinguishing it
+in any query/dashboard that groups by `guard_type` from a real Guardian guard type like
+`"registry"`/`"scm"`), and `guard_category` is `"event"` (Reflex sparks are event-driven, never a
+periodic condition check in the Guardian sense).
+
+**`suppressed_total`'s source is the agent-local counter, not a server-side derivation from sampled
+`suppressed_sampled` events.** The two would disagree if `suppressed_total` were instead computed
+server-side by counting `suppressed_sampled` events — sampling means most suppressions never emit an
+event at all (that is the point of sampling), so a server-derived count would systematically
+undercount. `suppressed_total` in `ReflexStatus`/`ReflexSetStatus` is the agent's own running
+counter of every suppression, journal-persisted (see "Generation, undeploy, and push semantics"
+above), independent of how many of those suppressions were *also* sampled into an emitted event.
 
 **Upgrade ordering is server-before-agent.** The server must accept `family` (and the additive
 `set_id`/`reflex_id` fields) before any agent build that sets them is rolled out — an old server
