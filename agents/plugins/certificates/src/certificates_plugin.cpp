@@ -1518,7 +1518,7 @@ ConsoleUserResolution resolve_console_user(
     // cached), so a single test process can point successive dispatches at
     // different fixtures.
     if (const char* override_user = std::getenv("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE");
-        override_user != nullptr) {
+        override_user != nullptr && override_user[0] != '\0') {
         username = override_user;
     } else {
         // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
