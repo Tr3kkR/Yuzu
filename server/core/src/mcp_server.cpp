@@ -1453,7 +1453,11 @@ static const ToolDef kTools[] = {
      R"j("cpu_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("commit_pct":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
      R"j("disk_lat_ms":{"type":["object","null"],"properties":{"avg":{"type":"number"},"p50":{"type":"number"},"p90":{"type":"number"},"max":{"type":"number"},"n":{"type":"integer"}}},)j"
-     R"j("reporting":{"type":"integer"},"windows_online":{"type":"integer"})j"
+     R"j("reporting":{"type":"integer"},"windows_online":{"type":"integer"},)j"
+     // Additive per-OS fields (C1) — appended after the original five, which
+     // stay untouched including "required" (unchanged on purpose).
+     R"j("linux_online":{"type":"integer"},"macos_online":{"type":"integer"},)j"
+     R"j("reporting_windows":{"type":"integer"},"reporting_linux":{"type":"integer"},"reporting_macos":{"type":"integer"})j"
      R"j(},"required":["cpu_pct","commit_pct","disk_lat_ms","reporting","windows_online"]})j"},
 
     {"get_dex_perf_cohorts",
@@ -14189,6 +14193,12 @@ McpServer::HandlerFn McpServer::build_handler(
                                   .raw("disk_lat_ms", stat_json(now.disk_lat))
                                   .add("reporting", now.reporting)
                                   .add("windows_online", now.windows_online)
+                                  // Additive per-OS fields (C1); trailing.
+                                  .add("linux_online", now.linux_online)
+                                  .add("macos_online", now.macos_online)
+                                  .add("reporting_windows", now.reporting_windows)
+                                  .add("reporting_linux", now.reporting_linux)
+                                  .add("reporting_macos", now.reporting_macos)
                                   .str();
                 } else if (tool_name == "get_dex_perf_cohorts") {
                     const auto key = param_str(args, "key", kDexDefaultCohortKey);
