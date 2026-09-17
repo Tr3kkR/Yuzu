@@ -658,6 +658,113 @@ TEST_CASE("from-instruction-result: unknown instruction_id 404s",
     REQUIRE(h.calls.empty());
 }
 
+// #4373-class fix, sibling-handler closure (flagged by governance Gate 2's
+// mandatory sibling-handler sweep, PR#4373 follow-on): from-instruction-result
+// had NO bound at all on instruction_id/params at creation time, unlike
+// re-eval which this PR bounds against a stored payload - closing that
+// smuggle-then-reeval path left the DIRECT one-step path open. These four
+// mirror re-eval's own bound-check coverage; each asserts the specific
+// message, since a bare 400+no-dispatch alone doesn't distinguish the NEW
+// bound check from the pre-existing "unknown instruction_id" 404 fallback's
+// neighbouring 400 paths (missing/empty instruction_id, invalid JSON).
+
+TEST_CASE("from-instruction-result: an oversized instruction_id is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(257, 'q');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an over-keyed params object is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params[std::format("k{}", i)] = "v";
+    body["params"] = params;
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized params key is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = {{std::string(257, 'k'), "v"}};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params key exceeds 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized params value is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = {{"path", std::string(65537, 'z')}};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: exact-boundary params are accepted and dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(256, 'q');  // wrong id, but within bound
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 32; ++i)
+        params[std::format("{:0<256}", std::format("k{}", i))] = std::string(65536, 'v');
+    body["instruction_id"] = iid;
+    body["params"] = params;
+    int status = 0;
+    h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+}
+
 TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
           "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

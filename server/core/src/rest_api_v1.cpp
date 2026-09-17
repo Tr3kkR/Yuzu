@@ -1466,7 +1466,7 @@ const std::string& openapi_spec() {
       "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), or dispatch unavailable/failed"}}}
     },
     "/result-sets/from-instruction-result": {
-      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
+      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
     },
     "/result-sets/{id}": {
       "get": {"summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped (non-owner is indistinguishable from missing — existence-oracle-safe 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
@@ -9572,6 +9572,56 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
                           return;
                       }
+                      // #4373-class fix: this route had no bound at all on instruction_id
+                      // or params (unlike the sql-bearing from-tar-query route two producers
+                      // up, which caps sql at creation time) - an ordinary authenticated
+                      // caller with plain Execution:Execute could dispatch fleet-wide with
+                      // an oversized instruction_id or an over-keyed/oversized params object
+                      // in ONE step, no smuggle-via-create-then-reeval needed. Same caps
+                      // MCP's create_result_set_from_instruction_result already enforces at
+                      // creation time; checked here ahead of the instruction_store gate
+                      // below, since a malformed/oversized field is a permanent client error
+                      // regardless of backend availability.
+                      if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
+                          rs_err(res, 400,
+                                 std::format(
+                                     "RESULT_SET_BAD_REQUEST: instruction_id must be at most {} "
+                                     "bytes",
+                                     yuzu::server::mcp::kInstructionIdMaxLen));
+                          return;
+                      }
+                      if (body.contains("params") && body["params"].is_object()) {
+                          const auto& p = body["params"];
+                          if (p.size() > yuzu::server::mcp::kExecInstrParamCountMax) {
+                              rs_err(res, 400,
+                                     std::format(
+                                         "RESULT_SET_BAD_REQUEST: params must have at most {} "
+                                         "keys",
+                                         yuzu::server::mcp::kExecInstrParamCountMax));
+                              return;
+                          }
+                          for (const auto& [k, v] : p.items()) {
+                              if (k.size() > yuzu::server::mcp::kExecInstrParamKeyMaxLen) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: a params key exceeds {} "
+                                             "bytes",
+                                             yuzu::server::mcp::kExecInstrParamKeyMaxLen));
+                                  return;
+                              }
+                              const std::size_t vlen =
+                                  v.is_string() ? v.get_ref<const std::string&>().size()
+                                                : v.dump().size();
+                              if (vlen > yuzu::server::mcp::kExecInstrParamValueMaxLen) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: a params value exceeds {} "
+                                             "bytes",
+                                             yuzu::server::mcp::kExecInstrParamValueMaxLen));
+                                  return;
+                              }
+                          }
+                      }
                       // ADR-0058: get_definition now returns std::expected — distinguish a
                       // genuine DB error (503) from "no such instruction" (404, unchanged).
                       auto def_result = instruction_store->get_definition(instruction_id);
@@ -9699,10 +9749,11 @@ void RestApiV1::register_routes(
                                   : "";
                           // #4373 fix: re-apply the SAME caps MCP's
                           // create_result_set_from_instruction_result enforces at creation
-                          // time (REST's own from-instruction-result route does not - this
-                          // specific bound gap is untracked; #4406 is a related but distinct
-                          // type-confusion defect on the same two REST creation routes), and
-                          // the SAME fix MCP's reevaluate_result_set already got (PR #4394) - checked
+                          // time (REST's own from-instruction-result route now enforces the
+                          // same caps too, added above in this same change; #4406 is a
+                          // related but distinct type-confusion defect on the two REST
+                          // creation routes), and the SAME fix MCP's reevaluate_result_set
+                          // already got (PR #4394) - checked
                           // here ahead of the instruction_store gate below, since a
                           // malformed/oversized field is a permanent client error
                           // regardless of backend availability. `orig` may have been minted
