@@ -285,9 +285,9 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
     // waiter_abandoned, or the callback published first and the waiter never reaches
     // this. A timeout while the claim is still Dispatching (mid-submit()) is waiter
     // abandonment too - never erase a claim the dispatcher still expects to find.
-    release_claim_index_locked(*claim);
     const std::string reason = stopping ? "stopping" : "arm timed out";
     if (claim->dispatch == ClaimDispatch::Queued) {
+        release_claim_index_locked(*claim);
         // Never dispatched: queue-wait expiry. Erase it outright; nothing is in flight.
         if (const auto eit = claims_.find(key); eit != claims_.end()) {
             auto& fifo = eit->second.fifo;
@@ -302,6 +302,29 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         }
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutQueued;
     } else {
+        // Adversarial-review fix (rung 9c PR-5d follow-up, Blocker 2): the ONLY
+        // fallible step in this branch - wedged_by_rule_.insert_or_assign()'s
+        // node allocation - now runs FIRST, before any irreversible mutation
+        // (release_claim_index_locked, waiter_abandoned, end). Previously the
+        // irreversible steps ran first: a throw from the insert (bad_alloc)
+        // left the claim already unreachable through index_/rules_ AND through
+        // detach_rule_locked()'s Case 0 (which deliberately excludes a
+        // waiter_abandoned claim) with no locator entry either - the only
+        // structure that could still find and deactivate it. A withdrawal of
+        // that exact rule would then silently no-op, and its eventual late
+        // success would be ADOPTED (is_retained_wedge()/rg->active both still
+        // read true, neither was ever touched) for a rule no longer desired -
+        // fail-open. Doing the fallible step first means a throw here leaves
+        // the claim completely untouched (still genuinely Dispatching, still
+        // index-held, still reachable the ordinary way) - the next maintenance
+        // tick simply retries, matching this file's own commit-or-rollback
+        // discipline (see on_arm_complete's own pre-sizing comment) rather than
+        // committing a partial, unrecoverable transition.
+        if (!stopping) {
+            wedge_locator_fault_here_for_test(); // seam: "the locator insertion throws"
+            wedged_by_rule_.insert_or_assign(claim->rule_id, claim); // may throw - claim untouched if so
+        }
+        release_claim_index_locked(*claim);
         claim->waiter_abandoned = true; // the completion callback finishes this episode
         // cpp-safety SHOULD (#4221, rung 9c PR-5c follow-up governance): when
         // `stopping` is true this writes ClaimEnd::Stopped DIRECTLY, bypassing
@@ -327,12 +350,12 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         // rung 9c PR-5d (concern 1): a genuine (non-stopping) wedge is the ONLY
         // case adoption ever applies to - R5.5's stopping-time disarm is
         // unconditional and never consults this map (late_adopt below requires
-        // !stopping_). Recorded here, at the exact instant `end` settles to
-        // WaiterTimedOutDispatched, so wedged_by_rule_ and is_retained_wedge()
-        // agree by construction rather than by a second, separately-maintained
-        // condition.
-        if (!stopping)
-            wedged_by_rule_.insert_or_assign(claim->rule_id, claim);
+        // !stopping_). The map entry itself was already inserted above, before
+        // any of this branch's irreversible mutation - by the time `end`
+        // settles to WaiterTimedOutDispatched here, wedged_by_rule_ and
+        // is_retained_wedge() already agree, atomically, rather than by a
+        // second, separately-maintained condition that could observe one
+        // updated and not the other.
     }
     if (!claim->outcome)
         claim->outcome = std::unexpected(reason);
@@ -3807,6 +3830,10 @@ void GuardianSparkRuntime::set_index_remove_fault_for_test(bool on) noexcept {
 
 void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {
     detach_fault_for_test_.store(on);
+}
+
+void GuardianSparkRuntime::set_wedge_locator_fault_for_test(bool on) noexcept {
+    wedge_locator_fault_for_test_.store(on);
 }
 
 void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hook) {

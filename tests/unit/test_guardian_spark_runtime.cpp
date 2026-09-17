@@ -8527,6 +8527,60 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2), coupling proof: an identical (rule_id, sp
     CHECK(b->arm_entries.load() == 1);
 }
 
+TEST_CASE("adversarial-review Blocker 2 (rung 9c PR-5d follow-up): a throw from the "
+          "wedged_by_rule_ locator insertion during abandon_claim_locked leaves the "
+          "claim completely untouched - not partially abandoned with no way for "
+          "withdrawal to ever find it again",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key = spark_key(file_spec("/a"));
+
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                               file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    rt->set_wedge_locator_fault_for_test(true);
+    REQUIRE_THROWS_AS(rt->expire_overdue_claims(), std::bad_alloc);
+
+    // Nothing durable moved: the claim is still exactly what it was before the
+    // failed abandon attempt - still Pending (never wedged), still occupying its
+    // key's FIFO slot, still findable the ordinary way. This is the whole point
+    // of the fix: previously the irreversible steps (index release,
+    // waiter_abandoned, end) ran BEFORE the fallible insertion, so a throw here
+    // left a partially-abandoned, unreachable-by-withdrawal claim behind.
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Pending);
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+    CHECK(rt->wedged_refusals() == 0);
+    CHECK(rt->wedged_reobservations() == 0);
+
+    // Withdrawal works normally right now - proof the claim was never made
+    // unreachable. (Pre-fix, this same detach_rule() call after a failed insert
+    // would have silently no-op'd: Case 0 excludes waiter_abandoned claims, and
+    // there was no locator entry either.)
+    rt->detach_rule("r1");
+    CHECK(rt->claim_queue_depth_for_test(key) == 1); // still present - it hasn't
+                                                      // resolved yet, only withdrawn
+
+    // The eventual late success is disarmed, exactly like any other withdrawn
+    // rule's late success - never adopted, which is what the pre-fix fail-open
+    // path would have allowed.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+}
+
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_id) "
           "onto a Wedged key is refused immediately, synchronously, with no new "
           "claim ever queued",
