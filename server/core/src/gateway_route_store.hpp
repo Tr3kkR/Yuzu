@@ -58,52 +58,80 @@
 /// `announce_connected` stays the sole writer of it); `register_fresh` NULLs
 /// it on a winning re-register for the same reason it NULLs `cluster_id`/
 /// `gateway_node` (4.2b Task A). `deregister`'s tombstone predicate is
-/// ASYMMETRIC, not the naive symmetric form:
-/// `stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')` — an
-/// UNSTAMPED (legacy, empty `$3`) incoming DISCONNECTED may only tear down a
-/// row whose STORED `stream_home_id` is also NULL/unstamped. This closes the
-/// SESSION GUARDS LIMIT above for a rolling gateway upgrade (mixed-version
-/// cluster is the NORMAL state of one): an old-build gateway node's late
-/// DISCONNECTED — unstamped — must not tombstone a new-build node's stamped
-/// re-home reusing the same session id, but a genuinely-matching stamped
-/// DISCONNECTED must still tear down its own stamped row, and a legacy
-/// DISCONNECTED against a legacy (never-stamped) row must still behave
-/// exactly as before (backward compatibility during a fleet-wide gateway
-/// upgrade with zero home-id-aware gateways yet). The naive symmetric
+/// `stream_home_id IS NULL OR stream_home_id = $3` — an EMPTY/NULL stored
+/// home ADMITS ANY incoming `$3` (stamped or not); a STAMPED stored home
+/// requires an EXACT match. This closes the SESSION GUARDS LIMIT above for a
+/// rolling gateway upgrade (mixed-version cluster is the NORMAL state of
+/// one): an old-build gateway node's late DISCONNECTED — unstamped — must
+/// not tombstone a new-build node's stamped re-home reusing the same session
+/// id (a stamped `$3` never satisfies `stream_home_id IS NULL` against a
+/// stamped stored value, and `stream_home_id = $3` needs an exact match), but
+/// a genuinely-matching stamped DISCONNECTED must still tear down its own
+/// stamped row, and a legacy DISCONNECTED against a legacy (never-stamped,
+/// stored-NULL) row must still behave exactly as before. The naive symmetric
 /// predicate (`$3 = '' OR stream_home_id = $3`) would let ANY unstamped
 /// DISCONNECTED tear down ANY row regardless of its stamped home id,
-/// re-opening exactly this race. `reap_stale_routes`'s tombstone sweep NULLs
-/// `stream_home_id` alongside `session_id`/`lease_until`/`cluster_id`/
-/// `gateway_node` for the same reason: a tombstoned row must have a fully
-/// cleared placement. CLOSED under today's shipped-gateway producer
-/// invariant (#4324 task 3/3): the RPC handler (`gateway_service_impl.cpp`'s
-/// `NotifyStreamStatus`) now threads the caller's REAL `stream_home_id` into
-/// both `announce_connected` and `deregister`, AND resolves an identical
-/// asymmetric fence against `AgentRegistry`'s in-memory
-/// `gateway_stream_home_id` — resolved ONCE, at the top of the DISCONNECTED
-/// branch, before ANY of the registry-clear/store-deregister/session-map-erase
-/// effects run (all-or-nothing; see that handler's own comment for why
-/// splitting them is a correctness bug, not a style choice). A gateway build
-/// predating #4324 (empty `stream_home_id` on every call) is unaffected —
-/// both sides of the asymmetric predicate default to empty, which the "both
-/// are legacy" clause always admits.
+/// re-opening exactly this race — do not "fix" this predicate back to that
+/// shape. `reap_stale_routes`'s tombstone sweep NULLs `stream_home_id`
+/// alongside `session_id`/`lease_until`/`cluster_id`/`gateway_node` for the
+/// same reason: a tombstoned row must have a fully cleared placement. CLOSED
+/// under today's shipped-gateway producer invariant (#4324 task 3/3): the
+/// RPC handler (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) threads
+/// the caller's REAL `stream_home_id` into both `announce_connected` and
+/// `deregister`, AND resolves an identical fence against `AgentRegistry`'s
+/// in-memory `gateway_stream_home_id` — resolved ONCE, at the top of the
+/// DISCONNECTED branch, before ANY of the registry-clear/store-deregister/
+/// session-map-erase effects run (all-or-nothing; see that handler's own
+/// comment for why splitting them is a correctness bug, not a style choice).
+/// A gateway build predating #4324 (empty `stream_home_id` on every call) is
+/// unaffected — a stored-NULL row always admits an empty incoming value too.
+///
+/// PREDICATE FIX (PR #4492 review, HIGH, fixed pre-merge): the ORIGINAL form
+/// of this predicate was `stream_home_id = $3 OR (stream_home_id IS NULL AND
+/// $3 = '')` — requiring the INCOMING value to ALSO be empty before a
+/// stored-NULL row would admit it. That was wrong: a stored-NULL home does
+/// NOT only mean "legacy, never stamped" — under the single-producer
+/// invariant it can equally mean "this session's own `announce_connected`
+/// (called from the CONNECTED branch) simply hasn't run yet." The gateway
+/// dispatches CONNECTED and DISCONNECTED as two independently
+/// `spawn_monitor`'d RPC workers with NO ordering guarantee between them
+/// (`yuzu_gw_upstream.erl`), so an ORDINARY connect/disconnect — no re-home,
+/// no second CONNECTED/DISCONNECTED pair, just the FIRST and ONLY one for a
+/// brand-new session — can have its DISCONNECTED reach this server before
+/// its own paired CONNECTED. The original predicate rejected that stamped,
+/// entirely legitimate DISCONNECTED (stored NULL, incoming non-empty), so
+/// the deregister/fence silently no-opped, and the delayed CONNECTED then
+/// published a route for an already-dead stream — a regression vs. the
+/// pre-#4324 unfenced behavior, where the same reordering self-corrected.
+/// This is DIFFERENT FROM, and reachable WITHOUT, the FORWARD NOTE gaps
+/// below (which all require a producer of a SECOND CONNECTED/DISCONNECTED
+/// pair for the same session — live re-home, not shipped until 4.3/4.4); it
+/// needed only the ordinary FIRST pair, reordered, which is reachable today
+/// under ordinary operational churn. The identical gap existed in the
+/// in-memory fence (`gateway_service_impl.cpp`'s `home_matches`) and is
+/// fixed there the same way — the two predicates must never diverge.
 ///
 /// SCOPE OF "CLOSED" (adversarial review, 2026-09-17): the fence is a
 /// check-then-act, not a single atomic operation — `gateway_stream_home_id()`
 /// reads and releases `stream_mu` before the three DISCONNECTED effects run
 /// under their own separate lock acquisitions. Under the CURRENT shipped
-/// gateway this is safe, because at most one `CONNECTED(S)` and one
-/// `DISCONNECTED(S)` are ever emitted per session id (see the SESSION GUARDS
-/// LIMIT above) — there is no producer of a second, genuinely concurrent
-/// `CONNECTED(S, home2)` for the fence's read-then-act window to race
-/// against. "CLOSED end-to-end" means closed against every interleaving that
-/// invariant permits, NOT atomic against arbitrary concurrent RPC execution.
-/// See the FORWARD NOTE immediately below for what 4.3/4.4 must add before
-/// same-session re-home makes that producer real.
+/// gateway this remains safe with the predicate fix above, because at most
+/// one `CONNECTED(S)` and one `DISCONNECTED(S)` are ever emitted per session
+/// id (see the SESSION GUARDS LIMIT above) — there is no producer of a
+/// second, genuinely concurrent `CONNECTED(S, home2)` for the fence's
+/// read-then-act window to race against. "CLOSED end-to-end" means closed
+/// against every interleaving that invariant permits (which, after the
+/// predicate fix, now correctly includes an out-of-order first pair), NOT
+/// atomic against arbitrary concurrent RPC execution for a SECOND pair. See
+/// the FORWARD NOTE immediately below for what 4.3/4.4 must add before
+/// same-session re-home makes that second-pair producer real.
 ///
-/// FORWARD NOTE for #4324's 4.3/4.4 (neither direction reachable today —
-/// both require a producer of a second CONNECTED/DISCONNECTED pair for the
-/// SAME session id, which does not exist until live re-home ships):
+/// FORWARD NOTE for #4324's 4.3/4.4 (none of the three directions below are
+/// reachable today — all three require a producer of a SECOND
+/// CONNECTED/DISCONNECTED pair for the SAME session id, which does not exist
+/// until live re-home ships; this is distinct from the PREDICATE FIX above,
+/// which was reachable with only the first, ordinary pair and is already
+/// fixed):
 ///
 /// (a) STORE-SIDE ordering gap: if a stale `DISCONNECTED(home1)` lands
 /// BEFORE the new `CONNECTED(home2)` arrives (two independent RPCs with no

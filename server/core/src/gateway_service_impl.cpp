@@ -1291,13 +1291,28 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // this fence's concern.
         if (auto stored_home = registry_.gateway_stream_home_id(agent_id, session_id);
             stored_home.has_value()) {
-            // Mirrors gateway_route_store.hpp's ASYMMETRIC deregister
-            // predicate byte-for-byte (`stream_home_id = $3 OR
-            // (stream_home_id IS NULL AND $3 = '')`) — never diverge the two:
-            // match if equal, OR if BOTH are empty (legacy, pre-#4324
-            // no-fence case).
-            const bool home_matches = (*stored_home == stream_home_id) ||
-                                      (stored_home->empty() && stream_home_id.empty());
+            // Mirrors gateway_route_store.cpp's deregister predicate
+            // byte-for-byte (`stream_home_id IS NULL OR stream_home_id = $3`)
+            // — never diverge the two: an EMPTY stored home ADMITS ANY
+            // incoming value, stamped or not.
+            //
+            // PREDICATE FIX (PR #4492 review, HIGH): the prior form also
+            // required `stream_home_id.empty()` on the incoming side for the
+            // empty-stored branch to admit. A stored-empty home never
+            // represents a live placement worth protecting — under the
+            // single-producer invariant it means ONLY "this session's own
+            // CONNECTED (which calls set_gateway_route) hasn't run yet" or
+            // "legacy, never stamped." The gateway dispatches CONNECTED and
+            // DISCONNECTED as two independently `spawn_monitor`'d RPC
+            // workers with NO ordering guarantee between them, so an
+            // ordinary (no re-home) DISCONNECTED can reach this handler
+            // BEFORE its own paired CONNECTED — the old both-empty
+            // requirement misclassified that stamped-but-legitimate
+            // DISCONNECTED as `stale_home`, skipped all three teardown
+            // effects, and let the delayed CONNECTED publish a route for an
+            // already-dead stream (a regression vs. the pre-#4324 unfenced
+            // behavior, where the same reordering self-corrected).
+            const bool home_matches = stored_home->empty() || (*stored_home == stream_home_id);
             if (!home_matches) {
                 record_directory_desync(metrics_, "deregister", "stale_home");
                 response->set_acknowledged(true);

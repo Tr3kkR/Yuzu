@@ -614,6 +614,88 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the ma
               .value() == 1);
 }
 
+TEST_CASE("NotifyStreamStatus #4324: a fresh session's OWN DISCONNECTED reaching the server "
+          "BEFORE its own paired CONNECTED still tears down normally — the reorder/"
+          "lost-CONNECTED regression from PR #4492's review, HIGH",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    // NO re-home involved — this is the FIRST and ONLY CONNECTED/DISCONNECTED
+    // pair this session will ever have. The gateway dispatches the two as
+    // independently spawn_monitor'd RPC workers with no ordering guarantee
+    // between them (see gateway_route_store.hpp's PREDICATE FIX note), so an
+    // ordinary fast connect/disconnect can have its DISCONNECTED reach this
+    // server before its own paired CONNECTED — which is what this test
+    // simulates by simply never sending the CONNECTED at all before the
+    // DISCONNECTED arrives.
+    auto req = make_gw_register(auth_mgr, "agent-reorder-1");
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    gw::StreamStatusNotification disc;
+    disc.set_agent_id("agent-reorder-1");
+    disc.set_session_id(session_id);
+    disc.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    disc.set_stream_home_id("home-first-and-only");
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &disc, &ack).ok());
+    CHECK(ack.acknowledged());
+
+    // Must NOT be misclassified as stale_home — this is a genuine, matching
+    // (if oddly-ordered) DISCONNECTED for this session's only ever home.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "stale_home"}})
+              .value() == 0);
+
+    // The DISCONNECTED's own teardown must have actually RUN, not been
+    // skipped: (1) the AgentRegistry entry is gone (remove_agent_if_session
+    // erases it outright on a match), and (2) the durable row is tombstoned.
+    // The ORIGINAL bug skipped all three teardown effects on this exact
+    // sequence, leaving both of these looking live.
+    CHECK(registry.get_session("agent-reorder-1") == nullptr);
+    auto row_after_disc = store.lookup_route("agent-reorder-1");
+    REQUIRE(row_after_disc.has_value());
+    REQUIRE(row_after_disc->has_value()); // tombstoned, not removed
+    CHECK_FALSE((*row_after_disc)->session_id.has_value());
+
+    // The delayed CONNECTED that eventually arrives for a stream that's
+    // already gone must NOT be able to publish a live-looking route for it.
+    // AgentRegistry::set_gateway_route no-ops on an agent_id it can't find
+    // (the DISCONNECTED already erased it), and announce_connected's
+    // session-guarded UPDATE misses the now-tombstoned row (session_id is
+    // NULL) with its ON CONFLICT fallback correctly no-opping against the
+    // existing tombstone (SLICE 4.2a) — so the delayed CONNECTED must leave
+    // BOTH sides exactly as the DISCONNECTED left them: gone, not live.
+    gw::StreamStatusNotification connected;
+    connected.set_agent_id("agent-reorder-1");
+    connected.set_session_id(session_id);
+    connected.set_event(gw::StreamStatusNotification::CONNECTED);
+    connected.set_cluster_id("cluster-late");
+    connected.set_gateway_node("node-late");
+    connected.set_stream_home_id("home-first-and-only");
+    gw::StreamStatusAck conn_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &connected, &conn_ack).ok());
+
+    CHECK(registry.get_session("agent-reorder-1") == nullptr);
+    auto row_after_late_connected = store.lookup_route("agent-reorder-1");
+    REQUIRE(row_after_late_connected.has_value());
+    REQUIRE(row_after_late_connected->has_value());
+    CHECK_FALSE((*row_after_late_connected)->session_id.has_value());
+}
+
 // ── #4324: the per-home stream-generation fence ─────────────────────────────
 //
 // The scenario #4324 exists to prevent: a session is CONNECTED under home A,

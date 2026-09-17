@@ -384,26 +384,32 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     // A SAME-session late DISCONNECTED is additionally fenced by `stream_home_id`
     // (file header SLICE #4324, #4246 #4): the re-announce path reuses the
     // session id, so session_id equality alone cannot tell an old home's
-    // teardown from a newer re-home under the same id — the ASYMMETRIC
-    // predicate below closes that gap at the store layer. (The RPC-handler
-    // wiring that threads a caller's real `stream_home_id` through is a later
-    // #4324 task — see gateway_route_store.hpp's SLICE #4324 note; until then
-    // every call here passes the default empty string, so behaviour is
-    // unchanged.)
+    // teardown from a newer re-home under the same id — the predicate below
+    // closes that gap at the store layer. CLOSED end-to-end (task 3/3): the
+    // RPC handler (`gateway_service_impl.cpp`'s `NotifyStreamStatus`) threads
+    // the caller's REAL `stream_home_id` through on every call here.
     //
-    // The predicate is ASYMMETRIC, not the naive symmetric form
-    // (`$3 = '' OR stream_home_id = $3`): an UNSTAMPED (empty `$3`) incoming
-    // DISCONNECTED may ONLY tombstone a row whose STORED `stream_home_id` is
-    // ALSO NULL/unstamped — never a row a stamped CONNECTED has since
-    // re-homed. A stamped `$3` still requires an EXACT match against the
-    // stored value (a stale stamped DISCONNECTED from a superseded home
-    // cannot tear down a different, newer stamped home either). This is what
+    // The predicate is deliberately NOT the naive symmetric form
+    // (`$3 = '' OR stream_home_id = $3`): a STORED NULL admits ANY incoming
+    // `$3` (stamped or not) — it does NOT additionally require `$3 = ''`
+    // (PR #4492 review, HIGH, fixed from an earlier `stream_home_id IS NULL
+    // AND $3 = ''` form). A stored NULL never represents a live placement
+    // worth protecting from a stale teardown: under the single-producer
+    // invariant it means ONLY "this session's own `announce_connected`
+    // hasn't landed yet" (a `register_fresh`-only row — the gateway's two
+    // independently-`spawn_monitor`'d RPC workers give no ordering guarantee
+    // between a session's own CONNECTED and DISCONNECTED, so the latter can
+    // reach the server first) or "already tombstoned" — both safe to admit.
+    // A STAMPED stored value, by contrast, DOES require an EXACT match
+    // against `$3` (a stale stamped DISCONNECTED from a superseded home
+    // cannot tear down a different, newer stamped home). This is what
     // protects a rolling gateway upgrade (mixed old-build/new-build gateway
     // nodes is the NORMAL state of one): an old-build node's late unstamped
     // DISCONNECTED must not tombstone a new-build node's stamped re-home
     // reusing the same session id, while a legacy DISCONNECTED against a
-    // legacy (never-stamped) row still behaves exactly as before (backward
-    // compatibility with a fleet that has no home-id-aware gateways yet).
+    // legacy (never-stamped, stored-NULL) row still behaves exactly as
+    // before (backward compatibility with a fleet that has no home-id-aware
+    // gateways yet).
     //
     // TOMBSTONE, not DELETE (file header "SLICE 4.2a", closes 4.2 design-doc
     // obligation #5 — late-CONNECTED resurrection, NOT #4). A DELETE lets a late/reordered CONNECTED for this
@@ -424,10 +430,24 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
     //
     // `home_id_arg` ALWAYS carries a value (never nullopt), even when empty —
     // unlike announce_connected's cluster/home-id args, which map an empty
-    // input to a stored NULL. Here the empty string must arrive at Postgres
-    // AS an empty string literal, not NULL, because the asymmetric predicate
-    // itself tests `$3 = ''` (a NULL parameter would make that comparison
-    // NULL/falsy and silently disable the legacy-compatibility branch).
+    // input to a stored NULL.
+    //
+    // PREDICATE FIX (PR #4492 review, HIGH): a STORED NULL/empty
+    // `stream_home_id` ADMITS ANY incoming value, stamped or not — it does
+    // NOT additionally require `$3 = ''`. A stored NULL never represents a
+    // live placement worth protecting from a stale teardown; under the
+    // single-producer invariant (see gateway_route_store.hpp's SESSION
+    // GUARDS LIMIT / SCOPE OF "CLOSED") it means ONLY "this session's own
+    // `announce_connected` hasn't landed yet" (a `register_fresh`-only row)
+    // or "already tombstoned" — both cases are safe to admit. The previous
+    // `stream_home_id IS NULL AND $3 = ''` form rejected a STAMPED incoming
+    // DISCONNECTED against a NULL stored value, misclassifying an ordinary
+    // out-of-order CONNECTED/DISCONNECTED pair (no re-home involved — the
+    // gateway's two independently-`spawn_monitor`'d RPC workers give no
+    // ordering guarantee, so DISCONNECTED can reach the server before its
+    // own paired CONNECTED) as a stale-home mismatch, skipping the tombstone
+    // and letting the delayed CONNECTED publish a route for an already-dead
+    // stream — a regression vs. the pre-#4324 unfenced behavior.
     std::optional<std::string> home_id_arg{std::string(stream_home_id)};
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -435,7 +455,7 @@ GatewayRouteStore::deregister(std::string_view agent_id, std::string_view sessio
         "  session_id=NULL, lease_until=NULL, cluster_id=NULL, gateway_node=NULL, "
         "  stream_home_id=NULL, updated_at=now() "
         "WHERE agent_id=$1 AND session_id=$2 "
-        "  AND (stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')) "
+        "  AND (stream_home_id IS NULL OR stream_home_id = $3) "
         "RETURNING agent_id",
         std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
                                                  std::move(home_id_arg)});

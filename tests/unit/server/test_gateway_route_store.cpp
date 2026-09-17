@@ -623,6 +623,37 @@ TEST_CASE("GatewayRouteStore[pg]: deregister tombstones a legacy row when neithe
     CHECK_FALSE((*row)->session_id.has_value());
 }
 
+TEST_CASE("GatewayRouteStore[pg]: deregister ADMITS a STAMPED incoming stream_home_id against a "
+          "register_fresh-only row (stored NULL, announce_connected never ran) — the reorder/"
+          "lost-CONNECTED regression from PR #4492's review, HIGH",
+          "[gateway_route][pg][store]") {
+    GatewayRoutePg fx;
+    // register_fresh only — no announce_connected call, so stream_home_id
+    // stays NULL. This is EXACTLY the state a fresh session is in if its own
+    // paired DISCONNECTED reaches the server before its own paired CONNECTED
+    // (the gateway dispatches the two as independently spawn_monitor'd RPC
+    // workers with no ordering guarantee — see gateway_route_store.hpp's
+    // PREDICATE FIX note). It is NOT distinguishable, at the store layer,
+    // from a genuinely stale row whose home was cleared by a tombstone sweep
+    // — both are safe to admit, because a stored-NULL home never represents
+    // a live placement worth protecting.
+    REQUIRE(fx.store().register_fresh("agent-home-7", "session-1").value().won);
+    CHECK_FALSE(fx.raw_get_stream_home_id("agent-home-7").has_value());
+
+    // The ORIGINAL predicate (`stream_home_id = $3 OR (stream_home_id IS
+    // NULL AND $3 = '')`) required $3 to ALSO be empty here, so this call
+    // returned removed=false — the bug. The fixed predicate
+    // (`stream_home_id IS NULL OR stream_home_id = $3`) admits it.
+    auto out = fx.store().deregister("agent-home-7", "session-1", "home-real");
+    REQUIRE(out.has_value());
+    CHECK(out->removed);
+
+    auto row = fx.store().lookup_route("agent-home-7");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());
+}
+
 TEST_CASE("GatewayRouteStore[pg]: deregister with an EMPTY (old-build gateway) stream_home_id "
           "does NOT tombstone a row carrying a STAMPED stream_home_id — the asymmetry a naive "
           "symmetric predicate gets wrong (#4324, rolling gateway upgrade)",
