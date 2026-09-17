@@ -882,6 +882,40 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r->file_ref_count == 12);
     }
 
+    SECTION("v23 two volumes succeed via well-formed bytes at the CODE'S ASSUMED 104-byte "
+            "offset -- the permanent, accepted 'constructed coincidence' residual both "
+            "reviewers of PR #4444's round-3 review independently reproduced (issue #4467), "
+            "kept here as a locked-in regression rather than something this parser can ever "
+            "close") {
+        // This is the SAME construction as the v26 two-volume test above, not a
+        // materially different byte layout -- and that is exactly the point.
+        // build_valid_prefetch_v23_blob_with_volumes places entry 1's refs
+        // sub-block at whatever offset kVolumeEntryStrideV23V26 (104) computes,
+        // then the parser reads entry 1 back from that SAME assumed offset --
+        // so this test, and every other v23/v26 two-volume positive above,
+        // IS the "wrong-stride-but-well-formed" scenario: nothing in
+        // parse_prefetch (bounds, refs_size/count consistency, or the version-
+        // field anchor added in response to this finding) can distinguish
+        // "entry 1 genuinely starts at 104" from "entry 1 does not really
+        // start there, but well-formed refs-sub-block bytes happen to be
+        // present anyway" -- both reviewers independently proved this by
+        // hand-constructing exactly this shape. A NATURALLY wrong stride
+        // (see the two SECTIONs above and the mutation test they cite)
+        // reads unwritten zero bytes and fails closed; only a DELIBERATE
+        // construction like this one -- indistinguishable, from inside the
+        // parser, from a genuinely well-formed file -- produces a false
+        // success. See execution_artifacts_parsers.hpp's file_ref_count
+        // doc comment and README.md caveat 1 for the full reasoning on why
+        // this is accepted as permanent, not something to chase further.
+        auto buf = build_valid_prefetch_v23_blob_with_volumes(23u, {3, 4});
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE(r.has_value());
+        CHECK(r->version == 23u);
+        CHECK(r->volume_count == 2);
+        CHECK(r->file_ref_count == 7);
+    }
+
     SECTION("v23 two volumes: entry 0 is well-formed, entry 1's refs-block offset is corrupted "
             "-- a malformed entry 1 in a v23 multi-volume file still fails the whole parse, "
             "not just entry 0 (not itself stride-discriminating -- see the comment above)") {

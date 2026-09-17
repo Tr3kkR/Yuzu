@@ -534,6 +534,11 @@ constexpr size_t kVolumeEntryStrideV30V31 = 0x60; // 96
 constexpr size_t kVolumeEntryFileRefsOffsetField = 0x14;
 constexpr size_t kVolumeEntryFileRefsSizeField = 0x18;
 constexpr size_t kFileRefsBlockHeaderBytes = 16; // [u32 version][u32 count][u64 unknown]
+// The refs sub-block's own leading version DWORD -- byte-verified as this
+// constant in all 5 real volumes examined across the 3 in-tree fixtures.
+// Checked in the volume loop below as a semantic anchor beyond pure
+// bounds/size arithmetic (see that check's own comment).
+constexpr uint32_t kFileRefsBlockVersion = 3;
 
 inline bool is_supported_prefetch_version(uint32_t v) {
     // v17 (XP/2003) is excluded on purpose — see the note above
@@ -621,12 +626,25 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
     // "this file genuinely referenced zero volumes' worth of files"
     // (routed-concerns.md's execution_artifacts row, clause (1): never an
     // empty success for malformed input). The refs_size/count consistency
-    // check below also doubles as this loop's own layout self-check: an
-    // entry read at the wrong stride (kVolumeEntryStrideV23V26 is
-    // documentation-derived and unpinned by a real capture -- see its own
-    // comment) produces a refs_off/refs_size pair that fails bounds or
-    // consistency, so a wrong stride fails closed rather than silently
-    // misreading.
+    // check below, plus the refs sub-block's own version-field check,
+    // doubles as this loop's own layout self-check: a NATURALLY wrong
+    // stride (kVolumeEntryStrideV23V26 is documentation-derived and
+    // unpinned by a real capture -- see its own comment) reads unrelated
+    // file bytes as a refs sub-block, and both reviewers of PR #4444's
+    // round-3 review independently confirmed this fails closed in both
+    // directions (a real 96-byte or 112-byte layout misread as 104).
+    // This is NOT an unconditional guarantee, though: both reviewers also
+    // independently constructed a synthetic layout where bytes at the
+    // WRONG stride-104 offset coincidentally satisfy every check below
+    // (refs-block bounds, size-vs-count consistency, and now the version
+    // constant too) and got a full, fabricated success instead of a
+    // failure -- a deliberately crafted file can still pass. The realistic
+    // (non-adversarial) failure mode fails closed; a SYSTEM/admin-tier
+    // local attacker with write access to C:\Windows\Prefetch\ who wanted
+    // to defeat this check specifically already has far more direct ways
+    // to feed this plugin bad data at that privilege tier (see issue
+    // #4467's regression test for the constructed-coincidence case kept
+    // as a permanent, documented residual).
     if (out.volume_count > 0) {
         auto vol_info_off =
             detail::read_u32(in, kFileInfoVolumesInfoOffsetField, "truncated_entry");
@@ -671,7 +689,27 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
                     static_cast<size_t>(entry) + kVolumeEntryFileRefsSizeField));
 
             // The refs sub-block is [u32 version][u32 count][u64 unknown]
-            // [count x u64 refs] -- the count DWORD is 4 bytes into it.
+            // [count x u64 refs]. The version DWORD is byte-verified as the
+            // constant 3 in all 5 real volumes examined across the 3
+            // in-tree fixtures -- checking it here is a semantic anchor,
+            // not just a bounds/size coincidence: a genuinely wrong stride
+            // reading unrelated file bytes as a refs sub-block would need
+            // to ALSO land the exact 4-byte value 3 at this specific
+            // offset to pass, on top of every other bounds/size check
+            // below, which meaningfully narrows (though — see this
+            // function's own doc comment above — does not eliminate) the
+            // "constructed coincidence" window a wrong v23/v26 stride
+            // assumption could otherwise slip through.
+            auto refs_version =
+                detail::read_u32(in, static_cast<size_t>(refs_block_start), "truncated_entry");
+            if (!refs_version)
+                return std::unexpected(refs_version.error());
+            if (*refs_version != kFileRefsBlockVersion)
+                return std::unexpected(
+                    detail::err("truncated_entry", static_cast<size_t>(refs_block_start)));
+
+            // The count DWORD is 4 bytes into the sub-block, right after
+            // the version DWORD just checked above.
             auto refs_count =
                 detail::read_u32(in, static_cast<size_t>(refs_block_start) + 4, "truncated_entry");
             if (!refs_count)

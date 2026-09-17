@@ -148,7 +148,16 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
 
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
-    make_owner_only_sa(sa, sd);
+    if (!make_owner_only_sa(sa, sd)) {
+        // Fail closed rather than fall through to CreateFileW with a null
+        // lpSecurityDescriptor (the token's default, potentially-inheriting
+        // DACL instead of the intended owner-only one) -- mirrors
+        // updater.cpp's identical ConvertStringSecurityDescriptorTo
+        // SecurityDescriptorW call, which has always failed closed here.
+        // GetLastError() already carries the real failure from inside
+        // make_owner_only_sa's own Win32 call.
+        return -1;
+    }
 
     HANDLE hFile = CreateFileW(full_path.c_str(), GENERIC_READ | GENERIC_WRITE,
                                0, // no sharing
@@ -245,7 +254,11 @@ YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, 
 
     SECURITY_ATTRIBUTES sa{};
     PSECURITY_DESCRIPTOR sd = nullptr;
-    make_owner_only_sa(sa, sd);
+    if (!make_owner_only_sa(sa, sd)) {
+        // See the identical fail-closed reasoning at the CreateFileW call
+        // site in yuzu_create_temp_file above.
+        return -1;
+    }
 
     BOOL ok = CreateDirectoryW(full_path.c_str(), &sa);
     // Capture before LocalFree -- see the identical reasoning at the
