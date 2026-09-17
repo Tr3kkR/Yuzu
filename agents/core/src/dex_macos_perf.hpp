@@ -51,4 +51,23 @@ YUZU_EXPORT std::uint64_t mach_abs_to_100ns(std::uint64_t t, std::uint32_t numer
 /// no time elapsed. Clamped to [0,100]. Mirrors yuzu::agent::lnx::cpu_busy_pct.
 YUZU_EXPORT std::optional<double> cpu_busy_pct(const CpuTicks& prev, const CpuTicks& cur);
 
+/// Aggregate IOBlockStorageDriver "Statistics" counters, summed over every driver
+/// instance in the IOKit registry — the macOS analogue of yuzu::agent::lnx::DiskIoTotals.
+/// Time fields are nanoseconds (kIOBlockStorageDriverStatisticsTotal{Read,Write}TimeKey).
+struct DiskTotals {
+    bool valid{false};
+    std::uint64_t read_bytes{0};
+    std::uint64_t write_bytes{0};
+    std::uint64_t reads{0};
+    std::uint64_t writes{0};
+    std::uint64_t read_time_ns{0};
+    std::uint64_t write_time_ns{0};
+};
+
+/// PURE: average service time (ms per completed I/O) over the interval between two
+/// DiskTotals readings — the iostat `await` shape, mirroring
+/// yuzu::agent::lnx::disk_await_ms. nullopt when either reading is invalid or a
+/// counter regressed. Zero completed ops this interval derives 0.0 (idle, not slow).
+YUZU_EXPORT std::optional<double> disk_await_ms(const DiskTotals& prev, const DiskTotals& cur);
+
 } // namespace yuzu::agent::macos
