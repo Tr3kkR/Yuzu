@@ -1439,6 +1439,9 @@ TEST_CASE("prefetch_absence_token: nullopt/0/1-3/other map to the three distinct
     static_assert(kPrefetchDisabled != kPrefetchEvidenceAbsent);
     static_assert(kPrefetchDisabled != kPrefetchStateUnknown);
     static_assert(kPrefetchEvidenceAbsent != kPrefetchStateUnknown);
+    CHECK(kPrefetchDisabled == "prefetch_disabled");
+    CHECK(kPrefetchEvidenceAbsent == "prefetch_evidence_absent");
+    CHECK(kPrefetchStateUnknown == "prefetch_state_unknown");
 
     SECTION("nullopt (registry unreadable) -> prefetch_state_unknown") {
         CHECK(prefetch_absence_token(std::nullopt) == kPrefetchStateUnknown);
