@@ -15,7 +15,7 @@
 
 #include "device_routes.hpp"
 
-#include "dex_routes.hpp"        // dex_signal_label for the DEX lens
+#include "dex_view_types.hpp"    // dex_signal_label for the DEX lens (store-free)
 #include "tar_process_tree.hpp"  // tar_is_suspicious_spawn — shared LOLBin/shell denylist
 #include "web_utils.hpp"
 
@@ -235,8 +235,6 @@ std::string render_devices_list_fragment(const std::vector<DeviceRow>& rows, con
     for (const auto& d : rows) {
         const std::string label = d.hostname.empty() ? d.agent_id : d.hostname;
         std::string tagline = esc(d.agent_id.substr(0, 12));
-        if (!d.segment.empty())
-            tagline += " &middot; " + esc(d.segment);
         h += "<tr class=\"gp-rowlink\" style=\"cursor:pointer\" "
              "onclick=\"location.href='/device?id=" +
              url_encode(d.agent_id) + "'\">";
@@ -277,10 +275,7 @@ std::string render_device_info_fragment(const DeviceRow& d) {
                                   kv("OS", os_label(d.os)) +
                                   kv("Architecture", esc(d.arch.empty() ? "&mdash;" : d.arch)));
     h += ci_group("Management",
-                  kv("Segment", d.segment.empty() ? std::string("<span class=\"gp-mute\">&mdash;"
-                                                                "</span>")
-                                                  : esc(d.segment)) +
-                      kv("Tags", tags) +
+                  kv("Tags", tags) +
                       kv("Agent version", d.agent_version.empty() ? std::string("&mdash;")
                                                                   : esc(d.agent_version)) +
                       kv("Status", d.online ? "<span style=\"color:#4ed27e\">online</span>"
@@ -1072,6 +1067,13 @@ std::string render_device_not_found(const std::string& agent_id) {
     return "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>"
            "<div class=\"gp-placeholder\"><b>Device not found</b>No enrolled device with id " +
            esc(agent_id) + ".</div>";
+}
+
+std::string render_device_degraded(const std::string& agent_id) {
+    return "<a class=\"gp-back\" href=\"/devices\">&larr; Devices</a>"
+           "<div class=\"gp-placeholder\"><b>Device data unavailable</b>The device store is "
+           "temporarily degraded &mdash; try again shortly (" +
+           esc(agent_id) + ").</div>";
 }
 
 } // namespace yuzu::server
