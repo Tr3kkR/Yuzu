@@ -387,15 +387,60 @@ needs its own `classify_reflex_event_for_scope` twin** (mirroring the existing p
 confined-projection sanitizer pattern) and its own pin test — it must not be bolted onto the
 existing bus consumer set without one.
 
+## Outbox sharing and ingest limits
+
+Reflex outcomes and Guardian drift events share the agent's single `__guard__` outbox (they are the
+same wire channel, per "Wire contract" above) — this section defines the guards that stop Reflex
+from starving Guardian, and Guardian's own enforcement evidence, of that shared, bounded resource.
+
+- **Reflex outcomes get their own lane/quota inside the shared outbox** — a burst of Reflex
+  `suppressed_sampled`/`fired` events (up to 32 reflexes × their own `max_per_hour` caps, across
+  potentially several event types each) must not be able to fill the outbox and cause Guardian's own
+  drift/remediation evidence to back up or drop. The exact quota shape (a reserved slot count, a
+  priority tier, or a per-family drop-oldest policy) is an R6/R8 implementation decision; this
+  document's job is to require that *some* such guard exists, not to leave the shared outbox
+  first-come-first-served across two independent, differently-volumed event sources.
+- **Every Reaction's `capture_output` is capped at 4 KiB, but the outcome as a whole is capped to fit
+  the ingest clamp.** `GuaranteedStateEvent.detail_json` (which carries the whole `ReflexOutcome` as
+  JSON) is subject to the server's existing ~16 KiB ingest clamp; today an over-cap `detail_json` is
+  silently **cleared** before the `family` demux even runs. A chain with several captured Reactions
+  can exceed 16 KiB (4 × 4 KiB raw, more once JSON-escaped) well before hitting any per-Reaction
+  cap. The agent therefore applies a **per-Reaction truncation marker**: if the assembled
+  `detail_json` would exceed the ingest clamp, later Reactions' `capture_output` is dropped from the
+  payload and the JSON records which ones were truncated (`"truncated": ["reflex_id", ...]`) — the
+  event still ships, with an honest record of what is missing, rather than being silently cleared to
+  nothing by the server-side clamp.
+- **Every fire produces exactly one terminal outcome row, or the loss is signaled.** `reflex_outcomes`
+  is claimed as CC7.2 change-detection evidence (see "Observability" below); that claim is only true
+  if a fired chain reliably produces exactly one terminal row (`completed`/`failed`/`aborted`). The
+  outbox quota above, the truncation marker above, and the journal's own delivery guarantee together
+  are what make this hold; if any of them cannot guarantee it in a given implementation, the CC7.2
+  claim in "Observability" below must be narrowed or withdrawn in that slice's own PR text — it is
+  not carried forward silently.
+- **Evidentiary rows have a retention floor**, distinct from the operator-configurable TTL below: an
+  operator setting the TTL very short must not be able to make CC7.2 evidence disappear before an
+  auditor could plausibly review it. The exact floor value is an R10 decision (see the
+  clock-guarded-retention adoption-register row it must record), matching the discipline the Periodic
+  Access Reviews "no-prune" precedent (`docs/auth-architecture.md`) sets for evidentiary rows
+  generally — this document requires a floor exists, not a specific number.
+
 ## Privacy (D10)
 
 - Outcomes record end-user **choices**, not identity: button choice + timestamps + reaction results
-  only, **never** free-text input, **never** a SID/username/user path. Device-scoped only.
+  only, **never** free-text input, **never** a SID/username/user path. Device-scoped only. (See
+  "Substitution tokens" above: resolved `{{spark.*}}` param values are explicitly excluded from this
+  journal — "reaction results" means the Reaction's own outcome, not its resolved input params.)
 - `capture_output` is opt-in per Reaction (default `false`), capped at 4 KiB, and a per-device
   outcome drill (including any captured output) is an **access-audited** surface via the existing
-  `rest_audit.hpp` chokepoint (`emit_behavioral_audit`) — never a bare read.
+  `rest_audit.hpp` chokepoint (`emit_behavioral_audit`) — never a bare read. The drill's audit write
+  follows a **named retention class** under `docs/audit_retention_rules.hpp`'s `classify` (assigned
+  at R10, alongside a stated fail-closed-vs-set-and-proceed decision for the write itself — see
+  `device.live.*`'s fail-closed precedent in the routed device-pages concern as the default lens,
+  not an automatic copy).
 - Operator-configurable TTL on Reflex outcomes (D10d) — implemented as a clock-guarded retention
-  sweep (`docs/clock-guarded-retention.md`; R10 records the adoption-register row).
+  sweep (`docs/clock-guarded-retention.md`; R10 records the adoption-register row), **bounded below
+  by the evidentiary retention floor above** — the TTL can be lengthened by the operator, never
+  shortened past the floor.
 - Fleet-level aggregates are aggregate-first and floor at the shipped `kDexCohortFloor` (an
   aggregate over 1-2 devices is a de facto per-device view); per-device drill stays audited per the
   bullet above.
