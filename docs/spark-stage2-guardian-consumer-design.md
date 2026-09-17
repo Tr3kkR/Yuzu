@@ -781,8 +781,9 @@ claim from its key's FIFO once that disarm completes regardless of
 already-decided outcome synchronously (never blocks, never silently succeeds)
 - so the practical effect is a bounded window in which one re-add attempt on
 that key returns a stale answer instead of triggering a fresh arm, self-
-healing on the next full-sync Reapply. Tracked as a SHOULD-severity follow-up
-(a regression test pinning this exact interleaving), not a merge blocker.
+healing on the next full-sync Reapply. Tracked as #4472 (a regression test
+pinning this exact interleaving, and a decision on whether it becomes a named
+Spark-flip-ladder precondition), not a merge blocker.
 
 **A late FAILURE (refusal, not success) on a still-desired wedged rule is a
 no-op by construction, not a third mechanism**: the claim was already terminal
