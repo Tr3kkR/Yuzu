@@ -1069,8 +1069,9 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     // occasional one. INFO, not WARN (Gate 8 unhappy-path NICE
                     // finding): an occasional occurrence is expected operational
                     // noise from ordinary redeploy churn, not a fault - the
-                    // counter, not the log level, is the signal an operator should
-                    // alert on a sustained rate from.
+                    // counter, not the log level, is the signal a sustained rate
+                    // would be worth investigating from, once wired to a fleet
+                    // gauge (internal-only today, #3415).
                     wedge_adopt_stale_refused_.fetch_add(1, std::memory_order_relaxed);
                     try {
                         spdlog::info("Guardian spark: a late arm success for rule '{}' "
