@@ -59,6 +59,22 @@
 #include <system_error>
 #include <unordered_map>
 #include <vector>
+
+// sweep_stale_scratch_dirs() is declared in execution_artifacts_scratch_sweep.hpp
+// but DEFINED only in execution_artifacts_scratch_sweep_win.cpp, which
+// meson.build compiles exclusively into the execution_artifacts shared_library
+// target -- agent_test_exe never links that target (it only loads the built
+// .dylib/.dll at runtime by path, via link_depends for build ordering, the
+// same pattern test_execution_artifacts_local_dispatcher.cpp relies on). A
+// plain call to sweep_stale_scratch_dirs from this TU would therefore leave
+// the symbol unresolved at link time. TU-include the .cpp directly instead --
+// the same pattern test_execution_artifacts_win_internals.cpp (#4392) already
+// uses for execution_artifacts_win.cpp. Unlike that file, nothing here is a
+// YUZU_PLUGIN_EXPORT/extern "C" plugin-ABI entry point, so no exclusion-guard
+// macro is needed: this TU's own copy of sweep_stale_scratch_dirs coexists
+// safely with the separately-loaded real plugin DLL other test cases in this
+// binary use, since they are different process modules.
+#include "../../agents/plugins/execution_artifacts/src/execution_artifacts_scratch_sweep_win.cpp"
 #endif
 
 using namespace yuzu::execution_artifacts;
