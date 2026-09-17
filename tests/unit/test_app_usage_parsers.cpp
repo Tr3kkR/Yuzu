@@ -524,20 +524,32 @@ TEST_CASE("run_last_used: unfiltered form returns exactly kMaxLastUsedRows "
          "when the table holds precisely that many rows -- the untruncated "
          "boundary",
           "[app_usage][last_used]") {
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    seed::create_schema(db);
-    seed::exec_or_fail(db, "BEGIN");
-    for (int64_t i = 0; i < static_cast<int64_t>(kMaxLastUsedRows); ++i) {
-        seed::insert_usage_daily(db, 100000, "exe_" + std::to_string(i), 1, 1, 100000, 100000, 0,
-                                 0);
+    // cpp-safety governance re-sweep: same raw-handle-across-throwing-
+    // assertions shape as the round-3 blocker, in a block that actually
+    // predates round 2 (commit 7c6b5f3a1). Fixed while already touching
+    // this file's RAII idiom this round -- not asserting this reclassifies
+    // every other pre-existing raw sqlite3_open in this file (the 6+
+    // blocks round 2 deliberately left alone stay left alone; this one
+    // just happened to also get independently found and is cheap to fix
+    // alongside the others). Take ownership before the REQUIRE.
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db{nullptr, &sqlite3_close};
+    {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open(":memory:", &raw);
+        db.reset(raw);
+        REQUIRE(rc == SQLITE_OK);
     }
-    seed::exec_or_fail(db, "COMMIT");
+    seed::create_schema(db.get());
+    seed::exec_or_fail(db.get(), "BEGIN");
+    for (int64_t i = 0; i < static_cast<int64_t>(kMaxLastUsedRows); ++i) {
+        seed::insert_usage_daily(db.get(), 100000, "exe_" + std::to_string(i), 1, 1, 100000,
+                                 100000, 0, 0);
+    }
+    seed::exec_or_fail(db.get(), "COMMIT");
 
-    const auto rows = run_last_used(db, std::nullopt, 0);
+    const auto rows = run_last_used(db.get(), std::nullopt, 0);
     REQUIRE(rows.has_value());
     CHECK(rows->size() == static_cast<std::size_t>(kMaxLastUsedRows));
-    sqlite3_close(db);
 }
 
 // ───────────────────────────────────────────────────────── schema check ───
