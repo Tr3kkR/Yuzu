@@ -31,11 +31,24 @@
 ///       ever act on their OWN principal's own resource, never another's;
 ///   (b) the backing store enforces that ownership unconditionally, with no
 ///       admin/service-account override, on every call path that can reach
-///       it; and
+///       it;
 ///   (c) admitting a non-admin caller here grants no new AUTHORITY beyond
 ///       what they already hold over their own resource (rotation, for
 ///       example, can never mint a credential broader than the one being
-///       rotated — see api_token_store.cpp's authority-inheritance guard).
+///       rotated — see api_token_store.cpp's authority-inheritance guard);
+///       and
+///   (d) the operation carries no separate, non-authority IMPACT that would
+///       justify gating it regardless — irreversibility, availability loss
+///       to a third party, or a compliance/audit-evidence requirement.
+///       (c) is about AUTHORITY; (d) is about everything else a self-targeted
+///       operation could still do damage with. `ApiToken:Rotate` clears (d)
+///       because it is explicitly non-destructive (the predecessor survives
+///       the overlap window; the sweep, not this gate, is what eventually
+///       revokes it) — a hypothetical future `ApiToken:Delete` entry would
+///       satisfy (a)-(c) identically but must be independently re-argued
+///       against (d), since deleting a token one currently lacks the secret
+///       for is irreversible and can break a dependent automation with no
+///       audit trail pointing back to why.
 ///
 /// This mirrors `DELETE /api/v1/sessions/me`, which does not go through
 /// `require_permission` at all for the identical reason (self-service,
