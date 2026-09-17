@@ -297,6 +297,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
