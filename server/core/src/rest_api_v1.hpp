@@ -18,6 +18,7 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -493,7 +494,15 @@ public:
         // dashboard fragments and the MCP compare_app_perf_versions tool call,
         // so REST/dashboard/MCP can never disagree. nullptr = the route answers
         // 503 (provider unwired), same degrade as the retired cohort provider.
-        std::shared_ptr<const VerifyApi> verify_api = nullptr);
+        std::shared_ptr<const VerifyApi> verify_api = nullptr,
+        // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam — backs
+        // GET /api/v1/devices[/{id}] (replaces the raw `agents_fn` read on
+        // this pair only; `agents_fn` itself stays wired for
+        // POST /api/v1/scope/preview, its other live consumer). The SAME
+        // instance `DeviceRoutes`/MCP `list_agents`+`get_agent_details` use, so
+        // REST/dashboard/MCP can never disagree on device identity data.
+        // nullptr = both routes answer 503 (provider unwired).
+        std::shared_ptr<const DeviceApi> device_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -582,7 +591,10 @@ public:
         DexVisibleFn dex_visible_fn = {},
         // ADR-0031 WS-A4 #4250: see the production overload's doc comment
         // above; identical trailing-optional-dep, 503-when-unwired contract.
-        std::shared_ptr<const VerifyApi> verify_api = nullptr);
+        std::shared_ptr<const VerifyApi> verify_api = nullptr,
+        // ADR-0031 WS-A4 wave 2: see the production overload's doc comment
+        // above; identical trailing-optional-dep, 503-when-unwired contract.
+        std::shared_ptr<const DeviceApi> device_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

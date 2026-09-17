@@ -10,6 +10,8 @@
 
 #include "guardian_push_builder.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <functional>
@@ -296,6 +298,104 @@ TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit 
     for (const auto& r : push.rules())
         if (r.rule_id() == "danger")
             CHECK(r.assertion().type() == "registry-value-equals");
+}
+
+// json-dump-depth-guard fix: build_agent_push is the SOLE function both
+// server.cpp:5224 (heartbeat reconcile) and server.cpp:17635 (baseline
+// deploy/toggle push fan-out) delegate to for the rule-filtering + spec_json
+// -> proto marshal (that split is exactly M7's point, see the file header) -
+// neither call site does any further per-rule processing on the result, so
+// pinning behaviour here covers both consumer paths with no live server/DB.
+TEST_CASE("build_agent_push: a rule nested past the depth guard is excluded; "
+          "other rules in the same batch still push normally",
+          "[guardian_push_builder][security][depth]") {
+    // A raw string, never materialised as a live nlohmann::json object at this
+    // depth. kMcpMaxJsonDepth is 32; the 40-deep array below is comfortably
+    // past it and still trivially safe to construct/dump directly in this test
+    // process, orders of magnitude short of the ~100,000-level depth that
+    // actually SIGSEGVs the real fill_block() dump() call this guard exists to
+    // prevent.
+    GuaranteedStateRuleRow poisoned = row("poisoned", "windows", "");
+    poisoned.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","nested":)" +
+        std::string(40, '[') + std::string(40, ']') +
+        R"(}},"remediation":{"type":"alert-only"}})";
+
+    GuaranteedStateRuleRow healthy = row("healthy", "windows", "");
+
+    auto push = guardian::build_agent_push({poisoned, healthy}, "windows", always_in_scope,
+                                           /*full_sync=*/true, /*generation=*/3);
+
+    // The poisoned rule is excluded ENTIRELY (not even a header-only entry)
+    // while the healthy rule still gets its full push treatment.
+    CHECK(rule_ids(push) == std::vector<std::string>{"healthy"});
+    REQUIRE(push.rules_size() == 1);
+    const auto& pr = push.rules(0);
+    CHECK(pr.rule_id() == "healthy");
+    CHECK(pr.spark().type() == "registry-change");
+    CHECK(pr.assertion().type() == "registry-value-equals");
+    CHECK(pr.remediation().type() == "alert-only");
+}
+
+TEST_CASE("build_agent_push: excluding a poisoned rule increments "
+          "yuzu_guardian_push_rule_excluded_total{reason=depth_exceeded}",
+          "[guardian_push_builder][security][depth][observability]") {
+    // Governance Gate 4/6 finding: a poisoned rule's exclusion previously had
+    // no fleet-wide signal beyond an unrated log line - this is the metric
+    // that closes that gap. `metrics` is a nullable trailing param
+    // (unchanged callers/tests keep compiling) so this test opts in
+    // explicitly.
+    yuzu::MetricsRegistry metrics;
+    GuaranteedStateRuleRow poisoned = row("poisoned2", "windows", "");
+    poisoned.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","nested":)" +
+        std::string(40, '[') + std::string(40, ']') +
+        R"(}},"remediation":{"type":"alert-only"}})";
+    GuaranteedStateRuleRow healthy = row("healthy2", "windows", "");
+
+    CHECK(metrics
+              .counter("yuzu_guardian_push_rule_excluded_total", {{"reason", "depth_exceeded"}})
+              .value() == 0.0);
+
+    auto push = guardian::build_agent_push({poisoned, healthy}, "windows", always_in_scope,
+                                           /*full_sync=*/true, /*generation=*/3, &metrics);
+
+    CHECK(rule_ids(push) == std::vector<std::string>{"healthy2"});
+    CHECK(metrics
+              .counter("yuzu_guardian_push_rule_excluded_total", {{"reason", "depth_exceeded"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("build_agent_push: a repeated attempt against the same poisoned row "
+          "behaves identically each time, no crash, no growth",
+          "[guardian_push_builder][security][depth]") {
+    // Models a second (and third) heartbeat/tick reconciling the SAME stored
+    // rule: the poisoned row persists in the store (this fix does not heal or
+    // rewrite it, see guardian_push_builder.hpp), so every subsequent push
+    // must re-derive the same exclusion, not crash, and not accumulate any
+    // per-call state (build_agent_push is a pure function with none to
+    // accumulate in the first place, this pins that property rather than
+    // assuming it).
+    GuaranteedStateRuleRow poisoned = row("poisoned", "windows", "");
+    poisoned.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","nested":)" +
+        std::string(40, '[') + std::string(40, ']') +
+        R"(}},"remediation":{"type":"alert-only"}})";
+    GuaranteedStateRuleRow healthy = row("healthy", "windows", "");
+    const std::vector<GuaranteedStateRuleRow> rules{poisoned, healthy};
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        INFO("attempt " << attempt);
+        auto push = guardian::build_agent_push(rules, "windows", always_in_scope,
+                                               /*full_sync=*/true,
+                                               /*generation=*/static_cast<std::uint64_t>(attempt));
+        CHECK(rule_ids(push) == std::vector<std::string>{"healthy"});
+        REQUIRE(push.rules_size() == 1);
+        CHECK(push.rules(0).rule_id() == "healthy");
+    }
 }
 
 TEST_CASE("guardian_guard_supported_on_platform — type-aware support matrix; unknown is open",

@@ -1146,12 +1146,15 @@ bool AuthRoutes::require_scoped_permission(const httplib::Request& req, httplib:
     // Legacy fallback: write/delete/execute/approve require admin (effective_role
     // — defense-in-depth; the is_elevated short-circuit above already returned for
     // elevated sessions).
-    // #2376 topology floor: mirrors require_permission's floor above. No
-    // floored (securable, operation) pair reaches this scoped variant today,
-    // but it is floored anyway so a FUTURE scoped topology read cannot
-    // silently bypass the floor — flooring only one of the two structurally
-    // identical legacy branches is the "second copy" defect this repo keeps
-    // re-learning. See authz_topology_floor.hpp for the rationale.
+    // #2376 topology floor: mirrors require_permission's floor above. Wave 7
+    // PR7b (app_usage) is the first floored (securable, operation) pair to
+    // reach this scoped variant — `Forensics:Read`, routed here via
+    // `app_usage_routes.cpp`'s scoped gate (see the `{"Forensics", "Read"}`
+    // entry in authz_topology_floor.hpp). It was floored defensively before
+    // that, so a FUTURE scoped topology read cannot silently bypass the
+    // floor — flooring only one of the two structurally identical legacy
+    // branches is the "second copy" defect this repo keeps re-learning. See
+    // authz_topology_floor.hpp for the rationale.
     const bool floored = topology_floor_applies(securable_type, operation);
     // #2963: mirrors require_permission's exemption above — no floored
     // (securable, operation) pair reaches this scoped variant today, but

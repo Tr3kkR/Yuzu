@@ -930,6 +930,70 @@ TEST_CASE("guard /page escapes a hostile severity in the class attribute",
     CHECK(g->body.find("&lt;img") != std::string::npos);   // proof it was escaped
 }
 
+// json-dump-depth-guard fix (#2437-class), C1: render_guard_page_fragment
+// parses a rule's stored spec_json back out and render_assertion_values'
+// as_str() dump()s any non-string params value (both named fields and the
+// unknown-key catch-all loop). B1/B2 close the REST write side, but this
+// read path stays reachable against a row written before that fix shipped,
+// or by direct DB manipulation - seed the poisoned row DIRECTLY via the
+// store (bypassing the now-guarded REST routes), mirroring this branch's
+// established pattern for proving a read-side guard independently (see
+// test_guardian_push_builder.cpp's build_agent_push depth tests). A raw
+// string, never materialised as a live nlohmann::json object at this depth:
+// kMcpMaxJsonDepth is 32, the 40-deep bracket chain below is comfortably
+// past it and still trivially safe to construct/parse directly in this test
+// process, orders of magnitude short of the ~100,000-level depth that
+// actually SIGSEGVs the real as_str() dump() call this guard exists to
+// prevent.
+TEST_CASE("guard /page renders an explicit invalid-data state for a spec_json "
+          "nested past the depth guard, never a crash or a false not-found",
+          "[pg][guardian_routes][page][security][depth]") {
+    Harness h;
+    auto r = make_rule("g-deep", "DeepGuard");
+    r.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","nested":)" +
+        std::string(40, '[') + std::string(40, ']') +
+        R"(}},"remediation":{"type":"alert-only"}})";
+    REQUIRE(h.store->create_rule(r));
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/g-deep/page", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200); // fragments render inline, not as an HTTP error
+    // The guard genuinely exists (get_rule succeeds) - must render as such,
+    // never as though the rule were absent.
+    CHECK(g->body.find("DeepGuard") != std::string::npos);
+    CHECK(g->body.find("Guard not found") == std::string::npos);
+    // Distinct, explicit invalid-data state - not a silently empty "What it
+    // checks" section, and not the pre-existing "not available" wording used
+    // for a genuinely absent/legacy spec (a different condition entirely).
+    CHECK(g->body.find("could not be displayed") != std::string::npos);
+    CHECK(g->body.find("structured spec is not available") == std::string::npos);
+}
+
+// Positive control: an ordinary, safely-nested structured spec_json still
+// renders its assertion values normally - the depth guard above must not
+// regress the happy-path "What it checks" render.
+TEST_CASE("guard /page still renders assertion values normally for an "
+          "ordinary structured spec_json",
+          "[pg][guardian_routes][page][security][depth]") {
+    Harness h;
+    auto r = make_rule("g-safe", "SafeGuard");
+    r.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\YuzuTest","value_name":"Flag","value_type":"REG_DWORD",)"
+        R"("expected":"1"}},"remediation":{"type":"alert-only"}})";
+    REQUIRE(h.store->create_rule(r));
+
+    auto g = h.sink.dispatch("GET", "/fragments/guardian/guard/g-safe/page", "", "");
+    REQUIRE(g != nullptr);
+    CHECK(g->status == 200);
+    CHECK(g->body.find("SafeGuard") != std::string::npos);
+    CHECK(g->body.find("could not be displayed") == std::string::npos);
+    CHECK(g->body.find("HKLM") != std::string::npos); // real assertion value rendered
+}
+
 // ── Platform honesty: macOS/Linux agents are no-ops, never "armed" ──────────────
 // The agent-side Guardian arms guards on Windows only today; an operator must never
 // read a connected Mac as compliant/protected when it enforces nothing.
