@@ -8455,7 +8455,11 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2), coupling proof: an identical (rule_id, sp
           "retry onto a Wedged key re-observes the existing head instead of being "
           "refused - the actual coupling immediate-refusal-alone would break "
           "(manually confirmed empirically: reverting to unconditional refusal makes "
-          "this test's res2/wedged_reobservations assertions fail)",
+          "this test's res2/wedged_reobservations assertions fail). Also the PR-5d "
+          "adversarial-review Blocker-1 regression guard: detach_all() (a routine "
+          "full-sync retry's own teardown) must not permanently strand this rule's "
+          "adoption candidacy when the very next reconciliation re-observes it as "
+          "STILL desired - only a genuinely OMITTED rule stays deactivated.",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -8497,22 +8501,30 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2), coupling proof: an identical (rule_id, sp
     CHECK(b->arm_entries.load() == 1); // never a second backend arm
 
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    // Adversarial-review Blocker-1 fix: the detach_all() above deactivated this
+    // claim's adoption candidacy (correct for a rule the new push OMITS), but the
+    // identical retry immediately above proved rule_id/spec are STILL desired -
+    // the hoisted Reobserved branch now restores candidacy for exactly that case,
+    // so the late success is ADOPTED, not disarmed (this is the behavior change
+    // from the pre-fix version of this test, which asserted disarms==1/
+    // rule_count==0 here - that was pinning the bug, not a correct baseline).
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
-    CHECK(rt->rule_count() == 0);
-    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 
-    // Adversarial-review finding (2026-09-15): the assertions above prove the FIFO
-    // cleared, but not that a fresh attach on the SAME key genuinely arms afterward -
-    // the direct regression test for the ghost-mapping hazard the no-index-handback
-    // design (PLAN "Correction to the kickoff") exists to avoid. A different rule_id
-    // targeting the identical spec (same key) proves no stale index refcount from
-    // re-observation is blocking a real 0->1 edge.
+    // A different rule_id sharing the same spec (same key) still arms normally as
+    // an ordinary live sibling of the now-adopted r1 - proves the reactivated
+    // subscription is a real, healthy PerKey entry, not a stale/ghost one. "N
+    // consumers, 1 watcher": the sibling reuses r1's already-live subscription,
+    // no second backend arm() call.
     const auto res3 = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
     REQUIRE(res3.has_value());
-    CHECK(rt->rule_count() == 1);
+    CHECK(rt->rule_count() == 2);
     CHECK(rt->armed_key_count() == 1);
-    CHECK(b->arm_entries.load() == 2); // the original arm, plus this genuinely new one
+    CHECK(b->arm_entries.load() == 1);
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_id) "

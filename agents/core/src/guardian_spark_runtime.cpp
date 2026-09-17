@@ -1988,6 +1988,24 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             if (is_retained_wedge(*pre_head) && pre_head->rule_id == rule_id &&
                 pre_head->spec == spec) {
                 wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
+                // Adversarial-review fix (rung 9c PR-5d follow-up): an intervening
+                // full-sync retry's detach_all() (or an intervening
+                // detach_rule_locked(rule_id) from a withdraw-then-immediately-
+                // readd sequence) may already have deactivated this EXACT claim's
+                // rg->active and cleared its wedged_by_rule_ entry - see
+                // detach_all()'s own comment, which justifies that sweep only for
+                // a rule genuinely OMITTED from the replacement desired set. This
+                // call reaching Reobserved is itself the proof rule_id/spec are
+                // STILL desired right now (attach_core() is never called for a
+                // rule nobody wants), so restore adoption candidacy here rather
+                // than leaving it permanently disabled by a sweep that was never
+                // meant to apply to it. Re-registering the locator (not just
+                // rg->active) matters too: a REAL subsequent withdrawal of this
+                // still-wedged claim must still be able to find and deactivate it.
+                if (pre_head->rg && !pre_head->rg->active) {
+                    pre_head->rg->active = true;
+                    wedged_by_rule_.insert_or_assign(rule_id, pre_head);
+                }
                 return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
                                         .error = {}, .claim = pre_head};
             }
