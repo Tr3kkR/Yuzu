@@ -170,6 +170,34 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
     if (!current_)
         return 0;
 
+    // rung 9c PR-5d (concern 2, arm-recovery): before scanning `pending`, check
+    // whether any retained Wedged failure from an earlier drain has since been
+    // ADOPTED by the runtime (concern 1's late-adoption path in on_arm_complete)
+    // - i.e. its exact (rule_id, generation) incarnation is now the one
+    // committed. `end`/receipt_status() never change on adoption (the receipt
+    // stays Wedged by design), which is exactly why this needs its own signal -
+    // GuardianSparkRuntime::receipt_recovered() - rather than re-draining
+    // `pending` again. Deliberately unbounded (no max_per_tick cap, no cursor):
+    // failed_receipts only ever holds rules that actually wedged, a naturally
+    // small, rare population compared to a full ruleset - a bounded pass with a
+    // resume cursor would be over-built for that shape here.
+    for (auto it = current_->failed_receipts.begin(); it != current_->failed_receipts.end();) {
+        if (runtime.receipt_recovered(it->second)) {
+            // Clears THIS application's own resolved_failed contribution only -
+            // never failed_out/arm_failures_, which is a cumulative fleet-visible
+            // audit counter and must never decrement (routed-concerns.md's
+            // Compliance evaluation pipeline row and this file's own header both
+            // treat "how many arm failures have ever happened" and "does the
+            // CURRENT application's generation may advance" as distinct
+            // questions; only the latter recovers here).
+            if (current_->resolved_failed > 0)
+                --current_->resolved_failed;
+            it = current_->failed_receipts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
     std::size_t resolved = 0;
     for (auto it = current_->pending.begin();
         it != current_->pending.end() && resolved < max_per_tick;) {
@@ -197,9 +225,19 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         case S::Committed:
             ++current_->resolved_armed;
             break;
+        case S::Wedged:
+            // rung 9c PR-5d (concern 2): retain the receipt itself (not just the
+            // rule_id) BEFORE the shared accounting below erases it from
+            // `pending` - this is the only failure status a later runtime
+            // adoption can retroactively recover (see failed_receipts' own doc
+            // comment on Application). A copy, not a move: `it->second` is read
+            // again below by nothing else in this loop, but keeping the copy
+            // explicit here avoids coupling this case's own lifetime to the
+            // shared fallthrough body's unrelated edits.
+            current_->failed_receipts.insert_or_assign(it->first, it->second);
+            [[fallthrough]];
         case S::Failed:
         case S::CongestionExpired:
-        case S::Wedged:
         case S::Withdrawn:
         case S::Stopped:
             ++current_->resolved_failed;
@@ -248,6 +286,10 @@ std::size_t GuardianArmAckLedger::applied_count() const {
 
 std::size_t GuardianArmAckLedger::pending_count_for_test() const {
     return current_ ? current_->pending.size() : 0;
+}
+
+std::size_t GuardianArmAckLedger::failed_receipt_count_for_test() const {
+    return current_ ? current_->failed_receipts.size() : 0;
 }
 
 std::vector<GuardianSparkRuntime::ReceiptStatus>
