@@ -123,6 +123,48 @@ TEST_CASE("autoruns: format_source_status renders '-' for a declared-only row, a
                                "foreign_os") == "source|mac_login_items|unsupported|0|foreign_os");
 }
 
+// ── 0b. utf16le_to_utf8 ───────────────────────────────────────────────────
+
+TEST_CASE("autoruns: utf16le_to_utf8 pairs a real surrogate pair into one "
+          "supplementary-plane code point (4-byte UTF-8), not two separate "
+          "3-byte CESU-8 sequences",
+          "[autoruns][parsers]") {
+    // U+1F600 GRINNING FACE -> UTF-16LE surrogate pair D83D DE00 -> UTF-8
+    // F0 9F 98 80.
+    const std::vector<unsigned char> bytes = {0x3D, 0xD8, 0x00, 0xDE, 0x00, 0x00};
+    const auto out = utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+    REQUIRE(out.size() == 4);
+    CHECK(static_cast<unsigned char>(out[0]) == 0xF0);
+    CHECK(static_cast<unsigned char>(out[1]) == 0x9F);
+    CHECK(static_cast<unsigned char>(out[2]) == 0x98);
+    CHECK(static_cast<unsigned char>(out[3]) == 0x80);
+}
+
+TEST_CASE("autoruns: utf16le_to_utf8 emits U+FFFD for an unpaired high surrogate "
+          "or a lone low surrogate, never a half-formed sequence",
+          "[autoruns][parsers]") {
+    SECTION("high surrogate followed by a non-surrogate unit") {
+        const std::vector<unsigned char> bytes = {0x3D, 0xD8, 'A', 0x00, 0x00, 0x00};
+        const auto out =
+            utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+        // U+FFFD (EF BF BD) followed by 'A'.
+        REQUIRE(out.size() == 4);
+        CHECK(static_cast<unsigned char>(out[0]) == 0xEF);
+        CHECK(static_cast<unsigned char>(out[1]) == 0xBF);
+        CHECK(static_cast<unsigned char>(out[2]) == 0xBD);
+        CHECK(out[3] == 'A');
+    }
+    SECTION("lone low surrogate with no preceding high surrogate") {
+        const std::vector<unsigned char> bytes = {0x00, 0xDE, 0x00, 0x00};
+        const auto out =
+            utf16le_to_utf8(std::span<const unsigned char>{bytes.data(), bytes.size()});
+        REQUIRE(out.size() == 3);
+        CHECK(static_cast<unsigned char>(out[0]) == 0xEF);
+        CHECK(static_cast<unsigned char>(out[1]) == 0xBF);
+        CHECK(static_cast<unsigned char>(out[2]) == 0xBD);
+    }
+}
+
 // ── 1. split_command_line ────────────────────────────────────────────────
 
 TEST_CASE("autoruns: split_command_line separates a quoted path from its flags "
@@ -155,6 +197,34 @@ TEST_CASE("autoruns: split_command_line on an empty string returns an empty spli
     const auto split = split_command_line("");
     CHECK(split.target.empty());
     CHECK(split.args.empty());
+}
+
+TEST_CASE("autoruns: split_command_line closes a quoted target on an EVEN "
+          "backslash run before the closing quote -- a bare single-backslash "
+          "check (this function's prior form) gets this wrong for a run of 2 "
+          "or more",
+          "[autoruns][parsers]") {
+    // Input: "C:\dir\\" -flag -- two backslashes immediately before the
+    // closing quote is an EVEN run, so the quote genuinely terminates the
+    // target (a plain trailing path separator; the target keeps both
+    // backslashes verbatim, this function never unescapes), and "-flag" is
+    // the argument tail -- not scanned past as if the quote were escaped.
+    const auto split = split_command_line("\"C:\\dir\\\\\" -flag");
+    CHECK(split.target == "C:\\dir\\\\");
+    CHECK(split.args == "-flag");
+}
+
+TEST_CASE("autoruns: split_command_line treats an ODD backslash run before a "
+          "quote as an escaped quote, not the real close",
+          "[autoruns][parsers]") {
+    // Input: "C:\a\"b\\" -flag -- ONE backslash immediately before the
+    // inner quote is an ODD run (escaped, not a real close), so scanning
+    // continues past it to the actual closing quote (preceded by an even,
+    // 2-backslash run) rather than stopping early and reading " -flag"
+    // (attached to the wrong half) as part of the target.
+    const auto split = split_command_line("\"C:\\a\\\"b\\\\\" -flag");
+    CHECK(split.target == "C:\\a\\\"b\\\\");
+    CHECK(split.args == "-flag");
 }
 
 // ── 2. parse_reg_run_values ──────────────────────────────────────────────
@@ -329,6 +399,150 @@ TEST_CASE("autoruns: parse_ifeo_debugger with a Debugger value reports it",
     CHECK(entry.debugger == "C:\\evil.exe");
 }
 
+// ── 6b. resolve_profile_shell_folder ─────────────────────────────────────
+
+TEST_CASE("autoruns: resolve_profile_shell_folder expands %USERPROFILE% against "
+          "the ENUMERATED PROFILE's own path, never a process environment lookup "
+          "(#4219 -- this is the fix for the bug that resolved against the agent's "
+          "own LocalSystem environment instead)",
+          "[autoruns][parsers]") {
+    auto no_machine_lookup = [](std::string_view) -> std::optional<std::string> {
+        FAIL("machine_var should not be consulted for a user-scoped token");
+        return std::nullopt;
+    };
+    const auto result = resolve_profile_shell_folder(
+        "%USERPROFILE%\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup",
+        "REG_EXPAND_SZ", "C:\\Users\\alice", "alice", no_machine_lookup);
+    REQUIRE(result.path.has_value());
+    CHECK(*result.path ==
+         "C:\\Users\\alice\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup");
+    CHECK(result.constraint.empty());
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder's token match is case-insensitive "
+          "(%AppData% not just %APPDATA%) and shorthand tokens resolve against the "
+          "profile path, not a lookup",
+          "[autoruns][parsers]") {
+    auto no_machine_lookup = [](std::string_view) -> std::optional<std::string> {
+        FAIL("machine_var should not be consulted for a user-scoped token");
+        return std::nullopt;
+    };
+    const auto appdata = resolve_profile_shell_folder("%AppData%\\CorpStartup", "REG_EXPAND_SZ",
+                                                      "C:\\Users\\alice", "alice",
+                                                      no_machine_lookup);
+    REQUIRE(appdata.path.has_value());
+    CHECK(*appdata.path == "C:\\Users\\alice\\AppData\\Roaming\\CorpStartup");
+
+    const auto localappdata = resolve_profile_shell_folder(
+        "%LOCALAPPDATA%\\CorpStartup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        no_machine_lookup);
+    REQUIRE(localappdata.path.has_value());
+    CHECK(*localappdata.path == "C:\\Users\\alice\\AppData\\Local\\CorpStartup");
+
+    const auto username = resolve_profile_shell_folder("C:\\Corp\\%USERNAME%\\Startup",
+                                                        "REG_EXPAND_SZ", "C:\\Users\\alice",
+                                                        "alice", no_machine_lookup);
+    REQUIRE(username.path.has_value());
+    CHECK(*username.path == "C:\\Corp\\alice\\Startup");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder resolves a machine-scoped token "
+          "(identical for every user on this host) via the injected lookup",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%SystemDrive%\\CorpStartup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view name) -> std::optional<std::string> {
+            CHECK(name == "SystemDrive");
+            return std::string{"C:"};
+        });
+    REQUIRE(result.path.has_value());
+    CHECK(*result.path == "C:\\CorpStartup");
+    CHECK(result.constraint.empty());
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved, "
+          "never a guess, for a token it doesn't recognize",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%OneDrive%\\Startup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> {
+            FAIL("OneDrive is not in the machine-scoped allowlist");
+            return std::nullopt;
+        });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved "
+          "when an allowlisted machine token's lookup itself comes back empty, never "
+          "a partial/guessed path",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%ProgramData%\\CorpStartup", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> { return std::nullopt; });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved "
+          "for an unterminated '%' with no closing '%' anywhere in the value "
+          "(governance Gate 4 unhappy-path: an adversarial/truncated registry value "
+          "shape with no valid token boundary at all)",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%USERPROFILE%\\Startup\\%NOCLOSE", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> {
+            FAIL("no allowlisted token appears before the unterminated one");
+            return std::nullopt;
+        });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_unresolved "
+          "for an empty '%%' token name",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder(
+        "%USERPROFILE%\\Start%%Menu", "REG_EXPAND_SZ", "C:\\Users\\alice", "alice",
+        [](std::string_view) -> std::optional<std::string> {
+            FAIL("no allowlisted token appears before the empty one");
+            return std::nullopt;
+        });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_unresolved");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder treats REG_SZ as a literal path, "
+          "no token expansion -- a stray '%' is kept verbatim",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder("C:\\CorpStartup\\100%done", "REG_SZ",
+                                                      "C:\\Users\\alice", "alice",
+                                                      [](std::string_view) { return std::nullopt; });
+    REQUIRE(result.path.has_value());
+    CHECK(*result.path == "C:\\CorpStartup\\100%done");
+    CHECK(result.constraint.empty());
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports startup_redirect_bad_type "
+          "for a value type that isn't REG_SZ/REG_EXPAND_SZ",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder("1", "REG_DWORD", "C:\\Users\\alice",
+                                                      "alice",
+                                                      [](std::string_view) { return std::nullopt; });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint == "startup_redirect_bad_type");
+}
+
+TEST_CASE("autoruns: resolve_profile_shell_folder reports \"not configured\", not a "
+          "failure, for an empty value",
+          "[autoruns][parsers]") {
+    const auto result = resolve_profile_shell_folder("", "REG_EXPAND_SZ", "C:\\Users\\alice",
+                                                      "alice",
+                                                      [](std::string_view) { return std::nullopt; });
+    CHECK_FALSE(result.path.has_value());
+    CHECK(result.constraint.empty()); // empty constraint == "not configured", not a failure
+}
+
 // ── 7. parse_task_xml ──────────────────────────────────────────────────────
 
 TEST_CASE("autoruns: parse_task_xml reads command, disabled state, principal and empty "
@@ -336,7 +550,7 @@ TEST_CASE("autoruns: parse_task_xml reads command, disabled state, principal and
           "[autoruns][parsers]") {
     const auto xml = read_fixture_reg_text("windows/sample_task.xml");
     const auto info = parse_task_xml(xml);
-    CHECK(info.parsed_ok); // a real, well-formed <Task>-rooted capture
+    CHECK(info.parsed_ok); // a real, well-formed <Task>-rooted capture (with the real xmlns)
     REQUIRE(info.actions.size() == 1);
     CHECK(info.actions[0].command == "%windir%\\system32\\appidpolicyconverter.exe");
     CHECK_FALSE(info.has_unmodelled_action);
@@ -355,7 +569,7 @@ TEST_CASE("autoruns: parse_task_xml on a truncated document reports parsed_ok=fa
           "[autoruns][parsers]") {
     // RECONSTRUCTION negative (acceptance criterion): a Command tag opened
     // but never closed must not throw or read past the buffer.
-    const std::string truncated = "<Task><Actions><Exec><Command>C:\\partial";
+    const std::string truncated = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions><Exec><Command>C:\\partial";
     const auto info = parse_task_xml(truncated);
     CHECK_FALSE(info.parsed_ok);
     CHECK(info.actions.empty());
@@ -374,7 +588,7 @@ TEST_CASE("autoruns: parse_task_xml on a well-formed task with no <Triggers> and
           "boring task, not a parse failure, and must not be conflated with the "
           "truncated/malformed cases above that also have empty actions/has_triggers)",
           "[autoruns][parsers]") {
-    const std::string xml = "<Task><RegistrationInfo><Date>2026-01-01T00:00:00</Date>"
+    const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><Date>2026-01-01T00:00:00</Date>"
                             "</RegistrationInfo></Task>";
     const auto info = parse_task_xml(xml);
     CHECK(info.parsed_ok);
@@ -393,7 +607,7 @@ TEST_CASE("autoruns: parse_task_xml reads <RegistrationInfo>/<Date> through the 
           "ahead of the real element would win a raw scan but must not win here)",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><RegistrationInfo>"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo>"
         "<!-- decoy: <Date>1999-01-01T00:00:00</Date> -->"
         "<Date>2026-06-15T12:30:00</Date>"
         "</RegistrationInfo></Task>";
@@ -405,7 +619,7 @@ TEST_CASE("autoruns: parse_task_xml reads <RegistrationInfo>/<Date> through the 
 TEST_CASE("autoruns: parse_task_xml reads every <Exec> action, not just the first",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec><Command>C:\\benign.exe</Command><Arguments>-a</Arguments></Exec>"
         "<Exec><Command>C:\\second.exe</Command><Arguments>-b</Arguments></Exec>"
         "</Actions></Task>";
@@ -421,7 +635,7 @@ TEST_CASE("autoruns: parse_task_xml reads every <Exec> action, not just the firs
 TEST_CASE("autoruns: parse_task_xml flags an unmodelled action type alongside a real Exec",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec><Command>C:\\benign.exe</Command></Exec>"
         "<ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId></ComHandler>"
         "</Actions></Task>";
@@ -435,7 +649,7 @@ TEST_CASE("autoruns: parse_task_xml does not confuse <Actions> with a longer tag
           "its prefix",
           "[autoruns][parsers]") {
     // A hypothetical <ActionsFoo> block must not be mistaken for <Actions>.
-    const std::string xml = "<Task><ActionsFoo><Exec><Command>C:\\decoy.exe</Command></Exec>"
+    const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><ActionsFoo><Exec><Command>C:\\decoy.exe</Command></Exec>"
                             "</ActionsFoo></Task>";
     const auto info = parse_task_xml(xml);
     CHECK(info.actions.empty());
@@ -452,7 +666,7 @@ TEST_CASE("autoruns: a raw '>' or '/>' inside a QUOTED attribute value does not 
     SECTION("a '>' inside the quoted Id value -- must not be read as the tag terminator, "
             "and the trigger must still be found as a real (non-self-closed) element") {
         const std::string xml =
-            "<Task><Triggers><LogonTrigger Id=\"a>b\"><Enabled>true</Enabled>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger Id=\"a>b\"><Enabled>true</Enabled>"
             "</LogonTrigger></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
@@ -460,7 +674,7 @@ TEST_CASE("autoruns: a raw '>' or '/>' inside a QUOTED attribute value does not 
     SECTION("a '/>' sequence inside the quoted id value -- must not be read as a genuine "
             "self-close, so the action's real Command/Arguments still reach the row") {
         const std::string xml =
-            "<Task><Actions Context=\"Author\">"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
             "<Exec id=\"a/>b\"><Command>C:\\payload.exe</Command><Arguments>-x</Arguments></Exec>"
             "</Actions></Task>";
         const auto info = parse_task_xml(xml);
@@ -476,7 +690,7 @@ TEST_CASE("autoruns: parse_task_xml decodes the 5 predefined XML entities in "
           "exact IOC/command-string matching against the real argv)",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec><Command>C:\\tools\\a&amp;b.exe</Command>"
         "<Arguments>--filter=\"x&lt;y&gt;z\" --tag=&apos;a&amp;b&apos;</Arguments></Exec>"
         "</Actions></Task>";
@@ -495,7 +709,7 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
     SECTION("an XML comment containing '>' and quotes, sitting between real elements, "
             "must not confuse the real content around it") {
         const std::string xml =
-            "<Task><Actions Context=\"Author\">"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
             "<!-- a comment with a stray > and \"quotes\" and 'more quotes' -->"
             "<Exec><Command>C:\\real.exe</Command></Exec>"
             "</Actions></Task>";
@@ -508,14 +722,14 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
             "obstacle") {
         const std::string xml =
             "<?xml version=\"1.0\" encoding=\"UTF-16\"?>"
-            "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger/></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("a decoy element sharing a trigger-type's local name but living OUTSIDE "
             "<Triggers> must not be mistaken for a real trigger") {
         const std::string xml =
-            "<Task><RegistrationInfo><LogonTrigger>decoy, not a real trigger element here"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><LogonTrigger>decoy, not a real trigger element here"
             "</LogonTrigger></RegistrationInfo><Triggers/></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
@@ -528,7 +742,7 @@ TEST_CASE("autoruns: parse_task_xml handles XML constructs a hand-rolled scanner
             "well-formed-but-boring task") {
         const std::string xml =
             "<?xml version=\"1.0\"?><!DOCTYPE Task [<!ENTITY x \"evil\">]>"
-            "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger/></Triggers></Task>";
         const auto info = parse_task_xml(xml);
         CHECK_FALSE(info.parsed_ok);
         CHECK_FALSE(info.has_triggers);
@@ -552,21 +766,21 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
           "[autoruns][parsers]") {
     SECTION("a single disabled trigger -> false") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><Enabled>false</Enabled>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><Enabled>false</Enabled>"
             "</CalendarTrigger></Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("a trigger with no <Enabled> tag at all -> true (schema default enabled)") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary>"
             "</CalendarTrigger></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("one disabled, one enabled -> true (at least one will fire)") {
         const std::string xml =
-            "<Task><Triggers>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>"
             "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
             "<TimeTrigger><Enabled>true</Enabled></TimeTrigger>"
             "</Triggers></Task>";
@@ -575,7 +789,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
 
     SECTION("all disabled -> false") {
         const std::string xml =
-            "<Task><Triggers>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>"
             "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
             "<TimeTrigger><Enabled>false</Enabled></TimeTrigger>"
             "</Triggers></Task>";
@@ -590,7 +804,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "Task Scheduler UI -- was misclassified as no live trigger, even "
             "though the untagged sibling will fire the task)") {
         const std::string xml =
-            "<Task><Triggers>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>"
             "<CalendarTrigger><Enabled>false</Enabled></CalendarTrigger>"
             "<TimeTrigger><StartBoundary>2026-01-01T00:00:00</StartBoundary></TimeTrigger>"
             "</Triggers></Task>";
@@ -598,7 +812,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
     }
 
     SECTION("whitespace-only Triggers block -> false") {
-        const std::string xml = "<Task><Triggers>\n   \t\n</Triggers></Task>";
+        const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers>\n   \t\n</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
@@ -606,12 +820,12 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "LogonTrigger/BootTrigger/etc. have no required children, so a bare "
             "<LogonTrigger/> is schema-valid and live; the round-4 exact-open-tag "
             "matcher missed this shape entirely)") {
-        const std::string xml = "<Task><Triggers><LogonTrigger/></Triggers></Task>";
+        const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger/></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("a self-closed trigger with a space before the slash -> true") {
-        const std::string xml = "<Task><Triggers><LogonTrigger /></Triggers></Task>";
+        const std::string xml = "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><LogonTrigger /></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
 
@@ -620,7 +834,7 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "base type defines an optional Id attribute; the round-4 exact "
             "'<Tag>' match required a bare tag with no attributes)") {
         const std::string xml =
-            "<Task><Triggers><BootTrigger Id=\"boot\"><Enabled>true</Enabled>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><BootTrigger Id=\"boot\"><Enabled>true</Enabled>"
             "</BootTrigger></Triggers></Task>";
         CHECK(parse_task_xml(xml).has_triggers);
     }
@@ -629,14 +843,14 @@ TEST_CASE("autoruns: parse_task_xml's has_triggers consults each trigger's own "
             "(RECONSTRUCTION: pins round 5's should-fix -- a bare =='false' string "
             "compare treated '0' as live)") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><Enabled>0</Enabled></CalendarTrigger>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><Enabled>0</Enabled></CalendarTrigger>"
             "</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
 
     SECTION("whitespace-padded <Enabled> false form still disables") {
         const std::string xml =
-            "<Task><Triggers><CalendarTrigger><Enabled> false </Enabled></CalendarTrigger>"
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Triggers><CalendarTrigger><Enabled> false </Enabled></CalendarTrigger>"
             "</Triggers></Task>";
         CHECK_FALSE(parse_task_xml(xml).has_triggers);
     }
@@ -649,13 +863,181 @@ TEST_CASE("autoruns: parse_task_xml reads an Exec action carrying the schema's o
           "target/args came back empty even though the task has a real command)",
           "[autoruns][parsers]") {
     const std::string xml =
-        "<Task><Actions Context=\"Author\">"
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><Actions Context=\"Author\">"
         "<Exec id=\"run\"><Command>C:\\real.exe</Command><Arguments>-x</Arguments></Exec>"
         "</Actions></Task>";
     const auto info = parse_task_xml(xml);
     REQUIRE(info.actions.size() == 1);
     CHECK(info.actions[0].command == "C:\\real.exe");
     CHECK(info.actions[0].arguments == "-x");
+}
+
+TEST_CASE("autoruns: parse_task_xml rejects a <Task>-named root that isn't in the Task "
+          "Scheduler namespace -- schema-garbage sharing child tag names (<Settings>/"
+          "<Actions>/<Triggers>) under an unrelated or absent namespace must not parse "
+          "as a plausible task with no signal it came from elsewhere (#4184 AC2)",
+          "[autoruns][parsers]") {
+    SECTION("root element with no namespace at all") {
+        const std::string xml =
+            "<Task><Settings><Enabled>true</Enabled></Settings>"
+            "<Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.parsed_ok);
+        CHECK(info.reject == TaskReject::wrong_root);
+        CHECK(info.actions.empty()); // safe defaults, not a partial/guessed parse
+    }
+
+    SECTION("root element in an unrelated namespace") {
+        const std::string xml =
+            "<Task xmlns=\"urn:not-task-scheduler\">"
+            "<Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK_FALSE(info.parsed_ok);
+        CHECK(info.reject == TaskReject::wrong_root);
+    }
+
+    SECTION("the real Task Scheduler namespace is still accepted") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions><Exec><Command>C:\\x.exe</Command></Exec></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK(info.parsed_ok);
+        CHECK(info.reject == TaskReject::none);
+    }
+}
+
+TEST_CASE("autoruns: parse_task_xml ignores a descendant that redeclares a foreign "
+          "default namespace, even under a correctly-namespaced <Task> root -- the "
+          "namespace hardening at the root must not stop there, or schema-garbage "
+          "nested under a genuine root is silently read as real task content",
+          "[autoruns][parsers]") {
+    SECTION("the whole <Actions> element redeclares a foreign namespace") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions xmlns=\"urn:other\"><Exec><Command>C:\\foreign.exe</Command></Exec>"
+            "</Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK(info.parsed_ok); // the root itself is genuine -- not a reject case
+        CHECK(info.actions.empty()); // the foreign-namespace <Actions> subtree is not read
+        CHECK_FALSE(info.has_unmodelled_action);
+    }
+
+    SECTION("a genuine <Actions> element's own <Exec> child redeclares a foreign namespace") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions><Exec xmlns=\"urn:other\"><Command>C:\\foreign.exe</Command></Exec>"
+            "</Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        CHECK(info.parsed_ok);
+        CHECK(info.actions.empty()); // the foreign-namespace <Exec> itself is not read as one
+        CHECK_FALSE(info.has_unmodelled_action);
+    }
+}
+
+TEST_CASE("autoruns: parse_task_xml refuses an oversized document before xmlReadMemory "
+          "ever sees it, distinct from an ordinary malformed rejection (#4184)",
+          "[autoruns][parsers]") {
+    const std::string oversized(kMaxTaskXmlBytes + 1, 'a');
+    const auto info = parse_task_xml(oversized);
+    CHECK_FALSE(info.parsed_ok);
+    CHECK(info.reject == TaskReject::oversized);
+}
+
+TEST_CASE("autoruns: task_reject_reason_token maps TaskReject::oversized to its own "
+          "'oversized' wire token, and every other rejection shape to the existing "
+          "'malformed' token -- closes the coverage gap an adversarial functional "
+          "review found: the win.cpp COM call site's mapping (autoruns_win.cpp) was "
+          "previously an inline ternary reachable only through Windows-only code, so "
+          "no test on any build host actually exercised it (#4184)",
+          "[autoruns][parsers]") {
+    CHECK(task_reject_reason_token(TaskReject::oversized) == "oversized");
+    CHECK(task_reject_reason_token(TaskReject::malformed) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::empty) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::dtd) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::wrong_root) == "malformed");
+    CHECK(task_reject_reason_token(TaskReject::none).empty());
+}
+
+TEST_CASE("autoruns: parse_task_xml rejects a deeply-nested, DTD-free document cleanly "
+          "-- a real error, not a crash or unbounded resource use (#4184 AC3). "
+          "XML_PARSE_HUGE is deliberately never passed (see parse_task_xml's own "
+          "banner), so libxml2's own default depth ceiling (~256 levels) is what "
+          "rejects this, not an explicit depth counter in this function",
+          "[autoruns][parsers]") {
+    std::string open, close;
+    for (int i = 0; i < 5000; ++i) {
+        open += "<x>";
+        close += "</x>";
+    }
+    const std::string xml =
+        "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">" + open +
+        close + "</Task>";
+    const auto info = parse_task_xml(xml);
+    CHECK_FALSE(info.parsed_ok);
+    // Genuinely nested, not DTD/oversized -- confirms the depth ceiling
+    // itself is what rejected it, not an unrelated guard firing first.
+    CHECK(info.reject == TaskReject::malformed);
+}
+
+TEST_CASE("autoruns: rows_for_task emits exactly one row for a task with zero decoded "
+          "actions -- whether genuinely action-less or carrying only an unmodelled "
+          "action type -- rather than silently vanishing (#4184 AC1)",
+          "[autoruns][parsers]") {
+    SECTION("genuinely no actions at all") {
+        TaskInfo info;
+        info.parsed_ok = true;
+        const auto rows =
+            rows_for_task(info, "\\MyTask", "MyTask", "SYSTEM", 12345, Enabled::enabled);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].entry == "MyTask");
+        CHECK(rows[0].target.empty());
+        CHECK(rows[0].args.empty());
+        CHECK(rows[0].enabled == Enabled::enabled);
+        CHECK(rows[0].mtime == 12345);
+    }
+
+    SECTION("only an unmodelled action type (ComHandler, no Exec) -- the row a caller "
+            "must not read as \"nothing here\"") {
+        const std::string xml =
+            "<Task xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+            "<Actions><ComHandler><ClassId>{00000000-0000-0000-0000-000000000000}</ClassId>"
+            "</ComHandler></Actions></Task>";
+        const auto info = parse_task_xml(xml);
+        REQUIRE(info.parsed_ok);
+        CHECK(info.actions.empty());
+        CHECK(info.has_unmodelled_action);
+        const auto rows = rows_for_task(info, "\\MyTask", "MyTask", "-", 0, Enabled::unknown);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].target.empty());
+        CHECK(rows[0].enabled == Enabled::unknown);
+    }
+}
+
+TEST_CASE("autoruns: rows_for_task emits one row per action, index-suffixing the entry "
+          "only once there's more than one",
+          "[autoruns][parsers]") {
+    TaskInfo info;
+    info.parsed_ok = true;
+    info.actions = {{"C:\\a.exe", "-a"}, {"C:\\b.exe", "-b"}};
+    const auto rows = rows_for_task(info, "\\MyTask", "MyTask", "SYSTEM", 999, Enabled::enabled);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].entry == "MyTask [action 1]");
+    CHECK(rows[0].target == "C:\\a.exe");
+    CHECK(rows[0].args == "-a");
+    CHECK(rows[1].entry == "MyTask [action 2]");
+    CHECK(rows[1].target == "C:\\b.exe");
+    CHECK(rows[1].args == "-b");
+}
+
+TEST_CASE("autoruns: rows_for_task's single-action case does not get an index suffix",
+          "[autoruns][parsers]") {
+    TaskInfo info;
+    info.parsed_ok = true;
+    info.actions = {{"C:\\solo.exe", ""}};
+    const auto rows = rows_for_task(info, "\\MyTask", "MyTask", "-", 0, Enabled::enabled);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].entry == "MyTask");
+    CHECK(rows[0].target == "C:\\solo.exe");
 }
 
 TEST_CASE("autoruns: scheduled_task_enabled_state requires both a live COM Enabled "
@@ -930,19 +1312,39 @@ TEST_CASE("autoruns: parse_anacrontab parses period/delay/job/command "
           "(anacrontab, real capture)",
           "[autoruns][parsers]") {
     const auto text = read_fixture_bytes("linux/anacrontab");
-    const auto entries = parse_anacrontab(text);
-    REQUIRE(entries.size() == 3);
-    CHECK(entries[0].period == "1");
-    CHECK(entries[0].delay == "5");
-    CHECK(entries[0].job_id == "cron.daily");
-    CHECK(entries[2].period == "@monthly");
+    const auto result = parse_anacrontab(text);
+    REQUIRE(result.entries.size() == 3);
+    CHECK(result.entries[0].period == "1");
+    CHECK(result.entries[0].delay == "5");
+    CHECK(result.entries[0].job_id == "cron.daily");
+    CHECK(result.entries[2].period == "@monthly");
+    CHECK(result.rejected_lines == 0);
 }
 
-TEST_CASE("autoruns: parse_anacrontab skips a malformed short line", "[autoruns][parsers]") {
-    // RECONSTRUCTION negative: a line with fewer than 4 fields is skipped,
-    // not mis-parsed into the wrong columns.
+TEST_CASE("autoruns: parse_anacrontab counts a malformed short line as rejected, "
+          "never silently dropped (#4184 unfiled-finding cleanup: matches "
+          "parse_crontab's rejected_lines contract, now actually consumed by "
+          "the /etc/anacrontab collector)",
+          "[autoruns][parsers]") {
+    // RECONSTRUCTION negative: a line with fewer than 4 fields is rejected
+    // and counted, not silently skipped nor mis-parsed into the wrong
+    // columns.
     const std::string text = "1\t5\n";
-    CHECK(parse_anacrontab(text).empty());
+    const auto result = parse_anacrontab(text);
+    CHECK(result.entries.empty());
+    CHECK(result.rejected_lines == 1);
+}
+
+TEST_CASE("autoruns: parse_anacrontab keeps other valid entries alongside a "
+          "rejected line, never dropping the whole file",
+          "[autoruns][parsers]") {
+    const std::string text = "1 5 cron.daily /etc/cron.daily\nshort line\n7 25 cron.weekly "
+                             "/etc/cron.weekly\n";
+    const auto result = parse_anacrontab(text);
+    REQUIRE(result.entries.size() == 2);
+    CHECK(result.entries[0].job_id == "cron.daily");
+    CHECK(result.entries[1].job_id == "cron.weekly");
+    CHECK(result.rejected_lines == 1);
 }
 
 // ── 11. parse_systemd_timer / timer_enabled_from_wants ───────────────────
@@ -955,6 +1357,16 @@ TEST_CASE("autoruns: parse_systemd_timer reads OnCalendar and WantedBy "
     CHECK(fields.on_calendar == "*-*-* 6,18:00");
     CHECK(fields.wanted_by == "timers.target");
     CHECK(fields.on_boot_sec.empty());
+}
+
+TEST_CASE("autoruns: parse_systemd_timer accepts whitespace-padded 'Key = Value' "
+          "-- systemd.syntax(7) makes the whitespace ignorable, not part of a "
+          "different (unrecognized, silently dropped) key",
+          "[autoruns][parsers]") {
+    const std::string text = "[Timer]\nOnCalendar = daily\n[Install]\nWantedBy = timers.target\n";
+    const auto fields = parse_systemd_timer(text);
+    CHECK(fields.on_calendar == "daily");
+    CHECK(fields.wanted_by == "timers.target");
 }
 
 TEST_CASE("autoruns: timer_enabled_from_wants finds a real symlink "
@@ -987,6 +1399,7 @@ TEST_CASE("autoruns: parse_desktop_entry on a normal entry is enabled "
     CHECK(entry.exec == "/usr/libexec/at-spi-bus-launcher --launch-immediately");
     CHECK_FALSE(entry.hidden);
     CHECK(entry.enabled == Enabled::enabled);
+    CHECK_FALSE(entry.malformed);
 }
 
 TEST_CASE("autoruns: parse_desktop_entry with Hidden=true is disabled "
@@ -997,6 +1410,66 @@ TEST_CASE("autoruns: parse_desktop_entry with Hidden=true is disabled "
     CHECK(entry.hidden);
     CHECK(entry.only_show_in == "GNOME;");
     CHECK(entry.enabled == Enabled::disabled);
+    CHECK_FALSE(entry.malformed); // Hidden, but still a real Exec -- not malformed
+}
+
+TEST_CASE("autoruns: parse_desktop_entry flags malformed when there's no "
+          "[Desktop Entry] group at all -- nothing this leg could run, must not "
+          "silently report an enabled row with an empty target",
+          "[autoruns][parsers]") {
+    const std::string text = "[Some Other Group]\nExec=/bin/should-not-count\n";
+    const auto entry = parse_desktop_entry(text);
+    CHECK(entry.malformed);
+    CHECK(entry.exec.empty());
+}
+
+TEST_CASE("autoruns: parse_desktop_entry flags malformed when [Desktop Entry] is "
+          "present but Exec is absent or empty",
+          "[autoruns][parsers]") {
+    SECTION("Exec key absent entirely") {
+        const std::string text = "[Desktop Entry]\nHidden=false\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+    SECTION("Exec key present but empty") {
+        const std::string text = "[Desktop Entry]\nExec=\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+}
+
+TEST_CASE("autoruns: parse_desktop_entry does NOT flag malformed for a "
+          "DBusActivatable=true entry with no Exec -- the Desktop Entry spec "
+          "requires Exec only when DBusActivatable is not true, so this is a "
+          "real D-Bus-activated autostart entry, not a broken one",
+          "[autoruns][parsers]") {
+    const std::string text = "[Desktop Entry]\nDBusActivatable=true\n";
+    const auto entry = parse_desktop_entry(text);
+    CHECK_FALSE(entry.malformed);
+    CHECK(entry.dbus_activatable);
+    CHECK(entry.exec.empty());
+}
+
+TEST_CASE("autoruns: parse_desktop_entry still flags malformed when Exec is "
+          "empty and DBusActivatable is absent or false -- DBusActivatable "
+          "does not blanket-waive the target requirement",
+          "[autoruns][parsers]") {
+    SECTION("DBusActivatable absent") {
+        const std::string text = "[Desktop Entry]\nHidden=false\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+    SECTION("DBusActivatable=false") {
+        const std::string text = "[Desktop Entry]\nDBusActivatable=false\n";
+        CHECK(parse_desktop_entry(text).malformed);
+    }
+}
+
+TEST_CASE("autoruns: parse_desktop_entry accepts whitespace-padded 'Key = Value' "
+          "-- the XDG Desktop Entry spec makes the whitespace ignorable, not part "
+          "of a different key ('Exec ' silently dropped, target reads empty)",
+          "[autoruns][parsers]") {
+    const std::string text = "[Desktop Entry]\nExec = /usr/bin/real --flag\n";
+    const auto entry = parse_desktop_entry(text);
+    CHECK(entry.exec == "/usr/bin/real --flag");
+    CHECK_FALSE(entry.malformed);
 }
 
 // ── 13. LaunchdFields / launchd_row_from_fields ──────────────────────────

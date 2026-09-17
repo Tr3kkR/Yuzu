@@ -173,8 +173,17 @@ groups:
       # #913 OTA-bounds alert thresholds, the single largest source of
       # review findings on that PR); tighten once real data exists.
       - alert: YuzuGatewayRouteWriteFailed
+        # HA WS-4 4.2b follow-up (#4344 MEDIUM 2): the rate window is 10m,
+        # DELIBERATELY WIDER than the 5m `for:`. A window == for-duration can
+        # never reach `firing` from a single isolated 0->1 increment (the
+        # rate()>0 straddle lasts only window-step, one step short of the `for:`
+        # it must hold across) — so with the counter now pre-seeded to 0, a lone
+        # write failure would otherwise reach `pending` and silently expire. The
+        # wider window keeps the 5m dampening (an instantaneous blip does not
+        # page immediately) while ensuring a genuine failure DOES fire ~5m after
+        # onset. Paired with the constructor pre-seed of every (op,reason) combo.
         expr: |
-          rate(yuzu_server_gateway_route_write_failed_total[5m]) > 0
+          rate(yuzu_server_gateway_route_write_failed_total[10m]) > 0
         for: 5m
         labels:
           severity: warning
@@ -188,10 +197,21 @@ groups:
             server (pg_stat_activity, pool-acquire wait); a register_fresh
             failure additionally refuses new ProxyRegister with UNAVAILABLE, so
             gateway-fronted agents may be unable to (re)enroll until the store
-            recovers. See ADR-2002 §7 "Ship the write-failure fail-closed
-            posture" and docs/user-manual/metrics.md's Gateway routing
-            directory section. INITIAL threshold, not yet tuned against real
-            fleet data.
+            recovers. TRIAGE BY op — the fail-open ops recover DIFFERENTLY, so do
+            not assume a uniform self-heal: op="register_fresh" (fail-CLOSED) is
+            the highest urgency, blocking new enrollment; op="renew_leases"
+            normally repairs on the next heartbeat; op="deregister" leaves a
+            stale row bounded by the ~90s lease TTL + the stale-route reaper; but
+            op="announce_connected" is the SOLE placement writer, so a lost
+            announce_connected leaves the row NON-ROUTABLE (cluster_id/gateway_node
+            NULL) — lease renewal does NOT repopulate placement, so it does NOT
+            self-heal on the lease TTL and needs another CONNECTED / agent
+            re-registration to restore routing. A lone fail-open failure is often
+            an early low-cost signal of the same shared-store root cause a
+            register_fresh failure hits harder. See ADR-2002 §7 "Ship the
+            write-failure fail-closed posture" and docs/user-manual/metrics.md's
+            Gateway routing directory section. INITIAL threshold, not yet tuned
+            against real fleet data.
 
       # HA WS-4 4.2b Task D's `route_unreadable` — a degraded batched
       # GatewayRouteStore read during confined dispatch (store_unavailable/
@@ -883,7 +903,9 @@ groups:
             sending arguments past the tool's published inputSchema bounds -
             check whether it read tools/list - or someone is probing the limits.
             Denials are audited as mcp.<tool>|denied with detail
-            "input bound exceeded: <reason>"; correlate there for the principal.
+            "input bound exceeded: <reason or field message>"; correlate there
+            for the principal (the #4353-follow-up tools carry a human-
+            readable field message here, not the bare reason label).
 
       - alert: YuzuMcpEngineRevalidateStoreUnreachable
         expr: |

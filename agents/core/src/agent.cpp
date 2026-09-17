@@ -40,6 +40,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "plugin_config_sync.hpp"
 #include "local_dispatcher.hpp"
 #include "shutdown_deadline_guard.hpp" // #2233 item 3: end-to-end stop() deadline
+#include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
 #include "sync_source_installed_software.hpp" // ADR-0016 source #1
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
@@ -1502,8 +1503,17 @@ public:
                     if (!cfg_.tls_allow_system_trust) {
                         spdlog::error(
                             "TLS is enabled but no CA could be pinned: --ca-cert was not given "
-                            "and no install CA was found at the standard path "
-                            "(/etc/yuzu/certs/default-ca.pem). Refusing to connect with the "
+                            "and no install CA was found at the standard path(s) "
+#ifdef _WIN32
+                            "(C:/ProgramData/Yuzu/certs/default-ca.pem). "
+#elif defined(__APPLE__)
+                            "(/etc/yuzu/certs/default-ca.pem, plus "
+                            "~/Library/Application Support/Yuzu/certs/default-ca.pem for a "
+                            "non-root agent). "
+#else
+                            "(/etc/yuzu/certs/default-ca.pem). "
+#endif
+                            "Refusing to connect with the "
                             "SYSTEM trust store, which does NOT trust a Yuzu self-signed install "
                             "CA — that would be a fail-open MITM posture. Fix one of: provide "
                             "--ca-cert; ensure the install CA exists at that path; pass "
@@ -2204,8 +2214,16 @@ public:
                                 need.push_back(n);
                             return need;
                         };
-                        SyncScheduler scheduler(cfg_.agent_id, kv_get, kv_set, sender);
-                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        auto scheduler_ptr =
+                            std::make_shared<SyncScheduler>(cfg_.agent_id, kv_get, kv_set, sender);
+                        SyncScheduler& scheduler = *scheduler_ptr;
+                        // Clear the sync-on-demand handle on EVERY exit of this thread
+                        // (normal stop, or a throw out of tick()) so the command loop
+                        // never arms a scheduler whose thread is gone.
+                        ScopeExit clear_sync_handle{[this]() {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sync_scheduler_.reset();
+                        }};
                         // DEX app-perf-over-time B1. Rides the same daily-sync thread +
                         // transport; collection is further gated by procperf_enabled (an
                         // empty rollup → the source skips the cycle) and the TAR plugin
@@ -2244,7 +2262,27 @@ public:
                         // usage_daily fold via the read-only app_usage plugin. Idles when
                         // the app_usage plugin isn't loaded (null descriptor) or TAR's usage
                         // source is disabled (constrained capture — skipped, not idled).
+                        // Registered here (before installed_software) rather than last: it's
+                        // a fast, local SQLite read, not the slow collector the reorder below
+                        // exists to deprioritize.
                         scheduler.add_source(make_app_usage_source(app_usage_descriptor));
+                        // Registers LAST (round-3 item 4 / sync-speed fix): SyncScheduler's
+                        // per-forced-source immediate-RPC pass (tick()) processes forced
+                        // indices in ascending registration order, so when the header's
+                        // "Sync now" forces every source at once (kAllSources), the faster
+                        // collectors above report back to the server before this one's —
+                        // installed_software's macOS leg alone can take several seconds
+                        // (system_profiler + per-package pkgutil spawns) — even starts.
+                        // Registration order carries NO persisted meaning (KV keys and
+                        // request_now()'s name match are both name-keyed, per
+                        // sync_scheduler.hpp's own contract), so this reorder is safe.
+                        scheduler.add_source(make_installed_software_source(ia_descriptor));
+                        // Publish AFTER the last add_source: request_now() reads sources_
+                        // without the mutex on the append-only-before-publication contract.
+                        {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sync_scheduler_ = scheduler_ptr;
+                        }
                         spdlog::info("Daily-sync thread started (sources=5: installed_software, "
                                      "app_perf, device_ci, software_licensing, app_usage)");
                         while (!should_stop()) {
@@ -2254,6 +2292,11 @@ public:
                             auto sleep = scheduler.tick(now_secs);
                             auto remaining = sleep;
                             while (remaining.count() > 0 && !should_stop()) {
+                                // __sync__.now: re-tick immediately; the drain at the top of
+                                // tick() fires the requested source(s). Checked before the
+                                // first sleep so a request landing mid-tick is not lost.
+                                if (sync_wake_.exchange(false, std::memory_order_acq_rel))
+                                    break;
                                 auto step = std::min(remaining, std::chrono::seconds{2});
                                 std::this_thread::sleep_for(step);
                                 remaining -= step;
@@ -3045,6 +3088,57 @@ public:
                             .counter("yuzu_agent_commands_executed_total",
                                      {{"plugin", "__guard__"}})
                             .increment();
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(resp, grpc::WriteOptions());
+                        continue;
+                    }
+
+                    // Reserved-name dispatch #2: `__sync__.now` — operator-triggered
+                    // sync-on-demand (ADR-0016 update). Arms the daily-sync scheduler
+                    // to run one source (or all) in its next pass and breaks its
+                    // sleep, so the report lands in seconds instead of ≤24h. Unlike
+                    // __guard__ this command IS dedup-claimed (the claim above exempts
+                    // only the literal "__guard__"), so its terminal MUST be recorded
+                    // before the write or a server re-send answers RUNNING forever.
+                    if (cmd.plugin() == "__sync__") {
+                        pb::CommandResponse resp;
+                        resp.set_command_id(cmd.command_id());
+                        auto epoch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+                        resp.mutable_sent_at()->set_millis_epoch(epoch_ms);
+                        std::string source{SyncScheduler::kAllSources};
+                        if (auto it = cmd.parameters().find("source");
+                            it != cmd.parameters().end() && !it->second.empty())
+                            source = it->second;
+                        std::shared_ptr<SyncScheduler> sched;
+                        {
+                            std::lock_guard<std::mutex> lk(sync_sched_mu_);
+                            sched = sync_scheduler_;
+                        }
+                        // Decision logic (unknown action / no scheduler / unknown
+                        // source / success) lives in sync_now_decision.hpp — a pure
+                        // free function unit-tested without gRPC or a live command
+                        // loop (tests/unit/test_agent_sync_command.cpp). Everything
+                        // else about this command (the metrics counter below,
+                        // record_command_terminal-before-write, the stream->Write)
+                        // stays here, unchanged.
+                        auto decision = decide_sync_now(cmd.action(), source, cfg_.inventory_disable,
+                                                         sched.get());
+                        resp.set_status(decision.status == SyncNowDecision::Status::Success
+                                             ? pb::CommandResponse::SUCCESS
+                                             : pb::CommandResponse::FAILURE);
+                        resp.set_exit_code(decision.exit_code);
+                        resp.set_output(std::move(decision.output));
+                        if (decision.status == SyncNowDecision::Status::Success)
+                            sync_wake_.store(true, std::memory_order_release);
+                        resp.set_plugin("__sync__");
+                        resp.set_action(cmd.action());
+                        metrics_
+                            .counter("yuzu_agent_commands_executed_total",
+                                     {{"plugin", "__sync__"}})
+                            .increment();
+                        record_command_terminal(cmd.command_id(), resp);
                         std::lock_guard lock(stream_write_mu_);
                         stream->Write(resp, grpc::WriteOptions());
                         continue;
@@ -3927,6 +4021,14 @@ private:
 
     std::atomic<bool> heartbeat_stop_{false};
     std::atomic<bool> sync_stop_{false}; // ADR-0016 daily-sync thread stop flag
+    // Sync-on-demand (`__sync__.now`, ADR-0016 update): the command read loop
+    // arms the scheduler through this handle and breaks the sync thread's sleep.
+    // sync_scheduler_ is null under --inventory-disable and between connections
+    // (published by the 4b-sync thread after its sources are registered, cleared
+    // by that same thread on exit) — the intercept answers FAILURE, never blocks.
+    std::atomic<bool> sync_wake_{false};
+    std::mutex sync_sched_mu_;
+    std::shared_ptr<SyncScheduler> sync_scheduler_;
     std::atomic<bool> keepalive_stop_{false}; // CHAOS-TTL-1 keepalive thread stop flag
     // Consecutive session-rejection-forced re-registrations (#1894). A successful
     // Register resets the normal reconnect backoff, so a server that reaps every

@@ -93,6 +93,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
   - [Result Sets](#result-sets)
+  - [Forensics](#forensics)
   - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -297,6 +298,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
@@ -5442,7 +5444,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Like `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
-All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
+All seven share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds`, `plugin-docs` and `plugin-docs/{name}` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs`, and `/discover/plugin-docs/{name}` as the MCP resource template `yuzu://plugin-docs/{name}` (`resources/templates/list`). REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
 #### `GET /api/v1/discover/permissions`
 
@@ -5611,7 +5613,7 @@ An action carries an inline `parameter_schema` **only** when it has a published 
 
 > **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 
-Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
+Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). `resource` names the per-plugin endpoint below (or the MCP resource template of the same shape). The full manifest is that endpoint, or the whole-catalog one above it.
 
 #### `GET /api/v1/discover/plugin-docs`
 
@@ -5657,6 +5659,18 @@ Per-plugin documentation as data: one manifest per agent plugin that has adopted
 ```
 
 Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as `/discover/scope-kinds` (the body is identical for every caller). `inputs[]` entries carry `{definition_id, name, type, required, default, constraints, description}`, where `constraints` is the parameter's DSL `validation` object or `null`; the key set of each manifest is the "Manifest schema" table in `docs/plugin-readme-standard.md`, which the docs suite binds to the generator.
+
+#### `GET /api/v1/discover/plugin-docs/{name}`
+
+One plugin's manifest, narrower than the whole-catalog route above (#4108) — the exact same object the catalog carries at `plugins[]` for that name, byte-identical. Same `manifest_by_name` builder as the catalog and as the MCP resource template `yuzu://plugin-docs/{name}`, so all three cannot drift from each other. The permission gate runs BEFORE the name lookup, so a caller without `Infrastructure:Read` learns nothing about which plugin names exist.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:** the single manifest object shown above for `disk_actions` (same key set, no wrapping envelope — no `catalog`/`version`/`plugins[]`).
+
+**Errors:** `404` (A4 envelope) when no manifest documents that name.
+
+Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as the catalog route.
 
 ---
 
@@ -6095,6 +6109,47 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ---
 
+### Forensics
+
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+
+#### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
+
+One device's per-executable last-used projection — the per-agent drill. Because it renders behavioural data, every open is **audited fail-closed**: if the `app_usage.agent.view` audit row cannot persist, the request is refused (`503` + `Sec-Audit-Failed`) and no data is served.
+
+**Permission:** `Forensics:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "apps": [
+      {"exe_key": "chrome.exe", "first_seen": 1751000000, "last_seen": 1751600000,
+       "run_count_30d": 42, "total_seconds_30d": 86400}
+    ],
+    "collected_at": 1751600000
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`first_seen`/`last_seen` are **within TAR's retained usage window** (31 days default, operator-tunable) — never a value spanning the executable's full run history. An executable absent from `apps` has not run inside that retained window; it does not mean the executable has never run. An agent that genuinely reported no rows for the window is `200` with `apps: []`.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks per-device-scoped `Forensics:Read` for this agent |
+| 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the six-store cascade).
+
+---
+
 ### Software Licensing (SLE)
 
 The **detected software-licence** discovery surface (ADR-0024; per its "Placement under ADR-1005" only the discovery mechanism is in-server — the compliance/entitlement/posture reads ship with the SAM use-case-engine module). Data is collected by the agent `license_scan` plugin and synced daily into `SoftwareLicensingStore`; see [Software licence detection](software-licensing.md) for what is collected and the per-user privacy carve-out. **Not** Yuzu's own product licence (that is [License Management](#license-management)).
@@ -6140,7 +6195,7 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf, and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all six per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, and app-usage), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
@@ -6155,8 +6210,8 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "decommissioned": true,
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
-               "software_licensing": "deleted"},
-    "deleted": 4,
+               "software_licensing": "deleted", "app_usage": "deleted"},
+    "deleted": 5,
     "skipped": 1,
     "failed": 0
   },
@@ -6977,6 +7032,7 @@ List license alerts (expiration warnings, seat limit approaching, etc.).
   "data": [
     {
       "id": "alert-001",
+      "license_id": "lic-001",
       "alert_type": "expiration_warning",
       "message": "License expires in 30 days",
       "triggered_at": 1711900800,
@@ -7687,6 +7743,17 @@ The fleet trend for one application — one point per `(version, UTC day)` over 
 - **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters (a `400` otherwise; a NUL would truncate the bound query). `version` — optional; omitted = every version interleaved, each point tagged with its canonicalized `version`; same length/charset rule.
 - **Response:** `{app, version, points[]}`. Each point: `{version, day, device_count, suppressed}` plus the full stat fields (`cpu_mean, cpu_max, cpu_p50, cpu_p95, ws_mean, ws_max, ws_p50, ws_p95, hist_stale`) **only when `suppressed` is false** — a sub-floor `(version, day)` point (fewer than 10 devices) carries `device_count` only, the same suppression the group endpoint applies (see the percentile/suppression note above). `400` on a missing/invalid `app` or `version`; `503` on store degrade. Not audited.
 
+#### `GET /api/v1/dex/perf/app/devices`
+
+The version-row "which devices" drill: unlike `/perf/app` above, each row here names an `agent_id` — a fleet-wide fan-out of identified per-device data (B1, up to 31 days) — so this route's authorization posture is entirely different from its aggregate sibling. Devices reporting one EXACT `(app, version)` among their retained top-N daily summaries, one row per device at its most recent reporting day for that version. **Not a census**: a device absent here may still run this app-version, just not among its top-N resource consumers that day (use the [software inventory](inventory.md) endpoints for a full install census).
+
+- **Permission:** `GuaranteedState:Read`, gated on `AuthRoutes::require_fleet_read` (ADR-0017 admit-then-filter) as the **sole** gate — never stacked with a bare permission check. A management-group- or service-scoped caller gets the real, narrowed `agent_id` intersection pushed into the store query itself (never a post-fetch filter), so a confined caller never sees an unfiltered page and a fully-confined-empty caller sees zero rows, not the whole fleet.
+- **Query parameters:** `app` — **required**, ≤ 512 bytes, no control characters. `version` — **required and present** (unlike `/perf/app`'s "omit = all versions" convention): this drill is always scoped to exactly one version; pass an empty string for the unknown-version bucket (the only bucket Linux agents report today — Linux procperf does not yet capture a file version) rather than omitting the parameter, which is rejected with `400`.
+- **Response:** `{app, version, truncated, devices[]}` where each device is `{agent_id, last_day, samples, cpu_avg, ws_avg_bytes}`. Rows are ordered by descending `cpu_avg` and capped; `truncated:true` means only the highest-CPU devices are returned, not an arbitrary subset. `400` on a missing/invalid `app`/`version`; `403` if the caller lacks `GuaranteedState:Read`; `503` on store degrade or a dropped audit row (`Sec-Audit-Failed: true`).
+- **Retention mismatch:** per-device data (B1) retains only 31 days, shorter than the fleet trend's 180-day (B2) window above — a version last reported more than a month ago legitimately returns `devices: []` even though `/perf/app` still shows aggregate history for it. This is expected, not a bug; the two stores retain independently.
+- **Headers:** `X-Correlation-Id` echoed on every response path.
+- **Audit:** emits `dex.app_perf.devices.view` (`target_type=GuaranteedState`, `target_id=""`, `detail` carries `app=<name> version=<token> devices=<n> cid=<correlation_id>`) **after** the read (so the count is honest) but **before** the response is sent — fail-closed: a persist failure returns `503` + `Sec-Audit-Failed: true` and serves no device data, same contract as `GET /api/v1/dex/devices/{id}/app-perf`. **MCP twin:** `list_dex_app_perf_devices`, set-and-proceed (`audit_persisted:false` in the body on a dropped row, no `Sec-Audit-Failed` header channel).
+
 #### `GET /api/v1/dex/perf/group`
 
 The same trend shape, aggregated **on-the-fly over one management group's member devices** (B1, **up to 31 days** — shorter than the fleet's 180-day B2 window, so a group series is shorter for the same app).
@@ -7695,6 +7762,15 @@ The same trend shape, aggregated **on-the-fly over one management group's member
 - **Query parameters:** `group_id` — **required**, ≤ 512 bytes, no control characters. `app` — **required**, same rule. `version` — optional, same rule.
 - **Response:** `{group_id, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An empty/unknown group returns `200` with `points: []` (not a `503`). `400` on a missing/invalid parameter; `503` on store degrade.
 - **Audit:** `dex.perf.group.view` (`denied` only — an ordinary successful read is not audited, matching this route's existing aggregate/cohort posture).
+
+#### `GET /api/v1/dex/perf/tag`
+
+The same trend shape as `/dex/perf/group` above, aggregated **on-the-fly over the devices carrying one tag VALUE** instead of a management-group id (B1, up to 31 days) — the REST/MCP twin of the dashboard's device-model cohort filter, mutually exclusive with the group scope. A tag-value cohort (e.g. one hardware model) is equally a "named set of specific devices", so it shares `/dex/perf/group`'s exact confinement, floor, and service-scoped-denial posture.
+
+- **Permission:** `GuaranteedState:Read`. Same global-permission gate and the same DIFFERENT-axis service-scoped-token caveat as `/dex/perf/group` — see that section. A service-scoped API token is denied outright (`403`).
+- **Query parameters:** `key` — optional tag key, default `"model"`; must match `^[A-Za-z0-9_.:-]{1,64}$` (`400` otherwise). `value` — **required**, ≤ 512 bytes, no control characters (an omitted or empty `value` is `400` — there is no "every value" wildcard). `app` — **required**, same rule. `version` — optional, same rule.
+- **Response:** `{key, value, app, version, floor, points[]}` where `floor` is the suppression threshold (10). Each point: `{version, day, device_count, suppressed}` plus the full stat fields **only when `suppressed` is false**. An unknown tag value returns `200` with `points: []` (not a `503`) — indistinguishable from a genuinely empty cohort. `400` on a missing/invalid parameter; `503` on store degrade.
+- **Audit:** `dex.perf.tag.view` (`denied` only — an ordinary successful read is not audited, matching `/dex/perf/group`'s posture).
 
 #### `GET /api/v1/dex/perf/compare`
 
@@ -9779,7 +9855,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `tools/list` | List available MCP tools for the current tier |
 | `tools/call` | Invoke an MCP tool by name with arguments |
 | `resources/list` | List available MCP resources |
-| `resources/read` | Read an MCP resource by URI |
+| `resources/templates/list` | List available MCP resource templates |
+| `resources/read` | Read an MCP resource by URI, or a resource template with a parameter substituted |
 | `prompts/list` | List available MCP prompts |
 | `prompts/get` | Get a prompt template by name |
 
@@ -9818,7 +9895,9 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 |---|---|
 | `list_dex_perf_apps` | Applications with retained fleet app-perf data (the picker) |
 | `get_dex_app_perf` | Fleet trend for one application, by version, over time |
-| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. Denial audited under `dex.perf.group.view`. |
+| `list_dex_app_perf_devices` | The version-row "which devices" drill — the MCP twin of `GET /api/v1/dex/perf/app/devices`. Required `app` AND `version` (version is present-required, unlike `get_dex_app_perf`'s "omit = all versions"; pass `""` for the unknown-version bucket). Unlike its aggregate siblings in this table, each row names an `agent_id`, so it gates on `require_fleet_read` (ADR-0017) instead of a bare permission check, confining a management-group/service-scoped caller to their visible devices with the filter pushed into the store query. Emits the dedicated `dex.app_perf.devices.view` audit verb (set-and-proceed, `audit_persisted:false` on a dropped row) plus the generic `mcp.list_dex_app_perf_devices` call audit. `truncated:true` means only the highest-CPU devices are returned. |
+| `get_dex_group_app_perf` | One management group's app trend (sub-floor-suppressed at 10 devices). A service-scoped API token is denied outright (`kPermissionDenied`) — found by this branch's own governance review (PR #3156); the same DIFFERENT-axis gap as its REST twin `GET /api/v1/dex/perf/group`. This tool's own interim deny call was retired as provably dead code (guardian-confinement-2298 PR 3 "the flip", #3290 Phase 2 bucket 1a): the shared `perm_fn` (`AuthRoutes::require_permission`) already denies any service-scoped token outright for `(GuaranteedState, Read)` before this tool-specific branch is reached, since the service-scope global-safe allow-list is seeded empty. That denial is audited under the generic `auth.permission_required` verb, not `dex.perf.group.view` (REST's twin route denies BEFORE `perm_fn` via its own `deny_fleet_wide_service_scoped` call, so REST's deny IS recorded under `dex.perf.group.view`). |
+| `get_dex_tag_app_perf` | The device-model tag-value cohort twin of `get_dex_group_app_perf` — the MCP twin of `GET /api/v1/dex/perf/tag`. Required `value` and `app`; optional `key` (default `"model"`, pattern `^[A-Za-z0-9_.:-]{1,64}$`) and `version`. An absent `key` defaults; a PRESENT `key` (including `""`) is validated like REST's `has_param`, so `key=""` `400`s identically on both transports rather than MCP silently substituting the default. Same sub-floor suppression, same service-scoped denial (`kPermissionDenied`) and the same retired-interim-deny-call / generic-`auth.permission_required`-verb posture as `get_dex_group_app_perf` above — not `dex.perf.tag.view` (REST's twin denies before `perm_fn` and IS recorded under that dedicated verb). |
 | `compare_app_perf_versions` | Cohort-paired before/after comparison (the `/auto` VERIFY stage). Parameters `group`, `app`, `baseline`, `candidate` (all required) + `window` (integer days, default 7). Returns the same identity-free aggregate shape as `GET /api/v1/dex/perf/compare`. A successful call is **recorded under the generic `mcp.compare_app_perf_versions` tool-call audit** (not the REST `dex.app_perf.compare` verb) — but a service-scoped API token is denied outright (`kPermissionDenied`, found by this branch's own governance review, PR #3156) and that denial IS recorded under `dex.app_perf.compare`, matching its REST twin's deny-path verb rather than the generic one. |
 | `get_dex_device_score` (#4035) | Per-device DEX read model — the MCP twin of `GET /api/v1/dex/devices/{id}`. Score (-1 = unavailable) + this device's own signal summary. Ancestor-aware SCOPED `GuaranteedState:Read` gate (like `query_software_licenses`); every call emits `dex.device.view` (set-and-proceed, `audit_persisted:false` on a dropped row — MCP has no `Sec-Audit-Failed` header, unlike the REST twin's fail-closed 503). |
 | `get_dex_device_app_perf` (#4035) | Per-device retained daily app-perf series — the MCP twin of `GET /api/v1/dex/devices/{id}/app-perf` (closes the gap this section previously documented as "no MCP twin"). Optional `app` narrows to one app. Same SCOPED gate + `dex.device.app_perf.view` audit posture as `get_dex_device_score`. |
@@ -9831,7 +9910,7 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `get_dex_trends` (#4035) | Cross-OS + per-family day-by-day trend — the MCP twin of `GET /api/v1/dex/trends`. Optional `window`. Not audited (no per-agent identity). |
 | `get_dex_overview` (#4035) | Fleet DEX overview — the MCP twin of `GET /api/v1/dex/overview`. Optional `window`. `top_devices[]` is confined to the caller's management-group scope (ADR-0017 World A), same as the REST twin. `deny_fleet_wide_service_scoped` (the separate service-scoped-token axis) + fail-closed `try_persist_audit` under `dex.overview.view`, same "REST/MCP add more rigor than the fragment" rationale as `get_dex_app` above. |
 
-The first three gate `GuaranteedState:Read` and are not audited (cohort posture) on success; `get_dex_group_app_perf` is now audited on a service-scoped-token deny (see above). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST, the `/device` dashboard DEX drill (the *Application performance over time* panel), **and now MCP** (`get_dex_device_app_perf`, #4035) — the REST route stays fail-closed (503 on a dropped audit row), while the MCP twin follows the set-and-proceed / `audit_persisted:false` posture every other DEX MCP read tool uses (different surface, different posture — see `docs/api-twin-recipe.md` §4). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
+The first three gate `GuaranteedState:Read` and are not audited (cohort posture) on success; `get_dex_group_app_perf`'s REST twin is audited on a service-scoped-token deny under the dedicated verb, but the MCP tool itself is not — its deny is recorded under the generic `auth.permission_required` verb instead (see above). `compare_app_perf_versions` also gates `GuaranteedState:Read`; because it has no cohort floor it **is** accountable — but over MCP that accountability is the generic `mcp.<tool>` tool-call audit, and the tool exposes only the identity-free aggregate (no per-machine drill — that is dashboard-only, see `GET /api/v1/dex/perf/compare`). The per-device app-perf drill (`GET /api/v1/dex/devices/{id}/app-perf`) is reachable via REST, the `/device` dashboard DEX drill (the *Application performance over time* panel), **and now MCP** (`get_dex_device_app_perf`, #4035) — the REST route stays fail-closed (503 on a dropped audit row), while the MCP twin follows the set-and-proceed / `audit_persisted:false` posture every other DEX MCP read tool uses (different surface, different posture — see `docs/api-twin-recipe.md` §4). See the *Application performance over time* REST section above for the shared percentile/suppression semantics.
 
 **Resources:**
 

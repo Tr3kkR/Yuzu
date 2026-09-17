@@ -35,6 +35,14 @@ struct OfflineEndpoint {
     std::string os;
     std::int64_t last_heartbeat_ms{0}; ///< Server wall-clock epoch ms at last ingest.
     std::int64_t agent_ts{0};          ///< Agent-emitted snapshot epoch seconds (0 if none).
+    /// Round-3 v2 columns (Devices-page merge, item 1): last-known agent
+    /// version/arch, so an OFFLINE row still shows a version/arch on the
+    /// Hardware list instead of blanking the moment the agent drops off the
+    /// live registry. Empty when never observed (pre-migration rows, or a
+    /// heartbeat that raced session lookup — see upsert()'s blank-preserve
+    /// note below).
+    std::string agent_version;
+    std::string arch;
 };
 
 class OfflineEndpointStore {
@@ -55,8 +63,17 @@ public:
     /// blipping database never fails the heartbeat path — the live in-memory
     /// stores remain the source of truth; this is durability on top. Single
     /// statement, autocommit, `INSERT ... ON CONFLICT ... RETURNING`.
+    ///
+    /// `agent_version`/`arch` (round-3 v2 columns): a BLANK value on the
+    /// incoming row NEVER overwrites an already-known non-blank value —
+    /// `hostname`/`os` are the ONE per-ingest source of truth (unconditional
+    /// EXCLUDED write, matching the pre-v2 columns), but a heartbeat that
+    /// raced the session lookup (registry lookup miss) supplies "" here, and
+    /// must not blank out a version/arch this store already learned from an
+    /// earlier heartbeat for the same agent.
     bool upsert(std::string_view agent_id, std::string_view hostname, std::string_view os,
-                std::int64_t last_heartbeat_ms, std::int64_t agent_ts);
+                std::int64_t last_heartbeat_ms, std::int64_t agent_ts,
+                std::string_view agent_version = {}, std::string_view arch = {});
 
     /// Every endpoint whose last heartbeat is within `window` of now, newest
     /// first. The viz handler renders those NOT currently online as stale

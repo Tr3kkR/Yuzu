@@ -43,6 +43,12 @@ const std::vector<pg::PgMigration>& migrations() {
          "  last_heartbeat_ms BIGINT NOT NULL,"
          "  agent_ts          BIGINT NOT NULL DEFAULT 0);"
          "CREATE INDEX endpoints_last_heartbeat_idx ON endpoints (last_heartbeat_ms);"},
+        // Round-3 Devices-page merge (item 1): last-known agent version/arch so
+        // an offline row still shows them on the Hardware list. IF NOT EXISTS
+        // makes this safe to re-run against an already-migrated v1 table.
+        {2,
+         "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS agent_version TEXT NOT NULL DEFAULT '';"
+         "ALTER TABLE endpoints ADD COLUMN IF NOT EXISTS arch TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -73,7 +79,8 @@ OfflineEndpointStore::OfflineEndpointStore(pg::PgPool& pool) : pool_(pool) {
 
 bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view hostname,
                                   std::string_view os, std::int64_t last_heartbeat_ms,
-                                  std::int64_t agent_ts) {
+                                  std::int64_t agent_ts, std::string_view agent_version,
+                                  std::string_view arch) {
     if (!open_ || agent_id.empty())
         return false;
     // Bounded acquire (gov UP-1): on a saturated pool, give up fast rather than
@@ -87,17 +94,25 @@ bool OfflineEndpointStore::upsert(std::string_view agent_id, std::string_view ho
     }
     // Single-statement autocommit upsert; RETURNING carries the result in the
     // step status (no sqlite3_changes()-style mutate-and-count race, #1033).
+    // agent_version/arch: a blank incoming value preserves the existing column
+    // (CASE ... THEN endpoints.x) — see the header doc comment — while
+    // hostname/os/last_heartbeat_ms/agent_ts stay an unconditional EXCLUDED
+    // write (pre-v2 behaviour, unchanged).
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO endpoint_state.endpoints "
-        "(agent_id, hostname, os, last_heartbeat_ms, agent_ts) "
-        "VALUES ($1, $2, $3, $4::bigint, $5::bigint) "
+        "(agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch) "
+        "VALUES ($1, $2, $3, $4::bigint, $5::bigint, $6, $7) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  hostname = EXCLUDED.hostname, os = EXCLUDED.os, "
-        "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts "
+        "  last_heartbeat_ms = EXCLUDED.last_heartbeat_ms, agent_ts = EXCLUDED.agent_ts, "
+        "  agent_version = CASE WHEN EXCLUDED.agent_version = '' THEN endpoints.agent_version "
+        "                       ELSE EXCLUDED.agent_version END, "
+        "  arch = CASE WHEN EXCLUDED.arch = '' THEN endpoints.arch ELSE EXCLUDED.arch END "
         "RETURNING agent_id",
         std::vector<std::string>{std::string(agent_id), std::string(hostname), std::string(os),
-                                 std::to_string(last_heartbeat_ms), std::to_string(agent_ts)});
+                                 std::to_string(last_heartbeat_ms), std::to_string(agent_ts),
+                                 std::string(agent_version), std::string(arch)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: upsert failed for agent={}: {}", agent_id,
                       PQerrorMessage(lease.get()));
@@ -125,14 +140,14 @@ std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chron
     // LIMIT caps the materialised set (gov sec-LOW / UP-5) so the store never
     // allocates more rows than the viz page could serve, regardless of table
     // growth. Newest-first, so the cap keeps the most recently-seen hosts.
-    pg::PgResult res = pg::exec_params(lease.get(),
-                                   "SELECT agent_id, hostname, os, last_heartbeat_ms, agent_ts "
-                                   "FROM endpoint_state.endpoints "
-                                   "WHERE last_heartbeat_ms >= $1::bigint "
-                                   "ORDER BY last_heartbeat_ms DESC "
-                                   "LIMIT $2::bigint",
-                                   std::vector<std::string>{std::to_string(since),
-                                                            std::to_string(kQueryRowCap)});
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT agent_id, hostname, os, last_heartbeat_ms, agent_ts, agent_version, arch "
+        "FROM endpoint_state.endpoints "
+        "WHERE last_heartbeat_ms >= $1::bigint "
+        "ORDER BY last_heartbeat_ms DESC "
+        "LIMIT $2::bigint",
+        std::vector<std::string>{std::to_string(since), std::to_string(kQueryRowCap)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::debug("OfflineEndpointStore: query failed: {}", PQerrorMessage(lease.get()));
         return out;
@@ -146,6 +161,8 @@ std::vector<OfflineEndpoint> OfflineEndpointStore::query_stale_within(std::chron
         ep.os = PQgetvalue(res.get(), i, 2);
         ep.last_heartbeat_ms = to_i64(PQgetvalue(res.get(), i, 3));
         ep.agent_ts = to_i64(PQgetvalue(res.get(), i, 4));
+        ep.agent_version = PQgetvalue(res.get(), i, 5);
+        ep.arch = PQgetvalue(res.get(), i, 6);
         out.push_back(std::move(ep));
     }
     return out;
