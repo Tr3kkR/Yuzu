@@ -155,12 +155,19 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
                                &sa,
                                CREATE_NEW, // fail if exists — prevents TOCTOU race
                                FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    // Capture CreateFileW's real failure code BEFORE LocalFree runs -- it is
+    // unconditional (success or failure) and, like every other cleanup call
+    // in this file, is not documented by MSDN as leaving GetLastError()
+    // untouched.
+    const DWORD create_file_err = GetLastError();
 
     if (sd)
         LocalFree(sd);
 
-    if (hFile == INVALID_HANDLE_VALUE)
-        return -1; // CreateFileW already set a meaningful last-error
+    if (hFile == INVALID_HANDLE_VALUE) {
+        SetLastError(create_file_err);
+        return -1;
+    }
 
     CloseHandle(hFile);
 
@@ -241,10 +248,15 @@ YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, 
     make_owner_only_sa(sa, sd);
 
     BOOL ok = CreateDirectoryW(full_path.c_str(), &sa);
+    // Capture before LocalFree -- see the identical reasoning at the
+    // CreateFileW call site in yuzu_create_temp_file above.
+    const DWORD create_dir_err = GetLastError();
     if (sd)
         LocalFree(sd);
-    if (!ok)
-        return -1; // CreateDirectoryW already set a meaningful last-error
+    if (!ok) {
+        SetLastError(create_dir_err);
+        return -1;
+    }
 
     if (wide_to_utf8(full_path.c_str(), path_out, path_out_size) != 0) {
         // Capture wide_to_utf8's real failure code before RemoveDirectoryW's
