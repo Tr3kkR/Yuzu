@@ -491,13 +491,16 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
             mark_result_partial(ctx, "cryptoapi:store-enum");
             continue;
         }
-        // Snapshot the fallback stores accumulated from EARLIER iterations,
-        // before this store's own (possible) append below -- if a match
-        // turns up in this store, any name in here fell back to CurrentUser
-        // with no match of its own and would otherwise never get its
-        // disclosure row (the "scan incomplete" summary below is skipped
-        // entirely on an early match-and-return, silently dropping it;
-        // CDX-P1-001).
+        // Snapshot every per-store degradation accumulated from EARLIER
+        // iterations, before this store's own (possible) append below -- if
+        // a match turns up in this store, any name in here never got its
+        // row-level disclosure because the loop moved on without a return
+        // (the "scan incomplete" summary below is skipped entirely on an
+        // early match-and-return, silently dropping it; CDX-P1-001 fixed
+        // this for the fallback case only -- governance Gate 2 found the
+        // identical gap for unopened/incomplete and it's fixed here too).
+        std::string prior_unopened = unopened;
+        std::string prior_incomplete = incomplete;
         std::string prior_fallback = fallback;
         bool is_fallback = enumeration.location == StoreLocation::kCurrentUser;
         if (is_fallback) {
@@ -506,6 +509,16 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
         }
         for (const auto& rec : enumeration.records) {
             if (rec.thumbprint == needle) {
+                if (!prior_unopened.empty()) {
+                    ctx.write_output(
+                        std::format("not_available|{} store(s) could not be opened",
+                                    prior_unopened));
+                }
+                if (!prior_incomplete.empty()) {
+                    ctx.write_output(
+                        std::format("not_available|{} store(s) enumeration incomplete",
+                                    prior_incomplete));
+                }
                 if (!prior_fallback.empty()) {
                     // An earlier store in this scan fell back to CurrentUser
                     // and didn't match -- its own row-level disclosure was
