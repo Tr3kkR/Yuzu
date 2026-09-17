@@ -447,12 +447,14 @@ public:
     /// TOMBSTONE the agent's route row (session_id/lease_until/cluster_id/
     /// gateway_node/stream_home_id -> NULL; `connection_epoch` retained), but
     /// ONLY if the row still belongs to `session_id` AND the incoming
-    /// `stream_home_id` clears the ASYMMETRIC fence (file header SLICE
-    /// #4324): `stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')`
-    /// — an unstamped (empty, the default) incoming DISCONNECTED may only
-    /// tombstone a row whose stored home id is ALSO unstamped; it can never
-    /// tear down a row a stamped CONNECTED has since re-homed. See the file
-    /// header "SLICE 4.2a" note for why this is an UPDATE, not a DELETE.
+    /// `stream_home_id` clears the fence (file header SLICE #4324):
+    /// `stream_home_id IS NULL OR stream_home_id = $3` — a NULL/empty
+    /// STORED home admits ANY incoming value (it never represents a live
+    /// placement worth protecting — see the file header's PREDICATE FIX
+    /// note); a STAMPED stored home requires an EXACT match against `$3`, so
+    /// it can never be torn down by an unstamped or differently-stamped
+    /// incoming value from a superseded home. See the file header "SLICE
+    /// 4.2a" note for why this is an UPDATE, not a DELETE.
     [[nodiscard]] std::expected<DeregisterResult, GatewayRouteStoreError>
     deregister(std::string_view agent_id, std::string_view session_id,
               std::string_view stream_home_id = {});
