@@ -79,7 +79,7 @@ struct CertDir {
 /// depends on: every syscall below is parent-handle-relative, never a fresh
 /// pathname lookup, so a directory swapped for another between two separate
 /// opens cannot make this code enumerate one directory and act on another.
-inline CertDir open_cert_dir(const char* dir_path) {
+[[nodiscard]] inline CertDir open_cert_dir(const char* dir_path) {
     // O_NONBLOCK is inert on a directory open (only a FIFO/device open can
     // block) but is included unconditionally per the "no open in this block
     // without O_NONBLOCK" rule below, so every open/openat call site is
@@ -128,7 +128,7 @@ struct ScopedDir {
 /// the false return, so callers can report WHY the scan didn't complete,
 /// not just that it didn't.
 template <typename OnName>
-bool for_each_cert_entry(int dirfd, OnName&& on_name, int* out_errno = nullptr,
+[[nodiscard]] bool for_each_cert_entry(int dirfd, OnName&& on_name, int* out_errno = nullptr,
                          const StoreSyscalls& sys = {}) {
     int dup_fd = ::dup(dirfd);
     if (dup_fd < 0) {
@@ -178,7 +178,7 @@ struct CertEntryRead {
 /// worker before the type filter ever gets a chance to reject it. Once fstat
 /// proves S_ISREG the flag is inert (POSIX: reads of a regular file never
 /// block), so no fcntl clear is needed afterward.
-inline CertEntryRead read_cert_entry(int dirfd, const std::string& name,
+[[nodiscard]] inline CertEntryRead read_cert_entry(int dirfd, const std::string& name,
                                      const StoreSyscalls& sys = {}) {
     CertEntryRead result;
 
@@ -356,7 +356,7 @@ struct DeleteScan {
 /// back on a failed recheck is itself just as racy as the original problem.
 /// fstatat-then-unlinkat with full identity verification is the WEAKER but
 /// side-effect-free sequence, and is chosen here for exactly that reason.
-inline DeleteScan delete_matching_cert(int dirfd, std::string_view canonical_needle,
+[[nodiscard]] inline DeleteScan delete_matching_cert(int dirfd, std::string_view canonical_needle,
                                        const StoreSyscalls& sys = {}) {
     DeleteScan scan{DeleteScanKind::kNotFound, {}};
     bool matched = false;
