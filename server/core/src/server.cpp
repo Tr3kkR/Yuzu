@@ -1758,7 +1758,7 @@ public:
         // Installed-software inventory observability (ADR-0016; #1664/#1675).
         metrics_.describe("yuzu_inventory_ingest_total",
                           "Inventory-report ingest outcomes by source and outcome "
-                          "(stored/touched/need_full/error/dropped/rejected)",
+                          "(stored/touched/need_full/error/dropped/rejected/rejected_depth)",
                           "counter");
         metrics_.describe("yuzu_inventory_ingest_duration_seconds",
                           "Time to apply one inventory source's report - the pooled-connection + "
@@ -3296,6 +3296,20 @@ public:
                           "counter");
         metrics_.describe("yuzu_server_guardian_baselines_total",
                           "Total Guardian Baselines persisted", "gauge");
+        // json-dump-depth-guard fix: a rule whose stored spec_json nests past
+        // kMcpMaxJsonDepth is excluded from every push it would otherwise be
+        // included in (build_agent_push, guardian_push_builder.cpp) - this is
+        // the fleet-wide signal that a rule silently stopped enforcing (the
+        // rule's own detail page also shows an "invalid data" state, but an
+        // operator who never opens that specific rule would otherwise have no
+        // tell). Pre-seed the one closed reason value so the series exists at
+        // zero on a healthy fleet.
+        metrics_.describe("yuzu_guardian_push_rule_excluded_total",
+                          "Guardian rules excluded from a push, by reason (currently only "
+                          "depth_exceeded)",
+                          "counter");
+        metrics_.counter("yuzu_guardian_push_rule_excluded_total",
+                         {{"reason", "depth_exceeded"}});
         // T12 (design doc §7): engine-credential overlap-pair rotation sweep.
         // Deliberately a bounded `reason` label set (currently one value,
         // "successor_unused") and NOT `event="security"` — this is an
@@ -5274,7 +5288,7 @@ public:
                             scope_member.emplace(expr, member);
                             return member;
                         },
-                        /*full_sync=*/true, current);
+                        /*full_sync=*/true, current, &metrics_);
                     // Unique per re-push (random suffix) so a same-generation reconcile
                     // can't collide with the agent's replay-dedup set (hp-F2/cons-S1).
                     const auto command_id =
@@ -18093,7 +18107,7 @@ private:
                     auto push = guardian::build_agent_push(
                         rules, agent_os,
                         [&](const std::string& expr) { return agent_in_scope(aid, expr); },
-                        full_sync, generation);
+                        full_sync, generation, &metrics_);
 
                     // Unique per push (random suffix) so two pushes in the same second
                     // can't collide on the agent's replay-dedup set (hp-F2/cons-S1).
