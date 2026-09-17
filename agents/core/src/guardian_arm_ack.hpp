@@ -356,7 +356,9 @@ private:
         /// receipt whose application was superseded before recovering is simply
         /// gone, same as every other per-application field here. This is NOT the
         /// durable, cross-application "last known outcome for every currently-
-        /// desired rule" gauge - that is 5e's job.
+        /// desired rule" gauge - deliberately unbuilt (rung 9c PR-5e, #4221's own
+        /// "Explicit narrowing": docs/spark-stage2-guardian-consumer-design.md's
+        /// R5.3 stamp), not a silent drop.
         ///
         /// rung 9c PR-5e (#4221, K-bound closeout): also re-validated every drain
         /// tick against GuardianSparkRuntime::receipt_wedge_k_eligible() (see that

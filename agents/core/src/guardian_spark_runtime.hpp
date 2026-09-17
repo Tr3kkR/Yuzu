@@ -1242,6 +1242,30 @@ public:
     ReceiptStatus receipt_status(const ArmReceipt& receipt) const;
     /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
     bool is_terminal(const ArmReceipt& receipt) const;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial-review-class finding,
+    /// cpp-safety): `status` exactly as receipt_status() would report, and
+    /// `wedge_eligible` (meaningful ONLY when `status == Wedged`, false otherwise)
+    /// exactly as receipt_wedge_k_eligible() would report - both computed under
+    /// ONE registry_mu_ acquisition. A caller needing BOTH facts about the same
+    /// receipt must use this, never receipt_status() followed by a separate call
+    /// to receipt_wedge_k_eligible() - the two-call sequence has the identical
+    /// TOCTOU shape the adversarial review found and fixed in
+    /// GuardianArmAckLedger::drain_locked()'s recovery-scan loop
+    /// (receipt_recovery_status()'s own doc comment), just reachable from
+    /// drain_locked()'s PRIMARY per-pending loop instead: a claim read as Wedged
+    /// by call 1 can be genuinely adopted-and-popped by on_arm_complete() in the
+    /// gap before call 2, which then (correctly, as of that later instant) reports
+    /// not-eligible - but the caller has already committed to treating the
+    /// receipt as a failure based on call 1's stale snapshot, permanently losing
+    /// the genuine success for this specific application (self-heals only on the
+    /// NEXT identical retry, via decide_retry()'s forced Reapply once
+    /// resolved_failed>0 - not truly unbounded, but a real, avoidable gap).
+    struct WedgeAwareStatus {
+        ReceiptStatus status{ReceiptStatus::Failed};
+        bool wedge_eligible{false};
+    };
+    [[nodiscard]] WedgeAwareStatus receipt_status_wedge_aware(const ArmReceipt& receipt) const;
     /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
     /// been ADOPTED - i.e. rules_ currently carries a live generation for that
     /// claim's rule_id AND it is EXACTLY this claim's own (rule_id, generation)
@@ -1439,6 +1463,28 @@ private:
     /// responsibility (both current call sites already hold it), not this
     /// function's, since it never touches shared state itself.
     [[nodiscard]] static bool is_retained_wedge(const KeyClaim& head) noexcept;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout): the pure ClaimEnd->ReceiptStatus
+    /// mapping receipt_status() applies - factored out so
+    /// receipt_status_wedge_aware() can compute the SAME mapping under its own
+    /// single registry_mu_ acquisition without duplicating the switch (and
+    /// therefore without the two ever silently drifting apart). No lock of its
+    /// own - a pure function of the enum value the caller already holds under
+    /// registry_mu_.
+    [[nodiscard]] static ReceiptStatus classify_claim_end(ClaimEnd end) noexcept;
+
+    /// rung 9c PR-5e (#4221, K-bound closeout - cpp-expert governance finding):
+    /// the K-eligibility predicate (`end == WaiterTimedOutDispatched && dispatch
+    /// == Dispatched && still its key's FIFO front`) - factored out so
+    /// receipt_wedge_k_eligible(), receipt_recovery_status() and
+    /// receipt_status_wedge_aware() all read ONE definition instead of three
+    /// independently-maintained copies (the drift risk classify_claim_end() was
+    /// already extracted to prevent for the ClaimEnd->ReceiptStatus mapping,
+    /// applied here to the eligibility predicate too). registry_mu_ held by the
+    /// CALLER - every call site already holds it - not this function's own
+    /// responsibility, since it never touches shared state itself beyond the
+    /// read-only `claims_` lookup a caller already has the right to make.
+    [[nodiscard]] bool is_wedge_k_eligible_locked(const std::shared_ptr<KeyClaim>& claim) const noexcept;
 
     // Helpers (all assume the documented lock discipline; see the .cpp).
     /// registry_mu_ held. Returns backend work still owed (a watcher disarm on the

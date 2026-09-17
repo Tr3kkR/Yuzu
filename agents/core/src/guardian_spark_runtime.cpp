@@ -1694,11 +1694,8 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
 }
 
 GuardianSparkRuntime::ReceiptStatus
-GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
-    if (!receipt.claim)
-        return ReceiptStatus::Failed; // nothing to observe
-    std::lock_guard<std::mutex> lk{registry_mu_};
-    switch (receipt.claim->end) {
+GuardianSparkRuntime::classify_claim_end(ClaimEnd end) noexcept {
+    switch (end) {
     case ClaimEnd::None:
         return ReceiptStatus::Pending;
     case ClaimEnd::Committed:
@@ -1730,8 +1727,37 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
     return ReceiptStatus::Failed;
 }
 
+GuardianSparkRuntime::ReceiptStatus
+GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return ReceiptStatus::Failed; // nothing to observe
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return classify_claim_end(receipt.claim->end);
+}
+
 bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
     return receipt_status(receipt) != ReceiptStatus::Pending;
+}
+
+bool GuardianSparkRuntime::is_wedge_k_eligible_locked(
+    const std::shared_ptr<KeyClaim>& claim) const noexcept {
+    if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
+        return false;
+    const auto eit = claims_.find(claim->key);
+    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
+}
+
+GuardianSparkRuntime::WedgeAwareStatus
+GuardianSparkRuntime::receipt_status_wedge_aware(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return WedgeAwareStatus{}; // Failed, wedge_eligible=false - nothing to observe
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto& claim = receipt.claim;
+    WedgeAwareStatus out;
+    out.status = classify_claim_end(claim->end);
+    if (out.status == ReceiptStatus::Wedged)
+        out.wedge_eligible = is_wedge_k_eligible_locked(claim);
+    return out;
 }
 
 bool GuardianSparkRuntime::receipt_recovered(const ArmReceipt& receipt) const {
@@ -1746,11 +1772,7 @@ bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) c
     if (!receipt.claim)
         return false;
     std::lock_guard<std::mutex> lk{registry_mu_};
-    const auto& claim = receipt.claim;
-    if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
-        return false;
-    const auto eit = claims_.find(claim->key);
-    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
+    return is_wedge_k_eligible_locked(receipt.claim);
 }
 
 GuardianSparkRuntime::RecoveryStatus
@@ -1766,11 +1788,8 @@ GuardianSparkRuntime::receipt_recovery_status(const ArmReceipt& receipt) const {
     const auto rit = rules_.find(claim->rule_id);
     if (rit != rules_.end() && rit->second->generation == claim->generation)
         return RecoveryStatus::Recovered;
-    if (claim->end == ClaimEnd::WaiterTimedOutDispatched && claim->dispatch == ClaimDispatch::Dispatched) {
-        const auto eit = claims_.find(claim->key);
-        if (eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim)
-            return RecoveryStatus::WedgeEligible;
-    }
+    if (is_wedge_k_eligible_locked(claim))
+        return RecoveryStatus::WedgeEligible;
     return RecoveryStatus::Blocking;
 }
 

@@ -248,7 +248,23 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
     std::size_t resolved = 0;
     for (auto it = current_->pending.begin();
         it != current_->pending.end() && resolved < max_per_tick;) {
-        const auto status = runtime.receipt_status(it->second);
+        // rung 9c PR-5e (#4221, K-bound closeout - cpp-safety governance finding):
+        // MUST be the combined receipt_status_wedge_aware() atomic read, one
+        // registry_mu_ acquisition - NOT receipt_status() followed by a separate
+        // receipt_wedge_k_eligible() call on the Wedged case (an earlier version
+        // of this loop did exactly that). A genuine adoption landing in the gap
+        // between two separate calls could read Wedged here, then read
+        // not-eligible moments later after on_arm_complete() already adopted and
+        // popped the claim - the receipt would be counted as an ordinary failure
+        // below (the fallthrough is unconditional on `status` alone) while never
+        // being retained in failed_receipts, permanently desyncing
+        // resolved_failed from failed_receipts.size() for this application (self-
+        // heals only on the next identical retry). Same TOCTOU class the
+        // adversarial review already found and fixed in the recovery-scan loop
+        // above (receipt_recovery_status()'s own doc comment), reachable here too
+        // until this single-read fix.
+        const auto wedge_aware = runtime.receipt_status_wedge_aware(it->second);
+        const auto status = wedge_aware.status;
         // Exhaustive switch, no `default` - SHOULD-1's own fix (see the
         // receipt_status_name() helper above): a future ReceiptStatus value
         // produces a missing-case WARNING here (werror=false repo-wide - not a
@@ -283,8 +299,11 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // shared fallthrough body's unrelated edits.
             //
             // rung 9c PR-5e (#4221, K-bound closeout): retain it into the
-            // K-eligible set ONLY if receipt_wedge_k_eligible() ALSO reads true
-            // at this exact moment - NOT unconditionally on every Wedged status.
+            // K-eligible set ONLY if `wedge_aware.wedge_eligible` ALSO read true
+            // in the SAME atomic read that produced `status == Wedged` above -
+            // NOT unconditionally on every Wedged status, and NOT via a second,
+            // separately-locked call (see this loop's own comment above the
+            // switch for why a second call would reintroduce a TOCTOU).
             // expire_overdue_claims() just above (this same drain_locked() call)
             // can itself mint end==WaiterTimedOutDispatched for a claim still
             // mid-dispatch (the Dispatching-window race's own unsettled window,
@@ -295,7 +314,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // drain, so the gap would stand open for one full tick. resolved_failed
             // still increments below regardless (it is still counted as an
             // ordinary failure - only its K-eligible-set MEMBERSHIP is gated).
-            if (runtime.receipt_wedge_k_eligible(it->second))
+            if (wedge_aware.wedge_eligible)
                 current_->failed_receipts.insert_or_assign(it->first, it->second);
             [[fallthrough]];
         case S::Failed:

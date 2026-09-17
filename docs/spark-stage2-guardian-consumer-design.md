@@ -817,7 +817,12 @@ explicit narrowing below.
   tick), and its existing recovery-scan loop (re-validate every RETAINED entry
   every tick, pruning one whose eligibility has since settled to false -
   `resolved_failed` itself is untouched; only K-eligible-set MEMBERSHIP
-  changes). `can_advance()` stays a cheap, runtime-free ledger query: `every
+  changes) - the recovery-scan loop calls this through
+  `GuardianSparkRuntime::receipt_recovery_status()`, the atomic combination of
+  `receipt_wedge_k_eligible()` with `receipt_recovered()` under ONE
+  `registry_mu_` acquisition (adversarial-review fix: the two-separate-calls
+  version could drop a genuine concurrent recovery in the gap between them).
+  `can_advance()` stays a cheap, runtime-free ledger query: `every
   resolved_failed entry counted in failed_receipts` AND `reapply_count >= K`.
   `latched_failure` still blocks unconditionally either way, never folded into
   the K-waiver branch.

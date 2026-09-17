@@ -1196,3 +1196,110 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a genuinely dispatched claim th
     }
     CHECK_FALSE(ledger.can_advance());
 }
+
+TEST_CASE("GuardianArmAckLedger::can_advance(): latch_failure() blocks "
+          "unconditionally even at reapply_count >= K with an otherwise fully "
+          "K-eligible failure set (governance Gate 3 quality-engineer finding)",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    const std::string digest(64, 'd');
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, digest, false, 1);
+    ledger.add_pending("r1", receipt);
+    CHECK(ledger.drain_locked(*rt, 10) == 1);
+    CHECK_FALSE(ledger.can_advance()); // reapply_count 0 < K
+
+    for (int i = 0; i < 3; ++i) {
+        ledger.begin_application(1, digest, false, 1);
+        auto re = accept(*rt, "r1"); // Reobserved: same underlying claim
+        ledger.add_pending("r1", re);
+        CHECK(ledger.drain_locked(*rt, 10) == 1);
+    }
+    REQUIRE(ledger.reapply_count_for_test() == 3);
+    REQUIRE(ledger.failed_receipt_count_for_test() == 1); // still genuinely eligible
+    REQUIRE(ledger.can_advance()); // K-waived, absent any latch - confirms the setup
+
+    // Now latch an unrelated application-level failure (e.g. a full_sync KV sweep
+    // failure apply_rules() itself would have hit) on this SAME, otherwise fully
+    // K-eligible application. latch_failure() must block unconditionally - it is
+    // checked BEFORE the K-arithmetic in can_advance(), and this must never
+    // silently reorder to let K-waiver bypass a latched failure.
+    ledger.latch_failure();
+    CHECK_FALSE(ledger.can_advance());
+
+    // Draining again (still genuinely wedged, still K-eligible) must not clear the
+    // latch or change the verdict.
+    CHECK(ledger.drain_locked(*rt, 10) == 0); // nothing new in `pending`
+    CHECK_FALSE(ledger.can_advance());
+}
+
+TEST_CASE("GuardianArmAckLedger::can_advance(): K-eligibility linearizes at the "
+          "drain-time read - a completion landing after drain but before "
+          "can_advance() does not retroactively revoke that tick's decision "
+          "(docs/spark-stage2-guardian-consumer-design.md's own drain-time-"
+          "linearization claim, governance Gate 3 quality-engineer finding)",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    const std::string digest(64, '9');
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, digest, false, 1);
+    ledger.add_pending("r1", receipt);
+    CHECK(ledger.drain_locked(*rt, 10) == 1);
+    for (int i = 0; i < 2; ++i) {
+        ledger.begin_application(1, digest, false, 1);
+        auto re = accept(*rt, "r1");
+        ledger.add_pending("r1", re);
+        CHECK(ledger.drain_locked(*rt, 10) == 1);
+    }
+    ledger.begin_application(1, digest, false, 1);
+    auto final_receipt = accept(*rt, "r1"); // Reobserved: same underlying claim
+    ledger.add_pending("r1", final_receipt);
+    CHECK(ledger.drain_locked(*rt, 10) == 1); // this tick's drain-time read: eligible
+    REQUIRE(ledger.reapply_count_for_test() == 3);
+    REQUIRE(ledger.failed_receipt_count_for_test() == 1);
+
+    // Now let the claim genuinely settle to a real refusal - AFTER this tick's
+    // drain already read it as eligible, but BEFORE can_advance() is called. Per
+    // the design doc's own "K-eligibility linearizes at the drain-time read"
+    // stamp, this tick's decision must stand: can_advance() reads the ledger
+    // membership drain_locked() already computed, not the runtime's current
+    // (now-stale-relative-to-this-tick) state.
+    b->fail_arm.store(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0; },
+        std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(final_receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // sticky
+    CHECK(ledger.can_advance()); // this tick's already-drained decision stands
+
+    // A SUBSEQUENT drain (the next heartbeat tick) re-validates and correctly
+    // prunes the now-settled entry - can_advance() then correctly flips to false
+    // for any FUTURE tick's own decision (this one's already happened).
+    CHECK(ledger.drain_locked(*rt, 10) == 0); // nothing new in `pending`
+    CHECK(ledger.failed_receipt_count_for_test() == 0);
+    CHECK_FALSE(ledger.can_advance());
+}
