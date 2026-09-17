@@ -173,9 +173,15 @@ launchctl_rows_to_services(std::span<const yuzu::shared::LaunchctlRow> rows) {
 /// the runner) straight into this file's ServiceParseResult vocabulary.
 /// Composes the shared raw row parser with launchctl_rows_to_services()
 /// above; behaviourally identical to the pre-A0 inline body for every input
-/// this file's tests exercise.
+/// this file's tests exercise. A structurally malformed header (UP-6 --
+/// yuzu::shared::parse_launchctl_list's own `malformed`, e.g. a missing or
+/// preamble-preceded header row) propagates through as `malformed` here too,
+/// on top of the per-row BR-service-001 check.
 inline ServiceParseResult parse_launchctl_list(const std::vector<std::string>& lines) {
-    return launchctl_rows_to_services(yuzu::shared::parse_launchctl_list(lines));
+    auto raw = yuzu::shared::parse_launchctl_list(lines);
+    auto out = launchctl_rows_to_services(raw.rows);
+    out.malformed = out.malformed || raw.malformed;
+    return out;
 }
 
 } // namespace yuzu::tar

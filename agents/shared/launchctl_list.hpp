@@ -49,6 +49,19 @@ struct LaunchctlRow {
     int status{0};
 };
 
+/// Result of parse_launchctl_list(): the decoded rows plus whether the input
+/// was structurally trustworthy at all. `malformed` is a STRUCTURAL check
+/// only -- line 0 must be exactly "PID\tStatus\tLabel" (a preamble line
+/// before the real header, or a header-less capture where the first line is
+/// already data, both fail this) -- distinct from a per-row policy decision
+/// like BR-service-001 (an individual row with an empty label), which stays
+/// the caller's job. `rows` is empty whenever `malformed` is true -- nothing
+/// past an unrecognised header is trustworthy enough to decode.
+struct LaunchctlParseResult {
+    std::vector<LaunchctlRow> rows;
+    bool malformed{false};
+};
+
 /// Decode one `launchctl list` data row: "PID\tStatus\tLabel". Splits on the
 /// FIRST two tabs only -- the label field is everything after the second tab
 /// verbatim, including any further literal tabs (a genuine label never
@@ -64,15 +77,17 @@ struct LaunchctlRow {
     LaunchctlRow row;
     auto tab1 = line.find('\t');
     if (tab1 == std::string_view::npos)
-        return row; // 1-field row: nothing past PID to decode
+        return row; // 1-field row: nothing to decode at all
     std::string_view pid_sv = line.substr(0, tab1);
     std::string_view rest = line.substr(tab1 + 1);
 
+    // 2-field row (no second tab): PID+status are still both present and
+    // decoded below -- only the label is genuinely absent. status_sv is
+    // `rest` in full; row.label stays "" (its default).
     auto tab2 = rest.find('\t');
-    if (tab2 == std::string_view::npos)
-        return row; // 2-field row: PID+status present, no label at all
-    std::string_view status_sv = rest.substr(0, tab2);
-    row.label = std::string(rest.substr(tab2 + 1));
+    std::string_view status_sv = (tab2 == std::string_view::npos) ? rest : rest.substr(0, tab2);
+    if (tab2 != std::string_view::npos)
+        row.label = std::string(rest.substr(tab2 + 1));
 
     if (pid_sv != "-" && !pid_sv.empty()) {
         std::int64_t v{};
@@ -91,55 +106,27 @@ struct LaunchctlRow {
 
 /// Parse the line-split stdout of `launchctl list` (blank lines already
 /// dropped, a trailing '\r' already stripped by the caller -- matches
-/// SubprocessResult::lines' contract). The first line is always the
-/// "PID\tStatus\tLabel" header and is skipped unconditionally; an empty
-/// `lines` yields an empty result. A total, non-throwing decode: a row with
-/// fewer than 3 tab-separated fields still produces a LaunchctlRow (with
-/// whatever fields it had; a missing label reads back as "").
-[[nodiscard]] inline std::vector<LaunchctlRow>
+/// SubprocessResult::lines' contract). An empty `lines` yields an empty,
+/// non-malformed result (no output at all is not the same as garbage
+/// output). Otherwise line 0 MUST be exactly "PID\tStatus\tLabel" -- a
+/// preamble line before the real header, or a header-less capture, is
+/// rejected wholesale (`malformed = true`, `rows` empty) rather than
+/// decoded starting from the wrong line (UP-6, governance A0 fix round:
+/// silently decoding from a wrong offset would misattribute every
+/// subsequent field). Every row after a valid header decodes via
+/// decode_launchctl_row(), which never throws.
+[[nodiscard]] inline LaunchctlParseResult
 parse_launchctl_list(std::span<const std::string> lines) {
-    std::vector<LaunchctlRow> out;
+    LaunchctlParseResult out;
     if (lines.empty())
         return out;
-    out.reserve(lines.size() - 1);
-
-    for (std::size_t i = 1; i < lines.size(); ++i) {
-        const std::string& line = lines[i];
-        std::size_t pos = 0;
-        auto next_field = [&]() -> std::string {
-            auto tab = line.find('\t', pos);
-            std::string field;
-            if (tab == std::string::npos) {
-                field = line.substr(pos);
-                pos = line.size();
-            } else {
-                field = line.substr(pos, tab - pos);
-                pos = tab + 1;
-            }
-            return field;
-        };
-
-        LaunchctlRow row;
-        auto pid_str = next_field();
-        auto status_str = next_field();
-        row.label = next_field();
-
-        if (pid_str == "-" || pid_str.empty()) {
-            row.pid = std::nullopt;
-        } else {
-            try {
-                row.pid = std::stoll(pid_str);
-            } catch (...) {
-                row.pid = std::nullopt; // unparsable PID column -- treat as absent
-            }
-        }
-        try {
-            row.status = status_str.empty() ? 0 : std::stoi(status_str);
-        } catch (...) {
-            row.status = 0; // "-" or any other non-numeric status column
-        }
-        out.push_back(std::move(row));
+    if (lines[0] != "PID\tStatus\tLabel") {
+        out.malformed = true;
+        return out;
     }
+    out.rows.reserve(lines.size() - 1);
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        out.rows.push_back(decode_launchctl_row(lines[i]));
     return out;
 }
 

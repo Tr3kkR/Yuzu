@@ -13,7 +13,6 @@
 #include <catch2/catch_test_macros.hpp>
 
 using yuzu::shared::decode_launchctl_row;
-using yuzu::shared::LaunchctlRow;
 using yuzu::shared::parse_launchctl_list;
 
 // ── decode_launchctl_row (CH-2 fixtures, A0 governance fix round) ────────────
@@ -68,13 +67,19 @@ TEST_CASE("decode_launchctl_row: a literal tab inside the label is preserved "
     CHECK(row.label == "com.example\tweird.label");
 }
 
-TEST_CASE("parse_launchctl_list: empty input yields empty output", "[launchctl_list]") {
-    CHECK(parse_launchctl_list({}).empty());
+TEST_CASE("parse_launchctl_list: empty input yields an empty, non-malformed result",
+          "[launchctl_list]") {
+    auto result = parse_launchctl_list({});
+    CHECK(result.rows.empty());
+    CHECK_FALSE(result.malformed); // no output at all is not garbage output
 }
 
-TEST_CASE("parse_launchctl_list: header-only input yields empty output", "[launchctl_list]") {
+TEST_CASE("parse_launchctl_list: header-only input yields empty rows, not malformed",
+          "[launchctl_list]") {
     std::vector<std::string> lines = {"PID\tStatus\tLabel"};
-    CHECK(parse_launchctl_list(lines).empty());
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.rows.empty());
+    CHECK_FALSE(result.malformed);
 }
 
 TEST_CASE("parse_launchctl_list: real macOS host capture -- raw fields preserved",
@@ -86,8 +91,10 @@ TEST_CASE("parse_launchctl_list: real macOS host capture -- raw fields preserved
         "93175\t-9\tcom.apple.knowledgeconstructiond",
     };
 
-    auto rows = parse_launchctl_list(lines);
-    REQUIRE(rows.size() == 3);
+    auto result = parse_launchctl_list(lines);
+    CHECK_FALSE(result.malformed);
+    REQUIRE(result.rows.size() == 3);
+    const auto& rows = result.rows;
 
     CHECK(rows[0].label == "com.apple.SafariHistoryServiceAgent");
     CHECK_FALSE(rows[0].pid.has_value());
@@ -114,9 +121,37 @@ TEST_CASE("parse_launchctl_list: a truncated row with no LABEL field decodes "
         "PID\tStatus\tLabel",
         "1190\t0", // synthetic: truncated row, LABEL column missing
     };
-    auto rows = parse_launchctl_list(lines);
-    REQUIRE(rows.size() == 1);
-    CHECK(rows[0].label.empty());
-    REQUIRE(rows[0].pid.has_value());
-    CHECK(*rows[0].pid == 1190);
+    auto result = parse_launchctl_list(lines);
+    CHECK_FALSE(result.malformed);
+    REQUIRE(result.rows.size() == 1);
+    CHECK(result.rows[0].label.empty());
+    REQUIRE(result.rows[0].pid.has_value());
+    CHECK(*result.rows[0].pid == 1190);
+}
+
+// ── header-row structural check (UP-6, governance A0 fix round) ─────────────
+
+TEST_CASE("parse_launchctl_list: a preamble line before the real header is "
+          "malformed, not decoded as if line 0 were the header",
+          "[launchctl_list]") {
+    std::vector<std::string> lines = {
+        "launchctl: some warning banner", // CH-2: preamble before the header
+        "PID\tStatus\tLabel",
+        "1190\t0\tcom.apple.progressd",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    CHECK(result.rows.empty());
+}
+
+TEST_CASE("parse_launchctl_list: a header-less capture (first line is already "
+          "data) is malformed, not decoded from the wrong offset",
+          "[launchctl_list]") {
+    std::vector<std::string> lines = {
+        "1190\t0\tcom.apple.progressd", // CH-2: no header row at all
+        "93175\t-9\tcom.apple.knowledgeconstructiond",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    CHECK(result.rows.empty());
 }
