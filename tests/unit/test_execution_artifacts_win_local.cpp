@@ -281,15 +281,35 @@ TEST_CASE("execution_artifacts win-local: amcache, with agent.data_dir pointed a
         if (current_process_is_elevated()) {
             // Elevated (or LocalSystem/service) access to
             // C:\Windows\appcompat\Programs\Amcache.hve is exactly this
-            // leg's documented prerequisite -- under it, a real row must
-            // carry a real path, not the empty-field shape the committed
-            // docs/samples/windows.txt capture shows today (see the PR
-            // remediation notes for that separate, pre-existing anomaly).
-            REQUIRE(rows.front().find('|') != std::string::npos);
-            const auto first_pipe = rows.front().find('|');
-            const auto second_pipe = rows.front().find('|', first_pipe + 1);
-            REQUIRE(second_pipe != std::string::npos);
-            CHECK(second_pipe > first_pipe + 1); // the path field is non-empty
+            // leg's documented prerequisite -- under it, the leg must be
+            // CAPABLE of producing a real, non-empty path, proving
+            // collect_amcache's registry-value reads genuinely work end to
+            // end and aren't silently defaulting every field to empty.
+            //
+            // This does NOT mean every row has one: root-caused live on
+            // the-rig (2026-09-17) via `reg load`+`reg query` against a
+            // copy of the real hive -- several InventoryApplicationFile
+            // subkeys (observed: built-in driver files like
+            // 1394kdbg.sys/1394ohci.sys) genuinely carry ONLY ProgramId
+            // and FileId in the registry itself, no LowerCaseLongPath/
+            // Size/LinkDate/etc. at all. That is real AmCache data
+            // sparseness on this Windows build, not a read failure --
+            // get_or_empty() (execution_artifacts_parsers.hpp) correctly
+            // returns "" for a value that is genuinely absent, and
+            // RegEnumKeyExW's enumeration order is not something this
+            // plugin controls, so a sparse entry can legitimately land at
+            // rows.front(). Asserting on THE FIRST row (as this test did
+            // before) was the test's own bug, not production code's --
+            // check that AT LEAST ONE row has a real path instead.
+            const bool any_row_has_path = std::any_of(
+                rows.begin(), rows.end(), [](const std::string& r) {
+                    if (r.rfind("amcache|", 0) != 0)
+                        return false;
+                    const auto first_pipe = r.find('|');
+                    const auto second_pipe = r.find('|', first_pipe + 1);
+                    return second_pipe != std::string::npos && second_pipe > first_pipe + 1;
+                });
+            CHECK(any_row_has_path);
         }
     } else if (has_other_constrained_row) {
         CHECK(result.rc == 1);
