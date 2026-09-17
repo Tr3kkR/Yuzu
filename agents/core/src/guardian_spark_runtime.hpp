@@ -1290,6 +1290,31 @@ public:
     /// internally.
     [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
 
+    /// rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    /// Codex Sol independently converging): the ATOMIC combination of
+    /// receipt_recovered() and receipt_wedge_k_eligible(), for a caller that needs
+    /// BOTH questions answered about the exact same instant. Calling the two
+    /// standalone accessors sequentially (each takes and releases registry_mu_
+    /// independently) is NOT equivalent to this - a genuine adoption can land in the
+    /// gap between them: the first call correctly observes "not yet recovered", the
+    /// adoption's on_arm_complete() pops the claim in the window, and the second call
+    /// then observes "not eligible either" (no longer FIFO-front) - so a caller
+    /// combining the two booleans with `if (recovered) ... else if (!eligible) ...`
+    /// can misclassify a genuine, just-landed recovery as "no longer eligible",
+    /// dropping it without recording the recovery (GuardianArmAckLedger::
+    /// drain_locked()'s own recovery-scan loop is exactly this caller - see its own
+    /// comment on why it uses this accessor instead of the two standalone ones).
+    /// `Recovered` takes priority over `WedgeEligible` when both could apply (they
+    /// cannot in practice - an adopted claim's rule generation match and an
+    /// unadopted claim's FIFO-front position are mutually exclusive states of the
+    /// SAME claim - but the priority is stated for clarity, not because the case is
+    /// reachable). `Blocking` covers every other case: an empty receipt, a claim
+    /// neither recovered nor currently wedge-eligible (settled to a genuine
+    /// refusal/rejection/withdrawal, or already popped by a resolution nobody
+    /// adopted). registry_mu_ taken ONCE, internally; never mutates state.
+    enum class RecoveryStatus { Recovered, WedgeEligible, Blocking };
+    [[nodiscard]] RecoveryStatus receipt_recovery_status(const ArmReceipt& receipt) const;
+
     enum class ArmOutcomeKind { Armed, Accepted };
     /// The non-waiting attach_rule() overload's success result. Never encodes
     /// Accepted as a special generation number or makes it implicitly convertible

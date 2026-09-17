@@ -8,6 +8,7 @@
 
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_arm_ack.hpp" // rung 9c PR-5e (#4221): ledger-level insertion-gate regression
 #include "guardian_convergence_scheduler.hpp" // up-5 (#4221): scheduler integration test
 #include "guardian_lifecycle_journal.hpp"
 
@@ -7790,6 +7791,27 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     // K-eligible one tick before dispatch_arm_off_lock's own re-lock corrects it.
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+
+    // Adversarial review finding (Kimi K3 + Codex Sol independently converging,
+    // mutation-proven): GuardianArmAckLedger::drain_locked()'s own PRIMARY per-pending
+    // loop must ALSO gate on receipt_wedge_k_eligible() before inserting into
+    // failed_receipts - not just the recovery-scan loop that re-validates EXISTING
+    // entries a tick later. Drive a real ledger drain WHILE r2 sits in this exact
+    // unsettled window (receipt_status() already Wedged, receipt_wedge_k_eligible()
+    // still false) - deleting that insertion-site gate leaves every test in this file
+    // and in test_guardian_arm_ack.cpp green (proven by mutation during review), since
+    // none of them reach this specific window through a real ledger drain. This is
+    // that missing regression test.
+    {
+        GuardianArmAckLedger ledger;
+        ledger.begin_application(1, std::string(64, 'r'), false, 1);
+        ledger.add_pending("r2", res2->receipt);
+        CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT K-eligible yet
+        CHECK(ledger.failed_receipt_count_for_test() == 0); // must NOT be inserted while unsettled
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1); // still counted as an ordinary failure - resolved_failed unaffected
+    }
 
     // Let admission resolve for real, as an ORDINARY (non-Stopped) refusal.
     rt->set_io_executor_fail_launch_for_test(true);

@@ -1753,6 +1753,27 @@ bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) c
     return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
 }
 
+GuardianSparkRuntime::RecoveryStatus
+GuardianSparkRuntime::receipt_recovery_status(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return RecoveryStatus::Blocking;
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto& claim = receipt.claim;
+    // Identical logic to receipt_recovered() + receipt_wedge_k_eligible(), inlined
+    // under this ONE lock acquisition rather than calling either standalone accessor
+    // - see this function's own doc comment for why the two-call sequence is unsafe
+    // for a caller that needs both answers about the same instant.
+    const auto rit = rules_.find(claim->rule_id);
+    if (rit != rules_.end() && rit->second->generation == claim->generation)
+        return RecoveryStatus::Recovered;
+    if (claim->end == ClaimEnd::WaiterTimedOutDispatched && claim->dispatch == ClaimDispatch::Dispatched) {
+        const auto eit = claims_.find(claim->key);
+        if (eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim)
+            return RecoveryStatus::WedgeEligible;
+    }
+    return RecoveryStatus::Blocking;
+}
+
 std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError>
 GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge) {

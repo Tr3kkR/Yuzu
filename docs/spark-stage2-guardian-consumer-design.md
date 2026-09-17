@@ -828,6 +828,23 @@ explicit narrowing below.
   never collapsed" above exactly. `arm_stats().failed` stays correctly nonzero
   through a K-waived advance and still clears on a genuine subsequent recovery
   (PR-5d's existing mechanism, unchanged).
+- **K-eligibility linearizes at the drain-time read, explicitly (adversarial
+  review finding, Kimi K3 + Codex Sol - Codex's initial HIGH withdrawn to LOW
+  once this sentence's own reasoning was put to it in cross-examination).**
+  `drain_locked()` samples eligibility under `registry_mu_` per receipt;
+  `can_advance()` reads the resulting ledger membership afterward with no lock
+  held across the gap, by design (it stays a cheap, runtime-free query, per the
+  scope narrowing above). A completion that lands in that sub-tick gap - after
+  the eligibility read, before `can_advance()`/`persist_generation_locked()` -
+  does NOT revoke the current tick's decision: the eligibility read IS the
+  linearization point, not generation persistence. This produces the SAME end
+  state "Completion ownership survives K" already sanctions for the ordinary
+  case (a completion landing one tick AFTER acknowledgment) - the gap does not
+  make a new state reachable, only an earlier one. Do not "fix" this into a
+  runtime-owned waiver-permit latch: the same sub-tick window would simply
+  reopen between permit consumption and persistence, or during the interval
+  before the server observes the acknowledgment - no achievable linearization
+  point eliminates it, so moving it is not a correctness gain.
 - **Explicit narrowing (Fable-reviewed decision, not a silent default): this PR
   delivers ONLY the K-bound retry-then-waive policy.** The durable,
   cross-application "last known arm outcome for every currently-desired rule"

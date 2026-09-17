@@ -369,14 +369,16 @@ during the #2233 item 3 governance sweep, re-surfaced while investigating this P
 `rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
 `active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
 non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
-PR-5 (fault/K-bound logic, DONE as a 5-PR sub-ladder 5a-5e, all five merged - 5a
-#4359 (up-101/cs-103), 5b #4381 (up-3/up-4/ch-1/up-5, see status paragraph
-below), 5c #4417 (up-2, see status paragraph below), 5d #4485 (late-result
-adoption by current desired state, R5.3's arm-recovery telemetry mechanism -
-see `docs/spark-stage2-guardian-consumer-design.md`'s "as implemented (rung 9c
+PR-5 (fault/K-bound logic, a 5-PR sub-ladder 5a-5e, 5a-5d merged and 5e
+implemented/not yet merged - 5a #4359 (up-101/cs-103), 5b #4381
+(up-3/up-4/ch-1/up-5, see status paragraph below), 5c #4417 (up-2, see status
+paragraph below), 5d #4485 (late-result adoption by current desired state,
+R5.3's arm-recovery telemetry mechanism - see
+`docs/spark-stage2-guardian-consumer-design.md`'s "as implemented (rung 9c
 PR-5d)" stamp), 5e #4221 (K=3 wedge waiver / decision 1 closeout, plus #4279's
-disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp) -
-see acceptance criteria below) → PR-6 (Service readiness signal + a re-run of the #3990
+disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp;
+implemented, not yet merged as of this writing) - see acceptance criteria
+below) → PR-6 (Service readiness signal + a re-run of the #3990
 diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
@@ -559,11 +561,12 @@ flip, with a red-first test each:
   refill-inside-catch admission-refusal arm, and a throwing last detach inside a
   Lost notification). Both closed by PR #4359, full governance pass, zero open
   BLOCKING findings on this PR at merge.
-- **K=3 wedge waiver / decision 1 status (rung 9c PR-5e, #4221): CLOSED.** Full
-  mechanism, K-eligibility settling requirement, and explicit scope narrowing
-  documented in `docs/spark-stage2-guardian-consumer-design.md`'s "R5.3 as
-  implemented (rung 9c PR-5e)" stamp - not restated here. This PR is the LAST in
-  the 5a-5e sub-ladder and carries `Closes #4221`.
+- **K=3 wedge waiver / decision 1 status (rung 9c PR-5e, #4221): implemented,
+  pending merge as of this writing.** Full mechanism, K-eligibility settling
+  requirement, and explicit scope narrowing documented in
+  `docs/spark-stage2-guardian-consumer-design.md`'s "R5.3 as implemented (rung
+  9c PR-5e)" stamp - not restated here. This PR is the LAST in the 5a-5e
+  sub-ladder and carries `Closes #4221`; mark CLOSED here only once it merges.
 - **#4279 disposition (rung 9c PR-5e, per this row's own criterion above):
   ASSESSED against the landed K-bound logic, not resolved, remains open.** The
   lane-cap-overshoot observation (`SparkDetachedLane`'s shared admission

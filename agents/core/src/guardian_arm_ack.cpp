@@ -194,13 +194,27 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
     // - i.e. its exact (rule_id, generation) incarnation is now the one
     // committed. `end`/receipt_status() never change on adoption (the receipt
     // stays Wedged by design), which is exactly why this needs its own signal -
-    // GuardianSparkRuntime::receipt_recovered() - rather than re-draining
+    // GuardianSparkRuntime::receipt_recovery_status() - rather than re-draining
     // `pending` again. Deliberately unbounded (no max_per_tick cap, no cursor):
     // failed_receipts only ever holds rules that actually wedged, a naturally
     // small, rare population compared to a full ruleset - a bounded pass with a
     // resume cursor would be over-built for that shape here.
+    //
+    // rung 9c PR-5e (#4221, K-bound closeout - adversarial review finding, Kimi K3 +
+    // Codex Sol independently converging): this MUST be the combined
+    // receipt_recovery_status() accessor, one registry_mu_ acquisition per entry -
+    // NOT two sequential calls to receipt_recovered() then receipt_wedge_k_eligible()
+    // (an earlier version of this loop did exactly that). Each standalone accessor
+    // takes and releases registry_mu_ independently, so a genuine adoption landing in
+    // the GAP between them - the first call correctly observing "not yet recovered",
+    // then on_arm_complete() adopting and popping the claim before the second call
+    // runs - reads as "not eligible either" and gets silently dropped from
+    // failed_receipts WITHOUT decrementing resolved_failed, permanently losing a
+    // genuine recovery this application would otherwise have recorded. Combining both
+    // questions under the SAME lock acquisition closes that window entirely.
     for (auto it = current_->failed_receipts.begin(); it != current_->failed_receipts.end();) {
-        if (runtime.receipt_recovered(it->second)) {
+        switch (runtime.receipt_recovery_status(it->second)) {
+        case GuardianSparkRuntime::RecoveryStatus::Recovered:
             // Clears THIS application's own resolved_failed contribution only -
             // never failed_out/arm_failures_, which is a cumulative fleet-visible
             // audit counter and must never decrement (this file's own header
@@ -210,7 +224,11 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             if (current_->resolved_failed > 0)
                 --current_->resolved_failed;
             it = current_->failed_receipts.erase(it);
-        } else if (!runtime.receipt_wedge_k_eligible(it->second)) {
+            break;
+        case GuardianSparkRuntime::RecoveryStatus::WedgeEligible:
+            ++it;
+            break;
+        case GuardianSparkRuntime::RecoveryStatus::Blocking:
             // rung 9c PR-5e (#4221, K-bound closeout): this entry's K-eligibility has
             // settled to false since it was retained - a Dispatching-window race
             // corrected to a genuine Failed/Stopped/AdmissionRejected outcome, or the
@@ -223,8 +241,7 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // is what keeps can_advance()'s `resolved_failed == failed_receipts.size()`
             // check a SAFE predicate rather than a stale one.
             it = current_->failed_receipts.erase(it);
-        } else {
-            ++it;
+            break;
         }
     }
 
