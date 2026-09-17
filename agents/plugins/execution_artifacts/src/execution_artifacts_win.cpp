@@ -111,6 +111,7 @@
 
 #include "execution_artifacts_legs.hpp" // also pulls in <yuzu/plugin.hpp> -- yuzu_create_temp_dir
 #include "execution_artifacts_parsers.hpp"
+#include "execution_artifacts_scratch_identity.hpp" // detail::scratch_dir_is_ours (A1: hoisted, also used by the sweep)
 
 #include <constraint_accumulator.hpp>
 #include <yuzu/agent/offline_hive_mutex.hpp> // ScopedOfflineHiveLock
@@ -384,79 +385,6 @@ ScopedHandle open_scratch_dir_handle(const std::wstring& dir) {
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
 }
 
-/// Returns the current process token's owner (TOKEN_OWNER) as an
-/// in-process buffer, or an empty vector on any failure -- the two-call
-/// GetTokenInformation idiom already used by process_enum.cpp/
-/// tar_proc_etw.cpp, requesting TokenOwner (a PSID) rather than TokenUser.
-/// The PSID inside the returned buffer is only valid for the buffer's
-/// lifetime.
-std::vector<BYTE> current_process_token_owner_buf() {
-    HANDLE raw_token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token))
-        return {};
-    ScopedHandle token(raw_token);
-
-    DWORD needed = 0;
-    GetTokenInformation(token.get(), TokenOwner, nullptr, 0, &needed);
-    if (needed == 0)
-        return {};
-    std::vector<BYTE> buf(needed);
-    if (!GetTokenInformation(token.get(), TokenOwner, buf.data(), needed, &needed))
-        return {};
-    return buf;
-}
-
-/// Verifies an already-open, freshly-created scratch-directory handle is
-/// the object this process itself created: not a reparse point, and owned
-/// by the SAME SID as the current process token's owner -- never a
-/// hardcoded SYSTEM/Administrators pair, so this holds unchanged under a
-/// future least-privilege NT SERVICE\YuzuAgent identity too (#1442/#4450).
-///
-/// yuzu_create_temp_dir() already gives CREATE_NEW semantics (ANY failure,
-/// including ERROR_ALREADY_EXISTS, is treated as a hard failure -- see
-/// temp_file.cpp) over a 128-bit crypto-random name, so this check is not
-/// what makes the directory safe to use -- a name nobody else can predict
-/// and a create that refuses to reuse an existing object already do that.
-/// It is a second, independent proof that the specific object this handle
-/// refers to really is the one collect_amcache just created, covering the
-/// narrow window between that create and this open during which a
-/// principal with FILE_DELETE_CHILD on agent.data_dir could in principle
-/// have deleted and resubstituted it.
-///
-/// Takes the HANDLE, not a path: every check below resolves against the
-/// OPEN OBJECT, never re-resolving the path -- combined with the caller
-/// holding this same handle open (no FILE_SHARE_DELETE) through the
-/// subsequent copy, this is what closes the TOCTOU a path-based
-/// verify-then-use would otherwise have.
-bool scratch_dir_is_ours(HANDLE dir_handle) {
-    BY_HANDLE_FILE_INFORMATION info{};
-    if (!GetFileInformationByHandle(dir_handle, &info))
-        return false;
-    if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-        return false; // a junction/symlink -- never follow it.
-
-    const auto owner_buf = current_process_token_owner_buf();
-    if (owner_buf.empty())
-        return false;
-    const PSID token_owner = reinterpret_cast<const TOKEN_OWNER*>(owner_buf.data())->Owner;
-
-    PSECURITY_DESCRIPTOR sd = nullptr;
-    PSID dir_owner = nullptr;
-    const DWORD rc = GetSecurityInfo(dir_handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
-                                     &dir_owner, nullptr, nullptr, nullptr, &sd);
-    if (rc != ERROR_SUCCESS)
-        return false;
-    struct SdGuard {
-        PSECURITY_DESCRIPTOR p;
-        ~SdGuard() {
-            if (p)
-                LocalFree(p);
-        }
-    } sd_guard{sd};
-
-    return EqualSid(dir_owner, token_owner);
-}
-
 /// The ERROR_SHARING_VIOLATION fallback: SeBackupPrivilege + backup-semantics
 /// read, chunked into `dest`. Unexercised on A1's probe host (plain CopyFileW
 /// always sufficed there — see the file banner) but kept for a host where the
@@ -700,7 +628,7 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
         if (!dest_dir_handle)
             return emit_constrained(ctx, "dest_dir_open_" + std::to_string(GetLastError()));
 
-        if (!scratch_dir_is_ours(dest_dir_handle.get()))
+        if (!detail::scratch_dir_is_ours(dest_dir_handle.get()))
             return emit_constrained(ctx, "dest_dir_acl");
 
         const std::wstring dest_hve = scratch.path() + L"\\amcache.hve";
