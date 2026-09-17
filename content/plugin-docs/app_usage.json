@@ -467,7 +467,7 @@
       "completeness": "partial",
       "provenance": "`usage_feeder_disabled`",
       "status": "`CONSTRAINED`",
-      "when": "`last_used` only: `tar_config.usage_feeder_enabled` reads `\"false\"` — TAR's own fold has stopped advancing (its `usage`/`process` collector is off), so `usage_daily` would otherwise silently serve a frozen, aging window as if it were live. `summary` surfaces the same signal via its `meta` row's `feeder_enabled` field instead of refusing to run."
+      "when": "`last_used` only: `tar_config.usage_feeder_enabled` reads `\"false\"` **or is absent** — TAR's own fold has stopped advancing (its `usage`/`process` collector is off), so `usage_daily` would otherwise silently serve a frozen, aging window as if it were live. Unlike `usage_enabled`, an absent feeder key is deliberately NOT treated as enabled — a missing key here is itself anomalous (a hand-restored or hand-edited `tar.db`), so it fails closed the same as an explicit `\"false\"`. `summary` surfaces the same signal via its `meta` row's `feeder_enabled` field instead of refusing to run."
     },
     {
       "completeness": "partial",
