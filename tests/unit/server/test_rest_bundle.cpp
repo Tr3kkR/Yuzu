@@ -538,3 +538,33 @@ TEST_CASE("REST POST rejects empty agent_id", "[pg][bundle][rest][unhappy]") {
            status);
     CHECK(status == 400);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// json-dump-depth-guard fix (#2437-class): nlohmann::json::dump() is
+// unboundedly recursive. The REST handler's OWN guard checks the RAW body
+// as a whole BEFORE any parse - this test's deep structure sits in a decoy
+// top-level field, deliberately NOT inside "steps", so it isolates THIS
+// guard from validate_bundle_steps's own independent depth check
+// (bundle_service.cpp, covered directly in test_bundle_service.cpp): with
+// only this route-level guard removed, "steps" itself stays shallow and
+// valid, so the request would proceed all the way to a real dispatch rather
+// than being caught a second time downstream. depth 40 is trivially safe to
+// build/dump directly in this test process; the real attack depth this
+// guard exists for is many orders of magnitude higher (~100,000 levels).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("POST /api/v1/bundles: a body nested past the depth limit is rejected "
+          "before dispatch",
+          "[pg][bundle][rest][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    BundleHarness h(pool);
+    int status = 0;
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string body =
+        R"({"agent_id":"agent-1","steps":[{"plugin":"os_info","action":"uptime"}],"junk":)" +
+        deep_array + "}";
+    h.post("/api/v1/bundles", body, status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty()); // never reached command_dispatch_fn
+}

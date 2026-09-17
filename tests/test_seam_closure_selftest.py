@@ -57,6 +57,14 @@ CHECKER_PATH = REPO_ROOT / "scripts" / "ci" / "check-seam-closure.py"
 # --- The comparison is LIST EQUALITY, so it is ORDER-SENSITIVE by design: a
 # --- pure re-order also trips it (both lists are printed side by side).
 EXPECTED_FAMILIES = {
+    "device": {
+        "tus": [
+            "server/core/src/device_routes.cpp",
+            "server/core/src/device_ui.cpp",
+            "server/core/src/device_api.hpp",
+            "server/core/src/device_api_local.hpp",
+        ],
+    },
     "network": {
         "tus": [
             "server/core/src/network_routes.cpp",

@@ -8,6 +8,7 @@
 #include "execution_event_bus.hpp"
 #include "execution_event_scope.hpp"
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "principal_quota_gate.hpp" // detail::adopt_quota_slot_into_stream (UP-1)
 #include "product_pack_model.hpp" // #4029: shared row/detail builders + error classifiers
 #include "rest_a4_envelope.hpp"     // detail::error_json_a4, make_correlation_id
@@ -2375,6 +2376,17 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto& def = **def_result;
+
+        // #2437-class guard: raw-text depth check before parse - a
+        // parsed-then-dumped "params" value below (`v.dump()`, non-string
+        // coercion) still crashes on the dump, so this has to run on the raw
+        // text before any allocation.
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                            "application/json");
+            return;
+        }
 
         // Parse request body
         nlohmann::json j;
