@@ -55,6 +55,7 @@
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
+#include "test_device_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
@@ -1156,6 +1157,13 @@ struct McpTestServer {
     /// wiring lambda below).
     std::optional<std::set<std::string>> dex_visible_for_test;
 
+    /// ADR-0031 WS-A4: the DeviceApi double backing list_agents/get_agent_details,
+    /// hoisted to a member (was a start()-local) so a test can read its #3564
+    /// short-circuit witness `lookup_calls` — asserting an out-of-scope
+    /// get_agent_details triggered ZERO backing read (mirrors the REST twin's
+    /// FakeDeviceApi.lookup_calls). Populated in start(); null before then.
+    std::shared_ptr<yuzu::server::test::JsonDeviceApi> device_api_for_test_;
+
     /// ADR-0024 (SLE discovery): optionally wire a typed SoftwareLicensingStore so
     /// query_software_licenses (the MCP twin of the GET /sle/agents/{id} drill) is
     /// exercised end-to-end — success shape, the deliberate user_scope/user_ref PII
@@ -1410,6 +1418,14 @@ private:
                                            {"arch", "x64"},
                                            {"agent_version", "0.1.3"}}});
         };
+        // ADR-0031 WS-A4 wave 2: list_agents/get_agent_details now source from
+        // DeviceApi instead of agents_fn directly — wrap the SAME mock data
+        // (copied before agents_fn is moved into build_handler below) so
+        // every pre-existing test in this file keeps seeing the identical two
+        // agents, byte-identical to the pre-rewire behaviour.
+        device_api_for_test_ =
+            std::make_shared<yuzu::server::test::JsonDeviceApi>(agents_fn);
+        auto device_api_for_test = device_api_for_test_;
 
         // #2384: the engine-credential store rides a setter, not a
         // build_handler param — wire before the handlers are built.
@@ -1596,6 +1612,7 @@ private:
             /*export_csr_fn=*/export_csr_fn_for_test,
             /*import_chain_fn=*/import_chain_fn_for_test,
             /*compliance_api=*/compliance_api_for_test,
+            /*device_api=*/device_api_for_test,
             // wave 7 PR7.2: true last parameter, matching the .hpp order.
             /*app_usage_store=*/app_usage_store_for_test);
     }
@@ -10415,8 +10432,16 @@ TEST_CASE("MCP get_agent_details: out-of-scope agent collapses to not-found",
     auto in_body = nlohmann::json::parse(in_scope->body);
     REQUIRE(in_body.contains("result"));
 
+    // #3564 (security-guardian Gate 8 OBS-2): an out-of-scope id must incur ZERO
+    // backing read — the in_scope gate denies BEFORE lookup_device, so a
+    // tag-store round-trip cannot betray existence by timing. Mirror of the REST
+    // twin's `lookup_calls == 0` assertion. (agent-001 above was in-scope and
+    // DID read, so measure the delta across just this out-of-scope call.)
+    REQUIRE(ts.device_api_for_test_);
+    const int lookups_before_oos = ts.device_api_for_test_->lookup_calls;
     auto out_of_scope = ts.call(
         R"({"jsonrpc":"2.0","method":"tools/call","id":20,"params":{"name":"get_agent_details","arguments":{"agent_id":"agent-002"}}})");
+    CHECK(ts.device_api_for_test_->lookup_calls == lookups_before_oos);
     REQUIRE(out_of_scope);
     CHECK(out_of_scope->status == 200);
     auto out_body = nlohmann::json::parse(out_of_scope->body);
@@ -25308,6 +25333,60 @@ TEST_CASE("MCP reevaluate_result_set: a params object smuggled past create_resul
     }
 }
 
+// json-dump-depth-guard fix (#2437-class): reevaluate_result_set used to
+// parse-then-dump orig->source_payload with no bound on its nesting depth.
+// nlohmann::json::dump() is unboundedly recursive, so a row poisoned via any
+// write path (past or future) would SIGSEGV the process on the eventual
+// dump() call. Seeded directly in the store, the same "unwired caller_fn"
+// pattern used above, since no creation path should ever be asked to build a
+// row this way. kMcpMaxJsonDepth is 32; the source_payload below nests 40
+// levels - trivially safe to construct/dump in this test process, and many
+// orders of magnitude short of the ~100,000-level depth that actually
+// crashes the real dump() call.
+TEST_CASE("MCP reevaluate_result_set: a stored source_payload nested past the depth "
+          "limit is refused, never dispatched",
+          "[pg][mcp][integration][result-sets][security][depth]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "poisoned";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth.
+    cr.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("nests too deeply") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched); // THE assertion: nothing was ever dispatched
+}
+
 // Gate 6 sre finding (#4364 re-review): the params-bound recheck just above
 // ran AFTER the instruction_store availability gate, unlike every sibling
 // ordering fix in this same PR - during a concurrent instruction_store
@@ -25414,6 +25493,64 @@ TEST_CASE("MCP create_result_set_from_inventory_query: matched membership is con
     // device_count would be 2. The fix narrows the candidate records to the
     // gate's scope BEFORE evaluation, so only "agent-visible" can ever match.
     CHECK(payload["device_count"] == 1);
+}
+
+// #2437-class guard (C11/C12), MCP transport: create_result_set_from_inventory_query
+// shares the exact same evaluate_inventory() (inventory_eval.cpp) as the REST
+// twin (test_rest_result_sets_async.cpp carries the equivalent REST-side
+// test) - one guard covers both. Uses "exists" rather than "==" for the same
+// reason as the REST twin: with "==" the poisoned record's dump()-fallback
+// string would never equal the target value, so the guard's absence would be
+// invisible at this level (the direct reachability proof lives in
+// test_inventory_eval.cpp, the actual code under test). Real structural
+// nesting, NOT brackets inside a string literal. Reachability-proxy depth
+// (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack depth.
+TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned stored data_json is "
+          "excluded from matching membership, a healthy matching agent is still included, "
+          "no crash",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"depth-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // no crash
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["device_count"] == 1);
+    // Confirm identity, not just count.
+    std::string next;
+    auto members = rs_bundle->members(payload["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
 }
 
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "

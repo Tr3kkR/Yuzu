@@ -473,6 +473,115 @@ TEST_CASE("discover.instructions: non-object parameter_schema nulls out, matchin
     CHECK(saw_string);
 }
 
+// json-dump-depth-guard fix (#2437-class): parameter_schema is stored
+// VERBATIM at write time. instruction_store.cpp's own import-path write-side
+// guard rejects a too-deep value from now on, but a row written before that
+// guard shipped, or via any path that bypasses import, still reaches this
+// read - build_discovery_doc's body.dump() below is the unboundedly
+// recursive call that would SIGSEGV the whole response. Seeded directly via
+// InstructionStore::create_definition (bypassing the now-guarded import
+// route), matching this branch's established "seed the poisoned state
+// directly to prove the read-side guard independently" pattern. The poisoned
+// text is an OBJECT at the top level ({"a": 35-deep bracket chain}), not a
+// bare array - both build_instructions_catalog and build_plugins_catalog
+// below only act on a value that separately passes an existing is_object()
+// filter, so an array-shaped payload would be excluded by that filter alone
+// and prove nothing about the depth guard specifically. 35 levels is
+// comfortably past kMcpMaxJsonDepth (32) and trivially safe to construct
+// here, orders of magnitude short of the ~100,000-level depth that actually
+// crashes the real dump().
+TEST_CASE("discover.instructions: parameter_schema nesting too deep excludes just that "
+          "definition, others unaffected (#2437-class)",
+          "[discovery][instructions][depth][pg]") {
+    DiscoverHarness h;
+    const std::string deep = R"({"a":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    auto poisoned_id = h.instr->create_definition(make_def("Poisoned", /*enabled=*/true, deep));
+    REQUIRE(poisoned_id.has_value());
+    auto healthy_id = h.instr->create_definition(
+        make_def("Healthy", /*enabled=*/true, R"({"type":"object"})"));
+    REQUIRE(healthy_id.has_value());
+
+    auto res = h.sink.Get("/api/v1/discover/instructions");
+    REQUIRE(res); // no crash
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    const auto& arr = j["instructions"];
+    bool saw_poisoned = false, saw_healthy = false;
+    for (const auto& d : arr) {
+        if (d["id"] == *poisoned_id)
+            saw_poisoned = true;
+        if (d["id"] == *healthy_id) {
+            saw_healthy = true;
+            CHECK(d["parameter_schema"]["type"] == "object");
+        }
+    }
+    CHECK_FALSE(saw_poisoned); // excluded, never dumped
+    CHECK(saw_healthy);        // other definitions in the same response unaffected
+}
+
+// Same hazard, the build_plugins_catalog enrichment join: a too-deep stored
+// parameter_schema would otherwise be spliced into an action's entry and
+// crash on THIS catalog's own dump(). Two distinct plugin/action pairs so the
+// exclusion is provably scoped to the poisoned one.
+TEST_CASE("discover.plugins: parameter_schema nesting too deep skips enrichment for just "
+          "that action, other actions unaffected (#2437-class)",
+          "[discovery][plugins][depth][pg]") {
+    DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/true, /*wire_registry=*/true,
+                      /*grant_instr_read=*/true);
+    // Object-shaped (see the comment on the sibling test above) - an
+    // array-shaped payload would already fail this function's own
+    // is_object() filter and never reach schema_by_action either way,
+    // proving nothing about the depth guard.
+    const std::string deep = R"({"a":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    // Matches make_def's default plugin/action (system_info/query).
+    auto poisoned_id = h.instr->create_definition(make_def("Poisoned Query", /*enabled=*/true, deep));
+    REQUIRE(poisoned_id.has_value());
+    auto healthy_def =
+        make_def("Healthy List", /*enabled=*/true, R"({"type":"object"})");
+    healthy_def.plugin = "processes";
+    healthy_def.action = "list";
+    REQUIRE(h.instr->create_definition(healthy_def).has_value());
+
+    auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
+    auto* p1 = info.add_plugins();
+    p1->set_name("system_info");
+    p1->add_capabilities("query");
+    auto* p2 = info.add_plugins();
+    p2->set_name("processes");
+    p2->add_capabilities("list");
+    (void)h.registry.register_agent(info);
+
+    auto res = h.sink.Get("/api/v1/discover/plugins");
+    REQUIRE(res); // no crash
+    CHECK(res->status == 200);
+
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["actions_enriched_with_schema"].get<int>() == 1); // only the healthy action
+    bool checked_system_info = false, checked_processes = false;
+    for (const auto& pl : j["plugins"]) {
+        if (pl["name"] == "system_info") {
+            for (const auto& a : pl["actions"]) {
+                if (a["name"] == "query") {
+                    checked_system_info = true;
+                    CHECK_FALSE(a.contains("parameter_schema")); // excluded, never dumped
+                }
+            }
+        }
+        if (pl["name"] == "processes") {
+            for (const auto& a : pl["actions"]) {
+                if (a["name"] == "list") {
+                    checked_processes = true;
+                    REQUIRE(a.contains("parameter_schema"));
+                    CHECK(a["parameter_schema"]["type"] == "object");
+                }
+            }
+        }
+    }
+    CHECK(checked_system_info);
+    CHECK(checked_processes);
+}
+
 TEST_CASE("discover.instructions: null InstructionStore -> 503",
           "[discovery][instructions][pg]") {
     DiscoverHarness h(/*wire_rbac=*/true, /*wire_instr=*/false);

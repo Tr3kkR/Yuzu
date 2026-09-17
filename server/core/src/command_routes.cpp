@@ -7,6 +7,7 @@
 #include "dispatch_scope_ladder.hpp"      // ScopeLadderAudit / resolve_scope_targets
 #include "dispatch_target_shape.hpp"      // check_targeting_shape / targeting_supplied / classify_dispatch_arm
 #include "json_extract.hpp"               // extract_json_string / _array / _map / _int
+#include "mcp_jsonrpc.hpp"                 // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "on_behalf_guard.hpp"            // onbehalf::sanitize_for_log
 #include "rest_audit.hpp"                 // yuzu::server::detail::emit_behavioral_audit
 
@@ -103,6 +104,20 @@ namespace yuzu::server::command {
 void register_command_routes(HttpRouteSink& sink, Deps deps) {
     sink.Post("/api/command", [deps = std::move(deps)](const httplib::Request& req,
                                                         httplib::Response& res) {
+        // #2437-class guard: raw-text depth check before ANY parse of this
+        // body. One check here covers every extraction below, including the
+        // helper-hidden ones (extract_json_string/_map both parse the body
+        // internally) and the later explicit nlohmann::json::parse, in
+        // particular extract_json_string_map's own `v.dump()` on a non-string
+        // "params" value, the actual crash site this guard closes.
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(
+                R"({"error":{"code":400,"message":"request body nests too deeply"},"meta":{"api_version":"v1"}})",
+                "application/json");
+            return;
+        }
+
         // Parse JSON body: { "plugin": "...", "action": "...", "agent_ids": [...] }
         auto plugin = extract_json_string(req.body, "plugin");
         auto action = extract_json_string(req.body, "action");

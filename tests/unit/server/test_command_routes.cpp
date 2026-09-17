@@ -846,3 +846,31 @@ TEST_CASE("/api/command: a Forensics action's single target falling outside the 
     CHECK(res->status == 404);
     CHECK(h.send_to_ids_called.empty());
 }
+
+// ─────────────── json-dump-depth-guard fix (#2437-class) ────────────────────
+//
+// nlohmann::json::dump() is unboundedly recursive. This body is an
+// otherwise-VALID, otherwise-ACCEPTED request (plugin/action/agent_ids all
+// well-formed) with one extra deeply-nested field inside "params" - the
+// exact field extract_json_string_map's non-string coercion calls .dump()
+// on - so on unguarded code the request proceeds all the way to dispatch,
+// and only the new depth check tells fixed and unfixed code apart. depth 40
+// is trivially safe to build/dump directly in this test process; the real
+// attack depth this guard exists for is many orders of magnitude higher
+// (~100,000 levels).
+
+TEST_CASE("/api/command: a body nested past the depth limit is rejected before dispatch",
+          "[command_routes][security][depth]") {
+    CommandHarness h;
+    const std::string deep_array = std::string(40, '[') + std::string(40, ']');
+    const std::string body =
+        R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],"params":{"deep":)" +
+        deep_array + "}}";
+    auto res = h.sink.Post("/api/command", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["message"].get<std::string>().find("nests too deeply") != std::string::npos);
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.send_all_calls == 0);
+}
