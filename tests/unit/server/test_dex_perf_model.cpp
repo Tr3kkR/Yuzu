@@ -127,6 +127,14 @@ TEST_CASE("dex_perf_os_from_session: normalizes to the closed token set",
     CHECK(rules::dex_perf_os_from_session("").empty());
 }
 
+TEST_CASE("dex_perf_os_collects: only OSes with a real perf collector today",
+          "[dex][perf][rules][os]") {
+    CHECK(rules::dex_perf_os_collects("windows"));
+    CHECK(rules::dex_perf_os_collects("linux"));
+    CHECK_FALSE(rules::dex_perf_os_collects("macos")); // kPlanned, not yet real
+    CHECK_FALSE(rules::dex_perf_os_collects(""));
+}
+
 // ── fleet_now ────────────────────────────────────────────────────────────────
 
 TEST_CASE("fleet_now: absent-not-zero + honest denominators", "[dex][perf][model]") {

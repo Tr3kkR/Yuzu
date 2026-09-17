@@ -115,4 +115,14 @@ inline std::string dex_perf_os_from_session(std::string_view raw) {
     return "";
 }
 
+/// Does this normalized OS token (see dex_perf_os_from_session) have a real
+/// heartbeat perf collector today? Windows and Linux both do (TAR perf
+/// capture source, `tar_perf.cpp`); macOS is `kPlanned` (all-invalid stub)
+/// until the agent-side collector lands. This is the ONE fact the
+/// not-reporting drill and the per-OS denominators key on — flip macOS to
+/// `true` here, and only here, once its collector ships.
+inline bool dex_perf_os_collects(std::string_view os) {
+    return os == "windows" || os == "linux";
+}
+
 } // namespace yuzu::server::detail
