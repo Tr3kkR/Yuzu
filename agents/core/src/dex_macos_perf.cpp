@@ -8,6 +8,7 @@
 #include <yuzu/agent/scoped_ioobject.hpp>
 
 #include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
 #include <IOKit/storage/IOBlockStorageDriver.h>
 #include <mach/mach_host.h>
 #include <mach/mach_init.h>
@@ -167,8 +168,36 @@ bool read_stat_key(CFDictionaryRef dict, CFStringRef key, std::int64_t& out) {
            CFNumberGetValue(num, kCFNumberSInt64Type, &out);
 }
 
-} // namespace
+// Per-driver outcome of reading one "Statistics" dict: kSkip (missing/malformed key —
+// not fatal, an idle/uninitialized driver legitimately has none yet), kCorrupt (a
+// negative counter — kernel-counter corruption, invalidates the WHOLE sample), or
+// kAccumulated (added into `out`). `out` is left untouched on kSkip/kCorrupt.
+enum class DriverStatOutcome { kSkip, kCorrupt, kAccumulated };
 
+DriverStatOutcome read_driver_stats(CFDictionaryRef dict, DiskTotals& out) {
+    std::int64_t rb = 0, wb = 0, rd = 0, wr = 0, rt = 0, wt = 0;
+    const bool complete =
+        read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey), rb) &&
+        read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey), wb) &&
+        read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsReadsKey), rd) &&
+        read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsWritesKey), wr) &&
+        read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsTotalReadTimeKey), rt) &&
+        read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsTotalWriteTimeKey), wt);
+    if (!complete)
+        return DriverStatOutcome::kSkip;
+    if (rb < 0 || wb < 0 || rd < 0 || wr < 0 || rt < 0 || wt < 0)
+        return DriverStatOutcome::kCorrupt;
+    out.read_bytes = sat_add(out.read_bytes, static_cast<std::uint64_t>(rb));
+    out.write_bytes = sat_add(out.write_bytes, static_cast<std::uint64_t>(wb));
+    out.reads = sat_add(out.reads, static_cast<std::uint64_t>(rd));
+    out.writes = sat_add(out.writes, static_cast<std::uint64_t>(wr));
+    out.read_time_ns = sat_add(out.read_time_ns, static_cast<std::uint64_t>(rt));
+    out.write_time_ns = sat_add(out.write_time_ns, static_cast<std::uint64_t>(wt));
+    return DriverStatOutcome::kAccumulated;
+}
+
+// File-private: read_disk_totals() below is the only caller. Sums every
+// IOBlockStorageDriver's "Statistics" dict reachable from `it` via read_driver_stats().
 DiskTotals sum_block_storage_stats(io_iterator_t it) {
     DiskTotals out;
     bool any = false;
@@ -178,32 +207,16 @@ DiskTotals sum_block_storage_stats(io_iterator_t it) {
             obj.get(), CFSTR(kIOBlockStorageDriverStatisticsKey), kCFAllocatorDefault, 0)};
         if (!stats || CFGetTypeID(stats.get()) != CFDictionaryGetTypeID())
             continue; // no Statistics dict yet — skip this driver, not fatal
-        auto dict = static_cast<CFDictionaryRef>(stats.get());
-
-        std::int64_t rb = 0, wb = 0, rd = 0, wr = 0, rt = 0, wt = 0;
-        const bool complete =
-            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey), rb) &&
-            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey), wb) &&
-            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsReadsKey), rd) &&
-            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsWritesKey), wr) &&
-            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsTotalReadTimeKey), rt) &&
-            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsTotalWriteTimeKey), wt);
-        if (!complete)
-            continue; // missing/malformed key — skip this driver
-        if (rb < 0 || wb < 0 || rd < 0 || wr < 0 || rt < 0 || wt < 0)
+        const auto outcome = read_driver_stats(static_cast<CFDictionaryRef>(stats.get()), out);
+        if (outcome == DriverStatOutcome::kCorrupt)
             return DiskTotals{}; // kernel-counter corruption — invalidate the whole sample
-
-        out.read_bytes += static_cast<std::uint64_t>(rb);
-        out.write_bytes += static_cast<std::uint64_t>(wb);
-        out.reads += static_cast<std::uint64_t>(rd);
-        out.writes += static_cast<std::uint64_t>(wr);
-        out.read_time_ns += static_cast<std::uint64_t>(rt);
-        out.write_time_ns += static_cast<std::uint64_t>(wt);
-        any = true;
+        any = any || (outcome == DriverStatOutcome::kAccumulated);
     }
     out.valid = any;
     return out;
 }
+
+} // namespace
 
 DiskTotals read_disk_totals() {
     io_iterator_t raw_it{};
@@ -211,6 +224,21 @@ DiskTotals read_disk_totals() {
                                      IOServiceMatching(kIOBlockStorageDriverClass),
                                      &raw_it) != KERN_SUCCESS)
         return {};
+    ScopedIOObject it{raw_it};
+    return sum_block_storage_stats(it.get());
+}
+
+DiskTotals sum_block_storage_stats_empty_iterator_for_test() {
+    // "YuzuNonexistentDriverClassForTest" matches no IOKit service by construction —
+    // IOServiceGetMatchingServices still succeeds, handing back a real iterator that
+    // IOIteratorNext immediately exhausts, so sum_block_storage_stats()'s "zero drivers
+    // -> valid stays false" arm is pinned deterministically (this box has real
+    // IOBlockStorageDriver rows, so that arm is otherwise unreachable from a test here).
+    io_iterator_t raw_it{};
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching("YuzuNonexistentDriverClassForTest"),
+                                     &raw_it) != KERN_SUCCESS)
+        return {}; // lookup itself failed — inconclusive, not a pin either way
     ScopedIOObject it{raw_it};
     return sum_block_storage_stats(it.get());
 }

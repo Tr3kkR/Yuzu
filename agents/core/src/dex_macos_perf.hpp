@@ -22,10 +22,6 @@
 #include <cstdint>
 #include <optional>
 
-#if defined(__APPLE__)
-#include <IOKit/IOKitLib.h>
-#endif
-
 namespace yuzu::agent::macos {
 
 /// Cumulative CPU tick counters since boot, from host_statistics(HOST_CPU_LOAD_INFO).
@@ -106,21 +102,24 @@ YUZU_EXPORT CpuTicks read_cpu_ticks();
 /// calls) or on every other platform.
 YUZU_EXPORT VmSnapshot read_vm_snapshot();
 
-#if defined(__APPLE__)
-/// Darwin only (the type itself, io_iterator_t, does not exist off Apple platforms):
-/// sum the "Statistics" dictionary of every IOBlockStorageDriver reachable from `it`.
-/// A driver with no Statistics dict, or missing one of the 6 keys read, is SKIPPED
-/// (does not invalidate the sample — an idle/uninitialized driver legitimately has
-/// none yet); a NEGATIVE value on any key present invalidates the WHOLE sample
-/// immediately (kernel-counter corruption, not a benign gap). valid=true only if at
-/// least one driver fully contributed and no negative value was ever seen.
-YUZU_EXPORT DiskTotals sum_block_storage_stats(io_iterator_t it);
-#endif
-
-/// Darwin: IOServiceGetMatchingServices(kIOBlockStorageDriverClass) walked via
-/// sum_block_storage_stats(). All-invalid on failure (including the service lookup
-/// itself) or on every other platform.
+/// Darwin: sums the "Statistics" dictionary of every IOBlockStorageDriver in the IOKit
+/// registry (IOServiceGetMatchingServices(kIOBlockStorageDriverClass)). A driver with no
+/// Statistics dict, or missing one of the 6 keys read, is SKIPPED (does not invalidate
+/// the sample — an idle/uninitialized driver legitimately has none yet); a NEGATIVE
+/// value on any key present invalidates the WHOLE sample immediately (kernel-counter
+/// corruption, not a benign gap). All-invalid on lookup failure or on every other
+/// platform. The walk itself (`sum_block_storage_stats`/`read_driver_stats`) is
+/// file-private to dex_macos_perf.cpp — this is its only caller.
 YUZU_EXPORT DiskTotals read_disk_totals();
+
+#if defined(__APPLE__)
+/// TEST-ONLY seam pinning the file-private sum_block_storage_stats()'s
+/// genuinely-empty-iterator arm (zero drivers matched -> valid stays false)
+/// deterministically, via an IOKit service class guaranteed to match nothing —
+/// independent of the live driver population, which read_disk_totals()'s own caller
+/// (this box has real drivers) cannot control. Never used outside tests.
+YUZU_EXPORT DiskTotals sum_block_storage_stats_empty_iterator_for_test();
+#endif
 
 /// Darwin: one sysctlbyname("kern.memorystatus_level") read. nullopt on failure or on
 /// every other platform — the raw kernel scale (0..100), NOT yet reduced by

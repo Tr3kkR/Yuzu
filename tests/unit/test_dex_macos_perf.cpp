@@ -246,6 +246,15 @@ TEST_CASE("read_disk_totals reads real IOBlockStorageDriver counters", "[dex][ma
     CHECK(disk.reads > 0);
 }
 
+TEST_CASE("sum_block_storage_stats's empty-iterator arm reports invalid",
+          "[dex][macos][perf][darwin]") {
+    // Deterministic seam (governance Gate 3 SHOULD finding): a bogus IOKit service class
+    // matches nothing, independent of this box's real (non-empty) driver population, so
+    // the "zero drivers matched -> valid stays false" arm is pinned regardless of runner.
+    const auto out = sum_block_storage_stats_empty_iterator_for_test();
+    CHECK_FALSE(out.valid);
+}
+
 TEST_CASE("read_memorystatus_level reads a value in [0,100]", "[dex][macos][perf][darwin]") {
     const auto level = read_memorystatus_level();
     REQUIRE(level.has_value());
