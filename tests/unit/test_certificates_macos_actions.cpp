@@ -315,6 +315,14 @@ TEST_CASE("list: System.keychain empty -> header only, UNDECLARED/UNKNOWN, no pr
         WARN("certificates plugin library not found -- skipping");
         return;
     }
+    // list_certs_macos() unconditionally resolves the console user before
+    // touching any keychain (it needs to know whether store=login would be
+    // readable at all) -- without this override that resolution spawns a
+    // real /usr/bin/stat, which this file's own banner says never happens.
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
     TestKeychain kc;
     yuzu::test::ScopedEnv sys_override("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
                                        kc.path.string());
@@ -342,6 +350,10 @@ TEST_CASE("list: System.keychain permission-denied -> exactly one not_available 
         WARN("certificates plugin library not found -- skipping");
         return;
     }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
     TestKeychain kc;
     DeniedCopy denied(kc);
 
@@ -386,6 +398,10 @@ TEST_CASE("list: System.keychain with the real root cert -> exactly one data row
         WARN("certificates plugin library not found -- skipping");
         return;
     }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
     auto expected = real_root_cert();
     if (!expected) {
         WARN("could not read a real certificate from SystemRootCertificates.keychain -- "
@@ -418,6 +434,10 @@ TEST_CASE("details: real cert present in System.keychain -> the row, no status|n
         WARN("certificates plugin library not found -- skipping");
         return;
     }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
     auto expected = real_root_cert();
     if (!expected) {
         WARN("could not read a real certificate from SystemRootCertificates.keychain -- "
@@ -448,6 +468,10 @@ TEST_CASE("details: System.keychain permission-denied -> not_available, never st
         WARN("certificates plugin library not found -- skipping");
         return;
     }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
     TestKeychain kc;
     DeniedCopy denied(kc);
 
@@ -485,6 +509,10 @@ TEST_CASE("details: System.keychain empty -> status|not_found, UNDECLARED",
         WARN("certificates plugin library not found -- skipping");
         return;
     }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
     TestKeychain kc;
     yuzu::test::ScopedEnv sys_override("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
                                        kc.path.string());
