@@ -1076,7 +1076,7 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "A REST caller named a device target that resolved to nothing"
+          summary: "A dispatch-targeting or result-set-producer request was rejected - see description for the specific reason"
           description: >-
             yuzu_server_dispatch_target_rejected_total is non-zero on
             {{ $labels.route }} (reason={{ $labels.reason }}). A client supplied
