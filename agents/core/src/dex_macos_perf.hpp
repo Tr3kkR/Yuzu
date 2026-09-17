@@ -70,4 +70,10 @@ struct DiskTotals {
 /// counter regressed. Zero completed ops this interval derives 0.0 (idle, not slow).
 YUZU_EXPORT std::optional<double> disk_await_ms(const DiskTotals& prev, const DiskTotals& cur);
 
+/// PURE: memory pressure % from a raw kern.memorystatus_level reading (0 = critical
+/// pressure, 100 = plenty of headroom — the scale memory_pressure(1) itself reads).
+/// Pressure is the complement, clamped [0,100] so an out-of-range level (a future
+/// kernel revision, or a bad read) never produces a nonsensical negative/>100 value.
+YUZU_EXPORT double memory_pressure_pct(int level) noexcept;
+
 } // namespace yuzu::agent::macos

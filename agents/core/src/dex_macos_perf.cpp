@@ -58,4 +58,8 @@ std::optional<double> disk_await_ms(const DiskTotals& prev, const DiskTotals& cu
     return (static_cast<double>(dtime_ns) / 1e6) / static_cast<double>(dops);
 }
 
+double memory_pressure_pct(int level) noexcept {
+    return std::clamp(100.0 - static_cast<double>(level), 0.0, 100.0);
+}
+
 } // namespace yuzu::agent::macos
