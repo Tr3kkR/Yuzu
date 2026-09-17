@@ -121,25 +121,11 @@ private:
 // guarantee is scoped to TAR's own long-lived connection at ITS open time —
 // this plugin opens a fresh connection per dispatch and would otherwise
 // silently serve/sync rows from a file TAR itself has already rejected.
-// PRAGMA quick_check(1) trades the full cross-index consistency pass for
-// speed (appropriate here — this runs on every dispatch, not once at
-// process start) and stops at the first error rather than enumerating every
-// one; on a genuinely large/corrupt tar.db this still costs a scan, same as
-// any integrity check.
-bool quick_check_ok(sqlite3* db) {
-    sqlite3_stmt* stmt = nullptr;
-    bool ok = false;
-    if (sqlite3_prepare_v2(db, "PRAGMA quick_check(1)", -1, &stmt, nullptr) == SQLITE_OK) {
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-            ok = text && std::string_view{text} == "ok";
-        }
-    }
-    if (stmt)
-        sqlite3_finalize(stmt);
-    return ok;
-}
-
+// yuzu::app_usage::quick_check_ok (app_usage_parsers.hpp) trades the full
+// cross-index consistency pass for speed (appropriate here — this runs on
+// every dispatch, not once at process start) and stops at the first error
+// rather than enumerating every one; on a genuinely large/corrupt tar.db
+// this still costs a scan, same as any integrity check.
 DbHandle open_readonly(const fs::path& path, std::string& out_err) {
     sqlite3* db = nullptr;
     const int rc = sqlite3_open_v2(path.string().c_str(), &db,
@@ -152,7 +138,7 @@ DbHandle open_readonly(const fs::path& path, std::string& out_err) {
     }
     sqlite3_busy_timeout(db, 2000);
     sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
-    if (!quick_check_ok(db)) {
+    if (!yuzu::app_usage::quick_check_ok(db)) {
         out_err = "tar.db failed integrity quick_check";
         sqlite3_close(db);
         return DbHandle{};
@@ -234,6 +220,37 @@ UsageSourceCheck check_source_state(sqlite3* db, std::string_view config_key) {
     if (state == yuzu::app_usage::SourceState::Errored)
         check.reason = std::string{config_key} + "=" + yuzu::util::safe_output_field(cfg.value);
     return check;
+}
+
+// Writes the CONSTRAINED response for a gated (Disabled/Errored)
+// check_source_state result and returns true; returns false without writing
+// anything when state == Enabled, so the caller proceeds. Shared by all
+// three check_source_state call sites (do_summary_on's usage_enabled check,
+// do_last_used_on's usage_enabled check, do_last_used_on's usage_feeder_enabled
+// check) so the three can never drift out of the same Disabled/Errored shape
+// by hand-editing one and not the others — exactly the class of bug the
+// stale-comment fix earlier in this same round caught. Exactly one token per
+// path (#560 tri-state, adjudication P3 respec §3) — a single failure mode,
+// so no ConstraintAccumulator here (that composes genuinely multi-source
+// failures; see read_meta). Errored covers both a corrupted stored value AND
+// a failed tar_config prepare/step (check_source_state maps the latter to
+// Errored directly, fail-closed — never silently Enabled).
+bool report_if_gated(yuzu::CommandContext& ctx, const UsageSourceCheck& check,
+                     std::string_view disabled_reason, std::string_view disabled_token,
+                     std::string_view errored_token) {
+    if (check.state == yuzu::app_usage::SourceState::Disabled) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              disabled_reason);
+        ctx.write_output("constrained|" + std::string{disabled_token});
+        return true;
+    }
+    if (check.state == yuzu::app_usage::SourceState::Errored) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              check.reason);
+        ctx.write_output("constrained|" + std::string{errored_token} + "|" + check.reason);
+        return true;
+    }
+    return false;
 }
 
 const YuzuActionDescriptor kActionDescriptors[] = {
@@ -350,24 +367,9 @@ private:
 
     int do_summary_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
         const auto check = check_source_state(db, yuzu::app_usage::kConfigUsageEnabled);
-        if (check.state == yuzu::app_usage::SourceState::Disabled) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, "usage_enabled=false");
-            ctx.write_output("constrained|usage_source_disabled");
+        if (report_if_gated(ctx, check, "usage_enabled=false", "usage_source_disabled",
+                            "usage_source_errored"))
             return 0;
-        }
-        // Exactly one token on this path (#560 tri-state, adjudication P3
-        // respec §3) — a single failure mode, so no ConstraintAccumulator
-        // (that composes genuinely multi-source failures; see read_meta).
-        // Covers both a corrupted stored value AND a failed tar_config
-        // prepare/step (check_usage_source_state maps the latter to Errored
-        // directly, fail-closed — never silently Enabled).
-        if (check.state == yuzu::app_usage::SourceState::Errored) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, check.reason);
-            ctx.write_output("constrained|usage_source_errored|" + check.reason);
-            return 0;
-        }
         // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
         // distinguishes a genuine read failure (busy/corrupt) from the
         // legitimate "no such table" case -- a failure must not be
@@ -440,24 +442,9 @@ private:
 
     int do_last_used_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
         const auto check = check_source_state(db, yuzu::app_usage::kConfigUsageEnabled);
-        if (check.state == yuzu::app_usage::SourceState::Disabled) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, "usage_enabled=false");
-            ctx.write_output("constrained|usage_source_disabled");
+        if (report_if_gated(ctx, check, "usage_enabled=false", "usage_source_disabled",
+                            "usage_source_errored"))
             return 0;
-        }
-        // Exactly one token on this path (#560 tri-state, adjudication P3
-        // respec §3) — a single failure mode, so no ConstraintAccumulator
-        // (that composes genuinely multi-source failures; see read_meta).
-        // Covers both a corrupted stored value AND a failed tar_config
-        // prepare/step (check_source_state maps the latter to Errored
-        // directly, fail-closed — never silently Enabled).
-        if (check.state == yuzu::app_usage::SourceState::Errored) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, check.reason);
-            ctx.write_output("constrained|usage_source_errored|" + check.reason);
-            return 0;
-        }
         // Round-3 review blocker: `usage_feeder_enabled` gates the FOLD's
         // freshness, not merely the table's presence. TAR's own aggregator
         // (tar_usage.cpp) computes usage_feeder_enabled = (usage_on &&
@@ -473,19 +460,9 @@ private:
         // (server/core/src/app_usage_ingestion.cpp) once the window drains
         // past the last real data.
         const auto feeder_check = check_source_state(db, yuzu::app_usage::kConfigFeederEnabled);
-        if (feeder_check.state == yuzu::app_usage::SourceState::Disabled) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "usage_feeder_enabled=false");
-            ctx.write_output("constrained|usage_feeder_disabled");
+        if (report_if_gated(ctx, feeder_check, "usage_feeder_enabled=false",
+                            "usage_feeder_disabled", "usage_feeder_errored"))
             return 0;
-        }
-        if (feeder_check.state == yuzu::app_usage::SourceState::Errored) {
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
-                                  YUZU_RESULT_COMPLETENESS_PARTIAL, feeder_check.reason);
-            ctx.write_output("constrained|usage_feeder_errored|" + feeder_check.reason);
-            return 0;
-        }
         // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
         // distinguishes a genuine read failure (busy/corrupt) from the
         // legitimate "no such table" case -- a failure must not be

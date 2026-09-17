@@ -502,6 +502,27 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
     return std::unexpected(QueryError{sqlite3_errmsg(db)});
 }
 
+// Round-3 review finding (HIGH): a fresh per-dispatch sqlite3_open_v2 alone
+// never proves tar.db's integrity -- TarDatabase::open (tar_db.cpp) runs a
+// full PRAGMA integrity_check and quarantines/fails closed on a corrupt file
+// at ITS OWN open time, but that guarantee is scoped to TAR's own long-lived
+// connection; this plugin's own connection has none of it. PRAGMA
+// quick_check(1) trades the full cross-index consistency pass for speed
+// (this runs on every dispatch, not once at process start) and stops at the
+// first error rather than enumerating every one. Uses `detail::Stmt` (not a
+// hand-rolled prepare/finalize) so this joins the SQL boundary this header's
+// own file comment states -- app_usage_plugin.cpp's open_readonly only OPENS
+// the connection, it does not run SQL of its own.
+[[nodiscard]] inline bool quick_check_ok(sqlite3* db) {
+    detail::Stmt stmt{db, "PRAGMA quick_check(1)"};
+    if (!stmt)
+        return false;
+    if (sqlite3_step(stmt.get()) != SQLITE_ROW)
+        return false;
+    const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt.get(), 0));
+    return text != nullptr && std::string_view{text} == "ok";
+}
+
 // ─────────────────────────────────────────────────────────── formatting ───
 
 /// See format_usage_row's P5 / no-fixed-buffer note — identical treatment.

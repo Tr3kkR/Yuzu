@@ -282,6 +282,37 @@ TEST_CASE("parse: a constrained| line sets constrained and stops collecting rows
     }
 }
 
+// Governance Gate 2 finding (round-3 app_usage remediation): does the
+// plugin's NEW trailing `constrained|last_used_truncated|<cap>` marker (added
+// after exactly kMaxLastUsedRows=5000 real last_used| rows, when the plugin
+// hit its own cap) get parsed as a genuine `constrained` capture here and
+// discard all 5000 real rows? This parser's OWN loop condition
+// (`out.rows.size() < kMaxRecords`, kMaxRecords=5000, coincidentally the same
+// cap value as the plugin's) already terminates BEFORE the trailing marker
+// line is ever read, once exactly 5000 last_used| rows have been collected --
+// so the marker is provably unreachable by this parser in the boundary case
+// that matters (the plugin's cap and this parser's cap being equal). This
+// test locks that in: `constrained` stays false and all 5000 real rows
+// survive parsing (make_app_usage_source's own separate
+// `rows.size() >= kMaxRecords` guard then skips the cycle regardless --
+// pre-existing behaviour, unrelated to and unaffected by the new marker).
+TEST_CASE("parse: the plugin's trailing last_used_truncated marker, at exactly "
+         "the parser's own kMaxRecords boundary, is never reached -- all real "
+         "rows survive and constrained stays false",
+          "[app_usage_sync][parse][regression]") {
+    constexpr int kMaxRecords = 5000; // mirrors the file-local constant under test
+    std::string captured;
+    captured.reserve(static_cast<std::size_t>(kMaxRecords) * 40);
+    for (int i = 0; i < kMaxRecords; ++i) {
+        captured += "last_used|exe_" + std::to_string(i) + "|1700000000|1699000000|1|60\n";
+    }
+    captured += "constrained|last_used_truncated|5000\n";
+
+    AppUsageParse p = parse_app_usage_last_used_output(captured);
+    CHECK_FALSE(p.constrained);
+    CHECK(p.rows.size() == static_cast<std::size_t>(kMaxRecords));
+}
+
 // ── render: blob framing ─────────────────────────────────────────────────────
 
 TEST_CASE("render: leading cfg|scope|machine record, then sorted+deduped lu| records",

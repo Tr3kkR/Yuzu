@@ -613,11 +613,90 @@ TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check an
 
     // Same technique test_app_usage_parsers.cpp's usage_daily_table_exists
     // corruption test uses: sqlite3_open() succeeds lazily, so the failure
-    // only surfaces on the first real access -- exactly what quick_check_ok
-    // performs.
+    // only surfaces on the first real access. NOTE: this specific "not a
+    // valid sqlite file at all" byte sequence fails at sqlite3_prepare_v2
+    // itself (SQLITE_NOTADB) -- it never reaches quick_check_ok's own
+    // sqlite3_step/"ok"-text-comparison line, which is the ACTUAL new logic
+    // this round's HIGH finding added (mutation-testing this in isolation
+    // confirmed it: neutering the text=="ok" comparison does NOT redden this
+    // test). It still correctly proves the outer open_readonly failure path
+    // reports tar_db_unavailable/rc=1 for a garbage file, which is real
+    // coverage -- just not of quick_check's comparison logic. See the
+    // sibling test below for that.
     {
         std::ofstream f(data_dir / "tar.db", std::ios::binary | std::ios::trunc);
         f << "not a valid sqlite database file -- forces quick_check to fail closed";
+    }
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 1);
+    const auto rows = captured_rows(last_used.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fails "
+         "quick_check's own \"ok\"-text comparison, never a fabricated success -- "
+         "quality-engineer false-green finding, closes the gap the garbage-bytes "
+         "test above cannot reach",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_page_corrupt_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+    const fs::path db_path = data_dir / "tar.db";
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t today_ts = now - (now % kSecondsPerDay);
+
+    // Enough rows to push usage_daily past SQLite's default 4096-byte page 1
+    // -- corrupting page 1 alone (the schema/sqlite_master page) risks
+    // failing at open/prepare time same as the garbage-bytes test above,
+    // rather than reaching quick_check's per-page scan.
+    {
+        sqlite3* writer = nullptr;
+        REQUIRE(sqlite3_open(db_path.string().c_str(), &writer) == SQLITE_OK);
+        seed::exec_or_fail(writer, "PRAGMA journal_mode=DELETE"); // single-file, no -wal sidecar
+        seed::create_schema(writer);
+        seed::exec_or_fail(writer, "BEGIN");
+        for (int i = 0; i < 300; ++i) {
+            seed::insert_usage_daily(writer, today_ts, "exe_" + std::to_string(i), 1, 60, now, now,
+                                     0, 0);
+        }
+        seed::exec_or_fail(writer, "COMMIT");
+        sqlite3_close(writer);
+    }
+
+    const auto file_size = fs::file_size(db_path, ec);
+    REQUIRE_FALSE(ec);
+    REQUIRE(file_size > 8192); // at least a 3rd page exists to corrupt
+
+    {
+        std::fstream f(db_path, std::ios::binary | std::ios::in | std::ios::out);
+        REQUIRE(f.is_open());
+        // Page 3+ (0-indexed byte offset 8192) -- past the schema page (1)
+        // and comfortably into real table data, never the 100-byte file
+        // header sqlite3_open itself parses.
+        f.seekp(8192);
+        std::string garbage(256, '\xFF');
+        f.write(garbage.data(), static_cast<std::streamsize>(garbage.size()));
+        REQUIRE(f.good());
     }
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
