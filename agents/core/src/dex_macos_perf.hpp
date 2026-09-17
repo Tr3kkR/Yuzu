@@ -117,4 +117,9 @@ YUZU_EXPORT VmSnapshot read_vm_snapshot();
 YUZU_EXPORT DiskTotals sum_block_storage_stats(io_iterator_t it);
 #endif
 
+/// Darwin: IOServiceGetMatchingServices(kIOBlockStorageDriverClass) walked via
+/// sum_block_storage_stats(). All-invalid on failure (including the service lookup
+/// itself) or on every other platform.
+YUZU_EXPORT DiskTotals read_disk_totals();
+
 } // namespace yuzu::agent::macos

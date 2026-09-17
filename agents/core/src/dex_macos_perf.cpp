@@ -205,6 +205,20 @@ DiskTotals sum_block_storage_stats(io_iterator_t it) {
     return out;
 }
 
+DiskTotals read_disk_totals() {
+    io_iterator_t raw_it{};
+    if (IOServiceGetMatchingServices(kIOMainPortDefault,
+                                     IOServiceMatching(kIOBlockStorageDriverClass),
+                                     &raw_it) != KERN_SUCCESS)
+        return {};
+    ScopedIOObject it{raw_it};
+    return sum_block_storage_stats(it.get());
+}
+
+#else
+
+DiskTotals read_disk_totals() { return {}; }
+
 #endif // __APPLE__
 
 } // namespace yuzu::agent::macos
