@@ -857,7 +857,9 @@ elif host_machine.system() == 'linux'
   endif
 elif host_machine.system() == 'darwin'
   # tar_proc_es.cpp (compiled directly into this exe) → Endpoint Security client +
-  # audit-token helpers, gated on the framework being present (full Xcode SDK).
+  # audit-token helpers, gated on the ES SDK being present (lib+header pair,
+  # present in both the Command Line Tools SDK and the full Xcode SDK --
+  # "needs full Xcode" is a myth, see docs/darwin-compat.md's ES row).
   # The live client never starts in CI (unentitled) so the pure-mapping + clean-
   # fallback tests run regardless; the ES TU only links the framework where it
   # exists. Mirror the plugin's capability detection (docs/darwin-compat.md).

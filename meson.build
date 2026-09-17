@@ -371,18 +371,26 @@ if host_os == 'darwin'
   httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
 
   # ── Endpoint Security (shared probe, A0) ────────────────────────────────────
-  # EndpointSecurity.framework ships only with the full Xcode SDK -- the
-  # Command Line Tools SDK omits it -- so probe with required: false. This is
-  # the SINGLE probe for every ES consumer in the tree: TAR's process stream
-  # (tar_proc_es.cpp) and agent-core's pure ES helpers (es_client.hpp) both
-  # consume endpoint_security_dep/_deps/_args instead of probing independently
-  # (a shared full ES client lands in a later slice). Found: real ES client
-  # compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks; -fblocks because the ES
-  # client passes an Objective-C block literal to es_new_client, which Apple
-  # Clang does not enable by default for a .cpp TU) and libbsm links
-  # (audit_token_to_pid / audit_token_to_ruid). Absent: every consumer's
-  # #if-guarded no-op path is used instead -- see docs/darwin-compat.md's
-  # EndpointSecurity pitfalls-table row.
+  # CORRECTION (A0 governance fix round): EndpointSecurity is NOT an
+  # `.framework` bundle -- it ships as `usr/lib/libEndpointSecurity.tbd` +
+  # `usr/include/EndpointSecurity/` in BOTH the Command Line Tools SDK and the
+  # full Xcode SDK. The `dependency('appleframeworks', modules:
+  # ['EndpointSecurity'])` probe below therefore NEVER succeeds on any SDK --
+  # it always falls to the `else` branch below, so the real ES client never
+  # compiles today. The correct probe (`cxx.find_library('EndpointSecurity')`
+  # + `cxx.has_header('EndpointSecurity/EndpointSecurity.h')`) is a separate,
+  # deliberately isolated behaviour change -- see the follow-up slice
+  # (feat/macos-spark-a0.5-es-probe) rather than this comment-only fix. This
+  # is the SINGLE probe site for every ES consumer in the tree: TAR's process
+  # stream (tar_proc_es.cpp) and agent-core's pure ES helpers (es_client.hpp)
+  # both consume endpoint_security_dep/_deps/_args instead of probing
+  # independently (a shared full ES client lands in a later slice). Found:
+  # real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks; -fblocks
+  # because the ES client passes an Objective-C block literal to
+  # es_new_client, which Apple Clang does not enable by default for a .cpp
+  # TU) and libbsm links (audit_token_to_pid / audit_token_to_ruid). Absent:
+  # every consumer's #if-guarded no-op path is used instead -- see
+  # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
   endpoint_security_dep = dependency('appleframeworks', modules: ['EndpointSecurity'],
                                      required: false, include_type: 'system')
   endpoint_security_deps = []
@@ -392,7 +400,7 @@ if host_os == 'darwin'
     endpoint_security_deps += cxx.find_library('bsm')
     endpoint_security_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
   else
-    message('EndpointSecurity framework not found (full Xcode SDK required) -- '
+    message('EndpointSecurity SDK not found (no ES SDK found on this host) -- '
           + 'ES-dependent code compiles as a no-op on this host.')
   endif
 

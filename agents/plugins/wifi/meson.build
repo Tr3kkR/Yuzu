@@ -32,10 +32,14 @@ elif host_machine.system() == 'darwin'
   # ONCE at the top-level meson.build's `corefoundation_dep` site (`apple_objcpp_args`)
   # instead of here — this block only supplies what is genuinely wifi-specific:
   # its own .mm source and its own framework module list. CoreWLAN is a PUBLIC
-  # framework in the base macOS SDK (present with the Command Line Tools SDK,
-  # unlike EndpointSecurity), so this dependency() call is required: true — a
-  # failure here is a real problem, not a missing-full-Xcode fallback. See
-  # docs/darwin-compat.md and docs/native-objcpp-conventions.md.
+  # framework in the base macOS SDK (present with the Command Line Tools SDK),
+  # so this dependency() call is required: true — a failure here is a real
+  # toolchain problem, not an optional-capability fallback. (EndpointSecurity
+  # is NOT a counter-example of an SDK-gated framework — despite a long-
+  # standing myth, it ships lib+header in both SDKs too; its current
+  # required:false probe is a defect, not a legitimate full-Xcode gate — see
+  # docs/darwin-compat.md's EndpointSecurity row.) See docs/darwin-compat.md
+  # and docs/native-objcpp-conventions.md.
   wifi_sources += files('src/wifi_corewlan.mm')
   wifi_deps += dependency('appleframeworks', modules: ['CoreWLAN', 'Foundation'],
                           include_type: 'system')

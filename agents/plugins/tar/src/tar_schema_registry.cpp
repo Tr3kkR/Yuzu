@@ -37,11 +37,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
                 {"macos",   OsSupportStatus::kSupportedConstrained, "endpoint_security",
                  "Endpoint Security NOTIFY_EXEC/EXIT stream (gap-free, full image "
                  "path, accurate ppid, owning user from the audit token) where the "
-                 "framework + entitlement are present (full Xcode SDK build, "
-                 "com.apple.developer.endpoint-security.client, root). Falls back to "
-                 "the KERN_PROC_ALL sysctl poll otherwise. Names-only on BOTH paths "
-                 "— no command line (works-council posture); the poll blanks the "
-                 "proc_pidpath image it would otherwise place in cmdline."},
+                 "ES SDK was detected at build time and the entitlement + root are "
+                 "present at runtime (com.apple.developer.endpoint-security.client). "
+                 "Falls back to the KERN_PROC_ALL sysctl poll otherwise. Names-only "
+                 "on BOTH paths — no command line (works-council posture); the poll "
+                 "blanks the proc_pidpath image it would otherwise place in cmdline."},
             },
             .granularities = {
                 {
