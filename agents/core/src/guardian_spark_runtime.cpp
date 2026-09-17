@@ -2184,10 +2184,11 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                     // with an already-COMMITTED generation on another key - it
                     // never fires here, because neither claim has reached
                     // rules_ yet, both are still just wedged. Noexcept (map
-                    // find + weak_ptr::lock() + a bool comparison, no
-                    // allocation), so safe to run unconditionally BEFORE the
-                    // fallible insert below - correct regardless of whether
-                    // that insert then succeeds or throws.
+                    // find + weak_ptr::lock() + a shared_ptr identity
+                    // comparison + a bool write, no allocation), so safe to
+                    // run unconditionally BEFORE the fallible insert below -
+                    // correct regardless of whether that insert then succeeds
+                    // or throws.
                     if (const auto wit = wedged_by_rule_.find(rule_id);
                         wit != wedged_by_rule_.end()) {
                         if (const auto orphaned = wit->second.lock();

@@ -8902,12 +8902,21 @@ TEST_CASE("External review (PR #4485, fjarvis): a THIRD, still-wedged claim for 
     CHECK(res_again_a->receipt.claim == res_a->receipt.claim); // re-observes the SAME key-A claim
     CHECK(rt->wedged_reobservations() >= 1);
 
-    // Withdraw r1. The ordinary wedge lookup finds and deactivates whatever
-    // wedged_by_rule_["r1"] currently names - post-fix, that is STILL claim B
-    // (the fix must not have let the restore branch's overwrite silently drop
-    // it); pre-fix, it is claim A (the restore branch's overwrite already
-    // clobbered claim B's entry), leaving claim B's own rg->active untouched and
-    // permanently stuck true.
+    // Withdraw r1. Corrected (governance, 4 independent reviewers - cpp-expert/
+    // quality-engineer/architect/docs-writer): the restore branch's own
+    // insert_or_assign(rule_id, pre_head) a few lines above is UNCONDITIONAL in
+    // BOTH pre-fix and post-fix code, so wedged_by_rule_["r1"] already names claim
+    // A again by this point either way - this call's ordinary wedge lookup finds
+    // and deactivates claim A in both variants, not claim B. What the fix actually
+    // changes is NOT which claim this withdrawal reaches through the map; it is
+    // whether claim B's own rg->active was already set false, IN PLACE, by the
+    // guard immediately above, BEFORE that unconditional overwrite ran. Pre-fix
+    // (no guard), the overwrite clobbers claim B's entry with no prior write to
+    // its rg->active, leaving it permanently stuck true and unreachable by any
+    // future withdrawal, including this one. Post-fix, claim B's rg->active is
+    // already false by the time the overwrite happens, independent of the map
+    // entry it loses - so this withdrawal's own effect on claim A is unchanged by
+    // the fix; what changed already happened.
     rt->detach_rule("r1");
 
     // Release every parked backend call at once - both claim A's and claim B's
