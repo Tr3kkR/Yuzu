@@ -670,6 +670,122 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a Wedged receipt (timed out whi
     CHECK(failed_out2 == 0);
 }
 
+TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a Wedged "
+          "receipt's arm-failed contribution clears once the runtime ADOPTS its late "
+          "success, without touching the cumulative fleet-visible failed_out counter",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 1);
+    ledger.add_pending("r1", receipt);
+
+    // First drain: resolves Wedged as an ordinary failure, exactly like the sibling
+    // test above - AND retains the receipt in failed_receipts (concern 2's own new
+    // bookkeeping), since Wedged is the one status a later runtime adoption can
+    // retroactively recover.
+    std::size_t failed_out = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 1);
+    CHECK(failed_out == 1);
+    CHECK(ledger.failed_receipt_count_for_test() == 1);
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+    }
+    CHECK_FALSE(ledger.can_advance());
+
+    // Nobody withdrew "r1" - releasing the parked backend call now delivers a late
+    // success the runtime ADOPTS (rung 9c PR-5d concern 1), not disarms.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // sticky
+
+    // Second drain: the recovery scan notices the adoption via receipt_recovered()
+    // and clears this rule's own resolved_failed contribution - failed_out (the
+    // cumulative fleet-visible counter) does NOT move, since this is a recovery,
+    // not a new failure.
+    std::size_t failed_out2 = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0); // nothing NEW resolved
+    CHECK(failed_out2 == 0);
+    CHECK(ledger.failed_receipt_count_for_test() == 0);
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 0);
+    }
+    CHECK(ledger.can_advance()); // recovered - nothing left blocking this application
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 - a Wedged receipt that is "
+          "later WITHDRAWN (never adopted) never recovers - failed_receipts retains it "
+          "and resolved_failed never clears",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, "content", false, 1);
+    ledger.add_pending("r1", receipt);
+    std::size_t failed_out = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out) == 1);
+    CHECK(ledger.failed_receipt_count_for_test() == 1);
+
+    // The operator withdraws "r1" while it is still wedged.
+    rt->detach_rule("r1");
+
+    // Late success for a no-longer-desired rule -> disarmed, not adopted. This
+    // file's own minimal FakeBackend does not count disarms (its disarm() is a
+    // plain no-op override) - the claim actually leaving the runtime's own queue
+    // is the observable signal here.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0; },
+        std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 0);
+
+    std::size_t failed_out2 = 0;
+    CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0);
+    CHECK(failed_out2 == 0);
+    // Never recovered: receipt_recovered() requires rules_ to carry this exact
+    // (rule_id, generation), which withdrawal never installs.
+    CHECK(ledger.failed_receipt_count_for_test() == 1);
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+    }
+    CHECK_FALSE(ledger.can_advance());
+}
+
 TEST_CASE("receipt_status_name(): every ReceiptStatus renders a distinct, correct "
           "name - the mapping drain_locked()'s async-failure warn line depends on",
           "[spark][ack]") {

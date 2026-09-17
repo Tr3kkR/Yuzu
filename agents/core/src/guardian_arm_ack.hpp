@@ -206,6 +206,13 @@ public:
     /// caller.
     std::size_t pending_count_for_test() const;
 
+    /// TEST-ONLY: the current application's retained-Wedged-failure count (0 if
+    /// there is no current application) - see Application::failed_receipts and
+    /// drain_locked()'s own arm-recovery scan (rung 9c PR-5d, concern 2). Lets a
+    /// test settle on "the recovery scan has cleared every rule it is going to"
+    /// without a production accessor. No production caller.
+    std::size_t failed_receipt_count_for_test() const;
+
     /// TEST-ONLY: every non-Committed ReceiptStatus this application's receipts
     /// have resolved to via drain_locked() - i.e. the same failure-group values
     /// receipt_status_name() would render into the log line this accessor
@@ -306,6 +313,19 @@ private:
         std::size_t resolved_failed{0};
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> pending;
         std::vector<GuardianSparkRuntime::ReceiptStatus> resolved_statuses_for_test;
+        /// rung 9c PR-5d (concern 2, arm-recovery): rule_id -> the receipt drain_
+        /// locked() resolved to Wedged, retained (NOT the other failure statuses -
+        /// nothing else can spontaneously become committed later) so a LATER
+        /// drain_locked() call can notice via GuardianSparkRuntime::
+        /// receipt_recovered() that the runtime has since adopted it (rung 9c
+        /// PR-5d's own concern 1) and clear its contribution to resolved_failed -
+        /// scoped to THIS application's own bookkeeping only: begin_application()/
+        /// retire() replace `current_` wholesale (see the file header), so a
+        /// receipt whose application was superseded before recovering is simply
+        /// gone, same as every other per-application field here. This is NOT the
+        /// durable, cross-application "last known outcome for every currently-
+        /// desired rule" gauge - that is 5e's job.
+        std::map<std::string, GuardianSparkRuntime::ArmReceipt> failed_receipts;
     };
     std::unique_ptr<Application> current_;
 };
