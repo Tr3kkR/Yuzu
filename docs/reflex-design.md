@@ -447,6 +447,31 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
 - Deliberately deferred to the works-council enablement backlog (not omissions): per-category
   collection toggle, an individual-view kill switch, pseudonymization.
 
+## HA — background-job classification and readiness
+
+Reflex introduces four pieces of server background work; each gets an explicit
+`BackgroundJobClass` (`server/core/src/background_jobs.hpp` — the live per-surface registry the
+Fenced-leader-election routed concern requires every loop to consult, **never a second
+"which loops are leader-only" list**):
+
+| Loop | `BackgroundJobClass` | Why |
+|---|---|---|
+| `reflex_outcomes` TTL sweep (R10) | `FencedLeaderOnly` | A bulk delete — needs the ADR-0012 advisory-locked SHARED clock/dedup rows on Postgres per `docs/clock-guarded-retention.md`'s single-writer rule, exactly like every other clock-guarded reaper. |
+| Compile + `push_sets` dispatch (R9) | leader-only | Two replicas independently pushing *different* generations of a dangerous Reflex Set to the same agent is a double-dispatch risk on a destructive surface — the same class of hazard the Fenced-leader-election concern exists to prevent for deployment/quarantine/policy-remediation. |
+| `get_status` reconcile-on-heartbeat (R9) | per-replica | Read-only census refresh; safe for every replica to do independently (mirrors `PolicyEvaluator::collect_ready`'s per-replica classification, not its leader-gated `dispatch_due`). |
+| Fleet-metric delta tracking (R13) | per-replica, with the double-count rule stated at R13 | Each replica computes its own last-seen delta; R13 must state how a multi-replica deployment avoids double-counting a delta two replicas both observe. |
+
+**Both new Postgres stores join the server's `/readyz` conjunction** — `ReflexSetStore` (R3) and the
+`reflex_outcomes` table (R10, inside the same store) are not readiness-invisible; a degraded Reflex
+store must surface the same way every other `stores_ok` component does.
+
+**Bounded resource shape, per agent:** a **ceiling on Reflexes-armed-per-agent** (distinct from the
+existing ≤ 32-reflexes-per-*set* bound — an agent can have several sets deployed at once), a
+**bounded per-agent Reflex job queue**, and a **stated drop policy** (oldest-first, matching the
+existing `queue_dropped` counter's semantics) are all required — with a 2-worker pool and Reactions
+up to 4 × 120 s each, many simultaneously-armed sets firing near-together can otherwise hold a
+worker for minutes with no defined behavior for what happens to the rest of the queue.
+
 ## Observability — tags, metrics, audit verbs (reserved vocabulary; R8/R13 implement)
 
 Heartbeat tags (composed by `reflex_heartbeat.hpp`, R8): `yuzu.reflex_running`,
@@ -456,8 +481,14 @@ when `--reflex-disable`; sparse per-reflex counters omitted (not zeroed) when un
 Fleet Prometheus families (R13): gauges
 `yuzu_fleet_reflex_{reporting,disabled,sets_armed,unsupported}{os}`; counters
 `yuzu_fleet_reflex_{fired,completed,failed,timeouts,queue_dropped,events_missed}_total{os}`
-(server-held, last-seen-delta with reset detection, mirroring `spark_fleet_tags.hpp`'s pinned-pair
-pattern); server-side `yuzu_server_reflex_{deploy,compile_refused}_total` pre-seeded labels.
+(server-held, last-seen-delta with reset detection — a genuinely new fleet-metric shape this
+document introduces, not a precedented one; R13 documents it in
+`docs/observability-conventions.md` alongside landing it, since neither of that doc's two existing
+fleet-gauge shapes covers a server-held delta counter); server-side
+`yuzu_server_reflex_{deploy,compile_refused}_total` pre-seeded labels. **R13 reserves a
+`yuzu-reflex` alert group** (`docs/prometheus/yuzu-alerts.yml`) covering `compile_refused` (page —
+every dangerous set fleet-wide going refused at once is a silent mass-disarm), `queue_dropped`,
+`events_missed`, and `unsupported`-vs-deployed drift — **no alert ships in R0 itself.**
 
 Audit verbs (R7/R9/R10): `reflex.set.{create,update,delete,deploy,undeploy,approval_required,
 compile_refused}`; `reflex.outcome.view` (per-device drill, ADR-0017 `authorize_list_read`
