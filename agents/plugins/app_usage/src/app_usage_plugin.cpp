@@ -11,20 +11,28 @@
  *                  window) plus a 30-day run_count/total_seconds window.
  *                  Optional `exe=<key>` param narrows to one executable
  *                  (normalised the same way tar_usage.hpp normalises
- *                  exe_key on write).
+ *                  exe_key on write); the unfiltered form is capped at
+ *                  kMaxLastUsedRows exe_keys (app_usage_parsers.hpp) and
+ *                  reports a trailing `constrained|last_used_truncated|<cap>`
+ *                  row if the cap was reached. Refuses to run at all
+ *                  (`constrained|usage_feeder_disabled`/`usage_feeder_errored`)
+ *                  when TAR's own fold is not actually advancing — see
+ *                  do_last_used_on's usage_feeder_enabled check.
  *   "foreground" — always CONSTRAINED, rc 0: per-session focus-time
  *                  attribution is not captured by this source (see
  *                  app_usage_parsers.hpp and app_usage.yaml).
  *
  * SEAM DECISION (see this package's spec): CommandContext (the type
  * execute() receives) has no get_config — only PluginContext (init()'s
- * argument) does, and no test ever runs a plugin's init(). So init()
- * caches `agent.data_dir` (same platform fallback as tar_plugin.cpp's
+ * argument) does, and most tests drive execute() directly without ever
+ * calling init() (test_app_usage_local_dispatcher.cpp's real-plugin case is
+ * the exception — it does call init() through StandalonePluginContext). So
+ * init() caches `agent.data_dir` (same platform fallback as tar_plugin.cpp's
  * init() applies when it is empty), and every execute() call re-resolves
  * `<dir>/tar.db` through resolve_db_dir(), which reapplies the identical
- * fallback when the cached value is still empty — i.e. when a test (or any
- * other caller) drives execute() directly without ever calling init(),
- * this plugin still finds the platform-default tar.db, not a null path.
+ * fallback when the cached value is still empty — i.e. when a caller drives
+ * execute() directly without ever calling init(), this plugin still finds
+ * the platform-default tar.db, not a null path.
  *
  * ALL SQL lives in app_usage_parsers.hpp, which takes an already-open
  * `sqlite3*` — this file only opens the connection (read-only, WAL-aware —
@@ -106,6 +114,32 @@ private:
 // is always WAL (tar_db.cpp:430); same process/user, so the -shm sidecar is
 // usable read-only. Returns an empty DbHandle and fills `out_err` on
 // failure; the returned handle owns the connection on success.
+//
+// Round-3 review finding (HIGH): sqlite3_open_v2 alone never proves tar.db's
+// integrity. TarDatabase::open (tar_db.cpp) runs a full PRAGMA
+// integrity_check and quarantines/fails closed on a corrupt file, but that
+// guarantee is scoped to TAR's own long-lived connection at ITS open time —
+// this plugin opens a fresh connection per dispatch and would otherwise
+// silently serve/sync rows from a file TAR itself has already rejected.
+// PRAGMA quick_check(1) trades the full cross-index consistency pass for
+// speed (appropriate here — this runs on every dispatch, not once at
+// process start) and stops at the first error rather than enumerating every
+// one; on a genuinely large/corrupt tar.db this still costs a scan, same as
+// any integrity check.
+bool quick_check_ok(sqlite3* db) {
+    sqlite3_stmt* stmt = nullptr;
+    bool ok = false;
+    if (sqlite3_prepare_v2(db, "PRAGMA quick_check(1)", -1, &stmt, nullptr) == SQLITE_OK) {
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            const auto* text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+            ok = text && std::string_view{text} == "ok";
+        }
+    }
+    if (stmt)
+        sqlite3_finalize(stmt);
+    return ok;
+}
+
 DbHandle open_readonly(const fs::path& path, std::string& out_err) {
     sqlite3* db = nullptr;
     const int rc = sqlite3_open_v2(path.string().c_str(), &db,
@@ -118,6 +152,11 @@ DbHandle open_readonly(const fs::path& path, std::string& out_err) {
     }
     sqlite3_busy_timeout(db, 2000);
     sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    if (!quick_check_ok(db)) {
+        out_err = "tar.db failed integrity quick_check";
+        sqlite3_close(db);
+        return DbHandle{};
+    }
     return DbHandle{db};
 }
 
@@ -170,20 +209,22 @@ ConfigReadResult get_tar_config(sqlite3* db, std::string_view key) {
     return out;
 }
 
-// Resolves the `usage_enabled` tri-state for both do_summary_on/do_last_used_on
-// (previously duplicated verbatim in each) — a genuine read failure is mapped
-// to SourceState::Errored HERE, directly, before source_state_from_config
-// ever sees it, so its nullopt->Enabled default (reserved for a genuinely
-// absent key) can never be reached by a failed prepare/step.
+// Resolves the tri-state for a named tar_config `<x>_enabled` key (shared by
+// the `usage_enabled` checks in both do_summary_on/do_last_used_on, and the
+// `usage_feeder_enabled` check added to do_last_used_on below) — a genuine
+// read failure is mapped to SourceState::Errored HERE, directly, before
+// source_state_from_config ever sees it, so its nullopt->Enabled default
+// (reserved for a genuinely absent key) can never be reached by a failed
+// prepare/step.
 struct UsageSourceCheck {
     yuzu::app_usage::SourceState state;
     std::string reason; // populated only when state == Errored
 };
 
-UsageSourceCheck check_usage_source_state(sqlite3* db) {
-    const auto cfg = get_tar_config(db, yuzu::app_usage::kConfigUsageEnabled);
+UsageSourceCheck check_source_state(sqlite3* db, std::string_view config_key) {
+    const auto cfg = get_tar_config(db, config_key);
     if (cfg.outcome == ConfigReadOutcome::kReadError)
-        return {yuzu::app_usage::SourceState::Errored, "usage_enabled=<read_error>"};
+        return {yuzu::app_usage::SourceState::Errored, std::string{config_key} + "=<read_error>"};
 
     const std::optional<std::string_view> stored =
         cfg.outcome == ConfigReadOutcome::kPresent ? std::optional<std::string_view>(cfg.value)
@@ -191,7 +232,7 @@ UsageSourceCheck check_usage_source_state(sqlite3* db) {
     const auto state = yuzu::app_usage::source_state_from_config(stored);
     UsageSourceCheck check{state, {}};
     if (state == yuzu::app_usage::SourceState::Errored)
-        check.reason = "usage_enabled=" + yuzu::util::safe_output_field(cfg.value);
+        check.reason = std::string{config_key} + "=" + yuzu::util::safe_output_field(cfg.value);
     return check;
 }
 
@@ -285,7 +326,7 @@ public:
 private:
     // No env-var/param override of the db path — an operator-supplied path
     // would be an arbitrary-file read (this package's spec, "boundaries").
-    // When init() never ran (every dispatcher test drives execute()
+    // When init() never ran (most dispatcher tests drive execute()
     // directly — see this file's header), data_dir_ is still empty here,
     // so the platform fallback is reapplied on every call.
     fs::path resolve_db_path() const {
@@ -308,7 +349,7 @@ private:
     }
 
     int do_summary_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
-        const auto check = check_usage_source_state(db);
+        const auto check = check_source_state(db, yuzu::app_usage::kConfigUsageEnabled);
         if (check.state == yuzu::app_usage::SourceState::Disabled) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, "usage_enabled=false");
@@ -398,7 +439,7 @@ private:
     }
 
     int do_last_used_on(yuzu::CommandContext& ctx, yuzu::Params& params, sqlite3* db) {
-        const auto check = check_usage_source_state(db);
+        const auto check = check_source_state(db, yuzu::app_usage::kConfigUsageEnabled);
         if (check.state == yuzu::app_usage::SourceState::Disabled) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, "usage_enabled=false");
@@ -409,12 +450,40 @@ private:
         // respec §3) — a single failure mode, so no ConstraintAccumulator
         // (that composes genuinely multi-source failures; see read_meta).
         // Covers both a corrupted stored value AND a failed tar_config
-        // prepare/step (check_usage_source_state maps the latter to Errored
+        // prepare/step (check_source_state maps the latter to Errored
         // directly, fail-closed — never silently Enabled).
         if (check.state == yuzu::app_usage::SourceState::Errored) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, check.reason);
             ctx.write_output("constrained|usage_source_errored|" + check.reason);
+            return 0;
+        }
+        // Round-3 review blocker: `usage_feeder_enabled` gates the FOLD's
+        // freshness, not merely the table's presence. TAR's own aggregator
+        // (tar_usage.cpp) computes usage_feeder_enabled = (usage_on &&
+        // process_on) and early-returns from the fold when either is off —
+        // i.e. TAR already knows and records "unable to observe" for this
+        // state, and this action was the only one that threw that signal
+        // away (do_summary_on surfaces it via format_meta_line's
+        // feeder_enabled field; this action has no meta row). Left
+        // unchecked, a feeder-dead source republishes a daily-changing slice
+        // of a FROZEN 30-day window (kLastUsedSqlAll) as OK/FULL forever,
+        // defeating the sync layer's hash-skip and eventually driving a real
+        // replace_agent_last_used wipe-to-empty
+        // (server/core/src/app_usage_ingestion.cpp) once the window drains
+        // past the last real data.
+        const auto feeder_check = check_source_state(db, yuzu::app_usage::kConfigFeederEnabled);
+        if (feeder_check.state == yuzu::app_usage::SourceState::Disabled) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "usage_feeder_enabled=false");
+            ctx.write_output("constrained|usage_feeder_disabled");
+            return 0;
+        }
+        if (feeder_check.state == yuzu::app_usage::SourceState::Errored) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL, feeder_check.reason);
+            ctx.write_output("constrained|usage_feeder_errored|" + feeder_check.reason);
             return 0;
         }
         // Governance Gate 7 round 2 (UP-1): usage_daily_table_exists now
@@ -458,7 +527,7 @@ private:
         const int64_t now = static_cast<int64_t>(std::time(nullptr));
         const int64_t since_30d_ts = align_to_day(now) - 29 * kSecondsPerDay;
 
-        const auto rows = yuzu::app_usage::run_last_used(db, exe, since_30d_ts);
+        auto rows = yuzu::app_usage::run_last_used(db, exe, since_30d_ts);
         if (!rows) {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE,
                                   YUZU_RESULT_COMPLETENESS_PARTIAL, rows.error().detail);
@@ -466,10 +535,26 @@ private:
             return 1;
         }
 
+        // run_last_used requests kMaxLastUsedRows+1 rows on the unfiltered
+        // (no `exe` param) path only, so the extra row is the truncation
+        // signal — round-3 review MEDIUM finding, see kMaxLastUsedRows.
+        const bool truncated =
+            !exe && rows->size() > static_cast<std::size_t>(yuzu::app_usage::kMaxLastUsedRows);
+        if (truncated)
+            rows->resize(static_cast<std::size_t>(yuzu::app_usage::kMaxLastUsedRows));
+
         for (const auto& row : *rows)
             ctx.write_output(yuzu::app_usage::format_last_used_row(row));
 
-        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+        if (truncated) {
+            ctx.write_output("constrained|last_used_truncated|" +
+                             std::to_string(yuzu::app_usage::kMaxLastUsedRows));
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                  YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "row cap reached, see last_used_truncated");
+        } else {
+            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+        }
         return 0;
     }
 

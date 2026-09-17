@@ -229,11 +229,20 @@ inline constexpr std::string_view kDistinctUsersSql =
 inline constexpr std::string_view kOpenRunsSql = "SELECT COUNT(*) FROM usage_live";
 inline constexpr std::string_view kUsageDailyExistsSql =
     "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_daily'";
+// A local unprivileged user can create unboundedly many distinct exe_keys
+// (each uniquely-named binary earns its own GROUP BY row in usage_daily),
+// and this query has no window filter on the GROUP BY dimension itself —
+// round-3 review finding (MEDIUM): an unprivileged-to-privileged resource
+// exhaustion path, since the agent reading this runs as LocalSystem/root.
+// Capped at kMaxLastUsedRows; run_last_used requests one extra row so the
+// shell can detect truncation without a second COUNT(*) query.
+inline constexpr int64_t kMaxLastUsedRows = 5000;
+
 inline constexpr std::string_view kLastUsedSqlAll =
     "SELECT exe_key, MAX(last_seen), MIN(first_seen), "
     "SUM(CASE WHEN day_ts >= ? THEN run_count ELSE 0 END), "
     "SUM(CASE WHEN day_ts >= ? THEN total_seconds ELSE 0 END) "
-    "FROM usage_daily GROUP BY exe_key ORDER BY exe_key";
+    "FROM usage_daily GROUP BY exe_key ORDER BY exe_key LIMIT ?";
 inline constexpr std::string_view kLastUsedSqlOne =
     "SELECT exe_key, MAX(last_seen), MIN(first_seen), "
     "SUM(CASE WHEN day_ts >= ? THEN run_count ELSE 0 END), "
@@ -446,9 +455,12 @@ run_last_used(sqlite3* db, std::optional<std::string_view> exe, int64_t since_30
         return std::unexpected(QueryError{sqlite3_errmsg(db)});
     sqlite3_bind_int64(stmt.get(), 1, since_30d_ts);
     sqlite3_bind_int64(stmt.get(), 2, since_30d_ts);
-    if (normalised_exe)
+    if (normalised_exe) {
         sqlite3_bind_text(stmt.get(), 3, normalised_exe->c_str(),
                           static_cast<int>(normalised_exe->size()), SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_int64(stmt.get(), 3, kMaxLastUsedRows + 1);
+    }
 
     int rc;
     while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {

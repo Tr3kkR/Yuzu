@@ -28,6 +28,7 @@
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
+#include "app_usage_parsers.hpp"
 #include "app_usage_test_seed.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
@@ -36,6 +37,7 @@
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <sqlite3.h>
 #include <sstream>
@@ -430,6 +432,203 @@ TEST_CASE("app_usage plugin: last_used with exe=\"\" returns every executable, m
     }
     CHECK(saw_a);
     CHECK(saw_b);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+// ── round-3 review blocker: last_used must refuse a feeder-dead source ─────
+
+TEST_CASE("app_usage plugin: last_used with usage_feeder_enabled=false reports "
+         "constrained|usage_feeder_disabled, never a real (stale) row -- round-3 review "
+         "blocker regression",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_feeder_disabled_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t today_ts = now - (now % kSecondsPerDay);
+
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer);
+    // A real, otherwise-valid row -- if the feeder check did nothing, this
+    // row would come back as a normal last_used| result.
+    seed::insert_usage_daily(writer, today_ts, "frozen.exe", 1, 60, now, now, 0, 0);
+    seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_tar_config(writer, "usage_feeder_enabled", "false");
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 0);
+    const auto rows = captured_rows(last_used.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front() == "constrained|usage_feeder_disabled");
+
+    // summary is NOT gated the same way -- it surfaces feeder_enabled via
+    // its own meta| row instead of refusing to run.
+    const auto summary = dispatcher.run(plugin->descriptor, "summary");
+    CHECK(summary.rc == 0);
+    const auto summary_rows = captured_rows(summary.captured);
+    REQUIRE_FALSE(summary_rows.empty());
+    CHECK(summary_rows.front().find("feeder_enabled|0") != std::string::npos);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+TEST_CASE("app_usage plugin: last_used with a garbage usage_feeder_enabled value reports "
+         "constrained|usage_feeder_errored, never silently Enabled",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_feeder_errored_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer);
+    seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_tar_config(writer, "usage_feeder_enabled", "corrupted-value");
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 0);
+    const auto rows = captured_rows(last_used.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().rfind("constrained|usage_feeder_errored|", 0) == 0);
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+// ── round-3 review MEDIUM: last_used's unfiltered form must be bounded ─────
+
+TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and reports "
+         "a trailing last_used_truncated row -- round-3 review resource-exhaustion regression",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_truncate_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t today_ts = now - (now % kSecondsPerDay);
+
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer);
+    const auto over_cap =
+        static_cast<int64_t>(yuzu::app_usage::kMaxLastUsedRows) + 5;
+    // One transaction for all ~5000 rows -- insert_usage_daily autocommits
+    // per call otherwise, which would fsync the WAL thousands of times and
+    // make this the slowest test in the suite for no reason.
+    seed::exec_or_fail(writer, "BEGIN");
+    for (int64_t i = 0; i < over_cap; ++i) {
+        seed::insert_usage_daily(writer, today_ts, "exe_" + std::to_string(i), 1, 60, now, now, 0,
+                                 0);
+    }
+    seed::exec_or_fail(writer, "COMMIT");
+    seed::insert_tar_config(writer, "usage_enabled", "true");
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 0);
+    const auto rows = captured_rows(last_used.captured);
+    // kMaxLastUsedRows real rows plus exactly one trailing truncation marker.
+    REQUIRE(rows.size() == yuzu::app_usage::kMaxLastUsedRows + 1);
+    std::size_t real_rows = 0;
+    for (std::size_t i = 0; i < rows.size() - 1; ++i) {
+        REQUIRE(rows[i].rfind("last_used|", 0) == 0);
+        ++real_rows;
+    }
+    CHECK(real_rows == static_cast<std::size_t>(yuzu::app_usage::kMaxLastUsedRows));
+    CHECK(rows.back() ==
+         "constrained|last_used_truncated|" + std::to_string(yuzu::app_usage::kMaxLastUsedRows));
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
+// ── round-3 review HIGH: a corrupt tar.db must never be silently served ────
+
+TEST_CASE("app_usage plugin: a corrupt tar.db fails the open-time quick_check and reports "
+         "constrained|tar_db_unavailable, rc 1, never a fabricated success",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_corrupt_db_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    // Same technique test_app_usage_parsers.cpp's usage_daily_table_exists
+    // corruption test uses: sqlite3_open() succeeds lazily, so the failure
+    // only surfaces on the first real access -- exactly what quick_check_ok
+    // performs.
+    {
+        std::ofstream f(data_dir / "tar.db", std::ios::binary | std::ios::trunc);
+        f << "not a valid sqlite database file -- forces quick_check to fail closed";
+    }
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 1);
+    const auto rows = captured_rows(last_used.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front().rfind("constrained|tar_db_unavailable|", 0) == 0);
 
     plugin->descriptor->shutdown(ctx.get());
 }

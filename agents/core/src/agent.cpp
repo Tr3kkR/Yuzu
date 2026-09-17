@@ -2153,7 +2153,7 @@ public:
                         spdlog::info("Daily-sync disabled (--inventory-disable / "
                                      "YUZU_AGENT_INVENTORY_DISABLE) — no inventory collected or "
                                      "pushed (sources: installed_software, app_perf, device_ci, "
-                                     "software_licensing)");
+                                     "software_licensing, app_usage)");
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);

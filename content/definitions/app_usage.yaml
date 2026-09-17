@@ -152,7 +152,12 @@ metadata:
     table. Optional `exe` parameter narrows the result to one executable,
     normalised with the same rule TAR uses to write exe_key (lowercased
     basename, trimmed). Machine scope only — no pid, cmdline, or user name
-    is ever surfaced.
+    is ever surfaced. Reports `constrained|usage_feeder_disabled` (or
+    `usage_feeder_errored`) instead of data when TAR's own usage fold is not
+    actually advancing (its process or usage collector is off), since this
+    action has no separate health row to carry that signal. The unfiltered
+    form is capped at 5000 executables and appends a trailing
+    `constrained|last_used_truncated|<cap>` row if the cap was reached.
   tags: [forensics, usage, inventory]
 
 spec:

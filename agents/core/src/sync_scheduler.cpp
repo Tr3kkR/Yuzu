@@ -203,14 +203,14 @@ std::chrono::seconds SyncScheduler::tick(std::int64_t now_secs) {
     // fast forced source (device_ci/app_perf/licensing) wait behind a slow
     // one's collect() (installed_software's macOS system_profiler scan can run
     // several seconds) whenever more than one source was forced at once (the
-    // header "Sync now" forces ALL FOUR via kAllSources). `handled` excludes
+    // header "Sync now" forces every source via kAllSources). `handled` excludes
     // these indices from the batch pass below regardless of outcome — a
     // forced source that fails here retries on the NEXT tick (its next_fire/
     // force_full were already persisted by drain_pending), never a second
     // attempt in the SAME tick via the batch path. Registration order in
     // agent.cpp decides processing order here (forced indices come out of
     // drain_pending in ascending source-index order) — installed_software
-    // registers LAST so a "sync all" reports the three fast sources back to
+    // registers LAST so a "sync all" reports the four fast sources back to
     // the server before starting the slow one.
     std::vector<bool> handled(sources_.size(), false);
     for (std::size_t i : forced) {

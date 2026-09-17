@@ -467,7 +467,7 @@ whose ingest is failing. Four further series sharpen the picture:
   a cold-cache `need_full` herd.
 - `yuzu_inventory_read_degrade_total{reason, source}` (counter, reason ∈ `store_not_open` /
   `pool_acquire_timeout` / `query_error`; source ∈ `installed_software` / `device_ci` /
-  `software_licensing` / `product_registry` / `generic`) — an
+  `software_licensing` / `product_registry` / `app_usage` / `generic`) — an
   **authoritative read** that returned
   a degrade (no data) rather than a silent empty. `/readyz` stays green under pure
   pool saturation, so without this counter a degraded fleet software query is
@@ -589,6 +589,31 @@ sync, defeating the hash-skip protocol.
 The operator-facing read surface — the **Hardware** list's CI columns and the CI
 record's **Overview** lens — is live; see the **`/hardware`** bullet above for its
 columns, fields, and audit/degrade posture.
+
+## App usage inventory (`app_usage`)
+
+A further daily-sync source, **`app_usage`**, is live on the agent and server. It
+derives machine-scope executable usage evidence read-only from TAR's `usage` fold
+(`usage_daily`/`usage_daily_user`/`usage_live` inside `tar.db`) and persists it in
+the typed Postgres schema **`app_usage_store`**: per-executable run counts, total
+seconds, first/last-seen, and a distinct-user count over a 30-day sliding window.
+
+- **Scope / privacy.** No pid, command line, or user name is ever emitted —
+  `distinct_users` is a `COUNT(DISTINCT user)` only. Even so, executable names and
+  run times are a working-hours/presence proxy: a host whose interactive tools
+  cluster their usage in a narrow daily window says something about when its
+  operator is active, regardless of who that operator is — treat this source as
+  behaviorally sensitive. The same **`--inventory-disable`** flag suppresses
+  `app_usage` along with the other sources (it gates the whole daily-sync thread).
+- **Observability.** Ingest shares `yuzu_inventory_ingest_total{source="app_usage"}`
+  + `yuzu_inventory_ingest_duration_seconds{source="app_usage"}`; read degrades use
+  `yuzu_inventory_read_degrade_total{source="app_usage"}`.
+- **Read surface.** Unlike the sources above, `app_usage` is NOT exposed through
+  the generic inventory read endpoints — it is gated behind the **`Forensics`**
+  securable (`GET /api/v1/forensics/agents/{id}/app-usage` + MCP
+  `get_agent_app_usage`), scoped to the device and floored to Administrator under
+  RBAC-off. See `docs/authz-model.md` §4 and the `execution_artifacts`/`app_usage`
+  rows in `.claude/routed-concerns.md`.
 
 ## See also
 
