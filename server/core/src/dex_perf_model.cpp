@@ -334,6 +334,7 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
         r.cpu_pct = d.cpu_pct;
         r.commit_pct = d.commit_pct;
         r.disk_lat_ms = d.disk_lat_ms;
+        r.os = d.os;
         if (auto v = metric_value(d, metric))
             r.fleet_pctile = detail::percentile_rank(fleet_vals, *v);
         rows.push_back(std::move(r));

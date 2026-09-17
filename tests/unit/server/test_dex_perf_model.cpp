@@ -260,6 +260,22 @@ TEST_CASE("device_list: not-reporting complement is Windows-only", "[dex][perf][
     REQUIRE(rows.size() == 1); // the mac is not EXPECTED to report — not listed
     CHECK(rows[0].agent_id == "w-quiet");
     CHECK(rows[0].fleet_pctile == -1); // no value for the sort metric
+    CHECK(rows[0].os == "windows");
+}
+
+TEST_CASE("device_list: os field + not-reporting spans every collecting OS",
+          "[dex][perf][model][devices][os]") {
+    DexPerfSnapshot snap;
+    snap.devices.push_back(dev("w-quiet", std::nullopt, std::nullopt, std::nullopt, "", "windows"));
+    snap.devices.push_back(dev("l-quiet", std::nullopt, std::nullopt, std::nullopt, "", "linux"));
+    snap.devices.push_back(dev("mac", std::nullopt, std::nullopt, std::nullopt, "", "macos"));
+    auto rows = dex_perf_device_list(snap, DexPerfMetric::kCpu, true, std::nullopt, 50);
+    // Both windows and linux collect today (dex_perf_os_collects); macos does not.
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].agent_id == "l-quiet"); // sorted by agent_id
+    CHECK(rows[0].os == "linux");
+    CHECK(rows[1].agent_id == "w-quiet");
+    CHECK(rows[1].os == "windows");
 }
 
 TEST_CASE("metric token round-trip + unknown falls back to cpu", "[dex][perf][model]") {

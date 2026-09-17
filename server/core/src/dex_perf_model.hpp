@@ -160,6 +160,7 @@ struct DexPerfDeviceRow {
     std::optional<double> commit_pct;
     std::optional<double> disk_lat_ms;
     int fleet_pctile{-1};
+    std::string os; ///< normalized OS token (dex_perf_os_from_session); trailing, additive (C1)
 };
 
 /// Sort metrics for the devices drill. Anything else resolves to kCpu.
