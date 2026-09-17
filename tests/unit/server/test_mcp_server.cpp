@@ -7824,7 +7824,7 @@ yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     auto dev = [](std::string id, double cpu, const char* cohort) {
         yuzu::server::DexPerfDevice d;
         d.agent_id = std::move(id);
-        d.is_windows = true;
+        d.os = "windows";
         d.cpu_pct = cpu;
         d.commit_pct = 50.0;
         d.disk_lat_ms = 1.0;
