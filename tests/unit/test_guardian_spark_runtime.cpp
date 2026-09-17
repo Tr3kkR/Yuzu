@@ -8833,6 +8833,104 @@ TEST_CASE("Governance Gate 8 finding (rung 9c PR-5d /governance run): an ordinar
     CHECK(rt->armed_key_count() == 1);
 }
 
+TEST_CASE("External review (PR #4485, fjarvis): a THIRD, still-wedged claim for the "
+          "same rule_id on a DIFFERENT key is silently orphaned by a flip-flop-back "
+          "reobservation - wedged_by_rule_ is keyed by rule_id alone, so the "
+          "Reobserved-restore branch's insert_or_assign overwrites whatever claim "
+          "currently occupies that slot with no check for a live different one. "
+          "Distinct from the Gate 8 flip-flop test above: there, key B's arm "
+          "resolves immediately and commits rules_[\"r1\"] live, so the separate "
+          "rules_.contains guard in on_arm_complete already refuses the stale key-A "
+          "adoption. Here, key B's arm ALSO wedges before the return-to-A redeploy - "
+          "rules_ never gets an entry for \"r1\" at all, so that guard never fires, "
+          "and the ONLY thing that could have protected key B's claim is the "
+          "locator itself, which the restore branch's unconditional overwrite just "
+          "destroyed",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key_a = spark_key(file_spec("/a"));
+    const auto key_b = spark_key(file_spec("/b"));
+
+    // Wedge r1 on key A - its own backend arm() call hangs until release_hang()
+    // below, shared across every hang in this test (single-gate FakeBackend, one
+    // release wakes every still-parked call at once - exactly what this test
+    // wants, since all three claims must resolve together at the very end).
+    auto res_a = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                 file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res_a.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+    CHECK(rt->receipt_status(res_a->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->claim_queue_depth_for_test(key_a) == 1);
+
+    // Redeploy r1 to key B. detach_rule_locked("r1") correctly finds and
+    // deactivates claim A's rg->active via wedged_by_rule_ (matches the ordinary,
+    // already-tested single-collision case) - key A's own claim stays parked in
+    // its FIFO, untouched otherwise. The new key-B arm ALSO hangs (re-armed
+    // below) rather than resolving immediately - the whole point of this test is
+    // that key B never reaches rules_, so the separate rules_.contains guard
+    // cannot be the thing that saves it.
+    b->hang_next_arm.store(true);
+    auto res_b = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/b"),
+                                 file_exists_rule("r1"), true);
+    REQUIRE(res_b.has_value());
+    CHECK(rt->rule_count() == 0); // never committed - still just a claim, on either key
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1); // wedges key B's claim too
+    CHECK(rt->receipt_status(res_b->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->claim_queue_depth_for_test(key_b) == 1);
+
+    // Redeploy r1 BACK to key A - identical (rule_id, spec) to the still-wedged,
+    // still-parked key-A claim. Hits the hoisted Reobserved-restore branch
+    // exactly like the Gate 8 flip-flop test above, EXCEPT this time
+    // wedged_by_rule_["r1"] currently names claim B (set when it wedged, above),
+    // not nothing and not a stale entry - a genuinely live, still-parked claim on
+    // a different key is about to be overwritten.
+    auto res_again_a = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                       file_exists_rule("r1"), true);
+    REQUIRE(res_again_a.has_value());
+    CHECK(res_again_a->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(res_again_a->receipt.claim == res_a->receipt.claim); // re-observes the SAME key-A claim
+    CHECK(rt->wedged_reobservations() >= 1);
+
+    // Withdraw r1. The ordinary wedge lookup finds and deactivates whatever
+    // wedged_by_rule_["r1"] currently names - post-fix, that is STILL claim B
+    // (the fix must not have let the restore branch's overwrite silently drop
+    // it); pre-fix, it is claim A (the restore branch's overwrite already
+    // clobbered claim B's entry), leaving claim B's own rg->active untouched and
+    // permanently stuck true.
+    rt->detach_rule("r1");
+
+    // Release every parked backend call at once - both claim A's and claim B's
+    // arm() calls resolve to a late SUCCESS (FakeBackend's default outcome).
+    // r1 was withdrawn a moment ago: NEITHER should be adopted.
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() >= 2; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(rt->receipt_status(res_a->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->receipt_status(res_b->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // The runtime stays healthy afterward - a fresh attach on either key arms
+    // normally, proving neither key's index/subscription state was left corrupt
+    // by the orphaned-then-disarmed claim.
+    const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/b"), file_exists_rule("r-fresh"),
+                                           true);
+    REQUIRE(res_fresh.has_value());
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+}
+
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_id) "
           "onto a Wedged key is refused immediately, synchronously, with no new "
           "claim ever queued",

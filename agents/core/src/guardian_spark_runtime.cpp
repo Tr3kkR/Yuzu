@@ -2109,6 +2109,37 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 // false), so the NEXT reobservation attempt retries the insert
                 // instead of silently giving up.
                 if (pre_head->rg && !pre_head->rg->active) {
+                    // External review fix (PR #4485, fjarvis): wedged_by_rule_ is
+                    // keyed by rule_id ALONE, not (rule_id, key) - the SAME
+                    // rule_id can be wedged on two different keys at once (an
+                    // ordinary flip-flop redeploy: wedge on key A, redeploy to
+                    // key B, key B ALSO wedges before redeploying back to A).
+                    // Left unguarded, the insert_or_assign below silently
+                    // overwrites whatever claim currently occupies rule_id's
+                    // slot - orphaning a genuinely live, still-parked claim on
+                    // the other key with no way for a later real withdrawal to
+                    // ever find and deactivate it again (the map is the ONLY
+                    // reachable path to a waiter_abandoned claim). That claim's
+                    // eventual late success then reads rg->active==true forever
+                    // and is wrongly adopted, even past a real withdrawal - the
+                    // same fail-open defect class as the two prior fixes in this
+                    // same branch, at a third, structurally distinct site
+                    // (cross-key locator collision, not a single-site ordering
+                    // bug). Distinct from on_arm_complete's separate
+                    // rules_.contains guard: that one only catches a collision
+                    // with an already-COMMITTED generation on another key - it
+                    // never fires here, because neither claim has reached
+                    // rules_ yet, both are still just wedged. Noexcept (map
+                    // find + weak_ptr::lock() + a bool comparison, no
+                    // allocation), so safe to run unconditionally BEFORE the
+                    // fallible insert below - correct regardless of whether
+                    // that insert then succeeds or throws.
+                    if (const auto wit = wedged_by_rule_.find(rule_id);
+                        wit != wedged_by_rule_.end()) {
+                        if (const auto orphaned = wit->second.lock();
+                            orphaned && orphaned != pre_head && orphaned->rg)
+                            orphaned->rg->active = false;
+                    }
                     wedge_locator_fault_here_for_test(); // seam shared with
                                                           // abandon_claim_locked's
                                                           // own insert - see that
