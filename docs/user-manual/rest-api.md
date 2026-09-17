@@ -407,8 +407,8 @@ Fetch one device's identity.
 }
 ```
 
-`tags` is present only when a TagStore is configured; it is omitted entirely (never an empty
-array) when it is not. A device outside the caller's fleet-read scope returns the SAME 404 as a
+`tags` is always present (`[]` when the device has no tags, or in the never-hit-in-production case
+of an unwired TagStore). A device outside the caller's fleet-read scope returns the SAME 404 as a
 genuinely nonexistent `agent_id` — an out-of-scope match is never distinguishable from "does not
 exist" in the response body (matches the pre-existing MCP `get_agent_details` tool's
 existence-oracle closure exactly).

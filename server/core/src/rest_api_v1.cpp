@@ -1775,7 +1775,7 @@ void RestApiV1::register_routes(
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1792,7 +1792,7 @@ void RestApiV1::register_routes(
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn), std::move(verify_api));
+                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api));
 }
 
 void RestApiV1::register_routes(
@@ -1817,7 +1817,7 @@ void RestApiV1::register_routes(
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -7548,7 +7548,7 @@ void RestApiV1::register_routes(
     // contract (#4033 acceptance criteria, explicit). require_fleet_read
     // already audits every DENIAL path internally (`auth.fleet_read_required`).
     sink.Get("/api/v1/devices",
-             [fleet_read_fn, agents_fn](const httplib::Request& req, httplib::Response& res) {
+             [fleet_read_fn, device_api](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (!fleet_read_fn) {
@@ -7563,21 +7563,21 @@ void RestApiV1::register_routes(
                  auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
                  if (!gate.admitted)
                      return; // gate already wrote the A4 error body + status.
-                 if (!agents_fn) {
+                 if (!device_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 const auto agents = agents_fn();
+                 const auto devices = device_api->list_devices();
                  JArr arr;
                  std::size_t dropped = 0;
-                 for (const auto& a : agents) {
-                     if (!authz::in_scope(gate.scope, a.value("agent_id", ""))) {
+                 for (const auto& d : devices) {
+                     if (!authz::in_scope(gate.scope, d.agent_id)) {
                          ++dropped;
                          continue;
                      }
-                     arr.add_raw(device_agent_row_json(a).dump());
+                     arr.add_raw(device_agent_row_json(d).dump());
                  }
                  JObj data;
                  data.raw("devices", arr.str());
@@ -7596,13 +7596,18 @@ void RestApiV1::register_routes(
     // same BLOCKING defect its doc comment warns against), and an
     // out-of-scope agent_id collapses to the SAME "not found" response as a
     // genuinely nonexistent one — the existence-oracle closure this pattern
-    // exists for. The scan does NOT early-break on an out-of-scope match
-    // (scan-length symmetry — the #3564/Gate-8 timing-side-channel lesson):
-    // both !found sub-cases are indistinguishable in every caller-visible
-    // channel (response body AND scan length); the distinction is recorded
-    // ONLY server-side (spdlog), never audited with a caller-queryable
-    // detail string (get_agent_details' own #3564 fix note explains why a
-    // per-id audit detail string cannot safely carry it).
+    // exists for.
+    //
+    // ADR-0031 WS-A4 wave 2: `device_api->lookup_device(id)` is an O(1) point
+    // lookup (device_api.hpp's #3564 POINT-LOOKUP NOTE), called UNCONDITIONALLY
+    // before the scope check — the two not-found sub-cases now cost the same
+    // single lookup either way (replacing the old scan-the-whole-list-either-
+    // way symmetry). `in_scope` is then applied to the REQUESTED id — computed
+    // independently of what the lookup returned — so it governs disclosure for
+    // EVERY lookup outcome uniformly, including a degraded backing read: an
+    // out-of-scope id collapses to 404 even if the tag-store read for it would
+    // have degraded, never leaking "an agent with this id exists" via a 503
+    // during a store outage.
     //
     // NOT audited (neither success nor not-found): matches list's posture
     // above and the fragments' (`/fragments/device/page`,
@@ -7614,8 +7619,7 @@ void RestApiV1::register_routes(
     // emit_behavioral_audit, and take the fragments' unaudited posture as
     // the standard to match rather than MCP's.
     sink.Get(R"(/api/v1/devices/([^/]+))",
-             [fleet_read_fn, agents_fn, tag_store](const httplib::Request& req,
-                                                   httplib::Response& res) {
+             [fleet_read_fn, device_api](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (!fleet_read_fn) {
@@ -7631,50 +7635,41 @@ void RestApiV1::register_routes(
                  if (!gate.admitted)
                      return;
                  const std::string agent_id = req.matches[1].str();
-                 if (!agents_fn) {
+                 if (!device_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 const auto agents = agents_fn();
-                 bool found = false;
-                 bool exists_out_of_scope = false;
-                 nlohmann::json match;
-                 for (const auto& a : agents) {
-                     if (a.value("agent_id", "") != agent_id)
-                         continue;
-                     if (authz::in_scope(gate.scope, agent_id)) {
-                         match = a;
-                         found = true;
-                         break; // only the in-scope match short-circuits the scan.
+                 const bool in_scope = authz::in_scope(gate.scope, agent_id);
+                 auto result = device_api->lookup_device(agent_id);
+                 if (!result) { // DeviceReadError::kDegraded — the id resolves, tag-store read failed
+                     if (!in_scope) {
+                         spdlog::debug("devices.detail: degraded read for out-of-scope {} "
+                                       "(caller-visible response unchanged)",
+                                       agent_id);
+                         res.status = 404;
+                         res.set_content(
+                             detail::error_json_a4(404, "Device not found: " + agent_id, cid),
+                             "application/json");
+                         return;
                      }
-                     // Keep scanning — see the route's header comment on why an
-                     // out-of-scope match must not break here.
-                     exists_out_of_scope = true;
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
+                                     "application/json");
+                     return;
                  }
-                 if (!found) {
+                 if (!*result || !in_scope) {
                      spdlog::debug("devices.detail: {} for {} (caller-visible response unchanged)",
-                                   exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                                   (*result && !in_scope) ? "out-of-scope match" : "no match",
+                                   agent_id);
                      res.status = 404;
                      res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
                                      "application/json");
                      return;
                  }
-                 std::optional<std::vector<DeviceTag>> tags;
-                 if (tag_store) {
-                     auto t = tag_store->get_all_tags(agent_id);
-                     if (!t) {
-                         res.status = 503;
-                         res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
-                                         "application/json");
-                         return;
-                     }
-                     tags = std::move(*t);
-                 }
-                 res.set_content(
-                     ok_json(device_agent_detail_json(match, tags ? &*tags : nullptr).dump()),
-                     "application/json");
+                 res.set_content(ok_json(device_agent_detail_json(**result).dump()),
+                                 "application/json");
              });
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────

@@ -30,6 +30,7 @@
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
+#include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
@@ -881,7 +882,14 @@ public:
                             // polic* routes use, so all three surfaces can never
                             // disagree. Trailing optional dep; nullptr leaves those
                             // tools on the pre-seam "Policy store unavailable" degrade.
-                            std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
+                            std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                            // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API
+                            // seam — backs `list_agents`/`get_agent_details`. The SAME
+                            // instance `DeviceRoutes`/REST GET /api/v1/devices[/{id}]
+                            // use, so all three surfaces can never disagree. Trailing
+                            // optional dep; nullptr leaves both tools on the pre-seam
+                            // "internal error"/unwired degrade.
+                            std::shared_ptr<const DeviceApi> device_api = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -993,7 +1001,10 @@ public:
                          CaRoutes::ExportCsrFn export_csr_fn = {},
                          CaRoutes::ImportChainFn import_chain_fn = {},
                          // ADR-0031 WS-A4: see build_handler's doc comment above.
-                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -1054,7 +1065,10 @@ public:
                          CaRoutes::ExportCsrFn export_csr_fn = {},
                          CaRoutes::ImportChainFn import_chain_fn = {},
                          // ADR-0031 WS-A4: see build_handler's doc comment above.
-                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr);
+                         std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
+                         // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
+                         // forwarded to it for `list_agents`/`get_agent_details`.
+                         std::shared_ptr<const DeviceApi> device_api = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

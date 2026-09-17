@@ -55,6 +55,7 @@
 #include "scope_engine.hpp"
 #include "tag_store.hpp"
 #include "test_compliance_api_double.hpp" // ADR-0031 WS-A4: FnComplianceApi
+#include "test_device_api_double.hpp"
 #include "test_network_api_double.hpp"
 #include "test_verify_api_double.hpp"
 #include "workflow_engine.hpp" // #4030 Gate 8 fix: mcp_workflow_tpl / get_workflow_execution tests
@@ -1395,6 +1396,13 @@ private:
                                            {"arch", "x64"},
                                            {"agent_version", "0.1.3"}}});
         };
+        // ADR-0031 WS-A4 wave 2: list_agents/get_agent_details now source from
+        // DeviceApi instead of agents_fn directly — wrap the SAME mock data
+        // (copied before agents_fn is moved into build_handler below) so
+        // every pre-existing test in this file keeps seeing the identical two
+        // agents, byte-identical to the pre-rewire behaviour.
+        auto device_api_for_test =
+            std::make_shared<yuzu::server::test::JsonDeviceApi>(agents_fn);
 
         // #2384: the engine-credential store rides a setter, not a
         // build_handler param — wire before the handlers are built.
@@ -1580,7 +1588,8 @@ private:
             /*sw_deploy_store=*/sw_deploy_store_for_test,
             /*export_csr_fn=*/export_csr_fn_for_test,
             /*import_chain_fn=*/import_chain_fn_for_test,
-            /*compliance_api=*/compliance_api_for_test);
+            /*compliance_api=*/compliance_api_for_test,
+            /*device_api=*/device_api_for_test);
     }
 };
 

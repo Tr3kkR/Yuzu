@@ -5041,7 +5041,8 @@ McpServer::HandlerFn McpServer::build_handler(
     OffloadTargetStore* offload_target_store, LicenseStore* license_store,
     SoftwareDeploymentStore* sw_deploy_store, CaRoutes::ExportCsrFn export_csr_fn,
     CaRoutes::ImportChainFn import_chain_fn,
-    std::shared_ptr<const ComplianceApi> compliance_api) {
+    std::shared_ptr<const ComplianceApi> compliance_api,
+    std::shared_ptr<const DeviceApi> device_api) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -7495,15 +7496,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 if (!perm_fn(req, res, "Infrastructure", "Read"))
                     return;
-                const auto& agents = get_agents();
+                // ADR-0031 WS-A4 wave 2: sourced from the DeviceApi seam instead of
+                // the raw registry snapshot — BYTE-IDENTICAL gate/scope posture:
+                // still tier_allows + perm_fn ONLY, no scope filter at all (the
+                // known World-A confinement gap, #4041 — unconfined by design,
+                // tracked separately; do not "fix" it here).
+                std::vector<DeviceListRow> devices =
+                    device_api ? device_api->list_devices() : std::vector<DeviceListRow>{};
                 JArr arr;
-                for (const auto& a : agents) {
+                for (const auto& d : devices) {
                     arr.add(JObj()
-                                .add("agent_id", a.value("agent_id", ""))
-                                .add("hostname", a.value("hostname", ""))
-                                .add("os", a.value("os", ""))
-                                .add("arch", a.value("arch", ""))
-                                .add("agent_version", a.value("agent_version", "")));
+                                .add("agent_id", d.agent_id)
+                                .add("hostname", d.hostname)
+                                .add("os", d.os)
+                                .add("arch", d.arch)
+                                .add("agent_version", d.agent_version));
                 }
                 mcp_audit("success");
                 res.set_content(
@@ -7674,41 +7681,46 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                // Find agent in registry. An out-of-scope agent collapses to
-                // the SAME "not found" response as a genuinely nonexistent
-                // one (#1700) — the existence probe (hostname/os disclosure
-                // for an agent outside the caller's confinement) IS the
-                // vulnerability this migration closes, so the response must
-                // not distinguish "doesn't exist" from "exists, not yours".
-                const auto& agents = get_agents();
-                JObj agent_obj;
-                bool found = false;
-                bool exists_out_of_scope = false;
-                for (const auto& a : agents) {
-                    if (a.value("agent_id", "") != agent_id)
-                        continue;
-                    if (authz::in_scope(gate.scope, agent_id)) {
-                        agent_obj.add("agent_id", a.value("agent_id", ""))
-                            .add("hostname", a.value("hostname", ""))
-                            .add("os", a.value("os", ""))
-                            .add("arch", a.value("arch", ""))
-                            .add("agent_version", a.value("agent_version", ""));
-                        found = true;
-                        break; // only the in-scope match short-circuits the scan.
+                // ADR-0031 WS-A4 wave 2: an O(1) point lookup (device_api.hpp's
+                // #3564 POINT-LOOKUP NOTE) replaces the old full-registry scan.
+                // `in_scope` is computed on the REQUESTED id, independent of the
+                // lookup's outcome, and governs disclosure uniformly across
+                // EVERY outcome — miss, hit, or a degraded backing read — so an
+                // out-of-scope agent_id collapses to the SAME "not found"
+                // response as a genuinely nonexistent one (#1700) even during a
+                // tag-store outage (never leaking "an agent with this id
+                // exists" via the degraded branch). The existence probe
+                // (hostname/os disclosure for an agent outside the caller's
+                // confinement) IS the vulnerability this migration closes, so
+                // the response must not distinguish "doesn't exist" from
+                // "exists, not yours".
+                const bool in_scope = authz::in_scope(gate.scope, agent_id);
+                std::expected<std::optional<DeviceDetail>, DeviceReadError> result{
+                    std::optional<DeviceDetail>{std::nullopt}};
+                if (device_api) result = device_api->lookup_device(agent_id);
+                if (!result) { // DeviceReadError::kDegraded — resolves, tag-store read failed
+                    if (!in_scope) {
+                        // Gate 8 / #3564 lesson: the degraded branch must not
+                        // become a NEW existence oracle for an out-of-scope
+                        // caller — collapse to the identical denial as a
+                        // genuine miss, same audit detail string as below.
+                        spdlog::debug("get_agent_details: degraded read for out-of-scope {} "
+                                      "(caller-visible audit unchanged)",
+                                      agent_id);
+                        mcp_audit("denied",
+                                  "agent not found or outside caller's fleet-read scope: " +
+                                      agent_id);
+                        res.set_content(
+                            error_response(id, kInvalidParams, "Agent not found: " + agent_id),
+                            "application/json");
+                        return;
                     }
-                    // Gate 8 re-review finding: an out-of-scope match must NOT
-                    // break here -- doing so would let scan length itself
-                    // distinguish "exists, out of scope" (early break, at this
-                    // agent's position) from "genuinely nonexistent" (full
-                    // scan), a timing signal the ORIGINAL pre-#1700 loop never
-                    // had (it only ever broke on match-AND-in-scope, so an
-                    // out-of-scope match fell through and scanned to the end
-                    // exactly like a nonexistent one). Record the fact and
-                    // keep scanning so both !found sub-cases stay scan-length
-                    // symmetric, matching that original behavior.
-                    exists_out_of_scope = true;
+                    mcp_audit("failure", agent_id);
+                    res.set_content(error_response(id, kInternalError, "Tag store unavailable"),
+                                    "application/json");
+                    return;
                 }
-                if (!found) {
+                if (!*result || !in_scope) {
                     // #1700 / Gate 6 sre finding: the RESPONSE never
                     // distinguishes "genuinely nonexistent" from "exists,
                     // out of scope" (that collapse IS the fix), but the
@@ -7717,29 +7729,16 @@ McpServer::HandlerFn McpServer::build_handler(
                     // codebase, and the scope-drop half mirrors
                     // query_installed_software's "denied" audit row.
                     //
-                    // Gate 8 re-review found and fixed two timing side-
-                    // channels here (synchronous-audit-write asymmetry,
-                    // scan-length asymmetry) -- both closed by making the
-                    // audit call and the scan unconditional. #3564 (external
-                    // adversarial review, Codex) then found the detail
-                    // STRING itself was still the leak: query_audit_log is a
-                    // documented MCP tool gated only on flat AuditLog:Read
-                    // (carried by the seeded Operator/PlatformEngineer roles)
-                    // and echoes every event's `detail` field back verbatim
-                    // -- a caller holding AuditLog:Read could call this tool,
-                    // then query_audit_log(principal=self), and read back
-                    // which detail string her own event got, learning
-                    // existence directly with no timing analysis at all.
-                    // Unlike query_installed_software's "denied" row (a
-                    // COUNT, safe because it never confirms/denies one
-                    // specific caller-supplied id), a single-agent lookup's
-                    // detail string cannot safely distinguish the two
-                    // sub-cases in ANY caller-queryable channel. Both now
-                    // audit the IDENTICAL detail string; the distinction is
-                    // recorded ONLY server-side, in the log line below, which
-                    // no MCP tool exposes back to a caller.
+                    // #3564 (external adversarial review, Codex): the detail
+                    // STRING itself must not distinguish the two sub-cases in
+                    // ANY caller-queryable channel (query_audit_log echoes
+                    // `detail` back verbatim to any AuditLog:Read holder) —
+                    // both audit the IDENTICAL detail string; the distinction
+                    // is recorded ONLY server-side, in the log line below,
+                    // which no MCP tool exposes back to a caller.
                     spdlog::debug("get_agent_details: {} for {} (caller-visible audit unchanged)",
-                                  exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                                  (*result && !in_scope) ? "out-of-scope match" : "no match",
+                                  agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
                                             agent_id);
                     res.set_content(
@@ -7747,26 +7746,25 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                // Add tags. Degrade fails the whole tool call (ADR-0050) —
-                // an agentic caller acting on a silently-tagless agent
-                // record is the same mis-decision shape as a collapsed scope
-                // read; a null store (test/embedded config) still just omits
-                // tags.
-                if (tag_store) {
-                    auto tags = tag_store->get_all_tags(agent_id);
-                    if (!tags) {
-                        mcp_audit("failure", agent_id);
-                        res.set_content(
-                            error_response(id, kInternalError, "Tag store unavailable"),
-                            "application/json");
-                        return;
-                    }
-                    JArr tag_arr;
-                    for (const auto& t : *tags)
-                        tag_arr.add(
-                            JObj().add("key", t.key).add("value", t.value).add("source", t.source));
-                    agent_obj.raw("tags", tag_arr.str());
-                }
+                const auto& detail = **result;
+                JObj agent_obj;
+                agent_obj.add("agent_id", detail.row.agent_id)
+                    .add("hostname", detail.row.hostname)
+                    .add("os", detail.row.os)
+                    .add("arch", detail.row.arch)
+                    .add("agent_version", detail.row.agent_version);
+                // ADR-0031 WS-A4 wave 2: DeviceApi always returns a (possibly
+                // empty) tags vector — a null/unwired TagStore at the seam
+                // degrades to empty, not an omitted key (device_api_local.hpp's
+                // own doc comment on make_local_device_api) — so, unlike the
+                // pre-rewire version of this tool, "tags" is now ALWAYS present
+                // in the response, never omitted. Deliberate, already-committed
+                // (wave 1) seam decision, not a new one made here.
+                JArr tag_arr;
+                for (const auto& t : detail.tags)
+                    tag_arr.add(
+                        JObj().add("key", t.key).add("value", t.value).add("source", t.source));
+                agent_obj.raw("tags", tag_arr.str());
                 mcp_audit("success", agent_id);
                 res.set_content(
                     success_response(id, tool_result(agent_obj.str(), kObjectOutputSchema)),
@@ -23186,7 +23184,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 CaRoutes::ExportCsrFn export_csr_fn,
                                 CaRoutes::ImportChainFn import_chain_fn,
-                                std::shared_ptr<const ComplianceApi> compliance_api) {
+                                std::shared_ptr<const ComplianceApi> compliance_api,
+                                std::shared_ptr<const DeviceApi> device_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -23206,7 +23205,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(lockout_clear_fn), offload_target_store,
                     license_store, sw_deploy_store, std::move(export_csr_fn),
                     std::move(import_chain_fn),
-                    std::move(compliance_api));
+                    std::move(compliance_api), std::move(device_api));
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -23250,7 +23249,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 CaRoutes::ExportCsrFn export_csr_fn,
                                 CaRoutes::ImportChainFn import_chain_fn,
-                                std::shared_ptr<const ComplianceApi> compliance_api) {
+                                std::shared_ptr<const ComplianceApi> compliance_api,
+                                std::shared_ptr<const DeviceApi> device_api) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -23286,7 +23286,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(lockout_clear_fn),
                             offload_target_store, license_store, sw_deploy_store,
                             std::move(export_csr_fn), std::move(import_chain_fn),
-                            std::move(compliance_api)));
+                            std::move(compliance_api), std::move(device_api)));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).

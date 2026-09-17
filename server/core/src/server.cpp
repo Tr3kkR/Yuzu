@@ -180,6 +180,8 @@
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
 #include "device_routes.hpp"
+#include "device_lens_routes.hpp"
+#include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -15896,10 +15898,25 @@ private:
                     return make_device_row(a);
             return std::nullopt;
         };
+        // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam (identity/
+        // list data) — the SAME instance DeviceRoutes, REST GET /api/v1/devices[/{id}]
+        // and MCP list_agents/get_agent_details use, so all three surfaces can never
+        // disagree. `make_device_row`/`devices_fn`/`lookup_fn` above are NOT retired
+        // by this rewire — they are shared infrastructure with other live consumers
+        // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
+        // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
+        auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // Per-row/per-page DEX score — wraps dex_device_score against the SAME
+        // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
+        // itself already returns -1 on a null store, so no separate null-guard is
+        // needed here (matches the prior `if (store_) {...}` guard's net effect).
+        auto dex_score_fn = [this](const std::string& agent_id) -> int {
+            return dex_device_score(guaranteed_state_store_.get(), agent_id, dex_iso_since(7));
+        };
         device_routes_ = std::make_unique<DeviceRoutes>();
         device_routes_->register_routes(
-            *web_server_, auth_fn, perm_fn, scoped_perm_fn, devices_fn, lookup_fn,
-            guaranteed_state_store_.get(),
+            *web_server_, auth_fn, perm_fn, scoped_perm_fn, device_api, visible_set_fn,
+            dex_score_fn,
             // "Get live info" dispatches real read-only plugin instructions through the
             // shared chokepoint — the live-snapshot cards (processes/list_tree +
             // network_diag/connections, services/list, users/logged_on,
@@ -15934,6 +15951,13 @@ private:
                 return out;
             },
             audit_fn);
+
+        // DeviceLensRoutes — the DEX + Guardian device-page lenses, split out of
+        // DeviceRoutes (ADR-0031 WS-A4 wave 2, see device_lens_routes.hpp's own
+        // banner). Same store/scope/audit wiring the lenses had inside DeviceRoutes.
+        device_lens_routes_ = std::make_unique<DeviceLensRoutes>();
+        device_lens_routes_->register_routes(*web_server_, scoped_perm_fn,
+                                             guaranteed_state_store_.get(), audit_fn);
 
         // InventoryRoutes — /inventory: the SOFTWARE inventory list (fleet catalogue +
         // installs-per-version drill + find-by-name) over SoftwareInventoryStore, gated on
@@ -18072,7 +18096,11 @@ private:
             // ADR-0031 WS-A4 #4250: the SAME VerifyApi instance VerifyRoutes
             // above and the MCP compare_app_perf_versions tool below use, so
             // all three GET /api/v1/dex/perf/compare siblings never disagree.
-            verify_api);
+            verify_api,
+            // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
+            // above and MCP list_agents/get_agent_details below use, so all
+            // three GET /api/v1/devices[/{id}] siblings never disagree.
+            device_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18559,7 +18587,11 @@ private:
                 // and the REST /api/v1/compliance*+/api/v1/polic* twins use, so
                 // the six read tools + the yuzu://compliance/fleet resource +
                 // get_fleet_posture_fast never disagree with those siblings.
-                compliance_api);
+                compliance_api,
+                // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
+                // and REST GET /api/v1/devices[/{id}] use, so list_agents/
+                // get_agent_details never disagree with those siblings.
+                device_api);
         }
 
         // -- Listen -----------------------------------------------------------
@@ -19129,6 +19161,7 @@ private:
     std::unique_ptr<DexRoutes> dex_routes_;
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
+    std::unique_ptr<DeviceLensRoutes> device_lens_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
