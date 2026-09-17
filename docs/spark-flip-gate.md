@@ -395,6 +395,34 @@ flip, with a red-first test each:
   `wait_for_claim`): a re-push onto a wedged key queues behind the abandoned head and waits the
   full `backend_op_deadline` under engine `mtx_` on every re-apply; the base code fail-fasted via
   the executor's `AlreadyRunning`. Criterion: a wedged key refuses a new claim immediately.
+- **up-2 status (rung 9c PR-5c, #4221): CLOSED.** Closed via three pieces: a dispatching-window
+  race fix (`reclassify_dispatching_race_locked()`, both reachable call sites) preventing a
+  claim's terminal classification from being silently overwritten by a stale value when a
+  caller-side timeout raced `dispatch_arm_off_lock()`'s own admission decision; `ReceiptStatus::
+  Expired` split into `CongestionExpired` (timed out merely queued - ordinary backpressure) and
+  `Wedged` (timed out while dispatching/dispatched); and the actual closure, `AttachCoreState::
+  Reobserved` - an identical (rule_id, spec) retry onto an already-`Wedged` key now re-observes
+  the existing head's receipt directly (no new claim, no index mutation, deliberately, to avoid
+  a ghost index-refcount leak), while a genuinely different claimant onto the same wedged key is
+  refused IMMEDIATELY (`kSparkKeyWedged`) instead of queuing behind the doomed claim and waiting
+  out `backend_op_deadline`. This PR's own full 8-gate `/governance` run found and closed one
+  BLOCKING residual, independently confirmed via adjudication: **UP-1** - `attach_core()` tore
+  down a retargeted rule's own prior working arm unconditionally before checking whether the new
+  target key was wedged-by-someone-else, so a retarget refused onto a wedged key left the
+  retargeting rule with zero live arms and no automatic recovery. Round 1 (`7c13ab269`) hoisted
+  the different-rule_id refusal check to run before `detach_rule_locked()`, but was insufficient
+  alone - the production caller, `GuardianEngine::reconcile_rule_locked()`, ran an unconditional
+  defensive cleanup on ANY `attach_rule` failure and tore the just-preserved arm back down one
+  call downstream; round 2 (`41a67dbc1`) closed it by threading a `prior_state_preserved` bit
+  through the failure result so the caller only cleans up when there is genuinely something to
+  clean up. A third Gate 8 re-review round (8 agents) on round 2's fix found no further blocking
+  residuals. Two small non-blocking follow-ups were identified and deliberately NOT fixed here,
+  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload still discards the
+  preservation signal, currently harmless since it has zero production callers today; and two
+  pre-existing raw-API-level tests could usefully assert `prior_state_preserved`'s value directly
+  for extra regression-locking. Separately, #4415 tracks the pre-existing (not introduced by this
+  PR) full-ruleset teardown-storm architecture this governance run's unhappy-path review
+  surfaced, confirmed a modest net improvement here rather than a regression.
 - **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
   on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
   wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
