@@ -7,7 +7,7 @@
  * agents/shared/win_profiles.hpp's with_user_hive() enables
  * SeBackupPrivilege/SeRestorePrivilege on the PROCESS token before an offline
  * RegLoadKeyW mount and restores the token's prior attributes on the way out.
- * Four plugins load this ladder into the SAME agent process --
+ * Five plugins load this ladder into the SAME agent process -- autoruns,
  * registry, installed_apps, license_scan, tar -- and tar's collectors run on
  * a background thread, so two overlapping offline-mount attempts race the
  * shared process token: A enables it, B enables it (recording A's now-enabled
@@ -15,10 +15,10 @@
  * "previous" -- silently disabling it out from under B, mid-mount.
  *
  * A std::mutex defined as a plain `inline`/header-local static in
- * win_profiles.hpp does NOT solve this: each of the four plugin .dll/.so
- * files is a SEPARATE dynamically loaded module, and a function-local static
- * in a header is instantiated once PER TRANSLATION UNIT THAT LINKS IT IN --
- * in practice, once per plugin binary. Four plugins therefore got four
+ * win_profiles.hpp does NOT solve this: each plugin .dll/.so file is a
+ * SEPARATE dynamically loaded module, and a function-local static in a
+ * header is instantiated once PER TRANSLATION UNIT THAT LINKS IT IN -- in
+ * practice, once per plugin binary. Five plugins therefore got five
  * independent mutexes, not one process-wide lock (confirmed: each plugin DLL
  * exports exactly its one required `yuzu_plugin_descriptor` symbol and
  * nothing else -- the mutex was never shared).
@@ -33,19 +33,64 @@
  * -> unload -> restore), not just the RegLoadKeyW call itself -- see
  * win_profiles.hpp's with_user_hive() for where it is taken. The live-hive
  * path (the common case) never takes this lock.
+ *
+ * INSTRUMENTATION: this one process-wide lock already serialises the
+ * offline arm for FIVE plugins via with_user_hive() -- autoruns,
+ * installed_apps, license_scan, registry, tar -- so a long hold by any one
+ * of them blocks the other four with no prior visibility into it. A
+ * planned execution_artifacts caller (not yet on this branch) will make it
+ * six, calling the lock directly rather than through with_user_hive().
+ * `ScopedOfflineHiveLock` wraps the acquire/release with a wait-time and
+ * hold-time log (spdlog, this codebase's existing agent-side logging
+ * mechanism) so an unusually long wait or hold is visible without
+ * instrumenting every call site by hand. Both lines log together from the
+ * destructor, after the mutex is released, so logging itself never extends
+ * another caller's wait. Prefer it over a bare
+ * `std::lock_guard<std::mutex>(offline_hive_mutex())` for any new caller;
+ * today with_user_hive() (agents/shared/win_profiles.hpp) is the only call
+ * site, serving the five plugins above.
  */
 
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
+#include <chrono>
 #include <mutex>
 
 namespace yuzu::agent {
 
 /**
- * The process-global offline-hive-mount lock. Take it as a std::lock_guard
- * around the whole privilege-enable-through-restore sequence -- see the file
- * header for the full contract.
+ * The process-global offline-hive-mount lock. Prefer `ScopedOfflineHiveLock`
+ * below over taking this directly -- see the file header for the full
+ * contract.
  */
 YUZU_EXPORT std::mutex& offline_hive_mutex();
+
+/**
+ * RAII guard around offline_hive_mutex() that logs how long this call
+ * waited to acquire the lock and how long it held it -- see the file
+ * header's INSTRUMENTATION note. `caller` is a short, static string
+ * identifying the call site (e.g. "with_user_hive", "execution_artifacts")
+ * for attributing contention; it is never freed, so pass a string literal.
+ */
+class YUZU_EXPORT ScopedOfflineHiveLock {
+public:
+    explicit ScopedOfflineHiveLock(const char* caller);
+    ~ScopedOfflineHiveLock();
+
+    ScopedOfflineHiveLock(const ScopedOfflineHiveLock&) = delete;
+    ScopedOfflineHiveLock& operator=(const ScopedOfflineHiveLock&) = delete;
+
+private:
+    const char* caller_;
+    // std::unique_lock, never a bare lock()/unlock() pair on the raw mutex
+    // (docs/cpp-conventions.md's Concurrency section) -- constructed
+    // std::defer_lock so the constructor can still measure wait time around
+    // the explicit lock() call below.
+    std::unique_lock<std::mutex> lock_;
+    std::chrono::steady_clock::time_point acquired_at_;
+    // Measured in the constructor, logged in the destructor (after unlock) --
+    // see offline_hive_mutex.cpp.
+    std::chrono::milliseconds waited_{};
+};
 
 } // namespace yuzu::agent
