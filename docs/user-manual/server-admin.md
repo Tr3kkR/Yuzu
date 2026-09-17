@@ -1566,6 +1566,34 @@ Three things are visible after upgrading agents:
    the text, delete `security.firewall.state` and re-import it via
    `POST /api/instructions/import` — do not edit it in the dashboard YAML
    editor, which drops the definition's `spec.visualization` on save.
+
+### vNEXT — Linux firewall `state` may now read `unknown` more often for ufw/iptables hosts (correctness fix)
+
+The `firewall` plugin's Linux ufw/iptables legs previously reported a parsed
+`active`/`inactive` `state` as soon as the underlying subprocess exited `0`
+— even if the read had actually timed out or been truncated before
+finishing, which could report a stale or simply wrong verdict with full
+confidence. `state|` is now gated on the same completeness check `ruleset|`
+already used (`tool_ran && exit_code==0 && !timed_out && !output_truncated`),
+matching the nftables leg's own honest-degrade behavior added alongside it.
+
+1. **Hosts whose `ufw status`/`iptables -S` reads were marginal** (slow,
+   near-timeout, or hitting the output cap) will now read `state|unknown`
+   more often post-upgrade, for the SAME underlying firewall state as
+   before. This is the fix working as intended — a previously
+   false-confident `active`/`inactive` becomes an honest "couldn't tell" —
+   not a detection regression. `ruleset|unknown` already had this behavior;
+   `state|` now matches it.
+2. **No row shape changed.** `unknown` was already a valid `state` value on
+   every backend (it is the nftables leg's own honest-degrade outcome); this
+   only changes which reads reach it. Integrations already handling
+   `state|unknown` need no changes.
+3. **Mixed-fleet blend during rollout:** agents not yet upgraded keep the
+   prior completeness posture for ufw/iptables; a wider spread of
+   `state|unknown` across the fleet for these backends specifically
+   identifies upgraded agents whose reads were genuinely marginal, not a
+   server-side fault.
+
 ### vNEXT — KEK rotation is now durably rate-limited (#2530) (breaking)
 
 Before this release, `POST /api/v1/secrets/kek/rotate` was rate-limited only by a 5-minute

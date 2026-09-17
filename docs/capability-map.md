@@ -512,7 +512,12 @@ each degrading to no anchor rows / `ruleset|unknown` rather than a false
 answer when the read is refused or incomplete. Windows adds a `ruleset|<n>`
 row on both actions via `INetFwRules::get_Count` — `state`'s is the true
 policy-wide total, `rules`' is the count of rows actually emitted that call
-(capped at 100), a distinct number from `state`'s.
+(capped at 100), a distinct number from `state`'s. Linux probes a fixed
+backend ladder — firewalld (sd-bus) → nftables (netlink, kernel-origin-
+verified via `nl_pid == 0`) → ufw → iptables — stopping at the first that
+answers; a refused or partial read reports `unknown`, never a false-safe
+guess, and each backend emits its own `ruleset|<n>` rule count (or
+`ruleset|unknown` on an incomplete/refused read).
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
