@@ -649,6 +649,13 @@ private:
     /// ("'Accepted' means reconcile_rule_locked() returned Accepted specifically —
     /// the async-arm outcome, as opposed to Armed").
     ///
+    /// Exception (rung 9c PR-5c, #4221 up-2): a same-rule_id/same-spec retry that
+    /// RE-OBSERVES an already-Wedged head is also Accepted, but its receipt is
+    /// ALREADY TERMINAL at registration time — no async resolution is pending for
+    /// it. The generation-hold gate still treats it like any other Accepted episode
+    /// (ack_ledger_->can_advance() reads the receipt's actual status), so it simply
+    /// resolves on the ledger's very next drain instead of waiting on anything new.
+    ///
     /// Production status as of this comment (rung 9c PR-2 Unit 6): PRODUCED -
     /// reconcile_rule_locked() calls GuardianSparkRuntime::attach_rule(NonWaiting{},
     /// ...), so a rule whose arm is genuinely still in flight resolves to Accepted

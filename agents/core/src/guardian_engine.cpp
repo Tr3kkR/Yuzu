@@ -1237,11 +1237,17 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             continue; // not counted as applied - reconcile_rule_locked already logged why
         }
         // rung 9c PR-2 Unit 6 (§R5.3): Accepted is not a failure - the rule was
-        // eligible and its arm attempt was accepted (dispatched, or queued behind an
-        // in-flight/retained claim on the same key, R5.2) - so it is counted as
-        // applied exactly like Armed/Inert, never added to reconcile_failures/
-        // arm_failures_. reconcile_rule_locked() already registered the receipt with
-        // ack_ledger_ (this application was begun before this loop started); the
+        // eligible and its arm attempt was accepted (dispatched, queued behind an
+        // in-flight/retained claim on the same key (R5.2), or - rung 9c PR-5c
+        // (#4221 up-2) - re-observing an already-Wedged head via an identical
+        // same-rule_id/same-spec retry, which constructs no new claim at all) - so
+        // it is counted as applied exactly like Armed/Inert, never added to
+        // reconcile_failures/arm_failures_. reconcile_rule_locked() already
+        // registered the receipt with ack_ledger_ for THIS application (this
+        // application was begun before this loop started) - including for a
+        // re-observed retry, whose receipt is registered fresh by THIS call, not
+        // inherited from whatever application the original attach ran under (see
+        // the add_pending() call site's own doc comment below, ~:1940); the
         // generation-hold gate below now reads ack_ledger_->can_advance(), not this
         // counter - pending_arms is kept only for the diagnostic log line.
         if (outcome == ReconcileOutcome::Accepted)
@@ -1904,8 +1910,10 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             // rung 9c PR-2 Unit 6: non-waiting entry point - attach_rule() no longer blocks
             // for its own claim's outcome. `res` resolves to Armed (already committed,
             // synchronously - an inline-type arm, or a same-key claim whose owner already
-            // resolved by the time attach_core rechecked) or Accepted (dispatched, or queued
-            // behind an in-flight/retained claim - not yet resolved) before ever throwing a
+            // resolved by the time attach_core rechecked) or Accepted (dispatched, queued
+            // behind an in-flight/retained claim - not yet resolved, or - rung 9c PR-5c
+            // (#4221 up-2) - re-observing an already-Wedged head via an identical retry,
+            // whose receipt is in that case already terminal) before ever throwing a
             // synchronous error.
             auto res = spark_runtime_->attach_rule(GuardianSparkRuntime::NonWaiting{},
                                                    rule.rule_id(), std::move(*spec),
@@ -1918,8 +1926,23 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                 // status is a DIFFERENT outcome (Accepted below); its own failure is logged
                 // by ack_ledger_'s drain, not here.
                 spdlog::warn("Guardian: spark arm failed for rule '{}': {}", rule.rule_id(),
-                             res.error());
-                spark_runtime_->detach_rule(rule.rule_id()); // defensive; attach_rule leaves nothing on failure
+                             res.error().message);
+                // rung 9c PR-5c round 2 (#4221, UP-1 residual): the old comment here
+                // read "defensive; attach_rule leaves nothing on failure" - true for
+                // every OTHER Failed path, but FALSE for exactly the case UP-1's own
+                // fix (round 1) introduced: a retarget refused onto a key wedged by a
+                // DIFFERENT rule_id refuses BEFORE tearing down rule_id's own,
+                // still-live arm on its previous key, specifically so that arm
+                // survives. Calling detach_rule() unconditionally here would undo
+                // that preservation one call later - detach_rule_locked() finds
+                // rule_id's real, committed arm (untouched by attach_rule's own
+                // refusal) and tears it down for real, reproducing UP-1's "zero live
+                // arms, no recovery" defect one function call downstream of where
+                // round 1 closed it. ArmError::prior_state_preserved is the signal
+                // that distinguishes the two: only run this defensive cleanup when
+                // attach_rule() itself did NOT already leave rule_id untouched.
+                if (!res.error().prior_state_preserved)
+                    spark_runtime_->detach_rule(rule.rule_id());
                 return ReconcileOutcome::Failed;
             }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
@@ -1930,7 +1953,10 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
             // their eventual failures without inventing a new server-generation
             // acknowledgment"). A genuine arm ATTEMPT that did not (yet) succeed - the
             // caller's policy_generation hold-on-failure gate must not treat this push as
-            // fully applied until it resolves.
+            // fully applied until it resolves. (Exception: a re-observed retry, rung 9c
+            // PR-5c #4221 up-2, registers a receipt that is already terminal - the
+            // Wedged head it observes - so ack_ledger_'s very next drain resolves it
+            // immediately rather than waiting on anything new.)
             ack_ledger_->add_pending(rule.rule_id(), std::move(res->receipt));
             return ReconcileOutcome::Accepted;
         }
