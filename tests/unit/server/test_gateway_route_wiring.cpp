@@ -866,6 +866,76 @@ TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id is treated as m
     CHECK_FALSE((*row)->session_id.has_value()); // tombstoned normally
 }
 
+TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id on DISCONNECTED is ALSO "
+          "clamped to empty (symmetric with the CONNECTED-path clamp above), and a legacy "
+          "(never-stamped) row still tombstones normally",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    const std::string agent_id = "agent-oversized-home-disc-1";
+    auto req = make_gw_register(auth_mgr, agent_id);
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    // Legacy-shaped CONNECTED -- stream_home_id left unset (empty), exactly like
+    // a pre-#4324 gateway build.
+    gw::StreamStatusNotification connected;
+    connected.set_agent_id(agent_id);
+    connected.set_session_id(session_id);
+    connected.set_event(gw::StreamStatusNotification::CONNECTED);
+    connected.set_gateway_node("node-oversized-disc");
+    gw::StreamStatusAck conn_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &connected, &conn_ack).ok());
+    CHECK(conn_ack.acknowledged());
+    CHECK(registry.gateway_stream_home_id(agent_id, session_id) == "");
+
+    // DISCONNECTED carries an oversized (>64 byte) stream_home_id this time --
+    // the clamp lives in the SAME `if (stream_home_id.size() > kMaxStreamHomeIdLen)`
+    // shape duplicated in both branches of gateway_service_impl.cpp; this proves
+    // the DISCONNECTED copy is genuinely reachable and behaves identically to the
+    // CONNECTED-path clamp asserted above, not merely "structurally identical by
+    // inspection" (Gate 2/3's LOW finding).
+    gw::StreamStatusNotification disconnected;
+    disconnected.set_agent_id(agent_id);
+    disconnected.set_session_id(session_id);
+    disconnected.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    disconnected.set_gateway_node("node-oversized-disc");
+    disconnected.set_stream_home_id(std::string(65, 'y')); // 1 over the 64-byte bound
+    gw::StreamStatusAck disc_ack;
+    REQUIRE(
+        gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &disconnected, &disc_ack).ok());
+    CHECK(disc_ack.acknowledged());
+
+    // Clamped to empty before the fence comparison -- the fence then sees
+    // stored="" (legacy CONNECTED) vs incoming="" (clamped), which matches the
+    // asymmetric predicate's both-empty legacy branch, so this tombstones
+    // normally rather than being (incorrectly) rejected as a stale-home mismatch.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "malformed_home_id"}})
+              .value() == 1);
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "stale_home"}})
+              .value() == 0);
+    auto row = store.lookup_route(agent_id);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value()); // tombstoned normally, not leaked
+}
+
 // ── BatchHeartbeat: renew_leases ────────────────────────────────────────────
 
 TEST_CASE("BatchHeartbeat: renews the route lease for the carried session ids in one call",

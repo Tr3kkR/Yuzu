@@ -130,7 +130,7 @@ delivery/ops workstreams the three-model review surfaced as missing.
 
 **Verified 2026-09-17 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
-4.2a + 4.2b Tasks A–D (#4299/#4344/#4355, merged), WS-7 (#3627),
+4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged), WS-7 (#3627),
 WS-10 10.1/10.2. In flight: WS-4 `#4324` (the per-home stream-generation
 fence — fenced agent→cluster routing directory, writer-path hardening,
 per-site fail-closed posture, and the directory wired into confined dispatch

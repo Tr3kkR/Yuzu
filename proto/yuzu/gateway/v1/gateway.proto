@@ -102,7 +102,10 @@ message StreamStatusNotification {
   // placement — from tearing down a NEWER re-home under the same reused
   // session id (HA WS-4, issue #4324). Absent/empty from an older gateway
   // build means no fence is available (legacy behavior); this field is
-  // additive and optional-safe.
+  // additive and optional-safe. This canonical file is mirrored verbatim into
+  // gateway/priv/proto/gateway.proto and gateway/priv/proto/yuzu/gateway/v1/
+  // gateway.proto — both gateway copies must carry this field identically or
+  // gpb drops it on one build path (docs/gateway-proto-grpcbox-constraints.md).
   string stream_home_id = 8;
 }
 
