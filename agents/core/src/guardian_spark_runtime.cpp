@@ -1032,10 +1032,10 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 // Governance Gate 7 fix (rung 9c PR-5d follow-up round 2,
                 // defense-in-depth): a wedged claim's rg->active reading true does
                 // NOT by itself prove nothing else has taken ownership of rule_id
-                // in the meantime - Gate 7's own adversarial review found a real
-                // bug (now fixed, in attach_core's Reobserved-restore branch
-                // above) that could violate that assumption on a fault-injection
-                // path. Gate 8's OWN review then found this branch is ALSO
+                // in the meantime - governance Gate 2-4 found a real bug (fixed
+                // at Gate 7, in attach_core's Reobserved-restore branch above)
+                // that could violate that assumption on a fault-injection path.
+                // Gate 8's OWN re-review then found this branch is ALSO
                 // reachable via entirely ordinary desired-state churn, no fault
                 // injection needed: rule R wedges on key A; R is redeployed to key
                 // B (commits normally, rules_[R] now live on B); R is redeployed
