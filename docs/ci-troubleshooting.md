@@ -111,6 +111,26 @@ do not dispatch it for a fork revision that has
 not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret is
 an additional wrapper-only guard and must not be exposed to build steps.
 
+**If `purge-quarantine-cache` itself fails** (the job after the gate, or the
+`linux` job in `fork-dynamic-review.yml`): the run shows red even though the
+PR's actual verdict — `trusted-gate`'s job in `trusted-fork-ci.yml`, or
+`linux`'s in `fork-dynamic-review.yml` — is unaffected and still authoritative;
+check that job's own status before assuming the whole dispatch failed. The
+error names the cause:
+
+- A transient `gh api` failure (rate limit, network blip) on the list or
+  delete calls aborts with an explicit `DELETE failed for cache id …`
+  message naming how many entries were already removed. Re-dispatch on the
+  **same** branch — the purge is idempotent and only removes what remains.
+- `$N cache entries still present … after purge` means the scope held more
+  than the 5-pass/100-per-page bound (500 entries) could drain in one run.
+  Re-dispatch on the same branch again rather than moving to a new
+  `-<sha>`-suffixed one — a new branch is a new, unpurged scope, and the old
+  one would otherwise sit unpurged until it ages out after seven days.
+- Use a fresh `gh workflow run` dispatch to retry, not GitHub's "Re-run failed
+  jobs" button — whether that button re-runs an `if: always()` downstream job
+  when only that job (not its `needs`) failed is not documented behavior.
+
 ---
 
 ## 1. Linux runner `yuzu-wsl2-linux` shows offline / tmux is dying

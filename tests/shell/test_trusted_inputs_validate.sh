@@ -36,6 +36,9 @@
 #                         controls at run time), trusted_execution=true,
 #                         base_sha from the PR, checkout_repository the base
 #                         repo
+#   workflow_call, PR head moved between approval and dispatch -> rejected
+#                         AFTER the API call (this is the one case that must
+#                         call gh to detect), nothing pinned
 #   workflow_call, malformed approved sha -> rejected outright
 #
 # The step's own body is extracted from ci.yml rather than duplicated here, so
@@ -80,8 +83,13 @@ cat > "$TMP/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 if [ "$#" -eq 2 ] && [ "$1" = "api" ] && [[ "$2" =~ ^repos/Tr3kkR/Yuzu/pulls/[1-9][0-9]*$ ]]; then
   : > "$STUB_MARKER"
+  # STUB_ACTUAL_HEAD_SHA overrides what the "live" PR head is, independent of
+  # STUB_HEAD_SHA (the approved SHA passed in) -- unset, it defaults to the
+  # approved SHA, so every existing case is unaffected; set, it simulates a
+  # PR that moved between approval and dispatch (test_trusted_inputs_validate.sh
+  # "PR head moved" case).
   printf '{"state":"open","head":{"sha":"%s","repo":{"full_name":"someone/Yuzu"}},"base":{"sha":"%s"}}\n' \
-    "$STUB_HEAD_SHA" "$STUB_BASE_SHA"
+    "${STUB_ACTUAL_HEAD_SHA:-$STUB_HEAD_SHA}" "$STUB_BASE_SHA"
   exit 0
 fi
 echo "stub gh: unexpected invocation: $*" >&2
@@ -99,7 +107,8 @@ run_validate() { # run_validate <event> <github_ref> <github_sha> <approved_sha>
            GITHUB_OUTPUT="$TMP/out" GH_EVENT_NAME="$1" GITHUB_REF="$2" GITHUB_SHA="$3" \
            APPROVED_SHA="$4" GH_BASE_SHA="$5" \
            REPOSITORY="Tr3kkR/Yuzu" PR_NUMBER="${RV_PR_NUMBER:-}" TRUSTED_GATE="${RV_TRUSTED_GATE:-}" \
-           GH_TOKEN="" STUB_MARKER="$TMP/gh-called" STUB_HEAD_SHA="$4" STUB_BASE_SHA="$5"
+           GH_TOKEN="" STUB_MARKER="$TMP/gh-called" STUB_HEAD_SHA="$4" STUB_BASE_SHA="$5" \
+           STUB_ACTUAL_HEAD_SHA="${RV_STUB_ACTUAL_HEAD_SHA:-}"
     bash "$TMP/validate.sh" >"$TMP/stdout" 2>"$TMP/stderr"
     echo $? > "$TMP/rc" )
   rc=$(cat "$TMP/rc")
@@ -174,6 +183,15 @@ if command -v jq >/dev/null 2>&1; then
     check "$ref: base_sha is the PR base"           "$SHA_BASE"   "$(out_of base_sha)"
     check "$ref: checkout_repository is the base repo" "Tr3kkR/Yuzu" "$(out_of checkout_repository)"
   done
+
+  echo "-- workflow_call, PR head moved between approval and dispatch: refused, nothing pinned --"
+  MOVED=4444444444444444444444444444444444444444
+  RV_PR_NUMBER=2832 RV_TRUSTED_GATE=sentinel RV_STUB_ACTUAL_HEAD_SHA="$MOVED" \
+    run_validate pull_request "$QUARANTINE" "$SHA_EVENT" "$APPROVED" "$SHA_BASE"
+  check "exits non-zero"                 "1"   "$([ "$rc" != 0 ] && echo 1 || echo 0)"
+  check "nothing pinned"                 ""    "$(cat "$TMP/out")"
+  check "stub gh WAS called (post-check, not pre-check)" "yes" "$(gh_called)"
+  check "names the mismatch"             "1"   "$(grep -c 'head moved' "$TMP/stdout" || true)"
 else
   printf '  [skip] approved-path cases need jq (the step itself uses it); not installed here\n'
 fi

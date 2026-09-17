@@ -77,7 +77,11 @@ query-filters:
   # exclusion is chosen here, not another individual dismissal, because this
   # change (adversarial-reviewed) also closes the underlying gap program-wide:
   # trusted_inputs AND fork-dynamic-review.yml both refuse any ref outside the
-  # trusted-fork/pr-<N> quarantine, and the sweep below covers .yml and .yaml.
+  # trusted-fork/pr-<N> quarantine, and the sweep in
+  # scripts/ci/test_runner_health_check.py covers .yml and .yaml. Alert
+  # #5177 itself stays dismissed (won't-fix, pointing at #4471) as the
+  # historical record of why this exclusion exists; this entry is what
+  # stops the pattern from generating a fresh alert on every future PR.
   # Siblings stay on: actions/cache-poisoning/direct-cache,
   # actions/untrusted-checkout/*, zizmor's cache-poisoning audit.
   - exclude:
