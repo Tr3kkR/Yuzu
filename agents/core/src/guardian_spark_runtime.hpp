@@ -1211,6 +1211,19 @@ public:
     ReceiptStatus receipt_status(const ArmReceipt& receipt) const;
     /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
     bool is_terminal(const ArmReceipt& receipt) const;
+    /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
+    /// been ADOPTED - i.e. rules_ currently carries a live generation for that
+    /// claim's rule_id AND it is EXACTLY this claim's own (rule_id, generation)
+    /// incarnation, not a newer or older one that happens to share the rule_id.
+    /// `end`/`receipt_status()` never change on adoption (the sticky-Wedged
+    /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
+    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal a ledger's
+    /// own maintenance drain uses to notice a late-success recovery on a claim it
+    /// is still holding as a retained failure - see GuardianArmAckLedger::
+    /// drain_locked(). False for a default-constructed / empty receipt (nothing
+    /// to recover) and false for any receipt whose claim was never adopted.
+    /// registry_mu_ taken internally.
+    [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
 
     enum class ArmOutcomeKind { Armed, Accepted };
     /// The non-waiting attach_rule() overload's success result. Never encodes
@@ -1672,6 +1685,34 @@ private:
     /// keys_/index_/rules_ above). See KeyClaim's doc; empty in steady state, an entry
     /// exists only while a key has an arm or disarm in flight, queued, or retained.
     std::unordered_map<std::string, KeyClaimQueue> claims_;
+    /// rung 9c PR-5d (concern 1, adoption): a locator from rule_id to its currently
+    /// wedged claim, if any - registry_mu_-guarded, same as claims_/rules_/index_
+    /// above. Populated ONLY by abandon_claim_locked() the instant a claim's `end`
+    /// settles to the sticky ClaimEnd::WaiterTimedOutDispatched (never for a
+    /// stopping-time abandonment - R5.5's disarm-unconditionally policy never
+    /// needs this). Exists because a wedged claim is UNREACHABLE by any other
+    /// lookup detach_rule_locked()/detach_all() already have: it is neither in
+    /// index_ (abandon_claim_locked releases that mapping unconditionally, before
+    /// this map is ever populated) nor in rules_ (it was never committed) - and
+    /// detach_rule_locked()'s own Case 0 FIFO scan deliberately EXCLUDES a
+    /// waiter_abandoned claim (see that function's own comment: "the search
+    /// excludes withdrawn AND abandoned claims"), which is exactly correct for
+    /// Case 0's own purpose but means a withdrawal of a purely-wedged rule_id
+    /// would otherwise be a silent no-op that on_arm_complete's own late-adoption
+    /// check (is_retained_wedge() + KeyClaim::rg->active) could never learn about.
+    /// Erased (a) by detach_rule_locked()/detach_all() the moment they deactivate
+    /// the entry's rg->active (withdrawal ends the claim's adoption candidacy for
+    /// good - a later Reobserved retry on the SAME still-wedged claim does not
+    /// reinstate it, see attach_core()'s own Reobserved branch, which is
+    /// unaffected by this map entirely), and (b) by on_arm_complete() the instant
+    /// the wedge actually resolves (adopted or not) - the episode is over either
+    /// way and a stale entry must never outlive the claim object it names.
+    /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
+    /// claim alive after claims_ itself has already dropped it (a defensive
+    /// belt-and-braces should erasure at (a)/(b) above ever be missed on some
+    /// future edit) - a caller consulting this map .lock()s it and treats a dead
+    /// weak_ptr exactly like "not found".
+    std::unordered_map<std::string, std::weak_ptr<KeyClaim>> wedged_by_rule_;
     /// ONE runtime-wide CV (paired with registry_mu_) for every claim waiter: per-key
     /// CVs have an entry-lifetime problem (erased while a waiter references them),
     /// and production has at most one waiter at a time (GuardianEngine's mtx_); the

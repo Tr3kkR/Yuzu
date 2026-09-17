@@ -324,6 +324,15 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         // which existing seams (dispatch_entry_hook_for_test_, hang_next_arm)
         // don't currently give direct control over.
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutDispatched;
+        // rung 9c PR-5d (concern 1): a genuine (non-stopping) wedge is the ONLY
+        // case adoption ever applies to - R5.5's stopping-time disarm is
+        // unconditional and never consults this map (late_adopt below requires
+        // !stopping_). Recorded here, at the exact instant `end` settles to
+        // WaiterTimedOutDispatched, so wedged_by_rule_ and is_retained_wedge()
+        // agree by construction rather than by a second, separately-maintained
+        // condition.
+        if (!stopping)
+            wedged_by_rule_.insert_or_assign(claim->rule_id, claim);
     }
     if (!claim->outcome)
         claim->outcome = std::unexpected(reason);
@@ -953,7 +962,106 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                         !c->outcome && !c->commit_exception && c->index_held)
                         live.push_back(c);
 
-                if (stopping_ || live.empty()) {
+                // rung 9c PR-5d (concern 1): a wedged head is structurally the ONLY
+                // claim that can ever be here (attach_core()'s up-2 immediate-refusal
+                // never queues a different-rule_id sibling behind a Wedged head, and
+                // a same-rule_id retry re-observes the SAME object instead of queuing
+                // a new one - see is_retained_wedge()'s own callers) - `finished` is
+                // just {claim} whenever this is true. Its episode ends HERE either
+                // way (adopted or not), so the locator entry is dropped unconditionally
+                // before deciding which.
+                const bool was_wedge = is_retained_wedge(*claim);
+                if (was_wedge) {
+                    if (const auto wit = wedged_by_rule_.find(claim->rule_id);
+                        wit != wedged_by_rule_.end() && wit->second.lock() == claim)
+                        wedged_by_rule_.erase(wit);
+                }
+
+                // rung 9c PR-5d (concern 1): a late success on a Wedged claim whose
+                // rule is STILL currently desired (nobody withdrew it while it was
+                // wedged - detach_rule_locked()/detach_all()'s own new wedge lookups
+                // are what flip rg->active false on withdrawal, since neither can
+                // reach this claim through claims_/rules_/index_ the ordinary way) is
+                // ADOPTED rather than disarmed: the subscription is committed exactly
+                // like an ordinary live claim's commit below, but `claim->outcome`/
+                // `claim->end` are LEFT UNTOUCHED - the sticky-Wedged receipt (this
+                // PR's own load-bearing invariant, pinned by test) records a fact
+                // about the ORIGINAL episode's own timeout, not the rule's live
+                // status; adoption is a second, independent signal entirely (R5.3's
+                // "Three separate transitions, never collapsed"). `live` deliberately
+                // never includes this claim (waiter_abandoned/outcome already exclude
+                // it) - adoption is handled as its own branch, not by loosening that
+                // filter, precisely because commit_new_generation_locked()'s siblings-
+                // path assumes every `live` claim still owns its index mapping, which
+                // a wedged claim does not (abandon_claim_locked released it
+                // unconditionally the instant it wedged).
+                bool adopted = false;
+                if (was_wedge && !stopping_ && armed_live && live.empty() && claim->rg &&
+                    claim->rg->active) {
+                    const std::uint64_t sub = **r;
+                    bool index_readded = false;
+                    try {
+                        // Reacquire the mapping abandonment released. Safe to re-add at
+                        // this exact (rule_id, generation): nothing else can have taken
+                        // ownership of rule_id without first running detach_rule_locked
+                        // (a fresh attach on this or any other key always detaches the
+                        // prior mapping first), and that path deactivates rg->active
+                        // before this branch would ever see it true again - so a
+                        // concurrent supersession is exactly what this check excludes.
+                        index_->add(key, claim->rule_id, claim->generation); // may throw
+                        index_readded = true;
+                        auto fresh = std::make_shared<PerKey>();
+                        fresh->spec = claim->spec;
+                        fresh->subscription = sub;
+                        if (!keys_.emplace(key, fresh).second)
+                            throw std::logic_error(
+                                "spark runtime: keys_ already holds a watcher for an adopted key");
+                        try {
+                            // Pass rg by COPY, not std::move like the ordinary commit
+                            // path below - claim keeps its own reference (harmless, one
+                            // extra shared_ptr refcount) rather than being left with a
+                            // null rg, since nothing here needs to null it out.
+                            commit_new_generation_locked(claim->rule_id, claim->generation,
+                                                         claim->guard_type, claim->rule_name,
+                                                         fresh, claim->rg, claim->attach_now,
+                                                         waker, outbox_waker);
+                        } catch (...) {
+                            rules_.erase(claim->rule_id);
+                            fresh->pending_initial.erase(claim->rule_id);
+                            keys_.erase(key);
+                            throw;
+                        }
+                        compensating.reset(); // adopted - no compensating disarm owed
+                        // Explicit, not relied-upon-as-already-false: the ordinary
+                        // stuck-index-release fault seam (set_index_remove_fault_for_test)
+                        // can leave a wedged claim's index_held stuck true from
+                        // abandonment - index_->add() above is still a safe idempotent
+                        // no-op against the same (key, rule_id, generation) in that case,
+                        // but this claim's OWN bookkeeping must say ownership has passed
+                        // to rules_/keys_ regardless of how it arrived here, matching the
+                        // ordinary live-commit path's identical line below.
+                        claim->index_held = false;
+                        adopted = true;
+                    } catch (...) {
+                        // Adoption failed (index_->add or the commit itself threw):
+                        // fall back to the existing safe default below - `compensating`
+                        // still holds `sub` (never reset above on this path), so the
+                        // deferred compensating-disarm branch runs normally, exactly as
+                        // an ordinary not-wanted late success always has. No verdict is
+                        // (re-)staged here: claim already carries its original "arm
+                        // timed out" outcome / Wedged end from abandonment.
+                        if (index_readded)
+                            index_->erase_rule(claim->rule_id, claim->generation); // noexcept
+                    }
+                }
+
+                if (adopted) {
+                    // Nothing to stage: publish_arm_verdicts_locked's own per-claim
+                    // guard (`if (c->outcome || c->commit_exception) continue;`) leaves
+                    // an already-resolved claim's outcome/end untouched regardless -
+                    // only the subscription changed hands. `finished`'s normal pop-
+                    // from-fifo below still runs unconditionally.
+                } else if (stopping_ || live.empty()) {
                     // Nobody is left to adopt the result: withdrawn, abandoned, or the
                     // runtime is stopping (R5.5: a late success is disarmed, never left
                     // live). No "armed" audit - nothing committed.
@@ -1476,6 +1584,14 @@ bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
     return receipt_status(receipt) != ReceiptStatus::Pending;
 }
 
+bool GuardianSparkRuntime::receipt_recovered(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return false;
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto rit = rules_.find(receipt.claim->rule_id);
+    return rit != rules_.end() && rit->second->generation == receipt.claim->generation;
+}
+
 std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError>
 GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge) {
@@ -1823,26 +1939,41 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // detach_rule_locked(rule_id) can only ever touch `key`'s own claims_ FIFO
         // via its Case 0 branch, which withdraws only an entry whose OWN rule_id
         // matches the rule being detached - it can never touch or reorder a front
-        // claim owned by a DIFFERENT rule_id. So this early return fires whenever
-        // the FRONT (computed right here, before any detach) belongs to a
-        // different rule_id, full stop - independent of whether rule_id's own
-        // active generation exists elsewhere in this same FIFO as a queued,
-        // non-front follower (it can: "Live followers CAN exist behind a wedged
-        // head", the up-2 comment below); this branch does not depend on rule_id's
-        // own generation being the front, only on someone ELSE's being it. The
-        // one case this early return does NOT cover - rule_id's own generation
-        // already IS the front, wedged - falls through to detach_rule_locked
-        // (which skips a waiter_abandoned claim, leaving that front unchanged)
-        // and then the Reobserved branch below, unaffected by this check.
+        // claim owned by a DIFFERENT rule_id. So the different-rule_id refusal
+        // below fires whenever the FRONT (computed right here, before any detach)
+        // belongs to someone else, full stop - independent of whether rule_id's
+        // own active generation exists elsewhere in this same FIFO as a queued,
+        // non-follower ("Live followers CAN exist behind a wedged head", the up-2
+        // comment below); it does not depend on rule_id's own generation being the
+        // front, only on someone ELSE's being it.
         //
-        // Deliberately duplicates part of that later check's Failed branch rather
-        // than restructuring it (both now share is_retained_wedge() - rung 9c
-        // PR-5c round 2 governance fold): this is the ONLY sub-case that must run
-        // before the detach. Leaving the Reobserved (same rule_id, same spec)
-        // sub-case at its ORIGINAL position, completely unchanged, keeps that
-        // path's own proven behavior - including its interaction with
-        // detach_rule_locked's Case 0, which explicitly skips a waiter_abandoned
-        // claim - exactly as it was.
+        // rung 9c PR-5d correction: the SAME-rule_id, SAME-spec case - rule_id's
+        // own generation already IS the front, wedged - must ALSO be decided HERE,
+        // before detach_rule_locked(rule_id) runs, not after. This comment
+        // previously said detach_rule_locked "skips a waiter_abandoned claim,
+        // leaving that front unchanged" - true before PR-5d, no longer true after
+        // it: detach_rule_locked() now has its OWN wedge lookup (wedged_by_rule_),
+        // added so a genuine WITHDRAWAL of a purely-wedged rule_id is no longer a
+        // silent no-op (see that function's own comment) - and rule_id's own
+        // detach_rule_locked(rule_id) call two lines below runs UNCONDITIONALLY on
+        // every attach_core() call, including a Reobserving one. Left at its
+        // original (post-detach) position, that new lookup would deactivate this
+        // exact claim's own RuleGeneration on EVERY reobservation, permanently
+        // disabling adoption for a caller whose whole intent was "I still want
+        // this rule" - measured directly (a reobservation-then-late-success test
+        // failed to adopt until this hoist was added). Returning Reobserved HERE
+        // means detach_rule_locked(rule_id) never runs at all for this call, so
+        // its wedge lookup never sees rule_id and never touches the claim -
+        // exactly the "construct nothing new, touch no index state at all" shape
+        // the up-2 design already committed to for this case, now extended to
+        // cover rg->active too.
+        //
+        // Deliberately duplicates part of the original (post-detach) Reobserved
+        // branch below rather than removing it: that branch stays as defense-in-
+        // depth for any call shape that could reach it with the hoisted check
+        // somehow not firing (there is none known today, matching this file's own
+        // established pattern of keeping a superseded check as a redundant
+        // backstop - see the UP-1 fix's own precedent immediately below).
         if (const auto pre_cit = claims_.find(key);
             io_class && pre_cit != claims_.end() && !pre_cit->second.fifo.empty()) {
             const auto& pre_head = pre_cit->second.fifo.front();
@@ -1853,6 +1984,12 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
                                         .error = std::string{kSparkKeyWedged},
                                         .prior_state_preserved = true, .claim = nullptr};
+            }
+            if (is_retained_wedge(*pre_head) && pre_head->rule_id == rule_id &&
+                pre_head->spec == spec) {
+                wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
+                return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
+                                        .error = {}, .claim = pre_head};
             }
         }
 
@@ -2171,6 +2308,20 @@ void GuardianSparkRuntime::detach_all() {
     std::vector<std::shared_ptr<KeyClaim>> works;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
+        // rung 9c PR-5d (concern 1): every currently-wedged claim loses its
+        // adoption candidacy too - a full sync that omits a wedged rule_id must
+        // not let its eventual late success resurrect it, and the per-rule
+        // detach_rule_locked() loop below can never reach a wedged claim (its
+        // own Case 0 deliberately skips waiter_abandoned entries - see that
+        // function's comment) the way it reaches a still-claimed, not-yet-
+        // abandoned one via `claimed` just below. Same deactivate-and-drop shape
+        // as detach_rule_locked()'s own new lookup, applied to every entry at
+        // once rather than by rule_id.
+        for (auto& [rid, weak] : wedged_by_rule_) {
+            if (const auto wedge = weak.lock(); wedge && wedge->rg)
+                wedge->rg->active = false;
+        }
+        wedged_by_rule_.clear();
         // rung 9c R5.2: a full sync replaces the active set, so a rule that is still
         // only CLAIMED (its arm in flight or queued, no rules_ entry yet) must be
         // withdrawn too - detach_rule_locked's Case 0 handles each, generalised.
@@ -2267,6 +2418,26 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 return nullptr; // nothing to disarm yet; the claim's completion handles it
             }
         }
+    }
+
+    // rung 9c PR-5d (concern 1): Case 0 above deliberately never finds a wedged
+    // (waiter_abandoned) claim - see its own comment - and rule_id has no rules_
+    // entry either (a purely-wedged claim was never committed), so without this,
+    // withdrawing a rule_id whose only presence is a wedged claim was a silent
+    // no-op: nothing ever told the claim it was no longer wanted, and a later
+    // late success would be adopted as if it still were. Deactivate the claim's
+    // own RuleGeneration (on_arm_complete's late-adoption check reads exactly
+    // this) and drop the locator entry - withdrawal ends this wedge's adoption
+    // candidacy for good, it does not touch `end`/`outcome`/`waiter_abandoned`
+    // (the sticky-Wedged receipt itself stays exactly what it already was).
+    // Nothing to disarm here either: the backend arm() call this claim is
+    // waiting on is still genuinely in flight (or already resolved and racing
+    // this call) - on_arm_complete's own ordinary "nobody left to adopt" path
+    // disarms it when it lands, unchanged.
+    if (const auto wit = wedged_by_rule_.find(rule_id); wit != wedged_by_rule_.end()) {
+        if (const auto wedge = wit->second.lock(); wedge && wedge->rg)
+            wedge->rg->active = false;
+        wedged_by_rule_.erase(wit);
     }
 
     const auto rit = rules_.find(rule_id);
