@@ -1718,21 +1718,41 @@ private:
     std::unordered_map<std::string, KeyClaimQueue> claims_;
     /// rung 9c PR-5d (concern 1, adoption): a locator from rule_id to its currently
     /// wedged claim, if any - registry_mu_-guarded, same as claims_/rules_/index_
-    /// above. Populated ONLY by abandon_claim_locked() the instant a claim's `end`
-    /// settles to the sticky ClaimEnd::WaiterTimedOutDispatched (never for a
-    /// stopping-time abandonment - R5.5's disarm-unconditionally policy never
-    /// needs this). Exists because a wedged claim is UNREACHABLE by any other
-    /// lookup detach_rule_locked()/detach_all() already have: it is neither in
-    /// index_ (abandon_claim_locked releases that mapping unconditionally, before
-    /// this map is ever populated) nor in rules_ (it was never committed) - and
+    /// above. Populated by TWO sites, corrected here (this comment previously said
+    /// "Populated ONLY by abandon_claim_locked()", which is false and has been
+    /// since 2131dc973 ("Adversarial-review Blocker 1", rung 9c PR-5d) first gave
+    /// the Reobserved-restore branch its own insert_or_assign() - well before
+    /// 1cd9a0772, which only added a cross-key GUARD around that pre-existing
+    /// insert, not the insert itself; a pre-existing stale claim in this comment,
+    /// not introduced by either fix): (1) abandon_claim_locked() the instant a
+    /// claim's `end` settles to the sticky ClaimEnd::WaiterTimedOutDispatched
+    /// (never for a stopping-time abandonment - R5.5's disarm-unconditionally
+    /// policy never needs this); and (2) attach_core()'s Reobserved-restore branch,
+    /// which re-inserts a still-wedged claim an intervening detach_all() sweep (or
+    /// detach_rule_locked()) already erased from this map, the moment the SAME
+    /// (rule_id, spec) is genuinely reobserved - see that branch's own comment for
+    /// why reaching Reobserved is itself proof the rule is still desired. Exists
+    /// because a wedged claim is UNREACHABLE by any other lookup
+    /// detach_rule_locked()/detach_all() already have: it is neither in index_
+    /// (abandon_claim_locked releases that mapping unconditionally, before this map
+    /// is ever populated) nor in rules_ (it was never committed) - and
     /// detach_rule_locked()'s own Case 0 FIFO scan deliberately EXCLUDES a
     /// waiter_abandoned claim (see that function's own comment: "the search
     /// excludes withdrawn AND abandoned claims"), which is exactly correct for
     /// Case 0's own purpose but means a withdrawal of a purely-wedged rule_id
     /// would otherwise be a silent no-op that on_arm_complete's own late-adoption
     /// check (is_retained_wedge() + KeyClaim::rg->active) could never learn about.
-    /// Erased (a) by detach_rule_locked()/detach_all() the moment they deactivate
-    /// the entry's rg->active - withdrawal ends the claim's adoption candidacy;
+    /// Erased (a) by detach_rule_locked() the moment it deactivates the entry's
+    /// rg->active - withdrawal ends the claim's adoption candidacy. Rung 9c PR-5d
+    /// (concern 1, 5th occurrence): this erasure runs UNCONDITIONALLY, FIRST,
+    /// before detach_rule_locked()'s own Case 0 FIFO scan even starts - not, as an
+    /// earlier version of this fix had it, only reached when Case 0 fell through
+    /// without matching anything (Case 0 `return nullptr;`s from inside its own
+    /// loop on a match, which used to skip this erasure entirely whenever a
+    /// DIFFERENT, non-abandoned claim for the same rule_id was live on another key
+    /// - see detach_rule_locked()'s own header comment for the reachable
+    /// interleaving and the proof the two blocks can never match the same claim);
+    /// erased likewise by detach_all()'s own equivalent, unconditional sweep;
     /// (b) by on_arm_complete() the instant the wedge actually resolves (adopted
     /// or not) - the episode is over either way and a stale entry must not
     /// outlive the claim object it names; and (c) by

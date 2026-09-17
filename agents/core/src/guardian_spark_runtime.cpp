@@ -2588,6 +2588,81 @@ void GuardianSparkRuntime::detach_all() {
 
 std::shared_ptr<GuardianSparkRuntime::KeyClaim>
 GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string_view lifecycle_kind) {
+    // rung 9c PR-5d (concern 1, 5th occurrence of this branch's own fail-open class -
+    // found by THIS governance run's own Gate 4 unhappy-path pass, independently
+    // confirmed by cpp-safety; unlike the prior three occurrences, not raised by an
+    // external reviewer and not a finding from an earlier Gate 2/3/7/8 round). This
+    // block - deactivate rule_id's currently-wedged claim, if any, via the
+    // wedged_by_rule_ locator (see that map's own doc comment for what populates it
+    // and why detach_rule_locked()/detach_all() are the only things that can ever
+    // reach a waiter_abandoned claim) - USED TO sit AFTER Case 0 below, reached only
+    // when Case 0's own FIFO scan fell through without matching anything. That
+    // ordering was itself the bug: Case 0's search deliberately EXCLUDES a
+    // waiter_abandoned claim (see its own comment below) but `return nullptr;`s from
+    // INSIDE its loop the instant it matches ANY live, non-abandoned claim for
+    // rule_id - which skips every line after it in this function, including this
+    // lookup. A single rule_id CAN have two structurally distinct claim objects live
+    // at once: one wedged-and-parked on an OLD key, reachable ONLY through this map;
+    // one Dispatching-and-not-yet-wedged on a NEW key after an intervening flip-flop
+    // redeploy, reachable through Case 0's own index_/claims_ scan. Reachable
+    // interleaving: wedge r1 on key A (wedged_by_rule_["r1"] = claim A, rg->active =
+    // true); redeploy r1 to key B (this same lookup - old position or new, the
+    // redeploy's own detach_rule_locked("r1") call reaches it either way, since Case
+    // 0 has nothing to match yet - deactivates claim A and erases the map entry;
+    // attach_core()'s own index_->add(B, "r1", genB) then makes claim B Dispatching,
+    // index-held, not yet wedged); redeploy r1 BACK to key A before claim B's own
+    // arm() call ever resolves (attach_core()'s hoisted Reobserved-restore branch
+    // finds the map empty, so its own cross-key guard has nothing to deactivate, and
+    // unconditionally reinstates claim A: wedged_by_rule_["r1"] = claim A again,
+    // rg->active = true again - this redeploy re-observes claim A directly and never
+    // reaches detach_rule_locked(rule_id) at all, so claim B's own index_ mapping to
+    // key B is untouched throughout); THEN withdraw r1 while claim B is STILL merely
+    // Dispatching. Under the OLD ordering, Case 0 ran first, found claim B via
+    // index_->key_for_rule("r1") == B - live, un-abandoned, index-held - matched it,
+    // marked it withdrawn, and `return nullptr;`d from inside the loop before this
+    // lookup ever ran. wedged_by_rule_ still names claim A at this point (nothing
+    // erases it between the Reobserved-restore step above and here) - the map
+    // itself is fine, it is only THIS lookup, the one thing that would have read it
+    // and deactivated claim A, that never ran. Claim A's rg->active stayed wrongly
+    // true past the withdrawal that should have deactivated it - the same fail-open
+    // shape as the three prior occurrences on this branch (a claim's adoption
+    // candidacy silently outliving a real withdrawal), at a fourth structurally
+    // distinct site: not a map-insert ordering or a same-key collision this time,
+    // but an early return that skips a LATER cleanup block entirely.
+    //
+    // The fix hoists this lookup to run UNCONDITIONALLY, first, before Case 0 even
+    // starts its scan - never gated on whether Case 0 finds a match. Provably safe,
+    // not merely plausible: wedged_by_rule_ is populated only for a claim with
+    // `waiter_abandoned == true && index_held == false` (abandon_claim_locked sets
+    // both together, atomically, in the same critical section a claim wedges in),
+    // while Case 0's own match condition below requires `!waiter_abandoned &&
+    // index_held` - the two conditions are mutually exclusive, so this lookup and
+    // Case 0's scan can NEVER match the SAME claim object; between them they can only
+    // ever find two DIFFERENT claims for the same rule_id, exactly as in the
+    // interleaving above. Running this lookup first therefore changes nothing about
+    // what Case 0 finds or what it returns - it only guarantees THIS cleanup always
+    // runs too, for every withdrawal, instead of being skipped whenever Case 0
+    // happens to match something first.
+    //
+    // What this lookup itself does, unchanged from its original introduction:
+    // rule_id has no rules_ entry (a purely-wedged claim was never committed), so
+    // without it, withdrawing a rule_id whose only presence is a wedged claim would
+    // be a silent no-op - nothing would ever tell the claim it was no longer wanted,
+    // and a later late success would be adopted as if it still were. Deactivate the
+    // claim's own RuleGeneration (on_arm_complete's late-adoption check reads exactly
+    // this) and drop the locator entry - withdrawal ends this wedge's adoption
+    // candidacy for good, it does not touch `end`/`outcome`/`waiter_abandoned` (the
+    // sticky-Wedged receipt itself stays exactly what it already was). Nothing to
+    // disarm here either: the backend arm() call this claim is waiting on is still
+    // genuinely in flight (or already resolved and racing this call) - on_arm_
+    // complete's own ordinary "nobody left to adopt" path disarms it when it lands,
+    // unchanged.
+    if (const auto wit = wedged_by_rule_.find(rule_id); wit != wedged_by_rule_.end()) {
+        if (const auto wedge = wit->second.lock(); wedge && wedge->rg)
+            wedge->rg->active = false;
+        wedged_by_rule_.erase(wit);
+    }
+
     // rung 9c R5.2 (Case 0, generalised from #2233 item 3): rule_id belongs to a key
     // whose arm is still CLAIMED - in flight as the head, or queued behind it - so it
     // has no rules_/keys_ entry to withdraw yet. Mark the claim withdrawn and release
@@ -2598,7 +2673,8 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
     // disarmed). No "disarmed" audit - the rule was never actually armed (same
     // "pending arm withdrawn -> no lifecycle entry" contract the confirmed path's
     // `known` gate already encodes). The search excludes withdrawn AND abandoned
-    // claims so a retained stale claim can never match ahead of its live replacement,
+    // claims so a retained stale claim can never match ahead of its live replacement
+    // (a wedged one is handled above, unconditionally, before this scan even starts),
     // and (adversarial review K1') a claim whose commit already ran: on_arm_complete
     // publishes and pops an adopted claim inside the commit's own critical section,
     // so such a claim is never in the fifo here - the guard is belt-and-braces.
@@ -2633,26 +2709,6 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 return nullptr; // nothing to disarm yet; the claim's completion handles it
             }
         }
-    }
-
-    // rung 9c PR-5d (concern 1): Case 0 above deliberately never finds a wedged
-    // (waiter_abandoned) claim - see its own comment - and rule_id has no rules_
-    // entry either (a purely-wedged claim was never committed), so without this,
-    // withdrawing a rule_id whose only presence is a wedged claim was a silent
-    // no-op: nothing ever told the claim it was no longer wanted, and a later
-    // late success would be adopted as if it still were. Deactivate the claim's
-    // own RuleGeneration (on_arm_complete's late-adoption check reads exactly
-    // this) and drop the locator entry - withdrawal ends this wedge's adoption
-    // candidacy for good, it does not touch `end`/`outcome`/`waiter_abandoned`
-    // (the sticky-Wedged receipt itself stays exactly what it already was).
-    // Nothing to disarm here either: the backend arm() call this claim is
-    // waiting on is still genuinely in flight (or already resolved and racing
-    // this call) - on_arm_complete's own ordinary "nobody left to adopt" path
-    // disarms it when it lands, unchanged.
-    if (const auto wit = wedged_by_rule_.find(rule_id); wit != wedged_by_rule_.end()) {
-        if (const auto wedge = wit->second.lock(); wedge && wedge->rg)
-            wedge->rg->active = false;
-        wedged_by_rule_.erase(wit);
     }
 
     const auto rit = rules_.find(rule_id);
