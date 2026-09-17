@@ -405,13 +405,21 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         // rung 9c PR-5d (concern 1): a genuine (non-stopping) wedge is the ONLY
         // case adoption ever applies to - R5.5's stopping-time disarm is
         // unconditional and never consults this map (on_arm_complete's own
-        // wedge_may_adopt requires !stopping_). The map entry itself was already
-        // inserted above, before
-        // any of this branch's irreversible mutation - by the time `end`
-        // settles to WaiterTimedOutDispatched here, wedged_by_rule_ and
-        // is_retained_wedge() already agree, atomically, rather than by a
-        // second, separately-maintained condition that could observe one
-        // updated and not the other.
+        // wedge_may_adopt requires !stopping_). Corrected (adec35363 follow-up):
+        // this used to say the map entry was "already inserted above" regardless -
+        // true only for the non-superseded branch, where wedged_by_rule_.
+        // insert_or_assign(claim->rule_id, claim) above IS the last write to this
+        // map before `end` settles here, so wedged_by_rule_ and is_retained_wedge()
+        // already agree, atomically, by construction. On the `superseded` branch
+        // above, NO insert happens at all - a fresher generation already occupies
+        // rule_id's slot, so the fix deactivates `claim->rg` directly, in place,
+        // and leaves the map untouched, still pointing at that fresher claim. Both
+        // branches still reach this same agreement, just by different means: the
+        // non-superseded branch makes the map agree with `claim` by inserting it;
+        // the superseded branch makes `claim`'s own rg->active agree with its
+        // absence from the map by deactivating it directly. Either way, no window
+        // exists where wedged_by_rule_/is_retained_wedge() disagree with
+        // rg->active for the claim the map actually names.
     }
     if (!claim->outcome)
         claim->outcome = std::unexpected(reason);

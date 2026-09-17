@@ -706,7 +706,23 @@ together in prose but which do not share one signal in code:
   through `index_`/`rules_` at abandonment time), so a dedicated locator,
   `wedged_by_rule_` (rule_id -> the currently-wedged claim, populated the
   instant a claim wedges, non-stopping only), is what lets
-  `detach_rule_locked()`/`detach_all()` find and deactivate it. A genuine
+  `detach_rule_locked()`/`detach_all()` find and deactivate it. The map has two
+  writers - `abandon_claim_locked()` (a claim just timed out) and
+  `attach_core()`'s Reobserved-restore branch (a still-wedged claim is
+  re-observed) - and both guard against a cross-key collision (the SAME
+  rule_id wedged on two different keys at once, an ordinary flip-flop
+  redeploy) in OPPOSITE directions, because the claim each is about to insert
+  carries opposite provenance; and `detach_rule_locked()`'s own deactivation
+  of this map's entry runs UNCONDITIONALLY, FIRST, before its Case 0 FIFO scan
+  even starts, rather than only when Case 0 falls through unmatched - the 5th
+  occurrence of this same fail-open class on this branch (rung 9c PR-5d, found
+  by this governance run's own Gate 4 unhappy-path pass) was Case 0's own
+  mid-loop `return nullptr;` skipping this cleanup whenever it matched a
+  DIFFERENT, still-live claim for the same rule_id on another key first. See
+  `wedged_by_rule_`'s own doc comment in `guardian_spark_runtime.hpp` and
+  `detach_rule_locked()`'s own header comment for the full mechanics, guard
+  proofs, and reachable interleavings - both are canonical here; this
+  paragraph is a summary, not a substitute. A genuine
   reobservation (the SAME rule_id + spec re-attaching onto its own still-wedged
   head) is hoisted to run BEFORE `detach_rule_locked(rule_id)`'s own
   unconditional call in `attach_core()` - without that ordering, every
