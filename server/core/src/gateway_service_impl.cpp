@@ -1318,7 +1318,12 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // the #4324 fence resolved at the top of this branch, above, which
         // covers this write (via the passed-through `stream_home_id`), the
         // legacy in-memory teardown just above, AND the session-map erase
-        // below — CLOSED, was #4246 #4 / #4324. Task B (4.2b): fail-OPEN,
+        // below — CLOSED under today's shipped-gateway single-producer
+        // invariant, was #4246 #4 / #4324 (see gateway_route_store.hpp's
+        // "SCOPE OF CLOSED" note: the fence is check-then-act, not atomic
+        // with these effects, which is safe only because no producer of a
+        // genuinely concurrent same-session CONNECTED exists today — 4.3/4.4
+        // must close that gap before live re-home ships). Task B (4.2b): fail-OPEN,
         // deliberately — a degraded tombstone write here leaves a stale row
         // behind, but that row is bounded by the 90s lease TTL regardless
         // (kGatewayRouteLeaseTtlSecs): once the lease expires, a future

@@ -71,7 +71,7 @@ message StreamStatusNotification {
   string gateway_node = 5;
 
   // CC-03: wire capabilities this gateway build supports, advertised with
-  // every CONNECTED notification. yuzu_gw_upstream:notify_stream_status/4
+  // every CONNECTED notification. yuzu_gw_upstream:notify_stream_status/5
   // sends "command_dispatch_tag_v1" here as proof this build's vendored
   // agent.proto carries CommandRequest.dispatch_tag = 9 and forwards it
   // untouched. Mirrors the canonical proto/yuzu/gateway/v1/gateway.proto

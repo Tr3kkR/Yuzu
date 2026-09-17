@@ -73,7 +73,7 @@ message StreamStatusNotification {
   // CC-03 wire-capability handshake: literals this gateway build supports on
   // the wire, sent with every CONNECTED notification (the first message the
   // gateway emits upstream when an agent's Subscribe stream establishes —
-  // see yuzu_gw_agent:init/1 -> yuzu_gw_upstream:notify_stream_status/4 in
+  // see yuzu_gw_agent:init/1 -> yuzu_gw_upstream:notify_stream_status/5 in
   // gateway/apps/yuzu_gw/src/). The dispatch chokepoint checks for the
   // literal "command_dispatch_tag_v1": its presence means this gateway's
   // vendored agent.proto carries CommandRequest.dispatch_tag = 9 (see
