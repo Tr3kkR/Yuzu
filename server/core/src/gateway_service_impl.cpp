@@ -21,6 +21,7 @@
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
@@ -1049,6 +1050,28 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
             if (is_typed_inventory_source(plugin_name))
                 continue; // typed projections, handled by their seams below
             std::string json_str(data_bytes.begin(), data_bytes.end());
+            // #2437-class guard: this is the ONLY call site of InventoryStore::upsert
+            // in the tree, and this blob is raw wire bytes off an agent (relayed via
+            // the gateway) with no prior validation - not even a confirmed parse,
+            // let alone a depth check. dump() on data_json is unboundedly recursive
+            // (mcp_jsonrpc.hpp), so a poisoned blob stored here would SIGSEGV the
+            // whole process on the next read (data_inventory_routes.cpp,
+            // inventory_eval.cpp). Reject the raw text BEFORE parse/store - this one
+            // chokepoint retroactively protects every reader for FUTURE rows, but
+            // does not heal rows already written before this guard shipped (the
+            // three read-side guards cover those). Skip only this one source; still
+            // ack the overall report. Log identifiers only, never the payload.
+            if (mcp::json_exceeds_depth(json_str, mcp::kMcpMaxJsonDepth)) {
+                spdlog::warn("[gateway] ProxyInventory: rejecting '{}' blob from agent={} - "
+                            "nests too deeply (#2437-class)",
+                            plugin_name, agent_id);
+                if (metrics_)
+                    metrics_
+                        ->counter("yuzu_inventory_ingest_total",
+                                 {{"source", plugin_name}, {"outcome", "rejected"}})
+                        .increment();
+                continue;
+            }
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
         }
     }
