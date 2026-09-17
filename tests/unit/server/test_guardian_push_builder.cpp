@@ -14,8 +14,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -374,10 +377,11 @@ TEST_CASE("build_agent_push: a repeated attempt against the same poisoned row "
     // Models a second (and third) heartbeat/tick reconciling the SAME stored
     // rule: the poisoned row persists in the store (this fix does not heal or
     // rewrite it, see guardian_push_builder.hpp), so every subsequent push
-    // must re-derive the same exclusion, not crash, and not accumulate any
-    // per-call state (build_agent_push is a pure function with none to
-    // accumulate in the first place, this pins that property rather than
-    // assuming it).
+    // must re-derive the same exclusion result and not crash. build_agent_push
+    // itself carries no per-call state (its rule filtering/marshal is pure);
+    // the only state that survives across calls is the process-wide, bounded
+    // (kCapacity-many rule_ids) RuleExclusionSampler used to pace the
+    // exclusion log line, which does not affect this test's assertions.
     GuaranteedStateRuleRow poisoned = row("poisoned", "windows", "");
     poisoned.spec_json =
         R"({"spark":{"type":"registry-change","params":{}},)"
@@ -463,4 +467,171 @@ TEST_CASE("platform_display_name — raw agent token to operator-facing label",
     CHECK(platform_display_name("linux") == "Linux");
     CHECK(platform_display_name("macos") == "macOS");  // alias normalises too
     CHECK(platform_display_name("") == "unknown");
+}
+
+// -----------------------------------------------------------------------
+// RuleExclusionSampler (#4497/#4499) - per-rule LRU, time-based log pacing
+// for the depth-guard exclusion path. These tests construct their OWN
+// independently-instantiable sampler with an injectable monotonic clock
+// (never the process-wide instance build_agent_push shares, and never a
+// real sleep), per the recorded design decision in
+// guardian_push_builder.hpp's RuleExclusionSampler doc comment.
+// -----------------------------------------------------------------------
+
+TEST_CASE("RuleExclusionSampler: a hot rule cannot mask a distinct rule's own first log",
+          "[guardian_push_builder][sampler]") {
+    // #4497's cross-rule-masking defect: the OLD single shared sampler could
+    // let rule A's ongoing "episode" swallow rule B's first exclusion, so an
+    // operator investigating rule B had no guarantee the log ever named it.
+    // Per-rule keying fixes this structurally: B's FIRST observation always
+    // logs immediately, independent of A's state.
+    guardian::RuleExclusionSampler sampler;
+    std::chrono::steady_clock::time_point t0{};
+    sampler.set_clock_for_test([&t0] { return t0; });
+
+    CHECK(sampler.should_log("rule-a"));        // A's first exclusion: immediate log
+    CHECK_FALSE(sampler.should_log("rule-a"));  // A still within its own 60s interval
+    CHECK_FALSE(sampler.should_log("rule-a"));
+    CHECK(sampler.should_log("rule-b"));        // B's first exclusion: STILL immediate
+}
+
+TEST_CASE("RuleExclusionSampler: sustained exclusions on one rule permit once per 60s",
+          "[guardian_push_builder][sampler]") {
+    guardian::RuleExclusionSampler sampler;
+    std::chrono::steady_clock::time_point now{};
+    sampler.set_clock_for_test([&now] { return now; });
+
+    CHECK(sampler.should_log("r"));  // initial permit - first observation
+    now += std::chrono::seconds(1);
+    CHECK_FALSE(sampler.should_log("r"));
+    now += std::chrono::seconds(58);  // t=59s since the permitted log: still suppressed
+    CHECK_FALSE(sampler.should_log("r"));
+    now += std::chrono::seconds(1);   // t=60s: at the boundary, due again
+    CHECK(sampler.should_log("r"));
+    now += std::chrono::seconds(1);   // right after a fresh permit
+    CHECK_FALSE(sampler.should_log("r"));
+    now += guardian::RuleExclusionSampler::kRepeatInterval;  // a full interval later
+    CHECK(sampler.should_log("r"));
+}
+
+TEST_CASE("RuleExclusionSampler: concurrent same-rule calls yield exactly one permit",
+          "[guardian_push_builder][sampler][concurrency]") {
+    guardian::RuleExclusionSampler sampler;
+    std::chrono::steady_clock::time_point now{};
+    sampler.set_clock_for_test([&now] { return now; });
+
+    constexpr int kThreads = 16;
+    std::atomic<int> permits{0};
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreads);
+    for (int i = 0; i < kThreads; ++i)
+        threads.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_relaxed);
+            while (!go.load(std::memory_order_acquire))
+                ;  // spin-gate: maximise actual overlap at should_log()
+            if (sampler.should_log("hot-rule"))
+                permits.fetch_add(1, std::memory_order_relaxed);
+        });
+    while (ready.load(std::memory_order_relaxed) < kThreads)
+        ;  // wait for every thread to reach the gate before releasing them together
+    go.store(true, std::memory_order_release);
+    for (auto& t : threads)
+        t.join();
+
+    // The internal mutex serializes should_log() end-to-end (the decision AND
+    // the deadline update happen under the same lock), so exactly one of the
+    // 16 racing calls for the SAME rule_id at the SAME injected timestamp can
+    // observe "not yet due" turn permitted - never zero, never more than one.
+    CHECK(permits.load() == 1);
+}
+
+TEST_CASE("RuleExclusionSampler: LRU capacity, eviction, and reappearance (#4497 exception)",
+          "[guardian_push_builder][sampler][lru]") {
+    guardian::RuleExclusionSampler sampler;
+    std::chrono::steady_clock::time_point now{};
+    sampler.set_clock_for_test([&now] { return now; });
+    constexpr auto kCapacity = guardian::RuleExclusionSampler::kCapacity;
+
+    SECTION("filling to capacity tracks every distinct rule, none evicted yet") {
+        for (std::size_t i = 0; i < kCapacity; ++i)
+            CHECK(sampler.should_log("rule-" + std::to_string(i)));  // each is a first observation
+        CHECK(sampler.tracked_count_for_test() == kCapacity);
+    }
+
+    SECTION("a 257th distinct rule evicts the least-recently-observed entry") {
+        // Observe kCapacity distinct rules in order 0..255: rule-0 is now the
+        // LEAST recently observed (touched first, never touched again).
+        for (std::size_t i = 0; i < kCapacity; ++i)
+            CHECK(sampler.should_log("rule-" + std::to_string(i)));  // each a first observation
+        CHECK(sampler.tracked_count_for_test() == kCapacity);
+
+        // A 257th distinct rule must evict rule-0 to stay within capacity.
+        CHECK(sampler.should_log("rule-256"));  // first observation: immediate log
+        CHECK(sampler.tracked_count_for_test() == kCapacity);
+
+        // rule-1..rule-255 were never evicted and stay suppressed within
+        // their own interval. Checked BEFORE re-touching rule-0 below: an
+        // evicted rule_id re-appearing is ITSELF a fresh insertion that would
+        // trigger a further eviction (of whatever is then the new
+        // least-recently-observed entry) and confound this assertion.
+        CHECK_FALSE(sampler.should_log("rule-1"));
+        CHECK_FALSE(sampler.should_log("rule-255"));
+
+        // rule-0 was evicted: encountering it again is a FIRST observation
+        // again and logs immediately, even though (had it not been evicted)
+        // it would still be well inside its own 60s repeat window. This is
+        // the documented, accepted tradeoff (#4497/#4499): an LRU capacity is
+        // NOT a global log-rate limit.
+        CHECK(sampler.should_log("rule-0"));
+    }
+
+    SECTION("touching an existing rule refreshes its recency, protecting it from eviction") {
+        for (std::size_t i = 0; i < kCapacity; ++i)
+            CHECK(sampler.should_log("rule-" + std::to_string(i)));  // each a first observation
+
+        // Re-touch rule-0 (a SUPPRESSED call still refreshes LRU recency), so
+        // it is no longer the least-recently-observed entry - rule-1 is.
+        CHECK_FALSE(sampler.should_log("rule-0"));
+        CHECK(sampler.should_log("rule-256"));  // evicts rule-1, not rule-0
+
+        // rule-0 survived (its recency was refreshed above): a further call
+        // is still suppressed, not treated as a fresh first-observation.
+        CHECK_FALSE(sampler.should_log("rule-0"));
+        // rule-1, now the least-recently-observed entry, was evicted instead.
+        CHECK(sampler.should_log("rule-1"));
+    }
+}
+
+TEST_CASE("build_agent_push: excluding the same poisoned rule repeatedly increments the "
+          "metric on every call regardless of whether the log line was suppressed",
+          "[guardian_push_builder][security][depth][observability][sampler]") {
+    // #4497/#4499: the log line is now paced PER RULE via RuleExclusionSampler
+    // and will be suppressed on the 2nd/3rd call below (well within its 60s
+    // repeat interval, since this test runs in well under 60 real seconds) -
+    // the counter increment MUST NOT be coupled to that decision, staying
+    // unconditional on every exclusion. Uses a rule_id no other TEST_CASE in
+    // this binary touches, since build_agent_push shares ONE process-wide
+    // RuleExclusionSampler across the whole test run.
+    yuzu::MetricsRegistry metrics;
+    GuaranteedStateRuleRow poisoned = row("poisoned-metric-unconditional", "windows", "");
+    poisoned.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","nested":)" +
+        std::string(40, '[') + std::string(40, ']') +
+        R"(}},"remediation":{"type":"alert-only"}})";
+
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+        INFO("attempt " << attempt);
+        auto push = guardian::build_agent_push({poisoned}, "windows", always_in_scope,
+                                               /*full_sync=*/true,
+                                               /*generation=*/static_cast<std::uint64_t>(attempt),
+                                               &metrics);
+        CHECK(push.rules_size() == 0);  // excluded every time
+        CHECK(metrics
+                  .counter("yuzu_guardian_push_rule_excluded_total",
+                          {{"reason", "depth_exceeded"}})
+                  .value() == static_cast<double>(attempt));
+    }
 }
