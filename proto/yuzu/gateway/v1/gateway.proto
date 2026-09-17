@@ -105,7 +105,8 @@ message StreamStatusNotification {
   // additive and optional-safe. This canonical file is mirrored verbatim into
   // gateway/priv/proto/gateway.proto and gateway/priv/proto/yuzu/gateway/v1/
   // gateway.proto — both gateway copies must carry this field identically or
-  // gpb drops it on one build path (docs/gateway-proto-grpcbox-constraints.md).
+  // gpb drops it on one build path (docs/erlang-gateway-build.md's
+  // check-proto-codegen.sh section).
   string stream_home_id = 8;
 }
 
