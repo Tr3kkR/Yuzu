@@ -204,13 +204,13 @@ These fields are used by the [Scope Engine](scope-engine.md) for device targetin
 
 ### Dashboard
 
-The **Devices** page (`/devices`) lists the **currently-connected** agents and requires the **`Infrastructure:Read`** permission — the same gate as the agent list (`/api/agents`). It uses the same visibility provider, so an operator without `Infrastructure:Read` cannot reach it; note that, exactly like `/api/agents`, an operator who *does* hold `Infrastructure:Read` sees the whole connected fleet here (per-team **list** filtering beyond that gate is not applied today — the per-team control is enforced per device, below). Each row shows hostname, OS, architecture, online status, and per-device DEX score. Filter by OS or search by name; click any row to open that device's page. **DEX scoring is per-render, never fleet-wide:** a device-page open scores that one device, and the list scores only the rows actually rendered after filtering (`devices_fn` is identity-only) — no page load may trigger a whole-fleet scoring pass.
+**`/devices` now 302-redirects to `/hardware`** (the Hardware CI list — round-3, see `docs/user-manual/inventory.md`) — the old standalone Devices page no longer renders directly; a bookmarked `/devices` link still works, since browsers follow the redirect transparently. Hardware's own list requires **`Inventory:Read`** rather than the old page's `Infrastructure:Read`; every seeded built-in role holding one also holds the other, so no default-role regression, but a custom role granted `Infrastructure:Read` alone loses list access via the old URL. Each row shows hostname, OS, architecture, online status, and per-device DEX score, plus (new) agent version, claimed IP, and tags. Filter by OS or search by name; click any row to open that device's Hardware CI record. **DEX scoring is per-render, never fleet-wide:** opening a record scores that one device, and the list scores only the rows actually rendered after filtering — no page load may trigger a whole-fleet scoring pass.
 
 > The list is sourced from the live connection registry, so it shows connected devices only (there is no offline/status filter). Enrolled-but-offline devices and real last-seen times arrive with the persistent device-inventory slice.
 
-#### Device page (`/device?id=`)
+#### Device page (`/device?id=`, redirects to `/hardware/ci?id=`)
 
-The per-device page is the shared entity view reached from any dashboard, organised into lens tabs:
+The per-device page is the shared entity view reached from any dashboard, organised into lens tabs — the same lens-tab machinery renders both the legacy device page's tabs and the Hardware CI record's Overview/DEX/Guardian tabs:
 
 Every per-device route is scoped to the device's management group (a global grant **or** a role assigned on the device's group / an ancestor): opening a device outside your scope returns *forbidden*, never its data.
 
@@ -249,6 +249,27 @@ The **ARP** card now works on all three platforms, with per-OS limits: Windows r
 The **Processes (tree)** and **ARP** cards depend on the `processes/list_tree` and `network_config/arp` agent actions, which ship with agents built from this release onward. An older agent that predates them returns an `unknown action` response, which currently renders as an **empty card** — upgrade the agent to populate those cards. (Tracked follow-up: have the agent emit an explicit "unsupported on this agent version" note instead of an empty card.)
 
 The machine-readable equivalents (for agentic workers and automation) are `GET /api/v1/dex/devices/{id}` (the per-device DEX read model), `GET /api/v1/dex/devices/{id}/app-perf` (the REST twin of the *Application performance over time* panel — the retained per-`(app, version, day)` history, same `dex.device.app_perf.view` audit, fail-closed), and `POST /api/v1/dex/devices/{id}/live?kind=uptime|processes` (the live dispatch — POST because it has a side effect; the dashboard's additional cards — process tree, services, users, network, capture sources — are dashboard-only pending the REST/JSON A1 backfill **#1649**). They enforce the same scoped permissions and emit the same audit verbs as these panels. **They differ in failure mode, though:** the REST endpoints are **audit-fail-closed** — if the audit row cannot persist they return `503` + `Sec-Audit-Failed: true` and serve no data (or, for `/live`, dispatch nothing), whereas these dashboard panels set `Sec-Audit-Failed: true` on the response but continue to render (a transient audit hiccup must not blank the dashboard). Alert on `Sec-Audit-Failed: true` from **either** surface as a SOC 2 CC7.2 evidence-gap signal. See [REST API — DEX](rest-api.md).
+
+##### Physical
+
+The Hardware CI record's own **Live** lens (`/hardware` → device → **Live** tab) hx-gets the same `/fragments/device/live/*` fragments as the device page above — same dispatch-and-poll machinery, same cards — and adds ten physical-hardware cards, each wiring an already-shipped agent plugin action into the shared card renderer:
+
+| Card | Source | Audit verb | OS |
+|---|---|---|---|
+| **Disks** — per-disk model, capacity, media type, and interface | `hardware/disks` | `device.live.hw_disks` | all |
+| **Memory** — installed memory modules: slot, capacity, type, speed | `hardware/memory` | `device.live.hw_memory` | all |
+| **Processors** — installed CPU(s): model, cores, threads, clock speed | `hardware/processors` | `device.live.hw_processors` | all |
+| **Drivers** — installed device drivers: name, version, date, provider, class | `hardware/drivers` | `device.live.hw_drivers` | Windows, Linux |
+| **Battery** — presence, charge state, percent, time-to-empty, cycle count, health | `power_health/battery` | `device.live.battery` | all |
+| **Thermal** — thermal zone status and temperature | `power_health/thermal` | `device.live.thermal` | all |
+| **Disk health (SMART)** — per-disk SMART health, percent used, spare percent | `disk_actions/smart` | `device.live.smart` | Windows, macOS |
+| **Volumes** — mounted volumes: mount points, backing device, filesystem, size | `disk_actions/volumes` | `device.live.volumes` | Windows, macOS |
+| **Network adapters** — adapter name, MAC, link speed, status | `network_config/adapters` | `device.live.adapters` | all |
+| **Wi-Fi** — current association: SSID, signal, security, BSSID/channel | `wifi/connected` | `device.live.wifi` | all |
+
+All ten are machine-health reads (hardware attributes, not per-user behavioral data) and require **`Execution:Execute`** plus `GuaranteedState:Read`, scoped to the device's management group — same gating as every other live card. **Drivers** is Windows- and Linux-only: the agent enumerates no equivalent driver registry on macOS. **Disk health (SMART)** and **Volumes** are Windows- and macOS-only: the `disk_actions` plugin's Linux leg does not back either action. The remaining six (Disks, Memory, Processors, Battery, Thermal, Network adapters, Wi-Fi) report on all three platforms.
+
+**Deferred: disk-encryption status.** BitLocker/FileVault/LUKS state (`bitlocker/state`) was investigated for this round and dropped, not shipped. Its three platform legs return incompatible wire shapes — Windows a 5-field volume/conversion/percent/method/protection record, Linux a 3-field volume/crypto-type/active-or-inactive record with entirely different field semantics at the same positions, and macOS a bare 1-field enabled/disabled flag — so one generic column table would mislabel the Linux and macOS data. It needs a bespoke per-OS renderer rather than the shared card table; filed as a follow-up.
 
 ### REST API
 

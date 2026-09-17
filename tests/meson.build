@@ -293,6 +293,7 @@ agent_test_exe = executable(
     'unit/test_guardian_rule_eval.cpp',
     'unit/test_guardian_drift_event.cpp',
     'unit/test_guardian_scope_guard.cpp',
+    'unit/test_offline_hive_mutex.cpp',       # ScopedOfflineHiveLock RAII/mutual-exclusion contract
     'unit/test_guardian_outbox.cpp',
     'unit/test_guardian_spark_send.cpp',
     'unit/test_guardian_spark_runtime.cpp',
@@ -313,6 +314,8 @@ agent_test_exe = executable(
     'unit/test_cert_discovery.cpp',
     'unit/test_env_util.cpp',
     'unit/test_inventory_sync.cpp',
+    'unit/test_agent_sync_command.cpp', # round-3 remediation: decide_sync_now pure-core extraction
+                                          # from agent.cpp's __sync__.now reserved-command branch
     'unit/test_device_ci_sync.cpp',
     'unit/test_sync_source_app_perf.cpp',
     'unit/test_win_str_utils.cpp',
@@ -334,10 +337,12 @@ agent_test_exe = executable(
     'unit/test_certificates_macos.cpp',  # A-1.11 (INT-2 handoff): existed unregistered on the branch;
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
+    'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
     'unit/test_passwd_lookup.cpp',       # #3406: bounded passwd resolution (agent-core seam). The
                                           # load-bearing case injects a NEVER-RETURNING lookup and asserts
                                           # the caller is released inside its budget -- the regression that
                                           # argv-izing the login-keychain read introduced.
+    'unit/test_keychain_read.cpp',        # #3246: bounded SecItem keychain read (agent-core seam); never-returning-read case is the regression test
     'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
@@ -451,6 +456,9 @@ agent_test_exe = executable(
                                                 # end to end via LocalDispatcher (Darwin-only, self-gated)
     'unit/test_installed_apps_macos_enrich.cpp', # Wave 4 PR4.3a gate-1 fix: SecStaticCode signed/unsigned
                                                 # discrimination (macOS-only; a no-op TU elsewhere)
+    'unit/test_installed_apps_macos_receipts.cpp', # round-3 sync-speed fix: pure receipt-plist byte
+                                                # parser against a real captured fixture (macOS-only;
+                                                # a no-op TU elsewhere)
     'unit/test_software_actions_parsers.cpp', # Wave 4 PR4.3b: software_actions' FIRST tests --
                                                 # pure winget/apt/yum/softwareupdate/dpkg-query parsers
     'unit/test_software_actions_actions.cpp', # Wave 4 PR4.3b: real software_actions.dylib/.so/.dll
@@ -1133,6 +1141,9 @@ if build_server
       'unit/server/test_dex_routes.cpp',
       'unit/server/test_device_ui.cpp',
       'unit/server/test_device_routes.cpp',
+      'unit/server/test_hardware_list_model.cpp', # round-3: Hardware CI list/record pure model
+      'unit/server/test_hardware_ui.cpp',         # round-3: Hardware CI list/record HTML fragment
+      'unit/server/test_hardware_routes.cpp',     # round-3: Hardware CI list/record routes + REST twin
       'unit/server/test_inventory_routes.cpp',
       'unit/server/test_inventory_store.cpp',
       'unit/server/test_data_inventory_routes.cpp', # #2542 PR-11: the 3-route generic plugin-data Inventory API, extracted onto the HttpRouteSink seam
@@ -2231,7 +2242,12 @@ test('plugin readme gate',
   _python3_test,
   args: [files('test_plugin_readmes.py')],
   suite: 'docs',
-  timeout: 60,
+  # Measured ~25-31s standalone; the self-hosted runner pools share one OS
+  # identity across 4 runner agents on one box (CLAUDE.md's documented
+  # shared-runner-under-load invariant), and this test was observed hitting
+  # the old 60s timeout under exactly that kind of concurrent docs-suite
+  # load on this session's own Mac (governance Gate 3, build-ci finding).
+  timeout: 120,
 )
 
 # Prometheus alert-rule unit tests (#2553). The same script the docs-lint
