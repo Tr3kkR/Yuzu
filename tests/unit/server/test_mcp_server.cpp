@@ -24709,6 +24709,64 @@ TEST_CASE("MCP create_result_set_from_inventory_query: matched membership is con
     CHECK(payload["device_count"] == 1);
 }
 
+// #2437-class guard (C11/C12), MCP transport: create_result_set_from_inventory_query
+// shares the exact same evaluate_inventory() (inventory_eval.cpp) as the REST
+// twin (test_rest_result_sets_async.cpp carries the equivalent REST-side
+// test) - one guard covers both. Uses "exists" rather than "==" for the same
+// reason as the REST twin: with "==" the poisoned record's dump()-fallback
+// string would never equal the target value, so the guard's absence would be
+// invisible at this level (the direct reachability proof lives in
+// test_inventory_eval.cpp, the actual code under test). Real structural
+// nesting, NOT brackets inside a string literal. Reachability-proxy depth
+// (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack depth.
+TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned stored data_json is "
+          "excluded from matching membership, a healthy matching agent is still included, "
+          "no crash",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"depth-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // no crash
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["device_count"] == 1);
+    // Confirm identity, not just count.
+    std::string next;
+    auto members = rs_bundle->members(payload["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
+}
+
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "
           "family), never silently treated as absent",
           "[mcp][integration][result-sets][scope]") {

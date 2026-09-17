@@ -1070,6 +1070,73 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
     CHECK(body["data"]["device_count"] == 1);
 }
 
+// #2437-class guard (C11/C12): a stored data_json row nesting past
+// kMcpMaxJsonDepth reaches evaluate_inventory() (inventory_eval.cpp) via this
+// exact route. json::parse handles very deep input fine, so without the
+// guard the row parses cleanly and json_value_to_string's dump() fallback on
+// the parsed tree would SIGSEGV the whole process — taking the OTHER
+// matching agent's membership down with it. Seeded directly via SQL
+// (bypassing the gateway write-side guard) to prove this read-side guard
+// independently, mirroring the confinement test's seeding pattern above.
+//
+// Uses "exists" rather than "==": with "==" the poisoned record's
+// dump()-fallback string would never equal the target value, so the guard's
+// absence would be invisible at this level (verified separately in
+// test_inventory_eval.cpp, which is the actual code under test and proves
+// reachability directly). "exists" matches on presence alone, so it is
+// answered TRUE for the poisoned record's "field1" whether the guard runs
+// or not — making device_count the deciding, guard-dependent signal here too
+// (2 without the guard, 1 with it). Real structural nesting, NOT brackets
+// inside a string literal — json_exceeds_depth deliberately does not count
+// bracket characters inside a string value as structure. Reachability-proxy
+// depth (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack
+// depth.
+TEST_CASE("from-inventory-query: a poisoned stored data_json is excluded from matching "
+          "membership, a healthy matching agent is still included, no crash",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"depth-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 201); // no crash
+    CHECK(body["data"]["device_count"] == 1);
+    // Confirm identity, not just count — the created set must contain the
+    // healthy agent and MUST NOT contain the poisoned one.
+    std::string next;
+    auto members = h.store->members(body["data"]["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
+}
+
 TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",
           "[pg][result_set][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
