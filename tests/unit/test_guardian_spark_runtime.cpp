@@ -8581,6 +8581,179 @@ TEST_CASE("adversarial-review Blocker 2 (rung 9c PR-5d follow-up): a throw from 
     CHECK(rt->armed_key_count() == 0);
 }
 
+TEST_CASE("Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): a throw from "
+          "the wedged_by_rule_ locator insertion during attach_core's Reobserved-"
+          "restore branch leaves rg->active untouched (still false) - fails closed, "
+          "not open, exactly like the sibling abandon_claim_locked fix",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key = spark_key(file_spec("/a"));
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // Routine full-sync retry teardown: deactivates candidacy, clears the locator -
+    // the precondition for the NEXT reobservation to reach the fallible INSERT path
+    // (rather than a same-key-overwrite no-op).
+    rt->detach_all();
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    // Fault the shared locator-insert seam, then reobserve the identical
+    // (rule_id, spec) - this is the ONLY call that reaches attach_core's Reobserved-
+    // restore branch's insert_or_assign (the seam is exercised at THIS site, not
+    // abandon_claim_locked's, since nothing is currently Dispatching/timing-out).
+    rt->set_wedge_locator_fault_for_test(true);
+    REQUIRE_THROWS_AS(rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                      file_exists_rule("r1"), true),
+                      std::bad_alloc);
+
+    // Fail CLOSED, not open: the throw must leave rg->active exactly as detach_all()
+    // left it (still false, still no locator entry) - never stuck true. Observable
+    // proof: releasing the hang now must disarm, not adopt, exactly like any other
+    // still-deactivated wedge's late success (pre-fix, the buggy order would have
+    // left rg->active permanently true here with no way for a real withdrawal to
+    // ever find and deactivate it again, and the late success would be wrongly
+    // adopted).
+    CHECK(rt->wedged_reobservations() == 1); // counted before the throw - "observed,"
+                                             // not "restored" (see the counter's own
+                                             // increment site, ahead of the fix)
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+}
+
+TEST_CASE("Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): after a faulted "
+          "Reobserved-restore attempt, a SECOND reobservation retries the insert and "
+          "succeeds - self-healing, not permanently poisoned",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key = spark_key(file_spec("/a"));
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+
+    rt->detach_all();
+    CHECK(rt->claim_queue_depth_for_test(key) == 1);
+
+    rt->set_wedge_locator_fault_for_test(true);
+    REQUIRE_THROWS_AS(rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                      file_exists_rule("r1"), true),
+                      std::bad_alloc);
+
+    // The seam is consumed-once: this SECOND reobservation is fault-free and must
+    // succeed in restoring candidacy - proving the guard (`!rg->active`) correctly
+    // stayed false after the throw and did not silently disable all future retries
+    // the way the pre-fix ordering would have (active=true written before the
+    // fallible insert, so a throw left `!active` reading false on every later
+    // attempt and the restore block never ran again).
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(res2.has_value());
+    CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->wedged_reobservations() == 2); // both attempts observed the wedge
+
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->armed_key_count() == 1);
+}
+
+TEST_CASE("Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): a clean "
+          "withdraw-then-redeploy-to-a-different-key sequence stays safe against a "
+          "stale key-A late success once the F1 fix is in place - does NOT itself "
+          "exercise the new rules_.contains defense-in-depth guard's true branch, "
+          "since reaching that branch requires the invariant it defends to already "
+          "be violated, which the F1 fix makes unreachable via the public API; that "
+          "branch is unit-tested only by code inspection, not a dedicated fault "
+          "seam - see this test's own trailing comment",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const auto key_a = spark_key(file_spec("/a"));
+
+    // Wedge r1 on key A.
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(rt->expire_overdue_claims() == 1);
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // Simulate the poisoned state directly via the ledger's own claim-index
+    // rollback: withdraw r1 the ordinary way (detach_rule_locked's wedge lookup
+    // deactivates rg->active/clears the locator, exactly as a genuine withdrawal
+    // should), matching "the invariant this PR relies on has been violated
+    // upstream" is not reachable via the public API post-fix (that's the point of
+    // the F1 fix) - so this test instead proves the F2 guard's OWN behavior
+    // directly: redeploy r1 to key B while it is genuinely withdrawn from key A,
+    // then release the ORIGINAL hang and confirm the stale key-A completion is
+    // disarmed (never adopted) and rules_["r1"] still resolves to key B's live
+    // generation throughout.
+    rt->detach_rule("r1");
+
+    // Key B's arm resolves immediately (no hang) - only the stale key-A claim is
+    // still outstanding.
+    auto res2 = rt->attach_rule("r1", file_spec("/b"), file_exists_rule("r1"), true);
+    REQUIRE(res2.has_value());
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1); // key B, live
+
+    // The stale key-A backend arm() finally completes. Because r1 was properly
+    // withdrawn before the redeploy (F1's fix keeps this the common, non-poisoned
+    // case), rg->active already reads false for the key-A claim - adoption is
+    // refused by the EXISTING `claim->rg->active` check alone here, which is
+    // exactly why this scenario needs the ledger-level assertion below rather than
+    // a forced fault to exercise the F2 guard's own `rules_.contains` branch in
+    // isolation (that branch requires rg->active==true AND rules_ already
+    // populated - a state this PR's own F1 fix makes unreachable via the public
+    // API in the ordinary withdraw-then-redeploy sequence, which is the deliberate
+    // defense-in-depth point: two independent guards, not one relied on alone).
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() >= 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(rt->rule_count() == 1);
+    CHECK(rt->armed_key_count() == 1);
+    const auto res3 = rt->attach_rule("r-fresh", file_spec("/b"), file_exists_rule("r-fresh"), true);
+    REQUIRE(res3.has_value());
+    CHECK(rt->rule_count() == 2); // r1 (key B) + r-fresh, sharing key B's watcher
+}
+
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_id) "
           "onto a Wedged key is refused immediately, synchronously, with no new "
           "claim ever queued",
