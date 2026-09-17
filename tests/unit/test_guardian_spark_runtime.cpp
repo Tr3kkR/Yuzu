@@ -8688,6 +8688,13 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a refused new claimant does not disturb a
     // includes it.
     CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Committed);
     CHECK(rt->rule_count() == 1);
+    // Adversarial-review should-fix (rung 9c PR-5d follow-up): explicit proof r1
+    // itself, NOT just "rule_count()==1", is the one NOT adopted here - the
+    // `live.empty()` guard (not structural uniqueness, see the corrected comment
+    // at on_arm_complete's adoption branch) is what excludes it while r2 is a
+    // live follower. r1's own rule stays unenforced until the next Reapply
+    // re-attaches it fresh; its receipt stays exactly what it already was.
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2), crash-regression: the BLOCKING attach_rule() "

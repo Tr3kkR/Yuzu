@@ -985,14 +985,23 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                         !c->outcome && !c->commit_exception && c->index_held)
                         live.push_back(c);
 
-                // rung 9c PR-5d (concern 1): a wedged head is structurally the ONLY
-                // claim that can ever be here (attach_core()'s up-2 immediate-refusal
-                // never queues a different-rule_id sibling behind a Wedged head, and
-                // a same-rule_id retry re-observes the SAME object instead of queuing
-                // a new one - see is_retained_wedge()'s own callers) - `finished` is
-                // just {claim} whenever this is true. Its episode ends HERE either
-                // way (adopted or not), so the locator entry is dropped unconditionally
-                // before deciding which.
+                // Adversarial-review correction (rung 9c PR-5d follow-up): this
+                // comment previously claimed a wedged head is structurally the ONLY
+                // claim that can ever be here - false. attach_core()'s up-2
+                // immediate-refusal only fires once the head is ALREADY wedged at
+                // attach time; a DIFFERENT rule_id that queued behind the head while
+                // it was still Dispatching survives the transition to Wedged and
+                // remains a live follower (see the up-2 comment elsewhere in this
+                // file: "Live followers CAN exist behind a wedged head" - a
+                // pre-existing test pins exactly this: an unrelated rule queued
+                // before the wedge, still live when the wedge's late success
+                // lands). What actually excludes adoption in that case is the
+                // `live.empty()` runtime guard just below, not structural
+                // uniqueness - when a live follower exists, the ordinary
+                // live-siblings commit path handles it and this claim's own wedge
+                // is NOT adopted (still recoverable on the next Reapply). Its
+                // episode ends HERE either way (adopted or not), so the locator
+                // entry is dropped unconditionally before deciding which.
                 const bool was_wedge = is_retained_wedge(*claim);
                 if (was_wedge) {
                     if (const auto wit = wedged_by_rule_.find(claim->rule_id);

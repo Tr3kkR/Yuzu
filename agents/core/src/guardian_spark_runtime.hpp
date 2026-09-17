@@ -1709,17 +1709,31 @@ private:
     /// would otherwise be a silent no-op that on_arm_complete's own late-adoption
     /// check (is_retained_wedge() + KeyClaim::rg->active) could never learn about.
     /// Erased (a) by detach_rule_locked()/detach_all() the moment they deactivate
-    /// the entry's rg->active (withdrawal ends the claim's adoption candidacy for
-    /// good - a later Reobserved retry on the SAME still-wedged claim does not
-    /// reinstate it, see attach_core()'s own Reobserved branch, which is
-    /// unaffected by this map entirely), and (b) by on_arm_complete() the instant
-    /// the wedge actually resolves (adopted or not) - the episode is over either
-    /// way and a stale entry must never outlive the claim object it names.
+    /// the entry's rg->active - withdrawal ends the claim's adoption candidacy;
+    /// (b) by on_arm_complete() the instant the wedge actually resolves (adopted
+    /// or not) - the episode is over either way and a stale entry must not
+    /// outlive the claim object it names; and (c) by
+    /// reclassify_dispatching_race_locked() when it corrects a claim's `end` away
+    /// from WaiterTimedOutDispatched (it is no longer a retained wedge once
+    /// that happens). Adversarial-review correction (rung 9c PR-5d follow-up):
+    /// a same-rule_id/same-spec Reobserved retry DOES reinstate a still-wedged
+    /// claim whose rg->active was deactivated by an intervening full-sync
+    /// detach_all() sweep - see attach_core()'s Reobserved branch, added as the
+    /// fix for exactly that case (a rule genuinely still desired must not
+    /// permanently lose adoption candidacy just because a routine retry's
+    /// blanket teardown ran first). Two narrower paths can still leave a stale
+    /// entry uncorrected today - a fault injected before on_arm_complete()'s
+    /// own erase at (b) (the `fault_here_for_test(1)` seam), and the compensating/
+    /// finalize path that pops a claim without consulting this map - both are
+    /// contained by the identity-check below and by insert_or_assign()
+    /// overwriting on a later same-rule wedge, never a correctness issue, only
+    /// a residual stale entry.
     /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
     /// claim alive after claims_ itself has already dropped it (a defensive
-    /// belt-and-braces should erasure at (a)/(b) above ever be missed on some
-    /// future edit) - a caller consulting this map .lock()s it and treats a dead
-    /// weak_ptr exactly like "not found".
+    /// belt-and-braces should erasure at (a)/(b)/(c) above ever be missed on
+    /// some future edit, including the two known-stale paths just named) - a
+    /// caller consulting this map .lock()s it and treats a dead weak_ptr
+    /// exactly like "not found".
     std::unordered_map<std::string, std::weak_ptr<KeyClaim>> wedged_by_rule_;
     /// ONE runtime-wide CV (paired with registry_mu_) for every claim waiter: per-key
     /// CVs have an entry-lifetime problem (erased while a waiter references them),
@@ -1869,8 +1883,19 @@ private:
     void reclassify_dispatching_race_locked(KeyClaim& claim, ClaimEnd real_end) noexcept {
         assert(claim.kind == ClaimKind::Arm);
         if (claim.dispatch == ClaimDispatch::Dispatching &&
-            claim.end == ClaimEnd::WaiterTimedOutDispatched)
+            claim.end == ClaimEnd::WaiterTimedOutDispatched) {
             claim.end = real_end;
+            // Adversarial-review minor fix (rung 9c PR-5d follow-up): this claim
+            // is no longer a retained wedge once `end` is corrected away from
+            // WaiterTimedOutDispatched - drop its wedged_by_rule_ entry too, so
+            // "erased the instant the wedge resolves" holds here as well, not
+            // only on the ordinary on_arm_complete path. Identity-checked: only
+            // erase if the map still points at THIS claim (a same-rule_id
+            // re-wedge could already have overwritten the entry).
+            if (const auto wit = wedged_by_rule_.find(claim.rule_id);
+                wit != wedged_by_rule_.end() && wit->second.lock().get() == &claim)
+                wedged_by_rule_.erase(wit);
+        }
     }
     /// rung 9c PR-5b hardening (this governance run): std::atomic<int> elements
     /// (was a plain std::array<int, kIoClassCount>) specifically so a
