@@ -1433,3 +1433,32 @@ TEST_CASE("parse_amcache_inventory_application_file: map-level mutation fuzz ove
         CHECK(result.malformed_fields == 0);
     }
 }
+
+TEST_CASE("prefetch_absence_token: nullopt/0/1-3/other map to the three distinct tokens",
+          "[execution_artifacts][parsers][prefetch]") {
+    static_assert(kPrefetchDisabled != kPrefetchEvidenceAbsent);
+    static_assert(kPrefetchDisabled != kPrefetchStateUnknown);
+    static_assert(kPrefetchEvidenceAbsent != kPrefetchStateUnknown);
+
+    SECTION("nullopt (registry unreadable) -> prefetch_state_unknown") {
+        CHECK(prefetch_absence_token(std::nullopt) == kPrefetchStateUnknown);
+    }
+
+    SECTION("0 (prefetcher off) -> prefetch_disabled") {
+        CHECK(prefetch_absence_token(uint32_t{0}) == kPrefetchDisabled);
+    }
+
+    SECTION("1, 2, 3 (documented on-settings) -> prefetch_evidence_absent") {
+        for (uint32_t v : {1u, 2u, 3u}) {
+            INFO("EnablePrefetcher: " << v);
+            CHECK(prefetch_absence_token(v) == kPrefetchEvidenceAbsent);
+        }
+    }
+
+    SECTION("4, 7, 0xFFFFFFFF (undocumented values) -> prefetch_state_unknown") {
+        for (uint32_t v : {4u, 7u, 0xFFFFFFFFu}) {
+            INFO("EnablePrefetcher: " << v);
+            CHECK(prefetch_absence_token(v) == kPrefetchStateUnknown);
+        }
+    }
+}
