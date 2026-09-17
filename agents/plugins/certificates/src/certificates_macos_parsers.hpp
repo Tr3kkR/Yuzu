@@ -90,9 +90,11 @@ inline std::string canonical_thumbprint(std::string_view s) {
 /// disclosed fallback is acceptable because nothing is being removed.
 /// win_store_fallback_allowed(kDelete) == false is therefore a decision-record
 /// oracle for that asymmetry, not a production-path test of delete's
-/// behaviour -- delete's regression oracle is the structural grep over its
-/// function body (see test_certificates_store_honesty.cpp / the package's
-/// acceptance checks), because there is no runtime branch here to exercise.
+/// behaviour. Delete's actual CURRENT_USER exclusion is verified manually by
+/// reviewers reading delete_cert_win's body for exactly one CertOpenStore
+/// call (see test_certificates_store_honesty.cpp's comment on this) -- there
+/// is no automated check enforcing it today, so a future regression here
+/// would not be caught by CI.
 enum class WinStoreAction { kRead, kDelete };
 inline bool win_store_fallback_allowed(WinStoreAction a) {
     return a == WinStoreAction::kRead;

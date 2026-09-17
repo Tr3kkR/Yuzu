@@ -62,10 +62,10 @@ TEST_CASE("canonical_thumbprint is a fold: lower and upper canonicalize identica
 // delete_cert_win does not actually call this predicate at all (it has no
 // fallback branch to guard): its CURRENT_USER exclusion is enforced
 // structurally (exactly one CertOpenStore call, no CERT_SYSTEM_STORE_
-// CURRENT_USER reference in the function body -- see the package's
-// structural grep oracle). The kDelete vector below is therefore a
-// decision-record of the asymmetry, not a test that exercises delete's
-// production path.
+// CURRENT_USER reference in the function body) -- verified manually by
+// reviewers reading the function, not by an automated check. The kDelete
+// vector below is therefore a decision-record of the asymmetry, not a test
+// that exercises delete's production path.
 TEST_CASE("win_store_fallback_allowed: read may fall back, delete may not",
           "[certificates][honesty]") {
     CHECK(win_store_fallback_allowed(WinStoreAction::kRead));

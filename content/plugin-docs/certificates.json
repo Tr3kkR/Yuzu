@@ -495,7 +495,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`cryptoapi:store-fallback`",
       "status": "`CONSTRAINED`",
-      "when": "Windows: the LocalMachine store could not be opened and `list`/`details` read the CurrentUser store instead; `list` discloses it with a `not_available` row before that store's rows, `details` folds it into the scan-incomplete verdict (`certificates_plugin.cpp:448,496`)"
+      "when": "Windows: the LocalMachine store could not be opened and `list`/`details` read the CurrentUser store instead; `list` discloses it with a `not_available` row before that store's rows; `details` discloses it with the same row immediately before a matched certificate served from that store, and folds an unmatched fallback into the combined scan-incomplete verdict (`certificates_plugin.cpp:448,494-511`)"
     },
     {
       "completeness": "`PARTIAL`",
