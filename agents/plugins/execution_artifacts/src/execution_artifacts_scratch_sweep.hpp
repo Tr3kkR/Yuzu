@@ -98,10 +98,21 @@ inline constexpr std::int64_t kScratchDirStaleAfterSecs = 3600;
 /// Maximum entries enumerated directly under agent.data_dir in one pass.
 inline constexpr std::size_t kScratchSweepMaxRootEntries = 4096;
 
-/// Maximum candidate scratch directories actually removed in one pass; the
-/// rest wait for the next pass and are counted in
-/// ScratchSweepResult::deferred, never silently dropped.
+/// Maximum candidate scratch directories successfully REMOVED in one pass;
+/// once reached, remaining stale candidates wait for the next pass and are
+/// counted in ScratchSweepResult::deferred, never silently dropped.
 inline constexpr std::size_t kScratchSweepMaxRemovals = 64;
+
+/// Maximum candidates that may FAIL (any reason -- sharing violation,
+/// ownership mismatch, non-flat contents, a transient OS error) in one
+/// pass, tracked SEPARATELY from kScratchSweepMaxRemovals. Deliberately
+/// distinct: a failure consumes none of the "blast radius" a removal does
+/// (nothing was deleted), so a run of persistent failures earlier in
+/// enumeration order must not be able to exhaust the SAME budget a later,
+/// genuinely-removable orphan needs to be reached in the same pass -- the
+/// two are counted and capped independently, and only a removal ever stops
+/// the pass at kScratchSweepMaxRemovals.
+inline constexpr std::size_t kScratchSweepMaxFailures = 256;
 
 /// Maximum wall-clock time (milliseconds) one sweep pass may run.
 inline constexpr std::int64_t kScratchSweepMaxWallMs = 2000;

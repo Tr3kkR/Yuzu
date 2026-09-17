@@ -470,12 +470,17 @@ TEST_CASE("sweep_stale_scratch_dirs: a scratch dir held open without FILE_SHARE_
         const ScratchSweepResult result =
             sweep_stale_scratch_dirs(root.path.wstring(), kNow, kScratchDirStaleAfterSecs);
         // Windows share-mode checks are per-object: the held handle blocks
-        // the FINAL directory removal (which needs DELETE access the held
-        // handle's share mode does not grant), so the directory survives
-        // this pass -- never removed, counted failed.
+        // even the CANDIDATE open (open_candidate_relative requests DELETE
+        // specifically so this conflict is detected here, before any child
+        // is touched -- see that function's banner), so the directory
+        // survives this pass -- never removed, counted failed, and its
+        // child file (the amcache.hve stand-in a real live dispatch is
+        // actively reading via RegLoadAppKeyW) is never even considered for
+        // deletion, not just "also still there by coincidence".
         CHECK(result.removed == 0);
         CHECK(result.failed == 1);
         CHECK(fs::exists(dir));
+        CHECK(fs::exists(dir / "amcache.hve"));
     } // `held` closes here.
 
     const ScratchSweepResult second =

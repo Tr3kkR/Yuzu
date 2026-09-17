@@ -109,12 +109,25 @@ NtOpenFileFn resolve_ntopenfile() {
 /// handle-relative to `root`, requesting READ_CONTROL in addition to the
 /// usual list/read-attributes rights that confined_fs::open_dir_at itself
 /// requests, since the ownership check below needs it and open_dir_at does
-/// not carry it (see the file banner). Shares for read, write AND delete --
-/// an in-flight dispatch's own open handle on this same object must be
-/// allowed to coexist so this sweep can OBSERVE the sharing violation on
-/// its own subsequent access, not manufacture one against a live
-/// dispatch. Reparse points are opened raw (never followed); the check is
-/// then made explicitly on the returned handle's attributes.
+/// not carry it (see the file banner). ALSO requests DELETE: collect_amcache's
+/// own dest_dir_handle (execution_artifacts_win.cpp's open_scratch_dir_handle)
+/// is held for the entire privilege-bearing span with share mode
+/// FILE_SHARE_READ only -- no FILE_SHARE_DELETE -- specifically so a
+/// concurrent DELETE-seeking open of that same directory is refused for as
+/// long as the dispatch holds it. Without DELETE in OUR OWN desired access,
+/// this sweep's candidate open would not need to negotiate against that
+/// share restriction at all and could proceed to open the directory (for
+/// list/read-attributes purposes) and then unlink its children out from
+/// under a live dispatch. Requesting DELETE here is what makes this sweep
+/// actually observe that protection via ERROR_SHARING_VIOLATION for the
+/// dispatch's entire copy-through-RegLoadAppKeyW-through-enumeration span,
+/// not just during the narrow window a handle-relative reopen would
+/// otherwise miss. Shares for read, write AND delete on OUR OWN handle --
+/// so a well-behaved LATER opener (another sweep pass, or the next
+/// dispatch once this one completes) is never blocked BY us; only an
+/// EXISTING share-restricted handle blocks THIS open, never the reverse.
+/// Reparse points are opened raw (never followed); the check is then made
+/// explicitly on the returned handle's attributes.
 cfs::WinHandle open_candidate_relative(HANDLE root, const std::wstring& wide_name) {
     const NtOpenFileFn fn = resolve_ntopenfile();
     if (fn == nullptr)
@@ -143,7 +156,7 @@ cfs::WinHandle open_candidate_relative(HANDLE root, const std::wstring& wide_nam
     HANDLE raw = INVALID_HANDLE_VALUE;
     IO_STATUS_BLOCK iosb{};
     const ACCESS_MASK desired_access =
-        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE;
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | SYNCHRONIZE | DELETE;
     const ULONG share_access = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
     const ULONG open_options =
         kFileDirectoryFile | kFileOpenReparsePoint | kFileSynchronousIoNonalert;
@@ -211,8 +224,28 @@ ScratchSweepResult sweep_stale_scratch_dirs(const std::wstring& data_dir,
                 continue;
             }
 
-            if (res.removed + res.failed >= kScratchSweepMaxRemovals) {
-                // Removals cap reached -- stop considering further entries
+            // The wall-time deadline is enforced by enumerate_at at entry
+            // (root and per-candidate) but NOT by anything in between --
+            // check it explicitly here too, before starting a new
+            // candidate's open/query/delete sequence, so a long run of
+            // slow-but-successful deletions can't carry the pass past its
+            // advertised bound. A single already-in-flight file-delete loop
+            // below is not itself interrupted mid-candidate (one candidate
+            // is a bounded, small unit of work), but no NEW candidate
+            // starts once the deadline has passed.
+            if (std::chrono::steady_clock::now() >= deadline) {
+                ++res.deferred;
+                break;
+            }
+
+            // Removed and failed are capped SEPARATELY (see
+            // kScratchSweepMaxFailures's doc comment): a run of persistent
+            // failures earlier in enumeration order must not be able to
+            // starve a later, genuinely-removable orphan out of this same
+            // pass by exhausting a shared budget.
+            if (res.removed >= kScratchSweepMaxRemovals ||
+                res.failed >= kScratchSweepMaxFailures) {
+                // Whichever cap was hit -- stop considering further entries
                 // this pass rather than acting past the configured blast
                 // radius.
                 ++res.deferred;
