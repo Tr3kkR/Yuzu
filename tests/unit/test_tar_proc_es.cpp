@@ -146,20 +146,6 @@ TEST_CASE("es_sample_to_proc_event preserves the inputs the handler guards on",
     REQUIRE(es_sample_to_proc_event(zero_pid).pid == 0); // handler drops (pid == 0)
 }
 
-TEST_CASE("es_seq_gap counts only forward jumps and never underflows", "[tar][proces]") {
-    using yuzu::tar::es_seq_gap;
-    // Consecutive seq → no gap.
-    REQUIRE(es_seq_gap(10, 11) == 0);
-    // A forward jump means the kernel dropped the messages in between.
-    REQUIRE(es_seq_gap(10, 14) == 3); // 11,12,13 lost
-    REQUIRE(es_seq_gap(0, 5) == 4);
-    // Duplicate (equal) or a backward jump (a client re-create resets the per-type
-    // counter) must yield 0 — never an unsigned underflow into a huge bogus count.
-    REQUIRE(es_seq_gap(10, 10) == 0);
-    REQUIRE(es_seq_gap(10, 2) == 0);
-    REQUIRE(es_seq_gap(10, 0) == 0);
-}
-
 TEST_CASE("es_stream_is_stalled measures idle from the later of last-event/start",
           "[tar][proces]") {
     using yuzu::tar::es_stream_is_stalled;

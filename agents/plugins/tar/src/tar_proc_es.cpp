@@ -13,6 +13,8 @@
 
 #include "tar_proc_es.hpp"
 
+#include <yuzu/agent/es_client.hpp> // yuzu::agent::es_seq_gap (A0 relocation)
+
 #include <string>
 
 namespace yuzu::tar {
@@ -62,12 +64,6 @@ std::string resolve_uid_cached(std::unordered_map<std::uint32_t, std::string>& c
     std::string name = lookup(uid);
     cache.emplace(uid, name);
     return name;
-}
-
-std::uint64_t es_seq_gap(std::uint64_t last_seq, std::uint64_t seq) noexcept {
-    // Only a strict forward jump is a kernel drop; equal/decreasing seq (a client
-    // re-create resets the per-type counter) yields 0 rather than underflowing.
-    return seq > last_seq + 1 ? seq - last_seq - 1 : 0;
 }
 
 bool es_stream_is_stalled(std::int64_t last_event_ts, std::int64_t started_ts,
@@ -202,7 +198,8 @@ struct ProcEsCollector::Impl {
     void note_seq(es_event_type_t type, std::uint64_t seq) {
         auto it = last_seq.find(type);
         if (it != last_seq.end())
-            kernel_dropped->fetch_add(es_seq_gap(it->second, seq), std::memory_order_relaxed);
+            kernel_dropped->fetch_add(yuzu::agent::es_seq_gap(it->second, seq),
+                                      std::memory_order_relaxed);
         last_seq[type] = seq;
     }
 
