@@ -556,10 +556,10 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
 - `capture_output` is opt-in per Reaction (default `false`), capped at 4 KiB, and a per-device
   outcome drill (including any captured output) is an **access-audited** surface via the existing
   `rest_audit.hpp` chokepoint (`emit_behavioral_audit`) — never a bare read. The drill's audit write
-  follows a **named retention class** under `docs/audit_retention_rules.hpp`'s `classify` (assigned
-  at R10, alongside a stated fail-closed-vs-set-and-proceed decision for the write itself — see
-  `device.live.*`'s fail-closed precedent in the routed device-pages concern as the default lens,
-  not an automatic copy).
+  follows a **named retention class** under `common/include/yuzu/audit_retention_rules.hpp`'s
+  `classify` (assigned at R10, alongside a stated fail-closed-vs-set-and-proceed decision for the
+  write itself — see `device.live.*`'s fail-closed precedent in the routed device-pages concern as
+  the default lens, not an automatic copy).
 - Operator-configurable TTL on Reflex outcomes (D10d) — implemented as a clock-guarded retention
   sweep (`docs/clock-guarded-retention.md`; R10 records the adoption-register row), **bounded below
   by the evidentiary retention floor above** — the TTL can be lengthened by the operator, never
