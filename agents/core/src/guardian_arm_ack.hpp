@@ -27,13 +27,22 @@
  * it every heartbeat, and the generation-hold gate reads can_advance() instead
  * of assuming pending_arms == 0.
  *
- * Deliberately conservative and pre-K-bound (rung 9c PR-2's own scope only):
- * a receipt that resolves to anything other than Committed holds its
- * application's generation FOREVER, exactly like today's synchronous
+ * Deliberately conservative and pre-K-bound at rung 9c PR-2's own original
+ * scope: a receipt that resolves to anything other than Committed held its
+ * application's generation FOREVER, exactly like the pre-PR-2 synchronous
  * behavior - no wedge marking, no K-bound retry-then-waive. §R5.2's ClaimEnd
- * already preserves the finer split a later rung 9c PR needs to implement
- * that (queue-wait expiry vs. dispatched timeout vs. genuine refusal); this
- * ledger does not need it and does not re-derive it here.
+ * preserved the finer split a later rung 9c PR needed to implement that
+ * (queue-wait expiry vs. dispatched timeout vs. genuine refusal); this
+ * ledger did not need it and did not re-derive it here.
+ *
+ * As implemented (rung 9c PR-5e, #4221, K-bound closeout, decision 1): that
+ * FOREVER hold now has exactly one carve-out, scoped narrowly to the Wedged
+ * subset ClaimEnd's split makes expressible - see can_advance()'s own doc
+ * comment and Application::reapply_count/failed_receipts for the mechanism.
+ * A CongestionExpired/Withdrawn/Stopped/plain-Failed receipt, or a latched
+ * application-level failure, still holds the generation forever exactly as
+ * this paragraph originally described - K is a Wedged-only escape hatch, not
+ * a change to that conservative default.
  *
  * One current application, never a history (Astra opine review: "New
  * application: stale receipts cannot acknowledge it"). begin_application()
@@ -72,6 +81,15 @@ namespace yuzu::agent {
 /// ever added). Generous relative to a realistic push size since each entry costs
 /// one brief, allocation-free registry_mu_ check, not KV I/O.
 inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
+
+/// rung 9c PR-5e (#4221, K-bound closeout, decision 1): the number of
+/// identically-re-applied generations (§R5.3's own "three identical same-generation
+/// re-applies") a Wedged-only failure set may be waived after. A single shared
+/// saturating counter per application-sequence - NOT per-rule credit (a rule that only
+/// wedges on the 2nd re-apply can still ride the sequence's existing count to waiver on
+/// the 3rd; see Application::reapply_count's own doc comment) - matching the master
+/// plan's recorded decision and R5.3's literal phrasing exactly.
+inline constexpr std::size_t kReapplyWaiverThreshold = 3;
 
 /// Content identity for a push: a rule_id, its enabled flag, enforcement_mode,
 /// version, and its spark/assertion/remediation GuardianSpecBlocks (type +
@@ -175,10 +193,19 @@ public:
                              std::size_t* failed_out = nullptr);
 
     /// True iff there IS a current application, it has nothing left pending,
-    /// nothing resolved to a failure, and nothing latched - i.e. its
-    /// generation may advance. False, not vacuously true, when there is no
-    /// current application at all (nothing to advance FOR is not the same
-    /// question as "may advance").
+    /// nothing latched, and either nothing resolved to a failure OR (rung 9c
+    /// PR-5e, #4221, K-bound closeout, decision 1) every resolved failure is a
+    /// still-genuinely-outstanding Wedged episode (Application::failed_receipts,
+    /// kept pruned to exactly that set every drain tick - see its own doc
+    /// comment) AND this application-sequence has been identically re-applied
+    /// at least kReapplyWaiverThreshold times (Application::reapply_count). A
+    /// non-Wedged failure (CongestionExpired/Withdrawn/Stopped/plain Failed, or
+    /// a Wedged entry whose eligibility has since settled to false) NEVER
+    /// waives, no matter how high reapply_count climbs - K is scoped to the
+    /// Wedged-only subset, never a generation-wide liveness bound (R5.3's own
+    /// framing). False, not vacuously true, when there is no current
+    /// application at all (nothing to advance FOR is not the same question as
+    /// "may advance").
     ///
     /// A current application with an EMPTY pending map because add_pending()
     /// was simply never called (every rule this push resolved synchronously -
@@ -212,6 +239,11 @@ public:
     /// test settle on "the recovery scan has cleared every rule it is going to"
     /// without a production accessor. No production caller.
     std::size_t failed_receipt_count_for_test() const;
+
+    /// TEST-ONLY: the current application's reapply_count (0 if there is no current
+    /// application) - rung 9c PR-5e (#4221, K-bound closeout, decision 1). No
+    /// production caller; can_advance() reads Application::reapply_count directly.
+    std::size_t reapply_count_for_test() const;
 
     /// TEST-ONLY: every non-Committed ReceiptStatus this application's receipts
     /// have resolved to via drain_locked() - i.e. the same failure-group values
@@ -325,7 +357,33 @@ private:
         /// gone, same as every other per-application field here. This is NOT the
         /// durable, cross-application "last known outcome for every currently-
         /// desired rule" gauge - that is 5e's job.
+        ///
+        /// rung 9c PR-5e (#4221, K-bound closeout): also re-validated every drain
+        /// tick against GuardianSparkRuntime::receipt_wedge_k_eligible() (see that
+        /// accessor's own doc comment) - an entry whose eligibility has since
+        /// settled to false (a Dispatching-window race corrected to a genuine
+        /// Failed/Stopped/AdmissionRejected outcome, or the claim was popped from
+        /// its key's FIFO by a real completion) is dropped from this map WITHOUT
+        /// decrementing resolved_failed: it is still a genuine, counted failure,
+        /// just no longer part of the Wedged-only subset K may waive. This keeps
+        /// `resolved_failed == failed_receipts.size()` a SAFE K-waiver predicate -
+        /// membership here means "currently, genuinely, still-outstanding Wedged",
+        /// never a stale or since-corrected classification.
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> failed_receipts;
+        /// rung 9c PR-5e (#4221, K-bound closeout, decision 1): a saturating count
+        /// (capped at kReapplyWaiverThreshold) of how many times THIS EXACT
+        /// application identity - (generation, content_id, full_sync), the same
+        /// comparison decide_retry() already uses - has been established in a row
+        /// via begin_application(). A single shared counter per application-
+        /// SEQUENCE, not per-rule credit: a rule that only wedges on the 2nd
+        /// identical reapply can still ride the sequence's existing count to
+        /// waiver on the 3rd (the master plan's own recorded decision 1). Carried
+        /// forward by begin_application() ONLY on an exact identity match against
+        /// the OUTGOING application; reset to 0 on any distinct generation,
+        /// content_id, full_sync, an invalid (non-SHA-256) digest on either side,
+        /// or when there was no prior application at all. can_advance() is the
+        /// sole production reader.
+        std::size_t reapply_count{0};
     };
     std::unique_ptr<Application> current_;
 };

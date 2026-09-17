@@ -3452,3 +3452,74 @@ TEST_CASE("governance UP-1 residual, round 2 (#4221): retargeting a rule onto an
     CHECK(f.engine->spark_armed_rule_count() == 1); // still just R, on K1, throughout
     CHECK(f.engine->spark_runtime_for_test()->armed_key_count() == 1);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// rung 9c PR-5e (#4221, K-bound closeout, decision 1): end-to-end proof the
+// FULL production wiring - apply_rules() -> decide_retry()/begin_application()
+// -> journal_maintenance_tick()'s drain -> can_advance() -> persist+advance -
+// K-waives a persistently Wedged-only rule after exactly
+// kReapplyWaiverThreshold identical server retries, through the real
+// GuardianEngine entry point rather than the raw GuardianSparkRuntime/
+// GuardianArmAckLedger APIs the sibling ledger-level tests exercise directly.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("rung 9c PR-5e (#4221): K-bound waives a persistently Wedged-only rule "
+          "after 3 identical server retries, advancing policy_generation, through "
+          "GuardianEngine::apply_rules()/journal_maintenance_tick() end to end",
+          "[spark][guardian][reconcile][liveness]") {
+    SparkReconcileFixture f{/*periodic_bound_ms=*/0,
+                            /*backend_op_deadline=*/std::chrono::milliseconds(50)};
+    REQUIRE(f.engine->policy_generation() == 0);
+
+    // hang_next_watch() is consumed by the FIRST watch() call only - up-2's
+    // Reobserved path means every SUBSEQUENT identical retry re-observes the
+    // SAME already-wedged claim without ever calling watch() again, so this
+    // single arm covers the whole test; no re-arming needed between retries.
+    f.mechanism->hang_next_watch();
+    struct ReleaseHangOnExit {
+        SparkReconcileFixture& fx;
+        ~ReleaseHangOnExit() { fx.mechanism->release_hang(); }
+    } release_parked{f};
+
+    gpb::GuaranteedStatePush p;
+    p.set_full_sync(true);
+    p.set_policy_generation(5);
+    *p.add_rules() = make_service_rule("r1");
+    const auto push_bytes = p.SerializeAsString(); // identical bytes every retry
+
+    auto dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+    REQUIRE(dr.exit_code == 0);
+    REQUIRE(f.mechanism->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    f.engine->journal_maintenance_tick(); // drains: r1 resolves Wedged, retained+eligible
+
+    CHECK(f.engine->policy_generation() == 0); // held - reapply_count 0 < K
+    {
+        const auto s = f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+    }
+
+    // 3 more identical server retries (4 established applications in total - see
+    // the sibling ledger-level K-bound test's own comment on this exact
+    // arithmetic: begin_application()'s reapply_count starts at 0 on the FIRST
+    // application, so K==3 needs 3 MORE identical begin_application() calls).
+    for (int i = 0; i < 3; ++i) {
+        dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
+        REQUIRE(dr.exit_code == 0);
+        f.engine->journal_maintenance_tick();
+    }
+
+    // The 3rd retry installed reapply_count == 3 == K, and the single remaining
+    // failure is still genuinely, settledly Wedged (the mechanism's watch() call
+    // is still parked in the hook this whole time) - K-waived. The generation
+    // advances and is durably persisted.
+    CHECK(f.engine->policy_generation() == 5);
+    {
+        const auto s = f.engine->arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1); // telemetry still reports it - K-waiver never erases it
+    }
+
+    // (the parked mechanism is released by `release_parked` above on every exit path)
+}

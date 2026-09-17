@@ -779,9 +779,80 @@ together in prose but which do not share one signal in code:
 
 Both mechanisms are **scoped to the current application/claim only** - neither
 is the durable, cross-application "last known arm outcome for every currently-
-desired rule" gauge a fleet-wide dashboard would need; that stronger semantic,
-plus the K-bound retry-then-waive acknowledgment policy and `arm_failed`'s
-reason/phase breakdown, remain rung 9c PR-5e's scope, unbuilt here.
+desired rule" gauge a fleet-wide dashboard would need.
+
+**R5.3 as implemented (rung 9c PR-5e, #4221, K-bound closeout, decision 1).**
+The K=3 wedge waiver this section names above ("A wedged key is K-bounded, not
+held forever... after three identical same-generation re-applies whose only
+unresolved rules are already-wedged, the generation acknowledges anyway") is
+now built, narrower in scope than this section's original assignment - see the
+explicit narrowing below.
+
+- **Mechanism.** `Application::reapply_count` (`guardian_arm_ack.hpp`), a
+  saturating counter (capped at `kReapplyWaiverThreshold == 3`) per
+  application-SEQUENCE, not per-rule credit: `begin_application()` compares the
+  incoming `(generation, content_id, full_sync)` against the OUTGOING
+  application (the same identity comparison `decide_retry()` already uses,
+  including the `is_sha256_hex()` sentinel guard) and carries the saturated
+  count forward only on an exact match; any distinct identity, or no prior
+  application at all, resets to 0.
+- **The K-eligibility gap the original design language did not anticipate.**
+  A naive predicate ("every remaining `resolved_failed` entry is present in
+  `failed_receipts`") is necessary but NOT sufficient: `ClaimEnd::
+  WaiterTimedOutDispatched` ("Wedged") is sticky by design (§R5.2), but the
+  underlying episode it describes is not always SETTLED at the instant it is
+  observed - (1) a caller-side timeout can stamp it while the claim is still
+  mid-dispatch, racing `dispatch_arm_off_lock()`'s own re-lock, which (on a
+  synchronous admission refusal) corrects the REAL outcome via
+  `reclassify_dispatching_race_locked()` (§R5.2/PR-5c) - but only while
+  `dispatch` is still `Dispatching`; (2) a genuinely-dispatched claim's backend
+  call can LATER resolve to a real refusal, popping the claim from its key's
+  FIFO while `end` stays stuck at Wedged (the sticky-Wedged contract, PR-5d) -
+  the "still-claimed" requirement this doc's own §A row already named in
+  prose. `GuardianSparkRuntime::receipt_wedge_k_eligible()` closes both: `end
+  == WaiterTimedOutDispatched && dispatch == Dispatched &&` the claim is still
+  its key's FIFO front, evaluated under `registry_mu_` at TWO points -
+  `GuardianArmAckLedger::drain_locked()`'s primary per-pending loop (never
+  insert an unsettled classification into `failed_receipts` even for one
+  tick), and its existing recovery-scan loop (re-validate every RETAINED entry
+  every tick, pruning one whose eligibility has since settled to false -
+  `resolved_failed` itself is untouched; only K-eligible-set MEMBERSHIP
+  changes). `can_advance()` stays a cheap, runtime-free ledger query: `every
+  resolved_failed entry counted in failed_receipts` AND `reapply_count >= K`.
+  `latched_failure` still blocks unconditionally either way, never folded into
+  the K-waiver branch.
+- **K-waiver never touches the runtime.** No failed receipt is erased, no
+  failure telemetry decremented, no application retired, no rule withdrawn, no
+  claim or compensation permit released, no failed rule represented as armed -
+  matching "Completion ownership survives K" and "Three separate transitions,
+  never collapsed" above exactly. `arm_stats().failed` stays correctly nonzero
+  through a K-waived advance and still clears on a genuine subsequent recovery
+  (PR-5d's existing mechanism, unchanged).
+- **Explicit narrowing (Fable-reviewed decision, not a silent default): this PR
+  delivers ONLY the K-bound retry-then-waive policy.** The durable,
+  cross-application "last known arm outcome for every currently-desired rule"
+  gauge, and `arm_failed`'s reason/phase breakdown, both named as rung 9c
+  PR-5e's scope in this section's original text, remain UNBUILT - narrowed out
+  of this PR's actual scope rather than silently dropped. A reader must not
+  infer either stronger semantic was delivered here; track them as a separate,
+  explicit follow-up if a fleet-wide dashboard later needs them.
+- **#4472 reassessment under K-waiver.** Traced directly against the current
+  implementation (not assumed): #4472's own race (an operator withdraw
+  immediately followed by a re-add of the identical rule, racing the original
+  claim's still-in-flight `on_arm_complete`) is driven entirely by
+  OPERATOR-INITIATED pushes and the runtime's own internal I/O-completion
+  timing (`finalize_arm_compensation()`'s unconditional FIFO pop) - neither
+  depends on the SERVER's routine 25s retry cadence, which is the only thing
+  K-waiver suppresses (once acknowledged, `server.cpp`'s heartbeat-reconcile
+  stops resending because `agent_gen` no longer trails `current`). A repeat,
+  IDENTICAL server retry was never what un-wedges a key in the first place -
+  up-2's Reobserved path re-observes the SAME existing claim without touching
+  the stuck worker at all ("a wedged key stays wedged until its own worker
+  returns or the agent restarts" - unchanged by K-waiver). #4472's residual is
+  therefore UNCHANGED and UNAFFECTED by K-waiver: its mechanism, its healing
+  timeline (bounded by the compensating disarm's own I/O completion, not the
+  25s cadence), and its acceptance criteria all stand exactly as recorded
+  below, with no additional K-specific caveat needed.
 
 **Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
 independently traced and REFUTED as permanent):** a withdraw immediately

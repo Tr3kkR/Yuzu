@@ -1256,6 +1256,40 @@ public:
     /// registry_mu_ taken internally.
     [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
 
+    /// rung 9c PR-5e (#4221, K-bound closeout): true iff `receipt`'s own claim is a
+    /// CURRENTLY, GENUINELY outstanding Wedged episode - the narrow subset of "sticky
+    /// Wedged" (see receipt_status()'s own doc comment) that K-bound may waive.
+    /// `end == ClaimEnd::WaiterTimedOutDispatched` alone is NOT sufficient - `end` is
+    /// sticky (never un-Wedges) but the underlying episode is NOT: (1) a caller-side
+    /// timeout can stamp WaiterTimedOutDispatched while the claim is still mid-dispatch
+    /// (abandon_claim_locked()'s Dispatching branch), racing dispatch_arm_off_lock()'s
+    /// own re-lock, which - on a synchronous admission refusal - corrects the REAL
+    /// outcome via reclassify_dispatching_race_locked() but ONLY while `dispatch` is
+    /// still Dispatching; `dispatch` itself never reaches Dispatched on that corrected
+    /// path (dispatch_arm_off_lock only ever writes Dispatched on a successful
+    /// submission, see its own body) - so requiring `dispatch == Dispatched` here
+    /// excludes exactly that unsettled/corrected window, never the genuinely-launched-
+    /// and-still-outstanding case (a claim that IS submitted reaches Dispatched
+    /// immediately, well before any real backend deadline, and simply stays there for
+    /// as long as the backend call genuinely runs). (2) A LATER real backend outcome
+    /// (a synchronous refusal on the worker, or any other on_arm_complete() resolution)
+    /// leaves `end` stuck at Wedged by design (the sticky-Wedged receipt is a fact
+    /// about the ORIGINAL episode, not a live status - R5.3 "Three separate
+    /// transitions, never collapsed") but POPS the claim from its key's FIFO the
+    /// instant that resolution is published - so requiring `claim` to still be
+    /// `claims_[claim->key]`'s FIFO FRONT is the "still-claimed" test
+    /// docs/spark-legacy-delta-registry.md's own K-bound row names: once popped, this
+    /// reads false forever for that claim, regardless of what `end` still says. Both
+    /// checks together, evaluated atomically under registry_mu_ (the same lock every
+    /// FIFO pop and every reclassify_dispatching_race_locked() call already holds), are
+    /// race-free: an external reader (GuardianArmAckLedger::drain_locked()) can only
+    /// ever observe the state strictly before or strictly after either transition, never
+    /// in between. False for a default-constructed / empty receipt, an unclaimed key, or
+    /// a key whose front is a different claim entirely. Never mutates state (a query
+    /// only, matching receipt_recovered()'s own contract) - registry_mu_ taken
+    /// internally.
+    [[nodiscard]] bool receipt_wedge_k_eligible(const ArmReceipt& receipt) const;
+
     enum class ArmOutcomeKind { Armed, Accepted };
     /// The non-waiting attach_rule() overload's success result. Never encodes
     /// Accepted as a special generation number or makes it implicitly convertible

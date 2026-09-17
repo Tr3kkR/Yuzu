@@ -7782,6 +7782,15 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(rt->expire_overdue_claims() == 1); // only r2 - r1 already compensated and popped.
 
+    // rung 9c PR-5e (#4221, K-bound closeout): this is EXACTLY the unsettled window
+    // receipt_wedge_k_eligible() exists to exclude - receipt_status() already reads
+    // Wedged (checked below, unchanged from before this PR), but r2's own `dispatch`
+    // is still Dispatching (this test's own comment above), not yet Dispatched - a
+    // K-waiver predicate relying on receipt_status() alone would treat this as
+    // K-eligible one tick before dispatch_arm_off_lock's own re-lock corrects it.
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+
     // Let admission resolve for real, as an ORDINARY (non-Stopped) refusal.
     rt->set_io_executor_fail_launch_for_test(true);
     released_by_test = true;
@@ -7796,6 +7805,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         },
         std::chrono::seconds(10)));
     rt->set_io_executor_fail_launch_for_test(false);
+
+    // rung 9c PR-5e (#4221, K-bound closeout): post-correction, receipt_status() has
+    // moved to Failed (checked below, unchanged) - receipt_wedge_k_eligible() must
+    // stay false too, for the OPPOSITE reason now: `dispatch` never reaches
+    // Dispatched on this synchronous-admission-failure path (dispatch_arm_off_lock()
+    // only ever writes Dispatched on a successful submission), so the strict
+    // `dispatch == Dispatched` clause excludes it just as it did in the unsettled
+    // window above - the two checks together never produce a false-eligible window
+    // on either side of the correction.
+    CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
 
     // Pre-fix: fail_all_claims_locked()'s guard could not overwrite the stale
     // WaiterTimedOutDispatched already on r2, so this stayed Wedged even though

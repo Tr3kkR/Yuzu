@@ -1742,6 +1742,17 @@ bool GuardianSparkRuntime::receipt_recovered(const ArmReceipt& receipt) const {
     return rit != rules_.end() && rit->second->generation == receipt.claim->generation;
 }
 
+bool GuardianSparkRuntime::receipt_wedge_k_eligible(const ArmReceipt& receipt) const {
+    if (!receipt.claim)
+        return false;
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    const auto& claim = receipt.claim;
+    if (claim->end != ClaimEnd::WaiterTimedOutDispatched || claim->dispatch != ClaimDispatch::Dispatched)
+        return false;
+    const auto eit = claims_.find(claim->key);
+    return eit != claims_.end() && !eit->second.fifo.empty() && eit->second.fifo.front() == claim;
+}
+
 std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError>
 GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge) {

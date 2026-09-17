@@ -127,16 +127,34 @@ GuardianArmAckLedger::~GuardianArmAckLedger() = default;
 
 void GuardianArmAckLedger::begin_application(std::uint64_t generation, std::string content_id,
                                              bool full_sync, std::size_t applied) {
+    // rung 9c PR-5e (#4221, K-bound closeout, decision 1): decide the incoming
+    // application's reapply_count BEFORE current_ is touched - an exact identity
+    // match against the OUTGOING application (same comparison decide_retry() already
+    // uses: both digests real SHA-256, not a sentinel) inherits its saturated count;
+    // anything else - a distinct generation/content_id/full_sync, an invalid digest
+    // on either side, or no prior application at all - starts fresh at 0. Read-only
+    // string/int comparisons only, nothing here can throw.
+    std::size_t reapply_count = 0;
+    if (current_ && current_->generation == generation && current_->full_sync == full_sync &&
+        is_sha256_hex(current_->content_id) && is_sha256_hex(content_id) &&
+        current_->content_id == content_id) {
+        reapply_count = std::min(current_->reapply_count + 1, kReapplyWaiverThreshold);
+    }
     // Unconditionally replaces whatever was open - Astra opine review: "New
     // application: stale receipts cannot acknowledge it." The old Application's
     // pending map (if any) is simply destroyed here; its receipts' claims stay
     // owned by the runtime's own claims_ registry regardless (ArmReceipt is an
-    // observation handle - see the header).
-    current_ = std::make_unique<Application>();
-    current_->generation = generation;
-    current_->content_id = std::move(content_id);
-    current_->full_sync = full_sync;
-    current_->applied = applied;
+    // observation handle - see the header). Built LOCALLY and published only at the
+    // end (rung 9c PR-5e, governance finding UP-1's own precedent applied here too):
+    // a make_unique/allocation throw here leaves current_ - and its reapply_count -
+    // completely untouched, matching apply_rules()'s own firewall around this call.
+    auto next = std::make_unique<Application>();
+    next->generation = generation;
+    next->content_id = std::move(content_id);
+    next->full_sync = full_sync;
+    next->applied = applied;
+    next->reapply_count = reapply_count;
+    current_ = std::move(next);
 }
 
 void GuardianArmAckLedger::add_pending(std::string rule_id,
@@ -192,6 +210,19 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             if (current_->resolved_failed > 0)
                 --current_->resolved_failed;
             it = current_->failed_receipts.erase(it);
+        } else if (!runtime.receipt_wedge_k_eligible(it->second)) {
+            // rung 9c PR-5e (#4221, K-bound closeout): this entry's K-eligibility has
+            // settled to false since it was retained - a Dispatching-window race
+            // corrected to a genuine Failed/Stopped/AdmissionRejected outcome, or the
+            // claim was popped from its key's FIFO by a real completion (the
+            // "still-claimed" requirement; see receipt_wedge_k_eligible()'s own doc
+            // comment). It is now an ORDINARY blocking failure - never K-waivable -
+            // so it is dropped from the waiver-eligible set here, but resolved_failed
+            // is deliberately left UNTOUCHED: this is still a genuine, counted
+            // failure, only its membership in the Wedged-only carve-out changes. This
+            // is what keeps can_advance()'s `resolved_failed == failed_receipts.size()`
+            // check a SAFE predicate rather than a stale one.
+            it = current_->failed_receipts.erase(it);
         } else {
             ++it;
         }
@@ -233,7 +264,22 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             // again below by nothing else in this loop, but keeping the copy
             // explicit here avoids coupling this case's own lifetime to the
             // shared fallthrough body's unrelated edits.
-            current_->failed_receipts.insert_or_assign(it->first, it->second);
+            //
+            // rung 9c PR-5e (#4221, K-bound closeout): retain it into the
+            // K-eligible set ONLY if receipt_wedge_k_eligible() ALSO reads true
+            // at this exact moment - NOT unconditionally on every Wedged status.
+            // expire_overdue_claims() just above (this same drain_locked() call)
+            // can itself mint end==WaiterTimedOutDispatched for a claim still
+            // mid-dispatch (the Dispatching-window race's own unsettled window,
+            // dispatch still Dispatching, not yet Dispatched) - without this
+            // check, THIS SAME call would insert a provisional, not-yet-settled
+            // classification straight into failed_receipts, and the recovery-
+            // scan loop above only re-validates EXISTING entries from a PRIOR
+            // drain, so the gap would stand open for one full tick. resolved_failed
+            // still increments below regardless (it is still counted as an
+            // ordinary failure - only its K-eligible-set MEMBERSHIP is gated).
+            if (runtime.receipt_wedge_k_eligible(it->second))
+                current_->failed_receipts.insert_or_assign(it->first, it->second);
             [[fallthrough]];
         case S::Failed:
         case S::CongestionExpired:
@@ -275,8 +321,21 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
 bool GuardianArmAckLedger::can_advance() const {
     if (!current_)
         return false; // nothing to advance FOR - not the same question as "may advance"
-    return current_->pending.empty() && current_->resolved_failed == 0 &&
-          !current_->latched_failure;
+    if (!current_->pending.empty() || current_->latched_failure)
+        return false;
+    if (current_->resolved_failed == 0)
+        return true;
+    // rung 9c PR-5e (#4221, K-bound closeout, decision 1): every remaining resolved
+    // failure is a currently-eligible Wedged entry - failed_receipts is kept pruned
+    // to exactly that set every drain_locked() tick (see its own recovery-loop
+    // comment), so this equality is a safe predicate, not a stale snapshot - AND this
+    // application-sequence has been identically re-applied at least
+    // kReapplyWaiverThreshold times. A non-Wedged failure, or a Wedged entry whose
+    // eligibility has since settled to false, is never part of failed_receipts, so it
+    // always breaks this equality and blocks the waiver, no matter how high
+    // reapply_count climbs.
+    return current_->resolved_failed == current_->failed_receipts.size() &&
+          current_->reapply_count >= kReapplyWaiverThreshold;
 }
 
 std::size_t GuardianArmAckLedger::applied_count() const {
@@ -289,6 +348,10 @@ std::size_t GuardianArmAckLedger::pending_count_for_test() const {
 
 std::size_t GuardianArmAckLedger::failed_receipt_count_for_test() const {
     return current_ ? current_->failed_receipts.size() : 0;
+}
+
+std::size_t GuardianArmAckLedger::reapply_count_for_test() const {
+    return current_ ? current_->reapply_count : 0;
 }
 
 std::vector<GuardianSparkRuntime::ReceiptStatus>

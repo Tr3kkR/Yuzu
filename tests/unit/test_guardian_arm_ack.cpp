@@ -733,8 +733,9 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a W
 }
 
 TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 - a Wedged receipt that is "
-          "later WITHDRAWN (never adopted) never recovers - failed_receipts retains it "
-          "and resolved_failed never clears",
+          "later WITHDRAWN (never adopted) never recovers via receipt_recovered(), and "
+          "resolved_failed never clears, but the entry leaves the K-eligible set (rung "
+          "9c PR-5e, #4221) since it is no longer still-claimed",
           "[spark][ack]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -776,12 +777,25 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 - a Wedged receipt th
     CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0);
     CHECK(failed_out2 == 0);
     // Never recovered: receipt_recovered() requires rules_ to carry this exact
-    // (rule_id, generation), which withdrawal never installs.
-    CHECK(ledger.failed_receipt_count_for_test() == 1);
+    // (rule_id, generation), which withdrawal never installs - resolved_failed stays
+    // exactly as it was, still 1 (checked via arm_stats() below).
+    //
+    // rung 9c PR-5e (#4221, K-bound closeout): the entry itself DOES leave
+    // failed_receipts now, via receipt_wedge_k_eligible()'s "still-claimed" (FIFO-
+    // front) check, not receipt_recovered()'s adoption check - the claim was popped
+    // from its key's FIFO the instant the late, disarmed success was published
+    // (claim_queue_depth_for_test() == 0 above), so it is no longer the still-
+    // outstanding episode K-eligibility requires. This is deliberately SAFER than the
+    // pre-5e behavior, not weaker: dropping the entry only ever shrinks the
+    // K-waiver-eligible set (resolved_failed itself never moves), so
+    // can_advance()'s `resolved_failed == failed_receipts.size()` check correctly
+    // stays permanently unsatisfiable for this application - see CHECK_FALSE below,
+    // unchanged from before this PR.
+    CHECK(ledger.failed_receipt_count_for_test() == 0);
     {
         const auto s = ledger.arm_stats();
         REQUIRE(s.has_value());
-        CHECK(s->failed == 1);
+        CHECK(s->failed == 1); // resolved_failed itself is untouched by the pruning
     }
     CHECK_FALSE(ledger.can_advance());
 }
@@ -859,4 +873,326 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a CongestionExpired receipt (ti
     std::size_t failed_out2 = 0;
     CHECK(ledger.drain_locked(*rt, /*max_per_tick=*/10, &failed_out2) == 0);
     CHECK(failed_out2 == 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// rung 9c PR-5e (#4221, K-bound closeout, decision 1): after
+// kReapplyWaiverThreshold identical (generation, content_id, full_sync)
+// re-applies, can_advance() waives a Wedged-only failure set - but ONLY once
+// receipt_wedge_k_eligible() confirms every remaining failure is still a
+// genuinely-outstanding, settled Wedged episode, never a stale or since-
+// corrected classification (the Dispatching-window-race / "still-claimed"
+// gaps a naive resolved_failed == failed_receipts.size() predicate alone
+// would miss - see can_advance()'s and receipt_wedge_k_eligible()'s own doc
+// comments).
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("GuardianArmAckLedger::can_advance(): K-bound waives a persistently "
+          "Wedged-only failure after exactly kReapplyWaiverThreshold identical "
+          "reapplies, never before",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    const std::string digest(64, 'a');
+
+    // Establish the wedge once: r1 hangs past its deadline, genuinely dispatched
+    // (dispatch reaches Dispatched well before the deadline - the backend call
+    // itself is what's hanging), so this is the SETTLED case
+    // receipt_wedge_k_eligible() must accept.
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_wedge_k_eligible(receipt));
+
+    GuardianArmAckLedger ledger;
+
+    // Application 1 (the original push, reapply_count starts at 0): drains as an
+    // ordinary Wedged failure. resolved_failed(1) == failed_receipts(1), but
+    // reapply_count(0) < K(3) - held.
+    ledger.begin_application(1, digest, false, 1);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    ledger.add_pending("r1", receipt);
+    CHECK(ledger.drain_locked(*rt, 10) == 1);
+    CHECK(ledger.failed_receipt_count_for_test() == 1);
+    CHECK_FALSE(ledger.can_advance());
+
+    // Reapplies 1-3 (identity-identical, 3 MORE begin_application() calls - the
+    // DELIVERY-PLAN's own recorded semantics: "K requires four established
+    // applications in total, not three pushes including the original"): up-2's
+    // Reobserved path hands back the SAME claim - re-observe it via accept() again
+    // each time, matching what a real repeated identical push does
+    // (reconcile_rule_locked() re-attaches and add_pending()s fresh for THIS
+    // application, per decide_retry()'s own Reapply trigger once resolved_failed >
+    // 0).
+    for (int i = 1; i <= 3; ++i) {
+        ledger.begin_application(1, digest, false, 1);
+        CHECK(ledger.reapply_count_for_test() == static_cast<std::size_t>(i));
+        auto re_receipt = accept(*rt, "r1"); // Reobserved: same underlying claim
+        ledger.add_pending("r1", re_receipt);
+        CHECK(ledger.drain_locked(*rt, 10) == 1);
+        CHECK(ledger.failed_receipt_count_for_test() == 1);
+        if (i < 3)
+            CHECK_FALSE(ledger.can_advance()); // reapply_count < K still
+    }
+    // The 3rd reapply (4th established application overall) installed
+    // reapply_count == 3 == K, and the single remaining failure is still genuinely,
+    // settledly Wedged - waived.
+    CHECK(ledger.reapply_count_for_test() == 3);
+    CHECK(ledger.can_advance());
+
+    // A K-waived generation still reports the failure via telemetry (R5.3's own
+    // "leaves arm_failed>0" requirement) - K-waiver never erases the receipt or
+    // decrements resolved_failed.
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+    }
+
+    // A 4th, DISTINCT push (different content) does not inherit the saturated
+    // count - starts a fresh sequence at 0.
+    ledger.begin_application(1, std::string(64, 'b'), false, 1);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    CHECK(ledger.failed_receipt_count_for_test() == 0); // fresh application, no leak
+    CHECK(ledger.can_advance()); // trivially true - nothing pending or failed yet
+}
+
+TEST_CASE("GuardianArmAckLedger::can_advance(): a non-Wedged failure blocks K-waiver "
+          "even at reapply_count >= K - the equality check actually discriminates, "
+          "not just the count",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - releases r1's own park, if still parked
+    } cleanup{b.get()};
+
+    const std::string digest(64, 'c');
+
+    // r1: hangs past its deadline - genuinely, settledly Wedged (dispatch reaches
+    // Dispatched well before the deadline; the backend call itself is what hangs).
+    // Never released until Cleanup - stays wedged for this whole test.
+    b->hang_next_arm.store(true);
+    auto r1 = accept(*rt, "r1", "/a");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+    // r2: a DIFFERENT, distinct-key rule whose backend call refuses IMMEDIATELY (no
+    // hang at all - hang_next_arm was already consumed by r1's own call above, so
+    // this one proceeds straight to the fail_arm check) - a genuine, ordinary
+    // (non-Wedged) BackendRefused failure. R5.3's "K is not a generation-wide
+    // liveness bound": a sibling's ordinary refusal must hold the generation
+    // regardless of r1's own reapply count.
+    b->fail_arm.store(true);
+    auto r2 = accept(*rt, "r2", "/b");
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); }, std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(r2) == GuardianSparkRuntime::ReceiptStatus::Failed);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1); // only r1 - r2 already resolved, never queued
+    REQUIRE(rt->receipt_status(r1) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_wedge_k_eligible(r1));
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, digest, false, 2);
+    ledger.add_pending("r1", r1);
+    ledger.add_pending("r2", r2);
+    CHECK(ledger.drain_locked(*rt, 10) == 2);
+    CHECK(ledger.failed_receipt_count_for_test() == 1); // only r1 - r2 was never Wedged at all
+    CHECK_FALSE(ledger.can_advance()); // resolved_failed(2) != failed_receipts.size()(1)
+
+    // Drive reapply_count to K: r1's claim is Reobserved each time (still the same
+    // retained-wedge head); r2's rule_id gets a brand-new claim each time (its prior
+    // one already resolved and popped) - fail_arm is still set, so each fresh r2
+    // attach refuses again immediately, matching "the same rule keeps failing every
+    // push" exactly.
+    for (int i = 0; i < 3; ++i) {
+        ledger.begin_application(1, digest, false, 2);
+        auto re_r1 = accept(*rt, "r1", "/a"); // Reobserved
+        auto re_r2 = accept(*rt, "r2", "/b"); // fresh claim, refuses again
+        REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(re_r2); },
+                                       std::chrono::seconds(10)));
+        ledger.add_pending("r1", re_r1);
+        ledger.add_pending("r2", re_r2);
+        CHECK(ledger.drain_locked(*rt, 10) == 2);
+        CHECK(ledger.failed_receipt_count_for_test() == 1); // still only r1
+    }
+    CHECK(ledger.reapply_count_for_test() == 3); // K reached
+
+    // Even at K, the equality check correctly discriminates: resolved_failed(2) !=
+    // failed_receipts.size()(1) - r2's non-Wedged failure alone holds the generation,
+    // no matter how high reapply_count climbs.
+    CHECK_FALSE(ledger.can_advance());
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 2);
+    }
+}
+
+TEST_CASE("GuardianArmAckLedger::begin_application(): reapply_count resets to 0 on "
+          "any distinct identity, an invalid digest never inherits it, and no stale "
+          "failure state leaks into a fresh identical application",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    // Short deadline: the pure begin_application() identity/reset checks below don't
+    // touch the runtime at all, but the "no stale failure state leaks" section
+    // further down needs a genuine, quickly-triggerable wedge.
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    const std::string digest_x(64, 'e'); // 0-9/a-f only - is_sha256_hex() rejects anything else
+    const std::string digest_y(64, 'f');
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, digest_x, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    ledger.begin_application(1, digest_x, false, 0); // identical identity
+    CHECK(ledger.reapply_count_for_test() == 1);
+    ledger.begin_application(1, digest_x, false, 0); // identical again
+    CHECK(ledger.reapply_count_for_test() == 2);
+
+    // A distinct generation resets it.
+    ledger.begin_application(2, digest_x, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    ledger.begin_application(2, digest_x, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 1);
+
+    // A distinct content_id under the SAME generation resets it too.
+    ledger.begin_application(2, digest_y, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    ledger.begin_application(2, digest_y, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 1);
+
+    // A distinct full_sync flag alone resets it.
+    ledger.begin_application(2, digest_y, true, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+
+    // An invalid (non-SHA-256-shaped) digest never inherits credit, even against an
+    // identical sentinel from a "different" push - matches decide_retry()'s own
+    // is_sha256_hex guard exactly.
+    ledger.begin_application(3, "not-a-real-digest", false, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    ledger.begin_application(3, "not-a-real-digest", false, 0); // identical sentinel
+    CHECK(ledger.reapply_count_for_test() == 0); // still 0 - sentinels never match
+
+    // Returning to an earlier, previously-established identity does not recover its
+    // old (now-superseded) count.
+    ledger.begin_application(1, digest_x, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+
+    // Retirement drops the sequence entirely - a subsequent begin has no inherited
+    // count regardless of identity. Current state going in: (1, digest_x, false,
+    // count=0), from the "returning to an earlier identity" check just above - one
+    // more identical call establishes a nonzero count to retire.
+    ledger.begin_application(1, digest_x, false, 0);
+    REQUIRE(ledger.reapply_count_for_test() == 1);
+    ledger.retire();
+    ledger.begin_application(1, digest_x, false, 0);
+    CHECK(ledger.reapply_count_for_test() == 0);
+
+    // No stale failure state leaks: begin a fresh identical application with a
+    // genuine outstanding wedge, K-waive it, then confirm the NEXT identical
+    // application starts with clean resolved_failed/failed_receipts (only
+    // reapply_count itself carries forward).
+    b->hang_next_arm.store(true);
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+    const std::string digest_z(64, '1');
+    ledger.begin_application(9, digest_z, false, 1);
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    ledger.add_pending("r1", receipt);
+    ledger.drain_locked(*rt, 10);
+    // 3 MORE identical reapplies (4 established applications in total - see the
+    // sibling K-bound test's own comment on this exact arithmetic).
+    for (int i = 0; i < 3; ++i) {
+        ledger.begin_application(9, digest_z, false, 1);
+        auto re = accept(*rt, "r1");
+        ledger.add_pending("r1", re);
+        ledger.drain_locked(*rt, 10);
+    }
+    REQUIRE(ledger.reapply_count_for_test() == 3);
+    REQUIRE(ledger.can_advance()); // K-waived
+
+    // Next identical application: reapply_count carries forward (saturated), but
+    // resolved_failed/failed_receipts start fresh - can_advance() is trivially true
+    // again (nothing pending/failed YET in this brand-new application), not because
+    // K-waiver leaked a "permanently advance-able" state forward.
+    ledger.begin_application(9, digest_z, false, 1);
+    CHECK(ledger.reapply_count_for_test() == 3); // saturated, carried forward
+    CHECK(ledger.failed_receipt_count_for_test() == 0); // no leak
+    CHECK(ledger.can_advance()); // vacuously true - a fresh, empty application
+}
+
+TEST_CASE("GuardianArmAckLedger::drain_locked(): a genuinely dispatched claim that "
+          "later resolves to a real backend refusal leaves the K-eligible set - the "
+          "\"still-claimed\" requirement (rung 9c PR-5e, #4221)",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    // The backend call is genuinely running (dispatch reached Dispatched well before
+    // the deadline - hang_next_arm blocks INSIDE arm(), which only runs after
+    // io_executor_.submit() already succeeded) - this is the SETTLED case, not the
+    // Dispatching-window race.
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_wedge_k_eligible(receipt)); // genuinely outstanding right now
+
+    GuardianArmAckLedger ledger;
+    ledger.begin_application(1, std::string(64, '2'), false, 1);
+    ledger.add_pending("r1", receipt);
+    CHECK(ledger.drain_locked(*rt, 10) == 1);
+    CHECK(ledger.failed_receipt_count_for_test() == 1); // retained - genuinely eligible right now
+
+    // The backend call NOW resolves for real, as a genuine refusal (not a success,
+    // not a hang) - on_arm_complete()'s !armed_live branch stages BackendRefused,
+    // but publish_arm_verdicts_locked() skips overwriting an already-resolved
+    // claim's outcome/end (the sticky-Wedged contract) - `end` stays
+    // WaiterTimedOutDispatched forever, but the claim is POPPED from its key's FIFO.
+    b->fail_arm.store(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until(
+        [&] { return rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0; },
+        std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // still sticky
+    CHECK_FALSE(rt->receipt_wedge_k_eligible(receipt)); // no longer still-claimed
+
+    std::size_t failed_out2 = 0;
+    CHECK(ledger.drain_locked(*rt, 10, &failed_out2) == 0); // nothing new in `pending`
+    CHECK(failed_out2 == 0);
+    // Pruned from the K-eligible set - never K-waivable now, even at reapply_count
+    // >= K - but resolved_failed itself is untouched (still a genuine, counted
+    // failure).
+    CHECK(ledger.failed_receipt_count_for_test() == 0);
+    {
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1);
+    }
+    CHECK_FALSE(ledger.can_advance());
 }
