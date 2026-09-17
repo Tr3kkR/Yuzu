@@ -26,6 +26,7 @@
  * every host" rule), even though no Windows caller exists today.
  */
 
+#include <charconv>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -47,6 +48,46 @@ struct LaunchctlRow {
     std::optional<std::int64_t> pid;
     int status{0};
 };
+
+/// Decode one `launchctl list` data row: "PID\tStatus\tLabel". Splits on the
+/// FIRST two tabs only -- the label field is everything after the second tab
+/// verbatim, including any further literal tabs (a genuine label never
+/// contains one, but a malformed/4+-field row is decoded rather than
+/// mis-split). Fewer than 2 tabs in the line -- 1-field row (no tabs at all)
+/// or 2-field row (one tab) -- yields whichever fields were present and an
+/// empty label for the rest; never throws. `std::from_chars` on the raw
+/// field, not `std::stoll`/`std::stoi`: a PARTIAL numeric match (e.g.
+/// "12abc", or "0x1A" -- from_chars stops at the "x", not a hex parse) is
+/// rejected as unparsable (pid -> nullopt, status -> 0), never silently
+/// truncated to the numeric prefix the way stoll/stoi would.
+[[nodiscard]] inline LaunchctlRow decode_launchctl_row(std::string_view line) {
+    LaunchctlRow row;
+    auto tab1 = line.find('\t');
+    if (tab1 == std::string_view::npos)
+        return row; // 1-field row: nothing past PID to decode
+    std::string_view pid_sv = line.substr(0, tab1);
+    std::string_view rest = line.substr(tab1 + 1);
+
+    auto tab2 = rest.find('\t');
+    if (tab2 == std::string_view::npos)
+        return row; // 2-field row: PID+status present, no label at all
+    std::string_view status_sv = rest.substr(0, tab2);
+    row.label = std::string(rest.substr(tab2 + 1));
+
+    if (pid_sv != "-" && !pid_sv.empty()) {
+        std::int64_t v{};
+        auto res = std::from_chars(pid_sv.data(), pid_sv.data() + pid_sv.size(), v);
+        if (res.ec == std::errc{} && res.ptr == pid_sv.data() + pid_sv.size())
+            row.pid = v;
+    }
+    if (status_sv != "-" && !status_sv.empty()) {
+        int v{};
+        auto res = std::from_chars(status_sv.data(), status_sv.data() + status_sv.size(), v);
+        if (res.ec == std::errc{} && res.ptr == status_sv.data() + status_sv.size())
+            row.status = v;
+    }
+    return row;
+}
 
 /// Parse the line-split stdout of `launchctl list` (blank lines already
 /// dropped, a trailing '\r' already stripped by the caller -- matches

@@ -2,17 +2,71 @@
  * test_launchctl_list.cpp -- fixture-fed tests for agents/shared/
  * launchctl_list.hpp's pure `launchctl list` row parser. Same discipline as
  * test_tar_service.cpp: every case feeds a fixed std::vector<std::string>
- * straight to the pure parser, no spawn, no sleep. Fixture rows are the same
- * real macOS host capture test_tar_service.cpp already documents the
- * provenance of (2026-08-25-era; see that file's header comment) -- reused
- * here rather than re-documented, since it's the identical wire shape.
+ * straight to the pure parser, no spawn, no sleep. Real-capture fixture rows
+ * are the same ones test_tar_service.cpp documents the provenance of
+ * (launchctl rows captured 2026-08-24 on a macOS arm64 dev host -- see that
+ * file's header comment) -- reused here rather than re-documented, since
+ * it's the identical wire shape.
  */
 #include <launchctl_list.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 
+using yuzu::shared::decode_launchctl_row;
 using yuzu::shared::LaunchctlRow;
 using yuzu::shared::parse_launchctl_list;
+
+// ── decode_launchctl_row (CH-2 fixtures, A0 governance fix round) ────────────
+
+TEST_CASE("decode_launchctl_row: a hex-looking PID is rejected, not truncated",
+          "[launchctl_list]") {
+    auto row = decode_launchctl_row("0x1A\t0\tcom.example.svc");
+    CHECK_FALSE(row.pid.has_value()); // from_chars stops at 'x' -- partial match rejected
+    CHECK(row.status == 0);
+    CHECK(row.label == "com.example.svc");
+}
+
+TEST_CASE("decode_launchctl_row: a trailing-garbage PID is rejected, not truncated "
+          "to its numeric prefix",
+          "[launchctl_list]") {
+    auto row = decode_launchctl_row("12abc\t0\tcom.example.svc");
+    CHECK_FALSE(row.pid.has_value()); // stoll would have silently accepted "12"
+}
+
+TEST_CASE("decode_launchctl_row: a dash status decodes to 0, not a parse attempt",
+          "[launchctl_list]") {
+    auto row = decode_launchctl_row("1190\t-\tcom.example.svc");
+    REQUIRE(row.pid.has_value());
+    CHECK(*row.pid == 1190);
+    CHECK(row.status == 0);
+}
+
+TEST_CASE("decode_launchctl_row: a 1-field row (no tabs) decodes with an empty "
+          "label and no pid, never throws",
+          "[launchctl_list]") {
+    auto row = decode_launchctl_row("1190");
+    CHECK(row.label.empty());
+    CHECK_FALSE(row.pid.has_value());
+    CHECK(row.status == 0);
+}
+
+TEST_CASE("decode_launchctl_row: a 4-field row folds the extra field into the "
+          "label verbatim, tab included",
+          "[launchctl_list]") {
+    auto row = decode_launchctl_row("1190\t0\tcom.example.svc\textra");
+    REQUIRE(row.pid.has_value());
+    CHECK(*row.pid == 1190);
+    CHECK(row.label == "com.example.svc\textra");
+}
+
+TEST_CASE("decode_launchctl_row: a literal tab inside the label is preserved "
+          "verbatim, not treated as a field boundary",
+          "[launchctl_list]") {
+    auto row = decode_launchctl_row("1190\t0\tcom.example\tweird.label");
+    REQUIRE(row.pid.has_value());
+    CHECK(*row.pid == 1190);
+    CHECK(row.label == "com.example\tweird.label");
+}
 
 TEST_CASE("parse_launchctl_list: empty input yields empty output", "[launchctl_list]") {
     CHECK(parse_launchctl_list({}).empty());
