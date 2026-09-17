@@ -246,6 +246,11 @@ is excluded from cross-seeding; it claims only that **`Push` is**, matching ever
 non-Guardian securable. (Exact additional role assignments for `Execute` beyond the cross-seed
 default are finalized and ratified at R7's own review.)
 
+**Deploy fails closed if its own audit write fails.** `reflex.set.deploy` is an ADR-1005-class
+mutation, and per that ADR's standing rule a mutation whose audit trail cannot be written must not
+be allowed to silently succeed unaudited — a deploy whose `reflex.set.deploy` audit event fails to
+write is refused, not applied-but-unlogged.
+
 ## Consent gate (D4)
 
 A **preventive compiler gate**, not an authoring convention, and **one rule with no escalation
@@ -460,6 +465,17 @@ Runtime shape (unchanged claims, restated alongside the semantics above):
 - Any Reflex maintenance work sharing a joined thread (journal paging, etc.) must carry its own
   `steady_clock` cadence — time-paced, never wake-paced (§24's journal-maintenance invariant applies
   verbatim; R8's `ReflexOutcomeJournal::maintenance_tick` implements this).
+- **Cooldown/hourly-cap windows are measured on `steady_clock`, which is per-OS in its
+  suspend-blindness.** A laptop's `steady_clock` typically halts across sleep on macOS/Linux but
+  Windows' equivalent monotonic clock does not behave identically across all sleep states — a
+  cooldown window can therefore span a different amount of real wall-clock time depending on OS and
+  sleep behavior. This is a documented, accepted quirk, not a defect to fix here: `suppressed_total`
+  and cooldown timing are **not cross-OS-comparable** aggregate metrics for exactly this reason.
+- **`last_fired` (`ReflexStatus`) is the agent's own wall clock, not a server-authored timestamp** —
+  an agent with a skewed clock reports a skewed `last_fired`, same as every other agent-authored
+  timestamp on the platform; the server does not correct it. `fired_total` is journal-persisted (see
+  above) and is never reset by a restart or a re-arm — only an explicit set-delete/redeploy resets
+  the counter for that Reflex.
 
 ## Chokepoints future routes must clear
 
@@ -598,8 +614,26 @@ every dangerous set fleet-wide going refused at once is a silent mass-disarm), `
 `events_missed`, and `unsupported`-vs-deployed drift — **no alert ships in R0 itself.**
 
 Audit verbs (R7/R9/R10): `reflex.set.{create,update,delete,deploy,undeploy,approval_required,
-compile_refused}`; `reflex.outcome.view` (per-device drill, ADR-0017 `authorize_list_read`
-confinement); `reflex.fragment.access_denied` (dashboard, service-scoped-token confinement, R12).
+compile_refused}`; `reflex.device_class.tag_set` (D4 write-gating, above); `reflex.outcome.view`
+(per-device drill, ADR-0017 `authorize_list_read` confinement); `reflex.fragment.access_denied`
+(dashboard, service-scoped-token confinement, R12).
+
+**One table, outcome → per-agent status counter → heartbeat tag → fleet family**, so the three
+partially-disjoint vocabularies above are read together rather than cross-referenced by hand:
+
+| `event_type` | `ReflexStatus` counter | Heartbeat tag | Fleet family |
+|---|---|---|---|
+| `reflex.fired` | `fired_total` | (sparse, omitted when 0) | `yuzu_fleet_reflex_fired_total` |
+| `reflex.completed` | — (implicit: fired without failed/timed_out/aborted) | — | `yuzu_fleet_reflex_completed_total` |
+| `reflex.failed` | — | — | `yuzu_fleet_reflex_failed_total` |
+| `reflex.timed_out` | — | — | `yuzu_fleet_reflex_timeouts_total` |
+| `reflex.aborted` | — | — | — *(no dedicated fleet counter today; folded into `events_missed` if the abort followed a seq gap, otherwise uncounted at fleet level — an R13 gap, not silently claimed covered)* |
+| `reflex.suppressed_sampled` | `suppressed_total` (agent-local, independent of sampling — see above) | — | `yuzu_fleet_reflex_events_missed_total` *(the sampled subset only; `suppressed_total` itself does not ride the fleet metric, only the per-device status)* |
+| *(SparkEvent seq gap, no fired event)* | — | — | `yuzu_fleet_reflex_events_missed_total` |
+| *(outbox drop)* | — | — | `yuzu_fleet_reflex_queue_dropped_total` |
+
+`yuzu.reflex_sets_armed` and `yuzu.reflex_generation` are set-level/agent-level heartbeat tags, not
+per-event counters, and have no row above by design.
 
 SOC 2 rows (R13): CC6/CC8 two-person deploy control; CC7.2 change-detection evidence via the
 outcome journal.
