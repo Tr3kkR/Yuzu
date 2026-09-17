@@ -780,9 +780,15 @@ TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
     REQUIRE(seeded.has_value());
 
     int status = 0;
-    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    // #4478's stored-payload depth guard 400s+no-dispatches this same route
+    // before parse, so status==400 + h.calls.empty() alone does not
+    // distinguish this fix's params-count bound from that unrelated guard -
+    // the message is what proves THIS check fired.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
 }
 
 TEST_CASE("re-eval: an oversized params value smuggled onto an existing "
@@ -807,9 +813,14 @@ TEST_CASE("re-eval: an oversized params value smuggled onto an existing "
     REQUIRE(seeded.has_value());
 
     int status = 0;
-    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    // Same distinguishing reasoning as the over-keyed case above: assert the
+    // message, not just the status, since #4478's depth guard 400s on this
+    // route too.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
 }
 
 TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
@@ -837,9 +848,14 @@ TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
     REQUIRE(seeded.has_value());
 
     int status = 0;
-    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    // Same distinguishing reasoning as the two cases above: assert the
+    // message, since a bare 400+no-dispatch is also what #4478's depth
+    // guard produces on this route.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
     REQUIRE(status == 400);
     REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
 }
 
 TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
@@ -873,6 +889,119 @@ TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
     REQUIRE(h.calls.empty());
     REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
             std::string::npos);
+}
+
+// Gate 8 follow-up (post-merge test-gap closure): the seven cases above cover
+// the count/value/instruction_id bounds and the two type-confusion cases, but
+// leave two gaps - no case ever sends a params KEY past its own bound, and no
+// case proves any of the four bounds accepts a request AT its boundary rather
+// than only rejecting past it. The three cases below close those gaps.
+
+TEST_CASE("re-eval: a 257-byte params key smuggled onto an existing "
+          "instruction_result row is refused with the bounds-specific error",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{std::string(257, 'k'), "v"}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-overlong-key";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params key exceeds 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an instruction_id of exactly 256 bytes passes the length "
+          "guard and falls through to instruction-unavailable",
+          "[pg][result_set][async][reeval]") {
+    // The 256-byte boundary itself must be ACCEPTED by this fix's length
+    // check (only >256 is rejected, per kInstructionIdMaxLen) - but
+    // InstructionStore::validate_and_prepare caps a real definition id at
+    // 128 characters, so no registered instruction can ever be 256 bytes
+    // long and this can never reach a successful dispatch. Proving
+    // acceptance-at-the-boundary therefore means proving the length check
+    // did NOT fire (no "must be at most 256 bytes" message) and the request
+    // instead reaches the pre-existing not-found fallback, not that it
+    // dispatched.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = std::string(256, 'q');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-boundary-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") ==
+            std::string::npos);
+    REQUIRE(j["error"]["message"].get<std::string>().find("original instruction unavailable") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: params at the exact per-field bounds (32 keys, a "
+          "256-byte key, a 65536-byte value) pass and the request dispatches",
+          "[pg][result_set][async][reeval]") {
+    // The positive-boundary twin of the count/key/value rejection cases
+    // above - proves 32 keys, a 256-byte key, and a 65536-byte value are all
+    // ACCEPTED (not merely that 33/257/65537 are rejected), and that an
+    // otherwise-valid request still reaches dispatch once every bound
+    // clears. Real, registered instruction_id (short - InstructionStore
+    // caps ids at 128 bytes, so the instruction_id bound's own accept-side
+    // boundary is covered separately above, not here).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    params[std::string(256, 'k')] = std::string(65536, 'v');
+    for (int i = 0; i < 31; ++i)
+        params["k" + std::to_string(i)] = "v";
+    REQUIRE(params.size() == 32);
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-boundary-params";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].plugin == "filehash");
+    REQUIRE(h.calls[0].action == "check");
+    REQUIRE(h.calls[0].params.at(std::string(256, 'k')) == std::string(65536, 'v'));
+    REQUIRE(j["data"]["source_kind"] == "instruction_result");
 }
 
 TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
