@@ -1,0 +1,219 @@
+{
+  "actions": [
+    {
+      "action": "audit",
+      "definition_ids": [
+        "security.ssh_hardening.audit"
+      ],
+      "legs": {
+        "linux": {
+          "fallback": "",
+          "mechanism": "std::filesystem/glob(3) read of /etc/ssh/sshd_config (+ Include globs); in-process rule evaluation (ssh_hardening_rules.hpp)",
+          "rung": "1",
+          "support": "supported"
+        },
+        "macos": {
+          "fallback": "Not yet ported -- OpenSSH on macOS also reads sshd_config, but this plugin's collector (ssh_hardening_collect.hpp) is Linux-gated (#ifdef __linux__); the pure rule-evaluation logic in ssh_hardening_rules.hpp is itself portable.",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        },
+        "windows": {
+          "fallback": "Windows does not ship an OpenSSH server by the same sshd_config convention this plugin audits; out of scope for this plugin.",
+          "mechanism": "",
+          "rung": "",
+          "support": "unsupported"
+        }
+      }
+    }
+  ],
+  "caveats": [
+    "**A permission-denied `sshd_config` read is indistinguishable from \"nothing configured\".** `collect_effective_sshd_config()` (`ssh_hardening_collect.hpp`) returns `std::nullopt` only when the root file does not exist at all (`std::filesystem::exists` false); if the file exists but the unprivileged `yuzu` account cannot open it (a host that hardened `sshd_config` to mode 0600, for example), the read silently yields an empty directive stream, and every check then reports the same MEDIUM \"not explicitly set\" finding it would for an honestly under-configured host. There is no distinct PERMISSION_DENIED signal anywhere in the output today.",
+    "**No typed result status is ever set.** `execute()` never calls `ctx.set_result_status()` on any branch, so the CC-07 status stays `UNDECLARED`/`UNKNOWN` for a clean audit, a HIGH-severity finding, and the sshd_config-not-found sentinel alike (see the Result status table above) — a consumer keying off result status rather than row content cannot yet distinguish a completed audit with findings from one that silently read nothing.",
+    "**`severity`'s full declared vocabulary is wider than what ships.** `ConfigCheckResult::severity`'s doc comment lists `CRITICAL/HIGH/MEDIUM/LOW/INFO`, but the four checks in `ssh_hardening_rules.hpp` (`evaluate_algorithm_directive`, `evaluate_host_keys`) only ever construct `HIGH`, `MEDIUM`, or `INFO` — `CRITICAL` and `LOW` are declared but currently unreachable.",
+    "**Only four directives are covered.** `KexAlgorithms`, `Ciphers`, `MACs`, and `HostKey` are the whole Mozilla \"Modern\" baseline this package checks; other hardening-relevant directives (`PermitRootLogin`, `PasswordAuthentication`, `X11Forwarding`, protocol version, etc.) are out of scope for this plugin as shipped.",
+    "**No live capture exists yet for the one supported leg.** The Linux sample in this package is a `[not captured] hardware-absent` marker, not a real `plugin-capture` run — no Linux build/runtime host was reachable in the environment this README was authored from. The pure evaluation logic (`ssh_hardening_rules.hpp`) is exercised against fixture content by `tests/unit/test_ssh_hardening_rules.cpp`, but the real filesystem/glob collector (`ssh_hardening_collect.hpp`) has not been run against a live host in this package."
+  ],
+  "definitions": [
+    {
+      "approval_mode": "auto",
+      "author_roles": [
+        "content-author"
+      ],
+      "description": "Audits /etc/ssh/sshd_config (and any files it Includes) against the Mozilla \"Modern\" OpenSSH baseline. Checks that KexAlgorithms, Ciphers, and MACs are restricted to the approved algorithm list, and that every HostKey directive references an approved key type (ed25519, rsa, ecdsa). A directive that is not explicitly set, uses a +/-/^ modifier the audit cannot resolve, or permits an algorithm outside the baseline is reported as a finding. Audit-only -- never modifies sshd_config. Linux-only.",
+      "display_name": "SSH Server Hardening Audit",
+      "execute_roles": [
+        "endpoint-admin",
+        "endpoint-operator",
+        "security-admin"
+      ],
+      "gather": {
+        "ttlSeconds": 300
+      },
+      "id": "security.ssh_hardening.audit",
+      "platforms": [
+        "linux"
+      ]
+    }
+  ],
+  "description": "SSH server hardening audit -- checks sshd_config KexAlgorithms/Ciphers/MACs/HostKey against the Mozilla Modern OpenSSH baseline",
+  "how_it_works": "`audit` reads `/etc/ssh/sshd_config` and flattens it with every file its `Include` directives glob-expand, in the exact interleaved order real `sshd` would see them, stopping the whole walk at the first top-level `Match` line (Match's conditional scope is not file-bound). The flattened directive stream is evaluated against the Mozilla \"Modern\" OpenSSH baseline: `KexAlgorithms`, `Ciphers` and `MACs` are checked as comma-separated allow-lists (a directive using a `+`/`-`/`^` modifier is reported MEDIUM as unresolvable from the file alone, since the effective list then depends on OpenSSH's compiled-in defaults); every `HostKey` directive is checked by filename against the three approved key types (ed25519, rsa, ecdsa). A directive absent entirely is MEDIUM (\"compiled-in default may be weaker\"), never silently skipped. The action is audit-only and never writes to `sshd_config` or anywhere else. It is deliberately not: a live `sshd -T` query of the *effective* configuration (it parses the file, so a `+`/`-`/`^` modifier's resolved outcome is out of scope by design); a check of any directive outside the four covered here; or a check of anything past the first `Match` block.",
+  "inputs": [],
+  "kind": {
+    "collector": true,
+    "gathered": true,
+    "mutating": false
+  },
+  "leg_hash": "660f54ac14fd",
+  "manifest_version": 1,
+  "name": "ssh_hardening",
+  "outputs": [
+    {
+      "columns": [
+        {
+          "description": "Finding severity. The four live checks (KexAlgorithms, Ciphers, MACs, HostKey) emit only HIGH/MEDIUM/INFO today; CRITICAL and LOW are declared in ConfigCheckResult's vocabulary but not currently reachable from any check.\n",
+          "example": "HIGH",
+          "name": "severity",
+          "platforms": null,
+          "type": "string",
+          "values": [
+            "HIGH",
+            "MEDIUM",
+            "INFO"
+          ]
+        },
+        {
+          "description": "Always the fixed literal \"ssh_hardening\" -- one category for the whole plugin.",
+          "example": "ssh_hardening",
+          "name": "category",
+          "platforms": null,
+          "type": "string",
+          "values": [
+            "ssh_hardening"
+          ]
+        },
+        {
+          "description": "The sshd_config directive the row is about (KexAlgorithms, Ciphers, MACs, HostKey), or \"sshd_config\" for the one INFO row emitted when /etc/ssh/sshd_config itself is not found.\n",
+          "example": "KexAlgorithms",
+          "name": "title",
+          "platforms": null,
+          "type": "string",
+          "values": [
+            "KexAlgorithms",
+            "Ciphers",
+            "MACs",
+            "HostKey",
+            "sshd_config"
+          ]
+        },
+        {
+          "description": "Free-text finding detail -- the disallowed algorithm list, the reason a directive could not be resolved, or a pass confirmation.\n",
+          "example": "KexAlgorithms permits algorithm(s) outside the approved baseline: diffie-hellman-group14-sha1",
+          "name": "detail",
+          "platforms": null,
+          "type": "string",
+          "values": null
+        }
+      ],
+      "definition_id": "security.ssh_hardening.audit"
+    }
+  ],
+  "outputs_note": "Pipe-delimited rows via `write_output()`, one line per finding: `severity|ssh_hardening|title|detail`. Exactly one row per check (`KexAlgorithms`, `Ciphers`, `MACs`, `HostKey`) on a normal run, always in that fixed order; if `/etc/ssh/sshd_config` itself is not found, `audit` instead emits a single `INFO|sshd_config|...|...` sentinel row and no per-directive rows at all.",
+  "platforms": {
+    "linux": "supported",
+    "macos": "unsupported",
+    "windows": "unsupported"
+  },
+  "privileges": [
+    {
+      "grant": "n/a",
+      "if_refused": "n/a",
+      "measured": "n/a — plugin is compiled and dispatched only on Linux (`meson.build`); the descriptor's Windows leg is a compile-time UNSUPPORTED declaration, not a runtime probe",
+      "os": "Windows",
+      "runs_as": "n/a"
+    },
+    {
+      "grant": "n/a",
+      "if_refused": "n/a",
+      "measured": "n/a — same as Windows",
+      "os": "macOS",
+      "runs_as": "n/a"
+    },
+    {
+      "grant": "None for the common case — `/etc/ssh/sshd_config` ships world-readable (mode 0644) on every mainstream distribution this package checked. A host that hardens the file to a stricter mode (e.g. 0600) needs no *additional* grant to keep the audit working, since the account is unprivileged by design and gaining one would contradict the privilege model; on such a host the read fails",
+      "if_refused": "`run_audit()` treats \"file missing\" (`std::filesystem::exists` false) and \"file exists but unreadable\" (open failed) identically today -- both fall through to an empty directive stream, which every check then reports as MEDIUM \"not explicitly set\" rather than a distinct permission-denied result. See Caveats #1.",
+      "measured": "not yet captured on real hardware in this session (`docs/samples/linux.txt`) — no Linux build/runtime host is reachable from this development environment",
+      "os": "Linux",
+      "runs_as": "dedicated unprivileged account (`yuzu`), never root by design (`docs/agent-privilege-model.md:12`)"
+    }
+  ],
+  "readme": "agents/plugins/ssh_hardening/README.md",
+  "result_status": [
+    {
+      "completeness": "—",
+      "provenance": "—",
+      "status": "`UNDECLARED`",
+      "when": "Every run, on every branch. `execute()` never calls `ctx.set_result_status()` — a genuinely clean audit, a HIGH-severity finding, and the \"sshd_config not found\" sentinel are all indistinguishable at the result-status level; only the row content itself (and the process return code, always 0 for a recognized action) tells the two apart. See Caveats #2."
+    }
+  ],
+  "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "audit",
+          "not_captured": "hardware-absent: no Linux build/runtime host is available in this development environment (Windows-only toolchain this session; no WSL, Docker, or native Linux machine reachable) to run plugin-capture against a real /etc/ssh/sshd_config -- the real output is a pipe-delimited severity|ssh_hardening|<directive>|<detail> row per KexAlgorithms/Ciphers/MACs/HostKey check, exactly as evaluate_ssh_hardening() in ssh_hardening_rules.hpp produces and tests/unit/test_ssh_hardening_rules.cpp already exercises against fixture sshd_config content",
+          "params": "",
+          "rc": 0,
+          "result_status": null,
+          "row_count": 0,
+          "rows": [],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-09-17",
+        "host_class": "bare-metal",
+        "leg_hash": "pending",
+        "os": "linux",
+        "os_version": "n/a",
+        "privilege": "n/a"
+      }
+    }
+  },
+  "security": [
+    {
+      "action": "audit",
+      "dispatch_class": "ReadOnly",
+      "execute_gate": "None",
+      "mutability": "None",
+      "operation": "Read",
+      "risk_tier": "Low",
+      "securable": "Security"
+    }
+  ],
+  "source": {
+    "capability_rows": [
+      "server/core/src/capability_decls/plugin_action_catalogue_ssh_hardening.hpp"
+    ],
+    "changelog": [],
+    "definitions": [
+      "content/definitions/ssh_hardening.yaml"
+    ],
+    "plugin": [
+      "agents/plugins/ssh_hardening/src/ssh_hardening_collect.hpp",
+      "agents/plugins/ssh_hardening/src/ssh_hardening_plugin.cpp",
+      "agents/plugins/ssh_hardening/src/ssh_hardening_rules.hpp"
+    ],
+    "privilege_row": false,
+    "tests": [
+      "tests/unit/test_ssh_hardening_rules.cpp"
+    ]
+  },
+  "version": "1.0.0",
+  "where_the_data_goes": [
+    "**Instruction result only.** Rows travel over the agent's mTLS gRPC channel as the command response and land in the ResponseStore, queryable at `/api/responses/{id}`. `gather.ttlSeconds: 300` caches a read for 5 minutes.",
+    "**Not consumed by** daily-sync inventory, the TAR warehouse, DEX, or metrics — `security.ssh_hardening.audit` has no sync-source or TAR consumer; the only server-side reference is the capability-catalogue registration (`server/core/src/capability_decls/plugin_action_catalogue_ssh_hardening.hpp`) and the `Security` RBAC securable it reuses (already seeded for `certificates`/`firewall`/`quarantine`).",
+    "**Sensitivity.** Rows carry no device, person, or software identifiers — a finding names only an sshd_config directive and, at most, the disallowed algorithm names or a HostKey *file path* (`ssh_hardening_rules.hpp`'s `evaluate_host_keys`), never key material, a fingerprint, or a username; nothing here goes beyond the device id. A HostKey path could in principle embed a local username if an administrator placed a key under a home directory, though the shipped baseline paths (`/etc/ssh/ssh_host_*_key`) do not.",
+    "**Siblings:** none in this package — this is the fleet's only SSH-server-configuration auditor. `docs/user-manual/security-hardening.md` covers device-level hardening surfaces generally; this plugin is not yet cross-referenced there."
+  ]
+}

@@ -1,0 +1,3 @@
+captured: linux n/a · bare-metal · 2026-09-17 · n/a · leg-hash pending
+== action=audit
+[not captured] hardware-absent: no Linux build/runtime host is available in this development environment (Windows-only toolchain this session; no WSL, Docker, or native Linux machine reachable) to run plugin-capture against a real /etc/ssh/sshd_config -- the real output is a pipe-delimited severity|ssh_hardening|<directive>|<detail> row per KexAlgorithms/Ciphers/MACs/HostKey check, exactly as evaluate_ssh_hardening() in ssh_hardening_rules.hpp produces and tests/unit/test_ssh_hardening_rules.cpp already exercises against fixture sshd_config content

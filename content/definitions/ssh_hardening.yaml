@@ -1,0 +1,99 @@
+## SSH Server Hardening Definitions
+## Audits /etc/ssh/sshd_config against the Mozilla "Modern" OpenSSH baseline
+## (https://wiki.mozilla.org/Security/Guidelines/OpenSSH): KexAlgorithms,
+## Ciphers, MACs, and HostKey are checked against an approved allow-list.
+## Audit-only -- never modifies sshd_config. Linux-only.
+## Plugin: ssh_hardening | Actions: audit
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.ssh_hardening.audit
+  displayName: SSH Server Hardening Audit
+  version: 1.0.0
+  description: >
+    Audits /etc/ssh/sshd_config (and any files it Includes) against the
+    Mozilla "Modern" OpenSSH baseline. Checks that KexAlgorithms, Ciphers,
+    and MACs are restricted to the approved algorithm list, and that every
+    HostKey directive references an approved key type (ed25519, rsa, ecdsa).
+    A directive that is not explicitly set, uses a +/-/^ modifier the audit
+    cannot resolve, or permits an algorithm outside the baseline is reported
+    as a finding. Audit-only -- never modifies sshd_config. Linux-only.
+  tags: [security, ssh, sshd, compliance, hardening, mozilla]
+
+spec:
+  type: question
+  platforms: [linux]
+
+  execution:
+    plugin: ssh_hardening
+    action: audit
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: severity
+        type: string
+        description: >
+          Finding severity. The four live checks (KexAlgorithms, Ciphers,
+          MACs, HostKey) emit only HIGH/MEDIUM/INFO today; CRITICAL and LOW
+          are declared in ConfigCheckResult's vocabulary but not currently
+          reachable from any check.
+        values: [HIGH, MEDIUM, INFO]
+        example: "HIGH"
+      - name: category
+        type: string
+        description: Always the fixed literal "ssh_hardening" -- one category for the whole plugin.
+        values: [ssh_hardening]
+        example: "ssh_hardening"
+      - name: title
+        type: string
+        description: >
+          The sshd_config directive the row is about (KexAlgorithms, Ciphers,
+          MACs, HostKey), or "sshd_config" for the one INFO row emitted when
+          /etc/ssh/sshd_config itself is not found.
+        values: [KexAlgorithms, Ciphers, MACs, HostKey, sshd_config]
+        example: "KexAlgorithms"
+      - name: detail
+        type: string
+        description: >
+          Free-text finding detail -- the disallowed algorithm list, the
+          reason a directive could not be resolved, or a pass confirmation.
+        example: "KexAlgorithms permits algorithm(s) outside the approved baseline: diffie-hellman-group14-sha1"
+    aggregation:
+      groupBy: [severity, title]
+      operations: [count]
+
+  visualization:
+    # ssh_hardening emits one row per directive check on `audit`, format
+    # `severity|category|title|detail`. labelField=0 picks severity so
+    # HIGH/MEDIUM/INFO each become a pie slice.
+    type: pie
+    processor: single_series
+    title: SSH hardening findings by severity
+    labelField: 0
+    valueLabel: Findings
+
+  readablePayload: "Audit SSH server hardening (sshd_config vs. Mozilla Modern baseline)"
+
+  gather:
+    ttlSeconds: 300
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [ssh_hardening]
+
+status:
+  phase: active
