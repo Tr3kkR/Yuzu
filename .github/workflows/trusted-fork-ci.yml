@@ -144,8 +144,8 @@ jobs:
         run: |
           set -euo pipefail
           # Never purge outside a quarantine ref. A mis-scoped dispatch is
-          # already refused by the quarantine-ref guard above; this keeps a future edit from
-          # turning the purge into a cold rebuild for every PR on dev/main.
+          # already refused by the check right below; this keeps a future edit
+          # from turning the purge into a cold rebuild for every PR on dev/main.
           [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$ ]] || {
             echo "::error::refusing to purge caches outside a trusted-fork/pr-<N> ref (got $GITHUB_REF); see docs/ci-troubleshooting.md 1.2."
             exit 1
