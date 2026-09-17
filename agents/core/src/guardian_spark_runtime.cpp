@@ -1030,47 +1030,52 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                 // unconditionally the instant it wedged).
                 bool adopted = false;
                 // Governance Gate 7 fix (rung 9c PR-5d follow-up round 2,
-                // defense-in-depth): the try block below states as an invariant
-                // that "nothing else can have taken ownership of rule_id without
-                // first running detach_rule_locked... that path deactivates
-                // rg->active before this branch would ever see it true again."
-                // Gate 7's own adversarial review found a real bug (now fixed,
-                // in attach_core's Reobserved-restore branch above) that could
-                // violate exactly this invariant on a fault-injection path -
-                // silently reverting rules_[rule_id] to this claim's own stale
-                // generation, or losing the entry outright on a second fault
-                // during the commit below, over a legitimately newer,
-                // already-live generation. wedge_may_adopt intentionally does
-                // NOT itself check rules_ - that check is the explicit,
-                // separately-logged guard immediately below, so a violation of
-                // the invariant is OBSERVABLE (Gate 6 sre finding) rather than
-                // silently absorbed into "the condition just happened to be
-                // false."
+                // defense-in-depth): a wedged claim's rg->active reading true does
+                // NOT by itself prove nothing else has taken ownership of rule_id
+                // in the meantime - Gate 7's own adversarial review found a real
+                // bug (now fixed, in attach_core's Reobserved-restore branch
+                // above) that could violate that assumption on a fault-injection
+                // path. Gate 8's OWN review then found this branch is ALSO
+                // reachable via entirely ordinary desired-state churn, no fault
+                // injection needed: rule R wedges on key A; R is redeployed to key
+                // B (commits normally, rules_[R] now live on B); R is redeployed
+                // BACK to key A while the ORIGINAL key-A arm is still in flight -
+                // is_retained_wedge() never consults rg->active (see its own
+                // definition), so the still-outstanding claim is genuinely
+                // re-observed and its rg->active legitimately restored to true by
+                // that Reobserved-restore branch, even though rules_[R] is
+                // correctly live on B the whole time. Either way, wedge_may_adopt
+                // intentionally does NOT itself check rules_ - that check is the
+                // explicit, separately-counted-and-logged guard immediately below,
+                // so BOTH the rare invariant-violation case and the ordinary churn
+                // case are handled by the SAME code path rather than the latter
+                // being assumed away.
                 const bool wedge_may_adopt = was_wedge && !stopping_ && armed_live &&
                                              live.empty() && claim->rg && claim->rg->active;
                 if (wedge_may_adopt && rules_.contains(claim->rule_id)) {
-                    // Verify the invariant explicitly rather than trusting it
-                    // structurally: rules_ already holding ANY entry for this
-                    // rule_id while this claim's own rg->active reads true
-                    // should be impossible under correct operation (a wedged
-                    // claim that never committed has no rules_ entry of its
-                    // own, and anything else committing for the same rule_id
-                    // must have gone through detach_rule_locked first, which
-                    // deactivates rg->active before this branch is ever
-                    // reached) - so reaching here is itself evidence the
-                    // invariant was violated somewhere upstream, not a case to
-                    // silently paper over by adopting anyway and risking a
-                    // clobber of a live generation. Refuse adoption; the claim
-                    // falls through to the ordinary non-adopt/compensating-
-                    // disarm path below exactly as ANY other unwanted late
-                    // success does (live.empty() is still true).
+                    // rules_ already holding an entry for this rule_id while this
+                    // claim's own rg->active reads true means SOMETHING else
+                    // legitimately owns rule_id right now (an ordinary redeploy
+                    // that landed after this claim wedged - the common case,
+                    // proven reachable above - or, more rarely, the invariant
+                    // violation the fix above closes) - never adopt over it.
+                    // Refuse; the claim falls through to the ordinary non-adopt/
+                    // compensating-disarm path below exactly as ANY other
+                    // unwanted late success does (live.empty() is still true).
+                    // Counted AND logged (Gate 8 finding: a bare "should be
+                    // impossible" WARN mischaracterised the common redeploy-churn
+                    // case as an anomaly) - see wedge_adopt_stale_refused()'s own
+                    // doc comment for what a sustained, climbing rate means vs. an
+                    // occasional one.
+                    wedge_adopt_stale_refused_.fetch_add(1, std::memory_order_relaxed);
                     try {
-                        spdlog::warn("Guardian spark: refusing to adopt a late arm "
-                                     "success for rule '{}' generation {} - rules_ "
-                                     "already holds an entry for this rule_id, which "
-                                     "should be impossible while this claim's own "
-                                     "rg->active reads true; falling back to disarm "
-                                     "rather than risk clobbering a live generation",
+                        spdlog::warn("Guardian spark: a late arm success for rule '{}' "
+                                     "generation {} arrived after rules_ already gained "
+                                     "a different entry for this rule_id (an ordinary "
+                                     "redeploy landing while this claim was still wedged, "
+                                     "or - rarely - an invariant violation) - disarming "
+                                     "the stale success rather than adopting over the "
+                                     "current live generation",
                                      claim->rule_id, claim->generation);
                     } catch (...) {
                     }
@@ -1079,12 +1084,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     bool index_readded = false;
                     try {
                         // Reacquire the mapping abandonment released. Safe to re-add at
-                        // this exact (rule_id, generation): nothing else can have taken
-                        // ownership of rule_id without first running detach_rule_locked
-                        // (a fresh attach on this or any other key always detaches the
-                        // prior mapping first), and that path deactivates rg->active
-                        // before this branch would ever see it true again - so a
-                        // concurrent supersession is exactly what this check excludes.
+                        // this exact (rule_id, generation): the guard immediately above
+                        // has already confirmed rules_ holds NOTHING for rule_id right
+                        // now, so nothing else currently owns it - a concurrent
+                        // supersession is exactly what that check excludes, whether it
+                        // arrived via detach_rule_locked's ordinary deactivation or (see
+                        // that guard's own comment) an ordinary ongoing redeploy.
                         index_->add(key, claim->rule_id, claim->generation); // may throw
                         index_readded = true;
                         auto fresh = std::make_shared<PerKey>();

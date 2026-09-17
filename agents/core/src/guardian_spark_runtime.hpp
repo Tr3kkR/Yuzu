@@ -665,6 +665,24 @@ public:
     [[nodiscard]] std::uint64_t wedged_reobservations() const noexcept {
         return wedged_reobservations_.load(std::memory_order_relaxed);
     }
+    /// Governance Gate 8 fix (rung 9c PR-5d /governance run): a wedged claim's
+    /// late arm success was refused adoption because `rules_` already held an
+    /// entry for its rule_id - NOT necessarily a bug. Reachable via entirely
+    /// ordinary desired-state churn, no fault injection needed: rule R wedges on
+    /// key A; R is redeployed to key B (commits normally, `rules_[R]` now live on
+    /// B); R is redeployed BACK to key A while the ORIGINAL key-A arm is still
+    /// in flight - `is_retained_wedge()` never consults `rg->active`, so the
+    /// still-outstanding claim is genuinely re-observed and its adoption
+    /// candidacy restored; when that original arm eventually completes, this
+    /// counter increments and the stale success is safely disarmed instead of
+    /// being adopted over the live key-B generation. A sustained, climbing rate
+    /// is worth investigating (a rule redeploying faster than its own arm calls
+    /// resolve), but a nonzero count alone is NOT itself evidence of a bug -
+    /// unlike wedged_refusals_/wedged_reobservations_ above, whose triggers are
+    /// narrower. Lock-free.
+    [[nodiscard]] std::uint64_t wedge_adopt_stale_refused() const noexcept {
+        return wedge_adopt_stale_refused_.load(std::memory_order_relaxed);
+    }
     /// rung 9c R5.2: completion-callback drains whose OWN bookkeeping threw (not a
     /// commit throw, which is delivered to the waiter) - the firewall published a
     /// terminal outcome on every claim and dropped the entry. Lock-free.
@@ -1923,6 +1941,10 @@ private:
     /// claim. Same "internal-only, rides #3415" scope as the pair above.
     std::atomic<std::uint64_t> wedged_refusals_{0};
     std::atomic<std::uint64_t> wedged_reobservations_{0};
+    /// Governance Gate 8 fix (rung 9c PR-5d /governance run): see
+    /// wedge_adopt_stale_refused()'s own doc comment - same "internal-only,
+    /// rides #3415" scope as the pair above.
+    std::atomic<std::uint64_t> wedge_adopt_stale_refused_{0};
 
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_queued_{0};     ///< R5.2: attach_rule queued behind a same-key claim
