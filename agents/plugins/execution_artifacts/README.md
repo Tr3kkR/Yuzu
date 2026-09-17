@@ -113,8 +113,8 @@ Pipe-delimited rows, one discriminator-prefixed row per artefact entry (`shimcac
 |---|---|---|---|
 | `OK` | full | *(empty)* | `shimcache`: the AppCompatCache value opened, read within the 16 MiB bound, and parsed to at least one row. `amcache`: every enumerated subkey and value read cleanly, no cap hit. `prefetch`: every `.pf` file was enumerated, read, decompressed and parsed with no per-file error and no cap hit. |
 | `OK` | partial | `file_oversized` · `read_failed` · `ntdll_symbol_missing` · `ntstatus_<hex>` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` (comma-joined when several fire) | `prefetch` only: the directory enumeration completed in full but one or more individual `.pf` files failed to open, read, decompress or parse; each failed file is already on the stream as its own `prefetch_error\|<file>\|<reason>` row, so the run is reported as a degraded success rather than a failure — one truncated file must never fail every other good row. |
-| `CONSTRAINED` | partial | `shimcache`: `reg_<code>` · `oversized` · `reg_changed_during_read` · `shimcache_empty` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` · `internal_error`. `amcache`: `data_dir_unset` · `dest_dir_create_<code>` · `dest_dir_open_<code>` · `dest_dir_acl` · `hive_missing` · `hive_oversized` · `hive_locked` · `win32_<code>` · `hive_short_write` · `regload_<code>` · `amcache_root_missing` · `subkey_cap` · `enum_<code>` · `subkey_open_failed` · `value_enum_incomplete` · `value_read_failed` · `amcache_empty` · `internal_error` (comma-joined; `amcache_empty` is always composed with any other accumulated reason via `reason_with`, never reported alone when a real cause is known). `prefetch`: `prefetch_disabled` · `prefetch_enum_<code>` · `file_cap` · `byte_cap` · `internal_error` (plus any of the `OK`/partial per-file tokens above, accumulated alongside a cap). | `shimcache`: the key/value could not be opened or read, the blob exceeded the 16 MiB cap, changed mid-read, parsed to zero rows, failed header parsing, or an unexpected exception was caught. `amcache`: `agent.data_dir` was never configured for this host (`data_dir_unset`); its per-dispatch random scratch directory could not be created (`dest_dir_create_<code>`) or could not be re-opened as a handle immediately afterward (`dest_dir_open_<code>`); or that freshly-created directory failed an owner/reparse-point safety check proving it is really the object this process just created (`dest_dir_acl`) — otherwise the hive could not be found, copied, size-checked, loaded, or enumerated within `kAmcacheMaxSubkeys` (20000), or an unexpected exception was caught. `prefetch`: the Prefetch directory could not be enumerated, or the per-file-count (2048) or total-byte (256 MiB) cap truncated the walk before every file was seen, or an unexpected exception was caught. |
-| `UNAVAILABLE` | partial | `windows_only_artefact` | All three actions, on every non-Windows build — this plugin has no macOS or Linux mechanism for ShimCache, Amcache, or Prefetch; the fixed fallback reports this token and rc 1 without attempting any OS call. |
+| `CONSTRAINED` | partial | `shimcache`: `reg_<code>` · `oversized` · `reg_changed_during_read` · `shimcache_empty` · `bad_magic` · `truncated_header` · `unknown_version` · `truncated_entry` · `oversize_count` · `bad_path_length` · `internal_error`. `amcache`: `data_dir_unset` · `dest_dir_create_<code>` · `dest_dir_open_<code>` · `dest_dir_acl` · `hive_missing` · `hive_oversized` · `hive_locked` · `win32_<code>` · `hive_short_write` · `regload_<code>` · `amcache_root_missing` · `subkey_cap` · `enum_<code>` · `subkey_open_failed` · `value_enum_incomplete` · `value_read_failed` · `amcache_empty` · `internal_error` (comma-joined; `amcache_empty` is always composed with any other accumulated reason via `reason_with`, never reported alone when a real cause is known). `prefetch`: `prefetch_disabled` · `prefetch_evidence_absent` · `prefetch_state_unknown` · `prefetch_enum_<code>` · `file_cap` · `byte_cap` · `internal_error` (plus any of the `OK`/partial per-file tokens above, accumulated alongside a cap). | `shimcache`: the key/value could not be opened or read, the blob exceeded the 16 MiB cap, changed mid-read, parsed to zero rows, failed header parsing, or an unexpected exception was caught. `amcache`: `agent.data_dir` was never configured for this host (`data_dir_unset`); its per-dispatch random scratch directory could not be created (`dest_dir_create_<code>`) or could not be re-opened as a handle immediately afterward (`dest_dir_open_<code>`); or that freshly-created directory failed an owner/reparse-point safety check proving it is really the object this process just created (`dest_dir_acl`) — otherwise the hive could not be found, copied, size-checked, loaded, or enumerated within `kAmcacheMaxSubkeys` (20000), or an unexpected exception was caught. `prefetch`: no `.pf` file exists under `C:\Windows\Prefetch` — reported as `prefetch_disabled` when `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters\EnablePrefetcher` reads `0` (prefetching is configured off), `prefetch_evidence_absent` when it reads `1`, `2` or `3` (prefetching is configured on, yet no file exists — consistent with, but not proof of, removal after the fact: the SysMain service state is not consulted, and a disabled SysMain leaves the directory legitimately empty with the value still `3`), or `prefetch_state_unknown` when the best-effort registry read failed or returned an undocumented value (a read failure never blocks or fails the action); otherwise the Prefetch directory could not be enumerated, or the per-file-count (2048) or total-byte (256 MiB) cap truncated the walk before every file was seen, or an unexpected exception was caught. |
+| `UNAVAILABLE` | partial | `windows_only_artefact` | All three actions, on every non-Windows build — this plugin has no macOS or Linux mechanism for ShimCache, Amcache, or Prefetch; the fixed fallback reports this token and rc 1 without attempting any OS call. The row itself is `<action>\|unsupported\|windows_only_artefact` — action-name-prefixed, the same leading-discriminator shape as every other row this plugin emits and the `registry`/`rdp_control` sibling convention. |
 
 ### Where the data goes
 
@@ -179,21 +179,21 @@ prefetch|CCLEANER.EXE|9768B079|31|35|1787047972018,1787047970346,1787038430500,1
 [result_status] OK / PARTIAL / unknown_version,truncated_header
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 421f7d82a099
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-17 · euid 501 · leg-hash 421f7d82a099
 
 ```
 == action=shimcache
-unsupported|windows_only_artefact
+shimcache|unsupported|windows_only_artefact
 [result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
 [rc] 1
 
 == action=amcache
-unsupported|windows_only_artefact
+amcache|unsupported|windows_only_artefact
 [result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
 [rc] 1
 
 == action=prefetch
-unsupported|windows_only_artefact
+prefetch|unsupported|windows_only_artefact
 [result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
 [rc] 1
 ```
