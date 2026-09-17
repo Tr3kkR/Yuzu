@@ -9,6 +9,12 @@ namespace {
 
 double clamp_pct(double v) { return std::clamp(v, 0.0, 100.0); }
 
+// Saturating uint64 add: never wraps past UINT64_MAX.
+std::uint64_t sat_add(std::uint64_t a, std::uint64_t b) {
+    const std::uint64_t sum = a + b;
+    return sum < a ? std::numeric_limits<std::uint64_t>::max() : sum;
+}
+
 // Saturating uint64 multiply: never wraps past UINT64_MAX.
 std::uint64_t sat_mul(std::uint64_t a, std::uint64_t b) {
     if (a == 0 || b == 0)
@@ -60,6 +66,15 @@ std::optional<double> disk_await_ms(const DiskTotals& prev, const DiskTotals& cu
 
 double memory_pressure_pct(int level) noexcept {
     return std::clamp(100.0 - static_cast<double>(level), 0.0, 100.0);
+}
+
+std::uint64_t vm_used_bytes(std::uint64_t wire, std::uint64_t internal, std::uint64_t purgeable,
+                             std::uint64_t compressor, std::uint64_t page) noexcept {
+    // purgeable pages are reclaimable-on-demand and already folded into `internal`, so
+    // they must not inflate "used" — floor at 0 rather than underflow.
+    const std::uint64_t app = internal >= purgeable ? internal - purgeable : 0;
+    const std::uint64_t used_pages = sat_add(sat_add(wire, app), compressor);
+    return sat_mul(used_pages, page);
 }
 
 } // namespace yuzu::agent::macos

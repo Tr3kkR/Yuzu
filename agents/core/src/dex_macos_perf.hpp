@@ -76,4 +76,21 @@ YUZU_EXPORT std::optional<double> disk_await_ms(const DiskTotals& prev, const Di
 /// kernel revision, or a bad read) never produces a nonsensical negative/>100 value.
 YUZU_EXPORT double memory_pressure_pct(int level) noexcept;
 
+/// One host_statistics64(HOST_VM_INFO64) + hw.memsize snapshot, already reduced to
+/// bytes (never raw page counts — the caller never needs the page size).
+struct VmSnapshot {
+    bool valid{false};
+    std::uint64_t total_bytes{0};
+    std::uint64_t used_bytes{0};
+};
+
+/// PURE, saturating: reduce a vm_statistics64 snapshot to a single "used" byte count,
+/// mirroring Activity Monitor's memory accounting: wired + (internal-app pages, minus
+/// the purgeable/reclaimable-on-demand pages already folded into `internal`) +
+/// compressor pages, all times the page size. Saturates rather than wraps on overflow;
+/// `purgeable > internal` floors the app term at 0 rather than underflowing.
+YUZU_EXPORT std::uint64_t vm_used_bytes(std::uint64_t wire, std::uint64_t internal,
+                                        std::uint64_t purgeable, std::uint64_t compressor,
+                                        std::uint64_t page) noexcept;
+
 } // namespace yuzu::agent::macos
