@@ -24,6 +24,8 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_ingestion.hpp"
+#include "app_usage_store.hpp"
 #include "peer_ip.hpp"
 
 namespace yuzu::server::detail {
@@ -1113,6 +1115,29 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         } catch (...) {
             spdlog::warn("[gateway] ProxyInventory: software_licensing ingest threw (unknown) for "
                          "agent={} — acked",
+                         agent_id);
+        }
+    }
+    // Typed app_usage via its shared seam (Wave 7 PR7.2) — byte-identical to
+    // the direct ReportInventory path, independently guarded + isolated.
+    if (app_usage_store_ && app_usage_store_->is_open()) {
+        try {
+            ingest_app_usage_report(*app_usage_store_, agent_id, *request, *response, metrics_);
+        } catch (const std::exception& ex) {
+            // P11: unlike the sibling blocks above, a swallowed throw here with no
+            // nack lets the agent's SyncScheduler advance last_hash and go
+            // hash-only for a day with nothing persisted — the nack forces a full
+            // resend next cycle. Follow-up issue filed at delivery to retrofit the
+            // four sibling blocks (installed_software/app_perf/device_ci/
+            // software_licensing) with the same nack; do not do it here.
+            response->add_need_full("app_usage");
+            spdlog::warn("[gateway] ProxyInventory: app_usage ingest threw for agent={} — "
+                         "nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("app_usage");
+            spdlog::warn("[gateway] ProxyInventory: app_usage ingest threw (unknown) for "
+                         "agent={} — nacked",
                          agent_id);
         }
     }

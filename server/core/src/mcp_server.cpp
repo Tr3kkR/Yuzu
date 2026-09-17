@@ -38,6 +38,8 @@
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
+#include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
+#include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
 // ADR-0031 operator surface (PR1.6c, p14) — mint/list/revoke_upload_grant.
@@ -2551,6 +2553,15 @@ static const ToolDef kTools[] = {
      "REST drill. Requires SoftwareLicensing:Read.",
      R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","minLength":1,"maxLength":256}},"required":["agent_id"]})",
      R"j({"type":"object","properties":{"agent_id":{"type":"string"},"count":{"type":"integer"},"licenses":{"type":"array","items":{"type":"object","properties":{"product":{"type":"string"},"vendor":{"type":"string"},"version":{"type":"string"},"license_type":{"type":"string"},"state":{"type":"string"},"expiry_at":{"type":"integer"},"channel":{"type":"string"},"key_hint":{"type":"string"},"detector":{"type":"string"},"confidence":{"type":"string"},"exe_hints":{"type":"string"}}}}},"required":["agent_id","count","licenses"]})j"},
+    {"get_agent_app_usage",
+     "Query a single agent's per-executable app-usage projection (wave 7 PR7.2) — the "
+     "MCP twin of GET /api/v1/forensics/agents/{id}/app-usage. One row per executable: "
+     "first_seen/last_seen (agent-observed, within TAR's retained usage window — 31 days "
+     "default, operator-tunable) and a trailing-30-day run_count/total_seconds window. "
+     "collected_at is the agent's batch collection time. No user names or pids — the "
+     "store carries none. Requires Forensics:Read.",
+     R"({"type":"object","properties":{"agent_id":{"type":"string","description":"Exact agent/device id","minLength":1,"maxLength":256}},"required":["agent_id"]})",
+     R"j({"type":"object","properties":{"agent_id":{"type":"string"},"apps":{"type":"array","items":{"type":"object","properties":{"exe_key":{"type":"string"},"first_seen":{"type":"integer"},"last_seen":{"type":"integer"},"run_count_30d":{"type":"integer"},"total_seconds_30d":{"type":"integer"}}}},"collected_at":{"type":"integer"}},"required":["agent_id","apps","collected_at"]})j"},
 
     // ── Periodic Access Reviews (SOC 2 CC6.2) — MCP twins of
     // /api/v1/access-reviews* (ADR-1005 parity). JSON only: the REST
@@ -3619,6 +3630,7 @@ static const ToolSecurityEntry kToolSecurityRows[] = {
     {"discover_scope_kinds", {"Infrastructure", "Read"}},
     {"discover_plugins", {"Infrastructure", "Read"}},
     {"query_software_licenses", {"SoftwareLicensing", "Read", ServiceScopeClass::confined}},
+    {"get_agent_app_usage", {"Forensics", "Read", ServiceScopeClass::confined}},
     // Periodic Access Reviews (SOC 2 CC6.2) — parity with the REST twins'
     // AccessReview:Read (export/get/list) and AccessReview:Attest
     // (open/attest/close) gates — a dedicated narrow securable, NOT AuditLog,
@@ -4228,6 +4240,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     {"discover_scope_kinds", {ToolEffect::ReadOnly, true, "Discover scope DSL"}},
     {"discover_plugins", {ToolEffect::ReadOnly, true, "Discover plugins"}},
     {"query_software_licenses", {ToolEffect::ReadOnly, true, "Query software licenses"}},
+    {"get_agent_app_usage", {ToolEffect::ReadOnly, true, "Get agent app-usage projection"}},
     {"export_access_review", {ToolEffect::ReadOnly, true, "Export access review evidence"}},
     {"get_access_review", {ToolEffect::ReadOnly, true, "Get access review campaign"}},
     {"list_access_reviews", {ToolEffect::ReadOnly, true, "List access review campaigns"}},
@@ -5110,7 +5123,11 @@ McpServer::HandlerFn McpServer::build_handler(
     OffloadTargetStore* offload_target_store, LicenseStore* license_store,
     SoftwareDeploymentStore* sw_deploy_store, CaRoutes::ExportCsrFn export_csr_fn,
     CaRoutes::ImportChainFn import_chain_fn,
-    std::shared_ptr<const ComplianceApi> compliance_api) {
+    std::shared_ptr<const ComplianceApi> compliance_api,
+    // wave 7 PR7.2: backs get_agent_app_usage. True last parameter (matching
+    // the .hpp order) so every existing caller that terminates its positional
+    // args earlier keeps compiling unchanged.
+    AppUsageStore* app_usage_store) {
 
     // Live reads via a pointer captured by value in the [=] handler below, so a
     // runtime settings-UI toggle of mcp_read_only / mcp_disable reaches this
@@ -8935,6 +8952,115 @@ McpServer::HandlerFn McpServer::build_handler(
                     payload.add("audit_persisted", false);
                 res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
                                 "application/json");
+                return;
+            }
+
+            // ── get_agent_app_usage (wave 7 PR7.2) ──────────────────────────
+            // The MCP twin of GET /api/v1/forensics/agents/{id}/app-usage: one
+            // agent's per-executable app-usage projection. Same per-device
+            // ancestor-aware SCOPED Forensics:Read gate as the REST route, plus
+            // the identical #1717 fail-closed guard (a corrupt/load-failed
+            // rbac.db REFUSES rather than falling through to a legacy-open
+            // read). No PII to omit — the store carries no user names/pids —
+            // so the payload mirrors the REST drill field-for-field.
+            if (tool_name == "get_agent_app_usage") {
+                if (!tier_allows(tier, "Forensics", "Read")) {
+                    res.set_content(
+                        a4_error(kTierDenied, "MCP tier does not allow this operation", kTierRemediation),
+                        "application/json");
+                    return;
+                }
+                if (rbac_enforcement_in_effect(rbac_store) && !(rbac_store && rbac_store->is_open())) {
+                    mcp_audit("failure", "authorization subsystem unavailable (#1717 fail-closed)");
+                    res.set_content(a4_error(kInternalError, "authorization subsystem unavailable",
+                                             {}, mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                auto agent_id = param_str(args, "agent_id");
+                if (agent_id.empty()) {
+                    res.set_content(a4_error(kInvalidParams, "agent_id is required"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn) {
+                    res.set_content(a4_error(kInternalError, "scope gate not configured"),
+                                    "application/json");
+                    return;
+                }
+                if (!scoped_perm_fn(req, res, "Forensics", "Read", agent_id))
+                    return; // the gate wrote its own 401/403
+                if (!app_usage_store) {
+                    mcp_audit("failure", "app-usage store unavailable; agent=" + agent_id);
+                    res.set_content(a4_error(kInternalError, "App-usage store unavailable",
+                                             "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                                    "application/json");
+                    return;
+                }
+                // Rows + collected_at come back together from ONE transaction
+                // (AppUsageStore::get_agent_usage_snapshot) — the REST twin
+                // (app_usage_routes.cpp) sources both through the same store
+                // method, so neither surface can pair one snapshot's rows with
+                // another's collected_at (the store method's own doc comment
+                // has the race a two-call split would reopen). collected_at is
+                // sourced from the usage_state PARENT row, never rows.front().
+                // collected_at — a legitimate replace-to-empty snapshot has no
+                // row to carry it, and that empty case must still report the
+                // real collection time, not 0 (#C2). Authoritative read: a
+                // store/pool/query/transaction degrade is an ERROR, never
+                // success+[] — mirrors the REST drill's 503.
+                auto snapshot_result = app_usage_store->get_agent_usage_snapshot(agent_id);
+                if (!snapshot_result.has_value()) {
+                    mcp_audit("failure", "app-usage store degraded; agent=" + agent_id);
+                    res.set_content(
+                        a4_error(kInternalError, "app-usage store unavailable — read failed",
+                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Per-access behavioural audit — same posture as the REST twin
+                // (app_usage_routes.cpp): this data is behavioural PII (what ran,
+                // when, how often), so a dropped audit row FAILS CLOSED rather than
+                // set-and-proceed. Mirrors the #3937 credential-reveal precedent
+                // (engine_principal.credential.reveal) — audit BEFORE the payload
+                // is built, and on failure the data is WITHHELD entirely, never
+                // served with an audit_persisted:false flag. DUAL audit, same
+                // shape as credential.reveal: the domain event ("app_usage.agent.view"
+                // — same verb as the REST twin) plus the generic mcp.<tool>
+                // bookkeeping event — either dropping fails the whole request
+                // closed, since both are the durable evidence this gate exists
+                // to guarantee.
+                const bool domain_audit_ok = yuzu::server::detail::try_persist_audit(
+                    audit_fn, req, "app_usage.agent.view", "success", "Agent", agent_id, "");
+                const bool audit_ok = mcp_audit("success", agent_id);
+                if (!domain_audit_ok || !audit_ok) {
+                    // Deliberately NOT passing audit_ok=false here: that flag makes
+                    // a4_error append "audit_persisted":false, the set-and-proceed
+                    // shape used elsewhere in this file when data IS still served.
+                    // This path withholds the data entirely (see the block comment
+                    // above), so the error body must carry no audit_persisted field
+                    // at all — passing false would silently reintroduce the
+                    // flagged-serve shape this gate exists to prevent.
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "the app-usage read succeeded but its access-audit record could "
+                                 "not be persisted; refusing to serve behavioural data without "
+                                 "durable evidence",
+                                 "retry the request",
+                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
+                        "application/json");
+                    return;
+                }
+                // Rule 1 shared builder (app_usage_read_model.hpp) — the SAME
+                // function the REST twin calls, so the two JSON shapes cannot
+                // drift apart.
+                AppUsageModel model;
+                model.agent_id = agent_id;
+                model.apps = std::move(snapshot_result->rows);
+                model.collected_at = snapshot_result->collected_at;
+                res.set_content(
+                    success_response(id, tool_result(app_usage_json(model), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 
@@ -23503,7 +23629,9 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 CaRoutes::ExportCsrFn export_csr_fn,
                                 CaRoutes::ImportChainFn import_chain_fn,
-                                std::shared_ptr<const ComplianceApi> compliance_api) {
+                                std::shared_ptr<const ComplianceApi> compliance_api,
+                                // wave 7 PR7.2: true last parameter.
+                                AppUsageStore* app_usage_store) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn),
                     std::move(agents_fn), rbac_store, instruction_store, execution_tracker,
@@ -23515,7 +23643,8 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(app_perf_providers), quarantine_store, std::move(tag_push_fn),
                     agent_registry, std::move(scoped_perm_fn), sessions, mcp_streaming_disabled,
                     mcp_streamed_post_enabled, std::move(allowed_origins),
-                    software_licensing_store, engine_principal_store, access_review_store,
+                    software_licensing_store, engine_principal_store,
+                    access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(revalidate_fn),
                     mcp_max_streams_per_principal, std::move(principal_audit_fn),
                     std::move(caller_fn), product_pack_store, workflow_engine,
@@ -23523,7 +23652,7 @@ void McpServer::register_routes(httplib::Server& svr, AuthFn auth_fn, PermFn per
                     std::move(lockout_clear_fn), offload_target_store,
                     license_store, sw_deploy_store, std::move(export_csr_fn),
                     std::move(import_chain_fn),
-                    std::move(compliance_api));
+                    std::move(compliance_api), app_usage_store);
 }
 
 void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm_fn,
@@ -23567,7 +23696,9 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                 SoftwareDeploymentStore* sw_deploy_store,
                                 CaRoutes::ExportCsrFn export_csr_fn,
                                 CaRoutes::ImportChainFn import_chain_fn,
-                                std::shared_ptr<const ComplianceApi> compliance_api) {
+                                std::shared_ptr<const ComplianceApi> compliance_api,
+                                // wave 7 PR7.2: true last parameter.
+                                AppUsageStore* app_usage_store) {
     // GET + DELETE first: they COPY auth_fn / audit_fn / allowed_origins, which
     // build_handler std::move()s below. &mcp_disabled is a live pointer into the
     // cfg_ member (outlives the handlers).
@@ -23591,7 +23722,8 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(tag_push_fn), agent_registry, std::move(scoped_perm_fn),
                             sessions, mcp_streaming_disabled, mcp_streamed_post_enabled,
                             std::move(allowed_origins),
-                            software_licensing_store, engine_principal_store, access_review_store,
+                            software_licensing_store, engine_principal_store,
+                            access_review_store,
                             auth_db, directory_sync, std::move(caller_fn),
                             // 2f PR 3b: the streamed-POST arm leases from the SAME
                             // budget as the GET channel above (which COPIED these, so
@@ -23603,7 +23735,7 @@ void McpServer::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                             std::move(lockout_clear_fn),
                             offload_target_store, license_store, sw_deploy_store,
                             std::move(export_csr_fn), std::move(import_chain_fn),
-                            std::move(compliance_api)));
+                            std::move(compliance_api), app_usage_store));
 
     // Streaming is ON only when a registry is wired AND the kill switch is off —
     // report the true state, not just the kill-switch bit (governance arch/sre NICE).
