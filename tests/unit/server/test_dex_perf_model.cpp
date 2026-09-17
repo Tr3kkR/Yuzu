@@ -161,6 +161,27 @@ TEST_CASE("fleet_now: absent-not-zero + honest denominators", "[dex][perf][model
     CHECK(now.windows_online == 3);
 }
 
+TEST_CASE("fleet_now: per-OS online + reporting denominators", "[dex][perf][model][os]") {
+    DexPerfSnapshot snap;
+    // Two Windows (one reporting), one Linux (reporting), two macOS (neither
+    // reporting — no collector yet), one unrecognized OS (online, never
+    // reporting, never counted in any *_online bucket).
+    snap.devices.push_back(dev("w1", 10.0, std::nullopt, std::nullopt, "", "windows"));
+    snap.devices.push_back(dev("w2", std::nullopt, std::nullopt, std::nullopt, "", "windows"));
+    snap.devices.push_back(dev("l1", 20.0, std::nullopt, std::nullopt, "", "linux"));
+    snap.devices.push_back(dev("m1", std::nullopt, std::nullopt, std::nullopt, "", "macos"));
+    snap.devices.push_back(dev("m2", std::nullopt, std::nullopt, std::nullopt, "", "macos"));
+    snap.devices.push_back(dev("u1", std::nullopt, std::nullopt, std::nullopt, "", ""));
+    auto now = dex_perf_fleet_now(snap);
+    CHECK(now.windows_online == 2);
+    CHECK(now.linux_online == 1);
+    CHECK(now.macos_online == 2);
+    CHECK(now.reporting == 2); // w1 + l1
+    CHECK(now.reporting_windows == 1);
+    CHECK(now.reporting_linux == 1);
+    CHECK(now.reporting_macos == 0);
+}
+
 TEST_CASE("fleet_now: partial reporters count once, per-metric n varies",
           "[dex][perf][model]") {
     DexPerfSnapshot snap;

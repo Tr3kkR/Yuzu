@@ -74,10 +74,24 @@ DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap) {
     DexPerfFleetNow out;
     std::vector<double> cpu, commit, disk;
     for (const auto& d : snap.devices) {
+        // *_online: every online device of that OS, regardless of whether it
+        // reported anything this cycle (the coverage-honest denominator).
         if (d.os == "windows")
             ++out.windows_online;
-        if (reports_any(d))
+        else if (d.os == "linux")
+            ++out.linux_online;
+        else if (d.os == "macos")
+            ++out.macos_online;
+        const bool reported = reports_any(d);
+        if (reported) {
             ++out.reporting;
+            if (d.os == "windows")
+                ++out.reporting_windows;
+            else if (d.os == "linux")
+                ++out.reporting_linux;
+            else if (d.os == "macos")
+                ++out.reporting_macos;
+        }
         if (d.cpu_pct)
             cpu.push_back(*d.cpu_pct);
         if (d.commit_pct)

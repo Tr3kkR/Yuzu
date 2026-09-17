@@ -86,7 +86,17 @@ struct DexPerfFleetNow {
     std::optional<DexPerfStat> commit;
     std::optional<DexPerfStat> disk_lat;
     int64_t reporting{0};      ///< devices contributing at least one metric
-    int64_t windows_online{0}; ///< the coverage-honest denominator
+    int64_t windows_online{0}; ///< the coverage-honest denominator (unchanged; keep first)
+    // Trailing per-OS breakdown (C1, additive — REST/MCP responses only ever
+    // APPEND fields; windows_online/reporting above stay byte-identical).
+    // *_online counts every online device of that OS (collector or not);
+    // reporting_* counts only those that ALSO reported ≥1 metric this cycle
+    // (dex_perf_os_collects gates which OSes can appear here at all today).
+    int64_t linux_online{0};
+    int64_t macos_online{0};
+    int64_t reporting_windows{0};
+    int64_t reporting_linux{0};
+    int64_t reporting_macos{0};
 };
 
 DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap);
