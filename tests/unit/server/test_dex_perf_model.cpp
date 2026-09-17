@@ -736,6 +736,12 @@ TEST_CASE("REST /dex/perf/fleet: stats + denominators, absent metric is null",
     CHECK(j["data"]["commit_pct"].is_null()); // nobody reported — null, never 0
     CHECK(j["data"]["reporting"] == 2);
     CHECK(j["data"]["windows_online"] == 3);
+    // Additive per-OS fields (C1) — all-Windows fixture, so linux/macos are 0.
+    CHECK(j["data"]["linux_online"] == 0);
+    CHECK(j["data"]["macos_online"] == 0);
+    CHECK(j["data"]["reporting_windows"] == 2);
+    CHECK(j["data"]["reporting_linux"] == 0);
+    CHECK(j["data"]["reporting_macos"] == 0);
 }
 
 TEST_CASE("REST /dex/perf/* A4 error bodies carry retry_after_ms + X-Correlation-Id (#1470)",
