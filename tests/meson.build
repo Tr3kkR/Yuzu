@@ -487,6 +487,8 @@ agent_test_exe = executable(
     'unit/test_execution_artifacts_parsers.cpp',   # Wave 7b PR7b.1: pure binary parsers over REAL CAPTURE fixtures + mutation fuzz
     'unit/test_execution_artifacts_local_dispatcher.cpp',  # Wave 7b PR7b.1: real plugin via LocalDispatcher, unguarded on every OS
     'unit/test_execution_artifacts_win_local.cpp',  # Wave 7b PR7b.1: Windows leg shape assertions, unguarded TU
+    'unit/test_execution_artifacts_scratch_sweep.cpp',  # #4390: portable scratch-dir selection policy (every OS) + Windows handle-relative sweep, init()/dispatch e2e
+    'unit/test_execution_artifacts_win_internals.cpp',  # #4392: TU-inclusion seam over execution_artifacts_win.cpp (Windows-only body, empty TU elsewhere)
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
   ),
