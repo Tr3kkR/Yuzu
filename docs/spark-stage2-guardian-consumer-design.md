@@ -730,7 +730,7 @@ together in prose but which do not share one signal in code:
   rather than merely trusts, that nothing else has taken ownership of the
   rule_id in the meantime: it refuses adoption outright (falling through to
   the ordinary disarm path, counted via `wedge_adopt_stale_refused()` and
-  logged at WARN) if `rules_` already holds ANY entry for that rule_id. This
+  logged at INFO) if `rules_` already holds ANY entry for that rule_id. This
   is NOT purely defense-in-depth against the fault-injection fix above -
   governance Gate 8 found (and a regression test now pins) that this branch
   is independently reachable via entirely ordinary desired-state churn, no

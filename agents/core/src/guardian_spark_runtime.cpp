@@ -1066,10 +1066,14 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                     // impossible" WARN mischaracterised the common redeploy-churn
                     // case as an anomaly) - see wedge_adopt_stale_refused()'s own
                     // doc comment for what a sustained, climbing rate means vs. an
-                    // occasional one.
+                    // occasional one. INFO, not WARN (Gate 8 unhappy-path NICE
+                    // finding): an occasional occurrence is expected operational
+                    // noise from ordinary redeploy churn, not a fault - the
+                    // counter, not the log level, is the signal an operator should
+                    // alert on a sustained rate from.
                     wedge_adopt_stale_refused_.fetch_add(1, std::memory_order_relaxed);
                     try {
-                        spdlog::warn("Guardian spark: a late arm success for rule '{}' "
+                        spdlog::info("Guardian spark: a late arm success for rule '{}' "
                                      "generation {} arrived after rules_ already gained "
                                      "a different entry for this rule_id (an ordinary "
                                      "redeploy landing while this claim was still wedged, "
