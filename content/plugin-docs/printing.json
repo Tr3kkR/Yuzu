@@ -508,7 +508,9 @@
     "capability_rows": [
       "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp"
     ],
-    "changelog": [],
+    "changelog": [
+      "changelog.d/wave9-pr91b-printing.added.md"
+    ],
     "definitions": [
       "content/definitions/printing.yaml"
     ],
