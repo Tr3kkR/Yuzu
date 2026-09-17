@@ -325,8 +325,9 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
             // docs-writer, independently confirmed by security-guardian/cpp-expert/
             // cpp-safety/architect - the 4th occurrence of the same fail-open class on
             // this branch, after adversarial-review Blocker 2, governance sec-h1/cs-1,
-            // and the external-review fix at attach_core's Reobserved-restore branch
-            // (1cd9a0772, immediately above at Gate 7/8's own review round). Reachable
+            // and the external-review fix at attach_core's Reobserved-restore branch,
+            // further down this same file (1cd9a0772, external review, PR #4485,
+            // fjarvis). Reachable
             // interleaving: wedge rule_id on key A; redeploy to key B (detach_rule_locked
             // deactivates claim A's rg->active AND erases wedged_by_rule_["rule_id"] -
             // see that function's own wedge lookup); redeploy BACK to key A before B ever

@@ -8973,10 +8973,10 @@ TEST_CASE("rung 9c PR-5d /governance cross-examination (Gate 2/3, this run: rais
 
     // Redeploy r1 to key B. detach_rule_locked("r1") finds wedged_by_rule_["r1"] ==
     // claim A, deactivates claim A's rg->active, AND ERASES the map entry (its own
-    // wedge-lookup branch, a few hundred lines above this test's own file) - claim A
-    // stays parked in key A's own fifo, untouched otherwise, but the locator no
-    // longer names it. Key B's own arm ALSO hangs rather than resolving immediately -
-    // it must still be merely Dispatching, not yet wedged, when the next step runs.
+    // wedge-lookup branch, further down guardian_spark_runtime.cpp) - claim A stays
+    // parked in key A's own fifo, untouched otherwise, but the locator no longer
+    // names it. Key B's own arm ALSO hangs rather than resolving immediately - it
+    // must still be merely Dispatching, not yet wedged, when the next step runs.
     b->hang_next_arm.store(true);
     auto res_b = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/b"),
                                  file_exists_rule("r1"), true);
@@ -9012,21 +9012,17 @@ TEST_CASE("rung 9c PR-5d /governance cross-examination (Gate 2/3, this run: rais
     CHECK(rt->expire_overdue_claims() == 1); // wedges key B's claim
     CHECK(rt->receipt_status(res_b->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
 
-    // Withdraw r1. Corrected (governance, 4 independent reviewers - cpp-expert/
-    // quality-engineer/architect/docs-writer): the restore branch's own
-    // insert_or_assign(rule_id, pre_head) a few lines above is UNCONDITIONAL in
-    // BOTH pre-fix and post-fix code, so wedged_by_rule_["r1"] already names claim
-    // A again by this point either way - this call's ordinary wedge lookup finds
-    // and deactivates claim A in both variants, not claim B. What the fix actually
-    // changes is NOT which claim this withdrawal reaches through the map; it is
-    // whether claim B's own rg->active was already set false, IN PLACE, by the
-    // guard immediately above, BEFORE that unconditional overwrite ran. Pre-fix
-    // (no guard), the overwrite clobbers claim B's entry with no prior write to
-    // its rg->active, leaving it permanently stuck true and unreachable by any
-    // future withdrawal, including this one. Post-fix, claim B's rg->active is
-    // already false by the time the overwrite happens, independent of the map
-    // entry it loses - so this withdrawal's own effect on claim A is unchanged by
-    // the fix; what changed already happened.
+    // Withdraw r1. Pre-fix, wedged_by_rule_["r1"] now names claim B (the unguarded
+    // overwrite above), so this ordinary wedge lookup only deactivates claim B -
+    // claim A's rg->active stays wrongly true, unreachable via the map (the
+    // opposite of the ORIGINAL flip-flop-back test above, where the unconditional
+    // Reobserved-restore overwrite always leaves the map naming claim A - here it
+    // is abandon_claim_locked's own insert, not attach_core's, that last wrote the
+    // map, and it names the claim that just timed out, B, not the claim already
+    // parked there, A). Post-fix, the map still names claim A (abandon_claim_locked
+    // left it untouched), so this is the withdrawal that actually reaches and
+    // deactivates it; claim B was already deactivated in place when it timed out,
+    // above.
     rt->detach_rule("r1");
 
     // Release every parked backend call at once - both claim A's and claim B's arm()
