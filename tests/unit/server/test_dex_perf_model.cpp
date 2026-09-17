@@ -237,6 +237,20 @@ TEST_CASE("perf fragment: real aggregations, suppression text, Performance tab",
     CHECK(html.find("/fragments/dex/perf/devices?metric=cpu") != std::string::npos); // drill
 }
 
+TEST_CASE("perf fragment: App Performance is a top-level tab, and the buried "
+          "inline CTA is now a plain cross-reference to it",
+          "[dex][perf][render]") {
+    auto snap = two_cohorts(1, 0);
+    auto html = render_dex_perf_fragment(snap, 7);
+    // The new sibling tab is present alongside "Performance" (not a replacement).
+    CHECK(html.find("/fragments/dex/perf/apps") != std::string::npos);
+    CHECK(html.find(">App Performance<") != std::string::npos);
+    // The old buried special call-to-action wording is gone...
+    CHECK(html.find("Open application performance over time") == std::string::npos);
+    // ...replaced by a plain mention of the tab, not an actionable link of its own.
+    CHECK(html.find("App Performance</b> tab above") != std::string::npos);
+}
+
 TEST_CASE("perf fragment: empty fleet renders honest placeholders, never zeros",
           "[dex][perf][render]") {
     DexPerfSnapshot snap; // nobody online, no tags

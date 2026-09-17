@@ -338,6 +338,7 @@ agent_test_exe = executable(
                                           # load-bearing case injects a NEVER-RETURNING lookup and asserts
                                           # the caller is released inside its budget -- the regression that
                                           # argv-izing the login-keychain read introduced.
+    'unit/test_keychain_read.cpp',        # #3246: bounded SecItem keychain read (agent-core seam); never-returning-read case is the regression test
     'unit/agent/test_services_macos.cpp',     # C-1.12: launchctl print-disabled parser (P8)
     'unit/agent/test_msi_macos.cpp',          # C-1.21: pkgutil --pkg-info parser (P8)
     'unit/agent/test_bitlocker_macos.cpp',    # A-1.16: diskutil apfs list parser (P8)
@@ -1220,6 +1221,7 @@ if build_server
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
+      'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
       'unit/server/test_rest_sessions.cpp',
