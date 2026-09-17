@@ -379,7 +379,15 @@ private:
     meta.gap_lost_events = get_config_i64(kConfigGapLostEvents, 0);
     meta.gap_last_ts = get_config(kConfigGapLastTs, "-");
     meta.lag_events = get_config_i64(kConfigLagEvents, 0);
-    meta.feeder_enabled = get_config(kConfigFeederEnabled, "true") != "false";
+    // Round-3 review SHOULD-FIX: an absent key must read as disabled here,
+    // matching last_used's own gate (check_source_state's
+    // missing_means_enabled=false for this same key, app_usage_plugin.cpp)
+    // -- unlike usage_enabled, whose missing-means-enabled default this
+    // deliberately does NOT share. An exact-match comparison against the
+    // literal "true" is required: defaulting to an empty string and still
+    // comparing with `!= "false"` leaves a missing key reading as enabled
+    // ("" != "false" is true), which is the same bug restated.
+    meta.feeder_enabled = get_config(kConfigFeederEnabled, "") == "true";
     meta.last_fold_ts = get_config(kConfigLastFoldTs, "-");
 
     return meta;

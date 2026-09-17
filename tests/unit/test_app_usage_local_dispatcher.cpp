@@ -567,18 +567,28 @@ TEST_CASE("app_usage plugin: last_used with usage_feeder_enabled entirely OMITTE
     const auto now = static_cast<int64_t>(std::time(nullptr));
     const int64_t today_ts = now - (now % kSecondsPerDay);
 
-    sqlite3* writer = nullptr;
-    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
-    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
-    seed::create_schema(writer);
+    // Round-3 review Blocker (policy floor): RAII-owned, matching the
+    // corruption-fixture idiom below in this same file -- take ownership
+    // before the REQUIRE so a failed open still unwinds through a live
+    // owner rather than leaking the handle.
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> writer{nullptr, &sqlite3_close};
+    {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open((data_dir / "tar.db").string().c_str(), &raw);
+        writer.reset(raw);
+        REQUIRE(rc == SQLITE_OK);
+    }
+    seed::exec_or_fail(writer.get(), "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer.get());
     // A real row present, to prove this isn't just the "no data" path --
     // if the feeder-missing case were mishandled as Enabled, this row
     // would come back as a normal last_used| line instead of the
     // constrained marker.
-    seed::insert_usage_daily(writer, today_ts, "frozen_no_feeder_key.exe", 1, 60, now, now, 0, 0);
-    seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_usage_daily(writer.get(), today_ts, "frozen_no_feeder_key.exe", 1, 60, now, now,
+                             0, 0);
+    seed::insert_tar_config(writer.get(), "usage_enabled", "true");
     // Deliberately no usage_feeder_enabled row at all.
-    sqlite3_close(writer);
+    writer.reset();
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
     REQUIRE(plugin->descriptor->init(ctx.get()) == 0);

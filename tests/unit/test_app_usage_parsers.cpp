@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -233,8 +234,42 @@ TEST_CASE("read_meta: RECONSTRUCTION — missing tar_config keys fall back to ho
     CHECK(meta->coverage_since == "-");
     CHECK(meta->open_runs == 0);
     CHECK(meta->unmatched_stops == 0);
-    CHECK(meta->feeder_enabled); // default true when the key is absent
+    // Round-3 review SHOULD-FIX: an absent usage_feeder_enabled key must
+    // read as disabled here, matching last_used's own gate -- unlike
+    // usage_enabled, this key does NOT default missing-to-enabled.
+    CHECK_FALSE(meta->feeder_enabled);
     sqlite3_close(db);
+}
+
+// Round-3 review SHOULD-FIX: summary's meta row and last_used's gate
+// previously disagreed about a missing usage_feeder_enabled key -- meta
+// read it as enabled (get_config's old "true" default combined with
+// `!= "false"`) while last_used's check_source_state(missing_means_enabled
+// =false) already reported Disabled. Isolates just the feeder key (with
+// other config present and populated) so this can't pass by accident
+// alongside the "every key missing" case above.
+TEST_CASE("read_meta: usage_feeder_enabled key specifically omitted reads as disabled, "
+         "not the general missing-key default",
+          "[app_usage][meta][regression]") {
+    // RAII-owned per the round-3 review policy-floor blocker (this file's
+    // own idiom, see the distinct-users regression test above) -- take
+    // ownership before the REQUIRE.
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db{nullptr, &sqlite3_close};
+    {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open(":memory:", &raw);
+        db.reset(raw);
+        REQUIRE(rc == SQLITE_OK);
+    }
+    seed::create_schema(db.get());
+    seed::insert_tar_config(db.get(), "usage_enabled", "true");
+    seed::insert_tar_config(db.get(), "usage_coverage_since", "1000");
+    // Deliberately no usage_feeder_enabled row at all.
+
+    const auto meta = read_meta(db.get());
+    REQUIRE(meta.has_value());
+    CHECK(meta->coverage_since == "1000"); // other keys still read normally
+    CHECK_FALSE(meta->feeder_enabled); // NOT true -- the bug this test guards against
 }
 
 // ───────────────────────────────────── run_summary (REAL CAPTURE) + user leak ─
@@ -369,41 +404,50 @@ TEST_CASE("run_summary: REAL CAPTURE fixture — top limit is respected", "[app_
 // already selected -- a genuinely top-ranked executable could silently read
 // distinct_users=0 once usage_daily_user held more than kMaxLastUsedRows
 // distinct exe_keys, because the old query's arbitrary first-N rows could
-// easily miss it. Reproduced here: insert far more than kMaxLastUsedRows
-// *other* exe_keys into usage_daily_user BEFORE the real target's own
-// usage_daily_user rows, so a table-order-based (no ORDER BY) LIMIT scan
-// would return the noise rows and never reach the target -- exactly the
-// physical ordering SQLite uses for an index-free GROUP BY LIMIT with no
-// ORDER BY. The target is the ONLY exe_key with a usage_daily row, so it is
-// unambiguously result.rows[0].
+// easily miss it. Reproduced here by inserting far more than
+// kMaxLastUsedRows "noise_*" exe_keys into usage_daily_user: the old query's
+// GROUP BY with no ORDER BY sorts through SQLite's temp b-tree, which lands
+// every "noise_*" key lexicographically before "target.exe" regardless of
+// insertion order (confirmed by round-3 review inserting the target both
+// first and last with identical results) -- so its unordered LIMIT scan
+// exhausts on noise and never reaches the target. The target is the ONLY
+// exe_key with a usage_daily row, so it is unambiguously result.rows[0].
 TEST_CASE("run_summary: a genuinely top-ranked executable's distinct_users survives "
-         "when usage_daily_user holds more than kMaxLastUsedRows OTHER exe_keys, "
-         "inserted first",
+         "when usage_daily_user holds more than kMaxLastUsedRows OTHER exe_keys "
+         "that sort lexicographically first",
           "[app_usage][summary][regression]") {
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
-    seed::create_schema(db);
-    seed::exec_or_fail(db, "BEGIN");
+    // Round-3 review Blocker (policy floor): RAII-owned -- take ownership
+    // before the REQUIRE so a failed open still unwinds through a live
+    // owner rather than leaking the handle (same idiom as the corruption
+    // fixture in test_app_usage_local_dispatcher.cpp).
+    std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db{nullptr, &sqlite3_close};
+    {
+        sqlite3* raw = nullptr;
+        const int rc = sqlite3_open(":memory:", &raw);
+        db.reset(raw);
+        REQUIRE(rc == SQLITE_OK);
+    }
+    seed::create_schema(db.get());
+    seed::exec_or_fail(db.get(), "BEGIN");
     const auto noise_count = static_cast<int64_t>(kMaxLastUsedRows) + 500;
     for (int64_t i = 0; i < noise_count; ++i) {
-        seed::insert_usage_daily_user(db, 100000, "noise_" + std::to_string(i), "someuser");
+        seed::insert_usage_daily_user(db.get(), 100000, "noise_" + std::to_string(i), "someuser");
     }
-    seed::insert_usage_daily(db, 100000, "target.exe", 5, 12000, 100000, 100500, 0, 0);
-    seed::insert_usage_daily_user(db, 100000, "target.exe", "alice");
-    seed::insert_usage_daily_user(db, 100000, "target.exe", "bob");
-    seed::exec_or_fail(db, "COMMIT");
+    seed::insert_usage_daily(db.get(), 100000, "target.exe", 5, 12000, 100000, 100500, 0, 0);
+    seed::insert_usage_daily_user(db.get(), 100000, "target.exe", "alice");
+    seed::insert_usage_daily_user(db.get(), 100000, "target.exe", "bob");
+    seed::exec_or_fail(db.get(), "COMMIT");
 
     WindowParams w;
     w.days = 30;
     w.top = 25;
     w.by = WindowParams::By::run_time;
 
-    const auto result = run_summary(db, w, 0);
+    const auto result = run_summary(db.get(), w, 0);
     REQUIRE(result.has_value());
     REQUIRE(result->rows.size() == 1);
     CHECK(result->rows[0].exe_key == "target.exe");
     CHECK(result->rows[0].distinct_users == 2); // NOT 0 -- the bug this test guards against
-    sqlite3_close(db);
 }
 
 // ─────────────────────────────────────────────────────────── run_last_used ─
