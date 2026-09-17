@@ -111,6 +111,22 @@ TEST_CASE("nearest-rank percentile: n=2 p90 is the MAX, not the MIN",
     CHECK(rules::nearest_rank(one, 0.90) == 5.0);
 }
 
+TEST_CASE("dex_perf_os_from_session: normalizes to the closed token set",
+          "[dex][perf][rules][os]") {
+    CHECK(rules::dex_perf_os_from_session("windows") == "windows");
+    CHECK(rules::dex_perf_os_from_session("Windows 11") == "windows");
+    CHECK(rules::dex_perf_os_from_session("linux") == "linux");
+    CHECK(rules::dex_perf_os_from_session("Linux 6.8") == "linux");
+    CHECK(rules::dex_perf_os_from_session("darwin") == "macos");
+    CHECK(rules::dex_perf_os_from_session("Darwin 24.0") == "macos");
+    CHECK(rules::dex_perf_os_from_session("macos") == "macos");
+    // The bug this function fixes: "darwin" CONTAINS "win" — a substring
+    // match would misclassify this as Windows.
+    CHECK(rules::dex_perf_os_from_session("darwin") != "windows");
+    CHECK(rules::dex_perf_os_from_session("freebsd").empty());
+    CHECK(rules::dex_perf_os_from_session("").empty());
+}
+
 // ── fleet_now ────────────────────────────────────────────────────────────────
 
 TEST_CASE("fleet_now: absent-not-zero + honest denominators", "[dex][perf][model]") {

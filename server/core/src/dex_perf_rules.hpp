@@ -18,10 +18,12 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace yuzu::server::detail {
@@ -91,6 +93,26 @@ inline int percentile_rank(const std::vector<double>& sorted_vals, double v) {
     const auto at_or_below = static_cast<double>(
         std::upper_bound(sorted_vals.begin(), sorted_vals.end(), v) - sorted_vals.begin());
     return static_cast<int>(at_or_below / static_cast<double>(sorted_vals.size()) * 100.0);
+}
+
+/// Normalize an agent-reported OS string (an `AgentSession::os` value, e.g.
+/// "Windows 11", "linux", "Darwin") into the closed token set the DEX perf
+/// surfaces key on: "windows" | "linux" | "macos" | "" (unrecognized/unknown).
+/// Case-insensitive prefix match — `starts_with`, NOT `find`: "darwin"
+/// CONTAINS "win", so a substring match would misclassify every macOS agent
+/// as Windows (the G4 UP-1 bug this function exists to fix, once, in one
+/// place, instead of duplicated inline at every call site).
+inline std::string dex_perf_os_from_session(std::string_view raw) {
+    std::string os(raw);
+    for (auto& c : os)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    if (os.starts_with("win"))
+        return "windows";
+    if (os.starts_with("lin"))
+        return "linux";
+    if (os.starts_with("darwin") || os.starts_with("macos"))
+        return "macos";
+    return "";
 }
 
 } // namespace yuzu::server::detail
