@@ -137,26 +137,52 @@ that the permission exists and is never folded into a cross-seeded op.)
 
 ## Consent gate (D4)
 
-A **preventive compiler gate**, not an authoring convention. The platform gains an
-operator-declared device classification via the free-form asset tag key `device_class` (`server` |
-`workstation`) — **declared, never inferred**; see `docs/asset-tagging-guide.md` "Recipe: Reflex
-consent gate." The compiler **rejects** `proceed`-on-exhaustion escalation on a dangerous Reaction
-whose resolved target scope can include a workstation-class device. **An unclassified device is
+A **preventive compiler gate**, not an authoring convention, and **one rule with no escalation
+exception**: a dangerous Reaction (per the safety chokepoint above) is **REFUSED at compile unless
+chain-consent or all-server tag-consent holds — independent of any escalation policy.** There is no
+weaker "the compiler only rejects `proceed`-on-exhaustion" reading. Escalation policy (deferred, see
+the grammar section) can only decide *when*, inside a Reflex whose consent basis already holds, an
+already-consented action proceeds — it never widens what a dangerous Reaction may do *without*
+consent. The platform gains an operator-declared device classification via the free-form asset tag
+key `device_class` (`server` | `workstation`) — **declared, never inferred**; see
+`docs/asset-tagging-guide.md` "Recipe: Reflex consent gate." **An unclassified device is
 workstation-class — fail-closed.**
 
 `evaluate_consent` (R4) admits a dangerous Reaction under either of:
 
 1. **Chain consent** — an `interaction.*` Reaction gated `on_success` precedes the dangerous
-   Reaction in the same chain (the end user already made an explicit choice earlier in the same
-   fire).
-2. **Tag consent** — every resolved target device satisfies `tag:device_class == "server"`
-   (`TagStore` read; ADR-0050's fail-closed construction/degrade posture applies: an **unreadable**
-   tag store is an evaluation **error**, never treated as `true`).
+   Reaction in the same chain, **and its result is an affirmative response TOKEN from the
+   interaction plugin** (e.g. `response == "ok"`), **never a bare plugin return code**. A prompt
+   dismissed, defaulted, or shown with no interactive desktop present (Windows session 0; a headless
+   agent) returns `rc == 0` from the plugin but carries **no** affirmative token — that case is a
+   **consent FAILURE**, and the chain refuses the dangerous Reaction rather than journaling "consent
+   given" for an unattended dismissal.
+2. **Tag consent** — every resolved target device satisfies `device_class == "server"`, established
+   by a **direct `TagStore::get_tag(agent_id, "device_class")` read** (never the scope-DSL's
+   case-insensitive `tag:` atom — a different mechanism with different case-folding semantics; see
+   `docs/asset-tagging-guide.md`). The match is **exact-byte** against the literal string `"server"`;
+   any other value, any differently-cased value, or an absent tag is `"workstation"`. Device-set
+   membership (management-group assignment → device ids) resolves via
+   `ManagementGroupStore::get_member_agents_in_subtrees`. ADR-0050's fail-closed
+   construction/degrade posture applies: an **unreadable** `TagStore` is an evaluation **error**,
+   never treated as `true`.
 
-Server-scoped variants (Reflex Sets whose entire assignment resolves to `device_class == "server"`
-devices only) may use `proceed`-on-exhaustion escalation; a mixed or workstation-inclusive
-assignment may not, regardless of chain consent, because chain consent is per-fire and
-proceed-on-exhaustion is specifically the no-user-present case.
+**Device-set binding, re-tag, and membership drift.** The two-person approval (D9 below) binds its
+digest to the **resolved device set at approval time**, not group IDs alone — a management-group
+membership growing after approval invalidates it, and the next compile refuses until re-approved
+(see D9). Re-tagging a device (`device_class` changes) or a membership change on an
+already-deployed, already-armed set triggers a **recompile**: the affected set's consent is
+re-evaluated, and if it no longer holds, the set is **disarmed** on the affected device(s) — never
+left silently armed under a now-false consent basis.
+
+**`device_class` write authorization.** Because `device_class` is the sole input to this
+safety-relevant compiler gate, setting or changing it is **not** a bare `Tag:Write` operation — it
+requires **`Reflex:Write` or admin**, and is recorded under a dedicated audit verb
+(`reflex.device_class.tag_set`, alongside the `reflex.set.*` verbs below). The existing
+service-scoped-token confinement helper `authz::service_scope_may_mutate_tag_key`
+(`docs/auth-architecture.md` clause 6) is **extended** to cover `device_class` — a service-scoped
+token must clear this check, checked BEFORE the scoped gate and value-blind, exactly like every
+other admission-deciding tag key. This is an EXTEND, never a parallel gate.
 
 ## Wire contract
 
