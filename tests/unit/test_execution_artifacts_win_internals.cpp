@@ -38,6 +38,7 @@
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
+#include <yuzu/agent/confined_fs.hpp> // WinHandle
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
 
@@ -226,10 +227,10 @@ TEST_CASE("execution_artifacts win internals: ScratchDirGuard reports note|temp_
     // std::filesystem::remove_all uses internally) fails with
     // ERROR_SHARING_VIOLATION while a handle without FILE_SHARE_DELETE stays
     // open on a file inside the directory being removed.
-    HANDLE held = CreateFileW(yuzu::win::to_wide(locked_file.string()).c_str(), GENERIC_READ,
-                              FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
-    REQUIRE(held != INVALID_HANDLE_VALUE);
+    yuzu::agent::confined_fs::WinHandle held(
+        CreateFileW(yuzu::win::to_wide(locked_file.string()).c_str(), GENERIC_READ,
+                    FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    REQUIRE(held.get() != INVALID_HANDLE_VALUE);
 
     const std::uint64_t before = g_temp_cleanup_failed_total.load(std::memory_order_relaxed);
     auto result = run_with_ctx([&](yuzu::CommandContext& ctx) -> int {
@@ -244,7 +245,7 @@ TEST_CASE("execution_artifacts win internals: ScratchDirGuard reports note|temp_
     CHECK(after == before + 1);
     CHECK(fs::exists(locked_sub)); // removal genuinely failed, not just under-reported
 
-    CloseHandle(held);
+    held.reset();
 
     // A second guard over the now-unheld path removes it cleanly: no note row.
     auto result2 = run_with_ctx([&](yuzu::CommandContext& ctx) -> int {

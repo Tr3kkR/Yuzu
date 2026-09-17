@@ -228,7 +228,7 @@ private:
                     result.deferred);
             }
             if (result.enumerate_error) {
-                spdlog::debug(
+                spdlog::warn(
                     "execution_artifacts: {} scratch sweep could not enumerate agent.data_dir "
                     "(os_error={})",
                     trigger, result.os_error);

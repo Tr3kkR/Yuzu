@@ -45,9 +45,12 @@
  *   - Part 5 (cap every accepted pass UNCONDITIONALLY) IS adopted, via the
  *     four `kScratchSweep*` constants below -- a pass never opens more than
  *     kScratchSweepMaxRootEntries root entries, never removes more than
- *     kScratchSweepMaxRemovals candidates, never runs past
- *     kScratchSweepMaxWallMs, and never trusts more than
- *     kScratchSweepMaxDirEntries entries inside one candidate.
+ *     kScratchSweepMaxRemovals candidates, never starts a new candidate once
+ *     kScratchSweepMaxWallMs has elapsed (checked before each root entry and
+ *     before each candidate -- not preemptive mid-candidate, since one
+ *     candidate's own bounded file-unlink loop is never interrupted once
+ *     started), and never trusts more than kScratchSweepMaxDirEntries
+ *     entries inside one candidate.
  *   - Part 6 (decide deliberately what a missing anchor means) is NOT
  *     adopted: there is no persisted anchor here to be missing.
  *   - Part 7 (elapsed-time thresholds are ABSOLUTE, never relative to a

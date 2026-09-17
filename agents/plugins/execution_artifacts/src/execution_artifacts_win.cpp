@@ -104,7 +104,6 @@
 #endif
 #include <windows.h>
 #include <winternl.h> // NTSTATUS (confined_fs_win.cpp precedent)
-#include <aclapi.h>   // GetSecurityInfo (scratch_dir_is_ours's owner check)
 
 #include <win_profiles.hpp> // RegKey, PrivilegeScope, offline_hive_mutex, read_reg_value,
                             // enumerate_value_names, to_wide/from_wide
@@ -448,7 +447,7 @@ std::string copy_amcache_via_backup_semantics(const wchar_t* dest) {
     return token; // empty on success
 }
 
-// real_enum_key/real_open_subkey wrap the two Win32 calls
+// real_enum_key/real_open_subkey wrap the two Win32 calls.
 // walk_amcache_inventory below routes through AmcacheWalkFns, at the exact
 // call shape collect_amcache used inline before this seam existed (#4392).
 LSTATUS real_enum_key(HKEY root, DWORD idx, wchar_t* name, DWORD* name_len) {
@@ -477,8 +476,9 @@ struct AmcacheWalkFns {
 using AmcacheSubkeys = std::vector<std::pair<std::string, std::map<std::string, std::string>>>;
 
 /// Body moved verbatim (routed through `fns`/`max_subkeys`) out of
-/// collect_amcache's inline loop -- see collect_amcache's own call site
-/// below for why this split changes no production behaviour.
+/// collect_amcache's inline loop -- see AmcacheWalkFns's docblock above for
+/// why this split changes no production behaviour (fns == {} is
+/// byte-identical to the old inline body).
 AmcacheSubkeys walk_amcache_inventory(HKEY root_key, yuzu::shared::ConstraintAccumulator& acc,
                                       const AmcacheWalkFns& fns = {},
                                       DWORD max_subkeys = kAmcacheMaxSubkeys) {
