@@ -273,6 +273,15 @@ TEST_CASE("GET /api/inventory/:agent_id/:plugin: a poisoned data_json is exclude
     PgHarness h;
     h.store->upsert("agent-poisoned", "custom_source", kPoisonedJson, 400);
 
+    // Confirm the seed actually landed with the poisoned bytes intact before
+    // exercising the route below - otherwise a skipped/failed upsert would
+    // let this test pass for the wrong reason (a genuinely-absent row is
+    // also a 404).
+    auto seeded = h.store->get("agent-poisoned", "custom_source");
+    REQUIRE(seeded.has_value());
+    REQUIRE(seeded->has_value());
+    CHECK((*seeded)->data_json == kPoisonedJson);
+
     auto res = h.sink.Get("/api/inventory/agent-poisoned/custom_source");
     REQUIRE(res);
     CHECK(res->status == 404); // same shape as a genuinely-absent record, never a crash/200
@@ -287,6 +296,18 @@ TEST_CASE("POST /api/inventory/query: a poisoned record is excluded, a healthy m
     PgHarness h;
     h.store->upsert("agent-poisoned2", "custom_source", kPoisonedJson, 500);
     h.store->upsert("agent-healthy", "custom_source", R"({"ok":true})", 501);
+
+    // Same false-green trap as the GET test above: confirm both rows actually
+    // seeded with their intended bytes before relying on the query route's
+    // count/exclusion behavior to prove anything.
+    auto poisoned_seed = h.store->get("agent-poisoned2", "custom_source");
+    REQUIRE(poisoned_seed.has_value());
+    REQUIRE(poisoned_seed->has_value());
+    CHECK((*poisoned_seed)->data_json == kPoisonedJson);
+    auto healthy_seed = h.store->get("agent-healthy", "custom_source");
+    REQUIRE(healthy_seed.has_value());
+    REQUIRE(healthy_seed->has_value());
+    CHECK((*healthy_seed)->data_json == R"({"ok":true})");
 
     auto res = h.sink.Post("/api/inventory/query", R"({"plugin":"custom_source"})");
     REQUIRE(res);
