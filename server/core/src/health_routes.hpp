@@ -164,6 +164,7 @@ class CustomPropertiesStore;
 class FleetTopologyStore;
 class AccessReviewStore;
 class SoftwareLicensingStore;
+class PluginConfigStore;
 class AppUsageStore;
 class ProductRegistryStore;
 class ProductPackStore;
@@ -268,6 +269,7 @@ struct Deps {
     FleetTopologyStore* fleet_topology_store{nullptr};
     AccessReviewStore* access_review_store{nullptr};
     SoftwareLicensingStore* software_licensing_store{nullptr};
+    PluginConfigStore* plugin_config_store{nullptr};
     AppUsageStore* app_usage_store{nullptr}; // Wave 7 PR7.2 (gov Gate 3 sre HIGH finding)
     ProductRegistryStore* product_registry_store{nullptr};
     ProductPackStore* product_pack_store{nullptr};
