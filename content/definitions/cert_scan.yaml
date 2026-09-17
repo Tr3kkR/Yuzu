@@ -1,0 +1,110 @@
+## SSL/TLS Certificate and Private-Key Discovery Definitions
+## Walks every local user's home directory (auto-discovered per-OS, or an
+## operator-supplied `paths` override) for certificate material, CSRs, and
+## private keys that escaped managed custody onto a developer or admin's
+## own filesystem. Never emits raw key material -- only structural
+## metadata (subject/issuer/validity/serial/thumbprint for certificates;
+## a classification label and severity for keys and opaque containers).
+## Plugin: cert_scan | Actions: scan
+##
+## Applying a scan to "all endpoints" vs. a subset is ordinary Scope
+## targeting on the instruction itself (tag/group/OS-based, same as every
+## other Yuzu instruction) -- no cert_scan-specific scoping mechanism is
+## needed.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.cert_scan.scan
+  displayName: Scan Home Directories for Certificates and Private Keys
+  version: 1.0.0
+  description: >
+    One-shot walk of every local user's home directory (or an operator-
+    supplied `paths` override) looking for certificate material,
+    certificate signing requests, and private keys. Detection combines a
+    candidate-extension allowlist (.pem/.crt/.cer/.key/.p12/.pfx/.jks/
+    .keystore/.csr) with a `.ssh`-directory carve-out, since default-named
+    OpenSSH keys (id_rsa, id_ed25519, ...) carry no extension at all.
+    Content classification uses PEM marker text, OpenSSH's own binary
+    key-header ciphername field, and binary signatures (JKS magic bytes,
+    DER certificate parsing). Severity: CRITICAL (unencrypted private
+    key), HIGH (encrypted private key, or a PKCS#12/JKS container --
+    opaque, not deep-parsed in this version), MEDIUM (expired or
+    self-signed certificate), LOW (valid certificate), INFO (certificate
+    signing request). Never emits raw key material or certificate bytes
+    -- only structural metadata.
+  tags: [security, compliance, certificates, pki, key-management]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: cert_scan
+    action: scan
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      paths:
+        type: string
+        description: >
+          Comma-separated list of directories to scan. Empty/absent (the
+          default) auto-discovers every local user's home directory on
+          this OS: Windows via the ProfileList registry, Linux via
+          /home/* plus /root, macOS via /Users/* (excluding Shared/Guest).
+      maxDepth:
+        type: string
+        description: 'Integer recursion depth cap for the directory walk (default 12).'
+
+  result:
+    columns:
+      - name: severity
+        type: string
+      - name: kind
+        type: string
+      - name: filePath
+        type: string
+      - name: subject
+        type: string
+      - name: issuer
+        type: string
+      - name: notBefore
+        type: string
+      - name: notAfter
+        type: string
+      - name: serial
+        type: string
+      - name: thumbprint
+        type: string
+    aggregation:
+      groupBy: [severity, kind]
+      operations: [count]
+
+  visualization:
+    type: pie
+    processor: single_series
+    title: Certificate/key findings by severity
+    labelField: 0
+    valueLabel: Findings
+
+  readablePayload: "Scan home directories for certificates and private keys"
+
+  gather:
+    ttlSeconds: 0  # not a cacheable point-in-time status check -- always re-run
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin, compliance-officer]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [cert_scan]
+
+status:
+  phase: active

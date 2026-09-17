@@ -487,6 +487,7 @@ if build_agent
   subdir('agents/plugins/asset_tags')
   subdir('agents/plugins/quarantine')
   subdir('agents/plugins/certificates')
+  subdir('agents/plugins/cert_scan')
   subdir('agents/plugins/ioc')
   subdir('agents/plugins/storage')
   subdir('agents/plugins/interaction')

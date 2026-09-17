@@ -1,0 +1,3 @@
+captured: macos not built by the plugin author · bare-metal · 2026-09-16 · not measured (capture did not complete in this authoring environment) · leg-hash pending
+== action=scan
+[not captured] agent-context: this authoring/CI environment is Windows-only, so no macOS capture was performed here. A macOS-side reviewer of this PR did successfully build and capture this action independently — that capture is not reproduced verbatim in this file since this file records what THIS environment produced, but it confirms a real macOS capture is achievable; a maintainer with macOS access should replace this placeholder with the real captured output (`--stamp macos` after capturing).
