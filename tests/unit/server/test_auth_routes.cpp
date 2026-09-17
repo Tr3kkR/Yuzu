@@ -732,6 +732,34 @@ TEST_CASE("AuthRoutes::require_scoped_permission — the #2963 self-service allo
     CHECK(ok);
 }
 
+TEST_CASE("AuthRoutes::require_permission — an operator-tier MCP token minted by a "
+          "NON-ADMIN creator now passes ApiToken:Rotate under RBAC-off (#2963's legacy "
+          "allowlist has live effect on MCP too, not just REST — the mcp_tier branch "
+          "falls through to legacy on a passing tier check, it does not return true)",
+          "[pg][auth_routes][legacy][self_service][mcp]") {
+    AuthRoutesFixture fix;
+    // Deliberately NON-admin creator — the pre-existing sibling test at
+    // "operator MCP tier IS allowed ApiToken:Rotate" above uses `test_user`,
+    // which the fixture registers as admin, so it cannot distinguish "the
+    // mcp_tier branch alone admits this" from "it fell through and the
+    // legacy branch's OWN admin-role check admitted it separately" — both
+    // would pass that test. This one pins the actual claim: before #2963,
+    // this exact token (operator tier, non-admin creator, RBAC-off) was
+    // DENIED at the legacy branch after tier_allows() let it fall through;
+    // #2963's legacy self-service allowlist is what makes it pass now.
+    REQUIRE(fix.auth_mgr.upsert_user("plain_operator_user", "password1234", auth::Role::user));
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-atr-op-nonadmin", "plain_operator_user",
+                                            now + 3600, "", "operator");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Rotate");
+    CHECK(ok);
+}
+
 // ---------------------------------------------------------------------------
 // #4028/#520 security regression guard: an admin-owned MCP token (any tier)
 // must still be blocked from the new settings read-twins' securables, even

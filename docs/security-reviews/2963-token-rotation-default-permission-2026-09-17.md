@@ -1,8 +1,30 @@
 # #2963 — human API-token rotation: default-permission reachability + tier-guard exception
 
 **Date:** 2026-09-17
-**Issue:** [#2963](https://github.com/Tr3kkR/Yuzu/issues/2963) (`decision` label — "the outcome is a recorded decision, not code")
-**Commits:** `daad9f7d1` (fix), `6aedf9ec1` (governance hardening round)
+**Issue:** [#2963](https://github.com/Tr3kkR/Yuzu/issues/2963) (`decision` label — "the outcome is a recorded decision, not code") — [decision-trail comment](https://github.com/Tr3kkR/Yuzu/issues/2963#issuecomment-5717905783) posted on the issue itself, independently of this document, after PR #4470 review flagged the issue had no recorded approval trail
+**PR:** [#4470](https://github.com/Tr3kkR/Yuzu/pull/4470)
+**Commits (as reviewed):** `daad9f7d1` (fix), `6aedf9ec1` (governance hardening
+round), `0cfa147db` (Gate 4/6 follow-through), `972a250a3` (ledger commit).
+**Commits (as pushed — see note below):** `aafadd85d`, `531816ecb`,
+`5f679211f`, `dbbb01620` respectively.
+
+> **Note on commit hashes (added after PR #4470 review flagged this):** the
+> four commits above were rewritten via `git commit-tree` (non-interactive,
+> preserving tree/parent/author/message content byte-for-byte except one
+> deleted `Claude-Session:` trailer line per line-item feedback in
+> [[feedback-no-claude-footer-or-session-link]]) AFTER every governance gate
+> in this document had already run and recorded its findings against the
+> ORIGINAL hashes. The rewrite changed commit identity (SHA) but not content
+> — every finding, fix, and test result recorded against the original SHAs
+> below is unchanged and still accurate against the pushed tree; only the
+> citation needs the mapping above to resolve. Governance ledger rows
+> recorded against the original SHAs are NOT edited in place (the ledger's
+> append/supersede-only contract) — see the superseding row in
+> `governance.d/2963-token-rotation-default-permission.bj3HoJ.jsonl` with
+> `finding_id: "2963-META-sha-rebase"`. Lesson for future runs: rewrite
+> commit history (if needed for any reason) BEFORE running governance, or
+> re-run governance against the final hashes, never after recording findings
+> against hashes about to be discarded.
 **Follows:** `docs/security-reviews/human-token-rotation-2026-08-10.md` (the original design review this decision resolves an open item from)
 
 ## Origin

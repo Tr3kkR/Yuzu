@@ -3466,24 +3466,34 @@ this section does not restate them.
   the boundary is stated plainly instead of only discoverable from the
   error text.
 - **A non-admin rotation caught mid-flight by an RBAC-off→on toggle can strand
-  at `confirm` — self-healing, not data loss, and newly reachable by a wider
-  population since #2963 (governance Gate 4 UP-6).** `ApiToken:Rotate` is
-  granted only to `Administrator`/`ApiTokenManager` under RBAC-on
-  (`rbac_store.cpp`'s seed data) — before #2963 only an admin could start a
-  self-service rotation at all, so this toggle race could only ever strand an
-  admin, who already holds the RBAC-on grant and is unaffected. Now a
-  non-admin owner can start one under the RBAC-off legacy allowlist; if an
-  operator enables RBAC before that caller confirms, `confirm` hits the
-  RBAC-enforced branch and 403s for a non-admin role lacking the grant. The
-  predecessor is not permanently stranded — the background rotation sweep
-  auto-revokes it once the (≥24h) overlap window elapses regardless of
-  confirm — but the caller sees a stuck rotation with no admin-override
-  confirm path (rotate-as-admin/confirm-as-admin is deliberately not offered,
-  per the identity-takeover rationale above). Accepted, not fixed, by this
-  decision: enabling RBAC mid-flight against in-progress self-service
-  rotations is an operator action outside this feature's scope to guard
-  against, and the failure mode is a delayed self-service credential swap,
-  not data loss or an authorization gap.
+  at `confirm`, and can require MANUAL operator resolution, not merely a
+  delay — corrected 2026-09-17 after PR #4470 review, governance Gate 4 UP-6
+  originally understated this.** `ApiToken:Rotate` is granted only to
+  `Administrator`/`ApiTokenManager` under RBAC-on (`rbac_store.cpp`'s seed
+  data) — before #2963 only an admin could start a self-service rotation at
+  all, so this toggle race could only ever strand an admin, who already
+  holds the RBAC-on grant and is unaffected. Now a non-admin owner can start
+  one under the RBAC-off legacy allowlist; if an operator enables RBAC
+  before that caller confirms, `confirm` hits the RBAC-enforced branch and
+  403s for a non-admin role lacking the grant. **Whether this self-heals
+  depends entirely on whether the successor secret is ever actually
+  presented for authentication** — the background sweep's eligibility
+  predicate (`kRotationEligiblePredicate`, `api_token_store.cpp`) requires
+  the successor's `last_used_at <> 0`, which `confirm` never sets and which
+  only a real authenticated request using the new secret sets. A caller
+  whose automation is still waiting on a successful `confirm` signal before
+  switching to the new secret — precisely the shape of this stranded case —
+  may never present it, in which case the pair is **PERMANENTLY ineligible**
+  for the sweep (the same "dropped/lost secret" case documented above for an
+  ordinary rotation, not a special one), and requires an operator to revoke
+  one of the two credentials manually; it does not resolve on any documented
+  timescale on its own. There is no admin-override confirm path
+  (rotate-as-admin/confirm-as-admin is deliberately not offered, per the
+  identity-takeover rationale above). Accepted, not fixed, by this decision:
+  enabling RBAC mid-flight against in-progress self-service rotations is an
+  operator action outside this feature's scope to guard against, but the
+  operator-facing guidance must state the manual-resolution possibility
+  plainly rather than imply automatic recovery.
 - **Known residual gaps, tracked, not fixed by this capability:** three
   pre-existing issues were surfaced while building this feature and filed
   rather than folded in silently — `#2943` (a confirm-path fallthrough
