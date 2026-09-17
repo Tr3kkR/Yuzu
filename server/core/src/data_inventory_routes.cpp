@@ -3,6 +3,7 @@
 #include "http_route_sink.hpp"
 #include "inventory_store.hpp"
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 
 #include <nlohmann/json.hpp>
 
@@ -86,7 +87,7 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
         if (mcp::json_exceeds_depth(rec.data_json, mcp::kMcpMaxJsonDepth)) {
             spdlog::warn("GET /api/inventory: excluding agent={} plugin={} - data_json nests "
                         "too deeply (#2437-class)",
-                        rec.agent_id, rec.plugin);
+                        rec.agent_id, onbehalf::sanitize_for_log(rec.plugin, 128));
             res.status = 404;
             res.set_content(
                 R"({"error":{"code":404,"message":"no inventory data found"},"meta":{"api_version":"v1"}})",
@@ -155,7 +156,7 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
             if (mcp::json_exceeds_depth(r.data_json, mcp::kMcpMaxJsonDepth)) {
                 spdlog::warn("POST /api/inventory/query: excluding agent={} plugin={} - "
                             "data_json nests too deeply (#2437-class)",
-                            r.agent_id, r.plugin);
+                            r.agent_id, onbehalf::sanitize_for_log(r.plugin, 128));
                 continue;
             }
             nlohmann::json data_obj;

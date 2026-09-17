@@ -392,6 +392,21 @@ restart sends a full list. Note that app *counts* can rise slightly after the
 fix: names that previously collapsed to the same `?`-mangled string (e.g. two
 different non-ASCII apps) now separate into distinct rows.
 
+**A generic (non-typed) inventory source never appears, with no error visible
+to the reporting agent.** The agent's own report is still acknowledged even
+when the server silently rejects one over-depth source blob (nesting past
+`kMcpMaxJsonDepth`, json-dump-depth-guard fix) - unlike a store/pool degrade,
+this is not surfaced back to the agent. Because ADR-0016's hash-skip only
+resends a source when its content changes, an agent whose plugin keeps
+reporting the SAME malformed shape never resends it, so the source stays
+permanently, silently absent from `InventoryStore` until the plugin itself
+stops emitting the over-depth shape. **Restarting the agent alone does not
+help** - unlike the non-ASCII-names case above, there is no cached mismatch
+for a restart to force-resend against. Diagnose via
+`yuzu_inventory_ingest_total{source="__generic__",outcome="rejected_depth"}`
+(non-zero means at least one agent has hit this) and the accompanying
+`spdlog::warn` log line, which names the real agent/plugin identifiers.
+
 **A `need_full` spike right after deploying the blob-v2 release is expected.**
 The v2 contract reformats the canonical content hash (12 fields instead of 4),
 so every agent's first post-upgrade report mismatches its stored v1 hash and the
@@ -410,8 +425,11 @@ and it ends when the lagging side upgrades. Deploy **server first, then agents**
 `rejected_depth` is a single generic (non-typed) source blob rejected for
 nesting past `kMcpMaxJsonDepth`, kept as its own outcome specifically so it
 does not page the `YuzuInventoryReportRejected` alert's source-map-cap
-runbook) - watch the `need_full` and `error` rates to spot a fleet whose
-hash-skip is degrading or whose ingest is failing. Four further series sharpen the picture:
+runbook - its `source` label is always the fixed sentinel `__generic__`,
+never the reporting plugin's actual name, so a query for a specific
+plugin's `source` label will not find it there) - watch the `need_full`
+and `error` rates to spot a fleet whose hash-skip is degrading or whose
+ingest is failing. Four further series sharpen the picture:
 
 - `yuzu_inventory_ingest_duration_seconds{source,phase}` (histogram) — how long
   applying one source's report holds a pooled Postgres connection (advisory lock +

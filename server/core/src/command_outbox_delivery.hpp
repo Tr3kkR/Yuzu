@@ -125,6 +125,12 @@ private:
     void deliver(const OutboxCommand& c, const std::string& lock_name, std::int64_t epoch);
     void audit(const OutboxCommand& c, const std::string& result, const std::string& detail);
     void count(const char* name);
+    // Labeled companion to count(): the bare counter above stays a single
+    // series (dashboards/alerts-in-waiting keep working unchanged), while this
+    // one distinguishes WHY within it, mirroring the split this fix already
+    // made for the structurally identical generic-inventory rejection
+    // (gateway_service_impl.cpp's outcome="rejected_depth").
+    void count_cause(const char* name, const char* cause);
 
     Deps d_;
 };

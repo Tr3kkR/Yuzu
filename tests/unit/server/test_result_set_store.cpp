@@ -753,8 +753,10 @@ TEST_CASE("ResultSetStore: pin enforces kMaxPinsPerOwner, per owner", "[pg][resu
 
 // json-dump-depth-guard fix (#2437-class): mark_failed's whole job is to
 // merge a failure reason into source_payload and write it back, and
-// nlohmann::json::dump() is unboundedly recursive. Runs on the background
-// maintenance thread with no HTTP caller to hand a 400 to, so it cannot
+// nlohmann::json::dump() is unboundedly recursive. It has no HTTP
+// request/response of its own to answer with a 400 (today it has no
+// production caller at all - a store method ahead of a future caller, not a
+// currently-wired background thread, per governance Gate 4/6), so it cannot
 // simply reject: it must still transition the row to `failed` while never
 // re-dumping a payload that could crash the process.
 TEST_CASE("ResultSetStore: mark_failed merges a failure reason into a healthy "

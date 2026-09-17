@@ -976,10 +976,13 @@ void ResultSetStore::mark_failed(const std::string& id, const std::string& reaso
 
     // #2437-class guard: this function's whole job is to write an updated
     // source_payload back, and nlohmann::json::dump() is unboundedly
-    // recursive. This runs on the BACKGROUND MAINTENANCE THREAD with no HTTP
-    // caller to hand a 400 to, so a poisoned row reaching here (written before
-    // this guard existed, or via any other path, past or future) would
-    // otherwise SIGSEGV the whole process on the `payload.dump()` below.
+    // recursive. This has no HTTP request/response of its own to answer with
+    // a 400 (governance Gate 4/6 finding: today it has NO production caller
+    // at all, only unit tests - the store method exists ahead of a future
+    // caller, not for a currently-wired background thread), so a poisoned
+    // row reaching here (written before this guard existed, or via any other
+    // path, past or future) would otherwise SIGSEGV the whole process on the
+    // `payload.dump()` below.
     // Check the RAW fetched text before it is ever parsed: if it nests too
     // deeply, DISCARD the poisoned original rather than try to preserve it.
     // The row still must transition to 'failed' (callers depend on that

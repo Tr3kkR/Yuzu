@@ -82,6 +82,22 @@ CommandOutboxDelivery::CommandOutboxDelivery(Deps deps) : d_(std::move(deps)) {
                             {{"cause", "containment_unreadable"}});
         d_.metrics->counter("yuzu_server_command_outbox_deliver_retry_cause_total",
                             {{"cause", "route_unreadable"}});
+        // json-dump-depth-guard fix: the bare
+        // yuzu_server_command_outbox_deliver_decode_failed_total counter stays
+        // unchanged (dashboards/alerts-in-waiting keep working), but it now
+        // fires for two structurally different causes - pre-seed the labeled
+        // companion the same way, for the same lone-incident reason above.
+        d_.metrics->describe(
+            "yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+            "Additive breakdown, by `cause`, of "
+            "yuzu_server_command_outbox_deliver_decode_failed_total - "
+            "payload_depth_exceeded (structurally valid JSON nested past kMcpMaxJsonDepth, "
+            "never parsed/dumped) or payload_decode_failed (genuinely malformed payload).",
+            "counter");
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                            {{"cause", "payload_depth_exceeded"}});
+        d_.metrics->counter("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                            {{"cause", "payload_decode_failed"}});
     }
 }
 
@@ -166,11 +182,19 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     // mark_failed/audit mechanism, same fencing/counting shape), so it looks
     // like a normal permanent failure to every other part of this file's state
     // machine. "payload_depth_exceeded" is a distinct reason (not lumped into
-    // "payload_decode_failed") so an operator can tell "too deep to safely
-    // parse" apart from genuinely malformed JSON in the audit trail.
+    // "payload_decode_failed") in the audit trail AND in the labeled
+    // count_cause() companion counter below - both this branch and the
+    // structurally identical generic-inventory fix
+    // (gateway_service_impl.cpp's outcome="rejected_depth") reuse the SAME
+    // bare counter (docs/user-manual/metrics.md documents it as "a malformed
+    // row failed to decode", which a valid-but-too-deep payload is not) but
+    // give the two causes a distinguishing label so an operator diagnosing
+    // via the metric, not just the audit log, does not conflate them.
     if (!c.parameters.empty() &&
         mcp::json_exceeds_depth(c.parameters, mcp::kMcpMaxJsonDepth)) {
         count("yuzu_server_command_outbox_deliver_decode_failed_total");
+        count_cause("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                   "payload_depth_exceeded");
         spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) parameters "
                       "nested past the depth guard (max {}), marking failed: cannot be safely "
                       "parsed",
@@ -192,6 +216,8 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     std::unordered_map<std::string, std::string> params;
     if (!decode_payload(c, agent_ids, params)) {
         count("yuzu_server_command_outbox_deliver_decode_failed_total");
+        count_cause("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
+                   "payload_decode_failed");
         spdlog::error("command_outbox_delivery: occurrence '{}' payload decode failed — "
                       "marking failed",
                       c.occurrence_id);
@@ -350,6 +376,11 @@ void CommandOutboxDelivery::audit(const OutboxCommand& c, const std::string& res
 void CommandOutboxDelivery::count(const char* name) {
     if (d_.metrics)
         d_.metrics->counter(name).increment();
+}
+
+void CommandOutboxDelivery::count_cause(const char* name, const char* cause) {
+    if (d_.metrics)
+        d_.metrics->counter(name, {{"cause", cause}}).increment();
 }
 
 } // namespace yuzu::server

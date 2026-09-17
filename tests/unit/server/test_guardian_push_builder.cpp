@@ -10,6 +10,8 @@
 
 #include "guardian_push_builder.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <functional>
@@ -334,6 +336,36 @@ TEST_CASE("build_agent_push: a rule nested past the depth guard is excluded; "
     CHECK(pr.spark().type() == "registry-change");
     CHECK(pr.assertion().type() == "registry-value-equals");
     CHECK(pr.remediation().type() == "alert-only");
+}
+
+TEST_CASE("build_agent_push: excluding a poisoned rule increments "
+          "yuzu_guardian_push_rule_excluded_total{reason=depth_exceeded}",
+          "[guardian_push_builder][security][depth][observability]") {
+    // Governance Gate 4/6 finding: a poisoned rule's exclusion previously had
+    // no fleet-wide signal beyond an unrated log line - this is the metric
+    // that closes that gap. `metrics` is a nullable trailing param
+    // (unchanged callers/tests keep compiling) so this test opts in
+    // explicitly.
+    yuzu::MetricsRegistry metrics;
+    GuaranteedStateRuleRow poisoned = row("poisoned2", "windows", "");
+    poisoned.spec_json =
+        R"({"spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM","nested":)" +
+        std::string(40, '[') + std::string(40, ']') +
+        R"(}},"remediation":{"type":"alert-only"}})";
+    GuaranteedStateRuleRow healthy = row("healthy2", "windows", "");
+
+    CHECK(metrics
+              .counter("yuzu_guardian_push_rule_excluded_total", {{"reason", "depth_exceeded"}})
+              .value() == 0.0);
+
+    auto push = guardian::build_agent_push({poisoned, healthy}, "windows", always_in_scope,
+                                           /*full_sync=*/true, /*generation=*/3, &metrics);
+
+    CHECK(rule_ids(push) == std::vector<std::string>{"healthy2"});
+    CHECK(metrics
+              .counter("yuzu_guardian_push_rule_excluded_total", {{"reason", "depth_exceeded"}})
+              .value() == 1.0);
 }
 
 TEST_CASE("build_agent_push: a repeated attempt against the same poisoned row "

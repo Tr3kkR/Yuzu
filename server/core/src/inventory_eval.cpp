@@ -1,6 +1,7 @@
 #include "inventory_eval.hpp"
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -207,7 +208,7 @@ std::vector<InventoryEvalResult> evaluate_inventory(
         if (mcp::json_exceeds_depth(data_json, mcp::kMcpMaxJsonDepth)) {
             spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json nests "
                         "too deeply (#2437-class)",
-                        record_agent_id, record_plugin);
+                        record_agent_id, onbehalf::sanitize_for_log(record_plugin, 128));
             continue;
         }
 

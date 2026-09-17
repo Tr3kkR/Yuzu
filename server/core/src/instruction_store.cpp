@@ -798,9 +798,9 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
     // whole-body text scan by design (it must not count structure inside a
     // string value).
     if (mcp::json_exceeds_depth(json_str, mcp::kMcpMaxJsonDepth))
-        return std::unexpected(
-            "instruction-import request body nests too deeply (flatten to at most " +
-            std::to_string(mcp::kMcpMaxJsonDepth) + " levels)");
+        return std::unexpected(std::format(
+            "instruction-import request body nests too deeply (flatten to at most {} levels)",
+            mcp::kMcpMaxJsonDepth));
 
     auto parsed = nlohmann::json::parse(json_str, nullptr, false);
     if (parsed.is_discarded())
@@ -939,9 +939,10 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
         // here at write time prevents new poison; discover_routes.cpp's own
         // guard protects rows already written before this check shipped.
         if (mcp::json_exceeds_depth(def.parameter_schema, mcp::kMcpMaxJsonDepth))
-            return std::unexpected(
-                "instruction-import parameter_schema nests too deeply (flatten to at most " +
-                std::to_string(mcp::kMcpMaxJsonDepth) + " levels)");
+            return std::unexpected(std::format(
+                "instruction-import parameter_schema nests too deeply (flatten to at most {} "
+                "levels)",
+                mcp::kMcpMaxJsonDepth));
     }
     if (parsed.contains("result_schema"))
         def.result_schema = parsed.value("result_schema", "{}");
@@ -990,9 +991,10 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
         // internal re-parse.
         if (v->is_string() &&
             mcp::json_exceeds_depth(v->get_ref<const std::string&>(), mcp::kMcpMaxJsonDepth)) {
-            return std::unexpected(
-                "instruction-import visualization_spec nests too deeply (flatten to at most " +
-                std::to_string(mcp::kMcpMaxJsonDepth) + " levels)");
+            return std::unexpected(std::format(
+                "instruction-import visualization_spec nests too deeply (flatten to at most "
+                "{} levels)",
+                mcp::kMcpMaxJsonDepth));
         }
         def.visualization_spec = normalize_to_array(*v);
     }
@@ -1053,10 +1055,10 @@ InstructionStore::import_definition_json_impl(const std::string& json_str, bool 
                 // here, which drop the field and let the import proceed, a
                 // too-deep string is evidence of a hostile payload, not a
                 // benign-but-oversized one.
-                return std::unexpected(
+                return std::unexpected(std::format(
                     "instruction-import response_templates_spec nests too deeply (flatten to "
-                    "at most " +
-                    std::to_string(mcp::kMcpMaxJsonDepth) + " levels)");
+                    "at most {} levels)",
+                    mcp::kMcpMaxJsonDepth));
             } else {
                 auto inner = nlohmann::json::parse(s, nullptr, /*allow_exceptions=*/false);
                 if (inner.is_discarded()) {

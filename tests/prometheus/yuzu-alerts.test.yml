@@ -2739,3 +2739,41 @@ tests:
       - expr: 'ALERTS{alertname="YuzuGatewayRouteUnreadable", alertstate="firing"}'
         eval_time: 15m
         exp_samples: []
+
+  # ── YuzuInventoryGenericBlobRejectedDepth (json-dump-depth-guard fix) ────
+  #
+  # This alert deliberately has no proportion/rate-floor guard, unlike
+  # YuzuOtaServerCapacityRejections above: it exists specifically to catch a
+  # single-agent, single-blob event (sre Gate 6 finding), so ANY non-zero
+  # rate over the 15m window must fire once `for: 5m` clears.
+
+  # CASE - a single isolated rejection fires once the `for: 5m` bar clears
+  # (the counter jumps once at t=5m and stays flat; rate()[15m] reads >0 for
+  # the whole window the jump remains inside, roughly [5m, 20m)).
+  - interval: 1m
+    name: generic inventory depth rejection - a single isolated event fires
+    input_series:
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="__generic__",outcome="rejected_depth"}'
+        values: "0x5 1x20"
+    promql_expr_test:
+      # Bare sum() with no by() (mirrors YuzuInventoryReportRejected's own
+      # expr shape) strips job/instance - this is a fleet-wide aggregate, not
+      # a per-instance one.
+      - expr: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing"}'
+        eval_time: 12m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE - a flat (never-rejecting) counter stays quiet: RED against dropping
+  # the `> 0` (an `>= 0` form would fire on the healthy pre-seeded-to-zero
+  # series every fleet has at boot).
+  - interval: 1m
+    name: generic inventory depth rejection - a flat zero-seeded counter stays quiet
+    input_series:
+      - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="__generic__",outcome="rejected_depth"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples: []
