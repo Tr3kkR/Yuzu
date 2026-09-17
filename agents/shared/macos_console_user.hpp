@@ -58,6 +58,7 @@
 // resolve_delete_keychain_path) is certificates-plugin-specific and not
 // intended for reuse as-is.
 
+#include <cstdlib>
 #include <format>
 #include <optional>
 #include <string>
@@ -184,12 +185,32 @@ inline bool is_valid_uid(std::string_view uid) {
 
 // ── Store -> keychain mapping ────────────────────────────────────────────────
 
+inline constexpr const char* kSystemKeychainPath = "/Library/Keychains/System.keychain";
+inline constexpr const char* kRootKeychainPath =
+    "/System/Library/Keychains/SystemRootCertificates.keychain";
+
+// Test-only overrides (#4374), mirroring the YUZU_KEYCHAIN_PROBE_PATH hidden-
+// probe precedent (tests/unit/test_keychain_read.cpp:332-336): read per call
+// by design (never cached), so a single test process can point successive
+// dispatches at different fixtures. Consulted by the READ paths only --
+// list_certs_macos and details_cert_macos -- `delete` deliberately does not
+// consult them (see resolve_delete_keychain_path below). A relative value is
+// ignored, never resolved against the daemon cwd (same rule as
+// is_valid_home_dir).
 inline std::string system_keychain_path() {
-    return "/Library/Keychains/System.keychain";
+    if (const char* override_path = std::getenv("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE");
+        override_path != nullptr && override_path[0] == '/') {
+        return override_path;
+    }
+    return kSystemKeychainPath;
 }
 
 inline std::string root_keychain_path() {
-    return "/System/Library/Keychains/SystemRootCertificates.keychain";
+    if (const char* override_path = std::getenv("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE");
+        override_path != nullptr && override_path[0] == '/') {
+        return override_path;
+    }
+    return kRootKeychainPath;
 }
 
 // Guard for a caller-resolved home directory: absolute and non-empty.
@@ -316,11 +337,17 @@ inline StorePlan resolve_store_plan(std::string_view store, bool has_console_use
 //                                silently redirected.
 //   "all", or any other/unrecognized value -- no single-keychain meaning
 //                                for a destructive op: rejected.
+// Resolves to the LITERAL paths (kRootKeychainPath / kSystemKeychainPath),
+// never the override-aware system_keychain_path()/root_keychain_path()
+// accessors above: destructive resolution stays literal so that a daemon
+// started with a test-only override set can never delete from a substituted
+// keychain -- the same fail-closed stance this comment already takes for an
+// unrecognised store name.
 inline std::optional<std::string> resolve_delete_keychain_path(std::string_view store) {
     if (store == "root")
-        return root_keychain_path();
+        return kRootKeychainPath;
     if (store == "MY" || store == "System")
-        return system_keychain_path();
+        return kSystemKeychainPath;
     return std::nullopt;
 }
 
