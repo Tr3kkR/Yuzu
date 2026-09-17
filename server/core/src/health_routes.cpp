@@ -45,6 +45,7 @@
 #include "schedule_engine.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_store.hpp"
 #include "tag_store.hpp"
 #include "update_registry.hpp"
 #include "upload_grant_store.hpp"
@@ -635,6 +636,14 @@ void register_health_routes(HttpRouteSink& sink, Deps deps) {
             // degrade to 503 (both) — surface it so an LB/operator sees the half-state.
             {"software_licensing_store",
              deps.software_licensing_store && deps.software_licensing_store->is_open()},
+            // Wave 7 PR7.2 born-on-Pg store (ADR-0016 §5, gov Gate 3 sre HIGH
+            // finding). Same rationale as software_licensing_store above:
+            // fail-closed at boot, but a not-open state post-boot makes
+            // ReportInventory/ProxyInventory silently ack the app_usage blob
+            // with no ingest and the Forensics REST/MCP reads degrade to
+            // 503/kInternalError — surface it so an LB/operator sees the
+            // half-state instead of only discovering it per-request.
+            {"app_usage_store", deps.app_usage_store && deps.app_usage_store->is_open()},
             {"product_registry_store",
              deps.product_registry_store && deps.product_registry_store->is_open()},
             // gov W7.4 R1 sre-B1: ProductPackStore became more load-bearing

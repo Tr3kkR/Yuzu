@@ -35,6 +35,8 @@
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_ingestion.hpp"
+#include "app_usage_store.hpp"
 #include "management_group_store.hpp"
 #include "notification_store.hpp"
 #include "offload_target_store.hpp"
@@ -812,6 +814,26 @@ grpc::Status AgentServiceImpl::ReportInventory(grpc::ServerContext* context,
         } catch (...) {
             spdlog::warn("ReportInventory: software_licensing ingest threw unknown exception for "
                          "agent {} — acked",
+                         agent_id);
+        }
+    }
+    if (app_usage_store_ && app_usage_store_->is_open()) {
+        try {
+            ingest_app_usage_report(*app_usage_store_, agent_id, *request, *response, &metrics_);
+        } catch (const std::exception& ex) {
+            // P11: unlike the sibling blocks above, a swallowed throw here with no
+            // nack lets the agent's SyncScheduler advance last_hash and go
+            // hash-only for a day with nothing persisted — the nack forces a full
+            // resend next cycle. Follow-up issue filed at delivery to retrofit the
+            // four sibling blocks (installed_software/app_perf/device_ci/
+            // software_licensing) with the same nack; do not do it here.
+            response->add_need_full("app_usage");
+            spdlog::warn("ReportInventory: app_usage ingest threw for agent {} — nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("app_usage");
+            spdlog::warn("ReportInventory: app_usage ingest threw unknown exception for agent {} "
+                         "— nacked",
                          agent_id);
         }
     }

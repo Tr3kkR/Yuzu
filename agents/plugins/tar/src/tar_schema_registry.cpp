@@ -1410,6 +1410,15 @@ bool is_queryable_table(std::string_view real_table_name) {
         std::unordered_set<std::string> s{"tar_state", "tar_config", "tar_cursor"};
         for (const auto& [real, ref] : table_ref_map())
             s.insert(real);
+        // #4260: app-usage tables are read ONLY through the Forensics-gated
+        // single-target app_usage plugin reads, never through generic tar.sql
+        // (Infrastructure:Read). Remove them from the allowlist after the loop
+        // above so the SQLite authorizer (tar_query_authorizer) denies every
+        // access path -- direct name, $Usage_* placeholder, alias, JOIN, or
+        // subquery -- post-translation, matching the tar_events #760 UP-8
+        // no-oracle reasoning this function already documents.
+        for (const char* usage_table : {"usage_live", "usage_daily", "usage_daily_user"})
+            s.erase(usage_table);
         return s;
     }();
     return allowed.contains(std::string(real_table_name));

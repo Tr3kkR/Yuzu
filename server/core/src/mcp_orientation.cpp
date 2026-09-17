@@ -59,7 +59,7 @@ constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_e
                                                  "query_audit_log"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
-                                           "query_software_licenses"};
+                                           "query_software_licenses", "get_agent_app_usage"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",

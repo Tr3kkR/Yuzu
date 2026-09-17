@@ -93,6 +93,7 @@ A separate, narrower shape applies to ordinary mutation routes that audit a chan
   - [Discovery (A2)](#discovery-a2)
   - [Inventory](#inventory)
   - [Result Sets](#result-sets)
+  - [Forensics](#forensics)
   - [Software Licensing (SLE)](#software-licensing-sle)
   - [Execution Statistics](#execution-statistics)
   - [Live-Query Bundles](#live-query-bundles)
@@ -6108,6 +6109,47 @@ Pin (exempt from TTL expiry) or unpin a result set.
 
 ---
 
+### Forensics
+
+The **per-agent app-usage** discovery surface (Wave 7 PR7.2, ADR-0016 §5). Data is derived on the agent from TAR's `usage_daily` fold via the read-only `app_usage` plugin and synced daily into `AppUsageStore`, projecting each executable's retained-window first/last-seen plus a trailing-30-day run-count/total-seconds window. `Forensics` is **Administrator-only by design** — deliberately absent from the seeded Viewer read-list.
+
+#### `GET /api/v1/forensics/agents/{agent_id}/app-usage`
+
+One device's per-executable last-used projection — the per-agent drill. Because it renders behavioural data, every open is **audited fail-closed**: if the `app_usage.agent.view` audit row cannot persist, the request is refused (`503` + `Sec-Audit-Failed`) and no data is served.
+
+**Permission:** `Forensics:Read` — **per-device scoped** (management-group confinement; `403` for an in-fleet device outside your scope).
+
+**Response (200):**
+
+```json
+{
+  "data": {
+    "agent_id": "agent-001",
+    "apps": [
+      {"exe_key": "chrome.exe", "first_seen": 1751000000, "last_seen": 1751600000,
+       "run_count_30d": 42, "total_seconds_30d": 86400}
+    ],
+    "collected_at": 1751600000
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+`first_seen`/`last_seen` are **within TAR's retained usage window** (31 days default, operator-tunable) — never a value spanning the executable's full run history. An executable absent from `apps` has not run inside that retained window; it does not mean the executable has never run. An agent that genuinely reported no rows for the window is `200` with `apps: []`.
+
+**Error responses:**
+
+| Status | Condition |
+|---|---|
+| 401 | Unauthenticated |
+| 403 | Caller lacks per-device-scoped `Forensics:Read` for this agent |
+| 503 + `Sec-Audit-Failed` | The per-open audit row could not persist — fail-closed, no data served |
+| 503 | Store unavailable or degraded (A4 envelope with `correlation_id`, `retry_after_ms: 5000`) — **never an empty 200** |
+
+Decommissioning the agent erases this store's rows too — see [Software Licensing (SLE)](#software-licensing-sle)'s `DELETE /api/v1/sle/agents/{agent_id}` (the six-store cascade).
+
+---
+
 ### Software Licensing (SLE)
 
 The **detected software-licence** discovery surface (ADR-0024; per its "Placement under ADR-1005" only the discovery mechanism is in-server — the compliance/entitlement/posture reads ship with the SAM use-case-engine module). Data is collected by the agent `license_scan` plugin and synced daily into `SoftwareLicensingStore`; see [Software licence detection](software-licensing.md) for what is collected and the per-user privacy carve-out. **Not** Yuzu's own product licence (that is [License Management](#license-management)).
@@ -6153,7 +6195,7 @@ A genuinely licence-free (or unknown) device is `200` with `count: 0`; a `503` m
 
 #### `DELETE /api/v1/sle/agents/{agent_id}`
 
-**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all five per-agent stores** (generic inventory, installed-software, device-CI, app-perf, and detected-licence), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
+**Destructive.** The audited whole-device erasure trigger: fans `delete_agent` across **all six per-agent stores** (generic inventory, installed-software, device-CI, app-perf, detected-licence, and app-usage), durably erasing the decommissioned device's rows — including the Decision-11 `user_ref` personal data. This is the wired GDPR Art. 17 whole-device erasure path (row-level / per-subject DSAR erasure is a stated gap, #1666). Deliberately REST-only — no MCP twin (recorded ADR-1005 exception, #2102).
 
 **Permission:** a single **per-device-scoped `Decommission:Delete`** securable (ADR-0024 Decision 9, amended Wave 7 PR7.2) — one grant authorizing for the cascade's whole blast radius, replacing the earlier per-store conjunction. A role lacking it is `403`'d, naming `Decommission:Delete` (the seeded Administrator/ITServiceOwner roles hold it by default; a custom role that had assembled the old per-store `Delete` grants must be granted this securable too — the three old grants no longer suffice).
 
@@ -6168,8 +6210,8 @@ Two durable audit events: `sle.agent.decommission|attempt` is written **before**
     "decommissioned": true,
     "stores": {"inventory": "deleted", "software_inventory": "deleted",
                "app_perf_daily": "deleted", "device_inventory": "skipped",
-               "software_licensing": "deleted"},
-    "deleted": 4,
+               "software_licensing": "deleted", "app_usage": "deleted"},
+    "deleted": 5,
     "skipped": 1,
     "failed": 0
   },
