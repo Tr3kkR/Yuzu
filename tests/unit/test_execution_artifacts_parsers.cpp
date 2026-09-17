@@ -826,11 +826,30 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
     // (kVolumeEntryStrideV23V26, 0x68/104) -- documentation-derived (libscca),
     // never pinned against a real capture in this repo (no v23/v26 fixture
     // exists; every real .pf.decompressed this repo has is v31). Before these,
-    // no test ever gave a v23 or v26 blob a nonzero volume_count at all, so the
-    // stride-selection branch and its own bounds/consistency checks had zero
-    // exercise -- these prove both the happy path AND that a wrong stride
-    // still fails closed, exactly as the parser's own header comment claims.
-    SECTION("v23 with a single volume succeeds with the true count, via the 104-byte stride") {
+    // no test ever gave a v23 or v26 blob a nonzero volume_count at all, so
+    // the stride-selection branch had zero exercise.
+    //
+    // Mutation-tested (2026-09-17): hardcoding the stride to the pinned
+    // kVolumeEntryStrideV30V31 (96) regardless of version reddens the v26
+    // two-volume SECTION below -- entry 1 is then read 8 bytes short of
+    // where it actually starts, landing in an unwritten (zero) region of
+    // entry 0's own tail, so refs_off/refs_size both read back as 0 and the
+    // parse fails instead of returning the correct summed count. That is
+    // real, load-bearing proof the 104-byte stride is actually used. The
+    // single-volume positive is NOT discriminating for stride -- entry 0's
+    // own position never depends on it (i*stride is 0 for i=0 regardless of
+    // stride's value) -- it only proves the v23 header-field dispatch (the
+    // is_v23 branch) reaches the volume walk at all. The entry-1-corruption
+    // negative is ALSO not stride-discriminating: under the same wrong-
+    // stride mutation, the corrupted bytes are simply never read (the wrong
+    // offset lands on a different, unwritten zero region instead), and
+    // reading that zero region still trips the refs_block_size<16 floor via
+    // a different path -- so it coincidentally still returns truncated_entry
+    // either way. It is kept because it is still a genuine, real negative
+    // (a corrupted entry 1 in a v23 multi-volume file must fail the parse,
+    // full stop) -- just not proof of which stride was used.
+    SECTION("v23 with a single volume succeeds with the true count -- proves the version-23 "
+            "header-field dispatch reaches the volume walk at all") {
         auto buf = build_valid_prefetch_v23_blob_with_volumes(23u, {9});
         Result<PrefetchResult> r{PrefetchResult{}};
         REQUIRE_NOTHROW(r = parse_prefetch(buf));
@@ -840,8 +859,9 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r->file_ref_count == 9);
     }
 
-    SECTION("v26 two volumes succeed with the SUMMED count -- proves the stride/version "
-            "dispatch isn't hardcoded to the literal 23") {
+    SECTION("v26 two volumes succeed with the SUMMED count -- the discriminating proof that "
+            "entry 1 is actually read at the 104-byte stride (mutation-verified above), and "
+            "that the dispatch isn't hardcoded to the literal 23") {
         auto buf = build_valid_prefetch_v23_blob_with_volumes(26u, {5, 7});
         Result<PrefetchResult> r{PrefetchResult{}};
         REQUIRE_NOTHROW(r = parse_prefetch(buf));
@@ -852,8 +872,8 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
     }
 
     SECTION("v23 two volumes: entry 0 is well-formed, entry 1's refs-block offset is corrupted "
-            "at the 104-byte stride -- the documentation-derived stride fails closed on entry "
-            "1 exactly like the pinned v30/v31 stride does above, not just on entry 0") {
+            "-- a malformed entry 1 in a v23 multi-volume file still fails the whole parse, "
+            "not just entry 0 (not itself stride-discriminating -- see the comment above)") {
         auto buf = build_valid_prefetch_v23_blob_with_volumes(23u, {5, 7});
         constexpr size_t kEntry1 = kVolumeEntryStrideV23V26; // entry 1 starts one stride in
         put_u32(buf, 0x100 + kEntry1 + kVolumeEntryFileRefsOffsetField, 0xFFFFFF00u);
