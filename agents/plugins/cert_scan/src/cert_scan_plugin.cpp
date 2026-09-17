@@ -91,12 +91,23 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
+// Escapes '|' (the output row delimiter) and '\n'/'\r' -- a certificate
+// field containing either would otherwise split one finding into extra
+// columns (a crafted CN like "cert-scan-repro-test|injectedfield") or
+// extra physical output lines (an embedded newline in a CN), both
+// reproduced independently against a real self-signed certificate a
+// one-line `openssl req` command can generate. Result-integrity only, not
+// confidentiality -- this plugin never emits raw key material regardless.
 std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
         if (c == '|')
             out += "\\|";
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
         else
             out += c;
     }
@@ -138,10 +149,29 @@ std::string lowercase_extension(const std::string& path) {
 
 void output_finding(yuzu::CommandContext& ctx, const CertFinding& f, std::string_view file_path) {
     const auto& cf = f.cert_fields;
-    ctx.write_output(std::format("{}|{}|{}|{}|{}|{}|{}|{}|{}", severity_name(f.severity),
-                                 finding_kind_name(f.kind), escape_pipes(file_path), cf.subject,
-                                 cf.issuer, cf.not_before, cf.not_after, cf.serial, cf.thumbprint));
+    // Every field is escaped, not just file_path. subject/issuer are
+    // attacker-influenced X.509 DN text (certificates_x509::extract_name
+    // uses X509_NAME_print_ex with no control-character escaping) -- a
+    // local, unprivileged user can generate a certificate with e.g.
+    // CN=x|injectedfield or an embedded newline in the CN with a one-line
+    // `openssl req` command, which without this would split one finding
+    // into extra columns or physical output lines. not_before/not_after/
+    // serial/thumbprint are lower-risk (narrower character sets in
+    // practice) but escaped uniformly rather than case-by-case.
+    ctx.write_output(std::format(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}", severity_name(f.severity), finding_kind_name(f.kind),
+        escape_pipes(file_path), escape_pipes(cf.subject), escape_pipes(cf.issuer),
+        escape_pipes(cf.not_before), escape_pipes(cf.not_after), escape_pipes(cf.serial),
+        escape_pipes(cf.thumbprint)));
 }
+
+// Upper bound on operator-supplied maxDepth. Without this, an operator
+// (or a caller reusing this action programmatically) could set an
+// arbitrarily large depth, removing the one depth-side guard that exists
+// -- the caller already controls `paths` too, so this isn't a new
+// privilege boundary, but it is the one resource guard this parameter
+// exists to provide, and an unclamped value silently defeats it.
+constexpr std::size_t kMaxDepthClamp = 64;
 
 void run_scan(yuzu::CommandContext& ctx, yuzu::Params params) {
     auto paths = split_csv(params.get("paths", ""));
@@ -153,10 +183,11 @@ void run_scan(yuzu::CommandContext& ctx, yuzu::Params params) {
         auto [ptr, ec] = std::from_chars(max_depth_str.data(),
                                          max_depth_str.data() + max_depth_str.size(), depth);
         if (ec == std::errc{})
-            cfg.max_depth = depth;
+            cfg.max_depth = depth > kMaxDepthClamp ? kMaxDepthClamp : depth;
     }
 
-    auto files = enumerate_files(cfg);
+    auto result = enumerate_files(cfg);
+    const auto& files = result.files;
     const std::string today = today_iso();
 
     ctx.report_progress(0);
@@ -176,8 +207,37 @@ void run_scan(yuzu::CommandContext& ctx, yuzu::Params params) {
             ctx.report_progress(static_cast<int>((i + 1) * 100 / files.size()));
     }
 
-    ctx.write_output(std::format("INFO|summary||{} files scanned, {} findings||||", files.size(),
-                                 total_findings));
+    // Nine pipe-delimited fields, matching the declared output schema
+    // (severity|kind|filePath|subject|issuer|notBefore|notAfter|serial|
+    // thumbprint) exactly -- this summary row used to emit only eight.
+    ctx.write_output(std::format("INFO|summary||{} files scanned, {} findings|||||",
+                                 files.size(), total_findings));
+
+    // CC-07 typed result status (ABI v4+). A root that could not be opened
+    // at all (the realistic default-scan outcome on a shared Linux/macOS
+    // box: the agent runs unprivileged and cannot read most other users'
+    // 0700 home directories) used to be silently skipped with no signal
+    // anywhere -- a scan that found nothing because it couldn't read
+    // anything was indistinguishable from a scan that genuinely found
+    // nothing. Report the honest outcome instead.
+    std::size_t inaccessible_roots = 0;
+    for (const auto& outcome : result.root_outcomes) {
+        if (!outcome.accessible)
+            ++inaccessible_roots;
+    }
+    if (inaccessible_roots > 0 || result.truncated_by_file_cap) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "cert_scan:scan");
+    } else if (result.root_outcomes.empty()) {
+        // Auto-discovery (no `paths` supplied) found zero home directories
+        // to even attempt -- not a read failure, but not a completed scan
+        // of anything either.
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                              "cert_scan:scan");
+    } else {
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL,
+                              "cert_scan:scan");
+    }
 }
 
 } // namespace

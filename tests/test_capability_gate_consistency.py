@@ -99,6 +99,17 @@ FRAGMENT_FILES = [
 # Wave 7 PR7.1: +2 autoruns (list/catalog).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # cert_scan: +1 (scan).
+#
+# COORDINATION HAZARD (flagged in this PR's own review): the sibling
+# pii_scan PR (#4427) independently bumps this SAME line to 201 (it adds
+# 4 rows from its own dev baseline of 197). Both PRs branched from the
+# same dev state, so whichever of the two merges SECOND will hit a real
+# git conflict on this exact line -- that is expected, not a bug in
+# either PR, and is not something either PR alone can prevent (the two
+# branches are editing the same constant independently, which git cannot
+# auto-resolve). Resolve it by ADDING both deltas: if pii_scan's +4 has
+# already landed when this merges, the correct value here becomes
+# 201 + 1 = 202, not 198.
 EXPECTED_TOTAL_ROWS = 198
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair

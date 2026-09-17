@@ -123,18 +123,22 @@ struct CertFinding {
     return f.not_after < today_iso;
 }
 
-/// Severity for one already-parsed certificate: Medium if expired or
-/// self-signed (either condition independently downgrades trust), else Low.
-/// An unresolvable expiry (is_expired returns nullopt) is NOT treated as
-/// "not expired" -- it still contributes Medium via the self-signed check
-/// alone if that applies, but never silently assumes freshness it could not
-/// verify beyond what self-signed already tells us.
+/// Severity for one already-parsed certificate: Medium if expired,
+/// self-signed, or the expiry cannot be determined at all -- Low is
+/// reserved for a certificate CONFIRMED both non-self-signed and
+/// non-expired. An unresolvable expiry used to fall through to Low (the
+/// same label an actually-verified-fresh certificate gets), which reads
+/// as "confirmed valid" when the honest answer is "could not confirm
+/// either way" -- this codebase's own established convention for exactly
+/// this shape of ambiguity is to report the LESS reassuring outcome
+/// (see openssh_key_encryption()'s Unknown -> the higher of its two key
+/// severities), not the more reassuring one.
 [[nodiscard]] inline Severity certificate_severity(const yuzu::certificates_x509::CertFields& f,
                                                     std::string_view today_iso) {
     if (is_self_signed(f))
         return Severity::Medium;
     auto expired = is_expired(f, today_iso);
-    if (expired.has_value() && *expired)
+    if (!expired.has_value() || *expired)
         return Severity::Medium;
     return Severity::Low;
 }
@@ -348,9 +352,19 @@ enum class KeyEncryption { Unencrypted, Encrypted, Unknown };
                                                                 std::string_view today_iso) {
     std::vector<CertFinding> out;
 
+    // Independent `if`s, not if/else-if: a file concatenating one
+    // encrypted PKCS#8 key and one unencrypted PKCS#8 key (a real, if
+    // uncommon, shape) used to report only the encrypted one -- the
+    // else-if silently dropped the unencrypted CRITICAL finding entirely.
+    // The two marker strings never overlap as substrings of each other
+    // ("-----BEGIN ENCRYPTED PRIVATE KEY-----" does not contain
+    // "-----BEGIN PRIVATE KEY-----" anywhere in it), so checking both
+    // independently cannot double-count a single encrypted key as
+    // unencrypted too.
     if (contains(content, "-----BEGIN ENCRYPTED PRIVATE KEY-----")) {
         out.push_back(CertFinding{FindingKind::PrivateKeyEncrypted, Severity::High, {}});
-    } else if (contains(content, "-----BEGIN PRIVATE KEY-----")) {
+    }
+    if (contains(content, "-----BEGIN PRIVATE KEY-----")) {
         out.push_back(CertFinding{FindingKind::PrivateKeyUnencrypted, Severity::Critical, {}});
     }
 
@@ -360,23 +374,54 @@ enum class KeyEncryption { Unencrypted, Encrypted, Unknown };
         {"-----BEGIN DSA PRIVATE KEY-----", "-----END DSA PRIVATE KEY-----"},
     }};
     for (const auto& [begin, end] : kTraditional) {
-        if (auto block = pem_block(content, begin, end)) {
-            bool encrypted = has_proc_type_encrypted_header(*block);
-            out.push_back(CertFinding{
-                encrypted ? FindingKind::PrivateKeyEncrypted : FindingKind::PrivateKeyUnencrypted,
-                encrypted ? Severity::High : Severity::Critical, {}});
+        if (!contains(content, begin))
+            continue;
+        // A truncated file (BEGIN present, END absent -- the realistic
+        // disk-full/crash/sync-interrupt shape) used to be silently
+        // dropped entirely here (pem_block() returning nullopt skipped
+        // the whole iteration) -- a live, readable private key going
+        // unreported is far worse than a Proc-Type search whose scope is
+        // wider than strictly necessary, so a missing END falls back to
+        // "BEGIN to end-of-content" as the search scope instead of
+        // skipping the key.
+        std::string_view block;
+        if (auto scoped = pem_block(content, begin, end)) {
+            block = *scoped;
+        } else {
+            block = content.substr(content.find(begin) + begin.size());
         }
+        bool encrypted = has_proc_type_encrypted_header(block);
+        out.push_back(CertFinding{
+            encrypted ? FindingKind::PrivateKeyEncrypted : FindingKind::PrivateKeyUnencrypted,
+            encrypted ? Severity::High : Severity::Critical, {}});
     }
 
-    if (auto body = extract_openssh_key_body(content)) {
-        KeyEncryption enc = openssh_key_encryption(*body);
-        // Unknown (undecodable body) is treated as the lower of the two
-        // key severities, not the higher -- an unconfirmed encryption
-        // claim should not read as a confirmed Critical finding.
-        bool unencrypted = (enc == KeyEncryption::Unencrypted);
-        out.push_back(CertFinding{
-            unencrypted ? FindingKind::PrivateKeyUnencrypted : FindingKind::PrivateKeyEncrypted,
-            unencrypted ? Severity::Critical : Severity::High, {}});
+    {
+        static constexpr std::string_view kOpenSshBegin = "-----BEGIN OPENSSH PRIVATE KEY-----";
+        if (contains(content, kOpenSshBegin)) {
+            // Same truncation fallback as the traditional-format loop
+            // above -- and unlike that case, the ciphername field this
+            // needs to decode sits near the START of the base64 body, so
+            // a missing END marker practically never actually prevents
+            // decoding it; falling back to "BEGIN to end-of-content"
+            // costs nothing extra in the common truncation case while
+            // still never silently dropping the key.
+            std::string_view body;
+            if (auto scoped = extract_openssh_key_body(content)) {
+                body = *scoped;
+            } else {
+                body = content.substr(content.find(kOpenSshBegin) + kOpenSshBegin.size());
+            }
+            KeyEncryption enc = openssh_key_encryption(body);
+            // Unknown (undecodable body) is treated as the lower of the
+            // two key severities, not the higher -- an unconfirmed
+            // encryption claim should not read as a confirmed Critical
+            // finding.
+            bool unencrypted = (enc == KeyEncryption::Unencrypted);
+            out.push_back(CertFinding{
+                unencrypted ? FindingKind::PrivateKeyUnencrypted : FindingKind::PrivateKeyEncrypted,
+                unencrypted ? Severity::Critical : Severity::High, {}});
+        }
     }
 
     if (contains_csr_marker(content))

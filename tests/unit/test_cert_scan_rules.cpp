@@ -275,6 +275,41 @@ TEST_CASE("classify_content: public key alone yields no findings", "[cert_scan]"
     CHECK(findings.empty());
 }
 
+// ── Realistic .ssh non-key fixture content ─────────────────────────────────
+//
+// is_candidate_file() (cert_scan_collect.hpp) admits ANY file under a
+// .ssh directory regardless of name, deliberately relying on content
+// classification here to be the real filter -- known_hosts/*.pub/config
+// are not key material and must produce zero findings against their
+// REAL shape, not just a generic placeholder string.
+
+TEST_CASE("classify_content: a realistic known_hosts file yields no findings", "[cert_scan]") {
+    std::string known_hosts =
+        "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl\n"
+        "192.168.1.1 ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQDExampleFakeHostKeyDataHere1234567890abcdef\n";
+    auto findings = classify_content(known_hosts, "2026-09-16");
+    CHECK(findings.empty());
+}
+
+TEST_CASE("classify_content: a realistic SSH public key (*.pub) yields no findings",
+         "[cert_scan]") {
+    std::string pub_key =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl user@host\n";
+    auto findings = classify_content(pub_key, "2026-09-16");
+    CHECK(findings.empty());
+}
+
+TEST_CASE("classify_content: a realistic SSH client config file yields no findings",
+         "[cert_scan]") {
+    std::string ssh_config =
+        "Host github.com\n"
+        "  HostName github.com\n"
+        "  User git\n"
+        "  IdentityFile ~/.ssh/id_ed25519\n";
+    auto findings = classify_content(ssh_config, "2026-09-16");
+    CHECK(findings.empty());
+}
+
 // ── classify_content: certificates and CSRs ──────────────────────────────
 
 TEST_CASE("classify_content: self-signed valid certificate yields Medium finding", "[cert_scan]") {
@@ -378,4 +413,118 @@ TEST_CASE("has_any_pem_marker: true for key/cert/CSR content", "[cert_scan]") {
 TEST_CASE("has_any_pem_marker: false for binary/unrelated content", "[cert_scan]") {
     CHECK_FALSE(has_any_pem_marker(std::string("\xFE\xED\xFE\xED", 4)));
     CHECK_FALSE(has_any_pem_marker("just some ordinary text file\n"));
+}
+
+// ── certificate_severity: unresolvable expiry must not read as confirmed-safe ──
+
+TEST_CASE("certificate_severity: unresolvable expiry and not self-signed is Medium, not Low",
+         "[cert_scan]") {
+    CertFields f;
+    f.subject = "CN=leaf";
+    f.issuer = "CN=ca";
+    f.not_after = "(unknown)"; // malformed/unparseable notAfter field
+    CHECK(certificate_severity(f, "2026-09-16") == Severity::Medium);
+}
+
+TEST_CASE("certificate_severity: unresolvable expiry alone does not itself read as expired",
+         "[cert_scan]") {
+    // is_expired() itself must still report "cannot determine" honestly
+    // (nullopt), distinct from "confirmed expired" (true) -- only
+    // certificate_severity()'s OWN mapping of that ambiguity changed.
+    CertFields f;
+    f.subject = "CN=leaf";
+    f.issuer = "CN=ca";
+    f.not_after = "(unknown)";
+    CHECK_FALSE(is_expired(f, "2026-09-16").has_value());
+}
+
+// ── Truncated key files: BEGIN present, END absent must still be reported ──
+
+TEST_CASE("classify_content: truncated RSA key (no END marker) still yields a finding",
+         "[cert_scan]") {
+    // The realistic disk-full/crash/sync-interrupt shape: a BEGIN marker
+    // with no matching END. This used to be silently dropped entirely.
+    auto findings =
+        classify_content("-----BEGIN RSA PRIVATE KEY-----\nMIIFakeTruncatedNoEndMarker\n",
+                         "2026-09-16");
+    REQUIRE(findings.size() == 1);
+    CHECK(findings[0].kind == FindingKind::PrivateKeyUnencrypted);
+    CHECK(findings[0].severity == Severity::Critical);
+}
+
+TEST_CASE("classify_content: truncated encrypted RSA key (no END) still detects Proc-Type",
+         "[cert_scan]") {
+    auto findings = classify_content(
+        "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,ABCD\n\n"
+        "MIIFakeTruncatedNoEndMarker\n",
+        "2026-09-16");
+    REQUIRE(findings.size() == 1);
+    CHECK(findings[0].kind == FindingKind::PrivateKeyEncrypted);
+    CHECK(findings[0].severity == Severity::High);
+}
+
+TEST_CASE("classify_content: truncated OpenSSH key (no END) still yields a finding",
+         "[cert_scan]") {
+    std::string body = make_openssh_body("none");
+    std::string content = "-----BEGIN OPENSSH PRIVATE KEY-----\n" + body + "\n";
+    auto findings = classify_content(content, "2026-09-16");
+    REQUIRE(findings.size() == 1);
+    CHECK(findings[0].kind == FindingKind::PrivateKeyUnencrypted);
+    CHECK(findings[0].severity == Severity::Critical);
+}
+
+// ── Concatenated encrypted + unencrypted PKCS8 keys in one file ────────────
+
+TEST_CASE("classify_content: concatenated encrypted + unencrypted PKCS8 keys both reported",
+         "[cert_scan]") {
+    std::string combined = "-----BEGIN ENCRYPTED PRIVATE KEY-----\nMIIFake1==\n"
+                           "-----END ENCRYPTED PRIVATE KEY-----\n"
+                           "-----BEGIN PRIVATE KEY-----\nMIIFake2==\n"
+                           "-----END PRIVATE KEY-----\n";
+    auto findings = classify_content(combined, "2026-09-16");
+    REQUIRE(findings.size() == 2);
+    bool saw_encrypted = false, saw_unencrypted = false;
+    for (const auto& f : findings) {
+        if (f.kind == FindingKind::PrivateKeyEncrypted)
+            saw_encrypted = true;
+        if (f.kind == FindingKind::PrivateKeyUnencrypted)
+            saw_unencrypted = true;
+    }
+    CHECK(saw_encrypted);
+    CHECK(saw_unencrypted);
+}
+
+// ── Never emits raw key material: structural regression guard ──────────────
+//
+// The plugin's central promise. cert_fields is populated ONLY for
+// FindingKind::Certificate (from certificates_x509::CertFields, itself
+// never containing raw key bytes) -- every key/container/CSR finding kind
+// must carry the untouched-default CertFields, proving structurally that
+// no file content ever flows into those findings, not just that the
+// output happens to look right today.
+TEST_CASE("classify_content: private-key findings never carry populated cert_fields",
+         "[cert_scan]") {
+    auto findings = classify_content(
+        "-----BEGIN PRIVATE KEY-----\nMIIRawKeyMaterialThatMustNeverAppearInCertFields==\n"
+        "-----END PRIVATE KEY-----\n",
+        "2026-09-16");
+    REQUIRE(findings.size() == 1);
+    CHECK(findings[0].kind == FindingKind::PrivateKeyUnencrypted);
+    CHECK(findings[0].cert_fields.subject == "(unknown)");
+    CHECK(findings[0].cert_fields.issuer == "(unknown)");
+    CHECK(findings[0].cert_fields.serial == "(unknown)");
+    CHECK(findings[0].cert_fields.thumbprint == "(unknown)");
+}
+
+TEST_CASE("classify_binary_content: JKS/PKCS12 findings never carry populated cert_fields",
+         "[cert_scan]") {
+    std::string jks{"\xFE\xED\xFE\xEDrest", 8};
+    auto jks_findings = classify_binary_content(jks, ".keystore", "2026-09-16");
+    REQUIRE(jks_findings.size() == 1);
+    CHECK(jks_findings[0].cert_fields.subject == "(unknown)");
+
+    std::string der{"\x30\x82\x05\x00garbagebytes", 15};
+    auto p12_findings = classify_binary_content(der, ".p12", "2026-09-16");
+    REQUIRE(p12_findings.size() == 1);
+    CHECK(p12_findings[0].cert_fields.subject == "(unknown)");
 }
