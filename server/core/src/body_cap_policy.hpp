@@ -478,6 +478,23 @@ inline constexpr BodyCapEntry kBodyCapTable[] = {
     {"POST", "/api/instructions/validate-yaml", 3149824u, false, "instruction_yaml"},
     {"POST", "/fragments/instructions/yaml-preview", 3149824u, false, "instruction_yaml"},
 
+    // /api/v1/hardware — the Hardware CI list/record/sync REST v1 twin
+    // (hardware_routes.cpp). ANY method: GET /api/v1/hardware and
+    // GET /api/v1/hardware/{id} are bodyless list/record reads; only
+    // POST /api/v1/hardware/{id}/sync carries a body, and it is a single
+    // JSON object with one short "source" token (one of 5 fixed literals,
+    // e.g. "installed_software") — a few dozen bytes at most. 4 KiB leaves
+    // generous headroom over that real shape while keeping this three orders
+    // of magnitude under the 4 MiB catch-all (governance Gate 2: this route
+    // had no reviewed entry, per the routed-concern row's requirement that
+    // every new mutating route get one). requires_measurable = true: the
+    // route's own `scoped_perm_fn` gate lives in the HANDLER, after httplib
+    // buffers the body, so without a pre-read bound an unauthenticated
+    // caller reaching this prefix with a chunked (no Content-Length) body
+    // would be uncapped up to httplib's 100 MiB default — the same class the
+    // /api/v1/uploads entry above closes.
+    {kBodyCapAnyMethod, "/api/v1/hardware", 4u * 1024, true, "hardware"},
+
     // The catch-all default. ANY method, empty prefix — always matches, and
     // always loses a longest-match comparison against every entry above.
     // Ordinary JSON/form traffic (most REST mutation routes) lands here.

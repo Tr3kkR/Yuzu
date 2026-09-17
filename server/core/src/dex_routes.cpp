@@ -1789,8 +1789,16 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                         ? static_cast<int>(static_cast<double>(seg_sum[i]) / seg_n[i] + 0.5)
                         : -1;
                 const char* ft = avg < 0 ? "" : (avg >= 90 ? "ok" : (avg >= 75 ? "warn" : "bad"));
-                h += "<a class=\"gp-fcard\" hx-get=\"/fragments/devices/list?os=" +
-                     url_encode(seg_os[i]) +
+                // Segment os is the raw agent-reported string ("darwin"/"linux"/
+                // "windows"/…); the Hardware list's os filter only knows
+                // "windows"/"linux"/"macos"/"all" (hardware_list_model.cpp).
+                const std::string hw_os = seg_os[i] == "darwin"   ? "macos"
+                                           : seg_os[i] == "windows" ? "windows"
+                                           : seg_os[i] == "linux"   ? "linux"
+                                           : seg_os[i] == "macos"   ? "macos"
+                                                                    : "all";
+                h += "<a class=\"gp-fcard\" hx-get=\"/fragments/hardware/list?os=" +
+                     url_encode(hw_os) +
                      "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
                 h += "<div class=\"fn\">" + oslbl(seg_os[i]) + "<span class=\"cnt\">" +
                      num(seg_n[i]) + " device(s)</span></div>";

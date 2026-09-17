@@ -91,8 +91,8 @@ inline constexpr GuardianArmMetric kGuardianArmMetrics[] = {
      "instantaneous truth"},
     {"yuzu.guardian_arm_failed", "yuzu_fleet_guardian_arm_failed",
      "Fleet SUM of accepted spark arms whose CURRENT application resolved to a "
-     "non-Committed terminal outcome (Failed/Expired/Withdrawn/Stopped), still "
-     "unresolved for acknowledgment. A RE-STATABLE gauge: resets to 0 the instant "
+     "non-Committed terminal outcome (Failed/CongestionExpired/Wedged/Withdrawn/"
+     "Stopped), still unresolved for acknowledgment. A RE-STATABLE gauge: resets to 0 the instant "
      "an application that saw a failure is REPLACED (an ordinary retry of that "
      "generation, live today) - REGARDLESS of whether that retry itself then "
      "succeeds, so a persistently-failing rule oscillates across heartbeat ticks "
