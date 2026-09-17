@@ -375,13 +375,26 @@ private:
 /// rename of the underlying directory OBJECT (ERROR_SHARING_VIOLATION to
 /// the would-be deleter), so the object scratch_dir_is_ours() verifies
 /// below is PROVABLY the same object the raw hive is later copied into.
+///
+/// DELETE is REQUESTED (never exercised -- this handle only ever reads
+/// attributes) specifically so this handle counts as one of the object's
+/// "Deleters" in Windows' own share-access bookkeeping (IoCheckShareAccess's
+/// per-object SHARE_ACCESS counters). Confirmed empirically on real
+/// Windows/MSVC (governance's own DELETE-access gate-fix -- see
+/// execution_artifacts_scratch_sweep_win.cpp's open_candidate_relative
+/// banner -- was verified on this exact handle shape and found NOT
+/// sufficient on its own): a handle whose DesiredAccess never claims DELETE
+/// is never counted as a Deleter regardless of its ShareMode, so a LATER
+/// opener that itself requests DELETE is never blocked by this handle's
+/// lack of FILE_SHARE_DELETE -- the sharing violation this banner's own
+/// prior revision claimed only fires once THIS side also claims DELETE.
 /// FILE_FLAG_OPEN_REPARSE_POINT opens a junction/symlink AS the reparse
 /// point itself rather than following it, so the reparse check below sees
 /// the object actually being opened, never its target.
 ScopedHandle open_scratch_dir_handle(const std::wstring& dir) {
     return ScopedHandle(CreateFileW(
-        dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-        FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL | DELETE, FILE_SHARE_READ, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
 }
 
 /// The ERROR_SHARING_VIOLATION fallback: SeBackupPrivilege + backup-semantics
