@@ -229,4 +229,16 @@ TEST_CASE("read_memorystatus_level reads a value in [0,100]", "[dex][macos][perf
     CHECK(*level <= 100);
 }
 
+#else // !defined(__APPLE__)
+
+// The all-invalid-stub contract every read_* function carries off Darwin
+// (net_quality_sampler.cpp / dex_linux_proc.cpp shape) — never a half-filled struct,
+// never a fabricated value, on a platform with no kernel to read from at all.
+TEST_CASE("every darwin reader stub reports invalid off Apple", "[dex][macos][perf]") {
+    CHECK_FALSE(read_cpu_ticks().valid);
+    CHECK_FALSE(read_vm_snapshot().valid);
+    CHECK_FALSE(read_disk_totals().valid);
+    CHECK_FALSE(read_memorystatus_level().has_value());
+}
+
 #endif // __APPLE__
