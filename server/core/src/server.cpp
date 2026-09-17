@@ -176,6 +176,7 @@
 #include "verify_api_local.hpp" // ADR-0031 WS-A4 #4250: core-only VERIFY seam factory
 #include "network_perf_rules.hpp"
 #include "inventory_routes.hpp"
+#include "hardware_routes.hpp"
 #include "inventory_ci_join.hpp"
 #include "network_routes.hpp"
 #include "software_catalog_rollup.hpp"
@@ -15978,9 +15979,13 @@ private:
                 return std::to_string(h) + "h ago";
             return std::to_string(h / 24) + "d ago";
         };
-        auto inv_devices_fn = [this, visible_set_fn,
-                               inv_human_age](const std::string& username)
-            -> InventoryDevicesResult {
+        // Extracted so both the Software tab's DevicesFn (scoped to one operator) and
+        // the Hardware tab's RosterFn (unfiltered — the FleetReadGate's own scope is
+        // the sole filter downstream, applied by HardwareRoutes) share ONE roster
+        // build. `visible` is nullopt for the unfiltered call.
+        auto build_hw_roster =
+            [this, inv_human_age](
+                const std::optional<std::set<std::string>>& visible) -> InventoryDevicesResult {
             InventoryDevicesResult result;
             auto& out = result.rows;
             if (!offline_endpoint_store_) {
@@ -15997,7 +16002,6 @@ private:
             // unordered_set: O(1) membership over up to fleet-size ids (gov perf-N2).
             auto online_ids = registry_.all_ids();
             std::unordered_set<std::string> online(online_ids.begin(), online_ids.end());
-            const auto visible = visible_set_fn(username); // nullopt = sees all (global read)
             const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                             std::chrono::system_clock::now().time_since_epoch())
                                             .count();
@@ -16008,10 +16012,16 @@ private:
                 r.agent_id = e.agent_id;
                 r.hostname = e.hostname;
                 r.os = e.os;
+                // endpoint_state v2 (round-3 merge): last-known version/arch,
+                // durable across a disconnect. Overwritten below with the live
+                // registry session's copy when the agent is currently online.
+                r.agent_version = e.agent_version;
+                r.arch = e.arch;
                 r.online = online.count(e.agent_id) > 0;
                 const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
                 r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000); // matches the inventory stale window
                 r.last_seen = r.online ? std::string("now") : inv_human_age(age_ms);
+                r.last_seen_ms = r.online ? now_ms : e.last_heartbeat_ms;
                 out.push_back(std::move(r));
             }
             // Device-CI enrichment (PR2): one list_device_ci(0) read — `0` means "uncapped,
@@ -16057,7 +16067,134 @@ private:
             } else {
                 result.ci_degraded = true;
             }
+            // Round-3 Devices-page merge: agent version/arch (session-sourced,
+            // online rows only — an offline row's version/arch come from the
+            // endpoint_state v2 columns via the CI-attach step above, not here),
+            // live IPs (TAR fleet-snapshot claims, online-only, 60 s cache), and
+            // tags (bulk-preloaded, two queries for the whole roster — never a
+            // per-row store call, matching the tag-compliance dashboard's own
+            // ADR-0050 discipline above).
+            for (auto& r : out) {
+                if (!r.online)
+                    continue;
+                if (auto sess = registry_.get_session(r.agent_id)) {
+                    r.agent_version = sess->agent_version;
+                    r.arch = sess->arch;
+                }
+            }
+            if (fleet_topology_store_) {
+                const auto ips = fleet_topology_store_->claimed_ips();
+                for (auto& r : out) {
+                    auto it = ips.find(r.agent_id);
+                    if (it != ips.end())
+                        r.ips = it->second;
+                }
+            }
+            if (tag_store_) {
+                const auto keys = tag_store_->get_distinct_keys().value_or(std::vector<std::string>{});
+                auto values_res = tag_store_->get_values_for_keys(keys);
+                if (values_res) {
+                    for (auto& r : out) {
+                        auto it = values_res->find(r.agent_id);
+                        if (it == values_res->end())
+                            continue;
+                        r.tags.reserve(it->second.size());
+                        for (const auto& [k, v] : it->second)
+                            r.tags.emplace_back(k, v);
+                    }
+                } else {
+                    result.tags_degraded = true;
+                }
+            } else {
+                result.tags_degraded = true;
+            }
             return result;
+        };
+        auto inv_devices_fn = [visible_set_fn,
+                               build_hw_roster](const std::string& username) -> InventoryDevicesResult {
+            return build_hw_roster(visible_set_fn(username));
+        };
+        auto hw_roster_fn = [build_hw_roster]() -> InventoryDevicesResult {
+            return build_hw_roster(std::nullopt);
+        };
+        // One device's identity row for the Hardware CI record — checks the live
+        // registry first (online, authoritative hostname/OS), else falls back to a
+        // linear scan of the same 30-day offline_endpoint_store_ roster the list
+        // uses. FOLLOW-UP: no point read exists on OfflineEndpointStore yet
+        // (#1783-adjacent) — a per-open O(fleet) scan is acceptable for a CI record
+        // page (opened far less often than the list re-renders).
+        auto hw_identity_fn = [this, inv_human_age](const std::string& agent_id)
+            -> std::optional<InventoryDeviceRow> {
+            if (auto sess = registry_.get_session(agent_id)) {
+                InventoryDeviceRow r;
+                r.agent_id = agent_id;
+                r.hostname = sess->hostname;
+                r.os = sess->os;
+                r.agent_version = sess->agent_version;
+                r.arch = sess->arch;
+                if (fleet_topology_store_)
+                    r.ips = fleet_topology_store_->ips_for(agent_id);
+                r.online = true;
+                r.last_seen = "now";
+                r.last_seen_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now().time_since_epoch())
+                                     .count();
+                return r;
+            }
+            if (!offline_endpoint_store_)
+                return std::nullopt;
+            auto eps = offline_endpoint_store_->query_stale_within(std::chrono::hours(24 * 30));
+            const std::int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch())
+                                            .count();
+            for (const auto& e : eps) {
+                if (e.agent_id != agent_id)
+                    continue;
+                InventoryDeviceRow r;
+                r.agent_id = e.agent_id;
+                r.hostname = e.hostname;
+                r.os = e.os;
+                r.agent_version = e.agent_version;
+                r.arch = e.arch;
+                r.online = false;
+                const std::int64_t age_ms = now_ms - e.last_heartbeat_ms;
+                r.stale = age_ms > (2LL * 24 * 60 * 60 * 1000);
+                r.last_seen = inv_human_age(age_ms);
+                r.last_seen_ms = e.last_heartbeat_ms;
+                return r;
+            }
+            return std::nullopt;
+        };
+        // The full per-device CI record composition — ONE closure shared verbatim
+        // by the dashboard fragment and the REST twin, so the two can never drift
+        // on what "the CI record" means. No MCP twin exists yet (tracked as a
+        // follow-up, governance Gate 3 finding — this comment previously claimed
+        // one was already wired).
+        auto hw_ci_detail_fn = [this, hw_identity_fn](const std::string& agent_id) -> HardwareCiDetail {
+            HardwareCiDetail detail;
+            detail.identity = hw_identity_fn(agent_id);
+            if (auto sess = registry_.get_session(agent_id))
+                detail.agent_version = sess->agent_version; // immutable identity field, lock-free
+            detail.ci = device_inventory_store_
+                            ? device_inventory_store_->get_device_ci(agent_id)
+                            : std::expected<std::optional<DeviceCiRecord>, CiReadError>(
+                                  std::unexpected(CiReadError::kDegraded));
+            if (software_inventory_store_) {
+                auto sw = software_inventory_store_->get_agent_software(agent_id);
+                if (sw) {
+                    detail.software_truncated = sw->size() > kHwSoftwareCap;
+                    if (detail.software_truncated)
+                        sw->resize(kHwSoftwareCap);
+                }
+                detail.software = std::move(sw);
+                detail.software_last_seen =
+                    software_inventory_store_->source_last_seen(agent_id, "installed_software");
+            }
+            if (tag_store_) {
+                auto tags = tag_store_->get_all_tags(agent_id);
+                detail.tags = tags ? std::optional(std::move(*tags)) : std::nullopt;
+            }
+            return detail;
         };
         inventory_routes_ = std::make_unique<InventoryRoutes>();
         inventory_routes_->register_routes(
@@ -16130,7 +16267,166 @@ private:
                 if (!device_inventory_store_)
                     return std::unexpected(CiReadError::kDegraded);
                 return device_inventory_store_->get_device_ci(id);
+            },
+            // Round-3 item 8: agent_id -> hostname for the Software page's
+            // "devices ›" expansion. One bulk read per render (never per-row) —
+            // endpoint_state's hostname column is written on every heartbeat
+            // regardless of online/offline, so this single 30-day window read
+            // covers both, mirroring hw_identity_fn's offline-store fallback
+            // tier without needing the registry-first tier here (a stale-by-a-
+            // few-seconds hostname on an online device is immaterial for this
+            // display-only lookup).
+            [this]() -> std::unordered_map<std::string, std::string> {
+                std::unordered_map<std::string, std::string> out;
+                if (!offline_endpoint_store_)
+                    return out;
+                for (auto& e : offline_endpoint_store_->query_stale_within(
+                         std::chrono::hours(24 * 30)))
+                    out.emplace(std::move(e.agent_id), std::move(e.hostname));
+                return out;
             });
+
+        // HardwareRoutes — /hardware (ServiceNow-style CI list + record), the
+        // successor UI to the Inventory tab's Devices sub-tab (nav-split: Software
+        // stays under /inventory's old routes; Hardware is the new CI surface).
+        // `fleet_read_fn` is the SOLE gate on the list + REST twin (admit-then-filter,
+        // ADR-0017) — `hw_roster_fn` is deliberately UNFILTERED, matching
+        // `FleetReadFn`'s own contract (never stack a second scope predicate).
+        hardware_routes_ = std::make_unique<HardwareRoutes>();
+        hardware_routes_->register_routes(
+            *web_server_, HardwareRoutes::Deps{
+                             .auth_fn = auth_fn,
+                             .scoped_perm_fn = scoped_perm_fn,
+                             .fleet_read_fn = fleet_read_fn,
+                             .audit_fn = audit_fn,
+                             .roster_fn = hw_roster_fn,
+                             .ci_detail_fn = hw_ci_detail_fn,
+                             // Actions lens (generic action runner): the connected
+                             // agent's advertised plugins/actions, copied into the
+                             // gRPC-free HwPluginActions shape.
+                             .actions_fn =
+                                 [this](const std::string& id)
+                                     -> std::optional<std::vector<HwPluginActions>> {
+                                     auto sess = registry_.get_session(id);
+                                     if (!sess)
+                                         return std::nullopt;
+                                     std::vector<HwPluginActions> out;
+                                     out.reserve(sess->plugin_meta.size());
+                                     for (const auto& pm : sess->plugin_meta)
+                                         out.push_back({pm.name, pm.version, pm.actions});
+                                     return out;
+                                 },
+                             .classify_fn =
+                                 [this](std::string_view p, std::string_view a) {
+                                     return capability_registry_.classify(p, a);
+                                 },
+                             // Enabled definitions' parameter_schema for one plugin,
+                             // keyed by action — object-shaped schemas only (mirrors
+                             // discover_routes.cpp's catalogue join).
+                             .schema_fn =
+                                 [this](const std::string& plugin)
+                                     -> std::unordered_map<std::string, std::string> {
+                                     std::unordered_map<std::string, std::string> out;
+                                     if (!instruction_store_)
+                                         return out;
+                                     InstructionQuery q;
+                                     q.plugin_filter = plugin;
+                                     q.enabled_only = true;
+                                     q.limit = 500;
+                                     auto defs = instruction_store_->query_definitions(q);
+                                     if (!defs)
+                                         return out;
+                                     for (const auto& d : *defs) {
+                                         auto parsed =
+                                             nlohmann::json::parse(d.parameter_schema, nullptr, false);
+                                         if (!parsed.is_discarded() && parsed.is_object())
+                                             out[d.action] = d.parameter_schema;
+                                     }
+                                     return out;
+                                 },
+                             // Narrow ResponseStore seam for the Actions-lens result poll
+                             // (byte-identical shape to DexRoutes' own — #1634: scope the
+                             // poll read AT THE STORE SEAM).
+                             .responses_fn =
+                                 [this](const std::string& command_id, const std::string& agent_id)
+                                     -> std::vector<DexAgentResponse> {
+                                     std::vector<DexAgentResponse> out;
+                                     if (!response_store_)
+                                         return out;
+                                     ResponseQuery q;
+                                     q.agent_id = agent_id;
+                                     for (const auto& r :
+                                          response_store_->query(command_id, q)
+                                              .value_or(std::vector<StoredResponse>{}))
+                                         out.push_back({r.agent_id, r.status, r.output, r.error_detail});
+                                     return out;
+                                 },
+                             // Execute-permission PROBE against a throwaway Response — the
+                             // Read gate above already ran; this is the stricter check
+                             // before offering (or honouring) a dispatch control. Same
+                             // idiom as DeviceRoutes' live-info `can_execute`.
+                             .scoped_probe_fn =
+                                 [scoped_perm_fn](const httplib::Request& req, const std::string& type,
+                                                  const std::string& op, const std::string& id) -> bool {
+                                     httplib::Response probe;
+                                     return scoped_perm_fn(req, probe, type, op, id);
+                                 },
+                             .action_descriptions = &detail::AgentRegistry::action_descriptions(),
+                             // Parameter hints: the embedded plugin-docs manifest (pre-serialised,
+                             // byte-identical to /api/v1/discover/plugin-docs/{name}).
+                             .manifest_fn =
+                                 [](const std::string& plugin) -> std::optional<std::string> {
+                                     const auto* doc = plugin_docs_manifest(plugin);
+                                     if (!doc)
+                                         return std::nullopt;
+                                     return doc->json;
+                                 },
+                             // Sync-on-demand: system-reserved push, the Guardian-push path
+                             // (build_classified_command(system) + send_system_reserved +
+                             // forward_gateway_pending) — NOT dispatch_confined, which would
+                             // withhold `__sync__` as a plugin no agent advertises (#3511).
+                             .sync_dispatch_fn =
+                                 [this](const std::string& id, const std::string& source)
+                                     -> HardwareRoutes::HwSyncDispatchResult {
+                                     const auto now_s =
+                                         std::chrono::duration_cast<std::chrono::seconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count();
+                                     const auto command_id =
+                                         "__sync__-now-" + std::to_string(now_s) + "-" +
+                                         auth::AuthManager::bytes_to_hex(
+                                             auth::AuthManager::random_bytes(8));
+                                     auto classified = build_classified_command(
+                                         yuzu::server::DispatchCaller{.system = true}, "__sync__",
+                                         "now", command_id, /*parameters=*/{{"source", source}});
+                                     if (!classified)
+                                         return {};
+                                     const bool ok = send_system_reserved(
+                                         id, *classified,
+                                         yuzu::server::SystemReservedPush::inventory_sync_now);
+                                     if (ok)
+                                         forward_gateway_pending(); // gateway agents are only QUEUED
+                                     return {ok, command_id};
+                                 },
+                             .agent_version_fn =
+                                 [this](const std::string& id) -> std::optional<std::string> {
+                                     auto sess = registry_.get_session(id);
+                                     if (!sess)
+                                         return std::nullopt;
+                                     return sess->agent_version;
+                                 },
+                             // Devices-page merge (round 3): the same 7-day DEX score
+                             // used by the standalone Devices/DEX drills. Deliberately
+                             // NOT baked into RosterFn/build_hw_roster — this must only
+                             // ever be called on the rows actually rendered on the
+                             // current page (post filter/sort/paginate), never the whole
+                             // roster (dex_device_score is one GROUP-BY query per call).
+                             .dex_score_fn =
+                                 [this](const std::string& id) -> int {
+                                     return dex_device_score(guaranteed_state_store_.get(), id,
+                                                             dex_iso_since(7));
+                                 },
+                         });
 
         // SleRoutes — /api/v1/sle/* SLE read surface (ADR-0024, PR1a). Gated on the
         // NEW SoftwareLicensing securable via the FAIL-CLOSED enforcement primitive
@@ -18854,6 +19150,7 @@ private:
     std::unique_ptr<NetworkRoutes> network_routes_;
     std::unique_ptr<DeviceRoutes> device_routes_;
     std::unique_ptr<InventoryRoutes> inventory_routes_;
+    std::unique_ptr<HardwareRoutes> hardware_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;

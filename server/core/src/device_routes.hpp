@@ -126,9 +126,10 @@ std::string render_device_page(const DeviceRow& d);
 
 /// PURE: a lens panel that isn't built yet (DEX/Guardian in slice 1) — renders the
 /// lens tab bar (so switching back works) + an honest "coming in a later slice"
-/// message. `active` is the tab id ("dex" | "guardian").
+/// message. `active` is the tab id ("dex" | "guardian"). `tabs=false` suppresses the
+/// own 3-chip bar (Hardware CI record mounts this lens under its own 7-tab bar).
 std::string render_device_lens_placeholder(const std::string& active, const std::string& agent_id,
-                                           const std::string& message);
+                                           const std::string& message, bool tabs = true);
 
 /// One guard's compliance state on a device (Guardian lens row).
 struct DeviceGuardRow {
@@ -139,12 +140,15 @@ struct DeviceGuardRow {
 
 /// PURE: the DEX lens for one device — the per-device score + its signal summary
 /// (obs_type → count, already fetched) + a link to the full /dex device drill.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_dex_lens(const std::string& agent_id, int score,
-                                    const std::vector<std::pair<std::string, std::int64_t>>& signals);
+                                    const std::vector<std::pair<std::string, std::int64_t>>& signals,
+                                    bool tabs = true);
 
 /// PURE: the Guardian lens for one device — compliance summary + per-guard state.
+/// `tabs=false` suppresses the own 3-chip bar (see render_device_lens_placeholder).
 std::string render_device_guardian_lens(const std::string& agent_id,
-                                        const std::vector<DeviceGuardRow>& guards);
+                                        const std::vector<DeviceGuardRow>& guards, bool tabs = true);
 
 /// PURE: the "Get live info" snapshot SHELL — a header + one auto-loading panel per
 /// live instruction (each div hx-gets /fragments/device/live/run?kind=…, which
@@ -227,6 +231,21 @@ std::string render_device_live_users(const std::vector<LiveUserRow>& rows);
 std::string render_device_live_netconfig(const std::vector<LiveNetAddr>& rows);
 std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows);
 std::string render_device_live_capture_sources(const std::vector<LiveCaptureSource>& rows);
+
+/// PURE: generic pipe-row renderer (round-3 item 11 -- physical-kit panels) for the ten
+/// hardware-detail live kinds (disks/memory/processors/drivers/battery/thermal/smart/
+/// volumes/adapters/wifi) whose wire format is a flat `<row_prefix>|field1|field2|...`
+/// table with no bespoke typed-row struct. `columns` is the ordered raw column-name
+/// list from live_kinds.hpp's LiveKind::columns (drives both the table header labels
+/// and each row's expected width); `rows` are the already-split, already-padded field
+/// vectors (device_routes.cpp render_live_result, one per matched line, prefix token
+/// dropped). `raw_rows` are lines that did NOT match the row_prefix, preserved
+/// verbatim (full original line text) instead of being silently dropped -- each
+/// renders as its own full-width diagnostic row at the end of the table.
+/// Defined in device_ui.cpp.
+std::string render_device_live_generic(const std::vector<std::string>& columns,
+                                       const std::vector<std::vector<std::string>>& rows,
+                                       const std::vector<std::string>& raw_rows);
 
 /// PURE: honest not-found body (unknown / never-enrolled agent_id).
 std::string render_device_not_found(const std::string& agent_id);

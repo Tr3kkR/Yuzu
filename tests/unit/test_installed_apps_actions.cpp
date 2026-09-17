@@ -41,6 +41,7 @@
 #include <yuzu/plugin.h>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp" // yuzu::test::unique_temp_path -- cache-invalidation marker filename
 
 #include <cstdlib>
 #include <filesystem>
@@ -149,6 +150,25 @@ TEST_CASE("installed_apps plugin: list executes real dpkg-query/rpm/pacman/syste
 }
 
 #if defined(__APPLE__)
+
+// Round-3 sync-speed fix coverage: the profiler memo cache
+// (installed_apps_plugin.cpp's ProfilerCache/get_inventory_macos, anonymous-
+// namespace so not directly includable) and the receipt-read/pkgutil-fallback
+// parity it sits in front of. `installed_apps_parsers.hpp` and
+// `installed_apps_macos_receipts.hpp` are both public, OS-scoped headers this
+// plugin's own .cpp includes -- reused verbatim here, not re-implemented, so
+// a parity test is never checking its own re-derivation of the contract.
+#include "installed_apps_macos_receipts.hpp"
+#include "installed_apps_parsers.hpp"
+
+#include <yuzu/agent/subprocess_runner.hpp>
+
+#include <chrono>
+#include <cstdio>
+#include <fstream>
+
+namespace parsers = yuzu::installed_apps::parsers;
+namespace macos_receipts = yuzu::installed_apps::macos_receipts;
 
 // Gate-1 remediation (external functional review): NOTHING dispatched
 // `list_inventory`, so the whole point of this PR on macOS -- the #2273
@@ -289,6 +309,179 @@ TEST_CASE("installed_apps plugin: list_inventory emits enriched macOS app rows a
     // collection, so the run returns rc=1 and never reaches this branch. The
     // degraded contract is asserted in the rc!=0 branch above; asserting a
     // bound here would be asserting something unreachable by construction.
+}
+
+// Round-3 sync-speed fix: the profiler memo cache (ProfilerCache/
+// apps_root_signature/get_inventory_macos, installed_apps_plugin.cpp) lives
+// in that .cpp's anonymous namespace, so it is not directly includable from a
+// test. The least invasive way to observe its behaviour from outside is
+// exactly what it exists to do: dispatch `list_inventory` twice in one
+// process and show the second call is a fast, byte-identical repeat of the
+// first -- never touching the cache's internals.
+//
+// TEST-EFFICIENCY JUSTIFICATION: this necessarily spawns real
+// system_profiler/pkgutil argv (same cost class as the sibling dispatch test
+// above -- "a few seconds" on this host per that test's own header comment).
+// It is the ONLY way to observe the cache's hit/miss behaviour at all: the
+// cache sits between the collector and the wire format, with no seam a pure
+// unit test could reach.
+TEST_CASE("installed_apps plugin: list_inventory memo cache serves an identical, faster repeat",
+          "[installed_apps][posix_actions][macos_inventory][cache]") {
+    auto plugin = load_installed_apps_plugin();
+    if (!plugin)
+        SKIP("installed_apps plugin library not found -- cannot drive LocalDispatcher");
+
+    yuzu::agent::LocalDispatcher dispatcher;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto first = dispatcher.run(plugin->descriptor, "list_inventory");
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (first.rc != 0) {
+        // Same degraded contract as the sibling test above: get_inventory_macos
+        // NEVER memoizes a degraded outcome (installed_apps_plugin.cpp resets
+        // cache.result rather than storing it), so there is nothing cached to
+        // prove a hit against on this run.
+        CHECK(first.captured.empty());
+        SKIP("system_profiler/pkgutil degraded on this host -- the memo cache was "
+             "never populated, so its hit behaviour is NOT exercised here");
+    }
+    REQUIRE_FALSE(first.captured.empty());
+
+    const auto first_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+
+    const auto t2 = std::chrono::steady_clock::now();
+    auto second = dispatcher.run(plugin->descriptor, "list_inventory");
+    const auto t3 = std::chrono::steady_clock::now();
+    const auto second_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+
+    INFO("first=" << first_ms << "ms second=" << second_ms << "ms");
+
+    // The cached result must be the EXACT same bytes, not merely fast -- this
+    // is what catches a cache bug that serves stale/wrong/truncated data.
+    CHECK(second.rc == first.rc);
+    CHECK(second.captured == first.captured);
+
+    // Absolute ceiling: a real cache hit is a mutex lock + a struct copy, not
+    // a fresh system_profiler+pkgutil collection. The sibling dispatch test's
+    // own header comment puts an UNCACHED list_inventory at "a few seconds"
+    // on this host -- 2s is generous headroom above a genuine cache hit while
+    // staying far below any plausible uncached run, even under CI load.
+    CHECK(second_ms < 2000);
+
+    // Relative check, guarded: only meaningful when the first call was itself
+    // slow enough that a ratio isn't noise -- an unusually quiet host could
+    // make the FIRST call fast too, which would make ANY ratio flaky; the
+    // absolute ceiling above is the real proof in that case.
+    if (first_ms >= 500) {
+        CHECK(second_ms * 3 <= first_ms);
+    }
+
+    SECTION("touching a per-user Applications root invalidates the cache") {
+        // apps_root_signature() lstat()s every local user's own
+        // ~/Applications (installed_apps_plugin.cpp). Creating then removing
+        // one throwaway file inside an EXISTING such directory changes its
+        // mtime -- and so the signature -- without changing anything the
+        // collection itself reports (the file is not a .app bundle and
+        // pkgutil never looks at it), so this is safe to run on a shared dev
+        // host and leaves it exactly as found.
+        const char* home = std::getenv("HOME");
+        std::error_code ec;
+        const auto apps_dir = home ? (fs::path(home) / "Applications") : fs::path{};
+        if (apps_dir.empty() || !fs::is_directory(apps_dir, ec)) {
+            SKIP("no ~/Applications directory on this host -- cache-invalidation "
+                 "signature path cannot be exercised without creating a new root "
+                 "the signature scan doesn't already cover");
+        }
+
+        // yuzu_test_ prefix (Defender-exclusion convention) + the shared
+        // process-salted unique-name generator -- never a thread-id hash or a
+        // clock read (#473/#482) -- even though this filename never leaves
+        // this host.
+        const auto marker =
+            apps_dir / yuzu::test::unique_temp_path("yuzu_test_cache_invalidate_").filename();
+        {
+            std::ofstream touch(marker);
+            REQUIRE(touch.is_open());
+        }
+        struct Cleanup {
+            fs::path p;
+            ~Cleanup() {
+                std::error_code rm_ec;
+                fs::remove(p, rm_ec);
+            }
+        } cleanup{marker};
+
+        const auto t4 = std::chrono::steady_clock::now();
+        auto third = dispatcher.run(plugin->descriptor, "list_inventory");
+        const auto t5 = std::chrono::steady_clock::now();
+        const auto third_ms = std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count();
+
+        if (third.rc != 0)
+            SKIP("system_profiler/pkgutil degraded on the invalidated re-collection -- "
+                 "invalidation itself cannot be distinguished from a transient tool "
+                 "hiccup here");
+
+        INFO("second=" << second_ms << "ms third=" << third_ms << "ms");
+        // Mirror image of the cache-hit check above: a signature match would
+        // return in the same fast window `second` did; a genuine invalidation
+        // re-runs the full collection, which is not fast by the same margin.
+        CHECK(third_ms > second_ms * 2);
+    }
+}
+
+// Receipt-read / pkgutil-fallback parity (round-3 sync-speed fix, item 4).
+// installed_apps_plugin.cpp's get_inventory_macos_uncached tries
+// macos_receipts::read_receipt_plist(id) FIRST and falls back to spawning
+// `pkgutil --pkg-info <id>` (parsed by parsers::parse_pkgutil_pkg_info) only
+// on a miss -- so proving the two AGREE on a real package, independently,
+// proves the fallback is a pure speed optimisation and never a second source
+// of truth, without needing to force the plugin down one path artificially.
+//
+// TEST-EFFICIENCY JUSTIFICATION: one bounded pkgutil spawn (the same shape
+// the plugin's own fallback call makes) plus a handful of small file reads --
+// no different in cost class from the parser/receipts unit tests already in
+// this suite.
+TEST_CASE("installed_apps plugin: receipt-plist read and pkgutil --pkg-info fallback agree",
+          "[installed_apps][macos][receipts][parity]") {
+    // Command Line Tools' Executables package is present on essentially every
+    // macOS host that can build this repo, but never assumed -- checked here,
+    // SKIPped loudly (never silently reported as a pass) if absent, matching
+    // this suite's false-green policy floor.
+    static constexpr const char* kPkgId = "com.apple.pkg.CLTools_Executables";
+
+    const auto pkgutil_path = yuzu::agent::probe_tool_path({"/usr/sbin/pkgutil"});
+    if (pkgutil_path.empty())
+        SKIP("pkgutil not found at /usr/sbin/pkgutil on this host");
+
+    const auto probe = yuzu::agent::run_bounded_subprocess(
+        {pkgutil_path, "--pkg-info", kPkgId},
+        yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20}});
+    if (probe.termination_reason != yuzu::agent::TerminationReason::exited ||
+        probe.exit_code != 0) {
+        SKIP(std::string(kPkgId) +
+             " is not installed on this host (pkgutil --pkg-info exited " +
+             std::to_string(probe.exit_code) +
+             ") -- receipt/pkgutil parity cannot be exercised here");
+    }
+
+    // The SAME parser the plugin's own fallback branch calls -- this
+    // comparison is against exactly what the fallback path produces, not a
+    // re-implementation of it.
+    const auto via_pkgutil = parsers::parse_pkgutil_pkg_info(probe.output);
+    REQUIRE_FALSE(via_pkgutil.version.empty());
+    REQUIRE_FALSE(via_pkgutil.install_time.empty());
+
+    const auto via_receipt = macos_receipts::read_receipt_plist(kPkgId);
+    if (!via_receipt) {
+        SKIP(std::string(kPkgId) +
+             "'s receipt plist was not readable on this host (missing/permissions) -- "
+             "the in-process read path can't be compared here; the plugin would itself "
+             "fall back to pkgutil in this exact case");
+    }
+
+    CHECK(via_receipt->version == via_pkgutil.version);
+    CHECK(via_receipt->install_time == via_pkgutil.install_time);
 }
 
 #endif // __APPLE__
