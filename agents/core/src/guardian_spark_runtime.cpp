@@ -2034,9 +2034,32 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 // meant to apply to it. Re-registering the locator (not just
                 // rg->active) matters too: a REAL subsequent withdrawal of this
                 // still-wedged claim must still be able to find and deactivate it.
+                //
+                // Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): the
+                // fallible, node-allocating wedged_by_rule_.insert_or_assign()
+                // MUST run before the irreversible rg->active=true write, exactly
+                // mirroring abandon_claim_locked's own fail-closed discipline a
+                // few hundred lines above (same file, same PR) - the two are the
+                // ONLY insert_or_assign call sites for this map and must share one
+                // exception-safety shape. Doing it in the ORIGINAL order (active
+                // first, insert second) meant a bad_alloc here left rg->active
+                // stuck true FOREVER with no locator entry: every later
+                // reobservation's own `!pre_head->rg->active` guard would then
+                // read false and skip retrying the insert, so a genuine later
+                // withdrawal could never find this claim (no locator) and its
+                // eventual late success would still read rg->active==true and be
+                // wrongly adopted - a fail-open hole in exactly the guarantee
+                // this fix exists to provide. Reordering makes the repair
+                // retry-safe: a throw here leaves rg->active untouched (still
+                // false), so the NEXT reobservation attempt retries the insert
+                // instead of silently giving up.
                 if (pre_head->rg && !pre_head->rg->active) {
-                    pre_head->rg->active = true;
-                    wedged_by_rule_.insert_or_assign(rule_id, pre_head);
+                    wedge_locator_fault_here_for_test(); // seam shared with
+                                                          // abandon_claim_locked's
+                                                          // own insert - see that
+                                                          // seam's doc comment
+                    wedged_by_rule_.insert_or_assign(rule_id, pre_head); // may throw - FIRST
+                    pre_head->rg->active = true; // noexcept; only after the insert succeeds
                 }
                 return AttachCoreResult{.state = AttachCoreState::Reobserved, .generation = 0,
                                         .error = {}, .claim = pre_head};

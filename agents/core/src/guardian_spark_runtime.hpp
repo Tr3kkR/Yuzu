@@ -763,13 +763,18 @@ public:
     /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
-    /// rung 9c PR-5d adversarial-review fault seam (Blocker 2): consumed once by the
-    /// next abandon_claim_locked() call on its dispatched (non-Queued), non-stopping
-    /// path - throws std::bad_alloc where wedged_by_rule_.insert_or_assign()'s node
-    /// allocation would, BEFORE release_claim_index_locked/waiter_abandoned/end are
-    /// touched. Proves a throw there leaves the claim completely untouched (still
-    /// Dispatching, still index-held) rather than stranding a partially-abandoned,
-    /// adoption-eligible claim with no locator entry to find it.
+    /// rung 9c PR-5d adversarial-review fault seam (Blocker 2, widened at Gate 7 to
+    /// cover Blocker 1's own reorder fix): consumed once by WHICHEVER of the two
+    /// wedged_by_rule_.insert_or_assign() call sites reaches it first -
+    /// abandon_claim_locked()'s dispatched (non-Queued), non-stopping path, OR
+    /// attach_core()'s Reobserved-restore branch. Throws std::bad_alloc where that
+    /// insert's node allocation would, BEFORE the site's own irreversible write
+    /// (abandon_claim_locked: release_claim_index_locked/waiter_abandoned/end;
+    /// attach_core: rg->active=true). Proves a throw at either site leaves its
+    /// claim completely untouched/retry-safe rather than stranding a partially-
+    /// abandoned or wrongly-reactivated, adoption-eligible claim with no locator
+    /// entry to find it. A test driving one site must not assume the other is
+    /// unconsumed - the flag is one-shot across BOTH.
     void set_wedge_locator_fault_for_test(bool on) noexcept;
     /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
     /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
