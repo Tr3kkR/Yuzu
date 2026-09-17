@@ -8679,11 +8679,27 @@ TEST_CASE("Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): after a faul
     CHECK(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
     CHECK(rt->wedged_reobservations() == 2); // both attempts observed the wedge
 
+    // Discriminating check (Gate 8 quality-engineer mutation-test finding): an
+    // undisturbed release-then-adopt here is NOT a discriminating observable -
+    // a mutation test (reverting the reorder fix) confirmed this test still
+    // passed unchanged, because the FIRST (buggy-order) attempt's leftover
+    // `rg->active = true` write survives regardless of whether the retry's own
+    // insert ever actually ran, and adoption reads only `rg->active`, not
+    // whether a locator entry exists. The only observable that tells the two
+    // apart is a REAL withdrawal after this successful retry: it can find and
+    // deactivate the claim ONLY if the locator was genuinely re-registered by
+    // THIS retry (fixed order) - under the buggy order, no locator entry was
+    // ever created by either attempt (the first attempt's insert threw before
+    // completing; a skipped restore block on the second attempt never
+    // attempts one either), so detach_rule_locked's wedge lookup would find
+    // nothing, `rg->active` would stay wrongly stuck true, and the eventual
+    // late success would still be wrongly adopted despite the withdrawal.
+    rt->detach_rule("r1");
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
+    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
-    CHECK(b->disarms.load() == 0);
-    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
 }
 
 TEST_CASE("Governance Gate 7 fix (rung 9c PR-5d follow-up round 2): a clean "
