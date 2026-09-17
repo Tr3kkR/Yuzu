@@ -1555,8 +1555,8 @@ third sovereign Spark consumer alongside Guardian (§31, real-time compliance en
 binding from a Spark to a small chain (≤ 4) of plugin-action Reactions, executed on the device the
 instant the Spark fires, with or without server connectivity, deployed only as part of a Reflex Set
 (exactly the Baseline grammar — individual Reflexes never deploy alone). Design contract:
-`docs/reflex-design.md`; ADR: `docs/adr/0021-spark-reflex-architecture.md` (Decisions 2, 4, 5, 7, 9,
-10 and the 2026-09-17 amendment). No code exists yet — no GitHub tracking issue filed for this domain
+`docs/reflex-design.md`; ADR: `docs/adr/0021-spark-reflex-architecture.md` (Decisions 2, 4, 5, 6, 7,
+8, 9, 10 and the 2026-09-17 amendment). No code exists yet — no GitHub tracking issue filed for this domain
 as a whole; see `docs/roadmap.md` Phase 20.*
 
 ### 40.1 Reflex Set Authoring and Safety/Consent Gates :x: `T2`
@@ -1586,7 +1586,9 @@ by 40.1/40.2, never re-authorized per fire. Wire: reserved plugin name `__reflex
 Not implemented. Outcomes reuse the existing `__guard__`/`event` channel
 (`GuaranteedStateEvent.family == "reflex"`), land in a Reflex-only `reflex_outcomes` table (a
 deliberate, ADR-amended partial exception to Decision 6's "one event store" — the single ingest
-router chokepoint is unaffected), and are never surfaced on the executions-history ladder
+router chokepoint is unaffected). The push itself is a SEPARATE `ReflexSetPush`/generation counter,
+an accepted-interim, ADR-amended exception to Decision 8's single compiled per-device document —
+not yet folded into it. Reflex outcomes are never surfaced on the executions-history ladder
 (agent-local automation, not operator dispatch). Fleet Prometheus families, heartbeat tags, audit
 verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard round-tripping the YAML
 — never the model.

@@ -1942,7 +1942,7 @@ the third and last sovereign Spark consumer alongside Guardian (real-time compli
 and DEX (curated telemetry) — a YAML-authored, agent-local binding from a Spark to a small chain of
 plugin-action Reactions, executed on the device the instant the Spark fires, with or without server
 connectivity. Design contract: `docs/reflex-design.md`; ADR: `docs/adr/0021-spark-reflex-architecture.md`
-(Decisions 2, 4, 5, 7, 9, 10 and the 2026-09-17 Reflex amendment). No GitHub tracking issue filed yet
+(Decisions 2, 4, 5, 6, 7, 8, 9, 10 and the 2026-09-17 Reflex amendment). No GitHub tracking issue filed yet
 for this phase as a whole — file one before implementation slices land, per
 `docs/agents/issue-standard.md`.*
 

@@ -2,7 +2,7 @@
 
 Status: design-only (R0). Implemented incrementally by slices R1-R14 of the Spark/Reflex/DEX
 programme; each slice cites the specific paragraph below it implements. Authoritative source:
-`docs/adr/0021-spark-reflex-architecture.md` (Decisions 2, 4, 5, 7, 9, 10 and their Amendments),
+`docs/adr/0021-spark-reflex-architecture.md` (Decisions 2, 4, 5, 6, 7, 8, 9, 10 and their Amendments),
 `docs/spark-stage2-guardian-consumer-design.md`, `docs/yuzu-guardian-design-v1.1.md` §24. This
 document is itself the canonical home for the fixed points below — later slices cite it rather than
 re-deriving these rules; if a later slice's PR text disagrees with this file, this file wins unless
