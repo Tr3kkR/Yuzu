@@ -9699,9 +9699,10 @@ void RestApiV1::register_routes(
                                   : "";
                           // #4373 fix: re-apply the SAME caps MCP's
                           // create_result_set_from_instruction_result enforces at creation
-                          // time (REST's own from-instruction-result route does not -
-                          // tracked as #4406/general REST-bound gap), and the SAME fix
-                          // MCP's reevaluate_result_set already got (PR #4394) - checked
+                          // time (REST's own from-instruction-result route does not - this
+                          // specific bound gap is untracked; #4406 is a related but distinct
+                          // type-confusion defect on the same two REST creation routes), and
+                          // the SAME fix MCP's reevaluate_result_set already got (PR #4394) - checked
                           // here ahead of the instruction_store gate below, since a
                           // malformed/oversized field is a permanent client error
                           // regardless of backend availability. `orig` may have been minted
