@@ -17,6 +17,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/disk_space/README', slug: 'plugins/disk_space', title: 'disk_space' },
   { file: 'agents/plugins/event_logs/README', slug: 'plugins/event_logs', title: 'event_logs' },
   { file: 'agents/plugins/example/README', slug: 'plugins/example', title: 'example' },
+  { file: 'agents/plugins/execution_artifacts/README', slug: 'plugins/execution_artifacts', title: 'execution_artifacts' },
   { file: 'agents/plugins/filesystem/README', slug: 'plugins/filesystem', title: 'filesystem' },
   { file: 'agents/plugins/filesystem_posture/README', slug: 'plugins/filesystem_posture', title: 'filesystem_posture' },
   { file: 'agents/plugins/firewall/README', slug: 'plugins/firewall', title: 'firewall' },
@@ -50,6 +51,7 @@ export const PLUGIN_ENTRIES = [
   { file: 'agents/plugins/users/README', slug: 'plugins/users', title: 'users' },
   { file: 'agents/plugins/vuln_scan/README', slug: 'plugins/vuln_scan', title: 'vuln_scan' },
   { file: 'agents/plugins/wifi/README', slug: 'plugins/wifi', title: 'wifi' },
+  { file: 'agents/plugins/windows_optional_features/README', slug: 'plugins/windows_optional_features', title: 'windows_optional_features' },
   { file: 'agents/plugins/windows_updates/README', slug: 'plugins/windows_updates', title: 'windows_updates' },
   { file: 'agents/plugins/wmi/README', slug: 'plugins/wmi', title: 'wmi' },
   { file: 'agents/plugins/wol/README', slug: 'plugins/wol', title: 'wol' }

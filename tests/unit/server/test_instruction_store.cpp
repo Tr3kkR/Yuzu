@@ -687,6 +687,161 @@ TEST_CASE("InstructionStore: import invalid JSON fails", "[instruction_store][js
     CHECK(!result.has_value());
 }
 
+// json-dump-depth-guard fix (#2437-class): import_definition_json_impl copies
+// visualization_spec / response_templates_spec sub-trees verbatim into
+// normalize_to_array_helper / normalise_templates_array, both of which
+// eventually dump() the result, and stores parameter_schema verbatim for a
+// later dump() on the discover-catalog read side (discover_routes.cpp). Four
+// guards close this: a whole-body check before any parse, a string-form
+// check on visualization_spec's own re-parsed text, one on
+// response_templates_spec's own re-parsed text, and a write-side check on
+// parameter_schema's raw text.
+//
+// Every poisoned body below is a raw string built with a 35-deep bracket
+// chain (std::string(35,'[') + std::string(35,']')), never materialised as a
+// live nlohmann::json object at that depth - kMcpMaxJsonDepth is 32, so 35 is
+// comfortably past it and still trivially safe to construct in this test
+// process, orders of magnitude short of the ~100,000-level depth that
+// actually SIGSEGVs the real dump() call these guards exist to prevent.
+TEST_CASE("InstructionStore: import rejects a request body nested past the depth guard "
+          "(visualization_spec sub-tree), no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+
+    // The deep chain is a direct sub-tree here (no surrounding quotes) - the
+    // whole-body guard runs before any parse and closes this and the
+    // response_templates_spec sub-tree sink in one check.
+    const std::string body =
+        R"({"name":"Deep Body","type":"question","plugin":"system_info","action":"query",)"
+        R"("visualization_spec":)" +
+        std::string(35, '[') + std::string(35, ']') + "}";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep Body"; }));
+}
+
+TEST_CASE("InstructionStore: import rejects visualization_spec supplied as a deeply-nested "
+          "JSON-encoded STRING, no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    // #1073: opt out of signature enforcement - the whole-body guard fires
+    // before the signature gate and needs no bypass, but this field's own
+    // re-parse site sits AFTER that gate, so an unsigned body would
+    // otherwise be rejected there first and never reach it.
+    store.set_require_signed_definitions(false);
+
+    // The deep chain is INSIDE a JSON string literal here - structurally
+    // different from the sub-tree test above. The whole-body text scan
+    // correctly does not count brackets inside a string value as structure,
+    // so this body reads as shallow to that scan; only the string's own
+    // decoded content, re-parsed at normalize_to_array's own site, is deep.
+    // This proves the dedicated string-form guard, not the whole-body one.
+    const std::string deep = std::string(35, '[') + std::string(35, ']');
+    const std::string body =
+        R"({"name":"Deep String Viz","type":"question","plugin":"system_info","action":"query",)"
+        R"("visualization_spec":")" +
+        deep + R"("})";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep String Viz"; }));
+}
+
+TEST_CASE("InstructionStore: import rejects response_templates_spec supplied as a "
+          "deeply-nested JSON-encoded STRING, no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    // Well under the pre-existing 256 KiB string-size cap, so that cap alone
+    // does not close this - only the depth check does.
+    const std::string deep = std::string(35, '[') + std::string(35, ']');
+    const std::string body =
+        R"({"name":"Deep String Templates","type":"question","plugin":"system_info",)"
+        R"("action":"query","response_templates_spec":")" +
+        deep + R"("})";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep String Templates"; }));
+}
+
+TEST_CASE("InstructionStore: import rejects a deeply-nested parameter_schema string "
+          "at write time, no definition created",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    const std::string deep = std::string(35, '[') + std::string(35, ']');
+    const std::string body =
+        R"({"name":"Deep Param Schema","type":"question","plugin":"system_info",)"
+        R"("action":"query","parameter_schema":")" +
+        deep + R"("})";
+    auto result = store.import_definition_json(body);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("nests too deeply") != std::string::npos);
+
+    InstructionQuery q;
+    auto all = store.query_definitions(q);
+    REQUIRE(all.has_value());
+    CHECK(std::none_of(all->begin(), all->end(),
+                       [](const auto& d) { return d.name == "Deep Param Schema"; }));
+}
+
+TEST_CASE("InstructionStore: import with valid, shallow visualization_spec / "
+          "response_templates_spec / parameter_schema succeeds (happy path unaffected "
+          "by the #2437-class depth guards)",
+          "[instruction_store][json][depth][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    InstructionStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_definitions(false);
+
+    const std::string body =
+        R"({"name":"Healthy Import","type":"question","plugin":"system_info","action":"query",)"
+        R"("parameter_schema":"{\"type\":\"object\"}",)"
+        R"("visualization_spec":[{"type":"bar"}],)"
+        R"("response_templates_spec":[{"id":"tmpl1","template":"ok"}]})";
+    auto result = store.import_definition_json(body);
+    REQUIRE(result.has_value());
+
+    auto def = store.get_definition(*result);
+    REQUIRE(def.has_value());
+    REQUIRE(def->has_value());
+    CHECK((*def)->parameter_schema == R"({"type":"object"})");
+    CHECK((*def)->visualization_spec.find("bar") != std::string::npos);
+    CHECK((*def)->response_templates_spec.find("tmpl1") != std::string::npos);
+}
+
 TEST_CASE("InstructionStore: export nonexistent returns empty", "[instruction_store][json][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, instruction_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};

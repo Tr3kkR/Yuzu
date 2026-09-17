@@ -257,6 +257,10 @@ struct RestGsHarness {
     // calling /perf/app to drive the suppression-serialization path (the wired fleet
     // lambda reads it lazily at request time).
     std::vector<yuzu::server::AppPerfFleetRow> fleet_rows_;
+    // Rows the wired tag-cohort provider returns (default empty), same lazy-read
+    // pattern as fleet_rows_ above — lets a test drive GET /dex/perf/tag's
+    // suppression-serialization path (sub-floor cohort) without a harness rebuild.
+    std::vector<yuzu::server::AppPerfFleetRow> tag_cohort_rows_;
 
     // GET /dex/perf/devices and GET /network/devices read seams — always wired
     // present-but-empty (unlike app_perf_providers_ above, no test here needs
@@ -496,6 +500,11 @@ struct RestGsHarness {
                 [](std::string_view, std::string_view, std::string_view)
                 -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
                 return std::vector<yuzu::server::AppPerfFleetRow>{};
+            };
+            app_perf_providers_.tag_cohort =
+                [this](std::string_view, std::string_view, std::string_view, std::string_view)
+                -> std::optional<std::vector<yuzu::server::AppPerfFleetRow>> {
+                return tag_cohort_rows_; // settable by a test (default empty)
             };
             // ADR-0031 WS-A4 #4250: the shared VerifyApi seam (replaces the
             // retired AppPerfCohortFn-in-AppPerfProviders ad-hoc cohort
@@ -1912,6 +1921,120 @@ TEST_CASE("REST gs.rules: metadata-only PUT preserves the existing structured sp
     CHECK(spec["remediation"]["params"]["mode"].get<std::string>() == "backoff");
 }
 
+// json-dump-depth-guard fix (#2437-class): derive_rule_spec's spec.dump() has
+// no depth guard on the raw caller-supplied spark/assertion/remediation
+// blocks it copies verbatim. Both the create and update handlers now check
+// the raw request body text before any parse. A raw string, never
+// materialised as a live nlohmann::json object at this depth: kMcpMaxJsonDepth
+// is 32, the 35-deep bracket chain below is comfortably past it and still
+// trivially safe to construct/parse directly in this test process, orders of
+// magnitude short of the ~100,000-level depth that actually SIGSEGVs the real
+// spec.dump() call this guard exists to prevent.
+TEST_CASE("REST gs.rules: create rejects a request body nested past the depth "
+          "guard, no row created",
+          "[pg][rest][guaranteed_state][create][security][depth]") {
+    RestGsHarness h;
+    const std::string body =
+        R"({"rule_id":"r-deep","name":"deep-guard","enforcement_mode":"enforce",)"
+        R"("severity":"high","spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\YuzuTest","value_name":"Flag","value_type":"REG_DWORD",)"
+        R"("expected":"1","nested":)" +
+        std::string(35, '[') + std::string(35, ']') +
+        R"(}},"remediation":{"type":"alert-only","params":{}}})";
+    auto res = h.sink.Post("/api/v1/guaranteed-state/rules", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("nests too deeply") != std::string::npos);
+
+    // Three-state (ADR-0038): the outer expected still has_value() (the read
+    // succeeded); not-created is the INNER optional being empty.
+    auto not_persisted = h.store->get_rule("r-deep");
+    REQUIRE(not_persisted.has_value());
+    CHECK_FALSE(not_persisted->has_value());
+    // Pre-parse rejection: rule_id is not yet known, so this mirrors the
+    // create handler's own "invalid JSON" sibling branch (no audit call),
+    // not the enforcement_mode/spec.error branches (which do audit).
+    CHECK(h.audit_log.empty());
+}
+
+TEST_CASE("REST gs.rules: create with a normal, safely-nested structured body "
+          "still succeeds (happy path unaffected)",
+          "[pg][rest][guaranteed_state][create][security][depth]") {
+    RestGsHarness h;
+    auto res = h.sink.Post(
+        "/api/v1/guaranteed-state/rules",
+        make_structured_body("r-safe", "safe-guard", "enforce", {{"mode", "persist"}}));
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    auto stored = h.store->get_rule("r-safe");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK_FALSE((*stored)->spec_json.empty());
+}
+
+TEST_CASE("REST gs.rules: PUT rejects a request body nested past the depth "
+          "guard, existing row unchanged",
+          "[pg][rest][guaranteed_state][crud][security][depth]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-edit-deep", "edit-deep-guard", "enforce",
+                                           {{"mode", "persist"}}))
+                ->status == 201);
+    auto before = h.store->get_rule("r-edit-deep");
+    REQUIRE(before.has_value());
+    REQUIRE(before->has_value());
+    const auto version_before = (*before)->version;
+    const auto spec_before = (*before)->spec_json;
+
+    const std::string body =
+        R"({"name":"edit-deep-guard","spark":{"type":"registry-change","params":{}},)"
+        R"("assertion":{"type":"registry-value-equals","params":{"hive":"HKLM",)"
+        R"("key":"SOFTWARE\\YuzuTest","value_name":"Flag","value_type":"REG_DWORD",)"
+        R"("expected":"1","nested":)" +
+        std::string(35, '[') + std::string(35, ']') +
+        R"(}},"remediation":{"type":"alert-only","params":{}}})";
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-edit-deep", body);
+    REQUIRE(upd);
+    CHECK(upd->status == 400);
+    CHECK(upd->body.find("nests too deeply") != std::string::npos);
+
+    auto after = h.store->get_rule("r-edit-deep");
+    REQUIRE(after.has_value());
+    REQUIRE(after->has_value());
+    CHECK((*after)->version == version_before);
+    CHECK((*after)->spec_json == spec_before);
+
+    // Update's invalid-body sibling branch DOES audit (UP-R1 parity), so the
+    // depth-guard rejection matches that, not the create handler's silent one.
+    REQUIRE(h.audit_log.size() == 2); // create + denied update
+    CHECK(h.audit_log[1].action == "guaranteed_state.rule.update");
+    CHECK(h.audit_log[1].result == "denied");
+    CHECK(h.audit_log[1].target_id == "r-edit-deep");
+    CHECK(h.audit_log[1].detail.find("nests too deeply") != std::string::npos);
+}
+
+TEST_CASE("REST gs.rules: PUT with a normal, safely-nested structured body "
+          "still succeeds (happy path unaffected)",
+          "[pg][rest][guaranteed_state][crud][security][depth]") {
+    RestGsHarness h;
+    REQUIRE(h.sink
+                .Post("/api/v1/guaranteed-state/rules",
+                      make_structured_body("r-edit-safe", "edit-safe-guard", "enforce",
+                                           {{"mode", "persist"}}))
+                ->status == 201);
+    auto upd = h.sink.Put("/api/v1/guaranteed-state/rules/r-edit-safe",
+                          make_structured_body("r-edit-safe", "edit-safe-guard", "enforce",
+                                               {{"mode", "bounded"}, {"max_attempts", 2}}));
+    REQUIRE(upd);
+    CHECK(upd->status == 200);
+    auto stored = h.store->get_rule("r-edit-safe");
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->has_value());
+    CHECK((*stored)->version == 2);
+}
+
 TEST_CASE("REST gs.schemas: catalog + ETag revalidation", "[pg][rest][guaranteed_state][schemas]") {
     RestGsHarness h;
     auto res = h.sink.Get("/api/v1/guaranteed-state/schemas");
@@ -2823,6 +2946,111 @@ TEST_CASE("REST dex/perf/group: ordinary session still reaches the route",
     auto res = h.sink.Get("/api/v1/dex/perf/group?group_id=g1&app=chrome.exe");
     REQUIRE(res);
     CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/tag: service-scoped token → 403, denial audited",
+          "[pg][rest][dex][app_perf][rbac]") {
+    RestGsHarness h;
+    h.session_token_scope_service = "printers";
+    auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].action == "dex.perf.tag.view");
+    CHECK(h.audit_log[0].result == "denied");
+    CHECK(h.audit_log[0].target_type == "GuaranteedState");
+}
+
+TEST_CASE("REST dex/perf/tag: ordinary session still reaches the route",
+          "[pg][rest][dex][app_perf]") {
+    RestGsHarness h;
+    auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+    REQUIRE(res);
+    CHECK(res->status != 403);
+}
+
+TEST_CASE("REST dex/perf/tag: missing params, invalid key, provider absent, floor "
+          "echoed, key defaults to model",
+          "[pg][rest][dex][app_perf][route]") {
+    SECTION("missing value → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("missing app → 400") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("invalid key → 400") {
+        RestGsHarness h;
+        auto res =
+            h.sink.Get("/api/v1/dex/perf/tag?key=bad%20key%21&value=x&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("present-but-empty value → 400, not treated as 'every value' (sec-M1)") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("present-but-empty key → 400, not silently defaulted (sec-M1)") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?key=&value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+    }
+    SECTION("provider absent → 503") {
+        RestGsHarness h(true, true, false);
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+    }
+    SECTION("present provider, key omitted → 200, floor echoed, key defaults to model") {
+        RestGsHarness h;
+        auto res = h.sink.Get("/api/v1/dex/perf/tag?value=Latitude+5420&app=chrome.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["data"]["floor"].get<int64_t>() == yuzu::server::kDexCohortFloor);
+        CHECK(j["data"]["key"].get<std::string>() == "model");
+        CHECK(j["data"]["value"].get<std::string>() == "Latitude 5420");
+    }
+    SECTION("sub-floor tag-cohort point serializes suppressed, stats omitted") {
+        // Same wiring (app_perf_group_trend) and same floor as the fleet/group
+        // routes' own sub-floor tests — this proves the ROUTE composes it
+        // correctly for a tag-value cohort, not just that the shared model
+        // function floors correctly in isolation (already covered at
+        // test_dex_app_perf_model.cpp's "app_perf_group_trend: sub-floor points
+        // suppress stats, keep device_count").
+        RestGsHarness h;
+        yuzu::server::AppPerfFleetRow r;
+        r.app_name = "niche.exe";
+        r.version = "1.0";
+        r.day = 1'700'000'000;
+        r.device_count = 3; // < kDexCohortFloor (10)
+        r.cpu_sum = 30.0;
+        r.cpu_max = 10.0;
+        r.ws_sum = 300;
+        r.ws_max = 100;
+        r.hist_version = yuzu::server::kAppPerfHistVersion;
+        r.cpu_hist.assign(yuzu::server::app_perf_cpu_buckets().size() + 1, 0);
+        r.ws_hist.assign(yuzu::server::app_perf_ws_buckets().size() + 1, 0);
+        h.tag_cohort_rows_ = {r};
+        auto res =
+            h.sink.Get("/api/v1/dex/perf/tag?value=RareModel&app=niche.exe");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        auto j = nlohmann::json::parse(res->body);
+        REQUIRE(j["data"]["points"].size() == 1);
+        const auto& pt = j["data"]["points"][0];
+        CHECK(pt["suppressed"] == true);
+        CHECK(pt["device_count"] == 3);
+        CHECK_FALSE(pt.contains("cpu_mean"));
+    }
 }
 
 TEST_CASE("REST dex/perf/compare: service-scoped token → 403, denied under the "

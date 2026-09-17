@@ -60,12 +60,17 @@ bool is_sha256_hex(std::string_view s) {
     return std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
 }
 
+} // namespace
+
 /// Governance finding SHOULD-1 (Gate 4, consistency-auditor): drain_locked()'s own
 /// async-failure warn previously logged no reason at all, unlike the sync-refusal
 /// warn in reconcile_rule_locked() which always names one. Exhaustive switch, no
 /// `default`, mirroring GuardianSparkRuntime::receipt_status()'s own convention -
-/// a future ReceiptStatus addition (e.g. a K-bound Wedged) fails to COMPILE
-/// here rather than silently landing in a catch-all bucket.
+/// a future ReceiptStatus addition produces a missing-case WARNING here (this
+/// repo's meson.build sets werror=false repo-wide, so it is not a build failure -
+/// correcting an earlier overclaim in this comment), not a silent catch-all.
+/// Exported (see the header declaration's own comment) so its mapping stays
+/// directly unit-testable without LogCapture's cross-image hazard.
 const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
     using S = GuardianSparkRuntime::ReceiptStatus;
     switch (status) {
@@ -75,8 +80,10 @@ const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
         return "Committed";
     case S::Failed:
         return "Failed";
-    case S::Expired:
-        return "Expired";
+    case S::CongestionExpired:
+        return "CongestionExpired";
+    case S::Wedged:
+        return "Wedged";
     case S::Withdrawn:
         return "Withdrawn";
     case S::Stopped:
@@ -84,8 +91,6 @@ const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status) {
     }
     return "Unknown"; // unreachable if the switch above is kept exhaustive
 }
-
-} // namespace
 
 std::string guardian_push_content_id(const gpb::GuaranteedStatePush& push) {
     std::vector<const gpb::GuaranteedStateRule*> sorted_rules;
@@ -170,9 +175,20 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         it != current_->pending.end() && resolved < max_per_tick;) {
         const auto status = runtime.receipt_status(it->second);
         // Exhaustive switch, no `default` - SHOULD-1's own fix (see the
-        // receipt_status_name() helper above): a future ReceiptStatus value fails
-        // to compile here rather than silently landing in a catch-all "failed"
+        // receipt_status_name() helper above): a future ReceiptStatus value
+        // produces a missing-case WARNING here (werror=false repo-wide - not a
+        // build failure), rather than silently landing in a catch-all "failed"
         // bucket the way the old if/else-if/else chain would have.
+        //
+        // rung 9c PR-5c (#4221): CongestionExpired and Wedged both fold into
+        // resolved_failed exactly like the pre-split Expired did - neither
+        // represents a committed arm. This PR adds classification only, not the
+        // later K-bound acknowledgement policy (5e): a Wedged receipt still
+        // counts as an ordinary resolved failure on every drain, and a repeated
+        // application can still count the same wedge again - nothing about up-2's
+        // re-observation changes that (re-observation exists so a TYPED Wedged
+        // status reaches this ledger at all, not to change what it means once it
+        // arrives).
         using S = GuardianSparkRuntime::ReceiptStatus;
         switch (status) {
         case S::Pending:
@@ -182,7 +198,8 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
             ++current_->resolved_armed;
             break;
         case S::Failed:
-        case S::Expired:
+        case S::CongestionExpired:
+        case S::Wedged:
         case S::Withdrawn:
         case S::Stopped:
             ++current_->resolved_failed;
@@ -202,6 +219,14 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
                              it->first, receipt_status_name(status));
             } catch (...) {
             }
+            // Governance follow-up (Gate 3, cpp-safety + cpp-expert; Gate 4,
+            // unhappy-path, 2026-09-16): pushed LAST in this branch, after
+            // resolved_failed/failed_out are already consistent with each other -
+            // a push_back bad_alloc here leaves this receipt un-erased (still in
+            // `pending`, re-drained and re-counted together next tick) rather than
+            // desyncing resolved_failed from failed_out the way an earlier-ordered
+            // push_back could have.
+            current_->resolved_statuses_for_test.push_back(status);
             break;
         }
         it = current_->pending.erase(it);
@@ -223,6 +248,12 @@ std::size_t GuardianArmAckLedger::applied_count() const {
 
 std::size_t GuardianArmAckLedger::pending_count_for_test() const {
     return current_ ? current_->pending.size() : 0;
+}
+
+std::vector<GuardianSparkRuntime::ReceiptStatus>
+GuardianArmAckLedger::resolved_statuses_for_test() const {
+    return current_ ? current_->resolved_statuses_for_test
+                    : std::vector<GuardianSparkRuntime::ReceiptStatus>{};
 }
 
 std::optional<GuardianArmStats> GuardianArmAckLedger::arm_stats() const {

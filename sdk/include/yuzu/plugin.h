@@ -411,7 +411,12 @@ YUZU_EXPORT char* yuzu_generate_sequence(int start, int count, const char* prefi
  * @param directory    Override temp directory. NULL uses the system default.
  * @param path_out     Buffer to receive the null-terminated absolute path.
  * @param path_out_size Size of path_out in bytes (recommend >= 512).
- * @return             0 on success, non-zero on failure.
+ * @return             0 on success, non-zero on failure. On Windows, a
+ *                     non-zero return always leaves GetLastError() carrying a
+ *                     meaningful code for THIS call (never a stale value left
+ *                     over from an earlier, unrelated Win32 call) -- callers
+ *                     may report it directly, e.g. as a `dest_dir_create_<N>`
+ *                     style constrained-reason token.
  */
 YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, const char* directory,
                                       char* path_out, size_t path_out_size);
@@ -425,7 +430,8 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
  * @param directory    Override parent directory. NULL uses the system default.
  * @param path_out     Buffer to receive the null-terminated absolute path.
  * @param path_out_size Size of path_out in bytes (recommend >= 512).
- * @return             0 on success, non-zero on failure.
+ * @return             0 on success, non-zero on failure. Same GetLastError()
+ *                     guarantee as yuzu_create_temp_file above.
  */
 YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, char* path_out,
                                      size_t path_out_size);

@@ -17,6 +17,7 @@
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
 #include "execution_event_bus.hpp"
@@ -816,7 +817,16 @@ const std::string& openapi_spec() {
       "get": {"summary": "Fleet device list (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint — SOLE gate, never stacked with a bare permission check). Row shape matches the pre-existing MCP list_agents tool exactly: agent_id/hostname/os/arch/agent_version, 5 fields, sourced from the live AgentRegistry. devices_omitted counts agents dropped by the caller's management-group/service-scope confinement (0 = unfiltered or nothing dropped). Not audited on success (device identity is machine metadata, not behavioural PII) — require_fleet_read itself audits every denial path internally.", "responses": {"200": {"description": "{data: {devices[], count, devices_omitted}, pagination, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "503": {"description": "Route misconfigured (fleet_read_fn/device registry unwired) or authorization store unavailable"}}}
     },
     "/devices/{id}": {
-      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Adds a tags array (key/value/source) when a TagStore is wired; omitted entirely when it is not. Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags?}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
+      "get": {"summary": "Single-device detail (#4033, #2146 API-parity Batch A)", "tags": ["Devices"], "description": "Requires Infrastructure:Read via require_fleet_read — matches the pre-existing MCP get_agent_details tool's pattern exactly, including its existence-oracle closure: an agent outside the caller's fleet-read scope collapses to the SAME 404 as a genuinely nonexistent agent_id (the distinction is recorded only server-side). Always includes a tags array (key/value/source), empty when the device has no tags (a null/unwired TagStore degrades to an empty array, never an omitted key). Not audited (neither success nor not-found) — device identity/tags are machine metadata, matching the /fragments/device/page and /fragments/device/info dashboard fragments' own unaudited posture.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {agent_id, hostname, os, arch, agent_version, tags[]}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Infrastructure:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, authorization store unavailable, or tag store degraded"}}}
+    },
+    "/hardware": {
+      "get": {"summary": "Hardware CI list (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read, gated via AuthRoutes::require_fleet_read (the canonical admit-then-filter chokepoint). Query params q/os/status/sort/dir/tag/offset/limit — an unrecognised sort/os/status/dir token is a 400. Rows carry the same identity fields as /devices plus CI blob fields (manufacturer/model/serial/cpu/ram/os_version), a per-page DEX score, agent_version/arch, claimed IPs, and tags. Audited on success as inventory.devices; a persist failure on the audit fails the request closed (503).", "responses": {"200": {"description": "{data: {rows[], kpis, query}, pagination, meta}"}, "400": {"description": "Unrecognised sort, dir, os, or status token"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "503": {"description": "Route misconfigured (roster/audit unwired) or audit subsystem degraded"}}}
+    },
+    "/hardware/{id}": {
+      "get": {"summary": "Hardware CI record (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Inventory:Read via require_fleet_read; an id outside the caller's fleet-read scope collapses to the same 404 as a genuinely nonexistent id (same existence-oracle closure as /devices/{id}). Composes identity + CI blob + installed software + tags into one record — each independently distinguishes degraded from absent. Audited on success as inventory.device.ci; a persist failure on the audit fails the request closed (503).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data: {identity, ci, software, tags, ci_state}, meta}"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks Inventory:Read"}, "404": {"description": "Not found, or found but outside the caller's fleet-read scope (indistinguishable by design)"}, "503": {"description": "Route misconfigured, or audit subsystem degraded"}}}
+    },
+    "/hardware/{id}/sync": {
+      "post": {"summary": "Request an on-demand agent sync (governance Gate 3 API-parity fix)", "tags": ["Hardware"], "description": "Requires Execution:Execute scoped to the device. Body is an optional JSON object with a source field (one of installed_software/app_perf/device_ci/software_licensing/all, default all). Dispatches the reserved __sync__.now agent command (system_reserved, ExecuteGate::None — gated entirely at this route). Audited BEFORE dispatch as inventory.sync.request; a persist failure on that audit fails the request closed (503) with no dispatch. Agents below the 0.13.1 sync-on-demand floor are refused with 409.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}], "requestBody": {"required": false, "content": {"application/json": {"schema": {"type": "object", "properties": {"source": {"type": "string", "enum": ["installed_software", "app_perf", "device_ci", "software_licensing", "all"]}}}}}}, "responses": {"202": {"description": "{data: {command_id, source, agents_reached, requested_at}, meta}"}, "400": {"description": "Malformed body, or source not one of the recognised tokens"}, "401": {"description": "Not authenticated"}, "403": {"description": "Caller lacks the scoped Execution:Execute grant for this device"}, "409": {"description": "Agent version predates sync-on-demand (needs 0.13.1 or later)"}, "503": {"description": "Sync dispatch unwired, agent not connected, agent unreachable, or audit subsystem degraded"}}}
     },
     "/management-groups": {
       "get": {"summary": "List management groups", "tags": ["Management Groups"], "responses": {"200": {"description": "List of management groups"}}},
@@ -1024,7 +1034,15 @@ const std::string& openapi_spec() {
         R"json(
     "/sle/agents/{agent_id}": {
       "get": {"summary": "SLE per-agent detected-licence drill (ADR-0024)", "tags": ["SLE"], "description": "One device's detected software licences (product, type, channel, state, expiry, confidence, exe_hints) INCLUDING the per-user fields user_scope/user_ref (personal data, ADR-0024 Decision 11). Requires SoftwareLicensing:Read SCOPED to the device (tier + management group, ancestor-aware — a global grant passes fleet-wide, otherwise the caller must hold Read via a management group the device is in; 403 outside scope). Individual-identifying data, so every call emits a per-open sle.agent.view behavioural audit and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that audit row cannot persist — the licence PII is never served without durable evidence (SOC 2 CC7.2). REAL data in PR1a. A store degrade returns 503 (never an empty 200).", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, licenses[].{product, vendor, version, license_type, state, expiry_at, channel, key_hint, detector, confidence, exe_hints, user_scope, user_ref, collected_at, first_seen, last_seen}, count}}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside the caller's management scope (SoftwareLicensing:Read on the device)"}, "503": {"description": "Store degraded, OR the sle.agent.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when per-agent licence PII was withheld because the access-audit row failed to persist."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}},
-      "delete": {"summary": "SLE agent decommission — durable erasure trigger (ADR-0024 Decision 11)", "tags": ["SLE"], "description": "Erase a decommissioned device's stored rows across every per-agent store (the decommission cascade's production caller), including detected-licence rows and the Decision-11 user_ref personal data (GDPR Art.17). Requires SoftwareLicensing:Delete AND Inventory:Delete AND GuaranteedState:Delete, each SCOPED to the device — a conjunction over every securable the cascade erases through, so it authorizes for its full blast radius rather than only the route's name: SoftwareLicensing governs the detected-licence rows, Inventory the ADR-0016 stores (inventory, software_inventory, device_inventory), and GuaranteedState the app_perf_daily DEX behavioural-PII series. (Administrator + ITServiceOwner hold all three; Operator/Viewer 403.) AUDIT-BEFORE-ERASE, FAIL-CLOSED: a durable sle.agent.decommission attempt is recorded first and, if it cannot persist, NO erasure occurs (503 + Sec-Audit-Failed). Each store reports its committed delete status, so a rolled-back store is reported failed (HTTP 500 — re-issue the idempotent DELETE), never a false decommissioned:true. NB per ADR-0024 'Placement under ADR-1005' the fleet posture/fan-out reads are the SAM use-case-engine module's, not served by this server.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, decommissioned:true, stores, deleted, skipped, failed}}"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside scope, or lacks any of SoftwareLicensing:Delete, Inventory:Delete, GuaranteedState:Delete"}, "500": {"description": "One or more stores failed to erase (partial) — re-issue the idempotent DELETE (A4 envelope)"}, "503": {"description": "Cascade unconfigured, or the attempt audit could not persist (Sec-Audit-Failed: true — no erasure)"}}}
+      "delete": {"summary": "SLE agent decommission — durable erasure trigger (ADR-0024 Decision 11, amended Wave 7 PR7.2)", "tags": ["SLE"], "description": "Erase a decommissioned device's stored rows across SIX per-agent stores (the decommission cascade's production caller): InventoryStore, SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by Inventory), AppPerfDailyStore (read-gated by GuaranteedState — DEX behavioural PII), SoftwareLicensingStore (read-gated by SoftwareLicensing — detected-licence rows incl. the Decision-11 user_ref personal data, GDPR Art.17), and AppUsageStore (read-gated by Forensics, Wave 7 PR7.2 — per-executable last-used rows). Requires ONE SCOPED securable, Decommission:Delete — a device-level erasure grant that authorizes for the cascade's whole blast radius rather than a hand-maintained conjunction over each store's own READ securable (Administrator + ITServiceOwner hold it via seed_defaults(); an operator-authored custom role that had assembled the old per-store Delete grants is refused until granted the new securable). AUDIT-BEFORE-ERASE, FAIL-CLOSED: a durable sle.agent.decommission attempt is recorded first and, if it cannot persist, NO erasure occurs (503 + Sec-Audit-Failed). Each store reports its committed delete status, so a rolled-back store is reported failed (HTTP 500 — re-issue the idempotent DELETE), never a false decommissioned:true. NB per ADR-0024 'Placement under ADR-1005' the fleet posture/fan-out reads are the SAM use-case-engine module's, not served by this server.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, decommissioned:true, stores, deleted, skipped, failed}}"}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside scope, or lacks Decommission:Delete"}, "500": {"description": "One or more stores failed to erase (partial) — re-issue the idempotent DELETE (A4 envelope)"}, "503": {"description": "Cascade unconfigured, or the attempt audit could not persist (Sec-Audit-Failed: true — no erasure)"}}}
+    },)json"
+        // Forensics (Wave 7 PR7.2) — the single app_usage REST surface, gated on
+        // the Forensics securable (Administrator-only by design, deliberately
+        // absent from the Viewer read-list — docs/authz-model.md §4). Own
+        // raw-string segment (MSVC C2026 16,380-byte cap).
+        R"json(
+    "/forensics/agents/{agent_id}/app-usage": {
+      "get": {"summary": "Per-agent app-usage drill (Wave 7 PR7.2)", "tags": ["Forensics"], "description": "One device's per-executable last-used projection (exe_key, first_seen, last_seen, run_count_30d, total_seconds_30d), derived on the agent from TAR's usage_daily fold. first_seen/last_seen are WITHIN TAR's retained usage window (31 days default, operator-tunable) — never a value spanning the executable's full run history; an executable absent from a report has not run inside that retained window, it does not mean the executable has never run. Requires Forensics:Read SCOPED to the device (tier + management group, ancestor-aware — a global grant passes fleet-wide, otherwise the caller must hold Read via a management group the device is in; 403 outside scope). Forensics is Administrator-only by design (absent from the seeded Viewer read-list). Behavioural data, so every call emits a per-open app_usage.agent.view audit and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that audit row cannot persist. A store degrade returns 503 (never an empty 200); an agent that genuinely reported no rows for the retained window returns 200 with an empty apps array.", "parameters": [{"name": "agent_id", "in": "path", "required": true, "schema": {"type": "string"}}], "responses": {"200": {"description": "{data:{agent_id, apps[].{exe_key, first_seen, last_seen, run_count_30d, total_seconds_30d}, collected_at}}", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Unauthenticated"}, "403": {"description": "Outside the caller's management scope (Forensics:Read on the device)"}, "503": {"description": "Store degraded, the scope gate unwired, OR the app_usage.agent.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when per-agent app-usage data was withheld because the access-audit row failed to persist."}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },)json"
         // Split again (MSVC C2026 16,380-byte cap); concatenated at compile time.
         R"json(
@@ -1197,8 +1215,14 @@ const std::string& openapi_spec() {
     "/dex/perf/app": {
       "get": {"summary": "Fleet performance-over-time trend for one app", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The 'over time' companion to /dex/perf/fleet: reads the retained Postgres B1/B2 substrate (NOT live heartbeat) to answer 'did this app regress across the fleet'. Returns one point per (version, UTC day) over the B2 retention (up to 180 days). version omitted = every version interleaved, each point tagged with its canonicalized version; a supplied version is canonicalized to match the stored key. Each point carries the EXACT fleet mean and max (cpu_mean share-of-capacity %, ws_mean working-set bytes) plus bucket-resolution p50/p95 read from the fixed histogram. A percentile is {value, lower_bound}: lower_bound=true means it falls in the open top bucket and value is a FLOOR (render '>= value'), and a percentile is null when the population is empty or the row predates the current histogram scheme. hist_stale=true flags a point whose stored histogram scheme differs from the running one — its means/maxima still stand, its percentiles are withheld. Fleet aggregate (no agent_id) — NOT audited; the per-device drill lives on the audited /dex/devices/{id} family.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover valid names via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized and matched exactly; omit for all versions."}], "responses": {"200": {"description": "Trend object (app, version, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale}). A sub-floor (<10 devices) point carries suppressed=true with device_count only."}, "400": {"description": "missing app, or app/version invalid (too long or control characters)"}, "503": {"description": "service unavailable, or the app-perf store read degraded (retry)"}}}
     },
+    "/dex/perf/app/devices": {
+      "get": {"summary": "Which devices reported one app version (version-row drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read via AuthRoutes::require_fleet_read (ADR-0017 admit-then-filter — the SOLE gate on this route, never stacked with a bare permission check). Unlike GET /dex/perf/app above, each row here names an agent_id — a fleet-wide fan-out of identified per-device data — so the caller's management-group/service-scope confinement is pushed into the underlying SQL query itself (never a post-fetch filter): a confined caller sees exactly their visible devices, never an unfiltered page. version is REQUIRED and matched EXACTLY (omit-means-'all-versions' does NOT apply here, unlike /dex/perf/app — pass an empty string for the unknown-version bucket; Linux procperf reports every app under this empty bucket today). Each row is that device's MOST RECENT reported day for this exact (app, version) among its retained daily top-N resource-significant app-versions — NOT a census of every device with this app-version installed (see /api/v1/inventory/software for the census). Rows are ordered by descending cpu_avg and capped; truncated=true means only the highest-CPU devices are shown. Per-device (B1) data retains only 31 days, shorter than this trend's 180-day (B2) retention, so a version last seen >31 days ago legitimately returns zero devices even though GET /dex/perf/app still shows aggregate history for it. Individual-identifying, so every call emits a dex.app_perf.devices.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Exact version, canonicalized and matched exactly; empty string = the unknown-version bucket, NOT 'all versions'."}], "responses": {"200": {"description": "Devices-drill object (app, version, truncated, devices[].{agent_id, last_day, samples, cpu_avg, ws_avg_bytes})"}, "400": {"description": "missing/invalid app or version (version must be present, even if empty)"}, "403": {"description": "caller lacks GuaranteedState:Read"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.app_perf.devices.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
+    },
     "/dex/perf/group": {
       "get": {"summary": "Management-group app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The fleet-trend shape (GET /dex/perf/app) aggregated over ONE management group's members, computed on-the-fly from the per-device B1 store (NOT the fleet B2). One point per (version, UTC day): exact group mean/max + bucket-resolution p50/p95, same histogram scheme as the fleet trend. Because a management group is a set of SPECIFIC devices, any (version, day) point covering fewer than the statistical floor (10) of devices is returned with suppressed=true and device_count only — its means/percentiles are withheld (a small named-group aggregate is de-facto individual behaviour). Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read (like the cohort surface): a management-group-scoped RBAC principal does not pass the global check and cannot use this endpoint — no cross-operator exposure on THAT axis. A service-scoped API token is a separate axis, though: it holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so it could otherwise supply any group_id, including one outside its own service — denied outright (403), and the deny is audited (dex.perf.group.view) though an ordinary successful read is not.", "parameters": [{"name": "group_id", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Group trend (group_id, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing group_id/app, or a param too long"}, "403": {"description": "Service-scoped API token — this management-group read cannot be confined to the token's service (a management-group-scoped RBAC grant is a different axis and is excluded by the global permission gate; a service-scoped token holds a global grant regardless)."}, "503": {"description": "service unavailable, or the app-perf group read degraded (retry)"}}}
+    },
+    "/dex/perf/tag": {
+      "get": {"summary": "Device-tag-cohort app performance over time", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The SAME on-the-fly B1 aggregate as GET /dex/perf/group, but membership resolves via a device tag value (default key 'model', the asset-tagging recipe's conventional key) instead of a management group id — e.g. 'which Latitude 5420 devices regressed on this app'. Because a named tag-value cohort is a set of SPECIFIC devices exactly like a management group, the SAME statistical floor (10) applies: a sub-floor (version, day) point is suppressed=true with device_count only. Discover valid values for a key via GET /dex/perf/cohorts?key=<key> (its cohorts[].cohort field lists them) — this endpoint answers the trend for ONE already-known value; it does not enumerate them. Aggregate (no agent_id). Gated on GLOBAL GuaranteedState:Read and denied to a service-scoped API token exactly like GET /dex/perf/group (a service-scoped token holds a global GuaranteedState:Read grant via ITServiceOwner regardless of scope, so unguarded it could supply any tag value fleet-wide, including one outside its own service) — denied outright (403), and the deny is audited (dex.perf.tag.view) though an ordinary successful read is not.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "value", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Tag value naming the cohort; discover via GET /dex/perf/cohorts?key=<key>."}, {"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "version", "in": "query", "required": false, "schema": {"type": "string", "maxLength": 512}, "description": "Canonicalized + matched exactly; omit for all versions."}], "responses": {"200": {"description": "Tag-cohort trend (key, value, app, version, floor, points[].{version, day, device_count, suppressed, and when not suppressed: cpu_mean, cpu_max, cpu_p50|null, cpu_p95|null, ws_mean, ws_max, ws_p50|null, ws_p95|null, hist_stale})"}, "400": {"description": "missing value/app, invalid tag key, or a param too long"}, "403": {"description": "Service-scoped API token — this tag-cohort read cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf tag cohort read degraded (retry)"}}}
     },
     "/dex/perf/compare": {
       "get": {"summary": "Before/after app performance (cohort-paired, /auto VERIFY)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. The UAT non-functional evidence: did upgrading 'app' from 'baseline' to 'candidate' change how the SAME machines in 'group' perform? The shift is computed PER MACHINE (each device's own baseline-version window vs its own candidate-version window, both from the per-device B1 store, the window anchored to that machine's version transition not to today), then the per-machine deltas are aggregated — so the population is held fixed (a fleet baseline-vs-candidate diff would be confounded by different populations). A machine that ran only one of the two versions in-window is EXCLUDED and counted (baseline_only/candidate_only); cohort members with no app-perf data at all are no_data. EVIDENTIAL ONLY: the response is the measured shift (cpu/ws before/after means, median per-machine delta, p95 across machines) plus the up/flat/down per-machine split — there is NO verdict, NO threshold, NO pass/fail. NO cohort floor (real canaries are 2-3 devices): a sub-floor paired set carries small_cohort=true (render 'indicative'), never suppression; insufficient=true means no machine ran both versions. The aggregate carries NO per-machine row (that PII is the audited dashboard drill). Because an unfloored small-cohort aggregate is near-individual, the read IS audited (dex.app_perf.compare, operational set-and-proceed). Gated on GLOBAL GuaranteedState:Read like /dex/perf/group, including the same service-scoped-token caveat: a token holds a global grant via ITServiceOwner regardless of scope, so it could otherwise supply any group, including one outside its own service — denied outright (403), audited under this same dex.app_perf.compare verb.", "parameters": [{"name": "app", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "App name; discover via GET /dex/perf/apps."}, {"name": "group", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "Management-group id whose members are the cohort."}, {"name": "baseline", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The before version (canonicalized + matched exactly)."}, {"name": "candidate", "in": "query", "required": true, "schema": {"type": "string", "maxLength": 512}, "description": "The after version; must differ from baseline."}, {"name": "window", "in": "query", "required": false, "schema": {"type": "integer", "default": 7, "minimum": 1, "maximum": 31}, "description": "Days of each version per machine to reduce."}], "responses": {"200": {"description": "Comparison object (app, group_id, baseline_version, candidate_version, window_days, cohort_size, paired, baseline_only, candidate_only, no_data, small_cohort, insufficient, cpu{before_mean, after_mean, delta_median, before_p95, after_p95}, ws{...}, distribution{up, flat, down})"}, "400": {"description": "missing/invalid param, or baseline == candidate"}, "403": {"description": "Service-scoped API token — this near-individual before/after comparison cannot be confined to the token's service."}, "503": {"description": "service unavailable, or the app-perf cohort read degraded (retry)"}}}
@@ -1767,7 +1791,7 @@ void RestApiV1::register_routes(
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1784,7 +1808,7 @@ void RestApiV1::register_routes(
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
                     std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn), std::move(verify_api));
+                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api));
 }
 
 void RestApiV1::register_routes(
@@ -1809,7 +1833,7 @@ void RestApiV1::register_routes(
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
     DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api) {
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -2104,6 +2128,17 @@ void RestApiV1::register_routes(
                   if (!bundle_orch) {
                       res.status = 503;
                       res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
+                      return;
+                  }
+                  // #2437-class guard: raw-text depth check before parse, same
+                  // ordering as the result-set creation routes above - a
+                  // parsed-then-dumped "steps" subtree still crashes on the
+                  // dump below (validate_bundle_steps(body["steps"].dump())),
+                  // so the check has to run on the raw text before any parse.
+                  if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                      res.status = 400;
+                      res.set_content(detail::a4_error(res, "request body nests too deeply"),
+                                      "application/json");
                       return;
                   }
                   auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -7540,7 +7575,7 @@ void RestApiV1::register_routes(
     // contract (#4033 acceptance criteria, explicit). require_fleet_read
     // already audits every DENIAL path internally (`auth.fleet_read_required`).
     sink.Get("/api/v1/devices",
-             [fleet_read_fn, agents_fn](const httplib::Request& req, httplib::Response& res) {
+             [fleet_read_fn, device_api](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (!fleet_read_fn) {
@@ -7555,21 +7590,21 @@ void RestApiV1::register_routes(
                  auto gate = fleet_read_fn(req, res, "Infrastructure", "Read");
                  if (!gate.admitted)
                      return; // gate already wrote the A4 error body + status.
-                 if (!agents_fn) {
+                 if (!device_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 const auto agents = agents_fn();
+                 const auto devices = device_api->list_devices();
                  JArr arr;
                  std::size_t dropped = 0;
-                 for (const auto& a : agents) {
-                     if (!authz::in_scope(gate.scope, a.value("agent_id", ""))) {
+                 for (const auto& d : devices) {
+                     if (!authz::in_scope(gate.scope, d.agent_id)) {
                          ++dropped;
                          continue;
                      }
-                     arr.add_raw(device_agent_row_json(a).dump());
+                     arr.add_raw(device_agent_row_json(d).dump());
                  }
                  JObj data;
                  data.raw("devices", arr.str());
@@ -7588,13 +7623,18 @@ void RestApiV1::register_routes(
     // same BLOCKING defect its doc comment warns against), and an
     // out-of-scope agent_id collapses to the SAME "not found" response as a
     // genuinely nonexistent one — the existence-oracle closure this pattern
-    // exists for. The scan does NOT early-break on an out-of-scope match
-    // (scan-length symmetry — the #3564/Gate-8 timing-side-channel lesson):
-    // both !found sub-cases are indistinguishable in every caller-visible
-    // channel (response body AND scan length); the distinction is recorded
-    // ONLY server-side (spdlog), never audited with a caller-queryable
-    // detail string (get_agent_details' own #3564 fix note explains why a
-    // per-id audit detail string cannot safely carry it).
+    // exists for.
+    //
+    // ADR-0031 WS-A4 wave 2: `in_scope` (a pure fn of the REQUESTED id + caller
+    // scope, reading NO fleet data) is checked FIRST and an out-of-scope id is
+    // denied with 404 BEFORE any backing read — so the out-of-scope path does
+    // ZERO registry/tag-store work and cannot leak "an agent with this id
+    // exists" by timing OR by a 503 during a tag-store outage. Only in-scope ids
+    // reach `device_api->lookup_device(id)`, an O(1) point lookup (device_api.hpp
+    // #3564 note); its miss returns the identical 404, its degrade a 503. This
+    // replaces the old scan-length-symmetry AND closes the tag-read timing gap a
+    // lookup-then-scope ordering would leave (governance #3564, security-guardian
+    // + architect).
     //
     // NOT audited (neither success nor not-found): matches list's posture
     // above and the fragments' (`/fragments/device/page`,
@@ -7606,8 +7646,7 @@ void RestApiV1::register_routes(
     // emit_behavioral_audit, and take the fragments' unaudited posture as
     // the standard to match rather than MCP's.
     sink.Get(R"(/api/v1/devices/([^/]+))",
-             [fleet_read_fn, agents_fn, tag_store](const httplib::Request& req,
-                                                   httplib::Response& res) {
+             [fleet_read_fn, device_api](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (!fleet_read_fn) {
@@ -7623,50 +7662,41 @@ void RestApiV1::register_routes(
                  if (!gate.admitted)
                      return;
                  const std::string agent_id = req.matches[1].str();
-                 if (!agents_fn) {
+                 if (!device_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "device registry unavailable", cid),
                                      "application/json");
                      return;
                  }
-                 const auto agents = agents_fn();
-                 bool found = false;
-                 bool exists_out_of_scope = false;
-                 nlohmann::json match;
-                 for (const auto& a : agents) {
-                     if (a.value("agent_id", "") != agent_id)
-                         continue;
-                     if (authz::in_scope(gate.scope, agent_id)) {
-                         match = a;
-                         found = true;
-                         break; // only the in-scope match short-circuits the scan.
-                     }
-                     // Keep scanning — see the route's header comment on why an
-                     // out-of-scope match must not break here.
-                     exists_out_of_scope = true;
-                 }
-                 if (!found) {
-                     spdlog::debug("devices.detail: {} for {} (caller-visible response unchanged)",
-                                   exists_out_of_scope ? "out-of-scope match" : "no match", agent_id);
+                 // #3564: deny an out-of-scope id BEFORE any backing read. `in_scope`
+                 // is a pure function of (id, caller scope) and touches no fleet data,
+                 // so an out-of-scope caller performs ZERO registry/tag-store work —
+                 // the not-found response is identical to a genuine miss in body, status
+                 // AND cost, and a degraded tag store cannot distinguish an out-of-scope
+                 // id (it is never read). Only in-scope ids reach lookup_device below.
+                 if (!authz::in_scope(gate.scope, agent_id)) {
+                     spdlog::debug("devices.detail: out-of-scope {} -> 404 before lookup; cid={}",
+                                   agent_id, cid);
                      res.status = 404;
                      res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
                                      "application/json");
                      return;
                  }
-                 std::optional<std::vector<DeviceTag>> tags;
-                 if (tag_store) {
-                     auto t = tag_store->get_all_tags(agent_id);
-                     if (!t) {
-                         res.status = 503;
-                         res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
-                                         "application/json");
-                         return;
-                     }
-                     tags = std::move(*t);
+                 auto result = device_api->lookup_device(agent_id);
+                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
+                     res.status = 503;
+                     res.set_content(detail::error_json_a4(503, "tag store unavailable", cid),
+                                     "application/json");
+                     return;
                  }
-                 res.set_content(
-                     ok_json(device_agent_detail_json(match, tags ? &*tags : nullptr).dump()),
-                     "application/json");
+                 if (!*result) { // genuine miss
+                     res.status = 404;
+                     res.set_content(detail::error_json_a4(404, "Device not found: " + agent_id, cid),
+                                     "application/json");
+                     return;
+                 }
+                 res.set_content(ok_json(device_agent_detail_json(**result).dump()),
+                                 "application/json");
              });
 
     // ── Execution Statistics (capability 1.9) ────────────────────────────
@@ -9123,6 +9153,14 @@ void RestApiV1::register_routes(
             auto session = auth_fn(req, res);
             if (!session)
                 return;
+            // #2437-class guard: check nesting on the RAW body BEFORE parse.
+            // A parsed-then-dumped subtree still crashes on the dump - the
+            // check has to run before any allocation, on the text itself
+            // (mirrors mcp_jsonrpc.hpp's own parse_request ordering).
+            if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                return;
+            }
             auto body = nlohmann::json::parse(req.body, nullptr, false);
             if (body.is_discarded() || !body.is_object()) {
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9220,6 +9258,16 @@ void RestApiV1::register_routes(
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      // Found during this fix, not named in the original triage:
+                      // this handler also does `cr.source_payload = body.dump()`
+                      // a few lines below on caller-supplied JSON, same crash
+                      // shape as the three named creation routes.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9436,6 +9484,12 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
+                          return;
+                      }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
                       if (body.is_discarded() || !body.is_object()) {
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
@@ -9500,6 +9554,12 @@ void RestApiV1::register_routes(
                           return;
                       if (!instruction_store || !instruction_store->is_open()) {
                           rs_err(res, 503, "instruction store not available");
+                          return;
+                      }
+                      // #2437-class guard: raw-text depth check before parse, same
+                      // as the identical guard on POST /api/v1/result-sets above.
+                      if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: request body nests too deeply");
                           return;
                       }
                       auto body = nlohmann::json::parse(req.body, nullptr, false);
@@ -9573,6 +9633,17 @@ void RestApiV1::register_routes(
                       auto orig = load_owned(req, id, session->username, res);
                       if (!orig)
                           return;
+                      // #2437-class guard, read side: the row is a SHARED table,
+                      // and a source_payload written before this guard existed
+                      // (or by any other path, past or future) could be poisoned.
+                      // Check the STORED text before parse, same as the write-time
+                      // guards above; on rejection, never reach run_async (no
+                      // re-dispatch of a row we can't safely re-serialise).
+                      if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          rs_err(res, 400,
+                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                          return;
+                      }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);
                       // Synthesise the parent so the sibling shares the
                       // original's parent (re-eval re-asks the same question
@@ -10856,6 +10927,20 @@ void RestApiV1::register_routes(
                             "application/json");
             return;
         }
+        // #2437-class guard: check nesting on the RAW body BEFORE parse. A
+        // parsed-then-dumped spark/assertion/remediation subtree still
+        // crashes on derive_rule_spec's spec.dump() below - the check has to
+        // run before any allocation, on the text itself (mirrors
+        // mcp_jsonrpc.hpp's own parse_request ordering and the result-set
+        // creation routes above).
+        if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+            res.status = 400;
+            res.set_content(detail::error_json_a4(400, "request body nests too deeply", cid,
+                                                  "flatten the request body; spark/assertion/"
+                                                  "remediation blocks may nest at most 32 levels deep"),
+                            "application/json");
+            return;
+        }
         auto body = nlohmann::json::parse(req.body, nullptr, false);
         if (body.is_discarded() || !body.is_object()) {
             res.status = 400;
@@ -11149,6 +11234,23 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const GuaranteedStateRuleRow& existing_rule = **existing;
+                 // #2437-class guard: check nesting on the RAW body BEFORE
+                 // parse, same ordering and rationale as the create handler
+                 // above - a metadata-only PUT never reaches derive_rule_spec
+                 // (it re-validates the EXISTING stored spec instead), but any
+                 // body actually supplying spark/assertion/remediation still
+                 // reaches derive_rule_spec's spec.dump() below.
+                 if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
+                     res.status = 400;
+                     res.set_content(
+                         detail::error_json_a4(400, "request body nests too deeply", cid,
+                                               "flatten the request body; spark/assertion/"
+                                               "remediation blocks may nest at most 32 levels deep"),
+                         "application/json");
+                     audit_fn(req, "guaranteed_state.rule.update", "denied", "GuaranteedState", id,
+                              "request body nests too deeply");
+                     return;
+                 }
                  auto body = nlohmann::json::parse(req.body, nullptr, false);
                  if (body.is_discarded() || !body.is_object()) {
                      res.status = 400;
@@ -12667,6 +12769,159 @@ void RestApiV1::register_routes(
                                  "application/json");
              });
 
+    // GET /dex/perf/app/devices?app=<name>&version=<v> — the version-row "which
+    // devices" drill: unlike the aggregate above, each row names an agent_id, a
+    // fleet-wide fan-out of identified per-device data. That single difference
+    // changes the authorization posture entirely (routed-concerns.md's DEX row):
+    // the aggregate above is correctly gated on a bare perm_fn (no agent_id to
+    // confine); THIS route uses `fleet_read_fn` (AuthRoutes::require_fleet_read,
+    // ADR-0017) as its SOLE gate instead — never stacked with perm_fn (the
+    // BLOCKING defect require_fleet_read's own doc comment warns against) — so a
+    // management-group- or service-scoped caller gets the real, narrowed
+    // agent_id set rather than either an unfiltered fleet-wide read or an
+    // outright deny. The gate's VisibleSet is pushed into the STORE QUERY
+    // (AppPerfDailyStore::list_devices_for_version), never a post-fetch filter —
+    // present-empty yields zero rows, not an unfiltered page.
+    //
+    // No statistical floor: every row already names an agent_id, so a
+    // named-group-sized list protects nothing a floor would add (same reasoning
+    // as the per-device drill GET /dex/devices/{id}/app-perf and VERIFY's
+    // compare, both floor-free). The audit trail is the control instead.
+    //
+    // `version` is REQUIRED-PRESENT (distinct from this file's `app` route's
+    // "" = all-versions convention above): this drill is always scoped to ONE
+    // exact version, and Linux procperf emits "" for every app
+    // (tar_proc_perf.cpp) — an omitted `version` would otherwise silently read
+    // as "all versions" and collapse to the single Linux bucket.
+    //
+    // FAIL-CLOSED audit (dex.app_perf.devices.view, distinct from every other
+    // dex.perf.*/dex.app_perf.* verb so this identified-device access stays
+    // independently countable, works-council precedent: dex.app_perf.compare.drill):
+    // the read happens first (so the audit detail can carry the real device
+    // count), and the RESPONSE is withheld — 503 + Sec-Audit-Failed — if that
+    // audit row fails to persist, matching GET /dex/devices/{id}/app-perf's
+    // posture exactly (this route just moves the read earlier so the detail is
+    // honest instead of generic).
+    sink.Get(
+        "/api/v1/dex/perf/app/devices",
+        [fleet_read_fn, audit_fn, app_perf_providers](const httplib::Request& req,
+                                                       httplib::Response& res) {
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!fleet_read_fn) {
+                spdlog::error("dex.app_perf.devices.view: fleet_read_fn unwired — misconfigured "
+                              "call site; failing closed; cid={}",
+                              cid);
+                res.status = 503;
+                res.set_content(detail::error_json_a4(503, "service unavailable", cid),
+                                "application/json");
+                return;
+            }
+            const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+            if (app.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'app'", cid,
+                                          "supply ?app=<name>; discover names via GET "
+                                          "/api/v1/dex/perf/apps"),
+                    "application/json");
+                return;
+            }
+            if (!app_perf_param_valid(app)) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "invalid parameter 'app'", cid,
+                                          "'app' must be <= 512 bytes with no control "
+                                          "characters"),
+                    "application/json");
+                return;
+            }
+            if (!req.has_param("version")) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'version'", cid,
+                                          "supply ?version=<exact version>, or ?version= for "
+                                          "the unknown-version bucket; discover versions via "
+                                          "GET /api/v1/dex/perf/app"),
+                    "application/json");
+                return;
+            }
+            const std::string raw_version = req.get_param_value("version");
+            if (!app_perf_param_valid(raw_version)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid parameter 'version'", cid),
+                                "application/json");
+                return;
+            }
+            const std::string version = yuzu::util::canon_version(raw_version);
+            // require_fleet_read is the SOLE gate — see the comment above the route
+            // registration for why it must never be stacked with perm_fn.
+            auto gate = fleet_read_fn(req, res, "GuaranteedState", "Read");
+            if (!gate.admitted)
+                return;
+            if (!app_perf_providers.version_devices) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            std::optional<std::vector<std::string>> visible_ids;
+            if (gate.scope)
+                visible_ids = std::vector<std::string>(gate.scope->begin(), gate.scope->end());
+            bool truncated = false;
+            auto rows = app_perf_providers.version_devices(app, version, visible_ids, truncated);
+            if (!rows) { // AUTHORITATIVE read degrade
+                (void)detail::try_persist_audit(
+                    audit_fn, req, "dex.app_perf.devices.view", "failure", "GuaranteedState", "",
+                    "app=" + audit_token(app) + " version=" + audit_token(version) +
+                        " store degraded; cid=" + cid);
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf store read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            // Audit AFTER the read (so the detail carries the real device count) but
+            // BEFORE the response is composed/sent — FAIL CLOSED: withhold the data
+            // if the evidence row is known-lost, exactly like GET
+            // /dex/devices/{id}/app-perf, just with a richer detail string.
+            if (!detail::emit_behavioral_audit(
+                    audit_fn, req, res, "dex.app_perf.devices.view", "success", "GuaranteedState",
+                    "",
+                    "app=" + audit_token(app) + " version=" + audit_token(version) +
+                        " devices=" + std::to_string(rows->size()) + " cid=" + cid)) {
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "audit subsystem unavailable; refusing to serve "
+                                               "device data without durable evidence",
+                                          cid, 5000, "retry the request"),
+                    "application/json");
+                spdlog::warn("dex.app_perf.devices.view audit fail-closed (503) cid={}", cid);
+                return;
+            }
+            JArr arr;
+            for (const auto& d : *rows) {
+                arr.add(JObj()
+                            .add("agent_id", d.agent_id)
+                            .add("last_day", d.last_day)
+                            .add("samples", d.samples)
+                            .add("cpu_avg", d.cpu_avg)
+                            .add("ws_avg_bytes", d.ws_avg_bytes));
+            }
+            res.set_content(ok_json(JObj()
+                                        .add("app", app)
+                                        .add("version", version)
+                                        .add("truncated", truncated)
+                                        .raw("devices", arr.str())
+                                        .str()),
+                            "application/json");
+        });
+
     // GET /dex/perf/group?group_id=<id>&app=<name>&version=<v> — the management-
     // group trend: the same fleet-trend shape, aggregated on-the-fly over ONE
     // group's members (B1, NOT the fleet B2), with the statistical-floor
@@ -12793,6 +13048,128 @@ void RestApiV1::register_routes(
             }
             res.set_content(ok_json(JObj()
                                         .add("group_id", group_id)
+                                        .add("app", app)
+                                        .add("version", version)
+                                        .add("floor", static_cast<int64_t>(kDexCohortFloor))
+                                        .raw("points", points.str())
+                                        .str()),
+                            "application/json");
+        });
+
+    // GET /dex/perf/tag?key=&value=&app=&version= — the SAME on-the-fly B1
+    // aggregate as /dex/perf/group just above, membership resolved via a
+    // device TAG value (default key "model") instead of a management-group
+    // id — the REST/MCP twin of the dashboard's device-model cohort filter
+    // (ADR-1005: that filter must not be UI-only). Same floor, same
+    // service-scoped-token exposure and deny posture as /dex/perf/group (see
+    // that handler's own comment for the full reasoning) — a tag-value
+    // cohort is equally a "named set of specific devices".
+    sink.Get(
+        "/api/v1/dex/perf/tag",
+        [perm_fn, app_perf_providers, app_pct_json,
+         deny_fleet_wide_service_scoped](const httplib::Request& req, httplib::Response& res) {
+            if (deny_fleet_wide_service_scoped(
+                    req, res, "dex.perf.tag.view", "GuaranteedState",
+                    "device-tag app-perf trend denied to a service-scoped token",
+                    "service-scoped tokens may not read a device-tag cohort's app-perf trend"))
+                return;
+            if (!perm_fn(req, res, "GuaranteedState", "Read"))
+                return;
+            const auto cid = detail::make_correlation_id();
+            res.set_header("X-Correlation-Id", cid);
+            if (!app_perf_providers.tag_cohort) {
+                res.status = 503;
+                res.set_content(detail::error_json_a4(
+                                    503, "service unavailable", cid, /*retry_after_ms=*/5000,
+                                    "retry after server warmup; the app-perf store provider "
+                                    "initialises during startup"),
+                                "application/json");
+                return;
+            }
+            std::string key =
+                req.has_param("key") ? req.get_param_value("key") : std::string(kDexDefaultCohortKey);
+            if (!TagStore::validate_key(key)) {
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid tag key", cid),
+                                "application/json");
+                return;
+            }
+            const std::string value =
+                req.has_param("value") ? req.get_param_value("value") : "";
+            if (value.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'value'", cid,
+                                          "supply ?value=<tag value>; discover values via GET "
+                                          "/api/v1/dex/perf/cohorts?key=<key>"),
+                    "application/json");
+                return;
+            }
+            if (!app_perf_param_valid(value)) { // shared cap + control-char/NUL re-floor
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid parameter 'value'", cid),
+                                "application/json");
+                return;
+            }
+            const std::string app = req.has_param("app") ? req.get_param_value("app") : "";
+            if (app.empty()) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "missing required parameter 'app'", cid,
+                                          "supply ?app=<name>; discover names via GET "
+                                          "/api/v1/dex/perf/apps"),
+                    "application/json");
+                return;
+            }
+            if (!app_perf_param_valid(app)) {
+                res.status = 400;
+                res.set_content(
+                    detail::error_json_a4(400, "invalid parameter 'app'", cid,
+                                          "'app' must be <= 512 bytes with no control characters"),
+                    "application/json");
+                return;
+            }
+            const std::string version =
+                req.has_param("version") ? req.get_param_value("version") : "";
+            if (!app_perf_param_valid(version)) { // "" allowed = all-versions sentinel
+                res.status = 400;
+                res.set_content(detail::error_json_a4(400, "invalid parameter 'version'", cid),
+                                "application/json");
+                return;
+            }
+            auto rows = app_perf_providers.tag_cohort(key, value, app, version);
+            if (!rows) { // AUTHORITATIVE degrade (tag lookup OR aggregate read)
+                res.status = 503;
+                res.set_content(
+                    detail::error_json_a4(503, "app-perf tag cohort read degraded", cid,
+                                          /*retry_after_ms=*/2000,
+                                          "the app-perf store could not be read; retry shortly"),
+                    "application/json");
+                return;
+            }
+            JArr points;
+            for (const auto& pt : app_perf_group_trend(*rows, kDexCohortFloor)) {
+                JObj o;
+                o.add("version", pt.version)
+                    .add("day", pt.day)
+                    .add("device_count", pt.device_count)
+                    .add("suppressed", pt.suppressed);
+                if (!pt.suppressed) {
+                    o.add("cpu_mean", pt.cpu_mean)
+                        .add("cpu_max", pt.cpu_max)
+                        .raw("cpu_p50", app_pct_json(pt.cpu_p50))
+                        .raw("cpu_p95", app_pct_json(pt.cpu_p95))
+                        .add("ws_mean", pt.ws_mean)
+                        .add("ws_max", pt.ws_max)
+                        .raw("ws_p50", app_pct_json(pt.ws_p50))
+                        .raw("ws_p95", app_pct_json(pt.ws_p95))
+                        .add("hist_stale", pt.hist_stale);
+                }
+                points.add(std::move(o));
+            }
+            res.set_content(ok_json(JObj()
+                                        .add("key", key)
+                                        .add("value", value)
                                         .add("app", app)
                                         .add("version", version)
                                         .add("floor", static_cast<int64_t>(kDexCohortFloor))

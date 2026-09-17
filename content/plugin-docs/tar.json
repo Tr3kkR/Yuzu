@@ -2804,6 +2804,7 @@
     "changelog": [
       "changelog.d/1986-getting-started-import-examples.fixed.md",
       "changelog.d/20260825-offload-target-store-postgres.changed.md",
+      "changelog.d/20260914-wave7b-tar-usage-sql-denied.security.md",
       "changelog.d/2093-tar-db-ddl-one-transaction.changed.md",
       "changelog.d/2093-tar-events-resurrected-on-reopen.fixed.md",
       "changelog.d/2361-tar-retention-clock-guard.fixed.md",

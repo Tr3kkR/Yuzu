@@ -32,8 +32,8 @@ Three things checked against the real, integrated tree:
      named failure instead.
   3. PARSE INTEGRITY: the number of fragment rows this script's regex finds
      an `.execute_gate` for must equal the number of rows it finds a
-     `.plugin`/`.action` pair for, and both must equal 189 (45+55+34+42+5+3+2+3
-     across the eight fragments) — architect review requirement: a regex that
+     `.plugin`/`.action` pair for, and both must equal EXPECTED_TOTAL_ROWS
+     (4+5+45+55+34+42+2+3+4+2+2 across the eleven fragments) — architect review requirement: a regex that
      silently fails to associate a gate with its row must read as a hard
      failure, never as an absent gate.
 
@@ -89,13 +89,18 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
 ]
-# 3 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
+# 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
 # doc comments and the #1398 design doc's verified row-count audit. The 2 is
 # disk_actions and the trailing 4 is power_health
 # (battery/thermal/power_plan/set_power_plan), both Wave 6.
 # Wave 7 PR7.1: +2 autoruns (list/catalog).
-EXPECTED_TOTAL_ROWS = 195
+# Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
+# Wave 9 PR9.2b: +2 windows_optional_features (list/info).
+# Hardware CI sync-on-demand: +1 core (__sync__.now).
+EXPECTED_TOTAL_ROWS = 201
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

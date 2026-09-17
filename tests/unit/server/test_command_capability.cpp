@@ -167,11 +167,11 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────
 
-TEST_CASE("capdecls::core_dispatch_capabilities: exactly the three system-initiated dispatches, "
+TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiated dispatches, "
           "all system_reserved",
           "[server][dispatch][capability]") {
     auto rows = capdecls::core_dispatch_capabilities();
-    REQUIRE(rows.size() == 3);
+    REQUIRE(rows.size() == 4);
     for (const auto& row : rows)
         CHECK(row.system_reserved);
 
@@ -191,6 +191,16 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the three system-initia
     REQUIRE(tags.has_value());
     CHECK(tags->securable == "Tag");
     CHECK(tags->operation == authz::Operation::Write);
+
+    // Sync-on-demand (__sync__.now): read-only, system-reserved, lands under Inventory.
+    auto sync = registry.classify("__sync__", "now");
+    REQUIRE(sync.has_value());
+    CHECK(sync->dispatch_class == DispatchClass::ReadOnly);
+    CHECK(sync->mutability == Mutability::None);
+    CHECK(sync->securable == "Inventory");
+    CHECK(sync->operation == authz::Operation::Read);
+    CHECK(sync->system_reserved);
+    CHECK(sync->execute_gate == ExecuteGate::None);
 }
 
 // ── normalize_action_key ─────────────────────────────────────────────────

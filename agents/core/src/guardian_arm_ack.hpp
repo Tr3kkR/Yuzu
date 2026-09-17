@@ -7,14 +7,17 @@
  *
  * GuardianArmAckLedger tracks ONE outstanding "application" - the set of rules
  * a single apply_rules() push accepted for spark arming
- * (GuardianEngine::ReconcileOutcome::Accepted) whose arms have not yet
- * resolved - so a heartbeat-bounded drain (§R5.3) can tell whether a
- * generation may advance, and a same-generation full_sync retry can be told
- * apart from a genuinely new or changed push (§R5.3's own duplicate-retry
- * language: "A same-generation re-push ... is a no-op while every outstanding
- * episode for that generation is still genuinely pending ... and only
- * triggers a full re-apply once something has actually failed, expired, or
- * the push's content has changed underneath it").
+ * (GuardianEngine::ReconcileOutcome::Accepted) - so a heartbeat-bounded drain
+ * (§R5.3) can tell whether a generation may advance, and a same-generation
+ * full_sync retry can be told apart from a genuinely new or changed push
+ * (§R5.3's own duplicate-retry language: "A same-generation re-push ... is a
+ * no-op while every outstanding episode for that generation is still
+ * genuinely pending ... and only triggers a full re-apply once something has
+ * actually failed, expired, or the push's content has changed underneath
+ * it"). Most Accepted receipts genuinely have not yet resolved when added -
+ * but a re-observed Wedged receipt (rung 9c PR-5c, #4221 up-2) is already
+ * terminal the moment it is registered; the ledger does not distinguish the
+ * two cases, it just drains whatever each receipt's own status reports.
  *
  * Built and independently tested here in Unit 5; wired into the live path by
  * Unit 6 - reconcile_rule_locked() now calls GuardianSparkRuntime::attach_rule
@@ -49,6 +52,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include <yuzu/plugin.h>
 
@@ -84,6 +88,18 @@ inline constexpr std::size_t kAckDrainMaxPerTick = 1024;
 /// regardless of process, restart, or map iteration order.
 YUZU_EXPORT std::string guardian_push_content_id(const yuzu::guardian::v1::GuaranteedStatePush& push);
 
+/// Human-readable rendering of a ReceiptStatus, for drain_locked()'s own async-
+/// failure warn line (the only place a non-Committed resolution is logged - see
+/// that call site's own comment). Exported (unlike an internal helper) so a
+/// direct unit test can assert the full mapping without LogCapture - governance
+/// follow-up (Gate 4, happy-path + unhappy-path, 2026-09-16): the LogCapture-
+/// based assertions this function's naming previously relied on were removed
+/// (cross-image hazard, see resolved_statuses_for_test()'s own doc comment)
+/// without anything replacing their incidental coverage of this mapping.
+/// Exhaustive switch, no `default` (its own definition's comment has the full
+/// rationale) - a missing case is a build WARNING, not a silent "Unknown".
+YUZU_EXPORT const char* receipt_status_name(GuardianSparkRuntime::ReceiptStatus status);
+
 class YUZU_EXPORT GuardianArmAckLedger {
 public:
     GuardianArmAckLedger();
@@ -106,13 +122,16 @@ public:
     void begin_application(std::uint64_t generation, std::string content_id, bool full_sync,
                            std::size_t applied);
 
-    /// Add one rule's accepted-but-unresolved arm to the current application.
-    /// Caller's responsibility: only ever called for a rule_id
-    /// reconcile_rule_locked mapped to ReconcileOutcome::Accepted, for the
-    /// application currently open (i.e. after begin_application() for this
-    /// push - never across a push boundary, and never with no current
-    /// application). A no-op (logged, not asserted - this is bookkeeping, not
-    /// a safety property) if called with no current application.
+    /// Add one rule's accepted arm to the current application - USUALLY still
+    /// unresolved, but a re-observed Wedged receipt (rung 9c PR-5c, #4221
+    /// up-2) is already terminal at this call; drain_locked() resolves it on
+    /// its very next tick either way. Caller's responsibility: only ever
+    /// called for a rule_id reconcile_rule_locked mapped to
+    /// ReconcileOutcome::Accepted, for the application currently open (i.e.
+    /// after begin_application() for this push - never across a push
+    /// boundary, and never with no current application). A no-op (logged, not
+    /// asserted - this is bookkeeping, not a safety property) if called with
+    /// no current application.
     void add_pending(std::string rule_id, GuardianSparkRuntime::ArmReceipt receipt);
 
     /// Mark the current application as having hit one of apply_rules()'s
@@ -186,6 +205,26 @@ public:
     /// GuardianEngine::ack_pending_count_for_test() forwards to this. No production
     /// caller.
     std::size_t pending_count_for_test() const;
+
+    /// TEST-ONLY: every non-Committed ReceiptStatus this application's receipts
+    /// have resolved to via drain_locked() - i.e. the same failure-group values
+    /// receipt_status_name() would render into the log line this accessor
+    /// replaces (Committed receipts increment resolved_armed instead and are
+    /// never pushed here). In drain order (std::map key order within one
+    /// drain_locked() call, call order across several - NOT the chronological
+    /// order the underlying claims actually resolved in at runtime); empty if
+    /// there is no current application. Plain object state, not captured log
+    /// text - a captured-log
+    /// assertion is unreliable here because drain_locked()'s own logging call is
+    /// compiled into libyuzu_agent_core, a SEPARATE shared library from the test
+    /// binary on macOS: the default-logger swap test_log_capture.hpp performs
+    /// happens in the test binary's own image and does not reach spdlog calls
+    /// made from the library's image there (see that header's own doc comment -
+    /// the same class of hazard already forced #2238's LogCapture use out of
+    /// this codebase once, tracked unfixed for a second instance as #3355; this
+    /// accessor exists so a third never needs LogCapture at all). No production
+    /// caller.
+    std::vector<GuardianSparkRuntime::ReceiptStatus> resolved_statuses_for_test() const;
 
     /// rung 9c PR-3: a re-statable snapshot of the current application's pending
     /// and resolved-failed counts (see guardian_arm_heartbeat.hpp's
@@ -266,6 +305,7 @@ private:
         std::size_t resolved_armed{0};
         std::size_t resolved_failed{0};
         std::map<std::string, GuardianSparkRuntime::ArmReceipt> pending;
+        std::vector<GuardianSparkRuntime::ReceiptStatus> resolved_statuses_for_test;
     };
     std::unique_ptr<Application> current_;
 };

@@ -21,9 +21,13 @@
 #include "inventory_ingestion.hpp"
 #include "inventory_store.hpp"
 #include "management_group_store.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+#include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
 #include "software_inventory_store.hpp"
 #include "software_licensing_ingestion.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_ingestion.hpp"
+#include "app_usage_store.hpp"
 #include "peer_ip.hpp"
 
 namespace yuzu::server::detail {
@@ -1049,6 +1053,45 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
             if (is_typed_inventory_source(plugin_name))
                 continue; // typed projections, handled by their seams below
             std::string json_str(data_bytes.begin(), data_bytes.end());
+            // #2437-class guard: this is the ONLY call site of InventoryStore::upsert
+            // in the tree, and this blob is raw wire bytes off an agent (relayed via
+            // the gateway) with no prior validation - not even a confirmed parse,
+            // let alone a depth check. dump() on data_json is unboundedly recursive
+            // (mcp_jsonrpc.hpp), so a poisoned blob stored here would SIGSEGV the
+            // whole process on the next read (data_inventory_routes.cpp,
+            // inventory_eval.cpp). Reject the raw text BEFORE parse/store - this one
+            // chokepoint retroactively protects every reader for FUTURE rows, but
+            // does not heal rows already written before this guard shipped (the
+            // three read-side guards cover those). Skip only this one source; still
+            // ack the overall report. Log identifiers only, never the payload.
+            if (mcp::json_exceeds_depth(json_str, mcp::kMcpMaxJsonDepth)) {
+                spdlog::warn("[gateway] ProxyInventory: rejecting '{}' blob from agent={} - "
+                            "nests too deeply (#2437-class)",
+                            onbehalf::sanitize_for_log(plugin_name, 128), agent_id);
+                if (metrics_)
+                    // Fixed sentinel, not plugin_name: this map's KEYS are raw,
+                    // agent-supplied strings for the generic (non-typed) source
+                    // family, so using plugin_name as a label here would let a
+                    // single agent mint unbounded metric series just by
+                    // submitting over-depth blobs under different made-up
+                    // names. Matches validate_inventory_report_source_count's
+                    // own "__report__" sentinel a few lines above for the
+                    // same reason. outcome is its OWN "rejected_depth" value,
+                    // not the existing "rejected" - that value is documented
+                    // (docs/user-manual/inventory.md) and alerted on
+                    // (YuzuInventoryReportRejected) as meaning specifically a
+                    // whole report rejected at the source-map cap; reusing it
+                    // here would make a single over-depth blob page an
+                    // operator with the wrong runbook (gov consistency, same
+                    // reasoning as validate_inventory_report_source_count's
+                    // own rejected-vs-dropped distinction in
+                    // inventory_ingestion.cpp).
+                    metrics_
+                        ->counter("yuzu_inventory_ingest_total",
+                                 {{"source", "__generic__"}, {"outcome", "rejected_depth"}})
+                        .increment();
+                continue;
+            }
             inventory_store_->upsert(agent_id, plugin_name, json_str, collected_epoch);
         }
     }
@@ -1113,6 +1156,29 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyInventory(grpc::ServerContext* con
         } catch (...) {
             spdlog::warn("[gateway] ProxyInventory: software_licensing ingest threw (unknown) for "
                          "agent={} — acked",
+                         agent_id);
+        }
+    }
+    // Typed app_usage via its shared seam (Wave 7 PR7.2) — byte-identical to
+    // the direct ReportInventory path, independently guarded + isolated.
+    if (app_usage_store_ && app_usage_store_->is_open()) {
+        try {
+            ingest_app_usage_report(*app_usage_store_, agent_id, *request, *response, metrics_);
+        } catch (const std::exception& ex) {
+            // P11: unlike the sibling blocks above, a swallowed throw here with no
+            // nack lets the agent's SyncScheduler advance last_hash and go
+            // hash-only for a day with nothing persisted — the nack forces a full
+            // resend next cycle. Follow-up issue filed at delivery to retrofit the
+            // four sibling blocks (installed_software/app_perf/device_ci/
+            // software_licensing) with the same nack; do not do it here.
+            response->add_need_full("app_usage");
+            spdlog::warn("[gateway] ProxyInventory: app_usage ingest threw for agent={} — "
+                         "nacked: {}",
+                         agent_id, ex.what());
+        } catch (...) {
+            response->add_need_full("app_usage");
+            spdlog::warn("[gateway] ProxyInventory: app_usage ingest threw (unknown) for "
+                         "agent={} — nacked",
                          agent_id);
         }
     }

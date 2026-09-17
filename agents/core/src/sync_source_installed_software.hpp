@@ -52,7 +52,7 @@ YUZU_EXPORT std::string installed_software_canonical_blob(std::vector<SwEntry> e
 
 /// Build the `installed_software` SyncSource. `descriptor` is the loaded
 /// `installed_apps` plugin descriptor; when null (plugin not built/loaded — e.g.
-/// `build_examples=false`) the source's collect returns std::nullopt and the
+/// `build_agent=false`) the source's collect returns std::nullopt and the
 /// scheduler no-ops it.
 YUZU_EXPORT SyncSource make_installed_software_source(const YuzuPluginDescriptor* descriptor);
 

@@ -59,7 +59,7 @@ constexpr std::string_view kExecutionsAudit[] = {"get_execution_status", "list_e
                                                  "query_audit_log"};
 constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_tables",
                                            "get_agent_inventory", "query_installed_software",
-                                           "query_software_licenses"};
+                                           "query_software_licenses", "get_agent_app_usage"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -88,7 +88,9 @@ constexpr std::string_view kDexSignals[] = {
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
-                                         "get_dex_group_app_perf",   "compare_app_perf_versions",
+                                         "list_dex_app_perf_devices",
+                                         "get_dex_group_app_perf",   "get_dex_tag_app_perf",
+                                         "compare_app_perf_versions",
                                          "get_dex_device_app_perf"};
 constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundle",

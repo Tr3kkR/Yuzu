@@ -2821,7 +2821,7 @@ Before upgrading any component:
   outbound `ReportInventory` traffic per agent — adjust egress baselines/firewall
   expectations; (b) the data lands in a **new Postgres schema**
   (`software_inventory_store`, auto-migrated at boot, fail-closed); (c) it requires
-  the `installed_apps` plugin to be loaded — a build with `-Dbuild_examples=false`
+  the `installed_apps` plugin to be loaded — a build with `-Dbuild_agent=false`
   (or a plugin dir missing it) collects **nothing**, silently (agent logs only at
   debug). Machine-scope only, no end-user PII (no username collection) — but the
   data is device-attributable, and on **personally-assigned devices** installed-
@@ -3219,6 +3219,37 @@ Grant `Decommission:Delete` to any custom role in that list that must retain the
 decommissioned device's data. `SoftwareLicensing:Delete`, `Inventory:Delete`, and
 `GuaranteedState:Delete` continue to gate their own unrelated surfaces exactly as before — only the
 erasure cascade's gate moved.
+
+### vNEXT — Hardware CI list requires `Inventory:Read`, not the old Devices page's `Infrastructure:Read` (breaking for custom roles)
+
+`/devices` now 302-redirects to `/hardware` (the Hardware CI list) and `/device?id=` redirects to
+`/hardware/ci?id=` — bookmarked links and existing browser navigation keep working transparently,
+since browsers follow redirects. The **permission the list itself checks** changed, though: the old
+Devices page gated on `Infrastructure:Read`; the Hardware CI list gates on `Inventory:Read` (the
+same securable the rest of the Inventory/Software surface already uses).
+
+**Seeded roles are unaffected.** Every built-in role that held `Infrastructure:Read` (Administrator,
+ITServiceOwner) also holds `Inventory:Read`, so no default-role regression on upgrade.
+
+**This is breaking only for a custom role granted `Infrastructure:Read` without `Inventory:Read`.**
+Such a role could see the device list via the old `/devices` page pre-upgrade and will get a `403`
+reaching the redirected `/hardware` page post-upgrade. Audit custom roles before upgrading:
+
+```sql
+SELECT pr.principal_type, pr.principal_id, pr.role_name
+  FROM rbac_store.principal_roles pr
+  JOIN rbac_store.role_permissions rp ON rp.role_name = pr.role_name
+  WHERE rp.securable_type = 'Infrastructure' AND rp.operation = 'Read' AND rp.effect = 'allow'
+    AND NOT EXISTS (
+      SELECT 1 FROM rbac_store.role_permissions rp2
+      WHERE rp2.role_name = pr.role_name
+        AND rp2.securable_type = 'Inventory' AND rp2.operation = 'Read' AND rp2.effect = 'allow'
+    );
+```
+
+Grant `Inventory:Read` to any custom role in that list that must retain device-list visibility.
+`Infrastructure:Read` continues to gate the fleet-wide agent list (`/api/agents`) and other
+infrastructure-tier reads exactly as before — only the Hardware CI list's own gate moved.
 
 ### Retention clock guards (#2360 server audit store, #2361 TAR agent warehouse, #2964 rotation sweep)
 

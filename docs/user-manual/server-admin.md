@@ -45,7 +45,7 @@ The Yuzu server binary accepts the following command-line flags. All flags are o
 | `--cert` | *(none)* | Path to PEM-encoded gRPC server certificate for the **agent listener** (port 50051 by default). Env: `YUZU_CERT`. |
 | `--key` | *(none)* | Path to PEM-encoded gRPC server private key for the agent listener. The file must not be world-readable (Unix: `chmod 600`). Env: `YUZU_KEY`. |
 | `--no-default-certs` | off | Do **not** auto-generate built-in default certificates on first boot. Restores the legacy refuse-to-start: the server will not start unless `--cert`/`--key` (and `--https-cert`/`--https-key` when HTTPS is enabled) are supplied. Use where operator- or HSM-provided certs are mandatory policy. (Defaults emit a startup banner, the audit actions `server.default_certs_generated` + `server.default_certs_in_use`, and the Prometheus gauge `yuzu_server_default_certs_active`.) Env: `YUZU_NO_DEFAULT_CERTS`. |
-| `--ca-dir` | *(platform cert dir)* | Directory for the built-in CA root + default leaf certs (`default-ca.pem`/`.key`, `default-server.pem`, `default-https.pem`, …). Default: `/etc/yuzu/certs` (Linux/macOS), `C:\ProgramData\Yuzu\certs` (Windows). The CA root key is `0600` — back it up (losing it forces a full fleet re-enrollment). Env: `YUZU_CA_DIR`. |
+| `--ca-dir` | *(platform cert dir)* | Directory for the built-in CA root + default leaf certs (`default-ca.pem`/`.key`, `default-server.pem`, `default-https.pem`, …). Default: `/etc/yuzu/certs` (Linux; macOS running as root — matches the packaged-install convention), `~/Library/Application Support/Yuzu/certs` (macOS running as a non-root user — e.g. a native `scripts/start-UAT.sh` dev run, since `/etc/yuzu` is root-owned and macOS has no packaged server installer), `C:\ProgramData\Yuzu\certs` (Windows). The CA root key is `0600` — back it up (losing it forces a full fleet re-enrollment). Env: `YUZU_CA_DIR`. |
 | `--cert-san` | *(none)* | **Repeatable.** Extra Subject Alternative Name to add to *every* auto-generated default leaf (dashboard HTTPS, agent/management gRPC, and gateway), on top of the base `localhost` / `127.0.0.1` / `::1` / `<hostname>`. Forms: `dns:<name>`, `ip:<addr>`, or a bare value (auto-classified as IP vs DNS by shape); a single value may be comma-separated. Use this so the built-in certs validate for a name a client actually dials — e.g. `--cert-san dns:gateway` so an agent reaching the gateway by that service name passes TLS hostname verification, or `--cert-san dns:yuzu.corp.example --cert-san ip:10.0.0.5` for a load-balancer name / VIP. An `ip:` value that is not an IP literal is ignored with a warning. **Ignored** when operator certs are supplied or `--no-default-certs` is set; **changing it does not rotate an existing cert set** — clear `--ca-dir` (or replace the certs) for new SANs to take effect (in a container the cert dir lives in the image layer unless a volume is mounted there, so *recreate* the container — a restart alone won't regenerate). Env: `YUZU_CERT_SAN`. |
 | `--ca-cert` | *(none)* | Path to PEM-encoded CA certificate used to verify agent client certificates (full mTLS). Without this, the agent listener has no client-cert verification — `--insecure-skip-client-verify` plus `YUZU_ALLOW_INSECURE_TLS=1` is required to start in that posture. Env: `YUZU_CA_CERT`. |
 | `--insecure-skip-client-verify` | off | Allow gRPC TLS without `--ca-cert` (one-way TLS — server cert is presented but client certs are not verified). Applies to BOTH the agent listener and the management listener. **Requires `YUZU_ALLOW_INSECURE_TLS=1` in the environment as a second confirmation** — the server refuses to start without it. Renamed from `--allow-one-way-tls` in v0.12.0; the old name is still accepted with a deprecation warning. |
@@ -1566,6 +1566,34 @@ Three things are visible after upgrading agents:
    the text, delete `security.firewall.state` and re-import it via
    `POST /api/instructions/import` — do not edit it in the dashboard YAML
    editor, which drops the definition's `spec.visualization` on save.
+
+### vNEXT — Linux firewall `state` may now read `unknown` more often for ufw/iptables hosts (correctness fix)
+
+The `firewall` plugin's Linux ufw/iptables legs previously reported a parsed
+`active`/`inactive` `state` as soon as the underlying subprocess exited `0`
+— even if the read had actually timed out or been truncated before
+finishing, which could report a stale or simply wrong verdict with full
+confidence. `state|` is now gated on the same completeness check `ruleset|`
+already used (`tool_ran && exit_code==0 && !timed_out && !output_truncated`),
+matching the nftables leg's own honest-degrade behavior added alongside it.
+
+1. **Hosts whose `ufw status`/`iptables -S` reads were marginal** (slow,
+   near-timeout, or hitting the output cap) will now read `state|unknown`
+   more often post-upgrade, for the SAME underlying firewall state as
+   before. This is the fix working as intended — a previously
+   false-confident `active`/`inactive` becomes an honest "couldn't tell" —
+   not a detection regression. `ruleset|unknown` already had this behavior;
+   `state|` now matches it.
+2. **No row shape changed.** `unknown` was already a valid `state` value on
+   every backend (it is the nftables leg's own honest-degrade outcome); this
+   only changes which reads reach it. Integrations already handling
+   `state|unknown` need no changes.
+3. **Mixed-fleet blend during rollout:** agents not yet upgraded keep the
+   prior completeness posture for ufw/iptables; a wider spread of
+   `state|unknown` across the fleet for these backends specifically
+   identifies upgraded agents whose reads were genuinely marginal, not a
+   server-side fault.
+
 ### vNEXT — KEK rotation is now durably rate-limited (#2530) (breaking)
 
 Before this release, `POST /api/v1/secrets/kek/rotate` was rate-limited only by a 5-minute
@@ -3103,7 +3131,7 @@ Schedule the dump alongside the existing SQLite/cert-dir backups; verify restore
 
 ### Key management (secrets KEK)
 
-Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux/macOS, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
+Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): each value is sealed under a fresh data-encryption key (DEK), and the DEK is wrapped by the install's key-encryption key (KEK). The KEK is a 32-byte key file generated on first boot (`secrets-kek-v1.key`, mode 0600, in the same key directory as the CA root key — `--ca-dir`, default `/etc/yuzu/certs` on Linux and on macOS running as root, `~/Library/Application Support/Yuzu/certs` on macOS running non-root, `C:\ProgramData\Yuzu\certs` on Windows) and **never enters the database** — `kek_meta` in the `secrets` schema records only non-secret fingerprints (key-check values), which the server verifies against the key files at every boot.
 
 > Three of the four gated stores now write secret columns through this machinery: `auth` (TOTP secrets, since 2026-07-16), `webhooks` (the outbound HMAC signing secret, ADR-0057), and `runtime_config_store` (the OIDC client secret, ADR-0060). `offload_targets` adopts it once it migrates to Postgres (ADR-0059). Set your backup procedure up for the pairing below **now** — every additional migration widens the blast radius of a KEK/DB backup mismatch, never narrows it.
 
@@ -3111,7 +3139,7 @@ Secret columns in PostgreSQL are **envelope-encrypted app-side** (ADR-0010): eac
 
 | Startup error prefix | Meaning | Recovery |
 |---|---|---|
-| `kek_unresolvable` | A registered KEK version has no key file. Causes: keys dir older than the DB (backup skew), wrong keys directory, or a second server instance pointed at the same database (unsupported — one KEK per database). | Restore the keys directory from the backup *paired* with this database. |
+| `kek_unresolvable` | A registered KEK version has no key file. Causes: keys dir older than the DB (backup skew), wrong keys directory, a second server instance pointed at the same database (unsupported — one KEK per database), **or, on macOS, a database registered by a server run as root (`/etc/yuzu/certs`) later opened by the same binary run non-root, or vice versa (`~/Library/Application Support/Yuzu/certs`)** — the two euid-dependent defaults do not share key material. | Restore the keys directory from the backup *paired* with this database, or pass `--ca-dir` pointing at whichever directory the original KEK actually lives in. |
 | `kek_corrupt` | The key file exists but does not match its registered fingerprint (torn/corrupt file or foreign key material — **not** row tamper). | Same: restore the paired keys directory. |
 | `provider_failure` | CSPRNG or key-storage failure during KEK generation or check-value computation (first boot / rotation). | Check the keys directory is writable and system entropy is healthy; if a prior first boot crashed, the message names the torn file to delete. |
 | `db_error` | Postgres connection/transaction failure during the `secrets` schema migration or `kek_meta` read/write. | Check the DSN and Postgres service health — triage as "DB down", not key loss. |
