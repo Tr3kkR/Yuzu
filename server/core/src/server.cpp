@@ -16561,24 +16561,20 @@ private:
         app_usage_routes_ = std::make_unique<AppUsageRoutes>();
         app_usage_routes_->register_routes(
             *web_server_, app_usage_scoped_perm_fn,
-            // Single-agent drill — REAL per-executable last-used data. nullopt on
-            // degrade → 503.
-            [this](const std::string& agent_id) -> std::optional<std::vector<AgentLastUsedRow>> {
-                if (!app_usage_store_)
-                    return std::nullopt;
-                return app_usage_store_->get_agent_last_used(agent_id);
-            },
-            // Batch collected_at, sourced from the usage_state PARENT row — never
+            // Single-agent drill — REAL rows + batch collected_at, together in
+            // ONE transaction (AppUsageStore::get_agent_usage_snapshot) so a
+            // concurrent write between the two reads can't pair one snapshot's
+            // rows with another's collected_at. nullopt on degrade → 503;
+            // collected_at is sourced from the usage_state PARENT row — never
             // rows.front().collected_at, which loses the value on a legitimate
-            // replace-to-empty snapshot (#C2). nullopt on degrade → 503; a
-            // present-but-absent state row (never collected) flattens to 0.
-            [this](const std::string& agent_id) -> std::optional<std::int64_t> {
+            // replace-to-empty snapshot (#C2).
+            [this](const std::string& agent_id) -> std::optional<AppUsageSnapshot> {
                 if (!app_usage_store_)
                     return std::nullopt;
-                auto r = app_usage_store_->collected_at(agent_id);
+                auto r = app_usage_store_->get_agent_usage_snapshot(agent_id);
                 if (!r.has_value())
                     return std::nullopt;
-                return r->value_or(0);
+                return *r;
             },
             audit_fn);
 

@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -27,9 +28,12 @@ namespace pb = ::yuzu::agent::v1;
 
 constexpr const char* kSourceAppUsage = "app_usage";
 
-// Caps — MUST match the agent source (agents/core/src/sync_source_app_usage.cpp)
-// — comment-coordinated (the repo has no shared agent/server constants, C-2).
-// A one-sided cap reintroduces the agent-sends/server-drops tight loop (UP-7).
+// Caps — MUST match the agent source once it lands (agents/core/src/
+// sync_source_app_usage.cpp — the producer for this ingest path ships in a
+// follow-up PR, not this one; see this repo's server-half-only precedent for
+// VulnFindingStore, docs/postgres-migration-ladder.md) — comment-coordinated
+// (the repo has no shared agent/server constants, C-2). A one-sided cap
+// reintroduces the agent-sends/server-drops tight loop (UP-7).
 constexpr std::size_t kMaxBlobBytes = 512u * 1024; // 512 KiB
 constexpr std::size_t kMaxRecords = 5000;
 constexpr std::size_t kMaxFieldLen = 512;
@@ -94,6 +98,16 @@ AppUsageParse parse_app_usage_blob(const std::string& blob) {
         out.over_record_cap = true;
         return out;
     }
+    // exe_key -> index in out.rows, so a repeated key within one blob
+    // OVERWRITES (last-wins) rather than appending a second row: the DB
+    // primary key is (agent_id, exe_key), so two rows for the same key would
+    // otherwise violate it and nack the whole replace, permanently, for this
+    // agent (a duplicate key can't ever heal — the raw-byte hash covers the
+    // exact bytes that produced it, so an identical resend hash-skips
+    // forever). Keyed by value (not a view into the loop-local `f` array
+    // below, which is reassigned every iteration) — deliberately a real
+    // std::string copy per unique key.
+    std::unordered_map<std::string, std::size_t> index_by_exe_key;
     std::size_t records_seen = 0;
     std::size_t i = 0;
     while (i < blob.size()) {
@@ -147,7 +161,12 @@ AppUsageParse parse_app_usage_blob(const std::string& blob) {
                     r.last_seen = parse_nonneg_i64(f[2]);
                     r.run_count_30d = parse_nonneg_i64(f[3]);
                     r.total_seconds_30d = parse_nonneg_i64(f[4]);
-                    out.rows.push_back(std::move(r));
+                    if (auto it = index_by_exe_key.find(r.exe_key); it != index_by_exe_key.end()) {
+                        out.rows[it->second] = std::move(r); // last-wins, same key
+                    } else {
+                        index_by_exe_key.emplace(r.exe_key, out.rows.size());
+                        out.rows.push_back(std::move(r));
+                    }
                 }
             }
             // else: `cfg|` (machine-scope marker), or any newer kind — SKIP
@@ -189,6 +208,11 @@ void ingest_app_usage_report(AppUsageStore& store, const std::string& agent_id,
                      agent_id, report.content_hashes_size(), report.plugin_data_size(),
                      kMaxSources);
         emit("rejected");
+        // Every other drop path in this function nacks so the agent resends
+        // in full next cycle — this one skipped that call (review finding),
+        // which would otherwise leave app_usage silently stuck until the next
+        // cycle's report happens to fall back under the cap on its own.
+        ack.add_need_full(kSourceAppUsage);
         return;
     }
 

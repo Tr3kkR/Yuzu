@@ -12,6 +12,7 @@
 
 #include "app_usage_routes.hpp"
 
+#include "app_usage_read_model.hpp" // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#1647)
 
@@ -66,9 +67,14 @@ std::string a4_error(int code, std::string_view message, std::string_view cid,
     return out.dump();
 }
 
-std::string ok_json(json data) {
+/// REST's `data` envelope wrapper — `app_usage_json()` (the Rule 1 shared
+/// builder) already returns a fully-serialized JSON OBJECT string, so this
+/// re-parses it rather than re-deriving the object, matching this file's own
+/// local-helpers discipline (see file header) while still sharing the actual
+/// field construction with the MCP twin.
+std::string ok_json(const std::string& data_json) {
     json out;
-    out["data"] = std::move(data);
+    out["data"] = json::parse(data_json);
     out["meta"] = json{{"api_version", "v1"}};
     return out.dump();
 }
@@ -78,32 +84,21 @@ void send_json(httplib::Response& res, int status, std::string body) {
     res.set_content(std::move(body), "application/json");
 }
 
-json app_usage_row_to_json(const AgentLastUsedRow& r) {
-    json j;
-    j["exe_key"] = r.exe_key;
-    j["first_seen"] = r.first_seen;
-    j["last_seen"] = r.last_seen;
-    j["run_count_30d"] = r.run_count_30d;
-    j["total_seconds_30d"] = r.total_seconds_30d;
-    return j;
-}
-
 } // namespace
 
 void AppUsageRoutes::register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn,
-                                     AgentLastUsedFn agent_last_used_fn,
-                                     CollectedAtFn collected_at_fn, AuditFn audit_fn) {
+                                     AgentUsageSnapshotFn agent_usage_snapshot_fn,
+                                     AuditFn audit_fn) {
     HttplibRouteSink sink(svr);
-    register_routes(sink, std::move(scoped_perm_fn), std::move(agent_last_used_fn),
-                    std::move(collected_at_fn), std::move(audit_fn));
+    register_routes(sink, std::move(scoped_perm_fn), std::move(agent_usage_snapshot_fn),
+                    std::move(audit_fn));
 }
 
 void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn,
-                                     AgentLastUsedFn agent_last_used_fn,
-                                     CollectedAtFn collected_at_fn, AuditFn audit_fn) {
+                                     AgentUsageSnapshotFn agent_usage_snapshot_fn,
+                                     AuditFn audit_fn) {
     scoped_perm_fn_ = std::move(scoped_perm_fn);
-    agent_last_used_fn_ = std::move(agent_last_used_fn);
-    collected_at_fn_ = std::move(collected_at_fn);
+    agent_usage_snapshot_fn_ = std::move(agent_usage_snapshot_fn);
     audit_fn_ = std::move(audit_fn);
 
     // ── GET /api/v1/forensics/agents/{agent_id}/app-usage — scoped + fail-closed audit ──
@@ -141,10 +136,20 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                      return;
                  }
 
-                 std::optional<std::vector<AgentLastUsedRow>> rows;
-                 if (agent_last_used_fn_)
-                     rows = agent_last_used_fn_(agent_id);
-                 if (!rows) {
+                 // Rows + collected_at come back together from ONE transaction
+                 // (AppUsageStore::get_agent_usage_snapshot) — see
+                 // app_usage_routes.hpp's file header for why a two-call split
+                 // (get_agent_last_used + collected_at separately) risked pairing
+                 // one snapshot's rows with another's collected_at. collected_at is
+                 // sourced from the usage_state PARENT row, never rows.front().
+                 // collected_at — a legitimate replace-to-empty snapshot has no row
+                 // to carry it, and that empty case must still report the real
+                 // collection time, not 0 (#C2). The MCP twin (mcp_server.cpp)
+                 // sources it the same way, through the same store method.
+                 std::optional<AppUsageSnapshot> snapshot;
+                 if (agent_usage_snapshot_fn_)
+                     snapshot = agent_usage_snapshot_fn_(agent_id);
+                 if (!snapshot) {
                      // Store/pool/query degrade — a durable failure-audit (the
                      // SleRoutes drill pattern), then 503 (never a silent empty
                      // 200).
@@ -157,32 +162,11 @@ void AppUsageRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_pe
                      return;
                  }
 
-                 // collected_at is sourced from the usage_state PARENT row (via
-                 // AppUsageStore::collected_at), never rows->front().collected_at —
-                 // a legitimate replace-to-empty snapshot has no row to carry it, and
-                 // that empty case must still report the real collection time, not 0
-                 // (#C2). The MCP twin (mcp_server.cpp) sources it the same way.
-                 std::optional<std::int64_t> collected_at;
-                 if (collected_at_fn_)
-                     collected_at = collected_at_fn_(agent_id);
-                 if (!collected_at) {
-                     (void)detail::try_persist_audit(audit_fn_, req, "app_usage.agent.view",
-                                                     "failure", "Agent", agent_id,
-                                                     "app-usage store degraded; cid=" + cid);
-                     send_json(res, 503,
-                               a4_error(503, "app-usage store unavailable — read failed", cid, 5000,
-                                        "retry the request"));
-                     return;
-                 }
-
-                 json apps = json::array();
-                 for (const auto& r : *rows)
-                     apps.push_back(app_usage_row_to_json(r));
-                 json data;
-                 data["agent_id"] = agent_id;
-                 data["apps"] = std::move(apps);
-                 data["collected_at"] = *collected_at;
-                 send_json(res, 200, ok_json(std::move(data)));
+                 AppUsageModel model;
+                 model.agent_id = agent_id;
+                 model.apps = std::move(snapshot->rows);
+                 model.collected_at = snapshot->collected_at;
+                 send_json(res, 200, ok_json(app_usage_json(model)));
              });
 }
 

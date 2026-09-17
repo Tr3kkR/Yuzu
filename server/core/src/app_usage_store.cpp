@@ -398,6 +398,79 @@ AppUsageStore::collected_at(std::string_view agent_id) {
     return std::optional<std::int64_t>{result_i64(res, 0, 0)};
 }
 
+std::expected<AppUsageSnapshot, AppUsageReadError>
+AppUsageStore::get_agent_usage_snapshot(std::string_view agent_id) {
+    if (!open_) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonStoreNotOpen, sampler); d.should_log)
+            spdlog::warn(
+                "AppUsageStore: get_agent_usage_snapshot degraded — store not open (occurrence {})",
+                d.occurrence);
+        return std::unexpected(AppUsageReadError::kDegraded);
+    }
+    if (agent_id.empty())
+        return AppUsageSnapshot{}; // precondition miss, not a degrade — empty rows, collected_at=0
+
+    // Both reads share one REPEATABLE READ transaction so a concurrent
+    // replace_agent_last_used/delete_agent landing between the rows read and
+    // the collected_at read can't hand back rows from one snapshot paired
+    // with collected_at from another — same pattern as
+    // access_review_store.cpp's get_campaign (see that file's comment for
+    // why a plain with_txn_for/READ COMMITTED isn't enough here).
+    AppUsageSnapshot snap;
+    std::string error_msg;
+    const bool ok = pool_.with_txn_for(kQueryAcquireTimeout, [&](PGconn* conn) -> bool {
+        pg::PgResult iso_res{PQexec(conn, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")};
+        if (iso_res.status() != PGRES_COMMAND_OK) {
+            error_msg = std::string("get_agent_usage_snapshot: failed to set REPEATABLE READ "
+                                    "isolation: ") +
+                       PQerrorMessage(conn);
+            return false;
+        }
+
+        const std::string rows_sql = std::string("SELECT ") + kUsageCols +
+                                     " FROM app_usage_store.agent_last_used WHERE agent_id = $1 "
+                                     "ORDER BY exe_key LIMIT $2::bigint";
+        pg::PgResult rows_res = pg::exec_params(
+            conn, rows_sql.c_str(),
+            std::vector<std::string>{std::string(agent_id), std::to_string(kAgentRowCap)});
+        if (rows_res.status() != PGRES_TUPLES_OK) {
+            error_msg =
+                std::string("get_agent_usage_snapshot rows read failed: ") + PQerrorMessage(conn);
+            return false;
+        }
+        const int n = PQntuples(rows_res.get());
+        snap.rows.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            AgentLastUsedRow r;
+            fill_row(rows_res, i, r);
+            snap.rows.push_back(std::move(r));
+        }
+
+        pg::PgResult ca_res = pg::exec_params(
+            conn, "SELECT collected_at FROM app_usage_store.usage_state WHERE agent_id = $1",
+            std::vector<std::string>{std::string(agent_id)});
+        if (ca_res.status() != PGRES_TUPLES_OK) {
+            error_msg = std::string("get_agent_usage_snapshot collected_at read failed: ") +
+                       PQerrorMessage(conn);
+            return false;
+        }
+        if (PQntuples(ca_res.get()) > 0)
+            snap.collected_at = result_i64(ca_res, 0, 0);
+        // else: no state row → never collected, snap.collected_at stays 0 (matches
+        // collected_at()'s own "no state row" semantics).
+        return true;
+    });
+    if (!ok) {
+        static DegradeSampler sampler;
+        if (const auto d = note_read_degrade(metrics_, kReasonQueryError, sampler); d.should_log)
+            spdlog::warn("AppUsageStore: get_agent_usage_snapshot degraded — {} (occurrence {})",
+                         error_msg, d.occurrence);
+        return std::unexpected(AppUsageReadError::kDegraded);
+    }
+    return snap;
+}
+
 bool AppUsageStore::delete_agent(std::string_view agent_id) {
     if (agent_id.empty()) {
         spdlog::warn("AppUsageStore: delete_agent called with an empty agent_id — refusing "

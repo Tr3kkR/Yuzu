@@ -27,15 +27,19 @@
 /// when the access-audit row cannot persist — set BEFORE the store read
 /// (per-open, not per-row).
 ///
-/// DEGRADE != EMPTY: both providers (`agent_last_used_fn`, `collected_at_fn`)
-/// return `std::nullopt` on a store/pool/query degrade -> the route answers
-/// 503 (A4 envelope, retryable), NEVER a silent empty/zero 200. An empty
-/// `apps` vector = the agent genuinely reported no rows for the retained
-/// window -> 200 with `data.apps` as an empty array and `data.collected_at`
-/// still the real batch collection time (#C2 — sourced from the store's
-/// `usage_state` parent row, not derived from a row that may not exist).
+/// DEGRADE != EMPTY: the provider (`agent_usage_snapshot_fn`) returns
+/// `std::nullopt` on a store/pool/query degrade -> the route answers 503
+/// (A4 envelope, retryable), NEVER a silent empty/zero 200. An empty `apps`
+/// vector = the agent genuinely reported no rows for the retained window ->
+/// 200 with `data.apps` as an empty array and `data.collected_at` still the
+/// real batch collection time (#C2 — sourced from the store's `usage_state`
+/// parent row, not derived from a row that may not exist). The rows read and
+/// the `collected_at` read happen together in the provider's own single
+/// transaction (`AppUsageStore::get_agent_usage_snapshot`) rather than as two
+/// separate provider calls, so a concurrent write between them can't produce
+/// a response mixing one snapshot's rows with another's `collected_at`.
 
-#include "app_usage_store.hpp" // AgentLastUsedRow
+#include "app_usage_store.hpp" // AgentLastUsedRow, AppUsageSnapshot
 
 #include <httplib.h>
 
@@ -59,21 +63,18 @@ public:
                            const std::string& securable_type, const std::string& operation,
                            const std::string& agent_id)>;
 
-    /// One agent's per-executable last-used rows (REAL data via
-    /// `AppUsageStore::get_agent_last_used`). `std::nullopt` on a degrade
-    /// (-> 503). An empty value = the agent genuinely reported no rows for
-    /// the retained window.
-    using AgentLastUsedFn =
-        std::function<std::optional<std::vector<AgentLastUsedRow>>(const std::string& agent_id)>;
-
-    /// The batch `collected_at` for one agent (REAL data via
-    /// `AppUsageStore::collected_at`, sourced from the `usage_state` parent
-    /// row — NOT `rows.front().collected_at`, which loses the value on a
-    /// legitimate empty-snapshot replace, #C2). `std::nullopt` on a degrade
-    /// (-> 503, same as `AgentLastUsedFn`). A value of 0 is legitimate — both
-    /// "never collected" (no state row) and an agent-reported 0 read back as
-    /// 0; the route does not need to distinguish them.
-    using CollectedAtFn = std::function<std::optional<std::int64_t>(const std::string& agent_id)>;
+    /// One agent's rows + batch `collected_at`, together (REAL data via
+    /// `AppUsageStore::get_agent_usage_snapshot`, ONE transaction — see that
+    /// method's doc comment for the race a two-call split would reopen).
+    /// `std::nullopt` on a degrade (-> 503). An empty `rows` = the agent
+    /// genuinely reported no rows for the retained window; `collected_at`
+    /// sourced from the `usage_state` parent row (NOT `rows.front().
+    /// collected_at`, which loses the value on a legitimate empty-snapshot
+    /// replace, #C2) — a value of 0 is legitimate (both "never collected" and
+    /// an agent-reported 0 read back as 0; the route does not distinguish
+    /// them).
+    using AgentUsageSnapshotFn =
+        std::function<std::optional<AppUsageSnapshot>(const std::string& agent_id)>;
 
     /// who/when/what audit sink (bool = persisted; false = a persist failure
     /// OR a throwing sink, routed through the #1647 throw-safe kernel).
@@ -82,20 +83,17 @@ public:
                                        const std::string& target_id, const std::string& detail)>;
 
     void register_routes(httplib::Server& svr, ScopedPermFn scoped_perm_fn,
-                         AgentLastUsedFn agent_last_used_fn,
-                         CollectedAtFn collected_at_fn = {}, AuditFn audit_fn = {});
+                         AgentUsageSnapshotFn agent_usage_snapshot_fn, AuditFn audit_fn = {});
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no
     /// httplib acceptor; the #438 TSan trap). The httplib::Server& overload
     /// wraps + delegates.
     void register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn,
-                         AgentLastUsedFn agent_last_used_fn,
-                         CollectedAtFn collected_at_fn = {}, AuditFn audit_fn = {});
+                         AgentUsageSnapshotFn agent_usage_snapshot_fn, AuditFn audit_fn = {});
 
 private:
     ScopedPermFn scoped_perm_fn_;
-    AgentLastUsedFn agent_last_used_fn_;
-    CollectedAtFn collected_at_fn_;
+    AgentUsageSnapshotFn agent_usage_snapshot_fn_;
     AuditFn audit_fn_;
 };
 

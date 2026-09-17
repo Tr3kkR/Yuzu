@@ -267,6 +267,69 @@ TEST_CASE("AppUsageStore: get_agent_last_used with an empty agent_id is an empty
     CHECK(got->empty());
 }
 
+// ── get_agent_usage_snapshot: the combined-transaction read (review finding) ─
+
+TEST_CASE("AppUsageStore: get_agent_usage_snapshot returns rows + collected_at together, "
+          "matching the two individual accessors",
+          "[app_usage_store][pg]") {
+    AUSG_SHARED(store, pool);
+    const std::string agent = "agent-snap-1";
+    REQUIRE(store.replace_agent_last_used(
+        agent, {row("chrome.exe", 1699000000, 1700000500)}, "hash-snap-1", 1700000500));
+
+    auto snap = store.get_agent_usage_snapshot(agent);
+    REQUIRE(snap.has_value());
+    REQUIRE(snap->rows.size() == 1);
+    CHECK(snap->rows[0].exe_key == "chrome.exe");
+    CHECK(snap->collected_at == 1700000500);
+
+    // Cross-checked against the two individual accessors this method
+    // replaces for callers that need both — same data, one transaction.
+    auto rows = store.get_agent_last_used(agent);
+    auto collected = store.collected_at(agent);
+    REQUIRE(rows.has_value());
+    REQUIRE(collected.has_value());
+    REQUIRE(collected->has_value());
+    CHECK(rows->size() == snap->rows.size());
+    CHECK(**collected == snap->collected_at);
+}
+
+TEST_CASE("AppUsageStore: get_agent_usage_snapshot on a cold cache is empty rows + "
+          "collected_at 0, not a degrade",
+          "[app_usage_store][pg]") {
+    AUSG_SHARED(store, pool);
+    auto snap = store.get_agent_usage_snapshot("never-seen-agent-snap");
+    REQUIRE(snap.has_value()); // not degraded — genuinely never collected
+    CHECK(snap->rows.empty());
+    CHECK(snap->collected_at == 0);
+}
+
+TEST_CASE("AppUsageStore: get_agent_usage_snapshot with an empty agent_id is an empty "
+          "value, not a degrade",
+          "[app_usage_store][pg]") {
+    AUSG_SHARED(store, pool);
+    auto snap = store.get_agent_usage_snapshot("");
+    REQUIRE(snap.has_value());
+    CHECK(snap->rows.empty());
+    CHECK(snap->collected_at == 0);
+}
+
+TEST_CASE("AppUsageStore: get_agent_usage_snapshot on an empty-snapshot replace still "
+          "carries the real collected_at, never 0 (#C2)",
+          "[app_usage_store][pg]") {
+    AUSG_SHARED(store, pool);
+    const std::string agent = "agent-snap-empty";
+    // A legitimate replace-to-empty (the store's own header banner: "the
+    // retained-window projection can genuinely shrink to nothing") — the
+    // pinned #C2 regression, now exercised through the combined accessor too.
+    REQUIRE(store.replace_agent_last_used(agent, {}, "hash-snap-empty", 1699009999));
+
+    auto snap = store.get_agent_usage_snapshot(agent);
+    REQUIRE(snap.has_value());
+    CHECK(snap->rows.empty());
+    CHECK(snap->collected_at == 1699009999);
+}
+
 // ── delete_agent: the two-table decommission, and the hash-skip repopulation
 //    trap it must never reopen (PLAN-01 ruling (b)) ─────────────────────────
 

@@ -38,6 +38,7 @@
 #include "store_errors.hpp"              // #2146 Batch B1: is_conflict_error/strip_conflict_prefix (create/update)
 #include "software_inventory_store.hpp"  // query_installed_software (typed daily-sync store)
 #include "software_licensing_store.hpp"  // query_software_licenses (ADR-0024 discovery store)
+#include "app_usage_read_model.hpp"        // AppUsageModel, app_usage_json (Rule 1 shared builder)
 #include "app_usage_store.hpp"            // get_agent_app_usage (wave 7 PR7.2 projection)
 #include "rbac_store.hpp"                 // rbac_enforcement_in_effect (#1717 fail-closed SLE gate)
 #include "service_scope_policy.hpp"       // authz::kServiceScopeGlobalSafe (#2298 PR 3 §3c boot cross-check)
@@ -8927,24 +8928,20 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto rows = app_usage_store->get_agent_last_used(agent_id);
-                if (!rows) {
-                    // Authoritative read: a store/pool/query degrade is an ERROR, never
-                    // success+[] — mirrors the REST drill's 503.
-                    mcp_audit("failure", "app-usage store degraded; agent=" + agent_id);
-                    res.set_content(
-                        a4_error(kInternalError, "app-usage store unavailable — read failed",
-                                 "retry the request", /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                        "application/json");
-                    return;
-                }
-                // collected_at is sourced from the usage_state PARENT row (never
-                // rows->front().collected_at — a legitimate replace-to-empty snapshot
-                // has no row to carry it, and that empty case must still report the
-                // real collection time, not 0, #C2). Same authoritative-read posture
-                // as the rows read above: a store/pool/query degrade is an ERROR.
-                auto collected_at_result = app_usage_store->collected_at(agent_id);
-                if (!collected_at_result.has_value()) {
+                // Rows + collected_at come back together from ONE transaction
+                // (AppUsageStore::get_agent_usage_snapshot) — the REST twin
+                // (app_usage_routes.cpp) sources both through the same store
+                // method, so neither surface can pair one snapshot's rows with
+                // another's collected_at (the store method's own doc comment
+                // has the race a two-call split would reopen). collected_at is
+                // sourced from the usage_state PARENT row, never rows.front().
+                // collected_at — a legitimate replace-to-empty snapshot has no
+                // row to carry it, and that empty case must still report the
+                // real collection time, not 0 (#C2). Authoritative read: a
+                // store/pool/query/transaction degrade is an ERROR, never
+                // success+[] — mirrors the REST drill's 503.
+                auto snapshot_result = app_usage_store->get_agent_usage_snapshot(agent_id);
+                if (!snapshot_result.has_value()) {
                     mcp_audit("failure", "app-usage store degraded; agent=" + agent_id);
                     res.set_content(
                         a4_error(kInternalError, "app-usage store unavailable — read failed",
@@ -8985,22 +8982,16 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                JArr arr;
-                for (const auto& r : *rows) {
-                    arr.add(JObj()
-                                .add("exe_key", r.exe_key)
-                                .add("first_seen", r.first_seen)
-                                .add("last_seen", r.last_seen)
-                                .add("run_count_30d", r.run_count_30d)
-                                .add("total_seconds_30d", r.total_seconds_30d));
-                }
-                // Hoisted to the top level exactly as the REST drill does — sourced
-                // from usage_state (collected_at_result), not rows->front().
-                const std::int64_t collected_at = collected_at_result->value_or(0);
-                JObj payload;
-                payload.add("agent_id", agent_id).raw("apps", arr.str()).add("collected_at", collected_at);
-                res.set_content(success_response(id, tool_result(payload.str(), kObjectOutputSchema)),
-                                "application/json");
+                // Rule 1 shared builder (app_usage_read_model.hpp) — the SAME
+                // function the REST twin calls, so the two JSON shapes cannot
+                // drift apart.
+                AppUsageModel model;
+                model.agent_id = agent_id;
+                model.apps = std::move(snapshot_result->rows);
+                model.collected_at = snapshot_result->collected_at;
+                res.set_content(
+                    success_response(id, tool_result(app_usage_json(model), kObjectOutputSchema)),
+                    "application/json");
                 return;
             }
 

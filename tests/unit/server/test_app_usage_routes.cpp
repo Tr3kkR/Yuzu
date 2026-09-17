@@ -68,8 +68,7 @@ struct AppUsageHarness {
 
     bool allow_scoped_all = false;
     std::vector<std::string> scoped_agents; // in-scope agent ids
-    bool degrade_agent = false;
-    bool degrade_collected_at = false;
+    bool degrade_snapshot = false; // the ONE combined rows+collected_at read degrades
     bool audit_should_fail = false;
 
     std::vector<AgentLastUsedRow> agent_rows;
@@ -96,16 +95,13 @@ struct AppUsageHarness {
             }
             return ok;
         };
-        auto agents_fn =
-            [this](const std::string&) -> std::optional<std::vector<AgentLastUsedRow>> {
-            if (degrade_agent)
+        auto snapshot_fn = [this](const std::string&) -> std::optional<AppUsageSnapshot> {
+            if (degrade_snapshot)
                 return std::nullopt;
-            return agent_rows;
-        };
-        auto collected_at_fn = [this](const std::string&) -> std::optional<std::int64_t> {
-            if (degrade_collected_at)
-                return std::nullopt;
-            return collected_at_value;
+            AppUsageSnapshot snap;
+            snap.rows = agent_rows;
+            snap.collected_at = collected_at_value;
+            return snap;
         };
         auto audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                             const std::string& tt, const std::string& tid, const std::string&) {
@@ -113,7 +109,7 @@ struct AppUsageHarness {
             audit_full.push_back(a + "|" + r + "|" + tt + "|" + tid);
             return !audit_should_fail;
         };
-        routes.register_routes(sink, scoped, agents_fn, collected_at_fn, audit);
+        routes.register_routes(sink, scoped, snapshot_fn, audit);
     }
 
     bool audited(const std::string& tok) const {
@@ -134,7 +130,7 @@ TEST_CASE("app-usage: unwired scope gate -> 503, never legacy-open", "[app_usage
     yuzu::server::test::TestRouteSink sink;
     AppUsageRoutes routes;
     // No scoped_perm_fn supplied — the default-constructed std::function is empty.
-    routes.register_routes(sink, /*scoped_perm_fn=*/{}, /*agent_last_used_fn=*/{});
+    routes.register_routes(sink, /*scoped_perm_fn=*/{}, /*agent_usage_snapshot_fn=*/{});
     auto res = sink.Get(kPath);
     REQUIRE(res);
     CHECK(res->status == 503);
@@ -183,27 +179,13 @@ TEST_CASE("app-usage: provider nullopt -> 503 A4 envelope, never a silent empty 
           "[app_usage_routes]") {
     AppUsageHarness h;
     h.allow_scoped_all = true;
-    h.degrade_agent = true;
+    h.degrade_snapshot = true;
     auto res = h.sink.Get(kPath);
     REQUIRE(res);
     CHECK(res->status == 503);
     auto j = json::parse(res->body);
     CHECK(j["error"]["code"] == 503);
     // A degrade is audited as a failure so the evidence trail is honest.
-    CHECK(h.audited("app_usage.agent.view|failure"));
-}
-
-TEST_CASE("app-usage: collected_at provider nullopt -> 503 A4 envelope",
-          "[app_usage_routes]") {
-    AppUsageHarness h;
-    h.allow_scoped_all = true;
-    h.agent_rows = {row("chrome.exe")}; // rows read succeeds; collected_at read degrades
-    h.degrade_collected_at = true;
-    auto res = h.sink.Get(kPath);
-    REQUIRE(res);
-    CHECK(res->status == 503);
-    auto j = json::parse(res->body);
-    CHECK(j["error"]["code"] == 503);
     CHECK(h.audited("app_usage.agent.view|failure"));
 }
 
@@ -352,16 +334,14 @@ struct ProductionFixture {
                   const std::string& op, const std::string& agent_id) {
                 return ar->require_scoped_permission(req, res, type, op, agent_id);
             };
-        AppUsageRoutes::AgentLastUsedFn agents_fn =
-            [](const std::string&) -> std::optional<std::vector<AgentLastUsedRow>> {
-            return std::vector<AgentLastUsedRow>{};
+        AppUsageRoutes::AgentUsageSnapshotFn snapshot_fn =
+            [](const std::string&) -> std::optional<AppUsageSnapshot> {
+            return AppUsageSnapshot{};
         };
-        AppUsageRoutes::CollectedAtFn collected_at_fn =
-            [](const std::string&) -> std::optional<std::int64_t> { return 0; };
         // Audit-off (empty AuditFn): this fixture exercises the AUTHZ
         // composition, not the audit tier — SleRoutes'/FloorFixture's
         // precedent of keeping unrelated dimensions out of scope.
-        routes.register_routes(sink, scoped, agents_fn, collected_at_fn, /*audit_fn=*/{});
+        routes.register_routes(sink, scoped, snapshot_fn, /*audit_fn=*/{});
     }
 
     httplib::Request session_request(const std::string& username, auth::Role role) {

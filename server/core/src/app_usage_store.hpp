@@ -102,6 +102,14 @@ struct AgentLastUsedRow {
 /// == store/pool/query failure.
 enum class AppUsageReadError { kDegraded };
 
+/// One agent's app-usage projection, read as a single point-in-time snapshot
+/// by `AppUsageStore::get_agent_usage_snapshot` — see that method's doc
+/// comment for the race it closes.
+struct AppUsageSnapshot {
+    std::vector<AgentLastUsedRow> rows;
+    std::int64_t collected_at{0};
+};
+
 class AppUsageStore {
 public:
     /// Borrows the shared pool and runs the `app_usage_store` schema
@@ -181,6 +189,23 @@ public:
     /// precondition miss → value holding `std::nullopt`, not a degrade.
     [[nodiscard]] std::expected<std::optional<std::int64_t>, AppUsageReadError>
     collected_at(std::string_view agent_id);
+
+    /// Combined read: `get_agent_last_used()`'s rows AND `collected_at()`'s
+    /// batch timestamp, together in ONE `REPEATABLE READ` transaction — a
+    /// concurrent `replace_agent_last_used`/`delete_agent` landing between two
+    /// SEPARATE calls to those two methods could otherwise hand back rows
+    /// from one snapshot paired with a `collected_at` from another (the
+    /// `access_review_store.cpp:255-267` pattern this mirrors). AUTHORITATIVE:
+    /// `std::unexpected(kDegraded)` on a store/pool/query/transaction failure.
+    /// A legitimate "no usage_state row yet" or "no rows this window" both
+    /// resolve to a value holding `rows` empty and/or `collected_at == 0` —
+    /// NOT a degrade, same non-degrade-empty semantics the two individual
+    /// accessors already document. Prefer this over calling
+    /// `get_agent_last_used()` + `collected_at()` separately for any caller
+    /// that needs both (`app_usage_routes.cpp` / `mcp_server.cpp`'s
+    /// `get_agent_app_usage`).
+    [[nodiscard]] std::expected<AppUsageSnapshot, AppUsageReadError>
+    get_agent_usage_snapshot(std::string_view agent_id);
 
     /// Drop an agent's `agent_last_used` rows AND its `usage_state` row in
     /// ONE transaction (see the file header — the two-table delete is
