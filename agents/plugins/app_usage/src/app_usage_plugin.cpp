@@ -135,24 +135,29 @@ private:
 // disk corruption, worth investigating" without parsing free-text detail.
 DbHandle open_readonly(const fs::path& path, std::string& out_err, std::string_view& out_token) {
     out_token = "tar_db_unavailable";
-    sqlite3* db = nullptr;
-    const int rc = sqlite3_open_v2(path.string().c_str(), &db,
+    sqlite3* raw = nullptr;
+    const int rc = sqlite3_open_v2(path.string().c_str(), &raw,
                                    SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, nullptr);
+    // Round-3 review Blocker (policy floor, round 2): owns `raw` from this
+    // point forward, even when `rc != SQLITE_OK` -- sqlite3_open_v2 can
+    // still allocate a handle on failure precisely so sqlite3_errmsg() has
+    // something to report, and the two branches below used to close it by
+    // hand instead of going through this file's own DbHandle RAII owner.
+    // Every path out of this function, including both failure returns, is
+    // now RAII-safe; no manual sqlite3_close() left in this function.
+    DbHandle db{raw};
     if (rc != SQLITE_OK) {
-        out_err = db ? sqlite3_errmsg(db) : "sqlite3_open_v2 failed";
-        if (db)
-            sqlite3_close(db);
+        out_err = db ? sqlite3_errmsg(db.get()) : "sqlite3_open_v2 failed";
         return DbHandle{};
     }
-    sqlite3_busy_timeout(db, 2000);
-    sqlite3_exec(db, "PRAGMA query_only=1", nullptr, nullptr, nullptr);
-    if (!yuzu::app_usage::quick_check_ok(db)) {
+    sqlite3_busy_timeout(db.get(), 2000);
+    sqlite3_exec(db.get(), "PRAGMA query_only=1", nullptr, nullptr, nullptr);
+    if (!yuzu::app_usage::quick_check_ok(db.get())) {
         out_err = "tar.db failed integrity quick_check";
         out_token = "tar_db_corrupt";
-        sqlite3_close(db);
         return DbHandle{};
     }
-    return DbHandle{db};
+    return db;
 }
 
 // Aligns a unix timestamp down to the start of its UTC day — usage_daily's
@@ -216,10 +221,27 @@ struct UsageSourceCheck {
     std::string reason; // populated only when state == Errored
 };
 
-UsageSourceCheck check_source_state(sqlite3* db, std::string_view config_key) {
+// `missing_means_enabled` (default true) controls what an ABSENT key maps
+// to -- true reuses source_state_from_config's nullopt->Enabled default,
+// correct for `usage_enabled` (TAR's own genuine default when that key has
+// never been written). Round-3 review should-fix: `usage_feeder_enabled`
+// has no such "safe missing" semantics -- TAR's fold (tar_usage.cpp) writes
+// this key unconditionally before it ever writes a usage_daily row, so a
+// genuinely absent key on a reachable host is itself an anomaly (a
+// hand-edited/restored tar.db, or a tar_config write fault) rather than
+// "the fold simply hasn't run yet". Passing false at that call site treats
+// a missing key the same as an explicit "false", keeping the round-1 fix's
+// own stated "false/missing -> constrained" contract for the feeder key
+// specifically, without changing source_state_from_config's default for
+// every other caller.
+UsageSourceCheck check_source_state(sqlite3* db, std::string_view config_key,
+                                    bool missing_means_enabled = true) {
     const auto cfg = get_tar_config(db, config_key);
     if (cfg.outcome == ConfigReadOutcome::kReadError)
         return {yuzu::app_usage::SourceState::Errored, std::string{config_key} + "=<read_error>"};
+
+    if (cfg.outcome == ConfigReadOutcome::kMissing && !missing_means_enabled)
+        return {yuzu::app_usage::SourceState::Disabled, {}};
 
     const std::optional<std::string_view> stored =
         cfg.outcome == ConfigReadOutcome::kPresent ? std::optional<std::string_view>(cfg.value)
@@ -470,7 +492,8 @@ private:
         // replace_agent_last_used wipe-to-empty
         // (server/core/src/app_usage_ingestion.cpp) once the window drains
         // past the last real data.
-        const auto feeder_check = check_source_state(db, yuzu::app_usage::kConfigFeederEnabled);
+        const auto feeder_check = check_source_state(db, yuzu::app_usage::kConfigFeederEnabled,
+                                                     /*missing_means_enabled=*/false);
         if (report_if_gated(ctx, feeder_check, "usage_feeder_enabled=false",
                             "usage_feeder_disabled", "usage_feeder_errored"))
             return 0;

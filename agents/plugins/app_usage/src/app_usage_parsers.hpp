@@ -232,20 +232,13 @@ inline constexpr std::string_view kSummarySqlByRunCount =
 // shell can detect truncation without a second COUNT(*) query.
 inline constexpr int64_t kMaxLastUsedRows = 5000;
 
-// Sibling of the kLastUsedSqlAll cap above (governance Gate 4 unhappy-path
-// UP-8): run_summary's exe_key set is already bounded to `top` (<=500) by
-// kSummarySqlByRunTime/ByRunCount's own LIMIT, but this query built the
-// FULL distinct_users map unbounded before that LIMIT was ever applied --
-// the identical unprivileged-local-user resource-exhaustion vector the
-// round-3 review's MEDIUM finding named for kLastUsedSqlAll, just on this
-// query instead. Capped at kMaxLastUsedRows (5000), the same generous bound
-// used there -- far larger than any legitimate `top`, so a host with sane
-// exe_key cardinality sees no behavior change; only a host being made to
-// mint unboundedly many exe_keys is affected, and it was already capped on
-// the last_used side.
-inline constexpr std::string_view kDistinctUsersSql =
-    "SELECT exe_key, COUNT(DISTINCT user) FROM usage_daily_user WHERE day_ts >= ? "
-    "GROUP BY exe_key LIMIT ?";
+// run_summary's distinct-user lookup is a runtime-built IN-list query, not
+// a pinned constant here -- see the comment at its call site in
+// run_summary for why (round-3 review CDX-R2-03/K5: a fixed-text
+// LIMIT-only cap here previously produced wrong distinct_users values for
+// legitimately top-ranked executables once the table held more than
+// kMaxLastUsedRows distinct exe_keys, since it had no relationship to
+// WHICH exe_keys result.rows had already selected).
 inline constexpr std::string_view kOpenRunsSql = "SELECT COUNT(*) FROM usage_live";
 inline constexpr std::string_view kUsageDailyExistsSql =
     "SELECT name FROM sqlite_master WHERE type='table' AND name='usage_daily'";
@@ -427,13 +420,39 @@ run_summary(sqlite3* db, const WindowParams& w, int64_t since_day_ts) {
 
     // Merge in distinct-user counts (usage_daily_user — COUNT(DISTINCT user)
     // only; the user names themselves never leave this function).
+    //
+    // Round-3 review MEDIUM (CDX-R2-03/K5): restricted to exactly the
+    // exe_keys already selected into result.rows (<= w.top, <= kMaxTop=500)
+    // via a parameterized IN-list, rather than an independently-capped,
+    // unordered scan of the whole usage_daily_user table. The prior
+    // LIMIT-only cap (kDistinctUsersSql, no ORDER BY) had no relationship
+    // to WHICH exe_keys it returned -- once the table held more than
+    // kMaxLastUsedRows distinct exe_keys, a genuinely top-ranked executable
+    // could fall outside the arbitrary first-N SQLite happened to return,
+    // silently reporting distinct_users=0 (a real, wrong RESULT, not merely
+    // an omission -- worse than the unbounded-cost problem the cap was
+    // meant to fix). This departs from this header's usual "SQL text pinned
+    // as a constexpr string_view" convention because the IN-list's arity
+    // depends on result.rows.size() at runtime; there is nothing to pin.
     std::map<std::string, int64_t> distinct_users;
-    {
-        detail::Stmt stmt{db, kDistinctUsersSql};
+    if (!result.rows.empty()) {
+        std::string sql = "SELECT exe_key, COUNT(DISTINCT user) FROM usage_daily_user "
+                          "WHERE day_ts >= ? AND exe_key IN (";
+        for (std::size_t i = 0; i < result.rows.size(); ++i) {
+            if (i != 0)
+                sql += ',';
+            sql += '?';
+        }
+        sql += ") GROUP BY exe_key";
+        detail::Stmt stmt{db, sql};
         if (!stmt)
             return std::unexpected(QueryError{sqlite3_errmsg(db)});
         sqlite3_bind_int64(stmt.get(), 1, since_day_ts);
-        sqlite3_bind_int64(stmt.get(), 2, kMaxLastUsedRows);
+        for (std::size_t i = 0; i < result.rows.size(); ++i) {
+            const auto& key = result.rows[i].exe_key;
+            sqlite3_bind_text(stmt.get(), static_cast<int>(i) + 2, key.c_str(),
+                              static_cast<int>(key.size()), SQLITE_TRANSIENT);
+        }
         int rc;
         while ((rc = sqlite3_step(stmt.get())) == SQLITE_ROW) {
             distinct_users[detail::col_text(stmt.get(), 0)] = sqlite3_column_int64(stmt.get(), 1);

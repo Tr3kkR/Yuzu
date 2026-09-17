@@ -38,6 +38,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <sqlite3.h>
 #include <sstream>
@@ -278,6 +279,7 @@ TEST_CASE("app_usage plugin: StandalonePluginContext-seeded real tar.db — init
                              /*total_seconds=*/60, /*first_seen=*/now, /*last_seen=*/now,
                              /*superseded_runs=*/0, /*expired_runs=*/0);
     seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -413,6 +415,12 @@ TEST_CASE("app_usage plugin: last_used with exe=\"\" returns every executable, m
     seed::insert_usage_daily(writer, today_ts, "blank_a.exe", 1, 60, now, now, 0, 0);
     seed::insert_usage_daily(writer, today_ts, "blank_b.exe", 1, 60, now, now, 0, 0);
     seed::insert_tar_config(writer, "usage_enabled", "true");
+    // Round-3 review should-fix: a missing usage_feeder_enabled key now
+    // gates last_used (see the dedicated missing-key regression test) --
+    // every OTHER real-data fixture in this file must seed it explicitly,
+    // matching what a genuinely reachable host always has by the time
+    // usage_daily holds any row (TAR's fold writes this key first).
+    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -530,6 +538,61 @@ TEST_CASE("app_usage plugin: last_used with a garbage usage_feeder_enabled value
     plugin->descriptor->shutdown(ctx.get());
 }
 
+// Round-3 review round-2 should-fix: usage_feeder_enabled has no TAR-default
+// "safe missing" semantics the way usage_enabled does -- TAR's fold writes
+// this key unconditionally before it ever writes a usage_daily row, so a
+// genuinely ABSENT key (never written at all, not just "false") on a
+// reachable host is itself an anomaly. Confirms the omitted-key case is
+// treated the same as an explicit "false" (constrained), never silently
+// Enabled the way usage_enabled's own missing-key case correctly is.
+TEST_CASE("app_usage plugin: last_used with usage_feeder_enabled entirely OMITTED (never "
+         "written, not just false) reports constrained|usage_feeder_disabled -- missing "
+         "has no safe default for this key, unlike usage_enabled",
+          "[app_usage][actions][regression]") {
+    auto plugin = load_app_usage_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    REQUIRE(plugin->descriptor->init != nullptr);
+    REQUIRE(plugin->descriptor->shutdown != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_app_usage_feeder_missing_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    REQUIRE_FALSE(ec);
+    const fs::path& data_dir = dir_guard.path;
+
+    constexpr int64_t kSecondsPerDay = 86400;
+    const auto now = static_cast<int64_t>(std::time(nullptr));
+    const int64_t today_ts = now - (now % kSecondsPerDay);
+
+    sqlite3* writer = nullptr;
+    REQUIRE(sqlite3_open((data_dir / "tar.db").string().c_str(), &writer) == SQLITE_OK);
+    seed::exec_or_fail(writer, "PRAGMA journal_mode=WAL");
+    seed::create_schema(writer);
+    // A real row present, to prove this isn't just the "no data" path --
+    // if the feeder-missing case were mishandled as Enabled, this row
+    // would come back as a normal last_used| line instead of the
+    // constrained marker.
+    seed::insert_usage_daily(writer, today_ts, "frozen_no_feeder_key.exe", 1, 60, now, now, 0, 0);
+    seed::insert_tar_config(writer, "usage_enabled", "true");
+    // Deliberately no usage_feeder_enabled row at all.
+    sqlite3_close(writer);
+
+    yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
+    REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto last_used = dispatcher.run(plugin->descriptor, "last_used");
+    CHECK(last_used.rc == 0);
+    const auto rows = captured_rows(last_used.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front() == "constrained|usage_feeder_disabled");
+
+    plugin->descriptor->shutdown(ctx.get());
+}
+
 // ── round-3 review MEDIUM: last_used's unfiltered form must be bounded ─────
 
 TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and reports "
@@ -569,6 +632,7 @@ TEST_CASE("app_usage plugin: last_used (unfiltered) caps at kMaxLastUsedRows and
     }
     seed::exec_or_fail(writer, "COMMIT");
     seed::insert_tar_config(writer, "usage_enabled", "true");
+    seed::insert_tar_config(writer, "usage_feeder_enabled", "true");
     sqlite3_close(writer);
 
     yuzu::agent::StandalonePluginContext ctx("app_usage", {{"agent.data_dir", data_dir.string()}});
@@ -669,29 +733,45 @@ TEST_CASE("app_usage plugin: a WELL-FORMED tar.db with a corrupted data page fai
     // (the schema/sqlite_master page) risks failing at open/prepare time
     // same as the garbage-bytes test above, rather than reaching
     // quick_check's per-page scan.
+    //
+    // Round-3 review Blocker (policy floor): RAII-owned, unlike this file's
+    // other seed blocks' raw sqlite3*/sqlite3_close -- those are a
+    // pre-existing convention this test merely sits beside (SHOULD, not a
+    // floor, per governance's "pre-existing cleanup in a file this change
+    // merely touches" carve-out), but this block is new code in this PR's
+    // diff, which the floor does gate.
     int64_t page_size = 0;
     {
-        sqlite3* writer = nullptr;
-        REQUIRE(sqlite3_open(db_path.string().c_str(), &writer) == SQLITE_OK);
-        seed::exec_or_fail(writer, "PRAGMA journal_mode=DELETE"); // single-file, no -wal sidecar
-        seed::create_schema(writer);
-        seed::exec_or_fail(writer, "BEGIN");
-        for (int i = 0; i < 300; ++i) {
-            seed::insert_usage_daily(writer, today_ts, "exe_" + std::to_string(i), 1, 60, now, now,
-                                     0, 0);
+        std::unique_ptr<sqlite3, decltype(&sqlite3_close)> writer{nullptr, &sqlite3_close};
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(db_path.string().c_str(), &raw) == SQLITE_OK);
+            writer.reset(raw);
         }
-        seed::exec_or_fail(writer, "COMMIT");
+        seed::exec_or_fail(writer.get(),
+                           "PRAGMA journal_mode=DELETE"); // single-file, no -wal sidecar
+        seed::create_schema(writer.get());
+        seed::exec_or_fail(writer.get(), "BEGIN");
+        for (int i = 0; i < 300; ++i) {
+            seed::insert_usage_daily(writer.get(), today_ts, "exe_" + std::to_string(i), 1, 60,
+                                     now, now, 0, 0);
+        }
+        seed::exec_or_fail(writer.get(), "COMMIT");
         // Read the ACTUAL page size rather than assuming SQLite's default
         // (governance Gate 4 consistency-auditor NICE finding) -- a future
         // vcpkg/platform SQLite built with a different compiled-in default
         // would otherwise silently corrupt bytes outside real table data,
         // false-greening this exact regression again.
-        sqlite3_stmt* stmt = nullptr;
-        REQUIRE(sqlite3_prepare_v2(writer, "PRAGMA page_size", -1, &stmt, nullptr) == SQLITE_OK);
-        REQUIRE(sqlite3_step(stmt) == SQLITE_ROW);
-        page_size = sqlite3_column_int64(stmt, 0);
-        sqlite3_finalize(stmt);
-        sqlite3_close(writer);
+        std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> stmt{nullptr,
+                                                                        &sqlite3_finalize};
+        {
+            sqlite3_stmt* raw_stmt = nullptr;
+            REQUIRE(sqlite3_prepare_v2(writer.get(), "PRAGMA page_size", -1, &raw_stmt,
+                                       nullptr) == SQLITE_OK);
+            stmt.reset(raw_stmt);
+        }
+        REQUIRE(sqlite3_step(stmt.get()) == SQLITE_ROW);
+        page_size = sqlite3_column_int64(stmt.get(), 0);
     }
     REQUIRE(page_size > 0);
 

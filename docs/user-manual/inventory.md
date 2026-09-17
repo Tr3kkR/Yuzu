@@ -617,8 +617,9 @@ seconds, first/last-seen, and a distinct-user count over a 30-day sliding window
   rows in `.claude/routed-concerns.md`.
 - **Per-host executable cap.** The agent-side `last_used` action is capped at 5000
   distinct executables in the retained window; a host past the cap still reports
-  its 5000 most-recently-tracked executables plus a trailing truncation marker
-  (never a silent drop). Known limitation, tracked in
+  5000 of them (lexicographically first by `exe_key`, not by recency or any usage
+  metric) plus a trailing truncation marker (never a silent drop). Known
+  limitation, tracked in
   [#4489](https://github.com/Tr3kkR/Yuzu/issues/4489): a host that stays
   *continuously* over the cap has its whole daily-sync cycle skipped rather than
   syncing a partial result — build servers, CI runners and dev workstations with

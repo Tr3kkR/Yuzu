@@ -363,6 +363,49 @@ TEST_CASE("run_summary: REAL CAPTURE fixture — top limit is respected", "[app_
     CHECK(result->rows[0].total_seconds == 870563);
 }
 
+// Round-3 review MEDIUM (CDX-R2-03/K5): run_summary's distinct-user merge
+// previously used an unordered, independently-LIMIT-capped query with no
+// relationship to which exe_keys the (top-ranked, <=w.top) result.rows had
+// already selected -- a genuinely top-ranked executable could silently read
+// distinct_users=0 once usage_daily_user held more than kMaxLastUsedRows
+// distinct exe_keys, because the old query's arbitrary first-N rows could
+// easily miss it. Reproduced here: insert far more than kMaxLastUsedRows
+// *other* exe_keys into usage_daily_user BEFORE the real target's own
+// usage_daily_user rows, so a table-order-based (no ORDER BY) LIMIT scan
+// would return the noise rows and never reach the target -- exactly the
+// physical ordering SQLite uses for an index-free GROUP BY LIMIT with no
+// ORDER BY. The target is the ONLY exe_key with a usage_daily row, so it is
+// unambiguously result.rows[0].
+TEST_CASE("run_summary: a genuinely top-ranked executable's distinct_users survives "
+         "when usage_daily_user holds more than kMaxLastUsedRows OTHER exe_keys, "
+         "inserted first",
+          "[app_usage][summary][regression]") {
+    sqlite3* db = nullptr;
+    REQUIRE(sqlite3_open(":memory:", &db) == SQLITE_OK);
+    seed::create_schema(db);
+    seed::exec_or_fail(db, "BEGIN");
+    const auto noise_count = static_cast<int64_t>(kMaxLastUsedRows) + 500;
+    for (int64_t i = 0; i < noise_count; ++i) {
+        seed::insert_usage_daily_user(db, 100000, "noise_" + std::to_string(i), "someuser");
+    }
+    seed::insert_usage_daily(db, 100000, "target.exe", 5, 12000, 100000, 100500, 0, 0);
+    seed::insert_usage_daily_user(db, 100000, "target.exe", "alice");
+    seed::insert_usage_daily_user(db, 100000, "target.exe", "bob");
+    seed::exec_or_fail(db, "COMMIT");
+
+    WindowParams w;
+    w.days = 30;
+    w.top = 25;
+    w.by = WindowParams::By::run_time;
+
+    const auto result = run_summary(db, w, 0);
+    REQUIRE(result.has_value());
+    REQUIRE(result->rows.size() == 1);
+    CHECK(result->rows[0].exe_key == "target.exe");
+    CHECK(result->rows[0].distinct_users == 2); // NOT 0 -- the bug this test guards against
+    sqlite3_close(db);
+}
+
 // ─────────────────────────────────────────────────────────── run_last_used ─
 
 TEST_CASE("run_last_used: REAL CAPTURE fixture — no exe filter returns every exe_key",
