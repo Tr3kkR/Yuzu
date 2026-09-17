@@ -59,6 +59,17 @@ static_assert(kGatewayRouteLeaseTtlSecs == yuzu::server::kKnownLeaseTtlSecs,
              "duplicated pair (see both files' comments) — they must be bumped "
              "together or the reap grace window (>= 1x this TTL) silently erodes");
 
+// HA WS-4 #4324: `StreamStatusNotification.stream_home_id` is gateway-
+// asserted, untrusted input like every other field on this message. The
+// gateway mints it as `string:lowercase(binary:encode_hex(crypto:
+// strong_rand_bytes(16)))` — 32 hex chars (yuzu_gw_agent.erl) — so 64 bytes
+// gives headroom for a future longer id without leaving the value unbounded.
+// An oversized incoming value is treated as MALFORMED and clamped to empty
+// (legacy/no-fence for that call) rather than rejecting the whole RPC or
+// comparing/storing the oversized value — see the CONNECTED/DISCONNECTED
+// branches below.
+constexpr std::size_t kMaxStreamHomeIdLen = 64;
+
 // HA WS-4 slice 4.1 / 4.2b Task B: shared log+metric helper for a degraded
 // GatewayRouteStore write (gateway_route_store.hpp). This function ONLY logs
 // and counts — it never decides proceed-vs-refuse. What each CALLER does next
@@ -197,6 +208,16 @@ GatewayUpstreamServiceImpl::GatewayUpstreamServiceImpl(AgentRegistry& registry, 
                           {{"op", "announce_connected"}, {"outcome", "session_mismatch"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "deregister"}, {"outcome", "session_mismatch"}});
+        // HA WS-4 #4324: the per-home stream-generation fence's two new
+        // outcomes — a genuine stale-home mismatch (the case this fence
+        // exists to catch) and a malformed (oversized) incoming
+        // stream_home_id on either notification kind.
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "deregister"}, {"outcome", "stale_home"}});
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "announce_connected"}, {"outcome", "malformed_home_id"}});
+        metrics_->counter("yuzu_server_gateway_route_desync_total",
+                          {{"op", "deregister"}, {"outcome", "malformed_home_id"}});
         metrics_->counter("yuzu_server_gateway_route_desync_total",
                           {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}});
     }
@@ -1171,8 +1192,19 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // capabilities not yet replaced) that could false-deny a dispatch.
         std::vector<std::string> wire_capabilities(request->wire_capabilities().begin(),
                                                     request->wire_capabilities().end());
+        // HA WS-4 #4324: stream_home_id is gateway-asserted, untrusted input
+        // (see kMaxStreamHomeIdLen's comment) — bound it once, here, before
+        // publishing it into the registry or the directory below. An
+        // oversized value is malformed: clamp to empty (legacy/no-fence for
+        // this call) rather than rejecting the whole RPC or using it
+        // unbounded downstream.
+        std::string stream_home_id = request->stream_home_id();
+        if (stream_home_id.size() > kMaxStreamHomeIdLen) {
+            record_directory_desync(metrics_, "announce_connected", "malformed_home_id");
+            stream_home_id.clear();
+        }
         registry_.set_gateway_route(agent_id, request->gateway_node(),
-                                    std::move(wire_capabilities));
+                                    std::move(wire_capabilities), stream_home_id);
         // HA WS-4 4.1: mirror the same CONNECTED fact into the durable,
         // cross-replica routing directory (gateway_route_store.hpp). As of
         // 4.2b Task C the directory IS read for dispatch (fallback-only, on a
@@ -1205,7 +1237,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
                              session_id);
             } else if (auto res = gateway_route_store_->announce_connected(
                            agent_id, session_id, request->cluster_id(), request->gateway_node(),
-                           kGatewayRouteLeaseTtlSecs);
+                           kGatewayRouteLeaseTtlSecs, stream_home_id);
                        !res) {
                 record_route_store_failure(metrics_, "announce_connected", res.error());
             } else if (!res->matched) {
@@ -1219,7 +1251,60 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         break;
     }
 
-    case gw::StreamStatusNotification::DISCONNECTED:
+    case gw::StreamStatusNotification::DISCONNECTED: {
+        // HA WS-4 #4324: stream_home_id is gateway-asserted, untrusted input
+        // — bound it once, here, before the fence comparison and everything
+        // downstream in this branch reuses the (possibly-clamped) value.
+        std::string stream_home_id = request->stream_home_id();
+        if (stream_home_id.size() > kMaxStreamHomeIdLen) {
+            record_directory_desync(metrics_, "deregister", "malformed_home_id");
+            stream_home_id.clear();
+        }
+
+        // HA WS-4 #4324 — the per-home stream-generation fence. Resolved
+        // ONCE, HERE, before ANY of the three DISCONNECTED effects below
+        // (registry clear_stream_if_session/remove_agent_if_session, the
+        // durable directory deregister, and the gateway_sessions_/
+        // lost_race_sessions_ erase) run. This is a design-review-mandated
+        // structural fix, not a style choice: fencing only a SUBSET of the
+        // three (e.g. the registry+store writes but not the session-map
+        // erase) is WORSE than the pre-#4324 unfenced behavior — a stale
+        // DISCONNECTED(home1) for a session re-homed to home2 would then
+        // correctly no-op the registry/store teardown, but STILL erase
+        // gateway_sessions_[session_id], so the very NEXT genuine
+        // notification for that live re-homed session (its real
+        // DISCONNECTED, or a CONNECTED) fails this handler's own "Verify
+        // session" gate above as `unknown_session` — the live session can
+        // never again be torn down by its own real events, a stale-
+        // placement trap bounded only by the 90s lease TTL, plus an
+        // unknown_session desync storm. So: proceed with all three, or skip
+        // all three — never split them.
+        //
+        // `stored_home` is `nullopt` when the registry has no session
+        // matching (agent_id, session_id) AT ALL (already gone via an
+        // earlier disconnect, or this session_id belongs to a different
+        // agent/was superseded) — that case has nothing for THIS fence to
+        // protect and is already handled correctly and independently by the
+        // legacy session_id guards below (clear_stream_if_session/
+        // remove_agent_if_session/deregister's own session-scoped
+        // predicate). Only a MATCHING session_id with a DIFFERING home id is
+        // this fence's concern.
+        if (auto stored_home = registry_.gateway_stream_home_id(agent_id, session_id);
+            stored_home.has_value()) {
+            // Mirrors gateway_route_store.hpp's ASYMMETRIC deregister
+            // predicate byte-for-byte (`stream_home_id = $3 OR
+            // (stream_home_id IS NULL AND $3 = '')`) — never diverge the two:
+            // match if equal, OR if BOTH are empty (legacy, pre-#4324
+            // no-fence case).
+            const bool home_matches = (*stored_home == stream_home_id) ||
+                                      (stored_home->empty() && stream_home_id.empty());
+            if (!home_matches) {
+                record_directory_desync(metrics_, "deregister", "stale_home");
+                response->set_acknowledged(true);
+                return grpc::Status::OK;
+            }
+        }
+
         // `clear_stream_if_session` also clears the advertised-capability set
         // (agent_registry.cpp) — a session whose stream is gone has nothing
         // live to route a dispatch-tagged command through, so no separate
@@ -1229,13 +1314,11 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // HA WS-4 4.1: mirror the DISCONNECTED fact into the durable routing
         // directory too — session-guarded (gateway_route_store.hpp), so a
         // DIFFERENT, superseded session's DISCONNECTED can't tear down a newer
-        // re-home. NOTE: a SAME-session late DISCONNECTED is NOT fenced (the
-        // re-announce reuses the session id); that is #4246 #4 / #4324, RE-SCOPED
-        // to a per-home generation fence and unreachable under the shipped gateway
-        // today (at most one CONNECTED(S) and one DISCONNECTED(S) per session) — this
-        // same-session teardown is session-keyed on the legacy in-memory path
-        // above (clear_stream_if_session/remove_agent_if_session) too, so the
-        // fence spans both when it lands. Task B (4.2b): fail-OPEN,
+        // re-home. A SAME-session late DISCONNECTED is now ALSO fenced — see
+        // the #4324 fence resolved at the top of this branch, above, which
+        // covers this write (via the passed-through `stream_home_id`), the
+        // legacy in-memory teardown just above, AND the session-map erase
+        // below — CLOSED, was #4246 #4 / #4324. Task B (4.2b): fail-OPEN,
         // deliberately — a degraded tombstone write here leaves a stale row
         // behind, but that row is bounded by the 90s lease TTL regardless
         // (kGatewayRouteLeaseTtlSecs): once the lease expires, a future
@@ -1245,7 +1328,8 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         // registry cleanup above over this would be a needless correctness
         // regression for no equivalent safety gain.
         if (gateway_route_store_) {
-            if (auto res = gateway_route_store_->deregister(agent_id, session_id); !res) {
+            if (auto res = gateway_route_store_->deregister(agent_id, session_id, stream_home_id);
+                !res) {
                 record_route_store_failure(metrics_, "deregister", res.error());
             } else if (!res->removed) {
                 record_directory_desync(metrics_, "deregister", "session_mismatch");
@@ -1259,6 +1343,7 @@ GatewayUpstreamServiceImpl::NotifyStreamStatus(grpc::ServerContext* context,
         spdlog::info("[gateway] Agent {} stream DISCONNECTED at gateway node '{}'", agent_id,
                      request->gateway_node());
         break;
+    }
 
     default:
         spdlog::warn("[gateway] NotifyStreamStatus: unknown event {} for agent {}",

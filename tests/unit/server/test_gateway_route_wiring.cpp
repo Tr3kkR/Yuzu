@@ -614,6 +614,258 @@ TEST_CASE("NotifyStreamStatus: DISCONNECTED tombstones the route only for the ma
               .value() == 1);
 }
 
+// ── #4324: the per-home stream-generation fence ─────────────────────────────
+//
+// The scenario #4324 exists to prevent: a session is CONNECTED under home A,
+// then RE-HOMED to home B while REUSING the same session_id (a live
+// circuit-recovery reconnect), and a stale DISCONNECTED from the now-torn-down
+// home A arrives afterward. Constructed here via the REAL production call
+// sequence — ProxyRegister's re-announce mechanism (needs a live grpc
+// context to carry x-yuzu-session-id metadata, hence LiveGatewayWiringHarness)
+// followed by a second CONNECTED for the reused session — rather than poking
+// registry/store internals directly: ProxyRegister always calls
+// register_agent() unconditionally (gateway_service_impl.cpp), even on the
+// re-announce branch, so the re-announce INSTALLS A NEW AgentSession object
+// that happens to be re-mapped onto the SAME session_id string — exactly the
+// "new home, reused session id" shape, and the one thing the shipped gateway
+// cannot produce today (at most one CONNECTED(S)/one DISCONNECTED(S) per
+// session — see gateway_route_store.hpp's SESSION GUARDS LIMIT note).
+
+TEST_CASE("NotifyStreamStatus #4324: a stale DISCONNECTED from a torn-down home does NOT tear "
+          "down a session re-homed under the SAME session id (registry, store, AND the "
+          "session map all survive)",
+          "[pg][gateway_route_wiring][grpc]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+    LiveGatewayWiringHarness h(store);
+
+    const std::string agent_id = "agent-stale-home-1";
+
+    // 1. Fresh registration — mints session1.
+    auto resp1 = h.register_agent(agent_id);
+    REQUIRE(resp1.accepted());
+    const std::string session1 = resp1.session_id();
+    REQUIRE_FALSE(session1.empty());
+
+    // 2. CONNECTED under home1 — the FIRST home.
+    gw::StreamStatusNotification connected1;
+    connected1.set_agent_id(agent_id);
+    connected1.set_session_id(session1);
+    connected1.set_event(gw::StreamStatusNotification::CONNECTED);
+    connected1.set_cluster_id("cluster-a");
+    connected1.set_gateway_node("node-a");
+    connected1.set_stream_home_id("home-1");
+    gw::StreamStatusAck ack1;
+    REQUIRE(h.svc.NotifyStreamStatus(/*context=*/nullptr, &connected1, &ack1).ok());
+    CHECK(ack1.acknowledged());
+    CHECK(h.registry.gateway_stream_home_id(agent_id, session1) == "home-1");
+
+    // 3. Re-announce: present the SAME session1 via x-yuzu-session-id metadata
+    // (a live circuit-recovery reconnect). ProxyRegister's re-announce branch
+    // reuses session1 in the RESPONSE, but register_agent() unconditionally
+    // installs a NEW AgentSession object underneath — that new object's own
+    // gateway_stream_home_id starts back at empty until its own CONNECTED
+    // arrives, below.
+    auto resp2 = h.register_agent(agent_id, session1);
+    REQUIRE(resp2.accepted());
+    REQUIRE(resp2.session_id() == session1); // reused, not a fresh mint
+
+    // 4. CONNECTED under home2 — the SAME session_id, a NEW home. This is the
+    // real re-home: same session, new stream_home_id.
+    gw::StreamStatusNotification connected2;
+    connected2.set_agent_id(agent_id);
+    connected2.set_session_id(session1);
+    connected2.set_event(gw::StreamStatusNotification::CONNECTED);
+    connected2.set_cluster_id("cluster-b");
+    connected2.set_gateway_node("node-b");
+    connected2.set_stream_home_id("home-2");
+    gw::StreamStatusAck ack2;
+    REQUIRE(h.svc.NotifyStreamStatus(/*context=*/nullptr, &connected2, &ack2).ok());
+    CHECK(ack2.acknowledged());
+    CHECK(h.registry.gateway_stream_home_id(agent_id, session1) == "home-2");
+
+    auto row_after_rehome = store.lookup_route(agent_id);
+    REQUIRE(row_after_rehome.has_value());
+    REQUIRE(row_after_rehome->has_value());
+    CHECK((*row_after_rehome)->gateway_node == "node-b");
+    CHECK((*row_after_rehome)->session_id == session1);
+
+    // 5. A STALE DISCONNECTED from the now-torn-down home1 arrives (delayed
+    // delivery from the old gateway process instance).
+    gw::StreamStatusNotification stale_disc;
+    stale_disc.set_agent_id(agent_id);
+    stale_disc.set_session_id(session1); // SAME session_id — reused
+    stale_disc.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    stale_disc.set_gateway_node("node-a");
+    stale_disc.set_stream_home_id("home-1"); // STALE — the torn-down home
+    gw::StreamStatusAck stale_ack;
+    REQUIRE(h.svc.NotifyStreamStatus(/*context=*/nullptr, &stale_disc, &stale_ack).ok());
+    // Acked exactly as a successful DISCONNECTED would be — the fence is a
+    // silent no-op from the gateway's point of view, not an error.
+    CHECK(stale_ack.acknowledged());
+
+    // Assertion 1: the durable directory route is UNCHANGED — home2's
+    // placement survives (not tombstoned, still session1/node-b).
+    auto row_after_stale = store.lookup_route(agent_id);
+    REQUIRE(row_after_stale.has_value());
+    REQUIRE(row_after_stale->has_value());
+    CHECK((*row_after_stale)->session_id == session1);
+    CHECK((*row_after_stale)->gateway_node == "node-b");
+    REQUIRE((*row_after_stale)->lease_until_ms.has_value()); // NOT tombstoned
+
+    // Assertion 2: the registry's in-memory session state ALSO survives — the
+    // naive "fence the registry/store writes but still erase the session map"
+    // shape the design review flagged would fail THIS check even though
+    // assertion 1 above would pass. Prove it by sending the SUBSEQUENT
+    // genuine DISCONNECTED for the live re-homed session and confirming it is
+    // NOT rejected as unknown_session.
+    CHECK(h.registry.gateway_stream_home_id(agent_id, session1) == "home-2");
+    gw::StreamStatusNotification real_disc;
+    real_disc.set_agent_id(agent_id);
+    real_disc.set_session_id(session1);
+    real_disc.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    real_disc.set_gateway_node("node-b");
+    real_disc.set_stream_home_id("home-2"); // matches the CURRENT home
+    gw::StreamStatusAck real_ack;
+    REQUIRE(h.svc.NotifyStreamStatus(/*context=*/nullptr, &real_disc, &real_ack).ok());
+    CHECK(real_ack.acknowledged());
+    // Not rejected as unknown_session — the fix this scenario exists to prove.
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "notify_stream_status"}, {"outcome", "unknown_session"}})
+              .value() == 0);
+    auto row_after_real = store.lookup_route(agent_id);
+    REQUIRE(row_after_real.has_value());
+    REQUIRE(row_after_real->has_value());
+    CHECK_FALSE((*row_after_real)->session_id.has_value()); // now genuinely tombstoned
+
+    // Assertion 3: the desync counter recorded exactly the one stale-home
+    // rejection above (not the genuine, matching teardown).
+    CHECK(h.metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "stale_home"}})
+              .value() == 1);
+}
+
+TEST_CASE("NotifyStreamStatus #4324: a legacy (empty stream_home_id) DISCONNECTED for a legacy "
+          "(empty stream_home_id) CONNECTED still tombstones normally — backward compatibility "
+          "for a gateway build predating #4324",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    const std::string agent_id = "agent-legacy-home-1";
+    auto req = make_gw_register(auth_mgr, agent_id);
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    // Legacy CONNECTED — stream_home_id left unset (defaults to empty, the
+    // pre-#4324 wire shape).
+    gw::StreamStatusNotification connected;
+    connected.set_agent_id(agent_id);
+    connected.set_session_id(session_id);
+    connected.set_event(gw::StreamStatusNotification::CONNECTED);
+    connected.set_gateway_node("node-legacy");
+    gw::StreamStatusAck connected_ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &connected, &connected_ack).ok());
+    CHECK(connected_ack.acknowledged());
+    CHECK(registry.gateway_stream_home_id(agent_id, session_id) == "");
+
+    // Legacy DISCONNECTED — also unset. Both empty ⇒ the fence's "both are
+    // legacy" clause admits it, exactly as if #4324 never shipped.
+    gw::StreamStatusNotification disconnected;
+    disconnected.set_agent_id(agent_id);
+    disconnected.set_session_id(session_id);
+    disconnected.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    disconnected.set_gateway_node("node-legacy");
+    gw::StreamStatusAck disconnected_ack;
+    REQUIRE(
+        gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &disconnected, &disconnected_ack)
+            .ok());
+    CHECK(disconnected_ack.acknowledged());
+
+    auto row = store.lookup_route(agent_id);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value());     // tombstoned
+    CHECK_FALSE((*row)->lease_until_ms.has_value());  // tombstoned
+
+    // No stale-home rejection — legacy-vs-legacy is not a mismatch.
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "deregister"}, {"outcome", "stale_home"}})
+              .value() == 0);
+}
+
+TEST_CASE("NotifyStreamStatus #4324: an oversized stream_home_id is treated as malformed and "
+          "clamped to empty, not used unbounded or rejecting the RPC",
+          "[pg][gateway_route_wiring]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, gwroutewiring_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayRouteStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    yuzu::server::auth::AuthManager auth_mgr;
+    yuzu::server::auth::AutoApproveEngine auto_approve;
+    GatewayUpstreamServiceImpl gateway_svc{registry, bus, auth_mgr, auto_approve, &metrics};
+    gateway_svc.set_gateway_route_store(&store);
+
+    const std::string agent_id = "agent-oversized-home-1";
+    auto req = make_gw_register(auth_mgr, agent_id);
+    apb::RegisterResponse resp;
+    REQUIRE(gateway_svc.ProxyRegister(/*context=*/nullptr, &req, &resp).ok());
+    const std::string session_id = resp.session_id();
+
+    gw::StreamStatusNotification connected;
+    connected.set_agent_id(agent_id);
+    connected.set_session_id(session_id);
+    connected.set_event(gw::StreamStatusNotification::CONNECTED);
+    connected.set_gateway_node("node-oversized");
+    connected.set_stream_home_id(std::string(65, 'x')); // 1 over the 64-byte bound
+    gw::StreamStatusAck ack;
+    REQUIRE(gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &connected, &ack).ok());
+    CHECK(ack.acknowledged()); // malformed input degrades to legacy, never rejects the RPC
+
+    // Clamped to empty, not stored unbounded.
+    CHECK(registry.gateway_stream_home_id(agent_id, session_id) == "");
+    CHECK(metrics
+              .counter("yuzu_server_gateway_route_desync_total",
+                       {{"op", "announce_connected"}, {"outcome", "malformed_home_id"}})
+              .value() == 1);
+
+    // A subsequent legacy-shaped (empty) DISCONNECTED still tears it down
+    // normally — the clamp behaves exactly like an honestly-empty value.
+    gw::StreamStatusNotification disconnected;
+    disconnected.set_agent_id(agent_id);
+    disconnected.set_session_id(session_id);
+    disconnected.set_event(gw::StreamStatusNotification::DISCONNECTED);
+    disconnected.set_gateway_node("node-oversized");
+    gw::StreamStatusAck disc_ack;
+    REQUIRE(
+        gateway_svc.NotifyStreamStatus(/*context=*/nullptr, &disconnected, &disc_ack).ok());
+    CHECK(disc_ack.acknowledged());
+    auto row = store.lookup_route(agent_id);
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK_FALSE((*row)->session_id.has_value()); // tombstoned normally
+}
+
 // ── BatchHeartbeat: renew_leases ────────────────────────────────────────────
 
 TEST_CASE("BatchHeartbeat: renews the route lease for the carried session ids in one call",
