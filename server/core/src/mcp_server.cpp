@@ -7790,9 +7790,19 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                std::expected<std::optional<DeviceDetail>, DeviceReadError> result{
-                    std::optional<DeviceDetail>{std::nullopt}};
-                if (device_api) result = device_api->lookup_device(agent_id);
+                if (!device_api) {
+                    // Wiring fault, id-INDEPENDENT — mirror REST's 503 rather than
+                    // masking it as a genuine miss (CDX-P2-04/K4). Reached only AFTER
+                    // the in_scope deny above, so an out-of-scope caller still gets the
+                    // identical not-found denial with zero backing read (#3564 intact).
+                    mcp_audit("failure", agent_id);
+                    res.set_content(
+                        error_response(id, kInternalError, "device registry unavailable"),
+                        "application/json");
+                    return;
+                }
+                std::expected<std::optional<DeviceDetail>, DeviceReadError> result =
+                    device_api->lookup_device(agent_id);
                 if (!result) { // DeviceReadError::kDegraded — id resolved, tag-store read failed
                                 // (in-scope only reaches here)
                     mcp_audit("failure", agent_id);
@@ -7800,7 +7810,7 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                if (!*result) { // genuine miss (or unwired device_api) — identical denial
+                if (!*result) { // genuine miss — identical denial to the out-of-scope case
                     spdlog::debug("get_agent_details: no match for {}", agent_id);
                     mcp_audit("denied", "agent not found or outside caller's fleet-read scope: " +
                                             agent_id);
