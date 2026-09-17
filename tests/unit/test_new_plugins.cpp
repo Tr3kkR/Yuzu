@@ -341,9 +341,11 @@ DESCRIPTOR_TEST("firewall", "firewall", 2, "state", "rules")
 
 // DESCRIPTOR_TEST has no per-plugin version parameter (shared across ~15
 // plugins with unrelated version histories) -- a standalone case pins the
-// parity-residual bump so a future revert of firewall_plugin.cpp's
-// version() string is caught, not just observed once in a manual capture
-// (code-review r1, FV-codex-05).
+// version bump so a future revert of firewall_plugin.cpp's version()
+// string is caught, not just observed once in a manual capture
+// (code-review r1, FV-codex-05). The pinned value tracks the highest bump
+// merged onto this plugin -- 0.5.0 for the macOS parity-residual work,
+// then 0.6.0 once the nftables netlink hardening bump landed on top.
 TEST_CASE("firewall: version reflects the parity-residual bump",
           "[plugins][descriptor][firewall]") {
     auto ph = load_plugin("firewall");
@@ -355,7 +357,7 @@ TEST_CASE("firewall: version reflects the parity-residual bump",
     }
     REQUIRE(ph.desc != nullptr);
     REQUIRE(ph.desc->version != nullptr);
-    CHECK(std::string_view(ph.desc->version) == "0.5.0");
+    CHECK(std::string_view(ph.desc->version) == "0.6.0");
 }
 
 DESCRIPTOR_TEST("windows_updates", "windows_updates", 4, "installed", "missing", "pending_reboot", "patch_connectivity")
