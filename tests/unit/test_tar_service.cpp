@@ -251,6 +251,35 @@ TEST_CASE("parse_launchctl_list: a truncated row with an empty LABEL field is "
     CHECK(result.entries[1].name == "com.apple.knowledgeconstructiond");
 }
 
+// ── header-row structural check (UP-6, governance A0 fix round) --
+// propagated from yuzu::shared::parse_launchctl_list's own header check
+// through this file's yuzu::tar::parse_launchctl_list wrapper.
+
+TEST_CASE("parse_launchctl_list: a preamble line before the real header is "
+          "malformed, not decoded as if line 0 were the header",
+          "[tar_service]") {
+    std::vector<std::string> lines = {
+        "launchctl: some warning banner", // CH-2: preamble before the header
+        "PID\tStatus\tLabel",
+        "1190\t0\tcom.apple.progressd",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    CHECK(result.entries.empty());
+}
+
+TEST_CASE("parse_launchctl_list: a header-less capture (first line is already "
+          "data) is malformed, not decoded from the wrong offset",
+          "[tar_service]") {
+    std::vector<std::string> lines = {
+        "1190\t0\tcom.apple.progressd", // CH-2: no header row at all
+        "93175\t-9\tcom.apple.knowledgeconstructiond",
+    };
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.malformed);
+    CHECK(result.entries.empty());
+}
+
 // ── enumerate_services_impl: runner-migration call-site coverage (Finding 3) ──
 //
 // Everything above exercises only the pure parsers. Nothing previously
