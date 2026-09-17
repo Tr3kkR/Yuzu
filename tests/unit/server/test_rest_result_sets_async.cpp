@@ -1339,4 +1339,14 @@ TEST_CASE("re-eval: a stored source_payload nested past the depth limit is refus
     CHECK(payload.contains("note"));
     CHECK_FALSE(payload.contains("sql"));
     CHECK_FALSE(payload.contains("junk"));
+
+    // Governance Gate 2/4 finding (#4493 re-review): the heal is a real
+    // write to an otherwise immutable-by-design row and must leave durable
+    // evidence, not just a status code -- same "refusal is durable evidence"
+    // discipline as the other audited-denial tests in this file.
+    const bool heal_audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [&](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.heal" && a.result == "success";
+        });
+    CHECK(heal_audited);
 }

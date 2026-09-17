@@ -266,9 +266,33 @@ public:
     /// caller's prior check) and is a no-op (returns false, writes nothing)
     /// when the payload is not actually poisoned, so it can never silently
     /// overwrite a healthy row's provenance. Returns true only when a
-    /// poisoned payload was found and replaced with the same small, fixed,
-    /// trivially-shallow placeholder `mark_failed` writes for its own
-    /// poisoned-pending case.
+    /// poisoned payload was found and replaced with the same fixed `note`
+    /// text `mark_failed` writes for its own poisoned-pending case (not the
+    /// same full object -- `mark_failed`'s also carries a caller-supplied
+    /// `failure` reason this method has no equivalent argument for).
+    ///
+    /// `false` is overloaded across four distinct causes: the store is not
+    /// open, no connection lease was available, the row is gone (deleted
+    /// concurrently), or the payload was never actually poisoned (the no-op
+    /// case) -- a caller needing to distinguish a genuine write failure from
+    /// a harmless no-op cannot do so from the return value alone (tracked as
+    /// a should-fix, #4493 governance re-review).
+    ///
+    /// Deliberately has NO owner check of its own -- same shape as
+    /// `mark_failed`. Both of this method's only two production callers
+    /// (REST `/re-eval`, MCP `reevaluate_result_set`) call it only after
+    /// their own `load_owned`/`rs_load_owned` has already confirmed the
+    /// caller owns `id`; a future caller must do the same before invoking
+    /// this method directly.
+    ///
+    /// Invariant this method's safety depends on and that is NOT enforced by
+    /// any type or assertion: today, REST's `/re-eval` and MCP
+    /// `reevaluate_result_set` are the ONLY code paths that ever parse
+    /// `source_payload` back into JSON, and both already depth-check it
+    /// first. A future consumer of `source_payload` (a dashboard/lineage
+    /// view, a list endpoint) that parses it WITHOUT its own depth check
+    /// would reopen the #2437 SIGSEGV class this guard exists to close --
+    /// healing on read here does not protect a consumer that never calls it.
     bool heal_poisoned_payload(const std::string& id);
 
     // ── GC ───────────────────────────────────────────────────────────────────

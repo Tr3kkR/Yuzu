@@ -11766,12 +11766,25 @@ McpServer::HandlerFn McpServer::build_handler(
                     // unrecoverably gone), but every future read of this row
                     // (this tool included) hits the safe placeholder instead
                     // of repeating the same depth-check dance forever.
-                    result_set_store_->heal_poisoned_payload(rs_id);
+                    // Gate 2/4 governance finding (#4493 re-review): this is
+                    // the only rejection branch in the whole result-set family
+                    // that performs a real write to an otherwise
+                    // immutable-by-design table (scope-walking-design.md), so
+                    // audit BOTH outcomes explicitly (REST's twin does the
+                    // same) rather than silently mutating on an error path -
+                    // and never claim the payload "has been discarded" unless
+                    // the write actually committed.
+                    const bool healed = result_set_store_->heal_poisoned_payload(rs_id);
+                    audit_fn(req, "result_set.heal", healed ? "success" : "failure",
+                             "ResultSet", rs_id, "");
                     res.set_content(
                         error_response(id, kInvalidParams,
-                                       "RESULT_SET_BAD_REQUEST: stored source_payload nested "
-                                       "too deeply and has been discarded; re-eval is "
-                                       "unavailable for this set"),
+                                       healed ? "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                                "nested too deeply and has been discarded; "
+                                                "re-eval is unavailable for this set"
+                                              : "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                                "nested too deeply; heal attempt failed, try "
+                                                "again"),
                         "application/json");
                     return;
                 }

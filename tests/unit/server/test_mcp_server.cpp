@@ -25391,6 +25391,12 @@ TEST_CASE("MCP reevaluate_result_set: a stored source_payload nested past the de
     CHECK(payload.contains("note"));
     CHECK_FALSE(payload.contains("sql"));
     CHECK_FALSE(payload.contains("junk"));
+
+    // Governance Gate 2/4 finding (#4493 re-review): the heal is a real
+    // write to an otherwise immutable-by-design row and must leave durable
+    // evidence, not just a JSON-RPC error code.
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "result_set.heal|success") !=
+          ts.audit_log.end());
 }
 
 // Gate 6 sre finding (#4364 re-review): the params-bound recheck just above
