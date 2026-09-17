@@ -453,6 +453,7 @@ constexpr size_t kPrefetchHashOffset = 0x4C; // 76
 // File-information block common prefix (present at the same absolute offset
 // for every supported version — verified against all three real captures).
 constexpr size_t kFileInfoVolumesInfoCountOffset = 0x70; // number of volumes
+constexpr size_t kFileInfoVolumesInfoSizeField = 0x74;   // total byte size of the volumes-info block
 
 // v23 (Vista/7): one last-run FILETIME, run count at 0x98.
 //
@@ -485,21 +486,54 @@ constexpr size_t kFileInfoV26V30V31LastRunOffset = 0x80;
 constexpr size_t kFileInfoV26V30V31RunCountOffset = 0xC8;
 
 // Volumes-information array absolute offset (a fixed early field in the
-// common file-information prefix, alongside the volume COUNT above).
+// common file-information prefix, alongside the volume COUNT and byte-SIZE
+// fields above).
 constexpr size_t kFileInfoVolumesInfoOffsetField = 0x6C;
 
-// Volume-entry sub-fields, relative to that volume's own entry start (the
-// entry at `volumes_info_offset`) — per libscca's documented Volume
-// Information structure, verified against all three of A1's real captures'
-// volume-0 entries: DOSKEY (entry_start 0x15A0) has offset 0x14 (absolute
-// 0x15B4) holding 0xA8, and the DWORD at (entry_start + 0xA8) = absolute
-// 0x1648 reads 3 -- matching the 3 distinct 8-byte NTFS file references
-// that follow it (absolute 0x1650..0x1667). OUTPUT (entry_start 0x1EE8) and
-// REG.EXE (entry_start 0x2318) both hold 0x108 at the same relative 0x14,
-// and both also read 3 at (entry_start + 0x108) -- absolute 0x1FF0 and
-// 0x2420 respectively -- so all three real fixtures independently confirm
-// this same offset field and pin file_ref_count at exactly 3.
+// Volume-entry stride: the fixed byte distance between consecutive entries
+// in the volumes-info block, per libscca's documented Volume Information
+// structure.
+//
+// v30/31 (Win 8.1/10/11) = 96 bytes (0x60) -- BYTE-VERIFIED against
+// OUTPUT.EXE-EE9CBC0B and REG.EXE-6A8B6960's real SECOND volume entries:
+// at entry_start + 0x60, both decode to a well-formed UTF-16LE
+// "\VOLUME{...}" device-path string when read at the offset that entry's
+// own +0x00/+0x04 fields declare (the alternative, +0x68, decodes to
+// garbage there for both files). v23/26 (XP-era through Win7) = 104 bytes
+// (0x68) per libscca -- documentation-derived, NOT independently verified
+// against a real capture (every real fixture on this hardware parses as
+// v31; see real_prefetch_captures() in the test file). Every entry this
+// parser walks is bounds- and consistency-checked against the block's own
+// declared size (kFileInfoVolumesInfoSizeField) regardless of version, so
+// a wrong stride for v23/26 fails the whole parse (truncated_entry /
+// oversize_count) rather than silently misreading -- see parse_prefetch's
+// volume loop.
+constexpr size_t kVolumeEntryStrideV23V26 = 0x68; // 104
+constexpr size_t kVolumeEntryStrideV30V31 = 0x60; // 96
+
+// Volume-entry sub-fields, relative to the VOLUMES-INFO BLOCK START (i.e.
+// kFileInfoVolumesInfoOffsetField's own value) PLUS this entry's own
+// index*stride -- NOT relative to the entry's start on their own, which an
+// earlier revision of this parser assumed for entry 0 (block start and
+// entry 0's start coincide, so the two bases were indistinguishable until
+// a second entry was ever read). Byte-verified against OUTPUT/REG.EXE's
+// real two-volume file-information blocks: entry 1's device-path fields
+// only decode correctly when +0x00/+0x04 are read block-relative.
+//
+// +0x14 holds the (block-relative) byte offset of this volume's
+// file-references sub-block; +0x18 holds that sub-block's own total byte
+// size. The sub-block itself is
+// [u32 version][u32 count][u64 unknown][count x u64 NTFS file references],
+// and refs_size == 16 + count*8 holds exactly in every one of the 5 real
+// volumes across A1's three fixtures (DOSKEY: 1 volume / 15 refs; OUTPUT:
+// 2 volumes / 7 + 16 = 23 refs; REG.EXE: 2 volumes / 3 + 29 = 32 refs) --
+// parse_prefetch's volume loop verifies this relationship (as a `<=`, to
+// tolerate trailing padding a real file might carry) rather than trusting
+// it, and sums file_ref_count across every declared volume, not just
+// entry 0.
 constexpr size_t kVolumeEntryFileRefsOffsetField = 0x14;
+constexpr size_t kVolumeEntryFileRefsSizeField = 0x18;
+constexpr size_t kFileRefsBlockHeaderBytes = 16; // [u32 version][u32 count][u64 unknown]
 
 inline bool is_supported_prefetch_version(uint32_t v) {
     // v17 (XP/2003) is excluded on purpose — see the note above
@@ -576,33 +610,83 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
         return std::unexpected(detail::err("oversize_count", kFileInfoVolumesInfoCountOffset));
     out.volume_count = *volume_count;
 
-    // file_ref_count: the number-of-file-references DWORD inside volume
-    // entry 0's own file-references sub-block. This is a documented,
-    // emitted output field (README.md), not an internal detail, so it
-    // follows the same contract as run_count/volume_count above: a
-    // truncated or over-cap read here fails the whole parse with a named
-    // reason rather than silently defaulting to 0, which would be
-    // indistinguishable from "this file genuinely referenced zero
-    // volumes' worth of files" (routed-concerns.md's execution_artifacts
-    // row, clause (1): never an empty success for malformed input).
+    // file_ref_count: the TOTAL number of NTFS file references SUMMED
+    // across EVERY declared volume entry (README.md / execution_artifacts.
+    // yaml's documented "Number of file-reference entries in the
+    // file-information block" -- whole-file, not volume-0-only). Every
+    // entry is walked and bounds-checked; a truncated or over-cap value in
+    // ANY entry fails the whole parse with a named reason rather than
+    // silently under-counting or defaulting to 0 -- indistinguishable from
+    // "this file genuinely referenced zero volumes' worth of files"
+    // (routed-concerns.md's execution_artifacts row, clause (1): never an
+    // empty success for malformed input). The refs_size/count consistency
+    // check below also doubles as this loop's own layout self-check: an
+    // entry read at the wrong stride (kVolumeEntryStrideV23V26 is
+    // documentation-derived and unpinned by a real capture -- see its own
+    // comment) produces a refs_off/refs_size pair that fails bounds or
+    // consistency, so a wrong stride fails closed rather than silently
+    // misreading.
     if (out.volume_count > 0) {
         auto vol_info_off =
             detail::read_u32(in, kFileInfoVolumesInfoOffsetField, "truncated_entry");
         if (!vol_info_off)
             return std::unexpected(vol_info_off.error());
-        auto refs_field_off = detail::read_u32(
-            in, static_cast<size_t>(*vol_info_off) + kVolumeEntryFileRefsOffsetField,
-            "truncated_entry");
-        if (!refs_field_off)
-            return std::unexpected(refs_field_off.error());
-        const size_t refs_count_off =
-            static_cast<size_t>(*vol_info_off) + static_cast<size_t>(*refs_field_off);
-        auto refs_count = detail::read_u32(in, refs_count_off, "truncated_entry");
-        if (!refs_count)
-            return std::unexpected(refs_count.error());
-        if (*refs_count > kPrefetchMaxFileRefs)
-            return std::unexpected(detail::err("oversize_count", refs_count_off));
-        out.file_ref_count = *refs_count;
+        auto vol_info_size =
+            detail::read_u32(in, kFileInfoVolumesInfoSizeField, "truncated_entry");
+        if (!vol_info_size)
+            return std::unexpected(vol_info_size.error());
+
+        const uint64_t block_start = *vol_info_off;
+        const uint64_t block_size = *vol_info_size;
+        if (block_start + block_size > *file_size)
+            return std::unexpected(detail::err("truncated_entry", kFileInfoVolumesInfoSizeField));
+
+        const size_t stride = (*version == 23 || *version == 26) ? kVolumeEntryStrideV23V26
+                                                                  : kVolumeEntryStrideV30V31;
+        const uint64_t entries_bytes = static_cast<uint64_t>(out.volume_count) * stride;
+        if (entries_bytes > block_size)
+            return std::unexpected(detail::err("truncated_entry", kFileInfoVolumesInfoSizeField));
+
+        uint64_t total_refs = 0;
+        for (uint32_t i = 0; i < out.volume_count; ++i) {
+            const uint64_t entry = block_start + static_cast<uint64_t>(i) * stride;
+
+            auto refs_off = detail::read_u32(
+                in, static_cast<size_t>(entry + kVolumeEntryFileRefsOffsetField),
+                "truncated_entry");
+            if (!refs_off)
+                return std::unexpected(refs_off.error());
+            auto refs_size = detail::read_u32(
+                in, static_cast<size_t>(entry + kVolumeEntryFileRefsSizeField), "truncated_entry");
+            if (!refs_size)
+                return std::unexpected(refs_size.error());
+
+            const uint64_t refs_block_start = block_start + static_cast<uint64_t>(*refs_off);
+            const uint64_t refs_block_size = *refs_size;
+            if (refs_block_start + refs_block_size > block_start + block_size ||
+                refs_block_size < kFileRefsBlockHeaderBytes)
+                return std::unexpected(detail::err(
+                    "truncated_entry",
+                    static_cast<size_t>(entry) + kVolumeEntryFileRefsSizeField));
+
+            // The refs sub-block is [u32 version][u32 count][u64 unknown]
+            // [count x u64 refs] -- the count DWORD is 4 bytes into it.
+            auto refs_count =
+                detail::read_u32(in, static_cast<size_t>(refs_block_start) + 4, "truncated_entry");
+            if (!refs_count)
+                return std::unexpected(refs_count.error());
+            const uint64_t declared_bytes =
+                kFileRefsBlockHeaderBytes + static_cast<uint64_t>(*refs_count) * 8;
+            if (*refs_count > kPrefetchMaxFileRefs || declared_bytes > refs_block_size)
+                return std::unexpected(
+                    detail::err("oversize_count", static_cast<size_t>(refs_block_start) + 4));
+
+            total_refs += *refs_count;
+            if (total_refs > kPrefetchMaxFileRefs)
+                return std::unexpected(
+                    detail::err("oversize_count", static_cast<size_t>(refs_block_start) + 4));
+        }
+        out.file_ref_count = static_cast<uint32_t>(total_refs);
     }
 
     return out;

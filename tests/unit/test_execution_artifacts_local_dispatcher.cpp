@@ -3,8 +3,14 @@
  * execution_artifacts plugin (execution_artifacts.dylib/.so/.dll) via
  * PluginHandle::load and drives it through yuzu::agent::LocalDispatcher
  * (test_app_usage_local_dispatcher.cpp's pattern), UNGUARDED — init() is
- * never called; this plugin's init() is a no-op anyway, so this proves
- * execute() alone handles every action correctly with no setup.
+ * never called here. init() is NOT a no-op any more (it captures
+ * agent.data_dir for the amcache leg's scratch directory) -- on Windows
+ * that means an uninitialized amcache dispatch deterministically reports
+ * `constrained|data_dir_unset` rather than reaching real collection code,
+ * which this file's own assertions already treat as an ordinary
+ * `constrained|` outcome. The init()-exercising amcache coverage lives in
+ * test_execution_artifacts_win_local.cpp (P32), which DOES call init()
+ * with a real agent.data_dir.
  *
  * RUNS ON ALL THREE PLATFORMS unconditionally, per
  * test_filesystem_posture_local_dispatcher.cpp's precedent for why a

@@ -44,19 +44,40 @@
  *   - RegLoadAppKeyW itself never needs a PrivilegeScope.
  *
  * HOLD-TIME BOUND (acceptance criterion): collect_amcache's single
- * offline_hive_mutex() hold spans PrivilegeScope construction (only taken on
- * the ERROR_SHARING_VIOLATION fallback path) through the copy, RegLoadAppKeyW,
- * enumeration (capped at kAmcacheMaxSubkeys = 20000 registry reads, each
- * itself bounded by win_profiles.hpp's kMaxRegValueBytes = 1 MiB), and
- * RegCloseKey. Every step in that span is bounded LOCAL disk/registry I/O
- * (copy capped at kAmcacheMaxBytes = 256 MiB) — never network, never user
- * input — so the hold time is bounded by those caps, not open-ended.
+ * yuzu::agent::ScopedOfflineHiveLock("execution_artifacts") hold spans
+ * PrivilegeScope construction (only taken on the ERROR_SHARING_VIOLATION
+ * fallback path) through the copy, RegLoadAppKeyW, enumeration (capped at
+ * kAmcacheMaxSubkeys = 20000 registry reads, each itself bounded by
+ * win_profiles.hpp's kMaxRegValueBytes = 1 MiB), and RegCloseKey. Every step
+ * in that span is bounded LOCAL disk/registry I/O (copy capped at
+ * kAmcacheMaxBytes = 256 MiB) — never network, never user input — so the
+ * hold time is bounded by those caps, not open-ended. The scratch
+ * directory's own creation/verification and its later removal both run
+ * OUTSIDE this lock (see SCRATCH DIRECTORY below) — neither is
+ * privilege-bearing, so neither belongs inside the hold this bound
+ * describes. offline_hive_mutex.hpp's own banner documents this as the
+ * sixth plugin calling the shared lock directly (the other five go through
+ * with_user_hive()).
  *
  * PROCESS-TOKEN DISCIPLINE (win_profiles.hpp:416-432): PrivilegeScope mutates
  * the PROCESS token, so this file follows with_user_hive's own discipline
  * (win_profiles.hpp:479-535) exactly — the privilege-bearing sequence is
- * fully nested inside ONE offline_hive_mutex() lock_guard, never split
- * across two.
+ * fully nested inside ONE ScopedOfflineHiveLock, never split across two.
+ *
+ * SCRATCH DIRECTORY: collect_amcache stages the raw hive copy in a
+ * per-dispatch directory created by yuzu_create_temp_dir() (temp_file.cpp)
+ * under the operator-configured agent.data_dir — a 128-bit crypto-random
+ * name, CREATE_NEW semantics (never reused), owner-only DACL, removed on
+ * scope exit by this file's own ScratchDirGuard. An earlier revision of
+ * this file instead reused ONE fixed path across dispatches and hand-rolled
+ * a DACL-verification step to guard against a pre-planted directory; that
+ * verifier could never pass (the owner-only SDDL it authored, D:P(A;;GA;;;OW),
+ * stores the literal SDDL_OWNER_RIGHTS alias S-1-3-4 in the DACL — Windows
+ * substitutes CREATOR_OWNER (CO) into the real owner's SID, but never does
+ * that for Owner Rights (OW) — so the verifier's SID-equality checks matched
+ * nothing and the action was permanently `constrained|dest_dir_acl` on
+ * every real install). A random, never-reused directory needs no such
+ * verifier: there is nothing to pre-plant a name for.
  *
  * ShimCache's local blob reader mirrors read_reg_value's size-then-fill +
  * changed_during_read bounded-retry idiom (win_profiles.hpp:560-620) at a
@@ -83,17 +104,16 @@
 #endif
 #include <windows.h>
 #include <winternl.h> // NTSTATUS (confined_fs_win.cpp precedent)
-#include <aclapi.h>   // GetSecurityInfo/GetAclInformation/GetAce (amcache_dest_dir_is_safe)
-#include <sddl.h>     // ConvertStringSecurityDescriptorToSecurityDescriptorW (amcache_dest_dir DACL)
+#include <aclapi.h>   // GetSecurityInfo (scratch_dir_is_ours's owner check)
 
 #include <win_profiles.hpp> // RegKey, PrivilegeScope, offline_hive_mutex, read_reg_value,
                             // enumerate_value_names, to_wide/from_wide
 
-#include "execution_artifacts_legs.hpp"
+#include "execution_artifacts_legs.hpp" // also pulls in <yuzu/plugin.hpp> -- yuzu_create_temp_dir
 #include "execution_artifacts_parsers.hpp"
 
 #include <constraint_accumulator.hpp>
-#include <yuzu/agent/offline_hive_mutex.hpp>
+#include <yuzu/agent/offline_hive_mutex.hpp> // ScopedOfflineHiveLock
 #include <yuzu/string_utils.hpp>
 
 #include <spdlog/spdlog.h>
@@ -101,10 +121,12 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <format>
 #include <map>
 #include <mutex>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -266,94 +288,162 @@ constexpr wchar_t kAmcacheSourceHve[] = L"C:\\Windows\\appcompat\\Programs\\Amca
 constexpr uint64_t kAmcacheMaxBytes = 256ull * 1024 * 1024; // 256 MiB
 constexpr DWORD kAmcacheMaxSubkeys = 20000;
 
-// `data_dir` is the agent's configured `agent.data_dir` (execution_artifacts_
-// plugin.cpp's init()-time capture, threaded through collect_amcache below --
-// tar_plugin.cpp's init()-time cache precedent, tar_plugin.cpp:565-580).
-// Empty (agent.data_dir unset) falls back to the historical hardcoded
-// C:/ProgramData/yuzu/agent literal -- the profile is never silently
-// dropped, only the platform default substituted for a genuinely absent
-// config value.
-std::wstring amcache_dest_dir(std::string_view data_dir) {
-    std::wstring base =
-        data_dir.empty() ? L"C:\\ProgramData\\yuzu\\agent" : yuzu::win::to_wide(data_dir);
-    return base + L"\\execution_artifacts";
-}
+/// Process-wide count of persistent scratch-directory cleanup failures
+/// (e.g. an AV lock holding a file open past this action's own lifetime)
+/// across every ScratchDirGuard instance in this plugin process. There is
+/// no cap or alert path on the underlying accumulation -- that residual is
+/// unchanged from this file's earlier per-file TempHiveCleanup -- but a
+/// repeated failure is now at least observable via this counter's value in
+/// the log line below, rather than each occurrence being an isolated,
+/// uncorrelated `note|` row with no way to tell "happened once" from
+/// "happening every run".
+std::atomic<uint64_t> g_temp_cleanup_failed_total{0};
 
-std::wstring amcache_temp_path(std::string_view data_dir) {
-    return amcache_dest_dir(data_dir) + L"\\amcache_" + std::to_wstring(GetCurrentProcessId()) +
-           L"_" + std::to_wstring(GetTickCount64()) + L".hve";
-}
+/// RAII owner of a per-dispatch scratch directory created by
+/// yuzu_create_temp_dir() (temp_file.cpp): removes the directory and
+/// everything in it (the raw hive copy, its .LOG1/.LOG2 sidecars, and
+/// anything else this leg or RegLoadAppKeyW placed there) on scope exit,
+/// regardless of which return path collect_amcache takes (this package's
+/// spec: "temp copies always deleted (scope guard)"). A removal failure is
+/// logged via a `note|` row, never silently dropped, but never fails the
+/// action itself -- the action's own result was already decided by the
+/// time cleanup runs.
+///
+/// Deliberately NOT yuzu::TempDir (sdk/include/yuzu/plugin.hpp): that
+/// class's destructor calls std::filesystem::remove_all on a NARROW
+/// std::string, which std::filesystem decodes via the ANSI code page on
+/// MSVC -- but yuzu_create_temp_dir itself writes the path back as UTF-8
+/// (temp_file.cpp's wide_to_utf8). A non-ASCII agent.data_dir would then
+/// silently fail to resolve the real path and leak the raw hive with no
+/// diagnostic. This guard instead keeps the path as a std::wstring (built
+/// once, immediately after creation, via yuzu::win::to_wide on the UTF-8
+/// buffer) and removes it through std::filesystem::path's wide-native
+/// constructor, which never round-trips through a narrow encoding.
+///
+/// MUST be declared BEFORE the scratch-directory HANDLE and BEFORE the
+/// offline-hive lock in collect_amcache -- see scratch_dir_is_ours's banner
+/// for why: RemoveDirectoryW (what remove_all uses internally) fails with
+/// ERROR_SHARING_VIOLATION while a HANDLE without FILE_SHARE_DELETE is
+/// still open on the directory, so that handle must close (destruct)
+/// before this guard's destructor runs. Declared before the lock too so
+/// removal -- itself not privilege-bearing -- never happens while the
+/// shared offline_hive_mutex is held (reverse-declaration-order
+/// destruction: the lock releases, then the handle closes, then this
+/// guard removes the directory).
+class ScratchDirGuard {
+public:
+    ScratchDirGuard(yuzu::CommandContext& ctx, std::wstring path)
+        : ctx_(ctx), path_(std::move(path)) {}
 
-/// True if `sid` is the well-known SID of `type` (SYSTEM or
-/// BUILTIN\Administrators here) -- compared as a SID, never a localised
-/// account name (yuzu-agent.iss's SecureTrustAnchorDir precedent: matching
-/// "BUILTIN\Administrators" by name fails open off an English build).
-bool sid_is_well_known(PSID sid, WELL_KNOWN_SID_TYPE type) {
-    if (!sid)
-        return false;
-    BYTE buf[SECURITY_MAX_SID_SIZE];
-    DWORD size = sizeof(buf);
-    if (!CreateWellKnownSid(type, nullptr, buf, &size))
-        return false;
-    return EqualSid(sid, buf);
-}
+    ScratchDirGuard(const ScratchDirGuard&) = delete;
+    ScratchDirGuard& operator=(const ScratchDirGuard&) = delete;
 
-/// Opens amcache_dest_dir() as a HANDLE, without FILE_SHARE_DELETE -- this is
-/// what makes the verify-then-use sequence below race-free rather than just
-/// re-checked-and-still-racy: as long as this handle stays open, Windows
-/// itself refuses any delete or rename of the underlying directory OBJECT
-/// (ERROR_SHARING_VIOLATION/ACCESS_DENIED to the would-be deleter), so the
-/// object amcache_dest_dir_is_safe() verifies below is PROVABLY the same
-/// object the raw hive is later copied into -- verifying by path and then
-/// using by path (as an earlier revision of this function did) leaves a
-/// window where the verified directory is deleted and replaced between the
-/// two path resolutions. FILE_FLAG_OPEN_REPARSE_POINT opens a junction/
-/// symlink AS the reparse point itself rather than following it, so the
-/// reparse check below sees the object actually being opened, never its
-/// target.
-ScopedHandle open_amcache_dest_dir_handle(const std::wstring& dir) {
+    const std::wstring& path() const { return path_; }
+
+    ~ScratchDirGuard() {
+        std::error_code ec;
+        std::filesystem::remove_all(std::filesystem::path{path_}, ec);
+        if (ec) {
+            const uint64_t total =
+                g_temp_cleanup_failed_total.fetch_add(1, std::memory_order_relaxed) + 1;
+            // Diagnostics (allocation inside write_output/spdlog) must
+            // never be allowed to throw out of a destructor -- that would
+            // call std::terminate and kill the agent process mid-unwind,
+            // losing every remaining cleanup and the in-flight result this
+            // destructor was trying to report around. The removal attempt
+            // and failure counter above are unconditional; only the
+            // diagnostic emission itself is best-effort.
+            try {
+                ctx_.write_output("note|temp_cleanup_failed");
+                spdlog::warn("execution_artifacts: scratch directory cleanup failed ({} total "
+                             "this process)",
+                             total);
+            } catch (...) {
+            }
+        }
+    }
+
+private:
+    yuzu::CommandContext& ctx_;
+    std::wstring path_;
+};
+
+/// Opens `dir` (a just-created scratch directory) as a HANDLE, without
+/// FILE_SHARE_DELETE -- this is what makes the verify-then-use sequence in
+/// collect_amcache race-free rather than just re-checked-and-still-racy: as
+/// long as this handle stays open, Windows itself refuses any delete or
+/// rename of the underlying directory OBJECT (ERROR_SHARING_VIOLATION to
+/// the would-be deleter), so the object scratch_dir_is_ours() verifies
+/// below is PROVABLY the same object the raw hive is later copied into.
+/// FILE_FLAG_OPEN_REPARSE_POINT opens a junction/symlink AS the reparse
+/// point itself rather than following it, so the reparse check below sees
+/// the object actually being opened, never its target.
+ScopedHandle open_scratch_dir_handle(const std::wstring& dir) {
     return ScopedHandle(CreateFileW(
         dir.c_str(), FILE_READ_ATTRIBUTES | READ_CONTROL, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
         FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
 }
 
-/// Verifies an already-open amcache_dest_dir() handle is safe to reuse for
-/// the raw Amcache.hve copy below.
+/// Returns the current process token's owner (TOKEN_OWNER) as an
+/// in-process buffer, or an empty vector on any failure -- the two-call
+/// GetTokenInformation idiom already used by process_enum.cpp/
+/// tar_proc_etw.cpp, requesting TokenOwner (a PSID) rather than TokenUser.
+/// The PSID inside the returned buffer is only valid for the buffer's
+/// lifetime.
+std::vector<BYTE> current_process_token_owner_buf() {
+    HANDLE raw_token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw_token))
+        return {};
+    ScopedHandle token(raw_token);
+
+    DWORD needed = 0;
+    GetTokenInformation(token.get(), TokenOwner, nullptr, 0, &needed);
+    if (needed == 0)
+        return {};
+    std::vector<BYTE> buf(needed);
+    if (!GetTokenInformation(token.get(), TokenOwner, buf.data(), needed, &needed))
+        return {};
+    return buf;
+}
+
+/// Verifies an already-open, freshly-created scratch-directory handle is
+/// the object this process itself created: not a reparse point, and owned
+/// by the SAME SID as the current process token's owner -- never a
+/// hardcoded SYSTEM/Administrators pair, so this holds unchanged under a
+/// future least-privilege NT SERVICE\YuzuAgent identity too (#1442/#4450).
 ///
-/// CreateDirectoryW only applies the caller's SECURITY_ATTRIBUTES when it
-/// actually creates the directory (ERROR_SUCCESS) -- on ERROR_ALREADY_EXISTS
-/// the existing object's DACL, and reparse status, are untouched. Without
-/// this check an unprivileged local user could pre-create this directory
-/// (or a junction to an attacker-controlled path -- standard users can
-/// create junctions) before the plugin's first dispatch, and the
-/// LocalSystem-run copy below would silently land the raw hive under the
-/// attacker's ACL/target. Mirrors yuzu-agent.iss's SecureTrustAnchorDir
-/// recipe (verify the EXACT owner+ACE set, fail closed on anything
-/// unverifiable) rather than its take-ownership-and-reset half: refusing a
-/// suspect directory is sufficient here, since -- unlike the installer's
-/// trust anchor, which must exist for the agent to run at all -- this
-/// scratch directory has no reason to already exist under a legitimate
-/// install (install-agent-user.ps1 does not provision it) and a refusal
-/// just degrades this one dispatch to `constrained`.
+/// yuzu_create_temp_dir() already gives CREATE_NEW semantics (ANY failure,
+/// including ERROR_ALREADY_EXISTS, is treated as a hard failure -- see
+/// temp_file.cpp) over a 128-bit crypto-random name, so this check is not
+/// what makes the directory safe to use -- a name nobody else can predict
+/// and a create that refuses to reuse an existing object already do that.
+/// It is a second, independent proof that the specific object this handle
+/// refers to really is the one collect_amcache just created, covering the
+/// narrow window between that create and this open during which a
+/// principal with FILE_DELETE_CHILD on agent.data_dir could in principle
+/// have deleted and resubstituted it.
 ///
-/// Takes the HANDLE from open_amcache_dest_dir_handle(), not a path: every
-/// check below (GetFileInformationByHandle, GetSecurityInfo) resolves
-/// against the OPEN OBJECT, never re-resolving the path -- combined with the
-/// caller holding that same handle open through the subsequent copy, this is
-/// what closes the TOCTOU a path-based verify-then-use would otherwise have.
-bool amcache_dest_dir_is_safe(HANDLE dir_handle) {
+/// Takes the HANDLE, not a path: every check below resolves against the
+/// OPEN OBJECT, never re-resolving the path -- combined with the caller
+/// holding this same handle open (no FILE_SHARE_DELETE) through the
+/// subsequent copy, this is what closes the TOCTOU a path-based
+/// verify-then-use would otherwise have.
+bool scratch_dir_is_ours(HANDLE dir_handle) {
     BY_HANDLE_FILE_INFORMATION info{};
     if (!GetFileInformationByHandle(dir_handle, &info))
         return false;
     if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
         return false; // a junction/symlink -- never follow it.
 
+    const auto owner_buf = current_process_token_owner_buf();
+    if (owner_buf.empty())
+        return false;
+    const PSID token_owner = reinterpret_cast<const TOKEN_OWNER*>(owner_buf.data())->Owner;
+
     PSECURITY_DESCRIPTOR sd = nullptr;
-    PSID owner_sid = nullptr;
-    PACL dacl = nullptr;
-    const DWORD rc = GetSecurityInfo(dir_handle, SE_FILE_OBJECT,
-                                     OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-                                     &owner_sid, nullptr, &dacl, nullptr, &sd);
+    PSID dir_owner = nullptr;
+    const DWORD rc = GetSecurityInfo(dir_handle, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                     &dir_owner, nullptr, nullptr, nullptr, &sd);
     if (rc != ERROR_SUCCESS)
         return false;
     struct SdGuard {
@@ -364,91 +454,8 @@ bool amcache_dest_dir_is_safe(HANDLE dir_handle) {
         }
     } sd_guard{sd};
 
-    // The owner must be a trusted principal -- anything else means a local
-    // user created this directory (and, as owner, permanently holds
-    // WRITE_DAC over it regardless of its current DACL contents).
-    if (!sid_is_well_known(owner_sid, WinLocalSystemSid) &&
-        !sid_is_well_known(owner_sid, WinBuiltinAdministratorsSid))
-        return false;
-
-    if (!dacl) // a null DACL grants Everyone full control.
-        return false;
-
-    ACL_SIZE_INFORMATION acl_info{};
-    if (!GetAclInformation(dacl, &acl_info, sizeof(acl_info), AclSizeInformation))
-        return false;
-
-    for (DWORD i = 0; i < acl_info.AceCount; ++i) {
-        LPVOID ace = nullptr;
-        if (!GetAce(dacl, i, &ace))
-            return false;
-        const auto* header = static_cast<ACE_HEADER*>(ace);
-        if (header->AceType != ACCESS_ALLOWED_ACE_TYPE)
-            continue; // a deny (or other) ACE doesn't grant anyone access.
-        const PSID ace_sid = &static_cast<ACCESS_ALLOWED_ACE*>(ace)->SidStart;
-        // Trust the same owner SID this directory was verified to have
-        // above (the fresh-create path's own D:P(A;OICI;GA;;;OW) grants
-        // access to CREATOR OWNER, which resolves to exactly this SID), or
-        // SYSTEM/Administrators outright.
-        if (!EqualSid(ace_sid, owner_sid) &&
-            !sid_is_well_known(ace_sid, WinLocalSystemSid) &&
-            !sid_is_well_known(ace_sid, WinBuiltinAdministratorsSid))
-            return false; // some other principal has been granted access.
-    }
-    return true;
+    return EqualSid(dir_owner, token_owner);
 }
-
-/// Process-wide count of persistent temp-hive cleanup failures (e.g. an AV
-/// lock holding the file open past this action's own lifetime) across every
-/// TempHiveCleanup instance in this plugin process. There is no cap or
-/// alert path on the underlying accumulation -- that residual is unchanged
-/// -- but a repeated failure is now at least observable via this counter's
-/// value in the log line below, rather than each occurrence being an
-/// isolated, uncorrelated `note|` row with no way to tell "happened once"
-/// from "happening every run".
-std::atomic<uint64_t> g_temp_cleanup_failed_total{0};
-
-/// Deletes every path added, on scope exit, regardless of which return path
-/// this function's caller takes (this package's spec: "temp copies always
-/// deleted (scope guard)"). A deletion failure is logged via a `note|`
-/// row, never silently dropped, but never fails the action itself -- the
-/// action's own result was already decided by the time cleanup runs.
-class TempHiveCleanup {
-public:
-    explicit TempHiveCleanup(yuzu::CommandContext& ctx) : ctx_(ctx) {}
-    void add(std::wstring path) { paths_.push_back(std::move(path)); }
-
-    TempHiveCleanup(const TempHiveCleanup&) = delete;
-    TempHiveCleanup& operator=(const TempHiveCleanup&) = delete;
-
-    ~TempHiveCleanup() {
-        for (const auto& p : paths_) {
-            if (!DeleteFileW(p.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND) {
-                const uint64_t total =
-                    g_temp_cleanup_failed_total.fetch_add(1, std::memory_order_relaxed) + 1;
-                // Diagnostics (allocation inside write_output/spdlog) must
-                // never be allowed to throw out of a destructor -- that
-                // would call std::terminate and kill the agent process
-                // mid-unwind, losing every remaining cleanup and the
-                // in-flight result this destructor was trying to report
-                // around. The deletion attempt and failure counter above
-                // are unconditional; only the diagnostic emission itself is
-                // best-effort.
-                try {
-                    ctx_.write_output("note|temp_cleanup_failed");
-                    spdlog::warn("execution_artifacts: temp hive cleanup failed ({} total this "
-                                 "process)",
-                                 total);
-                } catch (...) {
-                }
-            }
-        }
-    }
-
-private:
-    yuzu::CommandContext& ctx_;
-    std::vector<std::wstring> paths_;
-};
 
 /// The ERROR_SHARING_VIOLATION fallback: SeBackupPrivilege + backup-semantics
 /// read, chunked into `dest`. Unexercised on A1's probe host (plain CopyFileW
@@ -663,76 +670,49 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
         if (src_bytes > kAmcacheMaxBytes)
             return emit_constrained(ctx, "hive_oversized");
 
-        // CreateDirectoryW below does not create intermediate parents. When
-        // agent.data_dir is configured its parent is the agent's own root
-        // data directory, which already exists by the time any plugin runs
-        // -- this best-effort create only matters on the historical
-        // hardcoded-fallback path (data_dir unset).
+        // agent.data_dir is always set by the daemon before any plugin runs
+        // (agent.cpp) -- an empty value here means this leg is running
+        // outside that context (a test/tool that didn't configure it), not
+        // a case worth guessing a fallback location for. See the file
+        // banner's SCRATCH DIRECTORY note for why there is no hardcoded
+        // literal to fall back to any more.
         if (data_dir.empty())
-            CreateDirectoryW(L"C:\\ProgramData\\yuzu\\agent", nullptr); // best-effort; may pre-exist
+            return emit_constrained(ctx, "data_dir_unset");
 
-        // Owner-only, inheritable DACL (same D:P(A;;GA;;;OW) idiom as
-        // temp_file.cpp's make_owner_only_sa, +OICI so it propagates to the
-        // .LOG1/.LOG2 side files the registry engine creates loading the
-        // hive) -- this dir holds the RAW Amcache.hve copy, not just
-        // paths/hashes, and must not inherit ProgramData's Users-readable
-        // default.
-        PSECURITY_DESCRIPTOR amcache_sd = nullptr;
-        SECURITY_ATTRIBUTES amcache_sa{sizeof(amcache_sa), nullptr, FALSE};
-        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                L"D:P(A;OICI;GA;;;OW)", SDDL_REVISION_1, &amcache_sd, nullptr))
-            amcache_sa.lpSecurityDescriptor = amcache_sd;
-        const std::wstring dest_dir = amcache_dest_dir(data_dir);
-        const BOOL dir_created =
-            CreateDirectoryW(dest_dir.c_str(), amcache_sd ? &amcache_sa : nullptr);
-        const DWORD dir_create_err = dir_created ? ERROR_SUCCESS : GetLastError();
-        if (amcache_sd)
-            LocalFree(amcache_sd);
+        // 128-bit crypto-random name, CREATE_NEW semantics (never reused --
+        // any failure including ERROR_ALREADY_EXISTS is a hard failure),
+        // owner-only DACL: temp_file.cpp's yuzu_create_temp_dir(). See
+        // ScratchDirGuard's banner for why its own RAII (not
+        // yuzu::TempDir's) owns the removal.
+        char scratch_path_utf8[512]{};
+        if (yuzu_create_temp_dir("execution_artifacts-", std::string{data_dir}.c_str(),
+                                  scratch_path_utf8, sizeof(scratch_path_utf8)) != 0)
+            return emit_constrained(ctx, "dest_dir_create_" + std::to_string(GetLastError()));
 
-        if (!dir_created && dir_create_err != ERROR_ALREADY_EXISTS)
-            return emit_constrained(ctx, "dest_dir_create_" + std::to_string(dir_create_err));
+        ScratchDirGuard scratch(ctx, yuzu::win::to_wide(scratch_path_utf8));
 
         // Open the directory ONCE, as a handle, and hold it (dest_dir_handle
         // stays in scope for the rest of this function, spanning the verify
-        // below AND the copy further down) -- see
-        // open_amcache_dest_dir_handle's banner for why a held-open handle,
-        // not a second path-based check right before the copy, is what makes
-        // this sequence race-free: Windows refuses to delete or rename the
-        // underlying object while this handle is open, so the directory
-        // amcache_dest_dir_is_safe() verifies below is provably the same one
-        // the raw hive is copied into further down.
-        ScopedHandle dest_dir_handle = open_amcache_dest_dir_handle(dest_dir);
+        // below AND the copy further down) -- see open_scratch_dir_handle's
+        // banner for why a held-open handle, not a second path-based check
+        // right before the copy, is what makes this sequence race-free.
+        ScopedHandle dest_dir_handle = open_scratch_dir_handle(scratch.path());
         if (!dest_dir_handle)
             return emit_constrained(ctx, "dest_dir_open_" + std::to_string(GetLastError()));
 
-        // Verify unconditionally, even on the dir_created path -- CreateDirectoryW
-        // applies the owner-only DACL atomically with the create, but a narrow
-        // window still exists between that create returning and the handle open
-        // just above succeeding, during which a principal with FILE_DELETE_CHILD
-        // on the parent could delete and resubstitute the directory (the same
-        // precondition the ERROR_ALREADY_EXISTS path already treats as in-scope).
-        // Trusting dir_created here would skip the one check that catches exactly
-        // that race; the check itself is cheap, so there's no reason not to run it
-        // on both paths uniformly.
-        if (!amcache_dest_dir_is_safe(dest_dir_handle.get()))
+        if (!scratch_dir_is_ours(dest_dir_handle.get()))
             return emit_constrained(ctx, "dest_dir_acl");
 
-        const std::wstring dest_hve = amcache_temp_path(data_dir);
+        const std::wstring dest_hve = scratch.path() + L"\\amcache.hve";
 
         // ENTIRE privilege-bearing sequence -- PrivilegeScope construction
         // (fallback path only), the copy, RegLoadAppKeyW, enumeration, and
         // RegCloseKey -- runs under this ONE lock, exactly as with_user_hive
         // (win_profiles.hpp:479-535) holds it for its whole offline arm. See
-        // the file banner for the hold-time bound.
-        const std::lock_guard<std::mutex> offline_lock(yuzu::agent::offline_hive_mutex());
-
-        TempHiveCleanup cleanup(ctx);
-        // Registered before the first CopyFileW attempt (not only on its
-        // success path) so a possibly-partial file left behind by a failed
-        // or interrupted copy still gets cleaned up (SYN-06) -- a one-line,
-        // no-downside change regardless of whether CopyFileW itself can
-        // leave a partial file on every failure mode.
-        cleanup.add(dest_hve);
+        // the file banner for the hold-time bound. `"execution_artifacts"`
+        // is this leg's caller name for offline_hive_mutex.hpp's own
+        // contention-attribution logging.
+        const yuzu::agent::ScopedOfflineHiveLock offline_lock("execution_artifacts");
 
         if (!CopyFileW(kAmcacheSourceHve, dest_hve.c_str(), FALSE)) {
             const DWORD copy_err = GetLastError();
@@ -765,16 +745,12 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
         // .LOG1/.LOG2 -- best-effort only, plain copy, never the privilege
         // fallback: RegLoadAppKeyW's read of the main .hve is this leg's only
         // hard requirement (this package's spec: "+.LOG1/.LOG2 when present").
-        //
-        // Cleanup is registered BEFORE the copy attempt, same as dest_hve
-        // above (SYN-06) -- an interrupted sidecar copy can leave a partial
-        // .LOG1/.LOG2 temp file behind just as easily as the main hive, and
-        // that file must not leak just because it wasn't the copy that
-        // "succeeded".
+        // No per-file cleanup registration needed any more -- ScratchDirGuard
+        // removes the whole scratch directory (partial sidecars included) on
+        // scope exit regardless of which return path is taken (SYN-06).
         for (const wchar_t* ext : {L".LOG1", L".LOG2"}) {
             const std::wstring src_log = std::wstring{kAmcacheSourceHve} + ext;
             const std::wstring dst_log = dest_hve + ext;
-            cleanup.add(dst_log);
             if (CopyFileW(src_log.c_str(), dst_log.c_str(), FALSE)) {
                 // Sidecars have no size check of their own otherwise --
                 // bound them by the same cap so a huge .LOG1/.LOG2 can't
@@ -900,11 +876,15 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
                                                : YUZU_RESULT_COMPLETENESS_FULL,
                               acc.reason());
         return acc.incomplete() ? 1 : 0;
-        // `cleanup` (TempHiveCleanup), `root_key` and `loaded_key` destruct
-        // here in reverse declaration order on every return path above --
-        // RegCloseKey (root_key, then loaded_key) always runs before
-        // DeleteFileW (cleanup), matching this package's "RegCloseKey;
-        // DeleteFileW the copies in a scope guard" ordering.
+        // `root_key`, `loaded_key`, `offline_lock`, `dest_dir_handle` and
+        // `scratch` (ScratchDirGuard) all destruct here in REVERSE
+        // declaration order, on every return path above: RegCloseKey
+        // (root_key, then loaded_key) runs first, then offline_lock
+        // releases the shared mutex, then dest_dir_handle closes, then
+        // scratch removes the whole directory tree -- matching
+        // ScratchDirGuard's and scratch_dir_is_ours's banners exactly
+        // (the handle must close before RemoveDirectoryW can succeed, and
+        // removal must never happen while the lock is still held).
     } catch (...) {
         return emit_constrained(ctx, "internal_error");
     }

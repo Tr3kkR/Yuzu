@@ -22,6 +22,7 @@
 #include <yuzu/plugin.hpp>
 
 #include "local_dispatcher.hpp"
+#include "test_helpers.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -29,7 +30,12 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#if defined(_WIN32)
+#include <windows.h>
+#endif
 
 namespace fs = std::filesystem;
 
@@ -115,6 +121,29 @@ std::optional<LoadedPlugin> load_execution_artifacts_plugin() {
     return LoadedPlugin{std::move(*handle), descriptor};
 }
 
+#if defined(_WIN32)
+// Whether THIS test process's token is elevated -- plugin_capture.cpp:157's
+// precedent (same TokenElevation query; this file keeps its own minimal
+// RAII rather than reaching into agents/core's Guardian-internal
+// guard_win_handle.hpp for one short-lived token handle).
+bool current_process_is_elevated() {
+    struct TokenHandle {
+        HANDLE h{nullptr};
+        ~TokenHandle() {
+            if (h)
+                CloseHandle(h);
+        }
+    } token;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token.h))
+        return false;
+    TOKEN_ELEVATION te{};
+    DWORD got = 0;
+    if (!GetTokenInformation(token.h, TokenElevation, &te, sizeof te, &got))
+        return false;
+    return te.TokenIsElevated != 0;
+}
+#endif
+
 } // namespace
 
 #if !defined(_WIN32)
@@ -186,9 +215,8 @@ TEST_CASE("execution_artifacts win-local: prefetch returns real rows when Prefet
         CHECK(result.rc == 0);
 }
 
-TEST_CASE("execution_artifacts win-local: amcache returns real rows or a named token "
-          "(hive_locked/hive_missing/hive_oversized/regload_*/amcache_root_missing/"
-          "amcache_empty) -- never an empty success",
+TEST_CASE("execution_artifacts win-local: amcache without init() (so agent.data_dir was never "
+          "configured) reports the named data_dir_unset token, never an empty result",
           "[execution_artifacts][win_local]") {
     auto plugin = load_execution_artifacts_plugin();
     if (!plugin) {
@@ -196,16 +224,88 @@ TEST_CASE("execution_artifacts win-local: amcache returns real rows or a named t
         return;
     }
 
+    // Deliberately skip init() -- this is the "test/tool didn't configure
+    // agent.data_dir" case execution_artifacts_win.cpp's collect_amcache
+    // banner describes; must never fall back to guessing a location.
+    yuzu::agent::LocalDispatcher dispatcher;
+    auto result = dispatcher.run(plugin->descriptor, "amcache");
+    const auto rows = captured_rows(result.captured);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows.front() == "constrained|data_dir_unset");
+    CHECK(result.rc == 1);
+}
+
+TEST_CASE("execution_artifacts win-local: amcache, with agent.data_dir pointed at a real "
+          "scratch dir, returns real rows or a named constrained token -- never an empty "
+          "success -- and leaves the scratch dir empty afterward either way",
+          "[execution_artifacts][win_local]") {
+    auto plugin = load_execution_artifacts_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+
+    yuzu::test::TempDir data_dir("yuzu_test_execution_artifacts_data_dir_");
+    std::error_code ec;
+    fs::create_directories(data_dir.path, ec);
+    REQUIRE_FALSE(ec);
+
+    // Declared AFTER `plugin` (the library must outlive the context --
+    // plugin_capture.cpp:352-354's precedent).
+    yuzu::agent::StandalonePluginContext ctx(
+        "execution_artifacts",
+        std::unordered_map<std::string, std::string>{{"agent.data_dir", data_dir.path.string()}});
+    if (plugin->descriptor->init)
+        REQUIRE(plugin->descriptor->init(ctx.get()) == 0);
+
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "amcache");
     const auto rows = captured_rows(result.captured);
     REQUIRE_FALSE(rows.empty());
 
+    // The round-1 fix's own defect (round-2 finding 1): a verifier that can
+    // NEVER pass still produces a "real row or constrained" green test,
+    // because dest_dir_acl IS a named constrained token. That false-green
+    // is exactly why this assertion is split three ways instead of one
+    // permissive OR -- a permanently-broken amcache leg must show up as a
+    // FAILING test, not a passing one.
     const bool has_success_row = any_row_starts_with(rows, "amcache|");
-    const bool has_constrained_row = any_row_starts_with(rows, "constrained|");
-    CHECK((has_success_row || has_constrained_row));
-    if (has_success_row && !has_constrained_row)
+    const bool has_dest_dir_token = any_row_starts_with(rows, "constrained|dest_dir_");
+    const bool has_other_constrained_row =
+        any_row_starts_with(rows, "constrained|") && !has_dest_dir_token;
+    CAPTURE(result.captured);
+    CHECK_FALSE(has_dest_dir_token);
+    CHECK((has_success_row || has_other_constrained_row));
+    if (has_success_row) {
         CHECK(result.rc == 0);
+        if (current_process_is_elevated()) {
+            // Elevated (or LocalSystem/service) access to
+            // C:\Windows\appcompat\Programs\Amcache.hve is exactly this
+            // leg's documented prerequisite -- under it, a real row must
+            // carry a real path, not the empty-field shape the committed
+            // docs/samples/windows.txt capture shows today (see the PR
+            // remediation notes for that separate, pre-existing anomaly).
+            REQUIRE(rows.front().find('|') != std::string::npos);
+            const auto first_pipe = rows.front().find('|');
+            const auto second_pipe = rows.front().find('|', first_pipe + 1);
+            REQUIRE(second_pipe != std::string::npos);
+            CHECK(second_pipe > first_pipe + 1); // the path field is non-empty
+        }
+    } else if (has_other_constrained_row) {
+        CHECK(result.rc == 1);
+    }
+
+    if (plugin->descriptor->shutdown)
+        plugin->descriptor->shutdown(ctx.get());
+
+    // The scratch directory ScratchDirGuard owns is created AND removed
+    // entirely within collect_amcache's own scope -- nothing under
+    // data_dir should survive the dispatch above, success or failure.
+    bool data_dir_empty = true;
+    for (const auto& entry : fs::directory_iterator(data_dir.path, ec))
+        (void)entry, data_dir_empty = false;
+    CHECK_FALSE(ec);
+    CHECK(data_dir_empty);
 }
 
 #endif

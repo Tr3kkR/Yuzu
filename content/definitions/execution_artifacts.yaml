@@ -259,7 +259,9 @@ spec:
         platforms: [windows]
       - name: file_ref_count
         type: int64
-        description: Number of file-reference entries in the file-information block.
+        description: Total number of NTFS file references, summed across every
+          declared volume entry in the file-information block (not just the
+          first).
         example: 12
         platforms: [windows]
 

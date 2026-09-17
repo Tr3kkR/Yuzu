@@ -127,23 +127,61 @@ std::vector<uint8_t> build_valid_prefetch_v31_blob() {
     return buf;
 }
 
-// build_valid_prefetch_v31_blob() plus one well-formed volume entry, so the
-// volume_count > 0 file_ref_count walk (kFileInfoVolumesInfoOffsetField ->
-// kVolumeEntryFileRefsOffsetField -> the refs-count DWORD itself) has a
-// synthetic buffer to mutate for the negative tests below -- mirrors the
-// real layout A1's fixtures use (vol_info_off then a small relative offset
-// to the refs count), just with small, buffer-local offsets instead of the
-// real files' offsets thousands of bytes in.
-std::vector<uint8_t> build_valid_prefetch_v31_blob_with_volume(uint32_t refs_count) {
+// build_valid_prefetch_v31_blob() plus N well-formed volume entries at the
+// real v31 stride (kVolumeEntryStrideV30V31), each with its own
+// self-consistent refs sub-block ([version=3][count][u64 unknown], no
+// reference array contents needed -- the parser never reads past the
+// declared count/size), laid out back-to-back inside the volumes-info
+// block. Mirrors the real two-volume fixtures' layout (OUTPUT.EXE/
+// REG.EXE) closely enough to exercise entry 1+ specifically, with small
+// buffer-local offsets instead of the real files' offsets thousands of
+// bytes in. vol_info_size and file_size are both stamped to the exact,
+// consistent final extent -- every SECTION below that wants a negative
+// case mutates ONE field afterward rather than hand-building an
+// inconsistent blob from scratch.
+std::vector<uint8_t> build_valid_prefetch_v31_blob_with_volumes(
+    const std::vector<uint32_t>& refs_counts) {
     auto buf = build_valid_prefetch_v31_blob();
     constexpr size_t kVolInfoOff = 0x100;
-    constexpr size_t kRefsFieldOff = 0x08; // relative to kVolInfoOff
-    put_u32(buf, kFileInfoVolumesInfoCountOffset, 1);
+    constexpr size_t kEntryStride = kVolumeEntryStrideV30V31;
+    const size_t entries_bytes = refs_counts.size() * kEntryStride;
+
+    put_u32(buf, kFileInfoVolumesInfoCountOffset, static_cast<uint32_t>(refs_counts.size()));
     put_u32(buf, kFileInfoVolumesInfoOffsetField, static_cast<uint32_t>(kVolInfoOff));
-    put_u32(buf, kVolInfoOff + kVolumeEntryFileRefsOffsetField,
-            static_cast<uint32_t>(kRefsFieldOff));
-    put_u32(buf, kVolInfoOff + kRefsFieldOff, refs_count);
+
+    size_t cursor = entries_bytes; // refs sub-blocks start right after every entry
+    for (size_t i = 0; i < refs_counts.size(); ++i) {
+        const size_t entry = i * kEntryStride;
+        const size_t refs_block_size =
+            kFileRefsBlockHeaderBytes + static_cast<size_t>(refs_counts[i]) * 8;
+        put_u32(buf, kVolInfoOff + entry + kVolumeEntryFileRefsOffsetField,
+                static_cast<uint32_t>(cursor));
+        put_u32(buf, kVolInfoOff + entry + kVolumeEntryFileRefsSizeField,
+                static_cast<uint32_t>(refs_block_size));
+        put_u32(buf, kVolInfoOff + cursor, 3); // refs sub-block "version" -- unvalidated by the parser
+        put_u32(buf, kVolInfoOff + cursor + 4, refs_counts[i]);
+        cursor += refs_block_size;
+    }
+    put_u32(buf, kFileInfoVolumesInfoSizeField, static_cast<uint32_t>(cursor));
+    // The declared block extent (kVolInfoOff + cursor) can run past
+    // whatever buf.size() happens to be so far -- the puts above only grow
+    // buf far enough to write each field, never far enough to cover a
+    // large refs_count's full (unwritten, and never read past count/size
+    // by the parser) reference array. Pad explicitly so file_size, stamped
+    // from the REAL buf.size() below, is never smaller than what this
+    // function itself just declared.
+    if (buf.size() < kVolInfoOff + cursor)
+        buf.resize(kVolInfoOff + cursor, 0);
+    // Puts above may have grown buf (e.g. a large refs_count) -- re-stamp
+    // file_size to the buffer's FINAL extent, always last.
+    put_u32(buf, kPrefetchFileSizeOffset, static_cast<uint32_t>(buf.size()));
     return buf;
+}
+
+// Single-entry convenience wrapper -- most negative SECTIONs below only
+// need to mutate the one entry.
+std::vector<uint8_t> build_valid_prefetch_v31_blob_with_volume(uint32_t refs_count) {
+    return build_valid_prefetch_v31_blob_with_volumes({refs_count});
 }
 
 // A minimal but structurally valid v23 prefetch header, isolating the
@@ -450,13 +488,22 @@ struct RealPrefetchCapture {
     std::string basename;   // e.g. "DOSKEY.EXE-DDFD0A8D"
     std::string exe_prefix; // "DOSKEY.EXE"
     std::string hash_suffix; // "DDFD0A8D"
+    uint32_t volume_count;  // byte-verified against the real file-information block
+    uint32_t file_ref_count; // SUM across every declared volume entry (not just entry 0)
 };
 
 const std::vector<RealPrefetchCapture>& real_prefetch_captures() {
+    // volume_count/file_ref_count independently re-derived by walking each
+    // real file's raw bytes at the documented offsets (this file's own
+    // kVolumeEntryFileRefsOffsetField comment has the full per-entry
+    // evidence) -- DOSKEY has 1 volume with 15 refs; OUTPUT and REG.EXE
+    // each have 2 volumes, whose per-entry refs counts (7+16 and 3+29
+    // respectively) the round-2 review found this parser previously never
+    // read past entry 0 for.
     static const std::vector<RealPrefetchCapture> v = {
-        {"DOSKEY.EXE-DDFD0A8D", "DOSKEY.EXE", "DDFD0A8D"},
-        {"OUTPUT.EXE-EE9CBC0B", "OUTPUT.EXE", "EE9CBC0B"},
-        {"REG.EXE-6A8B6960", "REG.EXE", "6A8B6960"},
+        {"DOSKEY.EXE-DDFD0A8D", "DOSKEY.EXE", "DDFD0A8D", 1, 15},
+        {"OUTPUT.EXE-EE9CBC0B", "OUTPUT.EXE", "EE9CBC0B", 2, 23},
+        {"REG.EXE-6A8B6960", "REG.EXE", "6A8B6960", 2, 32},
     };
     return v;
 }
@@ -506,13 +553,15 @@ TEST_CASE("parse_prefetch: A1's three real .pf.decompressed payloads pin exe_nam
         CHECK(result->exe_name == cap.exe_prefix);
         CHECK(result->hash_hex == cap.hash_suffix);
         CHECK(result->run_count >= 1);
-        // All three real captures carry >0 volumes with exactly 3 NTFS file
-        // references recorded in volume 0 (kVolumeEntryFileRefsOffsetField's
-        // doc comment above has the byte-level evidence) -- this is the
-        // volume_count > 0 file_ref_count walk actually exercised against
-        // real data, not just bounded in the mutation fuzz below.
-        CHECK(result->volume_count > 0);
-        CHECK(result->file_ref_count == 3);
+        // Exact, per-capture, byte-verified volume_count and SUMMED
+        // file_ref_count (kVolumeEntryFileRefsOffsetField's doc comment
+        // above has the full per-entry evidence) -- for OUTPUT and
+        // REG.EXE this is the multi-volume walk actually exercised
+        // against real data (each has a real, non-trivial entry 1 the
+        // parser previously never read), not just bounded in the
+        // mutation fuzz below.
+        CHECK(result->volume_count == cap.volume_count);
+        CHECK(result->file_ref_count == cap.file_ref_count);
         REQUIRE_FALSE(result->last_runs_epoch_ms.empty());
         CHECK(result->last_runs_epoch_ms.size() <= kPrefetchMaxLastRuns);
         for (int64_t ts : result->last_runs_epoch_ms) {
@@ -625,16 +674,18 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
     }
 
     // The nested volume_count > 0 file_ref_count walk used to default
-    // file_ref_count to 0 and still return success on any of these three
+    // file_ref_count to 0 and still return success on any of these
     // failures -- indistinguishable from "this file genuinely references
     // zero volumes' worth of files". Each must now fail the whole parse
     // with a named reason, matching the sibling run_count/volume_count
-    // reads immediately above it.
-    SECTION("volume_count > 0 but the relative refs-field offset stored inside the volume "
-            "entry points past the buffer -- the refs count itself can never be read") {
+    // reads immediately above it. Round-2 review finding: an earlier
+    // revision of both this parser and these tests only ever validated
+    // volume entry 0 -- every SECTION below that says "entry 1" is new,
+    // added specifically to prove the walk actually visits every declared
+    // entry, not just the first.
+    SECTION("volume_count > 0 but the refs-block offset stored inside the (single) volume "
+            "entry points past the volumes-info block") {
         auto buf = build_valid_prefetch_v31_blob_with_volume(3);
-        // Overwrite the relative offset (normally 0x08) with a value that
-        // pushes refs_count_off past the end of the buffer.
         put_u32(buf, 0x100 + kVolumeEntryFileRefsOffsetField, 0xFFFFFF00u);
         Result<PrefetchResult> r{PrefetchResult{}};
         REQUIRE_NOTHROW(r = parse_prefetch(buf));
@@ -642,12 +693,33 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r.error().token == "truncated_entry");
     }
 
-    SECTION("volume_count > 0 but the refs-field offset field itself is past the buffer") {
+    SECTION("volume_count > 0 but the refs-block's declared byte size is smaller than its own "
+            "declared count needs (16 + count*8 > refs_size)") {
         auto buf = build_valid_prefetch_v31_blob_with_volume(3);
-        // vol_info_off points near the very end of the buffer, so reading
-        // the relative refs-field offset at (vol_info_off +
-        // kVolumeEntryFileRefsOffsetField) runs off the end.
-        put_u32(buf, kFileInfoVolumesInfoOffsetField, static_cast<uint32_t>(buf.size() - 2));
+        // A well-formed refs_size for count=3 is 16+3*8=40; shrink it below
+        // that without touching the count field itself.
+        put_u32(buf, 0x100 + kVolumeEntryFileRefsSizeField, 20u);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "oversize_count");
+    }
+
+    SECTION("volume_count * stride exceeds the volumes-info block's own declared byte size") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(3);
+        // The one entry's stride is kVolumeEntryStrideV30V31 (0x60) -- a
+        // declared block size smaller than that can't hold even entry 0's
+        // fixed fields, regardless of what its refs sub-block claims.
+        put_u32(buf, kFileInfoVolumesInfoSizeField, 0x10u);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "truncated_entry");
+    }
+
+    SECTION("the volumes-info block's own declared extent (offset + size) runs past file_size") {
+        auto buf = build_valid_prefetch_v31_blob_with_volume(3);
+        put_u32(buf, kFileInfoVolumesInfoSizeField, 0xFFFFFF00u);
         Result<PrefetchResult> r{PrefetchResult{}};
         REQUIRE_NOTHROW(r = parse_prefetch(buf));
         REQUIRE_FALSE(r.has_value());
@@ -663,6 +735,34 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r.error().token == "oversize_count");
     }
 
+    SECTION("two volumes: entry 0 is well-formed, entry 1's refs-block offset is corrupted -- "
+            "the walk must fail on entry 1, not silently stop after entry 0") {
+        auto buf = build_valid_prefetch_v31_blob_with_volumes({5, 7});
+        constexpr size_t kEntry1 = kVolumeEntryStrideV30V31; // entry 1 starts one stride in
+        put_u32(buf, 0x100 + kEntry1 + kVolumeEntryFileRefsOffsetField, 0xFFFFFF00u);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "truncated_entry");
+    }
+
+    SECTION("two volumes: entry 0 is well-formed, entry 1's refs count exceeds the cap -- the "
+            "cap applies to every entry, not just the first") {
+        auto buf = build_valid_prefetch_v31_blob_with_volumes({5, 7});
+        // Per the builder: 2 entries at stride 0x60 = 0xC0 (192) bytes of
+        // entries, so entry 0's refs sub-block (16 + 5*8 = 56 bytes) starts
+        // at block-relative 0xC0 and entry 1's starts right after it, at
+        // 0xC0 + 56 = 0xF8 (248). The count DWORD is 4 bytes into a refs
+        // sub-block (after the version DWORD).
+        constexpr uint32_t kEntry1RefsBlockOff = 0xC0 + 16 + 5 * 8; // 248
+        put_u32(buf, 0x100 + kEntry1RefsBlockOff + 4,
+                static_cast<uint32_t>(kPrefetchMaxFileRefs) + 1);
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "oversize_count");
+    }
+
     SECTION("volume_count > 0 with a well-formed nested refs chain succeeds with the exact "
             "count -- proves the walk isn't ALWAYS an error after the fix above") {
         auto buf = build_valid_prefetch_v31_blob_with_volume(5);
@@ -671,6 +771,17 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         REQUIRE(r.has_value());
         CHECK(r->volume_count == 1);
         CHECK(r->file_ref_count == 5);
+    }
+
+    SECTION("two volumes with well-formed nested refs chains succeed with the SUMMED count -- "
+            "this is the exact shape the round-2 review found unvalidated (entry 1 silently "
+            "unread)") {
+        auto buf = build_valid_prefetch_v31_blob_with_volumes({5, 7});
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE(r.has_value());
+        CHECK(r->volume_count == 2);
+        CHECK(r->file_ref_count == 12);
     }
 }
 
@@ -942,6 +1053,7 @@ TEST_CASE("parse_prefetch: mutation fuzz over A1's three real .pf.decompressed c
     static constexpr size_t kDocumentedFields[] = {
         kFileInfoVolumesInfoCountOffset,
         kFileInfoVolumesInfoOffsetField,
+        kFileInfoVolumesInfoSizeField,
         kVolumeEntryFileRefsOffsetField,
         kPrefetchFileSizeOffset,
     };
