@@ -1074,7 +1074,7 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
 // kMcpMaxJsonDepth reaches evaluate_inventory() (inventory_eval.cpp) via this
 // exact route. json::parse handles very deep input fine, so without the
 // guard the row parses cleanly and json_value_to_string's dump() fallback on
-// the parsed tree would SIGSEGV the whole process — taking the OTHER
+// the parsed tree would SIGSEGV the whole process, taking the OTHER
 // matching agent's membership down with it. Seeded directly via SQL
 // (bypassing the gateway write-side guard) to prove this read-side guard
 // independently, mirroring the confinement test's seeding pattern above.
@@ -1085,9 +1085,9 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
 // test_inventory_eval.cpp, which is the actual code under test and proves
 // reachability directly). "exists" matches on presence alone, so it is
 // answered TRUE for the poisoned record's "field1" whether the guard runs
-// or not — making device_count the deciding, guard-dependent signal here too
+// or not, making device_count the deciding, guard-dependent signal here too
 // (2 without the guard, 1 with it). Real structural nesting, NOT brackets
-// inside a string literal — json_exceeds_depth deliberately does not count
+// inside a string literal: json_exceeds_depth deliberately does not count
 // bracket characters inside a string value as structure. Reachability-proxy
 // depth (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack
 // depth.
@@ -1129,7 +1129,7 @@ TEST_CASE("from-inventory-query: a poisoned stored data_json is excluded from ma
         status);
     REQUIRE(status == 201); // no crash
     CHECK(body["data"]["device_count"] == 1);
-    // Confirm identity, not just count — the created set must contain the
+    // Confirm identity, not just count: the created set must contain the
     // healthy agent and MUST NOT contain the poisoned one.
     std::string next;
     auto members = h.store->members(body["data"]["id"].get<std::string>(), "", 10, next);
