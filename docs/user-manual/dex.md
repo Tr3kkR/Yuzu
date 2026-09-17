@@ -243,7 +243,23 @@ numbers match.
   in one sampling tick loses that tick's contribution to the trend (diluted
   into the hourly bucket the collision landed in, not a whole-day or
   whole-app loss) — rare, since kernel-thread names are short and
-  Linux-kernel-specific, but not impossible for an oddly-named binary.
+  Linux-kernel-specific, but not impossible for an oddly-named binary. The
+  `PF_KTHREAD` flag itself is read per-process from the real kernel flags
+  bit, never derived from a name — but the per-tick rollup first groups
+  every sampled process by NAME before deciding kernel-thread status, and
+  OR's the flag across everything in that name group. A name collision
+  therefore merges a real kernel thread and a same-named userspace process
+  into one bucket, and the kernel thread's true flag marks the whole bucket
+  excluded. This is accepted-by-design for accidental collisions and is
+  **also the mechanism a local process could deliberately abuse**: an
+  unprivileged process can rename itself to a live kernel-thread's name
+  (e.g. `kthreadd`) via `prctl(PR_SET_NAME)` so its own CPU/memory activity
+  lands in the same name-keyed bucket and rides the kernel thread's flag
+  out of this rollup for that tick.
+  A device already compromised enough to run an arbitrary renaming process
+  has far cheaper ways to hide from an app-perf trend, so this does not
+  raise the compromise's severity — but it means an *absence* of a process
+  from this trend is not, on its own, evidence that nothing was running.
 - **Per-device** — click a device to see its unified signal history (every
   signal type on one timeline, with friendly labels) plus a **device
   performance** panel: CPU, memory, and disk-latency sparklines built from the

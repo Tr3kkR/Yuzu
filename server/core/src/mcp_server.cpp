@@ -1574,7 +1574,7 @@ static const ToolDef kTools[] = {
      R"j(},"required":["app","version"]})j",
      R"j({"type":"object","properties":{"app":{"type":"string"},"version":{"type":"string"},"truncated":{"type":"boolean"},)j"
      R"j("devices":{"type":"array","items":{"type":"object","properties":{)j"
-     R"j("agent_id":{"type":"string"},"last_day":{"type":"string"},"samples":{"type":"integer"},"cpu_avg":{"type":"number"},"ws_avg_bytes":{"type":"integer"}},)j"
+     R"j("agent_id":{"type":"string"},"last_day":{"type":"integer","description":"UTC midnight epoch seconds"},"samples":{"type":"integer"},"cpu_avg":{"type":"number"},"ws_avg_bytes":{"type":"integer"}},)j"
      R"j("required":["agent_id","last_day","samples","cpu_avg","ws_avg_bytes"]}}},)j"
      R"j("required":["app","version","truncated","devices"]})j"},
 
@@ -1626,7 +1626,7 @@ static const ToolDef kTools[] = {
      R"j(},"required":["value","app"]})j",
      R"j({"type":"object","properties":{"key":{"type":"string"},"value":{"type":"string"},"app":{"type":"string"},"version":{"type":"string"},"floor":{"type":"integer"},)j"
      R"j("points":{"type":"array","items":{"type":"object","properties":{)j"
-     R"j("version":{"type":"string"},"day":{"type":"string"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
+     R"j("version":{"type":"string"},"day":{"type":"integer","description":"UTC midnight epoch seconds"},"device_count":{"type":"integer"},"suppressed":{"type":"boolean"},)j"
      R"j("cpu_mean":{"type":"number","description":"Omitted, along with every other stat field on this point, when suppressed is true"},"cpu_max":{"type":"number"},)j"
      R"j("cpu_p50":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
      R"j("cpu_p95":{"type":["object","null"],"properties":{"value":{"type":"number"},"lower_bound":{"type":"boolean"}}},)j"
@@ -14502,9 +14502,21 @@ McpServer::HandlerFn McpServer::build_handler(
                     // defaulted; only an ABSENT key falls back. Matches REST's
                     // has_param-based behavior so key="" 400s identically on both
                     // transports instead of MCP quietly substituting the default.
-                    std::string key = args.contains("key") && args["key"].is_string()
-                                           ? args["key"].get<std::string>()
-                                           : std::string(kDexDefaultCohortKey);
+                    // A present-but-wrong-JSON-type key (e.g. a number or null) is
+                    // also rejected rather than silently treated as absent — REST
+                    // has no such case (query params are always strings), but MCP
+                    // must not let a malformed caller silently widen the cohort to
+                    // the default key.
+                    if (args.contains("key") && !args["key"].is_string()) {
+                        res.set_content(
+                            error_response(id, kInvalidParams, "invalid parameter 'key'",
+                                           a4_data(0, "key must be a string matching "
+                                                      "^[A-Za-z0-9_.:-]{1,64}$")),
+                            "application/json");
+                        return;
+                    }
+                    std::string key = args.contains("key") ? args["key"].get<std::string>()
+                                                            : std::string(kDexDefaultCohortKey);
                     if (!TagStore::validate_key(key)) {
                         res.set_content(
                             error_response(id, kInvalidParams, "invalid parameter 'key'",

@@ -479,7 +479,10 @@ AppPerfDailyStore::list_devices_for_version(
     }
     sql += "  ORDER BY agent_id, day DESC"
            ") t ORDER BY cpu_avg DESC, agent_id LIMIT " +
-           std::to_string(kVersionDevicesRowCap);
+           // One row PAST the cap (#4030 pattern) so a fleet of exactly
+           // kVersionDevicesRowCap devices is never misreported as truncated —
+           // the sentinel row is trimmed back off below, never returned.
+           std::to_string(kVersionDevicesRowCap + 1);
 
     pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), params);
     if (res.status() != PGRES_TUPLES_OK) {
@@ -490,12 +493,13 @@ AppPerfDailyStore::list_devices_for_version(
                          PQerrorMessage(lease.get()), d.occurrence);
         return std::nullopt;
     }
-    const int n = PQntuples(res.get());
-    if (n >= kVersionDevicesRowCap) {
+    const int rows = PQntuples(res.get());
+    truncated = rows > kVersionDevicesRowCap;
+    const int n = truncated ? kVersionDevicesRowCap : rows;
+    if (truncated) {
         // The cap sits on the OUTER (cpu_avg DESC) ordering, so the dropped rows
         // are the LOWEST-cpu devices past the ceiling — a truncated read still
         // surfaces the highest resource consumers, never an arbitrary subset.
-        truncated = true;
         if (metrics_)
             metrics_->counter("yuzu_app_perf_version_devices_cap_hit_total", {}).increment();
         spdlog::warn("AppPerfDailyStore: list_devices_for_version hit the {}-row cap for "
