@@ -87,9 +87,12 @@
 #include "device_inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_store.hpp"
+#include "app_usage_routes.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
 #include "agent_decommission.hpp"
+#include "typed_inventory_sources.hpp"
 // Visualization engine consumers live in dashboard_routes.cpp (#589) and
 // rest_api_v1.cpp; server.cpp no longer references the engine directly.
 #include "management.grpc.pb.h"
@@ -1833,8 +1836,8 @@ public:
                           "than a result, by reason "
                           "(store_not_open/pool_acquire_timeout/query_error) and source "
                           "(installed_software/device_ci/software_licensing/product_registry/"
-                          "generic - generic is the ADR-0037 InventoryStore). /readyz stays "
-                          "green under pure pool saturation, so "
+                          "app_usage/generic - generic is the ADR-0037 InventoryStore). /readyz "
+                          "stays green under pure pool saturation, so "
                           "this is the read-path degrade signal",
                           "counter");
         // Management-group CONFINEMENT store observability (ADR-0042). The
@@ -1886,7 +1889,7 @@ public:
         metrics_.describe("yuzu_inventory_stale_agents",
                           "Agents whose installed-software inventory has not synced within the "
                           "staleness window (two missed daily cycles) - a freshness/liveness signal, "
-                          "by source",
+                          "by source (installed_software, app_usage)",
                           "gauge");
         metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
                           "Times the stale-agents freshness count could not be computed (pool "
@@ -6748,6 +6751,24 @@ public:
                 inventory_store_->set_metrics(&metrics_);
                 if (gateway_service_)
                     gateway_service_->set_inventory_store(inventory_store_.get());
+                // Defence-in-depth purge (adjudication P1): a typed source's rows
+                // never belong in the generic store — is_typed_inventory_source is
+                // the PRIMARY control (the gateway ProxyInventory generic-blob loop
+                // skips these sources outright); this sweep is hygiene for a
+                // newer-agent/older-server window where a typed blob landed here
+                // before the exclusion took effect (or before a source was
+                // promoted to typed at all). Never fails closed on a purge miss —
+                // the exclusion, not the purge, is what a caller must rely on.
+                for (const char* s : {"installed_software", "app_perf", "device_ci",
+                                      "software_licensing", "app_usage"}) {
+                    if (!is_typed_inventory_source(s))
+                        continue;
+                    if (!inventory_store_->delete_source(s))
+                        spdlog::warn("[PG] Boot purge: InventoryStore::delete_source(\"{}\") "
+                                     "reported failure (non-fatal — hygiene sweep, not a startup "
+                                     "gate)",
+                                     s);
+                }
             }
         }
 
@@ -6848,6 +6869,30 @@ public:
                     gateway_service_->set_software_licensing_store(software_licensing_store_.get());
             }
         }
+        // Typed per-agent last-used app-usage projection — born-on-Postgres (Wave
+        // 7 PR7.2, ADR-0016 §5, app_usage daily-sync source). Independent of the
+        // stores above (its own schema, its own fail-closed). Wires BOTH server
+        // entry points (direct ReportInventory + gateway ProxyInventory) to the
+        // app_usage ingest seam, which is otherwise dead: agent_service_/
+        // gateway_service_ already carry the set_app_usage_store() setter + the
+        // ingest call, but skip it while the store pointer is null. The
+        // /api/v1/forensics/agents/{agent_id}/app-usage READ route is registered
+        // below (in the route-wiring block) against this store.
+        if (pg_pool_ && !startup_failed_) {
+            app_usage_store_ = std::make_unique<AppUsageStore>(*pg_pool_);
+            if (!app_usage_store_->is_open()) {
+                spdlog::error("[PG] Refusing to start: app_usage store migration/open failed "
+                              "(database reachable but the app_usage_store schema could not be "
+                              "created/opened)");
+                startup_failed_ = true;
+            } else {
+                app_usage_store_->set_metrics(&metrics_);
+                agent_service_.set_app_usage_store(app_usage_store_.get());
+                if (gateway_service_)
+                    gateway_service_->set_app_usage_store(app_usage_store_.get());
+            }
+        }
+
         // ProductRegistryStore — SLE canonical product identities + match links
         // (ADR-0024 Decision 4). Sibling of the licensing store: its own schema, its
         // own fail-closed open. The UCE module's compliance evaluator (ADR-1005) is
@@ -7801,6 +7846,22 @@ public:
                     if (auto stale = software_inventory_store_->count_stale_agents(cutoff))
                         metrics_.gauge("yuzu_inventory_stale_agents",
                                        {{"source", "installed_software"}})
+                            .set(static_cast<double>(*stale));
+                    else
+                        metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
+                }
+                // App-usage freshness gauge (Wave 7 PR7.2): same staleness window and
+                // degrade-holds-prior-value/unavailable-counter posture as the
+                // installed_software block above — see its comment for the rationale.
+                if (app_usage_store_) {
+                    constexpr std::int64_t kAppUsageStaleWindowSecs = 2 * 24 * 60 * 60;
+                    const std::int64_t cutoff =
+                        std::chrono::duration_cast<std::chrono::seconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count() -
+                        kAppUsageStaleWindowSecs;
+                    if (auto stale = app_usage_store_->count_stale_agents(cutoff))
+                        metrics_.gauge("yuzu_inventory_stale_agents", {{"source", "app_usage"}})
                             .set(static_cast<double>(*stale));
                     else
                         metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
@@ -8861,6 +8922,7 @@ public:
             .app_perf_daily = app_perf_daily_store_.get(),
             .device_inventory = device_inventory_store_.get(),
             .software_licensing = software_licensing_store_.get(),
+            .app_usage = app_usage_store_.get(),
         }};
         return cascade.decommission(agent_id);
     }
@@ -9442,6 +9504,11 @@ public:
         if (gateway_service_)
             gateway_service_->set_software_licensing_store(nullptr);
         software_licensing_store_.reset();
+        // Per-agent app-usage store (Wave 7 PR7.2): same discipline.
+        agent_service_.set_app_usage_store(nullptr);
+        if (gateway_service_)
+            gateway_service_->set_app_usage_store(nullptr);
+        app_usage_store_.reset();
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
@@ -13953,6 +14020,7 @@ private:
                              .fleet_topology_store = fleet_topology_store_.get(),
                              .access_review_store = access_review_store_.get(),
                              .software_licensing_store = software_licensing_store_.get(),
+                             .app_usage_store = app_usage_store_.get(),
                              .product_registry_store = product_registry_store_.get(),
                              .product_pack_store = product_pack_store_.get(),
                              .scim_store = scim_store_.get(),
@@ -15701,6 +15769,42 @@ private:
                 agent_ids.push_back(m.agent_id);
             return app_perf_group_reader_->get_group_trend(agent_ids, app, version);
         };
+        // Device-model (tag) cohort trend for the app-perf page — same
+        // ManagementGroupStore->AppPerfGroupReader composition as `.group`
+        // above, just resolving membership via TagStore instead. A degraded
+        // tag read fails the WHOLE lookup closed (nullopt), never "no match".
+        app_perf_providers.tag_cohort =
+            [this](std::string_view tag_key, std::string_view tag_value, std::string_view app,
+                   std::string_view version) -> std::optional<std::vector<AppPerfFleetRow>> {
+            if (!app_perf_group_reader_ || !tag_store_)
+                return std::nullopt;
+            auto agents = tag_store_->agents_with_tag(std::string(tag_key), std::string(tag_value));
+            if (!agents)
+                return std::nullopt; // fail closed on a degraded tag read (TagStore contract)
+            return app_perf_group_reader_->get_group_trend(*agents, app, version);
+        };
+        app_perf_providers.tag_values =
+            [this](std::string_view tag_key) -> std::optional<std::vector<std::string>> {
+            if (!tag_store_)
+                return std::nullopt;
+            auto values = tag_store_->get_distinct_values(std::string(tag_key));
+            if (!values)
+                return std::nullopt;
+            return *values;
+        };
+        // The version-row "which devices" drill (B1, fleet-wide only — see the
+        // dashboard route's own registration comment for the documented v1
+        // group-scope gap). `visible_agent_ids` is threaded straight through
+        // from the caller's own require_fleet_read scope, never widened.
+        app_perf_providers.version_devices =
+            [this](std::string_view app, std::string_view version,
+                   const std::optional<std::vector<std::string>>& visible_agent_ids,
+                   bool& truncated) -> std::optional<std::vector<AppPerfVersionDeviceRow>> {
+            if (!app_perf_daily_store_)
+                return std::nullopt;
+            return app_perf_daily_store_->list_devices_for_version(app, version, visible_agent_ids,
+                                                                    truncated);
+        };
         // ADR-0031 WS-A4 #4250: the /auto VERIFY compare resource's store-reaching
         // assembly (members-then-B1-rows, ADR-0012 §1) moved verbatim behind the
         // VerifyApi seam (verify_api.{hpp,cpp}) — ONE instance, shared by the
@@ -15829,7 +15933,11 @@ private:
             // scoped and the device-id lists never enumerate out-of-scope agents.
             scoped_perm_fn, visible_set_fn,
             // F2b app-perf-over-time providers + the scope-selector group list.
-            app_perf_providers, dex_group_list_fn);
+            app_perf_providers, dex_group_list_fn,
+            // The devices-by-version drill's sole gate (ADR-0017) — the SAME
+            // fleet_read_fn lambda wired into RestApiV1/McpServer, so all three
+            // surfaces resolve visibility identically.
+            fleet_read_fn);
 
         // NetworkRoutes — /network (page shell) + /fragments/network/* (the
         // network-quality lens + net/device/app co-occurrence evidence).
@@ -16474,6 +16582,40 @@ private:
             // fans delete_agent across every registered per-agent store.
             [this](const std::string& agent_id) -> DecommissionResult {
                 return decommission_agent(agent_id);
+            },
+            audit_fn);
+
+        // AppUsageRoutes — /api/v1/forensics/agents/{agent_id}/app-usage (Wave 7
+        // PR7.2). Same fail-closed enforcement primitive as SleRoutes above
+        // (sle_gate_usable/G-1) — a corrupt/load-failed rbac.db is REFUSED (503),
+        // never served a legacy-open Forensics read. Forensics is
+        // Administrator-only by design (absent from the seeded Viewer read-list,
+        // docs/authz-model.md §4).
+        auto app_usage_scoped_perm_fn = [this, sle_gate_usable](
+                                            const httplib::Request& req, httplib::Response& res,
+                                            const std::string& type, const std::string& op,
+                                            const std::string& agent_id) -> bool {
+            if (!sle_gate_usable(req, res))
+                return false;
+            return require_scoped_permission(req, res, type, op, agent_id);
+        };
+        app_usage_routes_ = std::make_unique<AppUsageRoutes>();
+        app_usage_routes_->register_routes(
+            *web_server_, app_usage_scoped_perm_fn,
+            // Single-agent drill — REAL rows + batch collected_at, together in
+            // ONE transaction (AppUsageStore::get_agent_usage_snapshot) so a
+            // concurrent write between the two reads can't pair one snapshot's
+            // rows with another's collected_at. nullopt on degrade → 503;
+            // collected_at is sourced from the usage_state PARENT row — never
+            // rows.front().collected_at, which loses the value on a legitimate
+            // replace-to-empty snapshot (#C2).
+            [this](const std::string& agent_id) -> std::optional<AppUsageSnapshot> {
+                if (!app_usage_store_)
+                    return std::nullopt;
+                auto r = app_usage_store_->get_agent_usage_snapshot(agent_id);
+                if (!r.has_value())
+                    return std::nullopt;
+                return *r;
             },
             audit_fn);
 
@@ -18560,7 +18702,12 @@ private:
                 // and the REST /api/v1/compliance*+/api/v1/polic* twins use, so
                 // the six read tools + the yuzu://compliance/fleet resource +
                 // get_fleet_posture_fast never disagree with those siblings.
-                compliance_api);
+                compliance_api,
+                // Wave 7 PR7.2: the app_usage store, TRUE LAST parameter in every
+                // build_handler/register_routes overload — server.cpp's own
+                // positional call here terminates at compliance_api in every OTHER
+                // overload, so this parameter had to land after it.
+                app_usage_store_.get());
         }
 
         // -- Listen -----------------------------------------------------------
@@ -19134,6 +19281,7 @@ private:
     std::unique_ptr<InventoryRoutes> inventory_routes_;
     std::unique_ptr<HardwareRoutes> hardware_routes_;
     std::unique_ptr<SleRoutes> sle_routes_;
+    std::unique_ptr<AppUsageRoutes> app_usage_routes_;
     std::unique_ptr<PreflightRoutes> preflight_routes_;
     std::unique_ptr<VerifyRoutes> verify_routes_;
     std::unique_ptr<DeploymentRoutes> deployment_routes_;
@@ -19394,6 +19542,9 @@ private:
     // SLE detected-licence store (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool.
     std::unique_ptr<SoftwareLicensingStore> software_licensing_store_;
+    // Per-agent last-used app-usage store (Wave 7 PR7.2, ADR-0016 §5). Declared
+    // after pg_pool_ so it destructs before the pool.
+    std::unique_ptr<AppUsageStore> app_usage_store_;
     // SLE canonical product registry (ADR-0024 Decision 4). Declared after pg_pool_
     // so it destructs before the pool; the /api/v1/sle/* routes read it (the UCE
     // module's evaluator writes it, out-of-server).

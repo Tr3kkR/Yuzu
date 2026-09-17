@@ -10,6 +10,7 @@
 #include "inventory_store.hpp"
 #include "software_inventory_store.hpp"
 #include "software_licensing_store.hpp"
+#include "app_usage_store.hpp"
 
 namespace yuzu::server {
 
@@ -66,6 +67,14 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                                   return p->delete_agent(id);
                               })
                             : nullptr});
+    // The sixth store (Wave 7 PR7.2): agent_last_used per-executable rows,
+    // read-gated by the Forensics securable — the decommission cascade must
+    // reach it for the same reason it reaches software_licensing.
+    targets_.push_back({"app_usage",
+                        stores.app_usage ? Fn([p = stores.app_usage](std::string_view id) {
+                            return p->delete_agent(id);
+                        })
+                                         : nullptr});
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {

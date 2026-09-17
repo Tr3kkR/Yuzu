@@ -278,6 +278,40 @@ TEST_CASE("RestApiV1::register_routes vs openapi_spec_json(): every registered "
     REQUIRE(missing.empty());
 }
 
+TEST_CASE("openapi_spec_json(): the app-usage Forensics path is documented (Wave 7 PR7.2)",
+          "[openapi][app_usage]") {
+    const auto& spec_json = yuzu::server::openapi_spec_json();
+    json spec = json::parse(spec_json, nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec.contains("paths"));
+
+    const auto& paths = spec["paths"];
+    REQUIRE(paths.contains("/forensics/agents/{agent_id}/app-usage"));
+    const auto& path_obj = paths["/forensics/agents/{agent_id}/app-usage"];
+    REQUIRE(path_obj.contains("get"));
+    const auto& get_op = path_obj["get"];
+
+    REQUIRE(get_op.contains("tags"));
+    CHECK(get_op["tags"][0] == "Forensics");
+
+    REQUIRE(get_op.contains("responses"));
+    const auto& responses = get_op["responses"];
+    CHECK(responses.contains("200"));
+    CHECK(responses.contains("401"));
+    CHECK(responses.contains("403"));
+    CHECK(responses.contains("503"));
+    // The 503 leg must carry the Sec-Audit-Failed header — the fail-closed
+    // audit-tier contract every behavioural-data route in this file shares.
+    REQUIRE(responses["503"].contains("headers"));
+    CHECK(responses["503"]["headers"].contains("Sec-Audit-Failed"));
+
+    // Retained-window honesty (adjudication P3): first_seen/last_seen must
+    // never be described as all-time.
+    const std::string description = get_op.value("description", "");
+    CHECK(description.find("retained") != std::string::npos);
+    CHECK(description.find("all-time") == std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): every $ref (including discriminator.mapping "
           "values) resolves to an existing component",
           "[openapi][refs]") {

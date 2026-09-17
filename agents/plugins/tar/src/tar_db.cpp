@@ -699,6 +699,59 @@ std::expected<TarDatabase, std::string> TarDatabase::open(const std::filesystem:
         }
     }
 
+    // Version 7: add the `is_kthread` marker column to the procperf tiers —
+    // kernel-thread (Linux PF_KTHREAD) / Windows System-process (pid 4)
+    // exclusion for the daily app-perf-over-time rollup
+    // (sync_source_app_perf.cpp); see tar_proc_perf.hpp's "Kernel-thread
+    // marker" note. Same guarded-ALTER pattern as v4's `version` column: a
+    // FRESH db already has the column (create_warehouse_tables ran above),
+    // so each ALTER is guarded on a PRAGMA table_info existence check.
+    if (db.schema_version() == 6) {
+        std::lock_guard lock(db.mu_);
+        auto has_is_kthread_col = [&](const char* tbl) -> bool {
+            const auto pragma = std::format("PRAGMA table_info({})", tbl);
+            sqlite3_stmt* raw = nullptr;
+            if (sqlite3_prepare_v2(raw_db, pragma.c_str(), -1, &raw, nullptr) != SQLITE_OK)
+                return false;
+            StmtPtr q(raw);
+            while (sqlite3_step(q.get()) == SQLITE_ROW) {
+                const auto* col = reinterpret_cast<const char*>(sqlite3_column_text(q.get(), 1));
+                if (col && std::string_view{col} == "is_kthread")
+                    return true;
+            }
+            return false;
+        };
+        SqliteErrMsg emsg;
+        sqlite3_exec(raw_db, "SAVEPOINT v7_migration", nullptr, nullptr, nullptr);
+        bool ok = true;
+        for (const char* tbl : {"procperf_live", "procperf_hourly"}) {
+            if (has_is_kthread_col(tbl))
+                continue;
+            const auto alter =
+                std::format("ALTER TABLE {} ADD COLUMN is_kthread INTEGER NOT NULL DEFAULT 0", tbl);
+            if (sqlite3_exec(raw_db, alter.c_str(), nullptr, nullptr, emsg.addr()) != SQLITE_OK) {
+                // ERROR, not warn: insert_proc_perf_samples and the hourly rollup
+                // both name `is_kthread` unconditionally, so a stranded v6 DB fails
+                // to prepare EVERY tick and ALL procperf collection stops.
+                spdlog::error("TarDatabase: v7 ALTER {} failed: {} — schema remains at v6; ALL "
+                              "procperf collection will fail until the column is added. Recovery: "
+                              "stop the agent and run `ALTER TABLE {} ADD COLUMN is_kthread INTEGER "
+                              "NOT NULL DEFAULT 0;` on the tar.db, then restart.",
+                              tbl, emsg.text(), tbl);
+                ok = false;
+                break;
+            }
+        }
+        if (ok) {
+            db.set_config_locked("schema_version", "7");
+            sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
+            spdlog::info("TarDatabase: migrated to schema version 7 (procperf is_kthread column)");
+        } else {
+            sqlite3_exec(raw_db, "ROLLBACK TO v7_migration", nullptr, nullptr, nullptr);
+            sqlite3_exec(raw_db, "RELEASE v7_migration", nullptr, nullptr, nullptr);
+        }
+    }
+
     // Open a dedicated read-only, authorizer-sandboxed connection for untrusted
     // operator SQL (the tar.sql action). On this handle writes are structurally
     // impossible and the authorizer restricts reads to registry-known warehouse
@@ -2088,8 +2141,9 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
     sqlite3_free(err_msg);
 
     const char* sql = R"(
-        INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO procperf_live (ts, snapshot_id, name, version, instances, cpu_pct, ws_bytes,
+            is_kthread)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     )";
     sqlite3_stmt* raw_stmt = nullptr;
     if (sqlite3_prepare_v2(db_, sql, -1, &raw_stmt, nullptr) != SQLITE_OK) {
@@ -2107,6 +2161,7 @@ bool TarDatabase::insert_proc_perf_samples(const std::vector<ProcPerfRow>& rows)
         sqlite3_bind_int(stmt.get(), 5, r.instances);
         sqlite3_bind_double(stmt.get(), 6, r.cpu_pct);
         sqlite3_bind_int64(stmt.get(), 7, r.ws_bytes);
+        sqlite3_bind_int(stmt.get(), 8, r.is_kthread ? 1 : 0);
         if (sqlite3_step(stmt.get()) != SQLITE_DONE) {
             spdlog::error("insert_proc_perf_samples step: {}", sqlite3_errmsg(db_));
             sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
