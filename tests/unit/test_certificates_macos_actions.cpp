@@ -497,6 +497,10 @@ TEST_CASE("details: System.keychain permission-denied -> not_available, never st
         *yuzu::certificates_macos::secitem_failure_reason(
             yuzu::agent::KeychainReadStatus::OpenFailed, "System.keychain");
     CHECK(count_lines_containing(lines, std::format("not_available|{}", expected_reason)) == 1);
+    // Only System.keychain was queried and it failed to open: header + the
+    // sentinel is the only possible output, same reasoning as the list case
+    // above.
+    REQUIRE(lines.size() == 2);
     CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance ==
@@ -635,6 +639,9 @@ TEST_CASE("list: console owner recheck itself fails (unparseable uid) -> not_ava
     auto lines = split_lines(result.captured);
     CHECK(count_lines_containing(lines, "not_available|console user recheck failed") == 1);
     CHECK(count_lines_containing(lines, kInjectedLoginFailLine) == 0);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "login-keychain");
 }
 
 TEST_CASE("list control: console owner unchanged -> the armed injected-failure line fires, "
@@ -698,6 +705,171 @@ TEST_CASE("details control: console owner unchanged -> the armed injected-failur
     auto lines = split_lines(result.captured);
     CHECK(count_lines_containing(lines, kInjectedLoginFailLine) == 1);
     CHECK(count_lines_containing(lines, "status|not_found") == 0);
+}
+
+// ── Root-keychain override, action-level (code-review Gate 1 finding, found
+// independently by both external reviewers): cases 1-6 above only ever arm
+// YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE with store=System: nothing
+// drove store=root through the real plugin with the ROOT override armed, so
+// a regression that stopped consulting root_keychain_path() at either call
+// site would pass every existing assertion. Mirrors cases 2/5's
+// permission-denied shape exactly, just for the root keychain/store.
+
+TEST_CASE("list: SystemRootCertificates.keychain permission-denied -> exactly one "
+         "not_available line, CONSTRAINED/PARTIAL",
+         "[certificates][macos_actions]") {
+    if (root_would_bypass_dac())
+        return;
+    auto plugin = load_certificates_plugin();
+    if (!plugin) {
+        WARN("certificates plugin library not found -- skipping");
+        return;
+    }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
+    TestKeychain kc;
+    DeniedCopy denied(kc);
+
+    auto probe = yuzu::agent::read_keychain_bounded(denied.path.string(), 15s);
+    REQUIRE(probe.status == yuzu::agent::KeychainReadStatus::OpenFailed);
+    INFO("measured KeychainReadStatus of the denied copy: OpenFailed (precondition confirmed)");
+
+    yuzu::test::ScopedEnv root_override("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                        denied.path.string());
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    std::vector<YuzuParam> params{{"store", "root"}};
+    auto result = dispatcher.run(plugin->descriptor, "list", params);
+
+    CHECK(result.rc == 0);
+    auto lines = split_lines(result.captured);
+    const auto expected_reason =
+        *yuzu::certificates_macos::secitem_failure_reason(
+            yuzu::agent::KeychainReadStatus::OpenFailed, "SystemRootCertificates.keychain");
+    const std::string expected_line = std::format("not_available|{}", expected_reason);
+    CHECK(count_lines_containing(lines, expected_line) == 1);
+    REQUIRE(lines.size() == 2);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance ==
+         yuzu::certificates_macos::secitem_provenance("SystemRootCertificates.keychain"));
+}
+
+TEST_CASE("details: SystemRootCertificates.keychain permission-denied -> not_available, "
+         "never status|not_found",
+         "[certificates][macos_actions]") {
+    if (root_would_bypass_dac())
+        return;
+    auto plugin = load_certificates_plugin();
+    if (!plugin) {
+        WARN("certificates plugin library not found -- skipping");
+        return;
+    }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
+    TestKeychain kc;
+    DeniedCopy denied(kc);
+
+    auto probe = yuzu::agent::read_keychain_bounded(denied.path.string(), 15s);
+    REQUIRE(probe.status == yuzu::agent::KeychainReadStatus::OpenFailed);
+    INFO("measured KeychainReadStatus of the denied copy: OpenFailed (precondition confirmed)");
+
+    yuzu::test::ScopedEnv root_override("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                        denied.path.string());
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    std::vector<YuzuParam> params{{"store", "root"},
+                                  {"thumbprint", "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}};
+    auto result = dispatcher.run(plugin->descriptor, "details", params);
+
+    CHECK(result.rc == 0);
+    auto lines = split_lines(result.captured);
+    CHECK(count_lines_containing(lines, "status|not_found") == 0);
+    const auto expected_reason =
+        *yuzu::certificates_macos::secitem_failure_reason(
+            yuzu::agent::KeychainReadStatus::OpenFailed, "SystemRootCertificates.keychain");
+    CHECK(count_lines_containing(lines, std::format("not_available|{}", expected_reason)) == 1);
+    REQUIRE(lines.size() == 2);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance ==
+         yuzu::certificates_macos::secitem_provenance("SystemRootCertificates.keychain"));
+}
+
+// ── Console-user override, positive discrimination (code-review Gate 1
+// finding, found independently by both external reviewers): every case
+// above arms YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE with the CURRENT real
+// account (console_username_or_skip()), so on a single-user host the real
+// `stat /dev/console` would resolve to the identical username -- nothing
+// asserted the override's value, only its presence. A regression that
+// silently stopped consulting the override would pass every case above
+// while resuming the real subprocess spawn (the exact #4488 crash path,
+// which failed 100% pre-fix). This case uses a syntactically valid but
+// certainly-nonexistent username so the assertion can only pass if the
+// override's VALUE, not a real ::stat/getpwnam of the actual console user,
+// drove resolution.
+TEST_CASE("list: console user override with a valid but non-existent username -> "
+         "not_available sentinel proves the override value drove resolution",
+         "[certificates][macos_actions]") {
+    auto plugin = load_certificates_plugin();
+    if (!plugin) {
+        WARN("certificates plugin library not found -- skipping");
+        return;
+    }
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE",
+                                        "yuzu_no_such_test_user");
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    std::vector<YuzuParam> params{{"store", "login"}};
+    auto result = dispatcher.run(plugin->descriptor, "list", params);
+
+    CHECK(result.rc == 0);
+    auto lines = split_lines(result.captured);
+    CHECK(count_lines_containing(lines, "not_available|console user has no passwd record") == 1);
+    CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(result.result_provenance == "login-keychain");
+}
+
+// ── Injected login-read-failure detail truncation boundary (code-review
+// Gate 1 finding): injected_login_keychain_read_failure() truncates the env
+// value to 200 bytes; every other case supplies a short token, so the
+// truncation contract was proven only by implementation inspection.
+TEST_CASE("list control: injected login-read failure detail is truncated to 200 bytes",
+         "[certificates][macos_actions]") {
+    auto plugin = load_certificates_plugin();
+    if (!plugin) {
+        WARN("certificates plugin library not found -- skipping");
+        return;
+    }
+    auto me = console_username_or_skip();
+    if (!me)
+        return;
+
+    yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
+    yuzu::test::ScopedEnv uid_override("YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE",
+                                       std::to_string(::getuid()));
+    // 200 'A's is exactly the truncation limit; the trailing 'Z' must never
+    // appear in the output if truncation is correct.
+    const std::string long_token(200, 'A');
+    yuzu::test::ScopedEnv fail_override("YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE",
+                                        long_token + "Z");
+
+    yuzu::agent::LocalDispatcher dispatcher;
+    std::vector<YuzuParam> params{{"store", "login"}};
+    auto result = dispatcher.run(plugin->descriptor, "list", params);
+
+    CHECK(result.rc == 0);
+    auto lines = split_lines(result.captured);
+    const std::string expected_line =
+        std::format("not_available|login keychain read failed ({})", long_token);
+    CHECK(count_lines_containing(lines, expected_line) == 1);
+    for (const auto& l : lines)
+        CHECK(l.find('Z') == std::string::npos);
 }
 
 #endif // defined(__APPLE__) && defined(YUZU_HAVE_SECURITY_FRAMEWORK)
