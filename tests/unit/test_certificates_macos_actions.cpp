@@ -366,8 +366,13 @@ TEST_CASE("list: System.keychain permission-denied -> exactly one not_available 
             yuzu::agent::KeychainReadStatus::OpenFailed, "System.keychain");
     const std::string expected_line = std::format("not_available|{}", expected_reason);
     CHECK(count_lines_containing(lines, expected_line) == 1);
-    for (const auto& l : lines)
-        CHECK(l.find("subject|issuer|thumbprint") == std::string::npos);
+    // No CERTIFICATE DATA row leaked through -- lines[0] is unconditionally
+    // the header (list_certs_macos writes it before attempting any read, see
+    // the "header only" case above), and the header's own text trivially
+    // contains "subject|issuer|thumbprint" too, so it must be excluded here
+    // rather than scanned like a data row.
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        CHECK(lines[i].find("subject|issuer|thumbprint") == std::string::npos);
     CHECK(result.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
     CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(result.result_provenance ==
