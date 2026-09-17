@@ -4,6 +4,11 @@
 #include <limits>
 
 #if defined(__APPLE__)
+#include <yuzu/agent/scoped_cfref.hpp>
+#include <yuzu/agent/scoped_ioobject.hpp>
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/storage/IOBlockStorageDriver.h>
 #include <mach/mach_host.h>
 #include <mach/mach_init.h>
 #include <mach/machine.h>
@@ -147,6 +152,58 @@ VmSnapshot read_vm_snapshot() {
 #else
 
 VmSnapshot read_vm_snapshot() { return {}; }
+
+#endif // __APPLE__
+
+#if defined(__APPLE__)
+
+namespace {
+
+// One "Statistics" dict key: present, a CFNumber, and readable as SInt64. false on any
+// miss (absent key, wrong type, or a conversion CFNumberGetValue itself rejects).
+bool read_stat_key(CFDictionaryRef dict, CFStringRef key, std::int64_t& out) {
+    auto num = static_cast<CFNumberRef>(CFDictionaryGetValue(dict, key));
+    return num && CFGetTypeID(num) == CFNumberGetTypeID() &&
+           CFNumberGetValue(num, kCFNumberSInt64Type, &out);
+}
+
+} // namespace
+
+DiskTotals sum_block_storage_stats(io_iterator_t it) {
+    DiskTotals out;
+    bool any = false;
+    for (io_object_t raw_obj; (raw_obj = IOIteratorNext(it));) {
+        ScopedIOObject obj{raw_obj};
+        ScopedCFRef<CFTypeRef> stats{IORegistryEntryCreateCFProperty(
+            obj.get(), CFSTR(kIOBlockStorageDriverStatisticsKey), kCFAllocatorDefault, 0)};
+        if (!stats || CFGetTypeID(stats.get()) != CFDictionaryGetTypeID())
+            continue; // no Statistics dict yet — skip this driver, not fatal
+        auto dict = static_cast<CFDictionaryRef>(stats.get());
+
+        std::int64_t rb = 0, wb = 0, rd = 0, wr = 0, rt = 0, wt = 0;
+        const bool complete =
+            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey), rb) &&
+            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey), wb) &&
+            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsReadsKey), rd) &&
+            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsWritesKey), wr) &&
+            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsTotalReadTimeKey), rt) &&
+            read_stat_key(dict, CFSTR(kIOBlockStorageDriverStatisticsTotalWriteTimeKey), wt);
+        if (!complete)
+            continue; // missing/malformed key — skip this driver
+        if (rb < 0 || wb < 0 || rd < 0 || wr < 0 || rt < 0 || wt < 0)
+            return DiskTotals{}; // kernel-counter corruption — invalidate the whole sample
+
+        out.read_bytes += static_cast<std::uint64_t>(rb);
+        out.write_bytes += static_cast<std::uint64_t>(wb);
+        out.reads += static_cast<std::uint64_t>(rd);
+        out.writes += static_cast<std::uint64_t>(wr);
+        out.read_time_ns += static_cast<std::uint64_t>(rt);
+        out.write_time_ns += static_cast<std::uint64_t>(wt);
+        any = true;
+    }
+    out.valid = any;
+    return out;
+}
 
 #endif // __APPLE__
 

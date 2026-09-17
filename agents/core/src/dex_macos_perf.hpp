@@ -22,6 +22,10 @@
 #include <cstdint>
 #include <optional>
 
+#if defined(__APPLE__)
+#include <IOKit/IOKitLib.h>
+#endif
+
 namespace yuzu::agent::macos {
 
 /// Cumulative CPU tick counters since boot, from host_statistics(HOST_CPU_LOAD_INFO).
@@ -101,5 +105,16 @@ YUZU_EXPORT CpuTicks read_cpu_ticks();
 /// reduced via vm_used_bytes(). All-invalid on failure (any of the three underlying
 /// calls) or on every other platform.
 YUZU_EXPORT VmSnapshot read_vm_snapshot();
+
+#if defined(__APPLE__)
+/// Darwin only (the type itself, io_iterator_t, does not exist off Apple platforms):
+/// sum the "Statistics" dictionary of every IOBlockStorageDriver reachable from `it`.
+/// A driver with no Statistics dict, or missing one of the 6 keys read, is SKIPPED
+/// (does not invalidate the sample — an idle/uninitialized driver legitimately has
+/// none yet); a NEGATIVE value on any key present invalidates the WHOLE sample
+/// immediately (kernel-counter corruption, not a benign gap). valid=true only if at
+/// least one driver fully contributed and no negative value was ever seen.
+YUZU_EXPORT DiskTotals sum_block_storage_stats(io_iterator_t it);
+#endif
 
 } // namespace yuzu::agent::macos
