@@ -840,6 +840,7 @@ TEST_CASE("REST /dex/perf/devices: sort, filters, validation", "[dex][perf][rest
     CHECK(j["data"][0]["agent_id"] == "b-2"); // worst first
     CHECK(j["data"][0]["fleet_pctile"] == 100);
     CHECK(j["data"][0]["cohort"] == "b"); // grill pin: default key resolves cohorts
+    CHECK(j["data"][0]["os"] == "windows"); // additive (C1); two_cohorts' dev() default
 
     SECTION("cohort_key without cohort_value resolves display but does NOT filter") {
         auto all = h.sink.Get("/api/v1/dex/perf/devices?cohort_key=model");
