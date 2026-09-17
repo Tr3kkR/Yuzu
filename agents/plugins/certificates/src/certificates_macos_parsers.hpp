@@ -79,6 +79,25 @@ inline std::string canonical_thumbprint(std::string_view s) {
     return out;
 }
 
+/// Whether a Windows CryptoAPI store read/delete is allowed to fall back
+/// from LOCAL_MACHINE to CURRENT_USER when the LOCAL_MACHINE open fails.
+/// #4377: a destructive action must never target a store the caller did not
+/// name -- delete_cert_win therefore opens LOCAL_MACHINE only and has NO
+/// fallback branch that consults this predicate at all; its CURRENT_USER
+/// exclusion is enforced STRUCTURALLY (exactly one CertOpenStore call in the
+/// function body), not by a runtime check of kDelete here. This predicate is
+/// consumed ONLY by enumerate_store (the read path, list/details), where a
+/// disclosed fallback is acceptable because nothing is being removed.
+/// win_store_fallback_allowed(kDelete) == false is therefore a decision-record
+/// oracle for that asymmetry, not a production-path test of delete's
+/// behaviour -- delete's regression oracle is the structural grep over its
+/// function body (see test_certificates_store_honesty.cpp / the package's
+/// acceptance checks), because there is no runtime branch here to exercise.
+enum class WinStoreAction { kRead, kDelete };
+inline bool win_store_fallback_allowed(WinStoreAction a) {
+    return a == WinStoreAction::kRead;
+}
+
 /// The Linux cert-store directory filter: true iff `name` contains a '.' at
 /// an index > 0 and the suffix after the LAST '.' is exactly "pem" or "crt"
 /// (case-sensitive) -- byte-for-byte parity with the retired

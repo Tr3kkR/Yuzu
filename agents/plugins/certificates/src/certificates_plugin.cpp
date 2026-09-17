@@ -325,29 +325,49 @@ std::string get_key_usage(PCCERT_CONTEXT cert) {
     return result;
 }
 
-std::optional<std::vector<CertRecord>> enumerate_store(const char* store_name) {
+enum class StoreLocation { kLocalMachine, kCurrentUser };
+enum class StoreReadFailure { kNone, kOpen, kEnumeration };
+
+struct StoreEnumeration {
+    StoreReadFailure failure = StoreReadFailure::kNone;
+    StoreLocation location = StoreLocation::kLocalMachine;
     std::vector<CertRecord> records;
+};
+
+StoreEnumeration enumerate_store(const char* store_name) {
+    StoreEnumeration result;
 
     HCERTSTORE hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
                                       CERT_SYSTEM_STORE_LOCAL_MACHINE |
                                           CERT_STORE_OPEN_EXISTING_FLAG | CERT_STORE_READONLY_FLAG,
                                       store_name);
 
-    if (!hStore) {
-        // Fall back to current user store
+    if (!hStore &&
+        yuzu::certificates_macos::win_store_fallback_allowed(
+            yuzu::certificates_macos::WinStoreAction::kRead)) {
+        // Disclosed fallback (#4377): a READ may consult CurrentUser when
+        // LocalMachine could not be opened -- callers are told which
+        // location actually served the data via `result.location`, and mark
+        // the result CONSTRAINED/PARTIAL with cryptoapi:store-fallback
+        // provenance rather than silently presenting CurrentUser rows as if
+        // they came from LocalMachine.
         hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
                                CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG |
                                    CERT_STORE_READONLY_FLAG,
                                store_name);
+        if (hStore)
+            result.location = StoreLocation::kCurrentUser;
     }
     if (!hStore) {
-        // Both opens failed -- an honest std::nullopt, never a silent empty
-        // vector indistinguishable from "store opened, found nothing"
+        // Both opens failed (or fallback is not allowed for this action) --
+        // an honest typed failure, never a silent empty vector
+        // indistinguishable from "store opened, found nothing"
         // (consistency-auditor Gate-4 BLOCKING finding, same shape as the
         // macOS/Linux honesty fixes elsewhere in this file).
         spdlog::warn("certificates: CryptoAPI store '{}' could not be opened (GetLastError={})",
                     store_name, GetLastError());
-        return std::nullopt;
+        result.failure = StoreReadFailure::kOpen;
+        return result;
     }
 
     PCCERT_CONTEXT cert = nullptr;
@@ -361,27 +381,30 @@ std::optional<std::vector<CertRecord>> enumerate_store(const char* store_name) {
         rec.serial = get_cert_serial(cert);
         rec.store = store_name;
         rec.key_usage = get_key_usage(cert);
-        records.push_back(std::move(rec));
+        result.records.push_back(std::move(rec));
     }
     // CertEnumCertificatesInStore returns NULL both at genuine end-of-store
     // (CRYPT_E_NOT_FOUND, per Microsoft Learn) and on a real mid-enumeration
     // error -- treating every NULL as "fully scanned" would let a transient
     // CryptoAPI failure look like a clean, complete, possibly-empty result
-    // (adversarial-review CDX-003). Fold anything else into the same honest
-    // std::nullopt the open-failure path above already returns: this
-    // function's callers already treat nullopt as "cannot trust this
-    // store's results, mark PARTIAL, never report a definitive not_found".
+    // (adversarial-review CDX-003). Fold anything else into a typed
+    // kEnumeration failure, discarding the partial records the same way the
+    // open-failure path above never invents any: this function's callers
+    // already treat a non-kNone failure as "cannot trust this store's
+    // results, mark PARTIAL, never report a definitive not_found".
     DWORD enum_err = GetLastError();
     if (enum_err != CRYPT_E_NOT_FOUND) {
         spdlog::warn("certificates: CryptoAPI enumeration of store '{}' ended abnormally "
                     "(GetLastError={}), scan incomplete",
                     store_name, enum_err);
         CertCloseStore(hStore, 0);
-        return std::nullopt;
+        result.failure = StoreReadFailure::kEnumeration;
+        result.records.clear();
+        return result;
     }
 
     CertCloseStore(hStore, 0);
-    return records;
+    return result;
 }
 
 void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, int expiring_days) {
@@ -393,9 +416,9 @@ void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, in
         if (store_filter != "all" && store_filter != store_name)
             continue;
 
-        auto records = enumerate_store(store_name);
-        if (!records) {
-            // Both CertOpenStore attempts failed for this store -- say so
+        auto enumeration = enumerate_store(store_name);
+        if (enumeration.failure == StoreReadFailure::kOpen) {
+            // Every open attempt for this store failed -- say so
             // (operator-visible row + ABI4 typed status) and keep scanning
             // the remaining stores rather than silently reporting them as
             // empty (consistency-auditor Gate-4 BLOCKING finding).
@@ -404,7 +427,27 @@ void list_certs_win(yuzu::CommandContext& ctx, std::string_view store_filter, in
             mark_result_partial(ctx, "cryptoapi:store-open", reason);
             continue;
         }
-        for (const auto& rec : *records) {
+        if (enumeration.failure == StoreReadFailure::kEnumeration) {
+            auto reason =
+                std::format("not_available|{} store enumeration incomplete", store_name);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-enum", reason);
+            continue;
+        }
+        if (enumeration.location == StoreLocation::kCurrentUser) {
+            // Disclosed fallback (#4377): rows below actually came from
+            // CurrentUser, not the LocalMachine hive this store name
+            // normally means -- say so before the rows themselves, and mark
+            // the result CONSTRAINED/PARTIAL rather than presenting them as
+            // an ordinary LocalMachine read.
+            auto reason = std::format(
+                "not_available|{} store (LocalMachine) could not be opened; rows read from "
+                "CurrentUser",
+                store_name);
+            ctx.write_output(reason);
+            mark_result_partial(ctx, "cryptoapi:store-fallback", reason);
+        }
+        for (const auto& rec : enumeration.records) {
             if (expires_within_days(rec.not_after, expiring_days)) {
                 ctx.write_output(rec.to_row());
             }
@@ -418,38 +461,69 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
 
     auto needle = canonical_thumbprint(thumbprint);
-    // Tracks whether every selected store was actually opened. A store this
-    // process couldn't open leaves this loop free to keep scanning the
-    // rest, but the eventual "not found" verdict must not be reported as
-    // definitive if any store was skipped -- mirrors details_cert_linux's
-    // scan_complete flag.
+    // Tracks whether every selected store was actually opened AND fully
+    // enumerated AND (if fallback-served) that fallback was disclosed. Any
+    // one of those failing leaves this loop free to keep scanning the rest,
+    // but the eventual "not found" verdict must not be reported as
+    // definitive if any store was skipped, incompletely scanned, or served
+    // from a hive its name doesn't normally mean -- mirrors
+    // details_cert_linux's scan_complete flag.
     bool scan_complete = true;
     std::string unopened;
+    std::string incomplete;
+    std::string fallback;
+    auto append_store = [](std::string& list, const char* store_name) {
+        if (!list.empty())
+            list += ", ";
+        list += store_name;
+    };
     for (const auto* store_name : kStores) {
-        auto records = enumerate_store(store_name);
-        if (!records) {
+        auto enumeration = enumerate_store(store_name);
+        if (enumeration.failure == StoreReadFailure::kOpen) {
             scan_complete = false;
-            if (!unopened.empty())
-                unopened += ", ";
-            unopened += store_name;
+            append_store(unopened, store_name);
             mark_result_partial(ctx, "cryptoapi:store-open");
             continue;
         }
-        for (const auto& rec : *records) {
+        if (enumeration.failure == StoreReadFailure::kEnumeration) {
+            scan_complete = false;
+            append_store(incomplete, store_name);
+            mark_result_partial(ctx, "cryptoapi:store-enum");
+            continue;
+        }
+        if (enumeration.location == StoreLocation::kCurrentUser) {
+            append_store(fallback, store_name);
+            mark_result_partial(ctx, "cryptoapi:store-fallback");
+        }
+        for (const auto& rec : enumeration.records) {
             if (rec.thumbprint == needle) {
                 ctx.write_output(rec.to_row());
                 return;
             }
         }
     }
-    if (scan_complete) {
+    if (scan_complete && fallback.empty()) {
         ctx.write_output("status|not_found");
     } else {
-        // A store failed to open, so "not found" was never established --
-        // mirrors details_cert_linux's "scan incomplete" convention.
-        ctx.write_output(
-            std::format("not_available|{} store(s) could not be opened; scan incomplete",
-                        unopened));
+        // At least one store was unopened, incompletely enumerated, or
+        // fallback-served, so "not found" was never established -- mirrors
+        // details_cert_linux's "scan incomplete" convention.
+        std::vector<std::string> parts;
+        if (!unopened.empty())
+            parts.push_back(std::format("{} store(s) could not be opened", unopened));
+        if (!incomplete.empty())
+            parts.push_back(std::format("{} store(s) enumeration incomplete", incomplete));
+        if (!fallback.empty())
+            parts.push_back(std::format(
+                "{} store(s) read from CurrentUser (LocalMachine could not be opened)",
+                fallback));
+        std::string joined;
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (i > 0)
+                joined += "; ";
+            joined += parts[i];
+        }
+        ctx.write_output(std::format("not_available|{}; scan incomplete", joined));
     }
 }
 
@@ -463,21 +537,23 @@ bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
     // CertRecord::to_row().
     auto safe_store = yuzu::util::safe_output_field(store_name);
 
-    // CERT_STORE_OPEN_EXISTING_FLAG: without it, CertOpenStore silently
+    // CERT_STORE_OPEN_EXISTING_FLAG: without it, opening the store silently
     // CREATES a missing store and this function then reports the
     // certificate "not_found" in a store that was never actually opened --
     // an unopenable store must be reported honestly, not masked as a
     // definitive negative (consistency-auditor Gate-4 BLOCKING finding).
+    //
+    // LOCAL_MACHINE only, no CURRENT_USER retry: unlike the read path
+    // (enumerate_store), a destructive delete must never target a store the
+    // caller did not name (#4377). If the caller-named store can't be
+    // opened under LocalMachine, this fails closed and reports the failure
+    // rather than silently falling back to a different hive and deleting
+    // from a store the caller never asked about.
     HCERTSTORE hStore = CertOpenStore(
         CERT_STORE_PROV_SYSTEM_A, 0, 0,
         CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_OPEN_EXISTING_FLAG,
         std::string{store_name}.c_str());
 
-    if (!hStore) {
-        hStore = CertOpenStore(CERT_STORE_PROV_SYSTEM_A, 0, 0,
-                               CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_OPEN_EXISTING_FLAG,
-                               std::string{store_name}.c_str());
-    }
     if (!hStore) {
         auto reason =
             std::format("error|{} store could not be opened; nothing removed", safe_store);
@@ -518,7 +594,7 @@ bool delete_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint,
             auto reason = std::format(
                 "error|{} store enumeration ended abnormally; nothing removed", safe_store);
             ctx.write_output(reason);
-            mark_result_partial(ctx, "cryptoapi:store-open", reason);
+            mark_result_partial(ctx, "cryptoapi:store-enum", reason);
             CertCloseStore(hStore, 0);
             return false;
         }
