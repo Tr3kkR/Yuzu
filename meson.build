@@ -370,6 +370,32 @@ if host_os == 'darwin'
   grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
   httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
 
+  # ── Endpoint Security (shared probe, A0) ────────────────────────────────────
+  # EndpointSecurity.framework ships only with the full Xcode SDK -- the
+  # Command Line Tools SDK omits it -- so probe with required: false. This is
+  # the SINGLE probe for every ES consumer in the tree: TAR's process stream
+  # (tar_proc_es.cpp) and agent-core's pure ES helpers (es_client.hpp) both
+  # consume endpoint_security_dep/_deps/_args instead of probing independently
+  # (a shared full ES client lands in a later slice). Found: real ES client
+  # compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks; -fblocks because the ES
+  # client passes an Objective-C block literal to es_new_client, which Apple
+  # Clang does not enable by default for a .cpp TU) and libbsm links
+  # (audit_token_to_pid / audit_token_to_ruid). Absent: every consumer's
+  # #if-guarded no-op path is used instead -- see docs/darwin-compat.md's
+  # EndpointSecurity pitfalls-table row.
+  endpoint_security_dep = dependency('appleframeworks', modules: ['EndpointSecurity'],
+                                     required: false, include_type: 'system')
+  endpoint_security_deps = []
+  endpoint_security_args = []
+  if endpoint_security_dep.found()
+    endpoint_security_deps += endpoint_security_dep
+    endpoint_security_deps += cxx.find_library('bsm')
+    endpoint_security_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
+  else
+    message('EndpointSecurity framework not found (full Xcode SDK required) -- '
+          + 'ES-dependent code compiles as a no-op on this host.')
+  endif
+
   # ── Reusable per-target Apple frameworks + Objective-C++/ARC template ──────
   # Meson has no user-defined functions, so "template" here means: the parts
   # of the wifi plugin's pioneering objcpp/ARC pattern (agents/plugins/wifi/
