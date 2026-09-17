@@ -39,12 +39,32 @@ spec:
     columns:
       - name: severity
         type: string
+        description: >
+          Finding severity. The four live checks (KexAlgorithms, Ciphers,
+          MACs, HostKey) emit only HIGH/MEDIUM/INFO today; CRITICAL and LOW
+          are declared in ConfigCheckResult's vocabulary but not currently
+          reachable from any check.
+        values: [HIGH, MEDIUM, INFO]
+        example: "HIGH"
       - name: category
         type: string
+        description: Always the fixed literal "ssh_hardening" -- one category for the whole plugin.
+        values: [ssh_hardening]
+        example: "ssh_hardening"
       - name: title
         type: string
+        description: >
+          The sshd_config directive the row is about (KexAlgorithms, Ciphers,
+          MACs, HostKey), or "sshd_config" for the one INFO row emitted when
+          /etc/ssh/sshd_config itself is not found.
+        values: [KexAlgorithms, Ciphers, MACs, HostKey, sshd_config]
+        example: "KexAlgorithms"
       - name: detail
         type: string
+        description: >
+          Free-text finding detail -- the disallowed algorithm list, the
+          reason a directive could not be resolved, or a pass confirmation.
+        example: "KexAlgorithms permits algorithm(s) outside the approved baseline: diffie-hellman-group14-sha1"
     aggregation:
       groupBy: [severity, title]
       operations: [count]

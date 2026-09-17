@@ -92,7 +92,7 @@ duplicates.
 | **SSH server hardening audit** (sshd_config KexAlgorithms/Ciphers/MACs/HostKey vs. Mozilla Modern baseline) | ⛔ | ✅ | ⛔ (not yet ported — OpenSSH on macOS also reads sshd_config) | `agents/plugins/ssh_hardening/src/ssh_hardening_plugin.cpp` (`#ifdef __linux__`; pure rule logic in `ssh_hardening_rules.hpp` is portable, only the sshd_config/Include filesystem walk in `ssh_hardening_collect.hpp` is Linux-gated) |
 | **━━ Network quality (`/network`) ━━** | | | | Measurement-first device/local-link health lens. `net_quality_sampler.cpp`; `docs/user-manual/network.md` "Platform coverage" |
 | **Network quality** (throughput / retransmit / RTT) | 🟡 throughput + retransmit (no RTT) | ✅ all three | 🟡 throughput only | Win `GetIfTable2` throughput + `GetTcpStatisticsEx` system-wide interval retransmit (**measurement-first, not loss-validated** — withheld from the fleet retransmit aggregate); RTT needs ESTATS (admin+overhead) → 🔜. Linux has all three. macOS `NET_RT_IFLIST2` throughput only (`read_net_counters()` sums non-loopback `if_data64` rx/tx, differenced per heartbeat); retransmit + RTT deferred — global `net.inet.tcp.stats` reads all-zero on modern macOS → 🔜 |
-| **━━ Agent plugins (51) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 42 fully cross-platform, 5 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`, `windows_optional_features`), 3 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux; `disk_actions` — Win+macOS, Linux declared unimplemented), 1 macOS-constrained (`interaction` — GUI-less daemon). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted) |
+| **━━ Agent plugins (52) — per-plugin build/availability ━━** | | | | Per-OS via platform macros / per-OS TUs (`agents/plugins/*/src/*`). 42 fully cross-platform, 5 Windows-only (`rdp_control`, `registry`, `sccm`, `wmi`, `windows_optional_features`), 3 uneven (`tar` — richest on Windows; `msi_packages` — Win+macOS, no Linux; `disk_actions` — Win+macOS, Linux declared unimplemented), 1 macOS-constrained (`interaction` — GUI-less daemon), 1 Linux-only (`ssh_hardening` — audits `/etc/ssh/sshd_config`, which only exists on Linux). "Full" = the plugin builds and its core actions work on that OS; a plugin can be cross-platform yet expose a few OS-specific actions (noted) |
 | agent_actions | ✅ | ✅ | ✅ | portable — no platform macros |
 | agent_logging | ✅ | ✅ | ✅ | `_WIN32`/`__APPLE__`/Linux branches all implemented |
 | antivirus | ✅ | ✅ | ✅ | Defender/WMI (in-process, no more `powershell`) + exclusion-registry read · ClamAV+Falcon+Sophos with a real `status` leg · macOS real probes — XProtect bundle version + endpoint-security system-extension enumeration (`antivirus_plugin.cpp`, parsers `antivirus_parsers.hpp`), no longer a hardcoded assertion (posture depth: the **Antivirus posture** row) |
@@ -134,6 +134,7 @@ duplicates.
 | script_exec | ✅ | ✅ | ✅ | win/apple/linux. Different action sets per OS (`bash` POSIX-only; powershell/cmd on Windows) |
 | services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable) |
 | software_actions | ✅ | ✅ | ✅ | win/linux/apple branches |
+| ssh_hardening | ⛔ | ✅ | ⛔ | Linux-only — audits `/etc/ssh/sshd_config` (+ `Include` globs) against the Mozilla Modern OpenSSH baseline; the collector (`ssh_hardening_collect.hpp`) is `#ifdef __linux__`. Windows: out of scope (no equivalent sshd_config convention). macOS: not yet ported — OpenSSH also reads sshd_config there, but the collector hasn't been extended; the pure rule-evaluation logic in `ssh_hardening_rules.hpp` is itself portable |
 | status | ✅ | ✅ | ✅ | linux/apple/win branches |
 | storage | ✅ | ✅ | ✅ | portable — persistent KV store |
 | tags | ✅ | ✅ | ✅ | portable — `std::filesystem` |
@@ -168,7 +169,7 @@ merely shrink it — the script exits 1 on a *lower* count too until
 adoption gain is sticky rather than leaving room for a later regression back
 up to the old baseline.
 
-Adoption is now **complete**: all 51 plugins the CI gate tracks populate
+Adoption is now **complete**: all 52 plugins the CI gate tracks populate
 `action_descriptors`, so the undeclared count and `RATCHET_BASELINE_UNDECLARED`
 are both **0** and the "Undeclared plugins" section below is empty. From here
 the ratchet is equivalent to a hard fail — a new plugin directory landing
@@ -603,6 +604,9 @@ implementation is.
 | software_actions | installed_count | linux | supported | 2 | dpkg-query/rpm via bounded argv runner | - |
 | software_actions | installed_count | macos | supported | 2 | pkgutil --pkgs via bounded argv runner | - |
 | software_actions | installed_count | windows | supported | 1 | native Reg*W subkey count of the Uninstall key | reads only the default (64-bit) registry view, matching the powershell payload it replaced; 32-bit applications registered under WOW6432Node are not counted |
+| ssh_hardening | audit | linux | supported | 1 | std::filesystem/glob(3) read of /etc/ssh/sshd_config (+ Include globs); in-process rule evaluation (ssh_hardening_rules.hpp) | - |
+| ssh_hardening | audit | macos | unsupported | - | - | Not yet ported -- OpenSSH on macOS also reads sshd_config, but this plugin's collector (ssh_hardening_collect.hpp) is Linux-gated (#ifdef __linux__); the pure rule-evaluation logic in ssh_hardening_rules.hpp is itself portable. |
+| ssh_hardening | audit | windows | unsupported | - | - | Windows does not ship an OpenSSH server by the same sshd_config convention this plugin audits; out of scope for this plugin. |
 | status | version | linux | supported | 1 | in-process (compiled version constants) | - |
 | status | version | macos | supported | 1 | in-process (compiled version constants) | - |
 | status | version | windows | supported | 1 | in-process (compiled version constants) | - |

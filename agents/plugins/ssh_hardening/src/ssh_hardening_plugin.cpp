@@ -30,13 +30,49 @@ namespace {
 
 using yuzu::ssh_hardening::ConfigCheckResult;
 
+// ABI v4+ per-action, per-OS capability declaration (#2204) -- read directly
+// out of the built plugin binary by tools/capmatrix-gen to populate
+// docs/os-capability-matrix.md's generated block. Linux-only in substance:
+// sshd_config lives at a fixed POSIX path and this plugin's Include-glob
+// expansion uses glob(3), a POSIX-only primitive -- Windows/macOS legs
+// report Unsupported rather than a stub "would work if ported" claim,
+// since OpenSSH's sshd_config format itself is portable but nothing in
+// this plugin's collector is.
+const YuzuActionDescriptor kActionDescriptors[] = {
+    {
+        /* .action      = */ "audit",
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "std::filesystem/glob(3) read of /etc/ssh/sshd_config (+ Include globs); in-process "
+         "rule evaluation (ssh_hardening_rules.hpp)",
+         nullptr},
+        /* .macos_leg   = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "Not yet ported -- OpenSSH on macOS also reads sshd_config, but this plugin's "
+         "collector (ssh_hardening_collect.hpp) is Linux-gated (#ifdef __linux__); the pure "
+         "rule-evaluation logic in ssh_hardening_rules.hpp is itself portable."},
+        /* .windows_leg = */
+        {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
+         "Windows does not ship an OpenSSH server by the same sshd_config convention this "
+         "plugin audits; out of scope for this plugin."},
+    },
+};
+
 // Escape pipe characters in output values (same convention as vuln_scan).
+// Also escapes newlines -- an sshd_config value can theoretically embed one
+// via a directive whose value is quoted/continued, and an unescaped \n/\r
+// would split one logical pipe-delimited row across output lines (same fix
+// applied to pii_scan/cert_scan's escape_pipes on review).
 std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
         if (c == '|')
             out += "\\|";
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
         else
             out += c;
     }
@@ -83,6 +119,13 @@ public:
     const char* const* actions() const noexcept override {
         static const char* acts[] = {"audit", nullptr};
         return acts;
+    }
+
+    const YuzuActionDescriptor* action_descriptors() const noexcept override {
+        return kActionDescriptors;
+    }
+    size_t action_descriptor_count() const noexcept override {
+        return sizeof(kActionDescriptors) / sizeof(kActionDescriptors[0]);
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
