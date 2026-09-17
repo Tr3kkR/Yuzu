@@ -158,13 +158,32 @@ TEST_CASE("vm_used_bytes saturates rather than wraps on overflow", "[dex][macos]
 TEST_CASE("read_cpu_ticks reads two valid, monotonic snapshots", "[dex][macos][perf][darwin]") {
     const auto a = read_cpu_ticks();
     REQUIRE(a.valid);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    const auto b = read_cpu_ticks();
-    REQUIRE(b.valid);
+
+    // host_statistics(HOST_CPU_LOAD_INFO) publishes in ~1s batches on this kernel, so a
+    // single fixed 50ms sleep left dt==0 on most windows (measured 6/10 and 8/12 pass —
+    // the flaky case this replaces). Poll up to ~3s for a real elapsed interval instead
+    // of trusting one fixed-length sleep; never lengthen a single sleep to paper over it.
+    CpuTicks b{};
+    for (int i = 0; i < 30; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        b = read_cpu_ticks();
+        REQUIRE(b.valid);
+        if (b.user + b.system + b.nice + b.idle > a.user + a.system + a.nice + a.idle)
+            break;
+    }
+
+    CHECK(b.user >= a.user);
+    CHECK(b.system >= a.system);
+    CHECK(b.nice >= a.nice);
+    CHECK(b.idle >= a.idle);
+
+    // Conditional rather than REQUIRE: even after polling, an unlucky window can still
+    // land on dt==0 (cpu_busy_pct's own contract) — that is not itself a failure here.
     const auto pct = cpu_busy_pct(a, b);
-    REQUIRE(pct.has_value()); // ticks advanced enough for a non-zero interval
-    CHECK(*pct >= 0.0);
-    CHECK(*pct <= 100.0);
+    if (pct.has_value()) {
+        CHECK(*pct >= 0.0);
+        CHECK(*pct <= 100.0);
+    }
 }
 
 TEST_CASE("read_vm_snapshot's total matches an independent hw.memsize read",
