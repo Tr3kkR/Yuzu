@@ -35,7 +35,11 @@ namespace yuzu::server {
 /// nullopt = the device did not report that metric this cycle.
 struct DexPerfDevice {
     std::string agent_id;
-    bool is_windows{false}; ///< denominator scoping (perf collectors are Windows-only today)
+    /// Normalized OS token from dex_perf_rules.hpp's dex_perf_os_from_session:
+    /// "windows" | "linux" | "macos" | "" (unrecognized/session-less). Denominator
+    /// scoping — see dex_perf_os_collects for which of these have a real
+    /// heartbeat perf collector today.
+    std::string os;
     std::optional<double> cpu_pct;
     std::optional<double> commit_pct;
     std::optional<double> disk_lat_ms;

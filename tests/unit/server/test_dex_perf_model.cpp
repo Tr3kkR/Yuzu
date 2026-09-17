@@ -52,10 +52,10 @@ yuzu::test::PgTestTemplate guardian_pg_tpl{"guardianstate", [](const std::string
 
 DexPerfDevice dev(const std::string& id, std::optional<double> cpu, std::optional<double> commit,
                   std::optional<double> lat, const std::string& cohort = "",
-                  bool is_windows = true) {
+                  const std::string& os = "windows") {
     DexPerfDevice d;
     d.agent_id = id;
-    d.is_windows = is_windows;
+    d.os = os;
     d.cpu_pct = cpu;
     d.commit_pct = commit;
     d.disk_lat_ms = lat;
@@ -142,7 +142,7 @@ TEST_CASE("fleet_now: absent-not-zero + honest denominators", "[dex][perf][model
     // Two online Windows agents, neither reporting; one mac agent.
     snap.devices.push_back(dev("w1", std::nullopt, std::nullopt, std::nullopt));
     snap.devices.push_back(dev("w2", std::nullopt, std::nullopt, std::nullopt));
-    snap.devices.push_back(dev("m1", std::nullopt, std::nullopt, std::nullopt, "", false));
+    snap.devices.push_back(dev("m1", std::nullopt, std::nullopt, std::nullopt, "", "macos"));
     auto now = dex_perf_fleet_now(snap);
     CHECK_FALSE(now.cpu);
     CHECK_FALSE(now.commit);
@@ -234,7 +234,7 @@ TEST_CASE("device_list: not-reporting complement is Windows-only", "[dex][perf][
     DexPerfSnapshot snap;
     snap.devices.push_back(dev("w-quiet", std::nullopt, std::nullopt, std::nullopt));
     snap.devices.push_back(dev("w-loud", 10.0, 50.0, 1.0));
-    snap.devices.push_back(dev("mac", std::nullopt, std::nullopt, std::nullopt, "", false));
+    snap.devices.push_back(dev("mac", std::nullopt, std::nullopt, std::nullopt, "", "macos"));
     auto rows = dex_perf_device_list(snap, DexPerfMetric::kCpu, true, std::nullopt, 50);
     REQUIRE(rows.size() == 1); // the mac is not EXPECTED to report — not listed
     CHECK(rows[0].agent_id == "w-quiet");

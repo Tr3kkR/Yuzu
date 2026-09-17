@@ -74,7 +74,7 @@ DexPerfFleetNow dex_perf_fleet_now(const DexPerfSnapshot& snap) {
     DexPerfFleetNow out;
     std::vector<double> cpu, commit, disk;
     for (const auto& d : snap.devices) {
-        if (d.is_windows)
+        if (d.os == "windows")
             ++out.windows_online;
         if (reports_any(d))
             ++out.reporting;
@@ -306,9 +306,9 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
         if (cohort_filter && d.cohort != *cohort_filter)
             continue;
         if (not_reporting) {
-            // The complement list: Windows devices (the only OS expected to
-            // report today) that contributed nothing this cycle.
-            if (!d.is_windows || reports_any(d))
+            // The complement list: devices whose OS has a real perf collector
+            // (dex_perf_os_collects) but contributed nothing this cycle.
+            if (!detail::dex_perf_os_collects(d.os) || reports_any(d))
                 continue;
         } else {
             if (!metric_value(d, metric))
