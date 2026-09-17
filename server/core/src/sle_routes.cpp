@@ -205,12 +205,12 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
     // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for
     // the cascade's WHOLE blast radius, not the individual securables that govern
-    // each store's READ. The radius is FIVE stores: InventoryStore,
+    // each store's READ. The radius is SIX stores: InventoryStore,
     // SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by
     // `Inventory`), AppPerfDailyStore (read-gated by `GuaranteedState` — DEX
-    // behavioural PII), and SoftwareLicensingStore (read-gated by
-    // `SoftwareLicensing`). A companion package (Wave 7 PR7.2) adds a sixth store,
-    // AppUsageStore (read-gated by `Forensics`). Compat: the seeded
+    // behavioural PII), SoftwareLicensingStore (read-gated by
+    // `SoftwareLicensing`), and AppUsageStore (read-gated by `Forensics`,
+    // Wave 7 PR7.2). Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that
     // had assembled the old per-store Delete grants is refused (403 naming

@@ -34,15 +34,16 @@
  * win_profiles.hpp's with_user_hive() for where it is taken. The live-hive
  * path (the common case) never takes this lock.
  *
- * INSTRUMENTATION: this one process-wide lock already serialises the
- * offline arm for FIVE plugins via with_user_hive() -- autoruns,
- * installed_apps, license_scan, registry, tar -- so a long hold by any one
- * of them blocks the other four with no prior visibility into it. A
- * planned execution_artifacts caller (not yet on this branch) will make it
- * six, calling the lock directly rather than through with_user_hive().
- * `ScopedOfflineHiveLock` wraps the acquire/release with a wait-time and
- * hold-time log (spdlog, this codebase's existing agent-side logging
- * mechanism) so an unusually long wait or hold is visible without
+ * INSTRUMENTATION: this one process-wide lock serialises the offline arm
+ * for FIVE plugins via with_user_hive() -- autoruns, installed_apps,
+ * license_scan, registry, tar -- plus a SIXTH, execution_artifacts's
+ * AmCache leg (execution_artifacts_win.cpp), which calls the lock directly
+ * as `ScopedOfflineHiveLock("execution_artifacts")` rather than through
+ * with_user_hive() -- so a long hold by any one of the six blocks the
+ * other five with no prior visibility into it. `ScopedOfflineHiveLock`
+ * wraps the acquire/release with a wait-time and hold-time log (spdlog,
+ * this codebase's existing agent-side logging mechanism) so an unusually
+ * long wait or hold is visible without
  * instrumenting every call site by hand. Both lines log together from the
  * destructor, after the mutex is released, so logging itself never extends
  * another caller's wait. Prefer it over a bare

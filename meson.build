@@ -504,6 +504,8 @@ if build_agent
   subdir('agents/plugins/power_health')
   subdir('agents/plugins/autoruns')  # Wave 7 PR7.1
   subdir('agents/plugins/windows_optional_features')  # Wave 9 PR9.2b
+  subdir('agents/plugins/app_usage')  # Wave 7b PR7b.3
+  subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
 endif
 
 # ── Server ────────────────────────────────────────────────────────────────────

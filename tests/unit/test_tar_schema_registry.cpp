@@ -351,6 +351,20 @@ TEST_CASE("TAR schema: $Software dollar-names translate and DDL has the columns"
     }
 }
 
+TEST_CASE("TAR schema: usage tables are excluded from the tar.sql allowlist (#4260)",
+          "[tar][schema][security][usage]") {
+    // The three usage tables are read ONLY via the Forensics-gated app_usage
+    // plugin reads, never through generic tar.sql (Infrastructure:Read).
+    CHECK_FALSE(is_queryable_table("usage_live"));
+    CHECK_FALSE(is_queryable_table("usage_daily"));
+    CHECK_FALSE(is_queryable_table("usage_daily_user"));
+
+    // A generic warehouse table stays reachable -- this isn't a broken allowlist.
+    CHECK(is_queryable_table("process_live"));
+    CHECK(is_queryable_table("tar_config"));
+    CHECK(is_queryable_table("tar_cursor"));
+}
+
 TEST_CASE("TAR schema: netqual Windows is kSupportedConstrained via estats (ADR-0020)",
           "[tar][schema][netqual]") {
     const auto& sources = capture_sources();

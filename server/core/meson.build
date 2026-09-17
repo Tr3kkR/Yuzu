@@ -508,7 +508,9 @@ yuzu_server_core_lib = static_library(
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot
     'src/network_routes.cpp',
     'src/network_ui.cpp',
+    'src/device_api.cpp', # ADR-0031 WS-A4: the fourth per-family in-process API seam
     'src/device_routes.cpp',
+    'src/device_lens_routes.cpp', # ADR-0031 WS-A4 wave 2: DEX/Guardian device lenses (no public twin — outside the seam)
     'src/device_ui.cpp',
     'src/group_agent_count_preview.cpp',
     'src/inventory_routes.cpp',
@@ -582,6 +584,10 @@ yuzu_server_core_lib = static_library(
     'src/product_registry_store.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
+    'src/app_usage_store.cpp',           # Wave 7b PR7b.2
+    'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
+    'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
+    'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/agent_decommission.cpp',
