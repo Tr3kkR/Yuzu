@@ -617,13 +617,19 @@ public:
     /// authority-inheritance invariant `rotate_token` enforces, INCLUDING
     /// the #2963 empty-tier/scope exception (see that doc comment) — as
     /// DEFENCE IN DEPTH ONLY — a successor's tier/scope are fixed at mint
-    /// time and cannot legitimately diverge from what the caller who
-    /// initiated the rotation already held, so `rotate_token`'s own guard
-    /// is the load-bearing one; this catches only a hypothetical future
-    /// bypass of it, never a live path today. Both checks MUST stay in sync
-    /// — a caller that can successfully `rotate_token` must also be able to
-    /// `confirm_token_rotation` the SAME pair, or the two calls disagree on
-    /// an identical caller/token. REQUIRED, not defaulted, for the same
+    /// time and cannot legitimately diverge from the authority a caller
+    /// confirming it currently holds (NOT necessarily the same SESSION that
+    /// initiated the rotation — ownership + the #3015 proof-of-possession
+    /// check are what actually gate who may confirm; a second session
+    /// belonging to the same principal, with a matching or empty tier/scope
+    /// AND the raw successor secret, may legitimately confirm a rotation a
+    /// different session started), so `rotate_token`'s own guard is the
+    /// load-bearing one; this catches only a hypothetical future bypass of
+    /// it, never a live path today (governance Gate 4 UP-4). Both checks
+    /// MUST stay in sync — a caller presenting a given tier/scope that can
+    /// successfully `rotate_token` a pair must also be able to
+    /// `confirm_token_rotation` it presenting the SAME tier/scope, or the
+    /// two calls disagree on an identical caller/token. REQUIRED, not defaulted, for the same
     /// reason as `rotate_token`'s own pair (governance Gate 8 fix) — see
     /// that doc comment.
     ///

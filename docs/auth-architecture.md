@@ -3404,7 +3404,20 @@ this section does not restate them.
   successor secret to themselves — with neither `ApiToken:Delete` nor a
   supervised-tier approval. No privilege gain, but a real residual:
   availability (the sibling's predecessor is destroyed) plus cross-consumer
-  credential capture, within one principal's own tokens.
+  credential capture, within one principal's own tokens. **#2963 widens this
+  residual's reach, not its shape** (governance Gate 4 UP-3): a full-authority
+  session (empty tier/scope) can now rotate-then-confirm a same-principal
+  SIBLING that carries a tier or scope, not only an untiered/perpetual one —
+  previously the bare tier-equality guard blocked that combination
+  structurally. Concretely: a caller who compromises only a principal's
+  cookie session (e.g. via XSS/CSRF) can now silently rotate/confirm a
+  *different*, genuinely MCP-tiered automation token belonging to the same
+  principal, breaking whatever consumes it. Still no privilege gain — the
+  successor inherits the sibling's own tier/scope, never the attacker's — so
+  this stays an availability/credential-capture residual, not an
+  authorization one, and the disposition is unchanged: `ApiToken:Rotate`
+  remains deliberately not approval-gated (see above), and this is accepted,
+  not fixed, by this decision.
 - **The guard's blocking of the DE-escalating direction was decided and
   fixed by #2963 — a single full-authority exception, not a tier lattice.**
   The guard was originally bare equality, not "no broader than": a cookie
@@ -3452,6 +3465,25 @@ this section does not restate them.
   replacement (the bullet above). No code change; this bullet exists so
   the boundary is stated plainly instead of only discoverable from the
   error text.
+- **A non-admin rotation caught mid-flight by an RBAC-off→on toggle can strand
+  at `confirm` — self-healing, not data loss, and newly reachable by a wider
+  population since #2963 (governance Gate 4 UP-6).** `ApiToken:Rotate` is
+  granted only to `Administrator`/`ApiTokenManager` under RBAC-on
+  (`rbac_store.cpp`'s seed data) — before #2963 only an admin could start a
+  self-service rotation at all, so this toggle race could only ever strand an
+  admin, who already holds the RBAC-on grant and is unaffected. Now a
+  non-admin owner can start one under the RBAC-off legacy allowlist; if an
+  operator enables RBAC before that caller confirms, `confirm` hits the
+  RBAC-enforced branch and 403s for a non-admin role lacking the grant. The
+  predecessor is not permanently stranded — the background rotation sweep
+  auto-revokes it once the (≥24h) overlap window elapses regardless of
+  confirm — but the caller sees a stuck rotation with no admin-override
+  confirm path (rotate-as-admin/confirm-as-admin is deliberately not offered,
+  per the identity-takeover rationale above). Accepted, not fixed, by this
+  decision: enabling RBAC mid-flight against in-progress self-service
+  rotations is an operator action outside this feature's scope to guard
+  against, and the failure mode is a delayed self-service credential swap,
+  not data loss or an authorization gap.
 - **Known residual gaps, tracked, not fixed by this capability:** three
   pre-existing issues were surfaced while building this feature and filed
   rather than folded in silently — `#2943` (a confirm-path fallthrough
