@@ -66,20 +66,43 @@ grammar; do not treat its absence here as an oversight.
 
 ## Substitution tokens (closed list)
 
-A Reaction's `params` values may reference the firing Spark event via `{{spark.<fact>}}`. The
-**only** legal facts are:
-
-- `{{spark.key}}` — the armed Spark's watch key (e.g. a file path or service label as originally
-  authored)
-- `{{spark.path}}` — resolved at fire time, **Process spark type only** (the full executable path;
-  never persisted — only the basename travels in the event itself, per A7's privacy posture)
-- `{{spark.pid}}` — Process spark type only
-- `{{spark.service_state}}` — Service spark type only
-- `{{spark.edge}}` — the transition that fired (e.g. `started`/`exited`, `changed`/`deleted`)
+A Reaction's `params` values may reference the firing Spark event via `{{spark.<fact>}}`, using the
+literal `{{...}}` delimiter — matching the convention Reflex content actually implements (the same
+one `policy_evaluator.cpp` and shipped content definitions already use), **not** the
+`docs/yaml-dsl-spec.md` `${...}` convention documented for other content. A literal `{{` an author
+needs verbatim is escaped `\{\{`; an unbalanced or unterminated token is a validation error. The
+**only** legal facts, and which spark types can produce them, are listed under "Spark types and
+per-type facts" below — `{{spark.key}}`, `{{spark.path}}`/`{{spark.pid}}` (Process only, planned),
+`{{spark.service_state}}` (Service only), `{{spark.edge}}` (a closed, per-type enumeration, several
+types produce none at all).
 
 `validate_placeholders` (R4) rejects any `{{...}}` token outside this list, and rejects a fact not
-published for the Reflex's own spark `type` by `reflex_schema_registry::facts_for(spark_type)` (e.g.
-`{{spark.pid}}` on a `file` spark is a validation error, not a silent empty substitution).
+published for the Reflex's own spark `type` (e.g. `{{spark.pid}}` on a `file` spark is a validation
+error, not a silent empty substitution).
+
+**Substitution is data-only — never shell-composed.** `{{spark.*}}` tokens are **forbidden** in any
+parameter that reaches an interpreted context (a `script`/command-body parameter of `script_exec` or
+any plugin that composes a shell/interpreter line from its params) and in every parameter of a
+**dangerous** Reaction (`execute_gate != None` or `dispatch_class == Destructive`, per the safety
+chokepoint) — `validate_reflex`/`validate_placeholders` (R4) refuse the Reflex at compile if a token
+appears in either. Where substitution IS legal, the resolved value is passed as a discrete,
+argv-style parameter, never interpolated into a composed command string — an attacker-controlled
+Spark fact (e.g. a maliciously-named local file whose path becomes `{{spark.path}}`) cannot inject
+shell syntax this way.
+
+**Facts are re-validated at execution, against the fired edge, never against compile-time text.** At
+fire time the executor re-resolves each referenced fact from the actual `SparkEvent` (e.g.
+`{{spark.pid}}` is checked against the process's start time, so a pid recycled between the Spark
+firing and the Reaction actually running is detected and refused rather than silently substituted
+with an unrelated process's identity). If a referenced fact cannot be resolved at fire time (the
+process already exited, the file already vanished), the **whole chain is refused**
+(`reflex.aborted{unresolvable_fact}`) — never a partial substitution or an empty string.
+
+**Resolved parameter values are excluded from the outcome journal.** `capture_output` (Reaction
+stdout/stderr) is the only per-Reaction content persisted to `reflex_outcomes`; the actual resolved
+`{{spark.*}}` substitutions (which may carry a user path, e.g. a resolved `{{spark.path}}`) are
+**never** written to the journal or the outcome event — only a basename ever appears in any
+persisted record, matching A7's privacy posture and D10's "no SID/username/user path" rule.
 
 ## Safety chokepoint — `dangerous_reactions_in_spec()`
 
