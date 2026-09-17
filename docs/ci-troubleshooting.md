@@ -94,15 +94,20 @@ the fork checkout; build steps do not receive it. The trusted self-hosted legs
 use clean workspaces and private, no-share caches, then purge the checkout. The
 wrapper's final `purge-quarantine-cache` job deletes every GitHub Actions cache
 entry in the quarantine scope (deleting the branch does not do that by itself).
-The review workflow has no purge job of its own, so when re-approving a newer
-head on a PR whose branch already ran, name the branch
-`trusted-fork/pr-123-<sha7>` instead of reusing the bare name (both guards accept
-an optional hex suffix).
+`fork-dynamic-review.yml` purges its own scope the same way immediately after
+it finishes, so a crafted cache entry from the (at that point still unapproved)
+review run can never be restored by the later trusted gate's canary leg on the
+same ref. When re-approving a newer head on a PR whose branch already ran,
+either name is safe, but a fresh suffixed branch
+(`trusted-fork/pr-123-<sha7>`, both guards accept an optional hex suffix) is
+still the clearer record of which SHA a given dispatch approved.
 If the dispatch is refused with `must be dispatched on
 refs/heads/trusted-fork/pr-<N>`, the `--ref` was wrong — never work around it
-by dispatching on `main`. Two trusted dispatches do not serialise with each
-other and will contend for the self-hosted pools; run them one at a time. This
-is an explicit trust decision: do not dispatch it for a fork revision that has
+by dispatching on `main`. Two `trusted-fork-ci` dispatches for the same PR
+number queue rather than run concurrently (workflow-level `concurrency:`), so
+a re-approval before the first run finishes waits its turn instead of racing
+its purge against the first run's gate. This is an explicit trust decision:
+do not dispatch it for a fork revision that has
 not been statically reviewed. The `TRUSTED_FORK_CI_GATE` repository secret is
 an additional wrapper-only guard and must not be exposed to build steps.
 

@@ -84,3 +84,65 @@ jobs:
 
       - name: Test
         run: meson test -C build-linux --print-errorlogs
+
+  # #4471 (adversarial-review round, CDX-4471-01/kimi P1): this workflow
+  # executes UNREVIEWED fork code before a maintainer has approved the SHA,
+  # and the runbook dispatches the later trusted-fork-ci gate on the SAME
+  # quarantine ref -- same GitHub Actions cache scope. Without this job, a
+  # crafted cache entry written here (via the ambient runtime token; this job
+  # declares no actions/cache step, but that does not stop code running
+  # inside `meson compile`/`meson test` from calling the cache service
+  # directly -- the same mechanism #4471 exists to close) could be restored
+  # by the canary leg of the later trusted dispatch, before that job's own
+  # purge-quarantine-cache (trusted-fork-ci.yml) ever runs. Purging this
+  # workflow's own scope immediately, before a maintainer ever dispatches the
+  # gate, closes that ordering gap completely: the gate always sees an empty
+  # scope. Same shape as trusted-fork-ci.yml's purge job -- see its comment
+  # for the actions:write / no-checkout / always() reasoning, all identical
+  # here. (This job's own writes, if any, are removed by trusted-fork-ci.yml's
+  # purge after the gate runs, so re-approving a newer head on a reused
+  # branch is still safe either way.)
+  purge-quarantine-cache:
+    name: Purge quarantine cache scope
+    needs: [linux]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Delete every cache entry in this run's ref scope
+        env:
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Never purge outside a quarantine ref. A mis-scoped dispatch is
+          # already refused by Validate immutable inputs; this keeps a future
+          # edit from turning the purge into a cold rebuild for every PR on
+          # dev/main.
+          [[ "$GITHUB_REF" =~ ^refs/heads/trusted-fork/pr-[1-9][0-9]*(-[0-9a-fA-F]{7,40})?$ ]] || {
+            echo "::error::refusing to purge caches outside a trusted-fork/pr-<N> ref (got $GITHUB_REF)."
+            exit 1
+          }
+          list_ids() {
+            gh api -X GET "repos/$REPOSITORY/actions/caches" -f ref="$GITHUB_REF" -F per_page=100 \
+              | jq -r --arg ref "$GITHUB_REF" '.actions_caches[] | select(.ref == $ref) | .id'
+          }
+          deleted=0
+          # Bounded re-list: one page per pass, so a scope holding more than a
+          # page drains over several passes instead of looping forever.
+          for _ in 1 2 3 4 5; do
+            ids=$(list_ids)
+            [[ -n "$ids" ]] || break
+            for id in $ids; do
+              gh api -X DELETE "repos/$REPOSITORY/actions/caches/$id" >/dev/null
+              deleted=$((deleted + 1))
+            done
+          done
+          remaining=$(list_ids | wc -l | tr -d ' ')
+          [[ "$remaining" == "0" ]] || {
+            echo "::error::$remaining cache entries still present in $GITHUB_REF after purge."
+            exit 1
+          }
+          echo "purged $deleted cache entries from scope $GITHUB_REF"

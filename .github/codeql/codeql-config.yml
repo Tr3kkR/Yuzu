@@ -70,7 +70,15 @@ query-filters:
   # pins that on every PR; scripts/ci/test_runner_health_check.py pins that no
   # other workflow checks out a PR-derived ref), and no CodeQL control-check
   # covers workflow_dispatch, so each new preflight step re-raised a HIGH
-  # alert (#5177). Siblings stay on: actions/cache-poisoning/direct-cache,
+  # alert (#5177) -- alerts #5158 and #5175 hit the identical pattern and were
+  # each individually dismissed with the same rationale (governance.d
+  # mcp-retry-hardening.gilNSc.jsonl), which is the established precedent for
+  # this query and the recurring cost #4471 exists to stop paying. A global
+  # exclusion is chosen here, not another individual dismissal, because this
+  # change (adversarial-reviewed) also closes the underlying gap program-wide:
+  # trusted_inputs AND fork-dynamic-review.yml both refuse any ref outside the
+  # trusted-fork/pr-<N> quarantine, and the sweep below covers .yml and .yaml.
+  # Siblings stay on: actions/cache-poisoning/direct-cache,
   # actions/untrusted-checkout/*, zizmor's cache-poisoning audit.
   - exclude:
       id: actions/cache-poisoning/poisonable-step

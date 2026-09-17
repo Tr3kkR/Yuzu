@@ -21,6 +21,19 @@ permissions:
   pull-requests: read
   actions: read
 
+# #4471 (adversarial-review CDX-4471-04 / kimi K5): no group means two
+# dispatches on the same quarantine ref (a re-approval before the first run
+# finished) can run concurrently, letting one run's post-gate purge race the
+# other run's still-in-flight gate. Consequence is bounded to residue in an
+# already-unreadable scope (the runbook already says "run them one at a
+# time"), not a trust-boundary crossing -- but serialising costs nothing and
+# removes the race outright. Keyed on pr_number only (not the sha suffix)
+# so a same-PR re-approval on a differently-suffixed branch still queues
+# behind the one already running. Mirrors fork-dynamic-review.yml's group.
+concurrency:
+  group: trusted-fork-ci-${{ inputs.pr_number }}
+  cancel-in-progress: false
+
 jobs:
   # Quarantine-ref contract (#4471): this workflow may only be dispatched on a
   # throwaway per-PR `trusted-fork/pr-<N>[-<sha>]` branch, because the dispatch

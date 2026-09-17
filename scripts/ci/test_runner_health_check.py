@@ -455,7 +455,14 @@ class WorkflowWiringTests(unittest.TestCase):
             r"refs/pull/|github\.event\.pull_request\.head|inputs\.|needs\.[A-Za-z0-9_-]+\.outputs\."
         )
         offenders = []
-        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+        # GitHub loads BOTH extensions ("must have either a .yml or .yaml file
+        # extension" — Workflow syntax docs); adversarial-review (CDX-4471-02 /
+        # kimi P2) mutation-proved that globbing only *.yml lets an offending
+        # *.yaml workflow pass unseen. zizmor.yml's own grep already covers
+        # both (`--include='*.yml' --include='*.yaml'`) — match that pattern.
+        for path in sorted(
+            p for ext in ("*.yml", "*.yaml") for p in (ROOT / ".github" / "workflows").glob(ext)
+        ):
             text = path.read_text(encoding="utf-8")
             # A checkout step's `with:` block: the indented lines after the
             # `uses:` line (either `- uses:` or `- name:` + `uses:` form) up to
@@ -468,6 +475,19 @@ class WorkflowWiringTests(unittest.TestCase):
                 if ref and pr_derived.search(ref.group(1)) and path.name not in allowed:
                     offenders.append(f"{path.name}: ref: {ref.group(1).strip()}")
         self.assertEqual(offenders, [])
+
+    def test_fork_review_guard_precedes_checkout(self) -> None:
+        """#4471 (adversarial-review CDX-4471-03 / kimi K3): the extraction
+        test keys on step NAME only, so a future reorder that moves the
+        checkout above the quarantine-ref guard would keep every existing
+        assertion green while checking out unreviewed fork code first. Pin
+        the ORDER, not just the presence, of the two steps."""
+        review = self.job("fork-dynamic-review.yml", "linux")
+        validate_at = review.find("- name: Validate immutable inputs")
+        checkout_at = review.find("- name: Check out exact PR revision")
+        self.assertNotEqual(validate_at, -1)
+        self.assertNotEqual(checkout_at, -1)
+        self.assertLess(validate_at, checkout_at)
 
         # macOS deliberately keeps actions/checkout's default clean:true (a
         # fresh workspace every run is a *stronger* fork-isolation boundary; the

@@ -136,12 +136,20 @@ because any code executing in a run can write that run's scope, no in-workflow
 save gate could have closed this on its own (the canary's
 `trusted_execution != 'true'` gates are defence in depth behind it). The
 wrapper's final `purge-quarantine-cache` job then deletes every entry in that
-scope; deleting the branch does not — unread entries would otherwise linger for
-seven days. Cutting the branch from the PR's base also means the run uses that
+scope; `fork-dynamic-review.yml` carries an identical job that purges its own
+scope right after the hosted review finishes, so no window exists in which the
+review run's (at that point unapproved) writes are restorable by the gate's
+canary leg on the same ref. Deleting the branch does not purge caches by
+itself — unread entries would otherwise linger for seven days. Cutting the
+branch from the PR's base also means the run uses that
 base's `ci.yml` rather than `main`'s. Two operational consequences: trusted
-dispatches no longer share a concurrency group with each other, so two of them
-contend for the self-hosted pools; and the trusted canary reads only its own
-(empty) scope plus `main`, so it is a cold build. This deliberate approval
+dispatches for DIFFERENT PRs no longer share `ci.yml`'s own concurrency group
+(each resolves a distinct `github.ref`), so they run in parallel rather than
+queuing behind an unrelated PR's build — `trusted-fork-ci.yml`'s own
+`concurrency:` group still serialises two dispatches for the SAME PR, so a
+re-approval waits for the run already in flight rather than racing it; and the
+trusted canary reads only its own (empty) scope plus `main`, so it is a cold
+build. This deliberate approval
 therefore executes the full PR gate without turning a reviewed fork into a
 cache-publisher or exposing the administration-scoped PAT to fork-controlled
 code.
