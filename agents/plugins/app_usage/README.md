@@ -1,6 +1,15 @@
 # app_usage
 
 <!-- BEGIN GENERATED: plugin-doc-gen header -->
+| | |
+|---|---|
+| **What it does** | Read-only machine-scope app usage inventory derived from TAR's usage fold (no pid, command line, or user names in output) |
+| **Version** | 1.0.0 |
+| **Kind** | Collector · read-only · gathered (crossplatform.app_usage.summary, crossplatform.app_usage.last_used, crossplatform.app_usage.foreground) |
+| **Platforms** | Windows ✅ · macOS 🟡 constrained · Linux ✅ |
+| **Actions** | `foreground` (definition `crossplatform.app_usage.foreground`) · `last_used` (definition `crossplatform.app_usage.last_used`) · `summary` (definition `crossplatform.app_usage.summary`) |
+| **Security** | securable `Forensics` · operation Read · risk Medium · dispatch ReadOnly · approval gate AdminOrApproval |
+| **Roles** | execute: endpoint-admin, security-admin · author: content-author |
 <!-- END GENERATED -->
 
 ## How it works
@@ -22,6 +31,19 @@ flowchart LR
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
+| Action | Windows | macOS | Linux |
+|---|---|---|---|
+| `foreground` | 🟡 constrained · rung 1 · not captured | 🟡 constrained · rung 1 · not captured | 🟡 constrained · rung 1 · not captured |
+| `last_used` | ✅ supported · rung 1 · tar.db usage_daily (derived from TAR process/etw) | 🟡 constrained · rung 1 · tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll) | ✅ supported · rung 1 · tar.db usage_daily (derived from TAR process/procfs) |
+| `summary` | ✅ supported · rung 1 · tar.db usage_daily (derived from TAR process/etw) | 🟡 constrained · rung 1 · tar.db usage_daily (derived from TAR process/endpoint_security or sysctl poll) | ✅ supported · rung 1 · tar.db usage_daily (derived from TAR process/procfs) |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`foreground` / Windows** — foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change
+- **`foreground` / macOS** — foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change
+- **`foreground` / Linux** — foreground/focus time and per-session attribution are not captured; promoted by the user-context-bridge roadmap without a schema change
+- **`last_used` / macOS** — inherits the process source's names-only constraint; ES entitlement absent -> poll granularity
+- **`summary` / macOS** — inherits the process source's names-only constraint; ES entitlement absent -> poll granularity
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -39,6 +61,12 @@ No external binaries, no subprocesses, no network access — every branch is a `
 ### Inputs
 
 <!-- BEGIN GENERATED: plugin-doc-gen inputs -->
+| Definition | Parameter | Type | Required | Default | Constraints | Description |
+|---|---|---|---|---|---|---|
+| `crossplatform.app_usage.last_used` | `exe` | string | no | - | - | Optional executable name (or path — only the basename is used) to narrow the result to. Omit to return every executable TAR has recorded within its retained usage window. |
+| `crossplatform.app_usage.summary` | `days` | int32 | no | 30 | - | Number of trailing days to summarise. Clamped to 1-365. |
+| `crossplatform.app_usage.summary` | `top` | int32 | no | 25 | - | Maximum number of executables to return. Clamped to 1-500. |
+| `crossplatform.app_usage.summary` | `by` | string | no | run_time | - | Ranking metric: "run_time" (total_seconds, default) or "run_count". Any other value is rejected with error\|bad_param\|by. |
 <!-- END GENERATED -->
 
 ### Outputs
@@ -46,6 +74,36 @@ No external binaries, no subprocesses, no network access — every branch is a `
 Pipe-delimited rows via `write_output()`. `summary` emits exactly one `meta` row (fold health counters) followed by zero or more `usage` rows, most-active-first. `last_used` emits zero or more `last_used` rows, one per executable, ordered by `exe_key`. Every action's failure path instead emits a single row in the shared `<class>|<reason>[|<detail>]` shape (`constrained|...`, `unavailable|...`, `error|...`) — described row-by-row in Result status below — never mixed with a `meta`/`usage`/`last_used` row in the same call.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
+**`crossplatform.app_usage.foreground` — `status|reason|detail`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `status` | string | - | Windows, Linux, macOS | `constrained` | Always "constrained" — this action never returns a success row. Values: constrained. |
+| `reason` | string | - | Windows, Linux, macOS | `foreground_not_captured` | Always "foreground_not_captured". Values: foreground_not_captured. |
+| `detail` | string | - | Windows, Linux, macOS | `user-context-bridge roadmap (session-scope attribution)` | Free-text pointer to the roadmap item that will fill this action in. Values: human-readable text. |
+
+**`crossplatform.app_usage.last_used` — `exe_key|last_seen|first_seen|run_count_30d|total_seconds_30d`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `exe_key` | string | - | Windows, Linux, macOS | `chrome.exe` | Lowercased basename of the executable (P5-escaped, same rule as summary's exe_key column). Never a full path, pid, or command line. |
+| `last_seen` | int64 | - | Windows, Linux, macOS | `1717286400` | Unix timestamp of the most recent run within TAR's retained usage window. Values: unix seconds. |
+| `first_seen` | int64 | - | Windows, Linux, macOS | `1717200000` | Unix timestamp of the earliest run within TAR's retained usage window. Values: unix seconds. |
+| `run_count_30d` | int64 | - | Windows, Linux, macOS | `8` | Number of runs recorded in the trailing 30 days. Values: non-negative integer. |
+| `total_seconds_30d` | int64 | - | Windows, Linux, macOS | `28800` | Total wall-clock seconds observed running in the trailing 30 days. Values: non-negative integer. |
+
+**`crossplatform.app_usage.summary` — `exe_key|run_count|total_seconds|first_seen|last_seen|distinct_users|superseded_runs|expired_runs`**
+
+| Field | Type | Values | Available | Example | Description |
+|---|---|---|---|---|---|
+| `exe_key` | string | - | Windows, Linux, macOS | `chrome.exe` | Lowercased basename of the executable (P5-escaped: a literal "\|" becomes "\\|", CR/LF fold to a space, "\" folds to "/"). Never a full path, pid, or command line. |
+| `run_count` | int64 | - | Windows, Linux, macOS | `12` | Number of runs recorded for this executable within the window. Values: non-negative integer. |
+| `total_seconds` | int64 | - | Windows, Linux, macOS | `43200` | Total wall-clock seconds this executable was observed running within the window. Values: non-negative integer. |
+| `first_seen` | int64 | - | Windows, Linux, macOS | `1717200000` | Unix timestamp of the earliest run within TAR's retained usage window (not every run ever recorded — rows older than TAR's retention are already gone). Values: unix seconds. |
+| `last_seen` | int64 | - | Windows, Linux, macOS | `1717286400` | Unix timestamp of the most recent run within TAR's retained usage window. Values: unix seconds. |
+| `distinct_users` | int64 | - | Windows, Linux, macOS | `2` | COUNT(DISTINCT user) over the window — a count only; no user name ever leaves the agent's SQLite database. Values: non-negative integer. |
+| `superseded_runs` | int64 | - | Windows, Linux, macOS | `0` | Runs whose stop event was superseded by a newer start for the same pid before a clean stop was observed. Values: non-negative integer. |
+| `expired_runs` | int64 | - | Windows, Linux, macOS | `1` | Runs closed by the fold's own timeout rather than an observed stop event. Values: non-negative integer. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -72,6 +130,59 @@ Pipe-delimited rows via `write_output()`. `summary` emits exactly one `meta` row
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-09-15 · interactive user (elevated) · leg-hash pending
+
+```
+== action=summary
+constrained|tar_db_unavailable|C:\ProgramData\yuzu\agent\tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=last_used
+constrained|tar_db_unavailable|C:\ProgramData\yuzu\agent\tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=foreground
+constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)
+[result_status] CONSTRAINED / PARTIAL / foreground/focus attribution not captured by this source
+```
+
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 21254047acbd
+
+```
+== action=summary
+constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=last_used
+constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=foreground
+constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)
+[result_status] CONSTRAINED / PARTIAL / foreground/focus attribution not captured by this source
+```
+
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-15 · euid 0 · leg-hash pending
+
+```
+== action=summary
+constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=last_used
+constrained|tar_db_unavailable|/var/lib/yuzu/agent/tar.db|unable to open database file
+[result_status] UNAVAILABLE / PARTIAL / unable to open database file
+[rc] 1
+
+== action=foreground
+constrained|foreground_not_captured|user-context-bridge roadmap (session-scope attribution)
+[result_status] CONSTRAINED / PARTIAL / foreground/focus attribution not captured by this source
+```
 <!-- END GENERATED -->
 
 ## Caveats and known gaps
@@ -85,4 +196,9 @@ Pipe-delimited rows via `write_output()`. `summary` emits exactly one `meta` row
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
+- Plugin: `agents/plugins/app_usage/src/app_usage_parsers.hpp` · `agents/plugins/app_usage/src/app_usage_plugin.cpp`
+- Definitions: `content/definitions/app_usage.yaml`
+- Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp`
+- Tests: `tests/unit/server/test_app_usage_ingestion.cpp` · `tests/unit/server/test_app_usage_routes.cpp` · `tests/unit/server/test_app_usage_store.cpp` · `tests/unit/test_app_usage_local_dispatcher.cpp` · `tests/unit/test_app_usage_parsers.cpp`
+- Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->
