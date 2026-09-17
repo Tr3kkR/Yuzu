@@ -2862,7 +2862,8 @@ TEST_CASE("#3816: begin_stop() followed by a late successful arm disarms the exa
 // HIGH, plus C5/k3 (untested detach-during-in-flight-arm withdrawal path). ──
 
 TEST_CASE("#3816 (was C1/c1): a timeout followed by a LATE successful arm "
-          "is disarmed by GuardianIoExecutor's own on_abandoned, not leaked",
+          "is ADOPTED (rung 9c PR-5d: nobody withdrew \"r1\" - #3816's own exactly-"
+          "once/never-leaked invariant is preserved by adoption, not only by disarm)",
           "[spark][runtime][liveness]") {
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
@@ -2890,28 +2891,24 @@ TEST_CASE("#3816 (was C1/c1): a timeout followed by a LATE successful arm "
     CHECK(rt->backend_op_late_arms() == 0);
 
     b->release_hang(); // let the parked arm() finally return - successfully, LATE
-    // #3816: GuardianIoExecutor itself decides this arm arrived after its own
-    // caller gave up and routes it to attach_rule's on_abandoned callback, which
-    // disarms it - not a self-check racing arming_keys_'s erase any more.
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    // rung 9c PR-5d: nobody withdrew "r1" while it was wedged - #3816's exactly-
+    // once/never-leaked contract is satisfied by ADOPTION here, not disarm: the
+    // subscription is real, tracked, and enforcing, not torn down and reminted on
+    // a future retry.
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
     CHECK(b->arms.load() == 1);
-    CHECK(b->disarms.load() == 1);
-    // Exact-id check, not just balanced counts (#3816): the id disarmed must be
-    // the SAME id this arm() call minted, never merely "some id".
-    CHECK(b->armed_ids() == b->disarmed_ids());
-    CHECK(rt->backend_op_late_arms() == 1);
-    // No trace of a live watcher anywhere in the runtime's own bookkeeping - the
-    // subscription was real (arms==1) but is now fully reclaimed (disarms==1),
-    // not silently untracked.
-    CHECK(rt->armed_key_count() == 0);
-    CHECK(rt->rule_count() == 0);
-    CHECK(drain_lifecycle(*rt).empty()); // no phantom "armed" for a rule never committed
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->backend_op_late_arms() == 0); // this counter is the disarm-path's own signal
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(drain_lifecycle(*rt).size() == 1); // exactly one "armed" audit entry, not zero
 
-    // Runtime is still healthy afterward: a fresh attach on the SAME key arms cleanly.
+    // Runtime is still healthy: a fresh attach for a DIFFERENT rule on the SAME
+    // key joins the already-adopted watcher (no new backend arm needed).
     REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
     CHECK(rt->armed_key_count() == 1);
-    CHECK(b->arms.load() == 2);
+    CHECK(rt->rule_count() == 2);
+    CHECK(b->arms.load() == 1); // r2 joined the existing watcher - no second arm() call
 }
 
 TEST_CASE("#3816: a timeout followed by a LATE FAILED arm is not counted as a late "
@@ -3011,28 +3008,29 @@ TEST_CASE("#2233 item 3 (security-guardian F2 / cpp-safety HIGH): a same-rule_id
     CHECK(rt->armed_key_count() == 0);
 
     // Release the original hang - whichever episode's worker was actually parked
-    // resolves now. Regardless of exactly how the two episodes interleaved above,
-    // the runtime's own bookkeeping must end up CONSISTENT: no rule ever commits as
-    // armed (both episodes ended in error), and the real backend subscription that
-    // arm() mints is eventually disarmed - never left live and untracked.
+    // resolves now. rung 9c PR-5d: neither episode ever withdrew "r1" - the real
+    // backend subscription that arm() mints is ADOPTED (still desired), never
+    // disarmed, and the runtime's own bookkeeping ends up consistent with exactly
+    // one live rule, one arm, zero disarms.
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return b->arms.load() >= 1; }, std::chrono::seconds(10)));
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() >= b->arms.load(); },
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
     REQUIRE(yuzu::test::spin_until(
         [&] { return rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0; },
         std::chrono::seconds(10)));
     CHECK(b->arms.load() == 1);              // exactly one backend arm across both episodes
-    CHECK(rt->backend_op_late_arms() == 1);  // its late success was disarmed, once
-    CHECK(rt->rule_count() == 0);
-    CHECK(rt->armed_key_count() == 0);
-    CHECK(drain_lifecycle(*rt).empty()); // neither episode ever produced a phantom "armed"
-
-    // Runtime is still healthy: a genuinely fresh retry (well after both prior
-    // episodes settled) arms cleanly.
-    REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+    CHECK(b->disarms.load() == 0);           // adopted, not disarmed
+    CHECK(rt->backend_op_late_arms() == 0);
     CHECK(rt->armed_key_count() == 1);
-    CHECK(rt->rule_count() == 1);
+    CHECK(drain_lifecycle(*rt).size() == 1); // one "armed" audit entry for the adopted rule
+
+    // Runtime is still healthy: a fresh, DIFFERENT rule_id attaching onto the SAME
+    // now-adopted key joins the existing watcher rather than minting a second arm.
+    REQUIRE(rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true));
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 2);
+    CHECK(b->arms.load() == 1);
 }
 
 TEST_CASE("#2233 item 3 (C2/c2): the post-arm commit rollback's disarm runs "
@@ -6726,8 +6724,9 @@ TEST_CASE("rung 9c PR-5a (#4221 cs-103/ch-103): a throwing LAST detach inside a 
 // it had an outcome, not popped because nothing did), and every later same-key attach
 // queued behind it and timed out.
 TEST_CASE("rung 9c R5.2 (governance pass-3 sg-3/ar-4/cs-5): a publish that throws after the "
-          "verdicts are written pops the terminal head instead of leaving a Dispatched "
-          "tombstone - the next same-key attach arms",
+          "verdicts are written still pops the terminal head instead of leaving a Dispatched "
+          "tombstone - the next same-key attach arms (rung 9c PR-5d: this claim is now "
+          "adopted, not disarmed, but the double-fault recovery shape is identical)",
           "[spark][runtime][liveness]") {
     // Mutation: step (3)'s catch keeps the old "re-Queue only if !outcome" shape ->
     // claim depth stays 1 forever and r2's attach returns "arm timed out".
@@ -6747,19 +6746,30 @@ TEST_CASE("rung 9c R5.2 (governance pass-3 sg-3/ar-4/cs-5): a publish that throw
     CHECK(gen.error() == "arm timed out"); // waiter abandoned; the worker is still parked
 
     rt->set_drain_fault_point_for_test(3);
-    b->release_hang(); // late success -> nobody adopts -> compensating disarm -> deferred publish
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    // rung 9c PR-5d: "r1" was never withdrawn, so the late success is ADOPTED - the
+    // adoption's own commit (rules_/keys_/index_) already succeeded BEFORE this
+    // fault point fires (it lives inside publish_arm_verdicts_locked, called AFTER
+    // the commit); the fault only interrupts the immediate publish attempt, and
+    // the `if (!published)` recovery path's own firewalled re-publish sweeps the
+    // now-purely-bookkeeping claim out of the fifo (its index_held is already
+    // false - ownership passed to rules_/keys_ - so the firewall's own
+    // erase_if(!index_held) condition removes it, same mechanism the pre-PR-5d
+    // "hand back to Queued" recovery used for a claim WITHOUT an outcome yet;
+    // this claim already has one from its original abandonment).
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
     REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
                                    std::chrono::seconds(10)));
     CHECK(rt->claim_drain_failures() >= 1); // the catch fired (seam) and was contained
-    CHECK(b->armed_ids() == b->disarmed_ids());
-
-    b->reset_hang();
-    auto gen2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
-    REQUIRE(gen2); // not queued behind a tombstone nothing pops
+    CHECK(b->disarms.load() == 0); // adopted, not disarmed
     CHECK(rt->armed_key_count() == 1);
-    CHECK(b->arms.load() == 2);
+
+    auto gen2 = rt->attach_rule("r2", file_spec("/a"), file_exists_rule("r2"), true);
+    REQUIRE(gen2); // not queued behind a tombstone, nothing pops - joins the adopted watcher
+    CHECK(rt->armed_key_count() == 1);
+    CHECK(rt->rule_count() == 2);
+    CHECK(b->arms.load() == 1); // r1's adopted arm only - r2 joined it, no second arm() call
     CHECK(rt->claim_queue_depth_for_test(key) == 0);
 }
 
@@ -7000,10 +7010,18 @@ TEST_CASE("attach_rule(NonWaiting, ...): a same-key call queued behind an "
     CHECK(b->arms.load() == 1);         // exactly one real backend arm - r2 joined it
 }
 
-TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue arm "
-          "with nobody blocked in wait_for_claim() to notice, and the compensating "
-          "disarm still runs once the late success arrives",
+TEST_CASE("expire_overdue_claims(): a non-waiting claim's own overdue arm, with "
+          "nobody blocked in wait_for_claim() to notice, is ADOPTED once the late "
+          "success arrives - ruling 14(b): apply by current desired state, and "
+          "nobody withdrew this rule while it was wedged",
           "[spark][runtime][liveness]") {
+    // rung 9c PR-5d: this narrows #3816's cleanup policy for asynchronous desired-
+    // state ownership, it does not reverse it - exactly-once result delivery and
+    // continuous subscription ownership stay intact (the claim is still adopted or
+    // disarmed exactly once, never twice, never leaked). What changes is that a
+    // late success's disposition is now conditional on current desired state
+    // instead of unconditional: this is the STEADY-STATE case (nobody withdrew
+    // "r1"), covered by the withdrawn-regression-guard test right below this one.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     b->hang_next_arm.store(true);
@@ -7014,7 +7032,7 @@ TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue a
                                file_exists_rule("r1"), true);
     struct Cleanup {
         FakeBackend* backend;
-        ~Cleanup() { backend->release_hang(); }
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
     } cleanup{b.get()};
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
     REQUIRE(res.has_value());
@@ -7035,12 +7053,56 @@ TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue a
     // the enum split now names Wedged rather than the pre-split Expired.
     CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK(rt->backend_op_timeouts() == 1);
-    CHECK(rt->rule_count() == 0); // never committed - the expiry beat the late success
+    CHECK(rt->rule_count() == 0); // never committed yet - the expiry beat the arm
 
-    // The worker is still parked; releasing it now delivers a "late success" nobody
-    // wants (waiter_abandoned was set by abandon_claim_locked above) - it must be
-    // compensated (disarmed), not leaked, and the receipt's own Wedged status must
-    // not flip back to Committed once that late success lands.
+    // The worker is still parked; releasing it now delivers a late success for a
+    // rule NOBODY has withdrawn - rung 9c PR-5d adopts it: one watcher, live and
+    // enforcing, zero compensating disarms. The receipt's own Wedged status is a
+    // historical fact about THIS episode's timeout and must not flip to Committed -
+    // sticky-Wedged is untouched by adoption (assert this explicitly, per the
+    // umbrella kickoff's own test requirement).
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0); // adopted, never compensated
+    CHECK(rt->backend_op_late_arms() == 0); // this counter is the disarm-path's own signal
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->armed_key_count() == 1);
+    const auto status = rt->status_for_rule("r1");
+    REQUIRE(status.has_value());
+}
+
+TEST_CASE("expire_overdue_claims(): a non-waiting claim's own overdue arm is "
+          "disarmed, not adopted, when the rule was WITHDRAWN while wedged - "
+          "regression guard for the pre-PR-5d default behaviour",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                               file_exists_rule("r1"), true);
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res.has_value());
+    REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // The operator no longer wants "r1" - detach_rule_locked()'s new wedge lookup
+    // (rung 9c PR-5d) deactivates this claim's RuleGeneration even though it is
+    // unreachable through claims_/rules_/index_ the ordinary way.
+    rt->detach_rule("r1");
+
+    // The worker is still parked; releasing it now delivers a late success for a
+    // rule that IS no longer wanted - disarmed, exactly like the pre-PR-5d default.
     b->release_hang();
     REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
                                    std::chrono::seconds(10)));
@@ -7048,6 +7110,89 @@ TEST_CASE("expire_overdue_claims(): abandons a non-waiting claim's own overdue a
     CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
     CHECK(rt->rule_count() == 0);
     CHECK(rt->armed_key_count() == 0);
+}
+
+TEST_CASE("expire_overdue_claims(): a late FAILURE on a still-desired wedged rule "
+          "stays failed - no adoption, nothing to disarm, nothing newly armed",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    auto res = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                               file_exists_rule("r1"), true);
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res.has_value());
+    REQUIRE(res->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // Nobody withdrew "r1" (still desired), but the backend's own late answer is a
+    // FAILURE, not a success - row 4 of the late-result matrix: stays failed, no
+    // new behaviour. `armed_live` is false in on_arm_complete, so the adoption
+    // branch (which requires a live subscription to commit) never engages at all.
+    b->fail_arm.store(true);
+    b->release_hang();
+    // Nothing to spin on but the claim's own eventual resolution - the claim was
+    // already terminal (Wedged) before the late failure landed, so its own status
+    // cannot change further; spin on the backend having actually been entered a
+    // second time (there is only one arm() call total here, already counted) is
+    // moot. A short bounded wait for arm_entries staying 1 and rule_count staying 0
+    // is the only observable signal a genuinely async failure gives this test.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    CHECK(rt->receipt_status(res->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->rule_count() == 0);
+    CHECK(rt->armed_key_count() == 0);
+    CHECK(b->disarms.load() == 0); // nothing was ever armed - nothing to disarm
+}
+
+TEST_CASE("rung 9c PR-5d: a Reobserved retry's own late success is adopted too - "
+          "both the original and the reobserved receipt see the same Wedged "
+          "status, and both agree the rule is now live",
+          "[spark][runtime][liveness]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    auto res1 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    REQUIRE(res1.has_value());
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+
+    // An identical (rule_id, spec) retry re-observes the same wedged head instead
+    // of queuing a new claim (rung 9c PR-5c up-2) - the SAME underlying KeyClaim,
+    // confirmed by pointer identity below.
+    auto res2 = rt->attach_rule(GuardianSparkRuntime::NonWaiting{}, "r1", file_spec("/a"),
+                                file_exists_rule("r1"), true);
+    REQUIRE(res2.has_value());
+    REQUIRE(res2->kind == GuardianSparkRuntime::ArmOutcomeKind::Accepted);
+    CHECK(rt->wedged_reobservations() == 1);
+    CHECK(res2->receipt.claim == res1->receipt.claim);
+
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
+                                   std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0);
+    CHECK(rt->receipt_status(res1->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK(rt->armed_key_count() == 1);
 }
 
 // ── rung 9c PR-2, Unit 4 (compensation continuation, Astra opine review 2026-09-12)
@@ -8406,9 +8551,13 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): a genuinely new claimant (different rule_
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 1); // no new claim queued
     CHECK(rt->rule_count() == 0);
 
+    // rung 9c PR-5d: "r1" itself was never withdrawn - r2's refusal touches
+    // nothing about it (the hoisted pre-check returns before detach_rule_locked
+    // even runs) - so r1's own late success is adopted, not disarmed.
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0);
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a refused new claimant does not disturb an "
@@ -8513,9 +8662,11 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2), crash-regression: the BLOCKING attach_rul
     CHECK(rt->wedged_reobservations() == 1);
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 1);
 
+    // rung 9c PR-5d: nobody withdrew "r1" - the late success is adopted.
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0);
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2): repeated identical retries onto a Wedged key "
@@ -8549,18 +8700,23 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): repeated identical retries onto a Wedged 
         CHECK(b->arm_entries.load() == 1);     // never a second backend arm
     }
 
+    // rung 9c PR-5d: "r1" was never withdrawn across any of the 5 retries - its
+    // late success is adopted, not disarmed.
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0);
     CHECK(rt->claim_queue_depth_for_test(spark_key(file_spec("/a"))) == 0);
 
     // Adversarial-review finding (2026-09-15): same ghost-mapping regression test as
     // the coupling-proof case above - repeated re-observation must leave nothing
-    // behind that blocks a genuinely fresh arm on the same key afterward.
+    // behind that blocks a genuinely fresh arm on the same key afterward. Under
+    // PR-5d "r1" is now adopted and already owns this key's watcher, so a
+    // DIFFERENT rule_id on the SAME key joins it rather than minting a second arm.
     const auto res_fresh = rt->attach_rule("r-fresh", file_spec("/a"), file_exists_rule("r-fresh"), true);
     REQUIRE(res_fresh.has_value());
-    CHECK(rt->rule_count() == 1);
-    CHECK(b->arm_entries.load() == 2); // the original arm, plus this genuinely new one
+    CHECK(rt->rule_count() == 2);
+    CHECK(b->arm_entries.load() == 1); // r1's original arm only - r-fresh joined it
 }
 
 TEST_CASE("rung 9c PR-5c (#4221 up-2): a changed spec on the SAME rule_id targets a "
@@ -8674,9 +8830,14 @@ TEST_CASE("rung 9c PR-5c (#4221 up-2): re-observation still works when the "
     CHECK(rt->wedged_reobservations() == 1); // classified correctly despite index_held
     CHECK(rt->wedged_refusals() == 0);
 
+    // rung 9c PR-5d: "r1" was never withdrawn - adopted, not disarmed, despite the
+    // stuck index_held from the fault seam above (index_->add()'s own idempotent
+    // no-op for an identical (key, rule_id, generation) makes this safe - see
+    // on_arm_complete's adoption branch).
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 1; },
                                    std::chrono::seconds(10)));
+    CHECK(b->disarms.load() == 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8744,14 +8905,15 @@ TEST_CASE("governance UP-1 (#4221 rung 9c PR-5c follow-up): retargeting a rule o
     CHECK(rt->armed_key_count() == 1);
     CHECK(b->disarms.load() == 0); // K1's subscription was never torn down
 
-    // R2's own hung, wedged claim still recovers normally once released - its
-    // late arm is self-disarmed (nobody adopted it), and that is the ONLY
-    // disarm this whole scenario ever produces.
+    // R2's own hung, wedged claim still recovers normally once released - rung 9c
+    // PR-5d: R2 was never withdrawn either (R's refusal never touched it - the
+    // hoisted different-rule_id check returns before any detach runs), so its late
+    // success is ADOPTED, joining R's own live arm as a second, independent rule.
     b->release_hang();
-    REQUIRE(yuzu::test::spin_until([&] { return b->disarms.load() == 1; },
+    REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 2; },
                                    std::chrono::seconds(10)));
-    CHECK(rt->rule_count() == 1); // still just R, on K1, throughout
-    CHECK(rt->armed_key_count() == 1);
+    CHECK(b->disarms.load() == 0); // neither R's nor R2's subscription was ever torn down
+    CHECK(rt->armed_key_count() == 2); // K1 (R) and K2 (R2), both live
 }
 
 TEST_CASE("up-4 (#4221): a Queued, withdrawn head with no outcome (a double-fault residue) "
