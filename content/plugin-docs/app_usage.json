@@ -503,7 +503,7 @@
       "completeness": "partial",
       "provenance": "`last_used_truncated`",
       "status": "`CONSTRAINED`",
-      "when": "`last_used`, unfiltered form only: the result hit `kMaxLastUsedRows` (5000) distinct executables and was cut off there — a trailing row, not a replacement for the real `last_used` rows already emitted. Bounds an unprivileged-local-user resource-exhaustion path against the LocalSystem/root agent process."
+      "when": "`last_used`, unfiltered form only: the result hit `kMaxLastUsedRows` (5000) distinct executables and was cut off there — a trailing row, not a replacement for the real `last_used` rows already emitted. Bounds the C++-side result-set size (row count returned to the caller, and the SQL `LIMIT` itself) against an unprivileged local user minting unboundedly many exe_keys — it does **not** bound the underlying query's own scan/sort cost against the same growth (`EXPLAIN QUERY PLAN` still shows a full scan+group before `LIMIT` trims the output; round-3 review CDX-R2-04/K6), which is a separate, still-open concern."
     },
     {
       "completeness": "partial",
