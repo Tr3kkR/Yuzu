@@ -275,8 +275,7 @@ public:
     /// open, no connection lease was available, the row is gone (deleted
     /// concurrently), or the payload was never actually poisoned (the no-op
     /// case) -- a caller needing to distinguish a genuine write failure from
-    /// a harmless no-op cannot do so from the return value alone (tracked as
-    /// a should-fix, #4493 governance re-review).
+    /// a harmless no-op cannot do so from the return value alone (#4524).
     ///
     /// Deliberately has NO owner check of its own -- same shape as
     /// `mark_failed`. Both of this method's only two production callers
