@@ -27,6 +27,7 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "command_capability.hpp"
@@ -132,6 +133,7 @@ struct LabeledSpan {
         {"filesystem_posture", capdecls::plugin_action_catalogue_filesystem_posture(), false},
         {"power_health", capdecls::plugin_action_catalogue_power_health(), false},
         {"autoruns", capdecls::plugin_action_catalogue_autoruns(), false},
+        {"execution_artifacts", capdecls::plugin_action_catalogue_execution_artifacts(), false},
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
         {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
@@ -153,6 +155,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_autoruns(),
+        capdecls::plugin_action_catalogue_execution_artifacts(),
         capdecls::plugin_action_catalogue_windows_optional_features(),
         capdecls::plugin_action_catalogue_peripherals(),
         capdecls::core_dispatch_capabilities(),

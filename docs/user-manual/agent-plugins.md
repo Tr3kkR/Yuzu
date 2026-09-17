@@ -27,6 +27,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 | `disk_space` | ✅ ✅ ✅ | Reports free / total disk space for a single volume | [README](../../agents/plugins/disk_space/README.md) |
 | `event_logs` | ✅ ✅ ✅ | Queries system event logs for errors and filtered events | [README](../../agents/plugins/event_logs/README.md) |
 | `example` | ✅ ✅ ✅ | Reference example plugin — responds to 'ping' | [README](../../agents/plugins/example/README.md) |
+| `execution_artifacts` | ✅ ⛔ ⛔ | Windows execution-evidence sources: ShimCache, Amcache InventoryApplicationFile, and Prefetch. Forensics-gated, single-target, default-off | [README](../../agents/plugins/execution_artifacts/README.md) |
 | `filesystem` | ✅ ✅ ✅ | Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only) | [README](../../agents/plugins/filesystem/README.md) |
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
 | `firewall` | ✅ ✅ ✅ | Firewall status and rule listing | [README](../../agents/plugins/firewall/README.md) |

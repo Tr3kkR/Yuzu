@@ -203,6 +203,18 @@ public:
     /// leaving each dispatch call site to remember it).
     [[nodiscard]] bool action_allowed(std::string_view plugin, std::string_view action) const;
 
+    /// Wave 7: idempotent boot-time seed for a plugin that ships
+    /// default-off (e.g. `execution_artifacts`, the forensics class). Writes
+    /// a PLUGIN-LEVEL row (`action` = "") with `enabled=false`,
+    /// `set_by="system"` — `ON CONFLICT (scope_key) DO NOTHING`, so this
+    /// NEVER clobbers an operator's own `set_kill_switch` decision, on this
+    /// call or a later restart. Returns `false` only on a genuine write
+    /// failure (closed store, invalid plugin/reason, or the INSERT itself
+    /// failing) — a conflict (row already exists, whichever value it holds)
+    /// is success, not a distinct case the caller needs to branch on.
+    [[nodiscard]] bool seed_kill_switch_default_off(std::string_view plugin,
+                                                     std::string_view reason);
+
 private:
     pg::PgPool& pool_;
     pg::SecretCodec& secret_codec_;
