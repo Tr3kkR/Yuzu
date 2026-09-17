@@ -114,6 +114,20 @@ namespace {
     }
     return "arm failed";
 }
+
+/// up-3 (#4221): a runtime-level refusal, not an IoFailure - the compensating-
+/// disarm reservation pool (compensation_reserved_count_) is exhausted for this
+/// claim's IoClass. Deliberately NOT a case in arm_failure_reason's switch above:
+/// that map is exhaustively keyed on IoFailure (governance consistency c-1) and
+/// this refusal happens BEFORE io_executor_ is ever consulted. Named here so both
+/// call sites that report it route through the same string, not an ad-hoc literal.
+constexpr const char* kCompensationReservationExhausted =
+    "compensating-disarm reservation exhausted";
+/// up-2 (#4221, rung 9c PR-5c): a genuinely new claimant (different rule_id) tried
+/// to attach onto a key whose head is Wedged - refused immediately rather than
+/// queued, matching kCompensationReservationExhausted's own "one named constant,
+/// not an ad-hoc literal at the call site" pattern.
+constexpr const char* kSparkKeyWedged = "spark key wedged";
 } // namespace
 
 std::function<void(const SparkEvent&)>
@@ -147,9 +161,17 @@ bool GuardianSparkRuntime::release_claim_index_locked(KeyClaim& claim) noexcept 
     // `false`, and index_held stays true so the next release retries.
     try {
         index_remove_fault_here_for_test(); // seam: "the index removal threw"
-        index_->erase_rule(claim.rule_id);  // noexcept; idempotent; guarded by index_held
-                                            // so a stale claim never removes a
-                                            // replacement's mapping
+        // rung 9c PR-5a (#4221 up-101): pass claim.generation, not just claim.rule_id.
+        // `index_held` alone does NOT stop a stale, retried release from clobbering a
+        // replacement's mapping - it only stops THIS claim object calling erase twice.
+        // A DIFFERENT, older claim's legitimately-retried release (fail_all_claims_locked's
+        // "the next same-key event... retries the release" case) can fire after a
+        // same-rule re-attach has already installed a new mapping for this rule_id; the
+        // generation check inside erase_rule() is what makes that a safe no-op instead of
+        // an erroneous erase of the newer owner's entry. (An earlier version of this
+        // comment claimed index_held alone was sufficient - it was not; see the header
+        // doc comment on SparkKeyRuleIndex::erase_rule.)
+        index_->erase_rule(claim.rule_id, claim.generation); // noexcept; idempotent
     } catch (...) {
         claim_index_release_failures_.fetch_add(1, std::memory_order_relaxed);
         return false;
@@ -197,6 +219,28 @@ void GuardianSparkRuntime::fail_all_claims_locked(const std::string& key, const 
     auto& fifo = eit->second.fifo;
     bool all_released = true;
     for (auto& c : fifo) {
+        // up-5: a Disarm claim reached here (this function's only Disarm-relevant
+        // caller: submit_disarm_off_lock's Stopped branch) never holds index_held
+        // (release_claim_index_locked's own no-op check makes its release trivially
+        // succeed), so it is unconditionally dropped by this function either via
+        // the all_released erase below or the erase_if filter - a genuine terminal
+        // removal either way. Harmless no-op for every Arm claim.
+        clear_retained_locked(*c);
+        // consistency-auditor Gate 4 finding (this governance run, C-1): this
+        // function gained a second caller (dispatch_arm_off_lock's reservation-
+        // exhaustion path, up-3) that CAN reach an Arm claim holding a
+        // compensation_permit. Today that specific caller only ever fires before
+        // its own head's reservation succeeds, and a Disarm-only fifo can never
+        // hold a live Arm claim (detach_rule_locked's own invariant) - so this was
+        // provably a no-op on every reachable path even before this call was added.
+        // Added anyway, matching clear_retained_locked's own defensive placement
+        // one line above: release_compensation_locked() is idempotent (a no-op if
+        // `c` never held a permit), and calling it here means a FUTURE caller or a
+        // future up-3 change that violates either invariant above releases the
+        // slot immediately rather than only when `c`'s shared_ptr eventually goes
+        // out of scope via the RAII backstop (still correct either way, but this is
+        // more predictable and directly testable).
+        release_compensation_locked(*c);
         // noexcept; a failure (test seam / defence in depth - erase_rule cannot throw)
         // is counted and the claim keeps its index ownership for a retry.
         if (!release_claim_index_locked(*c)) {
@@ -259,6 +303,26 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutQueued;
     } else {
         claim->waiter_abandoned = true; // the completion callback finishes this episode
+        // cpp-safety SHOULD (#4221, rung 9c PR-5c follow-up governance): when
+        // `stopping` is true this writes ClaimEnd::Stopped DIRECTLY, bypassing
+        // the WaiterTimedOutDispatched staging value that
+        // reclassify_dispatching_race_locked()'s guard keys on. A stopping
+        // runtime's own admission attempt also reports IoFailure::Stopped (see
+        // dispatch_arm_off_lock's `real_end` computation), so this converges to
+        // the same real-world value as the guard's own correction would have
+        // produced - but that convergence is untested as an explicit
+        // interleaving (a caller-side timeout landing here with `stopping`
+        // already true, racing dispatch_arm_off_lock's own re-lock, is a
+        // distinct 3-way race from the two Dispatching-window race tests this
+        // PR already carries - see "the Dispatching-window race, Stopped
+        // variant" in test_guardian_spark_runtime.cpp, which instead drives
+        // WaiterTimedOutDispatched via expire_overdue_claims() and only THEN
+        // calls begin_stop(), exercising the guard's correction path, not this
+        // direct-write path). Flagging rather than adding a test: constructing
+        // this exact interleaving deterministically needs a caller-side
+        // wait_for_claim() timeout to land here with `stopping_` already true,
+        // which existing seams (dispatch_entry_hook_for_test_, hang_next_arm)
+        // don't currently give direct control over.
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutDispatched;
     }
     if (!claim->outcome)
@@ -365,7 +429,7 @@ void GuardianSparkRuntime::submit_disarm_off_lock(const std::shared_ptr<KeyClaim
             // redrive_retained_disarms() below, bounded and on demand.
             claim->dispatch = ClaimDispatch::Queued;
             ++claim->admission_rejections;
-            disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+            mark_retained_locked(*claim);
         }
     }
     claim_cv_.notify_all();
@@ -406,9 +470,13 @@ void GuardianSparkRuntime::on_disarm_complete(const std::string& key,
             }
             claim->dispatch = ClaimDispatch::Queued;
             ++claim->admission_rejections;
-            disarm_retained_.fetch_add(1, std::memory_order_relaxed);
+            mark_retained_locked(*claim);
             return;
         }
+        clear_retained_locked(*claim); // up-5: a retained claim's own successful
+                                       // completion is exactly the moment it stops
+                                       // being "currently retained" - see disarm_
+                                       // retained()'s doc comment.
         claim->end = ClaimEnd::DisarmDone;
         claim->outcome = 0;
         fifo.pop_front();
@@ -476,6 +544,65 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
             claim->dispatch = ClaimDispatch::Queued;
         return;
     }
+    // rung 9c PR-5c (#4221) test seam: default-empty, one-shot, fired here at entry -
+    // before this function takes registry_mu_ at all, so a hook body is free to call
+    // expire_overdue_claims() (or anything else needing that lock) without deadlocking.
+    // This is the window a caller-side timeout needs to land in, racing either the
+    // reservation check just below or the executor submission further down, to
+    // reproduce the Dispatching-window race deterministically.
+    {
+        std::function<void()> entry_hook;
+        {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            entry_hook = std::move(dispatch_entry_hook_for_test_);
+        }
+        if (entry_hook)
+            entry_hook();
+    }
+    // up-3 (#4221): reserve this claim's compensating-disarm slot BEFORE the arm is
+    // ever submitted, while no subscription exists yet - see
+    // compensation_reserved_count_'s header comment for why this is a separate,
+    // runtime-side pool rather than an io_executor_ admission. On exhaustion, fail
+    // the same way an ordinary capacity refusal already fails, before any backend
+    // arm runs - never leave an undriven Dispatching claim, never dispatch the arm.
+    {
+        bool refused = false;
+        {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            const auto eit = claims_.find(key);
+            if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
+                return; // already resolved/replaced before dispatch even began
+            if (auto permit = try_reserve_compensation_locked(claim->io_class)) {
+                // rung 9c PR-5b hardening (this governance run): the permit now
+                // lives on the claim itself (KeyClaim::compensation_permit, an
+                // RAII CompensationPermit) rather than a plain bool - see that
+                // class's own doc comment for why. Nothing else about this branch
+                // changes.
+                claim->compensation_permit = std::move(*permit);
+            } else {
+                refused = true;
+                compensation_reservation_refused_.fetch_add(1, std::memory_order_relaxed);
+                // Dispatching-window race (rung 9c PR-5c, #4221): this claim may already
+                // carry a stale WaiterTimedOutDispatched from a caller timeout that raced
+                // this same re-lock - see reclassify_dispatching_race_locked()'s own doc
+                // comment. Correct it before fail_all_claims_locked()'s guard would
+                // otherwise leave it in place.
+                reclassify_dispatching_race_locked(*claim, ClaimEnd::AdmissionRejected);
+                try {
+                    std::string reason{kCompensationReservationExhausted};
+                    fail_all_claims_locked(key, reason, ClaimEnd::AdmissionRejected);
+                } catch (...) {
+                    claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                    if (claim->dispatch == ClaimDispatch::Dispatching)
+                        claim->dispatch = ClaimDispatch::Queued;
+                }
+            }
+        }
+        if (refused) {
+            claim_cv_.notify_all();
+            return;
+        }
+    }
     IoResult<void> adm{std::unexpect, IoFailure::LaunchFailed};
     try {
         auto self = shared_from_this();
@@ -498,14 +625,25 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
         const auto eit = claims_.find(key);
-        if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim)
-            return; // the callback already ran (before submit() even returned) and
-                    // erased or replaced it - never touch whatever occupies the key now
+        if (eit == claims_.end() || eit->second.fifo.empty() || eit->second.fifo.front() != claim) {
+            // The callback already ran (before submit() even returned) and erased or
+            // replaced it - never touch whatever occupies the key now. If admission
+            // itself failed, the callback never fired and never will; nothing else
+            // will ever release this claim's reservation, so this call must.
+            if (!adm)
+                release_compensation_locked(*claim);
+            return;
+        }
         if (adm) {
             if (claim->dispatch == ClaimDispatch::Dispatching)
                 claim->dispatch = ClaimDispatch::Dispatched;
             return;
         }
+        // Synchronous submission failure (a throw building the call, or an executor
+        // admission refusal): no arm was ever dispatched, so nothing can ever need
+        // compensation for this claim - release its reservation now, in the same
+        // critical section as the rest of this failure's bookkeeping.
+        release_compensation_locked(*claim);
         // Adversarial re-review r3 C2: this branch is reached from on_arm_complete()
         // (noexcept) when a refill's admission is refused, and the reason string
         // allocates. Contained: on a throw the head is handed back to Queued (a
@@ -514,13 +652,18 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
         // claims' waiters stay bounded by their own deadlines. Nothing crosses the
         // noexcept boundary. fail_all_claims_locked itself is contained per claim.
         try {
+            const ClaimEnd real_end = adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
+                                                                        : ClaimEnd::AdmissionRejected;
+            // Dispatching-window race (rung 9c PR-5c, #4221): see
+            // reclassify_dispatching_race_locked()'s own doc comment. Done before the
+            // reason-string allocation below so the corrected classification survives
+            // even if that allocation throws.
+            reclassify_dispatching_race_locked(*claim, real_end);
             // Timeout/WorkerThrew are unreachable at admission (submit() has no
             // deadline; a throw happens on the worker) - the shared map keeps them so
             // the two sites can never drift (governance consistency c-1).
             std::string reason{arm_failure_reason(adm.error())};
-            fail_all_claims_locked(key, reason,
-                                   adm.error() == IoFailure::Stopped ? ClaimEnd::Stopped
-                                                                     : ClaimEnd::AdmissionRejected);
+            fail_all_claims_locked(key, reason, real_end);
         } catch (...) {
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             if (claim->dispatch == ClaimDispatch::Dispatching)
@@ -533,7 +676,15 @@ void GuardianSparkRuntime::dispatch_arm_off_lock(const std::string& key,
 void GuardianSparkRuntime::fault_here_for_test(int point) {
     int expected = point;
     if (drain_fault_point_for_test_.compare_exchange_strong(expected, 0)) {
-        if (point == 1)
+        // ch-1 (#4221): points 6/7/9 name fill-in-outcome allocations
+        // (std::unexpected(std::string{...})) - point 9 is synthesize_fallback_
+        // outcome_locked()'s own equivalent line, added this governance run
+        // alongside dropping that function's incorrect `noexcept` (consistency-
+        // auditor Gate 4 finding: the "mirror" function had no fault seam of its
+        // own, unlike the loop it mirrors). Inject the exact exception each
+        // allocation would actually throw under real memory pressure, matching
+        // point 1's existing precedent, not a generic runtime_error.
+        if (point == 1 || point == 6 || point == 7 || point == 8 || point == 9)
             throw std::bad_alloc{};
         throw std::runtime_error("drain fault point " + std::to_string(point) + " (test seam)");
     }
@@ -584,6 +735,10 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
                 c->end = ClaimEnd::Committed;
             } else {
                 release_claim_index_locked(*c);
+                fault_here_for_test(6); // ch-1 (#4221): "the finished loop's own
+                                        // fill-in allocation threw" - downstream of
+                                        // point 3, the seam that criterion actually
+                                        // names and was missing until now.
                 c->outcome = std::unexpected(std::string{"arm drain failed"});
                 c->end = ClaimEnd::CommitThrew;
             }
@@ -603,8 +758,13 @@ bool GuardianSparkRuntime::publish_arm_verdicts_locked(
                 c->withdrawn = true;
                 c->dispatch = ClaimDispatch::Queued;
             }
-            if (!c->outcome)
+            if (!c->outcome) {
+                fault_here_for_test(7); // ch-1: the SIBLING fill-in allocation, in
+                                        // the firewall loop - shares this function
+                                        // with the one above but has its own catch
+                                        // recovery at each of the 3 call sites.
                 c->outcome = std::unexpected(std::string{"arm drain failed"});
+            }
             if (c->end == ClaimEnd::None)
                 c->end = ClaimEnd::CommitThrew;
         }
@@ -647,10 +807,18 @@ void GuardianSparkRuntime::finalize_arm_compensation(std::shared_ptr<ArmCompensa
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
         publish_arm_verdicts_locked(cont->key, cont->claim, cont->finished, cont->verdicts,
                                     cont->firewalled, refill);
+        // up-3: the compensating disarm this continuation carried has now genuinely
+        // completed (successfully or best-effort-failed - direct_disarm_fallback's
+        // own contract) and its verdict is published. Same critical section as the
+        // pop above.
+        release_compensation_locked(*cont->claim);
+        cont->claim->compensation_finished = true;
     } catch (...) {
         claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
         try {
             std::lock_guard<std::mutex> lk{registry_mu_};
+            release_compensation_locked(*cont->claim);
+            cont->claim->compensation_finished = true;
             const auto eit = claims_.find(cont->key);
             if (eit != claims_.end() && !eit->second.fifo.empty() &&
                 eit->second.fifo.front() == cont->claim) {
@@ -793,6 +961,13 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                         release_claim_index_locked(*c);
                         stage(c, std::unexpected(std::string{stopping_ ? "stopping" : "withdrawn"}),
                               nullptr, stopping_ ? ClaimEnd::Stopped : ClaimEnd::Withdrawn);
+                        fault_here_for_test(8); // up-4 (#4221) test seam: fires AFTER
+                                                // this claim's own verdict is staged,
+                                                // so on a multi-claim batch it leaves
+                                                // any LATER sibling un-staged for
+                                                // publish_arm_verdicts_locked's own
+                                                // fill-in loop (ch-1's seam) to
+                                                // backstop.
                     }
                     if (armed_live) {
                         // `compensating` already owns the subscription (entry).
@@ -916,8 +1091,17 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             // `compensating` is still set - either because nothing adopted it above,
             // or because staging itself threw AFTER `compensating` was set but before
             // reaching here (the exception unwinds past this call entirely).
-            if (!compensating)
+            if (!compensating) {
                 published = publish_arm_verdicts_locked(key, claim, finished, verdicts, false, refill);
+                // up-3: the ordinary, non-faulted happy path (including "nothing was
+                // ever owed a disarm" and "commit threw / worker threw / backend
+                // refused") - `claim`'s compensation is resolved (never became owed)
+                // the instant this call returns without throwing. Same critical
+                // section as the pop inside it. The `if (!published)` recovery path
+                // below has its own release calls for when THIS call throws instead.
+                release_compensation_locked(*claim);
+                claim->compensation_finished = true;
+            }
         }
     } catch (...) {
         firewalled = true;
@@ -970,6 +1154,17 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
         // `cont` null, one direct_disarm_fallback() runs, and the fallthrough
         // below is reached exactly as intended - `if (cont)` is a true single
         // discriminator again.
+        // up-3/up-4 (#4221): compensation is now owed for `claim` - mark it not-yet-
+        // finished (expire_overdue_claims()'s terminal-recovery pass must never reap
+        // a head whose compensation is still outstanding) and establish its ONE
+        // absolute observation deadline, set once and never reset by a later
+        // fallback retry.
+        {
+            std::lock_guard<std::mutex> lk{registry_mu_};
+            claim->compensation_finished = false;
+            if (claim->compensation_deadline == std::chrono::steady_clock::time_point{})
+                claim->compensation_deadline = std::chrono::steady_clock::now() + cfg_.backend_op_deadline;
+        }
         const std::uint64_t sub = *compensating;
         compensating.reset(); // ownership from here is `cont` (below) or the direct
                                // disarm on the catch path - never this optional again
@@ -1057,6 +1252,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             if (firewalled)
                 claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             published = publish_arm_verdicts_locked(key, claim, finished, verdicts, firewalled, refill);
+            // up-3: reached whether `claim` was never owed a disarm at all, or a
+            // synchronous direct_disarm_fallback() already resolved it above (the
+            // `cont`-never-built fallthrough) - either way its compensation is fully
+            // resolved by this point. Same critical section as the pop above.
+            release_compensation_locked(*claim);
+            claim->compensation_finished = true;
         } catch (...) {
             // A throw here (the lock, or the fill-in allocations, now the only
             // throwing steps left on this path since the index release became
@@ -1071,6 +1272,12 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
             claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
             try {
                 std::lock_guard<std::mutex> lk{registry_mu_};
+                // Independent of whatever recovery below achieves: `claim`'s own
+                // compensation (if any was ever owed) is already resolved by this
+                // point on every path that reaches here - see this catch's own doc
+                // comment above.
+                release_compensation_locked(*claim);
+                claim->compensation_finished = true;
                 const auto eit = claims_.find(key);
                 if (eit != claims_.end() && !eit->second.fifo.empty() &&
                     eit->second.fifo.front() == claim) {
@@ -1187,6 +1394,18 @@ GuardianSparkRuntime::attach_rule(std::string rule_id, SparkSpec spec, RuleAsser
         return std::unexpected(std::move(core.error));
     case AttachCoreState::Pending:
         break; // fall through to the bounded wait below
+    case AttachCoreState::Reobserved:
+        // up-2 (#4221, rung 9c PR-5c): the existing wedged head's own outcome is
+        // already set (abandon_claim_locked wrote it when that claim first timed
+        // out) - return it directly. This function's return type has no way to
+        // expose a receipt for later polling, so there is nothing to wait on: the
+        // wedge is already a known, resolved-shaped fact. Do NOT wait on or
+        // re-abandon core.claim - this call owns nothing, it only observed.
+        if (core.claim->outcome)
+            return *core.claim->outcome;
+        return std::unexpected(std::string{kSparkKeyWedged}); // defensive: outcome
+                                                               // should always be set
+                                                               // for a retained wedge
     }
 
     // The bounded wait for THIS call's own claim (PR-1's synchronous contract: a
@@ -1231,8 +1450,9 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
     case ClaimEnd::Stopped:
         return ReceiptStatus::Stopped;
     case ClaimEnd::WaiterTimedOutQueued:
+        return ReceiptStatus::CongestionExpired;
     case ClaimEnd::WaiterTimedOutDispatched:
-        return ReceiptStatus::Expired;
+        return ReceiptStatus::Wedged;
     case ClaimEnd::BackendRefused:
     case ClaimEnd::WorkerThrew:
     case ClaimEnd::AdmissionRejected:
@@ -1246,15 +1466,17 @@ GuardianSparkRuntime::receipt_status(const ArmReceipt& receipt) const {
         // default:) so this switch stays exhaustive against ClaimEnd's real set.
         return ReceiptStatus::Failed;
     }
-    return ReceiptStatus::Failed; // unreachable (exhaustive above); no default so a
-                                  // new ClaimEnd enumerator fails to compile here
+    // unreachable (exhaustive above). No `default:` so a new ClaimEnd enumerator
+    // produces a missing-case WARNING here (meson.build's werror=false repo-wide -
+    // this is NOT a build failure, correcting an earlier overclaim in this comment).
+    return ReceiptStatus::Failed;
 }
 
 bool GuardianSparkRuntime::is_terminal(const ArmReceipt& receipt) const {
     return receipt_status(receipt) != ReceiptStatus::Pending;
 }
 
-std::expected<GuardianSparkRuntime::ArmOutcome, std::string>
+std::expected<GuardianSparkRuntime::ArmOutcome, GuardianSparkRuntime::ArmError>
 GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spec,
                                   RuleAssertion assertion, bool emit_compliant_edge) {
     const std::string key = spark_key(spec);
@@ -1295,9 +1517,41 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = core.generation,
                           .receipt = {}};
     case AttachCoreState::Failed:
-        return std::unexpected(std::move(core.error));
+        // rung 9c PR-5c round 2 (#4221): carry attach_core()'s own
+        // prior_state_preserved bit through to the caller - see ArmError's doc
+        // comment. GuardianEngine::reconcile_rule_locked() MUST check it before
+        // running its own defensive detach_rule() cleanup on this failure.
+        return std::unexpected(ArmError{.message = std::move(core.error),
+                                        .prior_state_preserved = core.prior_state_preserved});
     case AttachCoreState::Pending:
         break; // fall through: inspect below, without waiting
+    case AttachCoreState::Reobserved:
+        // up-2 (#4221, rung 9c PR-5c): return the EXISTING head's receipt directly
+        // as Accepted - this call created no claim of its own (arm_claim, the
+        // local out-param, is still null here), so there is nothing for
+        // claim_rollback to undo either way. The caller polls receipt_status() on
+        // this receipt exactly as it would for any other Accepted result - but
+        // unlike an ordinary unresolved Accepted receipt, this one is already
+        // terminal (Wedged) at the moment it's handed back, and STAYS Wedged
+        // once *this* claim's own `end` has settled to its final value: every
+        // downstream write site only sets a claim's `end` while it is still
+        // None, so a Reobserved retry's receipt cannot itself move `end` off
+        // Wedged (test-pinned: test_guardian_spark_runtime.cpp's sticky-Wedged-
+        // after-late-success case). This is not a blanket claim that `end` can
+        // never change after a Reobserved retry reads it -
+        // reclassify_dispatching_race_locked() is a deliberate, narrowly-scoped
+        // counter-example: for the one interleaving where a Reobserved retry
+        // lands inside the Dispatching-window race (after abandon_claim_locked
+        // sets the stale WaiterTimedOutDispatched but before
+        // dispatch_arm_off_lock's own re-lock corrects it), the SAME shared
+        // claim object's `end` is corrected to its real outcome, and both the
+        // original waiter and this Reobserved receipt see that corrected value
+        // (they share one claim). Don't read "eventually resolves on its own"
+        // into this either way - nothing about calling attach_rule again
+        // changes an already-settled `end`, short of a genuinely different
+        // rule_id/spec reaching this key.
+        return ArmOutcome{.kind = ArmOutcomeKind::Accepted, .generation = 0,
+                          .receipt = ArmReceipt{core.claim}};
     }
 
     // Astra opine review, Blocker 1 step 3: "Reacquire registry_mu_ and inspect this
@@ -1320,7 +1574,13 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
         if (outcome)
             return ArmOutcome{.kind = ArmOutcomeKind::Armed, .generation = *outcome,
                               .receipt = {}};
-        return std::unexpected(std::move(outcome).error());
+        // This call's own NEW claim (attach_core() already ran
+        // detach_rule_locked(rule_id) on rule_id's prior generation to create it)
+        // resolved to a failure by the time we re-checked - rule_id has nothing
+        // left either way, so prior_state_preserved is false, unchanged from
+        // before rung 9c PR-5c round 2 (#4221).
+        return std::unexpected(ArmError{.message = std::move(outcome).error(),
+                                        .prior_state_preserved = false});
     }
     // Still unresolved: hand off to runtime-owned state, never abandon it. True for
     // every Pending claim reaching here regardless of Queued/Dispatching/Dispatched -
@@ -1334,9 +1594,126 @@ GuardianSparkRuntime::attach_rule(NonWaiting, std::string rule_id, SparkSpec spe
                       .receipt = ArmReceipt{arm_claim}};
 }
 
+void GuardianSparkRuntime::synthesize_fallback_outcome_locked(KeyClaim& c) {
+    // Mirrors publish_arm_verdicts_locked's own fill-in loop (governance
+    // consistency: one place decides what an unfilled claim's outcome becomes).
+    // NOT noexcept (fixed, this governance run - see this function's own
+    // declaration comment in the header for the full story): the std::string
+    // allocation below CAN throw, exactly like that loop's own equivalent line -
+    // reap_stranded_claims_locked()'s existing try/catch around its call to this
+    // now genuinely contains it, degrading a rare allocation failure to "retry next
+    // pass" instead of a std::terminate.
+    if (c.outcome || c.commit_exception)
+        return;
+    const auto rit = rules_.find(c.rule_id);
+    if (c.kind == ClaimKind::Arm && rit != rules_.end() && rit->second->generation == c.generation) {
+        c.index_held = false;
+        c.outcome = c.generation;
+        c.end = ClaimEnd::Committed;
+    } else {
+        release_claim_index_locked(c);
+        fault_here_for_test(9); // consistency-auditor Gate 4 finding (this
+                                // governance run): the ONE call site of this
+                                // function's own allocating line previously had no
+                                // fault seam of its own, unlike the fill-in loop it
+                                // mirrors (points 6/7) - this closes that gap so the
+                                // now-genuinely-contained catch path is directly
+                                // testable.
+        c.outcome = std::unexpected(std::string{"arm drain failed"});
+        c.end = ClaimEnd::CommitThrew;
+    }
+}
+
+std::size_t GuardianSparkRuntime::reap_stranded_claims_locked(
+    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>>& refills) {
+    const auto now = std::chrono::steady_clock::now();
+    std::size_t reaped = 0;
+    for (auto it = claims_.begin(); it != claims_.end();) {
+        const std::string& key = it->first;
+        auto& fifo = it->second.fifo;
+        bool key_changed = false;
+        while (!fifo.empty()) {
+            auto& c = fifo.front();
+            if (c->kind != ClaimKind::Arm)
+                break; // a Disarm head is redrive_retained_disarms()'s own job
+            // up-3's deadline-observation contract: count-only, once, regardless of
+            // whether this claim ends up reaped this pass - never release anything.
+            if (!c->compensation_finished && !c->compensation_deadline_observed &&
+                c->compensation_deadline != std::chrono::steady_clock::time_point{} &&
+                now >= c->compensation_deadline) {
+                c->compensation_deadline_observed = true;
+                compensation_deadline_elapsed_.fetch_add(1, std::memory_order_relaxed);
+            }
+            // NOTE: deliberately Queued-only, never Dispatched/Dispatching - a
+            // Dispatched head can carry an outcome that abandon_claim_locked wrote
+            // EARLY (the timeout-while-still-physically-in-flight case: the async
+            // arm() call is genuinely still running, its own completion callback
+            // has not run yet, and reaping it here would rip the claim out from
+            // under that still-pending callback; measured directly (5b's own
+            // implementation) as a real regression on "expire_overdue_claims():
+            // abandons a non-waiting claim's own overdue arm... the compensating
+            // disarm still runs once the late success arrives" - `compensation_
+            // finished` defaults true and does not, by itself, distinguish this
+            // case from a genuinely stuck Dispatched head, and no cheaper signal
+            // was found in this pass to tell them apart safely). A Dispatched-head
+            // reap was the kickoff's own literal ask, but neither Astra's nor
+            // Fable's review could construct a real reproduction of it either -
+            // left as a documented non-fix (see the PLAN doc) rather than risking
+            // this exact class of defect again.
+            const bool stranded_queued = c->dispatch == ClaimDispatch::Queued && !c->outcome &&
+                                         !c->commit_exception &&
+                                         (c->withdrawn || c->waiter_abandoned);
+            if (!stranded_queued)
+                break; // legitimately still in flight, or legitimately awaiting its turn
+            if (!c->compensation_finished)
+                break; // its own compensating disarm is genuinely still outstanding
+            try {
+                synthesize_fallback_outcome_locked(*c);
+            } catch (...) {
+                claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                break; // leave it for the next pass rather than reap a half-written claim
+            }
+            if (!release_claim_index_locked(*c))
+                break; // release still failing (seam / genuine failure): retry next pass
+            fifo.pop_front();
+            ++reaped;
+            key_changed = true;
+        }
+        if (fifo.empty()) {
+            it = claims_.erase(it);
+        } else {
+            if (key_changed) {
+                if (auto refill = try_dispatch_head_locked(key)) {
+                    // Fable review (2026-09-14): try_dispatch_head_locked() already
+                    // flipped this head Queued->Dispatching before returning it - if
+                    // the collection push below throws (key's std::string copy,
+                    // vector growth), nobody will ever drive this claim: it is not
+                    // Queued any more (redrive_retained_disarms()/a same-key event
+                    // won't touch it) and the NEXT stranded-claims pass skips
+                    // non-Queued heads too. Same class of alloc-after-flip wedge this
+                    // function exists to fix - contained the same way the rest of
+                    // this file handles it (dispatch_arm_off_lock's own refusal path,
+                    // above): hand the head back to Queued so the next same-key event
+                    // or stranded-claims pass re-drives it, and count the failure.
+                    try {
+                        refills.emplace_back(key, refill);
+                    } catch (...) {
+                        claim_drain_failures_.fetch_add(1, std::memory_order_relaxed);
+                        if (refill->dispatch == ClaimDispatch::Dispatching)
+                            refill->dispatch = ClaimDispatch::Queued;
+                    }
+                }
+            }
+            ++it;
+        }
+    }
+    return reaped;
+}
+
 std::size_t GuardianSparkRuntime::expire_overdue_claims() {
     const auto now = std::chrono::steady_clock::now();
     std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> overdue;
+    std::vector<std::pair<std::string, std::shared_ptr<KeyClaim>>> refills;
     std::size_t expired_count = 0;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
@@ -1364,10 +1741,23 @@ std::size_t GuardianSparkRuntime::expire_overdue_claims() {
             abandon_claim_locked(key, c, /*stopping=*/false);
             ++expired_count;
         }
+        // up-4 (#4221): the terminal-recovery safety net (see this function's own
+        // doc comment) - separate from the overdue-live-claim pass above, which
+        // deliberately excludes anything already outcome/commit_exception/abandoned.
+        reap_stranded_claims_locked(refills);
     }
-    if (expired_count)
+    if (expired_count || !refills.empty())
         claim_cv_.notify_all();
+    for (auto& [key, refill] : refills)
+        dispatch_arm_off_lock(key, refill);
     return expired_count;
+}
+
+bool GuardianSparkRuntime::is_retained_wedge(const KeyClaim& head) noexcept {
+    return head.kind == ClaimKind::Arm &&
+           (head.dispatch == ClaimDispatch::Dispatching ||
+            head.dispatch == ClaimDispatch::Dispatched) &&
+           head.waiter_abandoned && head.end == ClaimEnd::WaiterTimedOutDispatched;
 }
 
 GuardianSparkRuntime::AttachCoreResult
@@ -1406,8 +1796,65 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
     {
         std::unique_lock<std::mutex> lk{registry_mu_};
         if (stopping_)
+            // rung 9c PR-5c round 2 (#4221): before detach_rule_locked(rule_id) ever
+            // runs below - rule_id's prior state, if any, is untouched.
             return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
-                                    .error = "stopping", .claim = nullptr};
+                                    .error = "stopping", .prior_state_preserved = true,
+                                    .claim = nullptr};
+
+        // UP-1 fix (#4221, rung 9c PR-5c follow-up governance - confirmed HIGH,
+        // newly-reachable by this PR's own Reobserved/immediate-refusal design):
+        // if the TARGET key `key`'s FIFO front is a retained wedge belonging to a
+        // genuinely DIFFERENT rule_id, refuse right here - BEFORE
+        // detach_rule_locked(rule_id) below unconditionally tears down whatever
+        // generation `rule_id` itself currently holds (armed, dispatching, or
+        // still queued elsewhere). Without this early check, the unconditional
+        // detach followed by the immediate refusal further down would leave
+        // `rule_id` with ZERO live arms and no automatic recovery path: the
+        // sticky-Wedged design means a same-rule retry never un-wedges `key` by
+        // itself, and a different-claimant refusal never creates a claim of its
+        // own, so nothing is left in `key`'s FIFO to later adopt a late success
+        // either. This is a regression from pre-PR-5c behavior, where a retry
+        // queued behind a busy key at least had a chance of late-success recovery
+        // if the head eventually resolved.
+        //
+        // Safe to evaluate here, before detach_rule_locked runs: nothing between
+        // taking registry_mu_ above and this point mutates claims_, and
+        // detach_rule_locked(rule_id) can only ever touch `key`'s own claims_ FIFO
+        // via its Case 0 branch, which withdraws only an entry whose OWN rule_id
+        // matches the rule being detached - it can never touch or reorder a front
+        // claim owned by a DIFFERENT rule_id. So this early return fires whenever
+        // the FRONT (computed right here, before any detach) belongs to a
+        // different rule_id, full stop - independent of whether rule_id's own
+        // active generation exists elsewhere in this same FIFO as a queued,
+        // non-front follower (it can: "Live followers CAN exist behind a wedged
+        // head", the up-2 comment below); this branch does not depend on rule_id's
+        // own generation being the front, only on someone ELSE's being it. The
+        // one case this early return does NOT cover - rule_id's own generation
+        // already IS the front, wedged - falls through to detach_rule_locked
+        // (which skips a waiter_abandoned claim, leaving that front unchanged)
+        // and then the Reobserved branch below, unaffected by this check.
+        //
+        // Deliberately duplicates part of that later check's Failed branch rather
+        // than restructuring it (both now share is_retained_wedge() - rung 9c
+        // PR-5c round 2 governance fold): this is the ONLY sub-case that must run
+        // before the detach. Leaving the Reobserved (same rule_id, same spec)
+        // sub-case at its ORIGINAL position, completely unchanged, keeps that
+        // path's own proven behavior - including its interaction with
+        // detach_rule_locked's Case 0, which explicitly skips a waiter_abandoned
+        // claim - exactly as it was.
+        if (const auto pre_cit = claims_.find(key);
+            io_class && pre_cit != claims_.end() && !pre_cit->second.fifo.empty()) {
+            const auto& pre_head = pre_cit->second.fifo.front();
+            if (is_retained_wedge(*pre_head) && pre_head->rule_id != rule_id) {
+                wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
+                // detach_rule_locked(rule_id) has NOT run yet - rule_id's prior
+                // state, if any, is untouched (rung 9c PR-5c round 2, #4221).
+                return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
+                                        .error = std::string{kSparkKeyWedged},
+                                        .prior_state_preserved = true, .claim = nullptr};
+            }
+        }
 
         // PR #3821 review (fjarvis, cpp-safety re-review): armed BEFORE
         // prior_disarm is even populated below, not after - fn is a std::function
@@ -1464,11 +1911,17 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         // both remove the mapping.
         bool index_added = false;
         GuardianRollback index_add_rollback;
-        index_add_rollback.fn = [this, rule_id, &index_added] {
+        index_add_rollback.fn = [this, rule_id, gen, &index_added] {
             if (index_added)
-                index_->erase_rule(rule_id); // noexcept (adversarial r4 K2/C5): remove_rule's
-                                            // key copy could throw inside ~GuardianRollback,
-                                            // which swallows it and leaves a ghost mapping
+                // rung 9c PR-5a (#4221 up-101): pass `gen` - this rollback only ever
+                // fires within THIS same attach_core() call, before anything else could
+                // have transferred ownership elsewhere, so `gen` is always still the
+                // recorded owner here; passing it keeps this call symmetric with every
+                // other erase_rule() call site now that the parameter is required for
+                // safety elsewhere.
+                index_->erase_rule(rule_id, gen); // noexcept (adversarial r4 K2/C5): remove_rule's
+                                                  // key copy could throw inside ~GuardianRollback,
+                                                  // which swallows it and leaves a ghost mapping
         };
 
         // rung 9c R5.2: a key that already has a claim entry (an arm in flight with
@@ -1482,7 +1935,72 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
         const auto cit = claims_.find(key);
         const bool key_claimed = io_class && cit != claims_.end() && !cit->second.fifo.empty();
 
-        const bool arm_edge = index_->add(key, rule_id); // may throw; index_added still false then
+        // up-2 (#4221, rung 9c PR-5c): when the key is already claimed, its FIFO
+        // front is always the claim that matters (try_dispatch_head_locked only
+        // ever dispatches the front; abandon_claim_locked retains a
+        // dispatching/dispatched claim in place rather than removing it - a
+        // genuinely unresolved dispatched arm can never have a live claim queued
+        // ahead of it). Live followers CAN exist behind a wedged head - irrelevant
+        // here, only the front matters. Checked BEFORE index_->add() below and
+        // BEFORE any index mutation: re-observation must construct nothing new and
+        // touch no index state at all (see the PLAN doc's "Correction to the
+        // kickoff" - a fresh index_->add() here would create a ghost mapping
+        // nothing ever cleans up, since the abandoned head's own completion
+        // already unconditionally releases its index ownership independent of
+        // this call).
+        if (key_claimed) {
+            const auto& head = cit->second.fifo.front();
+            // Compare the underlying ClaimEnd/ClaimDispatch fields directly, never
+            // the public receipt_status() accessor - it acquires registry_mu_
+            // itself, and this locked block already holds it.
+            const bool retained_wedge = is_retained_wedge(*head);
+            // Do NOT require index_held == false to recognize this state -
+            // abandonment releases the index unconditionally in the ordinary case,
+            // but the existing fault seam can make that release fail and leave
+            // index_held true; that seam must never corrupt this classification.
+            if (retained_wedge) {
+                if (head->rule_id == rule_id && head->spec == spec) {
+                    // Re-observe: return the EXISTING claim's receipt, construct
+                    // nothing new. Must not reset outcome, abandonment, dispatch
+                    // state, or deadline - re-observation never revives or
+                    // restarts anything, it only reports what is already true.
+                    wedged_reobservations_.fetch_add(1, std::memory_order_relaxed);
+                    return AttachCoreResult{.state = AttachCoreState::Reobserved,
+                                            .generation = 0, .error = {}, .claim = head};
+                }
+                // A genuinely different claimant (different rule_id - the "same
+                // rule_id, different spec" case is structurally unreachable:
+                // spark_key() canonically encodes the full spec into the key
+                // itself, so two different specs on the same rule_id can never
+                // reach this branch with the SAME key in the first place).
+                //
+                // UP-1 fix (#4221): the hoisted pre-check above already refuses
+                // (and returns) every call that would land here - it runs the
+                // identical condition (now is_retained_wedge(), rung 9c PR-5c
+                // round 2 governance fold) on the identical FIFO front BEFORE
+                // detach_rule_locked, and detach_rule_locked can never touch a
+                // front owned by a rule_id other than the one it was called
+                // with. This branch is kept, unchanged, as defense-in-depth
+                // rather than removed: it still fires correctly (redundantly)
+                // if it were ever reached, and removing it would make the
+                // Reobserved branch above stand alone in a way that is easy to
+                // accidentally break on a future edit. Unlike the hoisted
+                // pre-check, detach_rule_locked(rule_id) already ran earlier in
+                // THIS call by the time we reach here - rule_id has nothing left
+                // to preserve, so prior_state_preserved is (explicitly) false: a
+                // caller's defensive cleanup on this Failed result is a genuine
+                // no-op, not a live-arm teardown (rung 9c PR-5c round 2, #4221).
+                wedged_refusals_.fetch_add(1, std::memory_order_relaxed);
+                return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
+                                        .error = std::string{kSparkKeyWedged},
+                                        .prior_state_preserved = false, .claim = nullptr};
+            }
+        }
+
+        const bool arm_edge = index_->add(key, rule_id, gen); // may throw; index_added still false
+                                                              // then. rung 9c PR-5a (#4221 up-101):
+                                                              // `gen` is this attach's own incarnation
+                                                              // token - see erase_rule()'s doc comment.
         index_added = true;
         if (key_claimed || (arm_edge && io_class)) {
             // Claim path: mark and return to the caller below WITHOUT touching
@@ -1550,9 +2068,13 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             };
             auto armed = backend_->arm(spec); // may THROW -> rollback + index_add_rollback undo it
             if (!armed)
-                // rollback + index_add_rollback undo it
+                // rollback + index_add_rollback undo it. detach_rule_locked(rule_id)
+                // already ran earlier in this call, and this attempt's own new state
+                // is fully rolled back above - rule_id has nothing left either way,
+                // so prior_state_preserved stays false (rung 9c PR-5c round 2, #4221).
                 return AttachCoreResult{.state = AttachCoreState::Failed, .generation = 0,
-                                        .error = armed.error(), .claim = nullptr};
+                                        .error = armed.error(),
+                                        .prior_state_preserved = false, .claim = nullptr};
             sub = *armed;
             armed_here = true;
             pk = std::make_shared<PerKey>();
@@ -1799,17 +2321,101 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
                 // never writes keys_ until it commits, and commit erases the entry);
                 // a never-dispatched terminal tombstone may still sit here after a
                 // double fault, and is swept first (governance pass-3 sg-3/ar-4/cs-5).
+                //
+                // rung 9c PR-5a (#4221 cs-103) reachability note (corrected 2026-09-14,
+                // governance S2 - the original (a) below was wrong for a same-rule_id
+                // tombstone; see the correction inline): this sweep's ATTACH-path twin
+                // (try_dispatch_head_locked, this file's other
+                // sweep_terminal_queued_locked call site) has concrete, tested repros
+                // (the "adversarial re-review r3 C2" death test and PR-5a's own
+                // "up-101/ch-101" test both leave a real tombstone for this call to
+                // sweep). This DETACH-path call site does not, and an extensive trace
+                // of the actual call graph (attach_core, publish_arm_verdicts_locked,
+                // on_arm_complete, Case 0 in this function) did not turn up a
+                // producible sequence of public-API calls that reaches here with a
+                // non-empty fifo. Two cases, scoped by whose rule_id the tombstone
+                // holds - conflating them was the (a) defect:
+                // (a) a DIFFERENT rule sharing this key still holds its OWN
+                //     index_->add() mapping (its release having failed): by_key_ is a
+                //     std::set<rule_id>, so a SECOND, distinct rule_id inflates
+                //     index_->refcount() for this key past 1 and blocks `last_on_key`
+                //     above from ever gating entry into this branch while that
+                //     tombstone persists. This case does NOT apply to a same-rule_id
+                //     tombstone from an older generation: by_key_ counts the rule_id
+                //     string once regardless of which generation currently owns it in
+                //     by_rule_, so refcount stays 1 either way.
+                // (b) the SAME rule's own stale tombstone gets opportunistically swept
+                //     by try_dispatch_head_locked's OWN call as part of that rule's
+                //     next attach - see PR-5a's up-101 test, where the tombstone is
+                //     cleared before the new claim ever reaches commit, not left for a
+                //     later, separate detach to find. This is the case that actually
+                //     covers a same-rule_id tombstone; (a) never needs to.
+                // The overall unreachability conclusion rests on (b) alone for the
+                // same-rule case and on (a) for the different-rule case - independently
+                // traced by two reviewers with no counter-example found, but not
+                // exhaustively modeled against every background retry path. This
+                // matches the governance finding's own framing (sg-3/ar-4/cs-5 hardened
+                // BOTH sweep call sites symmetrically as defence-in-depth) rather than a
+                // distinctly reproduced defect at this specific site. Flagging rather
+                // than asserting impossibility: a future change to up-5's
+                // retained-disarm redrive (5b) or to the claim/index bookkeeping above
+                // could open a path this analysis didn't model - re-check this note
+                // rather than deleting it if either changes. Because this conclusion is
+                // call-graph reasoning, not a compile-time guarantee, the check right
+                // below is a REAL runtime guard (counted via
+                // detach_sweep_left_residue(), logged, safe fallback) rather than a bare
+                // debug-only assert - see its own comment for why.
                 sweep_terminal_queued_locked(eit->second);
+                // rung 9c PR-5a (#4221 cs-103): a bare assert() here would compile out
+                // entirely under NDEBUG, silently proceeding as if the sweep's
+                // precondition held even though this investigation only established it
+                // via call-graph reasoning, not a compile-time guarantee. Matches this
+                // file's own established precedent for a should-never-happen branch
+                // (dispatch_arm_off_lock's "not an Arm claim" guard): keep the debug
+                // assert for immediate local visibility, but pair it with a REAL,
+                // NDEBUG-surviving fallback that never risks inserting this Disarm claim
+                // behind (or ahead of) something whose state this code no longer
+                // understands.
+                //
+                // Gate 8 re-review correction (G2, both cpp-expert and cpp-safety):
+                // this comment and this commit's own message originally claimed the
+                // disarm itself is "deferred to the next same-key event" - that is
+                // WRONG. Deliberately not pushing the new Disarm claim here just leaves
+                // `claim_pushed` false and `inline_disarm` unset, so control falls
+                // through to the PRE-EXISTING (unrelated to this PR) `!claim_pushed`
+                // last-resort fallback in the `if (disarm_key)` block later in this
+                // function: that fallback runs SYNCHRONOUSLY, in this SAME call, under
+                // this SAME lock -
+                // it calls backend_->disarm() on the real subscription directly and then
+                // unconditionally erases keys_[key]. So the real disarm and the key's
+                // teardown both happen immediately, not deferred. The ONLY thing
+                // genuinely left for the next same-key event is the unexpected residue
+                // still sitting in claims_[key]'s own fifo (this rule's own
+                // rules_/index_ cleanup below also runs unconditionally regardless).
                 assert(eit->second.fifo.empty());
-                try {
-                    eit->second.fifo.push_back(c);
-                } catch (...) {
-                    if (inserted)
-                        claims_.erase(eit); // never leave an empty entry behind
-                    throw;
+                if (!eit->second.fifo.empty()) {
+                    detach_sweep_left_residue_.fetch_add(1, std::memory_order_relaxed);
+                    try {
+                        spdlog::error("Guardian spark: key '{}' still has {} queued claim(s) "
+                                     "after the last-on-key sweep for rule '{}' - the real "
+                                     "disarm still runs synchronously via the existing "
+                                     "last-resort fallback, but this leftover fifo residue "
+                                     "is left for the next same-key event to sweep (see "
+                                     "detach_sweep_left_residue())",
+                                     *key_opt, eit->second.fifo.size(), rule_id);
+                    } catch (...) {
+                    }
+                } else {
+                    try {
+                        eit->second.fifo.push_back(c);
+                    } catch (...) {
+                        if (inserted)
+                            claims_.erase(eit); // never leave an empty entry behind
+                        throw;
+                    }
+                    work = c;
+                    claim_pushed = true;
                 }
-                work = c;
-                claim_pushed = true;
             } else {
                 inline_disarm = kit->second->subscription;
             }
@@ -1865,8 +2471,15 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
             if (inline_disarm) {
                 backend_->disarm(*inline_disarm); // inline type: unchanged, synchronous
             } else if (!claim_pushed) {
-                // Cannot happen by construction (the prediction ran under this same
-                // lock); counted last resort so a subscription is NEVER stranded.
+                // Gate 8 re-review correction (G3): this used to read "cannot happen by
+                // construction" - that stopped being true the moment the residue-sweep
+                // branch above (rung 9c PR-5a, #4221 cs-103) was added. That branch
+                // deliberately leaves `claim_pushed` false whenever the last-on-key sweep
+                // finds leftover fifo residue it can't safely reorder past, so THIS
+                // fallback is now the real, live disarm+cleanup path for that case, not
+                // just an unreachable last resort. It remains the defensive last resort
+                // for any other path that leaves `claim_pushed` false; this is the
+                // last-resort real disarm, counted so a subscription is NEVER stranded.
                 detach_claim_failures_.fetch_add(1, std::memory_order_relaxed);
                 try {
                     backend_->disarm(kit->second->subscription);
@@ -1947,6 +2560,9 @@ void GuardianSparkRuntime::on_subscription_lost(const std::string& key,
             auto& head = eit->second.fifo.front();
             if (head->kind == ClaimKind::Disarm && head->dispatch == ClaimDispatch::Queued &&
                 head->subscription == subscription_id) {
+                clear_retained_locked(*head); // up-5: terminal removal - this claim
+                                              // may have been retained by an
+                                              // earlier admission refusal
                 head->outcome = std::uint64_t{0};
                 head->end = ClaimEnd::DeadSubscription;
                 eit->second.fifo.pop_front();
@@ -2828,6 +3444,7 @@ void GuardianSparkRuntime::begin_stop() {
                     // ownership kept - moot after stop); the outcome copy is contained,
                     // and a waiter that never sees one still wakes on stopping_
                     // (wait_for_claim's predicate) and returns "stopping".
+                    clear_retained_locked(*c); // up-5: terminal removal (erased below)
                     release_claim_index_locked(*c);
                     try {
                         if (!c->outcome)
@@ -3006,6 +3623,11 @@ void GuardianSparkRuntime::set_detach_fault_for_test(bool on) noexcept {
 void GuardianSparkRuntime::set_drain_gap_hook_for_test(std::function<void()> hook) {
     std::lock_guard<std::mutex> lk{registry_mu_};
     drain_gap_hook_for_test_ = std::move(hook);
+}
+
+void GuardianSparkRuntime::set_dispatch_entry_hook_for_test(std::function<void()> hook) {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    dispatch_entry_hook_for_test_ = std::move(hook);
 }
 
 void GuardianSparkRuntime::set_pending_initial_waker(std::function<void()> waker) {

@@ -369,8 +369,9 @@ during the #2233 item 3 governance sweep, re-surfaced while investigating this P
 `rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
 `active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
 non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
-PR-5 (fault/K-bound logic, not started - see acceptance criteria below,
-now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
+PR-5 (fault/K-bound logic, IN PROGRESS as a 5-PR sub-ladder 5a-5e - 5a merged
+#4359, 5b landed up-3/up-4 (partial, see status paragraph below)/ch-1/up-5 - see
+acceptance criteria below, now including #4279) → PR-6 (Service readiness signal + a re-run of the #3990
 diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
@@ -394,6 +395,34 @@ flip, with a red-first test each:
   `wait_for_claim`): a re-push onto a wedged key queues behind the abandoned head and waits the
   full `backend_op_deadline` under engine `mtx_` on every re-apply; the base code fail-fasted via
   the executor's `AlreadyRunning`. Criterion: a wedged key refuses a new claim immediately.
+- **up-2 status (rung 9c PR-5c, #4221): CLOSED.** Closed via three pieces: a dispatching-window
+  race fix (`reclassify_dispatching_race_locked()`, both reachable call sites) preventing a
+  claim's terminal classification from being silently overwritten by a stale value when a
+  caller-side timeout raced `dispatch_arm_off_lock()`'s own admission decision; `ReceiptStatus::
+  Expired` split into `CongestionExpired` (timed out merely queued - ordinary backpressure) and
+  `Wedged` (timed out while dispatching/dispatched); and the actual closure, `AttachCoreState::
+  Reobserved` - an identical (rule_id, spec) retry onto an already-`Wedged` key now re-observes
+  the existing head's receipt directly (no new claim, no index mutation, deliberately, to avoid
+  a ghost index-refcount leak), while a genuinely different claimant onto the same wedged key is
+  refused IMMEDIATELY (`kSparkKeyWedged`) instead of queuing behind the doomed claim and waiting
+  out `backend_op_deadline`. This PR's own full 8-gate `/governance` run found and closed one
+  BLOCKING residual, independently confirmed via adjudication: **UP-1** - `attach_core()` tore
+  down a retargeted rule's own prior working arm unconditionally before checking whether the new
+  target key was wedged-by-someone-else, so a retarget refused onto a wedged key left the
+  retargeting rule with zero live arms and no automatic recovery. Round 1 (`7c13ab269`) hoisted
+  the different-rule_id refusal check to run before `detach_rule_locked()`, but was insufficient
+  alone - the production caller, `GuardianEngine::reconcile_rule_locked()`, ran an unconditional
+  defensive cleanup on ANY `attach_rule` failure and tore the just-preserved arm back down one
+  call downstream; round 2 (`41a67dbc1`) closed it by threading a `prior_state_preserved` bit
+  through the failure result so the caller only cleans up when there is genuinely something to
+  clean up. A third Gate 8 re-review round (8 agents) on round 2's fix found no further blocking
+  residuals. Two small non-blocking follow-ups were identified and deliberately NOT fixed here,
+  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload still discards the
+  preservation signal, currently harmless since it has zero production callers today; and two
+  pre-existing raw-API-level tests could usefully assert `prior_state_preserved`'s value directly
+  for extra regression-locking. Separately, #4415 tracks the pre-existing (not introduced by this
+  PR) full-ruleset teardown-storm architecture this governance run's unhappy-path review
+  surfaced, confirmed a modest net improvement here rather than a regression.
 - **up-3, direct compensating-disarm fallback** (`on_arm_complete`'s `run_compensating_disarm`):
   on a non-timeout executor refusal the disarm runs direct on the worker, holding no quota;
   wedged direct calls accumulate alive workers to the per-instance ceiling and the instance
@@ -427,6 +456,63 @@ flip, with a red-first test each:
   the flip. Test-side note: `tests/unit/test_guardian_spark_runtime.cpp`'s 200-key `detach_all` test
   (governance qe-303) now asserts `disarms + disarm_retained() == 200` rather than the false invariant
   `disarms == 200` this row's chaos reproduction disproved.
+- **up-3/up-4/ch-1/up-5 status (rung 9c PR-5b, #4221)**: up-3 fixed via a runtime-owned
+  compensating-disarm reservation reserved per claim BEFORE its arm dispatches (not routed through
+  `GuardianIoExecutor`'s own admission - it has no compensation-priority `IoClass` and rejects
+  everything once `Stopped`, which would have broken the Stopped-still-triggers-fallback
+  requirement R5.5 depends on); sized 1:1 with the executor's own per-class quotas. up-4 fixed for
+  the CONFIRMED real shape (a `Queued`, withdrawn/abandoned head with no outcome, left behind by
+  the same double-fault recovery paths, reachable via a genuine allocation failure) via a new
+  `expire_overdue_claims()` terminal-recovery pass; the kickoff's literal Dispatched-terminal-head
+  variant was investigated and NOT implemented in this PR - a first attempt (reaping any
+  `Dispatched`+outcome-bearing head) regressed a real, already-tested scenario (a caller-timeout-
+  abandoned claim whose async `arm()` is still genuinely in flight; `compensation_finished`
+  defaults true and does not by itself distinguish the two cases). **Correction (Fable re-review,
+  2026-09-14): a safe signal is NOT structurally impossible** - a dedicated `completion_finished`
+  fact (distinct from `compensation_finished`), written only by the true completion callback and
+  reset at the `Queued`->`Dispatching` re-drive chokepoint, would distinguish them; it simply
+  wasn't built in this PR. Separately, the literal double-fault residue this variant targets was
+  independently confirmed unreachable on the current call graph (every path that could produce it
+  routes through a `noexcept`-only inner catch before the pop) by three independent passes (Astra,
+  Fable, and this implementation attempt) - so the risk of leaving it unbuilt is assessed as near
+  nil in practice. Tracked as **#4366** (P2, defense-in-depth), not flip-gating.
+  ch-1's fill-in-allocation seam added (both the ordinary and firewall-loop occurrences). up-5's
+  redrive is now wired onto the convergence lane's priority loop (elapsed-time-gated, its own
+  firewalled sweep); **this row's own "Missing telemetry" wording above is now WRONG** -
+  `disarm_retained()` is no longer "current (non-monotonic)" but a real lifecycle count
+  (an RAII `RetainedGuard` per claim, released on the claim's own successful completion or any other
+  terminal removal - see the governance-hardening note below for the RAII rename) - the fleet-gauge
+  alternative this row offered was itself retracted on issue #4221's own comment thread as
+  insufficient (a monotonic counter cannot answer "is anything stuck right now"), so the bounded
+  redrive is the only closure this criterion accepts. `redrive_retained_disarms()` walks `claims_`
+  directly (never `keys_`), reaching a retained disarm even behind a torn-down key - closes the
+  #4221 follow-up comment (`ar-402`) that had worried a convergence-lane trigger might enumerate the
+  wrong registry and miss that case.
+- **Governance hardening round (full 8-gate `/governance` pass, this run, 2026-09-14)**: this PR's
+  own pre-push governance found ONE genuine BLOCKING item - cpp-safety's Gate 3 adjudication declined
+  the RAII-impossibility exception for both up-3's compensating-disarm reservation pool and up-5's
+  retained-disarm lifecycle count, which up to that point were plain bool-guarded manual
+  acquire/release pairs (`compensation_reserved`/`retained_counted`). No live leak was found on any
+  traced path, including every throw path, but the manual pairing was ruled a policy-floor contract
+  violation regardless (CLAUDE.md standing rule 2's non-RAII-cleanup-in-new-C++ floor) since a
+  stack-scoped guard was wrongly assumed impossible - the real fix is a move-only guard owned by the
+  already-long-lived `KeyClaim` object, not a stack frame. Fixed by wrapping both in dedicated RAII
+  types (`CompensationPermit`, `RetainedGuard`, `guardian_spark_runtime.hpp`) backed by
+  `std::atomic` counters so the destructor is safe to run off-lock - a structural backstop against a
+  future forgotten release call, not just a currently-correct one. Bundled into the same fix: the
+  independently-confirmed (security-guardian, cpp-expert, cpp-safety) `noexcept`-on-a-throwing-body
+  defect in `synthesize_fallback_outcome_locked` (dropped `noexcept`, added fault-injection point 9
+  matching its own now-genuinely-functional catch path), and `fail_all_claims_locked` now also
+  releases a compensation permit defensively (consistency-auditor finding, provably a no-op today,
+  kept for future-caller safety). Two new isolated `[spark]` test cases pin the RAII types' own
+  engage/move/release contract directly; a third (Gate 8 re-review follow-up, quality-engineer and
+  cpp-safety independently converging on the same gap) drives fault point 9 through a genuine
+  double-fault scenario and was red-first-validated - the noexcept bug was temporarily
+  reintroduced, confirmed the new test crashes with `terminate called after throwing std::bad_alloc`,
+  then reverted. Full agent suite (3034/3035 cases, 1 platform-skipped, 126244 assertions) and
+  targeted `[spark]` suite (588/588, 14012 assertions) both green after all three fix commits;
+  Gate 8 re-review (11 agents across the re-run Gate 2/3/4/6 set) found zero new BLOCKING findings
+  and confirmed the RAII-floor finding CLOSED (cpp-safety's own authoritative ruling).
 - **NEW (added 2026-09-13, sre finding on the #2012/#3840 doc-sweep)**: #4279's lane-cap-overshoot
   observation (`SparkDetachedLane`'s shared admission primitive, `max_active=9 > cap=8` on a real
   storm-load test, 1-in-~10 hardware runs, root cause undetermined) has no PR-5 acceptance
@@ -435,6 +521,28 @@ flip, with a red-first test each:
   same-type load. Criterion: PR-5 either resolves #4279 directly or explicitly re-assesses it
   against the landed K-bound logic and records the outcome here, rather than leaving it to drift
   as an unrelated open issue.
+- **NEW (added 2026-09-14, discovered during rung 9c PR-5a's own cs-103 tombstone-reachability
+  investigation)**: #4354, `publish_arm_verdicts_locked`'s ordinary (non-firewall) pop loop
+  (`guardian_spark_runtime.cpp:580-601`) pops every claim in `finished` on outcome presence and
+  fifo-front identity alone - it never checks whether that claim's index release actually
+  succeeded. The one release attempt for a withdrawn sibling happens earlier, exactly once, in
+  `on_arm_complete`'s own "claims that were withdrawn/abandoned while their siblings adopted"
+  loop (`:911-913`); nothing retries it. A failure there (reproduced via a `[.exploratory]` test
+  in `tests/unit/test_guardian_spark_runtime.cpp`, PR-5a) leaves a permanent ghost
+  `SparkKeyRuleIndex` entry with no `claims_[key]` residue at all - unlike up-2/up-101's
+  tombstones, no existing sweep can ever find it. Consequence, confirmed empirically: the ghost
+  permanently blocks `keys_[key]`'s own erasure (even after the last real rule on that key is
+  properly detached, `detach_rule_locked`'s `index_->remove_rule` keeps reporting "siblings
+  remain"), leaking the real backend subscription; a LATER, unrelated rule attaching to the same
+  key then silently inherits that stale, never-reverified subscription via the "reuse existing
+  shared watcher" path, with no new `arm()` call. Same production-reachability status as every
+  other criterion in this list - `release_claim_index_locked`'s real `erase_rule` call is
+  internally noexcept/allocation-free, so this is reachable only via the
+  `set_index_remove_fault_for_test` seam today, not live - but structurally real, and worse in
+  consequence (a permanent leak plus silent stale-subscription reuse, not just delayed cleanup)
+  than anything else named here. Criterion: give the ordinary pop loop the same release-success
+  check the firewall branch already has (the cs-2 fix, `:602-620`), or an equivalent guarantee
+  that a release-failed sibling is retained rather than silently popped, before the flip.
 
 ## 4. #2340 scenario contract
 

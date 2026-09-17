@@ -65,8 +65,19 @@ constexpr std::string_view kCompliance[] = {
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
     "get_policy_agent_statuses"}; // #4034
 constexpr std::string_view kScope[] = {"validate_scope", "preview_scope_targets"};
+// B4 (#2146 API-parity) adds Create/Read/Update/membership/role management-
+// group tools to this family (create/get/update/add_member/list_roles/
+// assign_role) — same domain, same securable, no reason for a separate family.
+// Delete-class management-group operations (delete group, remove member,
+// unassign role) have no MCP twin yet.
 constexpr std::string_view kMgmtGroups[] = {"list_management_groups",
-                                            "preview_management_group_agent_count"};
+                                            "preview_management_group_agent_count",
+                                            "create_management_group",
+                                            "get_management_group",
+                                            "update_management_group",
+                                            "add_management_group_member",
+                                            "list_management_group_roles",
+                                            "assign_management_group_role"};
 constexpr std::string_view kApprovals[] = {"list_pending_approvals", "approve_request",
                                            "reject_request"};
 constexpr std::string_view kDexSignals[] = {
@@ -85,8 +96,12 @@ constexpr std::string_view kExecution[] = {"execute_instruction", "execute_bundl
 constexpr std::string_view kRemediation[] = {"quarantine_device"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
+// B5 (api-parity #2146): export_ca_root_csr joins too — same PKI/CA domain,
+// same Security securable, distinct from the "Offload targets" family below
+// despite both being new in this same PR.
 constexpr std::string_view kCerts[] = {"list_issued_certs", "revoke_certificate",
-                                       "issue_code_signing_cert"};
+                                       "issue_code_signing_cert", "export_ca_root_csr",
+                                       "import_ca_chain"};
 // KEK rotation (#2395 track C) is its own family, distinct from Certificates:
 // a KEK is the server's own secrets-at-rest encryption key, not a PKI
 // certificate, and it gates on a different lifecycle (rotate/rewrap/status,
@@ -115,9 +130,16 @@ constexpr std::string_view kEnginePrincipals[] = {
 constexpr std::string_view kAccessReviews[] = {"export_access_review", "open_access_review",
                                                "record_attestation", "get_access_review",
                                                "list_access_reviews", "close_access_review"};
-// Human API-token rotation (P2 #11, SOC 2 CC6.3) — self-service, own family
-// distinct from Engine principals: no admin/approval gate, owner-only.
-constexpr std::string_view kApiTokens[] = {"rotate_api_token", "confirm_api_token_rotation"};
+// Human API-token lifecycle (P2 #11, SOC 2 CC6.3 rotation; B4 #2146 API-parity
+// adds list/create/revoke) — own family distinct from Engine principals. List/
+// create/rotate/confirm are self-service ONLY (mint/list/rotate always act on
+// the calling principal's own tokens, never an admin-for-another-user path);
+// revoke ADDITIONALLY allows an elevated/admin session to act on another
+// user's token (the one asymmetry in this family — see revoke_api_token's own
+// tool description for the exact posture).
+constexpr std::string_view kApiTokens[] = {"rotate_api_token", "confirm_api_token_rotation",
+                                           "list_api_tokens", "create_api_token",
+                                           "revoke_api_token"};
 constexpr std::string_view kAgenticHelpers[] = {"get_fleet_posture_fast",
                                                 "classify_operational_question",
                                                 "get_incident_playbook", "summarize_working_set"};
@@ -200,8 +222,39 @@ constexpr std::string_view kExecutionStatistics[] = {"get_execution_statistics",
 // agents" (a machine/process/socket topology snapshot is a different data
 // model from an agent roster row).
 constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_host_topology"};
+// B4 (#2146 API-parity) — no existing family covers a self-check "can I do X"
+// RBAC read; own family, distinct from Discovery's discover_permissions (the
+// whole catalog + role grid) and from Engine principals' assign/unassign/
+// list_engine_roles (grant AUTHORING, not a self-check).
+constexpr std::string_view kRbacCheck[] = {"check_permission"};
+// B4 — no existing family covers local-account lockout lifecycle; own family,
+// distinct from Directory & identity (AD/Entra sync, a different identity
+// axis) and from Engine principals (a different principal class entirely).
+constexpr std::string_view kAccountLockout[] = {"unlock_account"};
+// B5 (api-parity #2146) — response-offload targets (event-forwarding
+// webhooks). Own family: distinct securable (Infrastructure, same as several
+// others, but a distinct operator mental model) and no prior MCP presence.
+// export_ca_root_csr joins Certificates (same PKI domain as
+// list_issued_certs/revoke_certificate/issue_code_signing_cert), not this
+// family, despite both being CA-adjacent — see kCerts below.
+constexpr std::string_view kOffloadTargets[] = {
+    "list_offload_targets", "create_offload_target", "get_offload_target",
+    "delete_offload_target", "list_offload_target_deliveries"};
+// B5 — platform license lifecycle. LicenseStore is dormant on `dev`
+// (ADR-0048) — see mcp_server.hpp's forward-declaration comment — so this
+// family answers "unavailable" in production today, same posture as its
+// REST siblings.
+constexpr std::string_view kLicense[] = {"get_platform_license", "activate_platform_license",
+                                         "list_license_alerts"};
+// B5 — software-package fleet deployments. SoftwareDeploymentStore is
+// dormant on `dev` (ADR-0051) — same posture note as kLicense above. No
+// start_software_deployment tool (MFA step-up, non-interactive MCP tokens
+// cannot satisfy it) — see the tool family's own per-tool doc comments.
+constexpr std::string_view kSoftwareDeployments[] = {
+    "list_software_deployments", "create_software_deployment",
+    "rollback_software_deployment", "cancel_software_deployment"};
 
-constexpr std::array<ToolFamily, 33> kFamilies{{
+constexpr std::array<ToolFamily, 38> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
     {"Instructions & schedules", "instruction definitions, their full export, and recurring "
@@ -220,7 +273,10 @@ constexpr std::array<ToolFamily, 33> kFamilies{{
                     "(from a pre-computed list, an inventory query, a TAR SQL dispatch, or an "
                     "instruction-result dispatch); walk their lineage",
      kResultSets},
-    {"Management groups", "the hierarchical device grouping used for access scoping", kMgmtGroups},
+    {"Management groups",
+     "the hierarchical device grouping used for access scoping — list/create/get/update groups, "
+     "manage static membership, and delegate group-scoped Operator/Viewer roles",
+     kMgmtGroups},
     {"Approvals", "list pending approvals and approve/reject maker-checker tickets", kApprovals},
     {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
      kDexSignals},
@@ -246,8 +302,9 @@ constexpr std::array<ToolFamily, 33> kFamilies{{
      kEnginePrincipals},
     {"Access reviews", "open, attest, close, and export SOC 2 access-certification reviews",
      kAccessReviews},
-    {"API tokens", "self-service overlap-pair rotation of your own API tokens (owner-only, "
-                   "no admin/approval gate)",
+    {"API tokens", "list/create/revoke/rotate your own API tokens (self-service; revoke "
+                   "additionally allows an elevated admin session to act on another user's "
+                   "token)",
      kApiTokens},
     {"Agentic helpers", "high-level workflow helpers: fast posture, classification, playbooks",
      kAgenticHelpers},
@@ -273,6 +330,19 @@ constexpr std::array<ToolFamily, 33> kFamilies{{
     {"Fleet visualization", "3D fleet topology snapshot -- per-machine processes, "
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
+    {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
+                        "permission",
+     kRbacCheck},
+    {"Account lockout", "clear a local account's failed-login lockout counter (SOC 2 CC6.3)",
+     kAccountLockout},
+    {"Offload targets", "configure event-forwarding webhook targets and inspect their delivery "
+                        "history",
+     kOffloadTargets},
+    {"Platform license", "the active platform license, activation, and lifecycle alerts",
+     kLicense},
+    {"Software deployments", "software-package fleet deployment lifecycle (list, create, "
+                             "rollback, cancel)",
+     kSoftwareDeployments},
 }};
 
 }  // namespace

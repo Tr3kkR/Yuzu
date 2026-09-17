@@ -33,3 +33,46 @@ TEST_CASE("interaction rows split into exactly key + value", "[result_parsing]")
     CHECK(split_fields("interaction", "response|yes | no maybe") ==
           std::vector<std::string>{"response", "yes | no maybe"});
 }
+
+// ── cell_hint_for (#4187) ────────────────────────────────────────────────
+
+TEST_CASE("cell_hint_for returns the autoruns enabled=unknown hint for an "
+          "autorun row's field 7",
+          "[result_parsing]") {
+    const std::vector<std::string> fields = {
+        "autorun", "lnx_systemd_timers_user", "1", "/etc/systemd/system/foo.timer",
+        "foo.timer", "", "", "unknown", "user", "alice", "not_checked", "0"};
+    const auto hint = cell_hint_for("autoruns", fields, 7);
+    CHECK_FALSE(hint.empty());
+    CHECK(hint.find("not the same as disabled") != std::string_view::npos);
+}
+
+TEST_CASE("cell_hint_for returns empty for a non-unknown enabled value",
+          "[result_parsing]") {
+    std::vector<std::string> fields = {
+        "autorun", "win_run_hklm", "1", "loc", "entry", "target", "args",
+        "enabled", "system", "-", "not_checked", "0"};
+    CHECK(cell_hint_for("autoruns", fields, 7).empty());
+}
+
+TEST_CASE("cell_hint_for returns empty for a source| row -- the row_kind guard, "
+          "since source| and autorun| rows share one stream and field 7 there "
+          "is not the enabled column at all",
+          "[result_parsing]") {
+    std::vector<std::string> fields = {"source", "win_run_hklm", "supported", "0", "ok"};
+    CHECK(cell_hint_for("autoruns", fields, 7).empty());
+}
+
+TEST_CASE("cell_hint_for returns empty for a different plugin's field 7, even if "
+          "its value happens to be the literal string 'unknown'",
+          "[result_parsing]") {
+    std::vector<std::string> fields = {"autorun", "x", "x", "x", "x", "x", "x", "unknown"};
+    CHECK(cell_hint_for("not_autoruns", fields, 7).empty());
+}
+
+TEST_CASE("cell_hint_for is safe against a field_index past the end of a short "
+          "fields vector",
+          "[result_parsing]") {
+    const std::vector<std::string> fields = {"autorun"};
+    CHECK(cell_hint_for("autoruns", fields, 7).empty());
+}

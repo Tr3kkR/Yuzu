@@ -12,6 +12,7 @@
  */
 
 #include "authz_gates.hpp"
+#include "compliance_api_local.hpp" // make_local_compliance_api — ADR-0031 WS-A4
 #include "compliance_routes.hpp"
 #include "pg/pg_pool.hpp"
 #include "policy_store.hpp"
@@ -67,7 +68,11 @@ struct ComplianceHarness {
     /// that), but a test can pass a REAL, live-Postgres-backed PolicyStore
     /// (see `policy_store_tpl` below) to exercise query parsing, pagination,
     /// and the audit fail-closed path end to end — the one thing the
-    /// null-store harness can never reach.
+    /// null-store harness can never reach. ADR-0031 WS-A4: routes now
+    /// consume the store-free ComplianceApi seam, so a non-null store is
+    /// wrapped in `make_local_compliance_api` before registration; a null
+    /// store leaves the seam nullptr, matching the pre-seam null-store
+    /// degrade path exactly.
     explicit ComplianceHarness(PolicyStore* policy_store = nullptr) {
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -85,8 +90,6 @@ struct ComplianceHarness {
             audit_calls.push_back({action, result, target_type, target_id, detail});
             return audit_ok;
         };
-        auto emit_fn = [](const std::string&, const httplib::Request&, const nlohmann::json&,
-                          const nlohmann::json&) {};
         auto agents_json_fn = []() -> std::string { return "[]"; };
         ComplianceRoutes::FleetReadFn fleet_read_fn =
             [this](const httplib::Request&, httplib::Response& res, const std::string&,
@@ -100,8 +103,11 @@ struct ComplianceHarness {
             return {true, fleet_scope};
         };
 
-        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, policy_store,
-                               agents_json_fn, /*policy_evaluator=*/nullptr, /*metrics=*/nullptr,
+        ComplianceRoutes::ComplianceApiPtr api;
+        if (policy_store)
+            api = make_local_compliance_api(*policy_store);
+
+        routes.register_routes(sink, auth_fn, perm_fn, audit_fn, api, agents_json_fn,
                                std::move(fleet_read_fn));
     }
 };

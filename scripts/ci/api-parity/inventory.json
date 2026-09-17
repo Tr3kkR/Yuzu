@@ -44,6 +44,14 @@
   },
   {
     "method": "GET",
+    "path": "/fragments/inventory/software/devices",
+    "capability_id": "get.fragments-inventory-software-devices",
+    "rest_v1_twin": null,
+    "mcp_twin": null,
+    "status": "planned:#2146"
+  },
+  {
+    "method": "GET",
     "path": "/fragments/inventory/software/versions",
     "capability_id": "get.fragments-inventory-software-versions",
     "rest_v1_twin": null,

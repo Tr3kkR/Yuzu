@@ -169,6 +169,20 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (securable_type == "UserManagement" && operation == "Write") return true;
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
 
+        // ApiToken:Write (create_api_token / POST /api/v1/tokens) gates here too
+        // (gov security-guardian finding, #2146 B4 fix round): minting a NEW
+        // credential is a genuinely different risk shape from ApiToken:Rotate
+        // below -- it can set an arbitrary `expires_at` (including 0/perpetual)
+        // and `mcp_tier`/`scope_service` up to the caller's own authority, none
+        // of which is inherited/pinned from a predecessor the way rotation's
+        // successor is. Before this entry, a supervised MCP token -- and, since
+        // this rule is shared by AuthRoutes::require_permission, an equally-
+        // tiered REST caller of POST /api/v1/tokens -- could self-mint a fresh,
+        // untiered, non-expiring bearer token with no human in the loop and no
+        // MFA step-up (unlike the dashboard's own token-creation form). Adding
+        // it here closes both transports via the one shared policy table.
+        if (securable_type == "ApiToken" && operation == "Write") return true;
+
         // ApiToken:Rotate is DELIBERATELY ABSENT — recorded here rather than
         // left silent-by-omission (PR #2974 review).
         //

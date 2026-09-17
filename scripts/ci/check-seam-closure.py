@@ -6,7 +6,7 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers exactly one family, `network` (see FAMILIES below).
+covers three families — `network`, `verify`, `compliance` (see FAMILIES below).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -25,7 +25,7 @@ That implication only breaks two ways, both ACKNOWLEDGED and NOT caught here:
      header - the closure walk never sees the real header because the code
      never asked for it, yet the call still resolves at link time.
 
-Neither shape exists in the family this script covers today; if one is ever
+Neither shape exists in any family this script covers today; if one is ever
 introduced, this check will pass while the seam is actually broken. That is a
 known, stated gap - not a silent one.
 
@@ -77,16 +77,17 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks exactly the `network` family's dashboard
-(`network_ui.cpp`), REST-route (`network_routes.cpp`), and model
-(`network_perf_model.cpp`) translation units, plus the in-process API header
-(`network_api.hpp`) the sibling INV-31-4 change is introducing beside them.
-The network family's REST-handler TWIN registrations live inside
-`rest_api_v1.cpp`, and its MCP-tool twin inside `mcp_server.cpp` - BOTH are
+FAMILY COVERAGE: today this checks three families — `network`, `verify` and
+`compliance` — each contributing its dashboard/UI, REST-route (or seamed routes)
+and model translation units, plus the abstract in-process API header and (since
+#4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
+set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
+live inside `rest_api_v1.cpp` (or the family's own routes TU), and its MCP-tool
+twin inside `mcp_server.cpp` - BOTH are
 multi-family translation units that legitimately hold real store access for
 ~20 OTHER families each. An include-closure check applied to either whole
 file would trivially fail (or be gamed by scoping) and would say nothing
-meaningful about the network family specifically. Those two files' network
+meaningful about a given family specifically. Those two files' per-family
 sections are therefore INSPECTED-NOT-ENFORCED - reviewed by hand today, not
 gated by this script - until a block-scoped or symbol-scoped successor
 exists. Do not read a clean run of this script as covering them.
@@ -161,8 +162,8 @@ FORBIDDEN_HEADER_PATTERNS = [
 ]
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Two families so far: `network` (WS-A4 item 1's pilot) and `verify` (WS-A4
-# #4250, the SECOND family through the seam). Each set covers the
+# Three families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# #4250, the SECOND family) and `compliance` (the THIRD). Each set covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -197,6 +198,21 @@ FAMILIES = {
             "server/core/src/verify_ui.cpp",
             "server/core/src/verify_api.hpp",
             "server/core/src/verify_api_local.hpp",
+        ],
+    },
+    # `compliance` (ADR-0031 WS-A4, the THIRD family through the seam). The
+    # read/presentation surface (`compliance_routes.cpp` + dashboard fragments,
+    # `compliance_ui.cpp`) consumes the store-free `ComplianceApi` seam; the
+    # policy/fragment MUTATORS (no public REST/MCP twin — INV-31-4) live in
+    # `policy_admin_routes.*`, deliberately OUTSIDE this enforced set (see that
+    # file's banner). `compliance_model.cpp` is the family's pure model TU.
+    "compliance": {
+        "tus": [
+            "server/core/src/compliance_routes.cpp",
+            "server/core/src/compliance_ui.cpp",
+            "server/core/src/compliance_model.cpp",
+            "server/core/src/compliance_api.hpp",
+            "server/core/src/compliance_api_local.hpp",
         ],
     },
 }

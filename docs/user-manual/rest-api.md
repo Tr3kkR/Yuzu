@@ -298,6 +298,7 @@ Derived directly from `server/core/src/body_cap_policy.hpp`'s `kBodyCapTable` (l
 | POST | `/api/instructions/yaml` | 3076 KiB | `instruction_yaml` | † The handler checks the FORM-DECODED `yaml_source` field at 1048576 chars (`instruction_yaml.cpp:165`); 3× worst-case percent-encoding of that value, plus 4 KiB flat headroom for field-name framing and the `id` field (save only). |
 | POST | `/api/instructions/validate-yaml` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
 | POST | `/fragments/instructions/yaml-preview` | 3076 KiB | `instruction_yaml` | † Same check, same margin — see above. |
+| any | `/api/v1/hardware` | 4 KiB | `hardware` | The third `requires_measurable=true` class. Only `POST .../sync` carries a body (a single short `source` enum token); the bodyless `GET /api/v1/hardware` and `GET /api/v1/hardware/{id}` list/record routes share the class rather than falling to the 4 MiB catch-all. |
 | any (catch-all) | *(empty prefix — matches everything not listed above)* | 4 MiB | `default` | Applies to ordinary JSON/form mutation routes not called out individually. |
 
 † = a reasoned margin over a real, cited handler-level check — the pre-routing gate sees the RAW body while the handler checks a DECODED/PARSED value (form-decoded, JSON-unescaped, or multipart-extracted), so the two numbers are never expected to match exactly. Reasoned headroom, not a measured worst case; getting the margin wrong rejects legitimate traffic (the `tar_dashboard_sql`/`tar_result_set_sql` history above is a shipped example).
@@ -5443,7 +5444,7 @@ Returns the OpenAPI/Swagger specification for the v1 API as JSON.
 
 Agentic-first discovery family (roadmap Issue 17.1, `docs/agentic-first-principle.md` §A2): "an agentic worker should be able to learn what is possible from the live server alone, without a side-channel doc fetch." Like `GET /api/v1/openapi.json` above, every endpoint here is **authenticated** and gates `Infrastructure:Read` (`/discover/instructions` gates `InstructionDefinition:Read` instead). Each response body IS the catalog object directly — no `data`/`meta` envelope wrapper, matching the `GET /api/v1/guaranteed-state/schemas` discovery precedent this family is modeled on.
 
-All six share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds` and `plugin-docs` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs` instead. REST and MCP share the same builder functions internally, so they cannot drift from each other.
+All seven share the same revalidation contract: a content-derived `ETag` header; send `If-None-Match: <etag>` to get a cheap `304 Not Modified` instead of re-downloading. `instructions`, `routes`, `scope-kinds`, `plugin-docs` and `plugin-docs/{name}` are `Cache-Control: public, max-age=300`; `permissions` and `plugins` are `private` with a `Vary` header because their bodies depend on the caller. Five are mirrored as read-only MCP tools of the same name (`discover_permissions`, `discover_instructions`, `discover_routes`, `discover_scope_kinds`, `discover_plugins`); `/discover/plugin-docs` is mirrored as the MCP resource `yuzu://plugin-docs`, and `/discover/plugin-docs/{name}` as the MCP resource template `yuzu://plugin-docs/{name}` (`resources/templates/list`). REST and MCP share the same builder functions internally, so they cannot drift from each other.
 
 #### `GET /api/v1/discover/permissions`
 
@@ -5612,7 +5613,7 @@ An action carries an inline `parameter_schema` **only** when it has a published 
 
 > **Consumer note:** this catalog is now `"version": 3` (was `1`; v2 added the inline `parameter_schema` and top-level `actions_enriched_with_schema` fields). The revision is additive; treat `version` as a **minimum** (`>= 1`), not `== 1`, so future additive revisions do not break your client.
 
-Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). The full manifest is the endpoint below.
+Each plugin entry also carries `docs`: a build-embedded documentation summary `{summary, kind, platforms, readme, resource}` (`kind` = `{collector, mutating, gathered}`) when the plugin has adopted the README standard (`docs/plugin-readme-standard.md`), or an explicit `null` when it has not (catalog `version` 2 → 3). `resource` names the per-plugin endpoint below (or the MCP resource template of the same shape). The full manifest is that endpoint, or the whole-catalog one above it.
 
 #### `GET /api/v1/discover/plugin-docs`
 
@@ -5658,6 +5659,18 @@ Per-plugin documentation as data: one manifest per agent plugin that has adopted
 ```
 
 Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as `/discover/scope-kinds` (the body is identical for every caller). `inputs[]` entries carry `{definition_id, name, type, required, default, constraints, description}`, where `constraints` is the parameter's DSL `validation` object or `null`; the key set of each manifest is the "Manifest schema" table in `docs/plugin-readme-standard.md`, which the docs suite binds to the generator.
+
+#### `GET /api/v1/discover/plugin-docs/{name}`
+
+One plugin's manifest, narrower than the whole-catalog route above (#4108) — the exact same object the catalog carries at `plugins[]` for that name, byte-identical. Same `manifest_by_name` builder as the catalog and as the MCP resource template `yuzu://plugin-docs/{name}`, so all three cannot drift from each other. The permission gate runs BEFORE the name lookup, so a caller without `Infrastructure:Read` learns nothing about which plugin names exist.
+
+**Permission:** `Infrastructure:Read`
+
+**Response:** the single manifest object shown above for `disk_actions` (same key set, no wrapping envelope — no `catalog`/`version`/`plugins[]`).
+
+**Errors:** `404` (A4 envelope) when no manifest documents that name.
+
+Same ETag / `Cache-Control: public, max-age=300` / `If-None-Match` → `304` contract as the catalog route.
 
 ---
 
@@ -7019,6 +7032,7 @@ List license alerts (expiration warnings, seat limit approaching, etc.).
   "data": [
     {
       "id": "alert-001",
+      "license_id": "lic-001",
       "alert_type": "expiration_warning",
       "message": "License expires in 30 days",
       "triggered_at": 1711900800,
@@ -9821,7 +9835,8 @@ JSON-RPC 2.0 endpoint for MCP tool calls, resource reads, and prompt requests.
 | `tools/list` | List available MCP tools for the current tier |
 | `tools/call` | Invoke an MCP tool by name with arguments |
 | `resources/list` | List available MCP resources |
-| `resources/read` | Read an MCP resource by URI |
+| `resources/templates/list` | List available MCP resource templates |
+| `resources/read` | Read an MCP resource by URI, or a resource template with a parameter substituted |
 | `prompts/list` | List available MCP prompts |
 | `prompts/get` | Get a prompt template by name |
 

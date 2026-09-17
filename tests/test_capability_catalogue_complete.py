@@ -6,9 +6,9 @@ The capability catalogue (`server/core/src/command_capability.hpp`'s
 sources: seven per-plugin-group fragment headers
 (`capability_decls/plugin_action_catalogue_{content_dist,a,b,c,d,disk_actions,filesystem_posture}.hpp`,
 each owned by a different package) plus the core-owned
-`capability_decls/core_dispatch_capabilities.hpp` (the three
+`capability_decls/core_dispatch_capabilities.hpp` (the four
 system-initiated dispatches a plugin never receives from a caller —
-`tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`). Nobody
+`tar.fleet_snapshot`, `__guard__.push_rules`, `asset_tags.sync`, `__sync__.now`). Nobody
 mechanically checks that these eight sources, taken together, actually match
 what the plugins declare via their `actions()` override. This script is
 that check.
@@ -79,6 +79,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
 ]
 CORE_FILE = "server/core/src/capability_decls/core_dispatch_capabilities.hpp"
 

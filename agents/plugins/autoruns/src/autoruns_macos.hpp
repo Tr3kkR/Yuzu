@@ -25,6 +25,7 @@
 #include <expected>
 #include <optional>
 #include <span>
+#include <string_view>
 
 #if defined(__APPLE__)
 #include <yuzu/agent/scoped_cfref.hpp>
@@ -56,6 +57,42 @@ enum class PlistError { unparseable };
 /// Portable (plain errno arithmetic, no CF dependency) so it is testable
 /// without an Apple-only build.
 inline bool is_benign_absent_errno(int err) noexcept { return err == ENOENT; }
+
+/// `errno` from a failed `open`/`openat`/`fdopendir` on a directory this leg
+/// walks -> a stable reason token for a `constrained` source status. Only
+/// called once the caller has already ruled out is_benign_absent_errno --
+/// there is no "absent" case here, every value is a real constraint.
+/// Portable (plain errno arithmetic, no CF dependency) so it is testable
+/// without an Apple-only build.
+inline std::string_view dir_open_constraint_token(int err) noexcept {
+    switch (err) {
+        case EACCES: return "permission_denied";
+        case ELOOP: return "symlink_refused";
+        case ENOTDIR: return "not_a_directory";
+        default: return "dir_open_failed";
+    }
+}
+
+/// `errno` from a failed `fstat`/`fstatat` metadata read on a directory
+/// entry this leg is walking (issue #4241) -> a stable reason token, or
+/// nullopt when the failure is benign (ENOENT: the entry vanished between
+/// listing and the stat call -- a race, not a real acquisition failure,
+/// matching is_benign_absent_errno's own absence contract). A non-benign
+/// failure must never be silently folded into "this entry contributed
+/// nothing" (AC4: failure != empty) -- the caller routes a non-nullopt
+/// result through its constraint accumulator. Distinct token set from
+/// dir_open_constraint_token: ENOTDIR does not apply (the entry's own type
+/// was never assumed before the stat call), so any other errno maps to the
+/// generic "stat_failed" rather than reusing "dir_open_failed". Portable,
+/// same reason as dir_open_constraint_token above.
+inline std::optional<std::string_view> stat_constraint_token(int err) noexcept {
+    if (is_benign_absent_errno(err)) return std::nullopt;
+    switch (err) {
+        case EACCES: return "permission_denied";
+        case ELOOP: return "symlink_refused";
+        default: return "stat_failed";
+    }
+}
 
 #if defined(__APPLE__)
 

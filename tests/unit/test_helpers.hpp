@@ -223,6 +223,32 @@ inline constexpr int kSpinScale =
     return pred();
 }
 
+/// RAII cleanup that also runs on exception unwind - a failing REQUIRE/CHECK mid-test
+/// still runs `f` before the enclosing scope's other locals destruct. Declare AFTER
+/// whatever `f` releases/reads so it destructs FIRST on any exit path (reverse
+/// declaration order). `f` must not throw (it may run during unwind, where a second
+/// exception would terminate) - use CHECK, never REQUIRE, inside it. Promoted from
+/// test_thread_pool.cpp once a second file needed it (test_guardian_outbox_send_executor.cpp,
+/// #4223) - see docs/testing/unit-test-conventions.md's "Exception-safe test cleanup" entry.
+/// Non-copyable AND non-movable (governance Gate 3 quality-engineer finding on the
+/// promotion, corrected at Gate 4 unhappy-path review - deleting the copy ops plus a
+/// user-declared destructor suppresses the IMPLICIT move ops too, rather than making
+/// this move-only; no explicit move is declared, so it stays non-movable). Neither
+/// property is needed by either current consumer (both construct in place, never
+/// move/return one). Both current consumers' cleanup is idempotent, but a copy would
+/// double-run `f` on scope exit of each copy, which is silently wrong for a
+/// non-idempotent cleanup a future consumer might wrap (close/delete/free).
+template <typename F> struct ScopeExit {
+    explicit ScopeExit(F fn) : f(std::move(fn)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() { f(); }
+
+private:
+    F f;
+};
+template <typename F> ScopeExit(F) -> ScopeExit<F>;
+
 #if defined(YUZU_TEST_ENABLE_PG)
 
 /// ── Postgres test support (#1320 PR 1) ──────────────────────────────────

@@ -387,7 +387,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.2 Windows Installer (MSI) Package Inventory :white_check_mark: `T1`
 
-`msi_packages` plugin (Windows MSI / macOS pkgutil).
+`msi_packages` plugin (Windows MSI / macOS pkgutil). Distinct from `windows_optional_features`: MSI inventories installed software packages, `windows_optional_features` reports the state of built-in Windows OS features (DISM) — neither reads the other's data.
 
 ### 7.3 SCCM Integration :white_check_mark: `T2`
 
@@ -504,7 +504,20 @@ this claim describes is real in the source. Claim holds.)*
 
 `firewall` plugin (cross-platform). macOS `state` reports the Application
 Firewall (`socketfilterfw --getglobalstate`) as the primary signal, with the
-pf packet filter demoted to a secondary row; `rules` lists pf rules.
+pf packet filter demoted to a secondary row; `rules` lists pf rules. Both
+actions also read the unprivileged per-app allow/block list
+(`socketfilterfw --listapps`) on `rules`, and the root-only pf anchor list
+(`pfctl -s Anchors`) and rule count (`pfctl -s rules`) on both actions —
+each degrading to no anchor rows / `ruleset|unknown` rather than a false
+answer when the read is refused or incomplete. Windows adds a `ruleset|<n>`
+row on both actions via `INetFwRules::get_Count` — `state`'s is the true
+policy-wide total, `rules`' is the count of rows actually emitted that call
+(capped at 100), a distinct number from `state`'s. Linux probes a fixed
+backend ladder — firewalld (sd-bus) → nftables (netlink, kernel-origin-
+verified via `nl_pid == 0`) → ufw → iptables — stopping at the first that
+answers; a refused or partial read reports `unknown`, never a false-safe
+guess, and each backend emits its own `ruleset|<n>` rule count (or
+`ruleset|unknown` on an incomplete/refused read).
 
 ### 9.3 Disk Encryption Status :white_check_mark: `T1`
 
@@ -1573,6 +1586,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
 | wmi | Y | - | - | System Config |
+| windows_optional_features | Y | - | - | System Config |
 | script_exec | Y | Y | Y | Execution |
 | content_dist | Y | Y | Y | Content Dist |
 | http_client | Y | Y | Y | Content Dist |
