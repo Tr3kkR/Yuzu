@@ -382,6 +382,11 @@ TEST_CASE("build_agent_push: a repeated attempt against the same poisoned row "
     // the only state that survives across calls is the process-wide, bounded
     // (kCapacity-many rule_ids) RuleExclusionSampler used to pace the
     // exclusion log line, which does not affect this test's assertions.
+    // NOTE: this TEST_CASE reuses the literal rule_id "poisoned", also used
+    // by the earlier "a rule nested past the depth guard is excluded" case in
+    // this file - harmless today since neither asserts on log cadence for it,
+    // but a future test asserting should_log()/log-line behavior for either
+    // must pick a distinct rule_id or account for the shared g_exclusion_sampler.
     GuaranteedStateRuleRow poisoned = row("poisoned", "windows", "");
     poisoned.spec_json =
         R"({"spark":{"type":"registry-change","params":{}},)"
@@ -578,6 +583,7 @@ TEST_CASE("RuleExclusionSampler: LRU capacity, eviction, and reappearance (#4497
         // least-recently-observed entry) and confound this assertion.
         CHECK_FALSE(sampler.should_log("rule-1"));
         CHECK_FALSE(sampler.should_log("rule-255"));
+        CHECK(sampler.tracked_count_for_test() == kCapacity);
 
         // rule-0 was evicted: encountering it again is a FIRST observation
         // again and logs immediately, even though (had it not been evicted)
@@ -585,6 +591,7 @@ TEST_CASE("RuleExclusionSampler: LRU capacity, eviction, and reappearance (#4497
         // the documented, accepted tradeoff (#4497/#4499): an LRU capacity is
         // NOT a global log-rate limit.
         CHECK(sampler.should_log("rule-0"));
+        CHECK(sampler.tracked_count_for_test() == kCapacity);
     }
 
     SECTION("touching an existing rule refreshes its recency, protecting it from eviction") {
@@ -601,6 +608,65 @@ TEST_CASE("RuleExclusionSampler: LRU capacity, eviction, and reappearance (#4497
         CHECK_FALSE(sampler.should_log("rule-0"));
         // rule-1, now the least-recently-observed entry, was evicted instead.
         CHECK(sampler.should_log("rule-1"));
+    }
+}
+
+TEST_CASE("RuleExclusionSampler: at-capacity paces correctly, kCapacity+1 is a hard "
+          "cliff not a gradual leak (#4497/#4499)",
+          "[guardian_push_builder][sampler][lru]") {
+    // Pins the ACCEPTED LIMITATION's ACTUAL shape (see this class's doc
+    // comment and docs/user-manual/guaranteed-state.md): more than kCapacity
+    // distinct poisoned rules cycling through the cache in a REPEATING order
+    // is not a mild "logs somewhat more often" leak - it is a 0%-suppression
+    // cliff at exactly kCapacity+1. Verified directly against this class
+    // during governance review before this test was added (257 rule_ids, 5
+    // consecutive passes: 257/257 logged on every single pass).
+    constexpr auto kCapacity = guardian::RuleExclusionSampler::kCapacity;
+
+    SECTION("at exactly kCapacity, stable-order cycling paces correctly across passes") {
+        guardian::RuleExclusionSampler sampler;
+        std::chrono::steady_clock::time_point now{};
+        sampler.set_clock_for_test([&now] { return now; });
+
+        std::vector<std::string> rules;
+        for (std::size_t i = 0; i < kCapacity; ++i)
+            rules.push_back("cap-rule-" + std::to_string(i));
+
+        for (auto& r : rules)
+            CHECK(sampler.should_log(r));  // pass 0: every rule is a first observation
+
+        for (int pass = 0; pass < 3; ++pass) {
+            std::size_t logged = 0;
+            for (auto& r : rules)
+                if (sampler.should_log(r))
+                    ++logged;
+            INFO("pass " << pass);
+            // None evicted at exactly kCapacity, so every rule stays cached
+            // and within its own 60s window: nothing re-logs.
+            CHECK(logged == 0);
+        }
+    }
+
+    SECTION("at kCapacity+1, stable-order cycling is a 0%-suppression cliff") {
+        guardian::RuleExclusionSampler sampler;
+        std::chrono::steady_clock::time_point now{};
+        sampler.set_clock_for_test([&now] { return now; });
+
+        std::vector<std::string> rules;
+        for (std::size_t i = 0; i < kCapacity + 1; ++i)
+            rules.push_back("cliff-rule-" + std::to_string(i));
+
+        for (int pass = 0; pass < 5; ++pass) {
+            std::size_t logged = 0;
+            for (auto& r : rules)
+                if (sampler.should_log(r))
+                    ++logged;
+            INFO("pass " << pass);
+            // Every rule evicts its predecessor's slot right before that
+            // predecessor's own next turn in the SAME pass, so EVERY rule
+            // logs on EVERY pass - not "somewhat more often than 60s".
+            CHECK(logged == rules.size());
+        }
     }
 }
 

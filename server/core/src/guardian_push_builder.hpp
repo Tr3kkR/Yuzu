@@ -144,8 +144,11 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
 //   - Every exclusion (permitted or suppressed) refreshes that rule_id's LRU
 //     recency; only a PERMITTED exclusion advances its logging deadline.
 //   - Inserting a rule_id beyond kCapacity evicts the least-recently-OBSERVED
-//     entry (not least-recently-logged - the two coincide, since every
-//     observation, permitted or not, is what moves an entry to the front).
+//     entry, NOT the least-recently-PERMITTED-TO-LOG one - the two differ in
+//     general: every observation, permitted or not, splices an entry to the
+//     front, so a rule under continuous exclusion pressure stays "hot" (never
+//     evicted) even while its own log line stays silenced by kRepeatInterval.
+//     Eviction happens only when a rule_id stops being observed entirely.
 //     An evicted rule_id subsequently encountered is therefore treated as a
 //     fresh first-observation and logs immediately again.
 //   - This deliberately fixes #4497's OTHER symptom too (throughput-scaling
@@ -157,9 +160,17 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
 // tradeoff, not a gap): a 256-entry LRU is bounded PER-RULE pacing, not a
 // GLOBAL log-rate limit. Two cases are explicitly out of scope:
 //   (1) a stable set of MORE than kCapacity distinct poisoned rules cycling
-//       through the cache evicts and re-admits entries, so a rule can log
-//       more often than once per kRepeatInterval if enough OTHER distinct
-//       rules are also poisoned at the same time;
+//       through the cache IN A REPEATING ORDER is a HARD CLIFF, not a mild
+//       leak: at exactly kCapacity+1 such rules, every rule is evicted right
+//       before its own next turn in the SAME pass that re-admits it, so
+//       EVERY rule logs on EVERY pass - a 0% suppression rate, not merely
+//       "somewhat more often than once per kRepeatInterval". Verified
+//       directly against this class (see test_guardian_push_builder.cpp's
+//       kCapacity+1 cliff test: 257 rule_ids, 5 consecutive passes, 257/257
+//       logged every pass). This is worse in this one regime than the
+//       pre-#4497 shared sampler's 1-in-100 log floor, and is an accepted
+//       design tradeoff (a per-rule backstop for this regime was out of
+//       scope for #4497/#4499) rather than a defect in this class;
 //   (2) a simultaneous first-observation burst across many distinct rules
 //       (all new to the cache at once) is unbounded - every one of them logs
 //       immediately, by design (the point of per-rule keying is that a FIRST
