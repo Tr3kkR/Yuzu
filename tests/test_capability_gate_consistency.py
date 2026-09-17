@@ -89,6 +89,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_filesystem_posture.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_power_health.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_autoruns.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
 ]
@@ -97,10 +98,11 @@ FRAGMENT_FILES = [
 # disk_actions and the trailing 4 is power_health
 # (battery/thermal/power_plan/set_power_plan), both Wave 6.
 # Wave 7 PR7.1: +2 autoruns (list/catalog).
+# Wave 7b PR7b.3: +3 app_usage (summary/last_used/foreground).
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
 # Hardware CI sync-on-demand: +1 core (__sync__.now).
-EXPECTED_TOTAL_ROWS = 201
+EXPECTED_TOTAL_ROWS = 204
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no
