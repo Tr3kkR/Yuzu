@@ -491,12 +491,33 @@ void details_cert_win(yuzu::CommandContext& ctx, std::string_view thumbprint) {
             mark_result_partial(ctx, "cryptoapi:store-enum");
             continue;
         }
-        if (enumeration.location == StoreLocation::kCurrentUser) {
+        bool is_fallback = enumeration.location == StoreLocation::kCurrentUser;
+        if (is_fallback) {
             append_store(fallback, store_name);
             mark_result_partial(ctx, "cryptoapi:store-fallback");
         }
         for (const auto& rec : enumeration.records) {
             if (rec.thumbprint == needle) {
+                if (is_fallback) {
+                    // Disclosed fallback (#4377), same wording and ordering
+                    // as list_certs_win's matching branch: the row about to
+                    // be written came from CurrentUser, not the LocalMachine
+                    // hive this store name normally means -- say so
+                    // immediately before it. README.md and this issue's own
+                    // changelog fragment promise this row for both list and
+                    // details; returning the match without it (as this
+                    // branch previously did) left a caller with no
+                    // output-level signal, only the
+                    // CONSTRAINED/PARTIAL/cryptoapi:store-fallback status
+                    // metadata. Scoped to the matched store only -- the
+                    // no-match path below already has its own combined
+                    // "N store(s) read from CurrentUser" summary line, and
+                    // duplicating a per-store row there would be redundant.
+                    ctx.write_output(std::format(
+                        "not_available|{} store (LocalMachine) could not be opened; rows read "
+                        "from CurrentUser",
+                        store_name));
+                }
                 ctx.write_output(rec.to_row());
                 return;
             }
