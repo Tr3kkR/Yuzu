@@ -1103,6 +1103,7 @@ an InstructionDefinition dispatch: an oversized `instruction_id` or an over-keye
 | `POST /api/v1/result-sets/from-instruction-result` | `instruction_id` over 256 bytes | dispatched | `400` |
 | `POST /api/v1/result-sets/from-instruction-result` | `params` over 32 keys, a key over 256 bytes, or a value over 64 KiB | dispatched | `400` |
 | `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `params` present but not a JSON object (a string, array, or number) | dispatched/re-dispatched with an EMPTY params map, silently discarding it | `400` |
 
 **Who this affects.** Only a caller already sending a field past these bounds - the same bounds
 MCP's equivalent tools have always enforced. No supported flow constructs an `instruction_id` or

@@ -9575,8 +9575,10 @@ void RestApiV1::register_routes(
                       // is_string() first - this one didn't, so a type-mismatched
                       // instruction_id (e.g. a number or object) threw an uncaught
                       // nlohmann::json::type_error -> an unguarded HTTP 500 instead of
-                      // a clean 400, on this file's own #2437-class documented "no
-                      // server-wide exception handler" behavior.
+                      // a clean 400 (this is the #4406 defect class, distinct from the
+                      // #2437-class JSON-depth-guard convention used elsewhere in this
+                      // file - there is no server-wide exception handler, per line
+                      // ~11368's guardian-route comment).
                       std::string instruction_id =
                           (body.contains("instruction_id") && body["instruction_id"].is_string())
                               ? body.value("instruction_id", "")

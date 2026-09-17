@@ -441,9 +441,10 @@ TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    h.post("/api/v1/result-sets/from-tar-query", R"({"sql":12345})", status);
+    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":12345})", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("'sql' is required") != std::string::npos);
 }
 
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
@@ -685,9 +686,12 @@ TEST_CASE("from-instruction-result: a type-mismatched instruction_id is refused 
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     int status = 0;
-    h.post("/api/v1/result-sets/from-instruction-result", R"({"instruction_id":12345})", status);
+    auto j =
+        h.post("/api/v1/result-sets/from-instruction-result", R"({"instruction_id":12345})", status);
     CHECK(status == 400);
     CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("'instruction_id' is required") !=
+          std::string::npos);
 }
 
 TEST_CASE("from-instruction-result: a non-object params is refused with 400, not "
