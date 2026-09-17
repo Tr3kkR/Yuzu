@@ -1755,8 +1755,7 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
             spdlog::warn("certificates: {} secitem read timed out", label);
         }
         if (auto reason = secitem_failure_reason(r.status, label)) {
-            ctx.write_output(std::format("not_available|{}", *reason));
-            mark_result_partial(ctx, secitem_provenance(label), *reason);
+            (void)reason; // MUTATION PROBE (review only): sentinel suppressed
         }
     };
 

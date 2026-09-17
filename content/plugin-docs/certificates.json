@@ -753,7 +753,8 @@
       "changelog.d/3245-certificates-linux-delete-toctou.fixed.md",
       "changelog.d/3246-certificates-bounded-keychain-read.fixed.md",
       "changelog.d/3247-certificates-windows-thumbprint-case.fixed.md",
-      "changelog.d/3406-certificates-login-keychain-argv.changed.md"
+      "changelog.d/3406-certificates-login-keychain-argv.changed.md",
+      "changelog.d/4374-certificates-macos-orchestration-tests.added.md"
     ],
     "definitions": [
       "content/definitions/certificates.yaml"
