@@ -22,8 +22,9 @@ namespace {
 // RuntimeConfigStore entry): the counter always increments, but the log only
 // fires on the first occurrence of a new "episode" or every Nth occurrence
 // within a sustained one, so a persisting poisoned row (this function runs on
-// every heartbeat reconcile, for every connected agent) cannot flood the log
-// for as long as it remains unfixed in the store.
+// both the periodic heartbeat reconcile and the on-demand push fan-out
+// triggered by a rule create/update/dashboard toggle, for every affected
+// agent) cannot flood the log for as long as it remains unfixed in the store.
 constexpr std::uint64_t kExclusionLogSample = 100;
 constexpr std::int64_t kExclusionEpisodeGapSecs = 60;
 
@@ -38,6 +39,12 @@ struct ExclusionSampler {
     std::atomic<std::int64_t> last_ts{0};
 };
 
+// Unlike RuntimeConfigStore's note_read_degrade, this deliberately does NOT
+// also take a MetricsRegistry* and increment a counter itself: the counter
+// increment here has its own always-fires condition (every exclusion, not
+// just sampled ones), so the caller does that separately, right before
+// calling this - a reader porting this pattern elsewhere should not assume
+// the two responsibilities are bundled the way they are in that precedent.
 bool should_log_exclusion(ExclusionSampler& s) {
     const std::int64_t now = now_secs();
     const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
@@ -207,7 +214,8 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
                 spdlog::error(
                     "Guardian push: rule {} ('{}') has spec_json nested past the depth "
                     "guard (max {}); excluding it from this push, cannot be safely parsed",
-                    row.rule_id, onbehalf::sanitize_for_log(row.name, 128),
+                    onbehalf::sanitize_for_log(row.rule_id, 128),
+                    onbehalf::sanitize_for_log(row.name, 128),
                     yuzu::server::mcp::kMcpMaxJsonDepth);
             continue;
         }

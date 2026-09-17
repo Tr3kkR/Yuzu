@@ -2765,11 +2765,14 @@ tests:
           - labels: 'ALERTS{alertname="YuzuInventoryGenericBlobRejectedDepth", alertstate="firing", severity="warning"}'
             value: 1
 
-  # CASE - a flat (never-rejecting) counter stays quiet: RED against dropping
-  # the `> 0` (an `>= 0` form would fire on the healthy pre-seeded-to-zero
-  # series every fleet has at boot).
+  # CASE - a flat/absent counter stays quiet: RED against dropping the `> 0`
+  # (an `>= 0` form would spuriously fire the instant this series is scraped
+  # at all - unlike yuzu_guardian_push_rule_excluded_total, this series has
+  # no boot-time pre-seed call anywhere in the tree, so it is genuinely
+  # ABSENT until the first rejection, not present-at-zero; simulated here as
+  # a flat zero series since promtool's input_series needs a concrete value).
   - interval: 1m
-    name: generic inventory depth rejection - a flat zero-seeded counter stays quiet
+    name: generic inventory depth rejection - a flat/absent counter stays quiet
     input_series:
       - series: 'yuzu_inventory_ingest_total{job="yuzu",instance="s1",source="__generic__",outcome="rejected_depth"}'
         values: "0x30"

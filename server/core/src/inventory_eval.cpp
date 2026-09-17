@@ -208,7 +208,8 @@ std::vector<InventoryEvalResult> evaluate_inventory(
         if (mcp::json_exceeds_depth(data_json, mcp::kMcpMaxJsonDepth)) {
             spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json nests "
                         "too deeply (#2437-class)",
-                        record_agent_id, onbehalf::sanitize_for_log(record_plugin, 128));
+                        onbehalf::sanitize_for_log(record_agent_id, 128),
+                        onbehalf::sanitize_for_log(record_plugin, 128));
             continue;
         }
 

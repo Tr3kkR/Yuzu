@@ -194,7 +194,7 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
         mcp::json_exceeds_depth(c.parameters, mcp::kMcpMaxJsonDepth)) {
         count("yuzu_server_command_outbox_deliver_decode_failed_total");
         count_cause("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
-                   "payload_depth_exceeded");
+                    "payload_depth_exceeded");
         spdlog::error("command_outbox_delivery: occurrence '{}' (command_id={}) parameters "
                       "nested past the depth guard (max {}), marking failed: cannot be safely "
                       "parsed",
@@ -217,7 +217,7 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
     if (!decode_payload(c, agent_ids, params)) {
         count("yuzu_server_command_outbox_deliver_decode_failed_total");
         count_cause("yuzu_server_command_outbox_deliver_decode_failed_cause_total",
-                   "payload_decode_failed");
+                    "payload_decode_failed");
         spdlog::error("command_outbox_delivery: occurrence '{}' payload decode failed — "
                       "marking failed",
                       c.occurrence_id);

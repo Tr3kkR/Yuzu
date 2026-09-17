@@ -393,10 +393,14 @@ fix: names that previously collapsed to the same `?`-mangled string (e.g. two
 different non-ASCII apps) now separate into distinct rows.
 
 **A generic (non-typed) inventory source never appears, with no error visible
-to the reporting agent.** The agent's own report is still acknowledged even
-when the server silently rejects one over-depth source blob (nesting past
-`kMcpMaxJsonDepth`, json-dump-depth-guard fix) - unlike a store/pool degrade,
-this is not surfaced back to the agent. Because ADR-0016's hash-skip only
+to the reporting agent.** Reachable only via gateway-proxied agents
+(`GatewayUpstreamServiceImpl::ProxyInventory`); the direct
+`AgentServiceImpl::ReportInventory` path never writes generic sources to
+`InventoryStore` at all, by design, regardless of depth, so a direct-connect
+agent cannot hit this case. For a gateway-proxied agent: the agent's own
+report is still acknowledged even when the server silently rejects one
+over-depth source blob (nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard
+fix) - unlike a store/pool degrade, this is not surfaced back to the agent. Because ADR-0016's hash-skip only
 resends a source when its content changes, an agent whose plugin keeps
 reporting the SAME malformed shape never resends it, so the source stays
 permanently, silently absent from `InventoryStore` until the plugin itself
@@ -506,6 +510,8 @@ Shipped alert rules live in the `yuzu-inventory` group of
 `need_full` for 15m — hash-skip is not taking, so agents keep re-sending full
 payloads), `YuzuInventoryDroppedBlobs` (an over-cap blob dropped + nacked),
 `YuzuInventoryReportRejected` (a whole report rejected at the source-map cap),
+`YuzuInventoryGenericBlobRejectedDepth` (a generic source blob rejected for
+nesting past `kMcpMaxJsonDepth`, json-dump-depth-guard fix),
 `YuzuInventoryReadDegraded` (a read returned a degrade, by reason),
 `YuzuInventoryIngestSlow` (full-payload ingests holding a connection >10s — a
 leading pool-saturation indicator), and `YuzuInventoryStaleCountUnavailable` (the
