@@ -780,22 +780,34 @@ devices always appear as an explicit "(untagged)" residual row.
 
 The Reflex system (`docs/reflex-design.md`, ADR-0021 Decision 4 — design-only as of this writing,
 see `docs/roadmap.md` Phase 20) needs to know which devices have no end user present to consent to
-a prompt, so a consequential automated Reaction can safely `proceed`-on-exhaustion instead of
-waiting on someone who will never see it. That classification is the free-form tag key
-`device_class`, with a closed vocabulary of two values:
+a prompt, because a dangerous (consequential) Reflex Reaction is **refused at compile unless chain
+consent or all-server tag consent holds** — this is one unconditional rule, not something an
+escalation policy can widen. That classification is the free-form tag key `device_class`, with a
+closed vocabulary of two values:
 
-- `device_class=server` — no end user is normally present; a dangerous Reflex Reaction *may* use
-  `proceed`-on-exhaustion escalation on this device.
+- `device_class=server` — no end user is normally present; a dangerous Reflex Reaction may be
+  admitted by tag consent alone on this device.
 - `device_class=workstation` — an end user is normally present; a dangerous Reaction may only fire
   with prior in-chain consent (an `interaction.*` Reaction gated `on_success` earlier in the same
-  chain) — it may never proceed unattended.
+  chain, whose result is an affirmative response — a dismissed or no-desktop prompt does **not**
+  count) — it may never fire unattended.
 
 `device_class` is **not** one of the four structured categories (`role` / `environment` /
 `location` / `service`) — it has no entry in `tag-categories` and is not schema-validated the way
-`environment`'s `Dev`/`UAT`/`Production` values are. The `server`/`workstation` vocabulary is
-enforced entirely by the Reflex consent-gate reader (`consent_satisfied_by_tags`), not by
-`TagStore`. **An untagged device is treated as `workstation` — fail-closed** — Reflex never infers
-"no user present" from the absence of a tag.
+`environment`'s `Dev`/`UAT`/`Production` values are; the vocabulary above is enforced entirely by
+the Reflex consent-gate reader (`evaluate_consent`, `docs/reflex-design.md` "Consent gate (D4)"),
+not by `TagStore` schema validation. **The match is exact-byte** against the literal string
+`"server"` — unlike the scope-DSL's `tag:` atom (case-insensitive), this is a **direct store read**,
+so `Server` or `" server"` reads as `workstation`, not `server`. **An untagged device is treated as
+`workstation` — fail-closed** — Reflex never infers "no user present" from the absence of a tag.
+
+**Sequencing: tag before you deploy.** A Reflex Set with a workstation-inclusive assignment and no
+chain consent simply cannot compile — there is no bulk `device_class` import specific to this
+recipe today (no automated pipeline exists yet), so tag your all-server fleet *before* authoring a
+Reflex Set that needs tag consent, the same way you would walk inventory to populate `model` in the
+DEX cohort recipe above. Setting or changing `device_class` requires the `Reflex:Write` permission
+(or admin) — a bare `Tag:Write` grant is not sufficient, because this tag is the sole input to a
+safety-relevant compiler gate.
 
 Tag a device as a server (no end user present):
 
@@ -808,6 +820,12 @@ curl -s -X PUT "$YUZU/api/v1/tags" -b "$COOKIE" \
 An unreadable `TagStore` read at evaluation time is treated as a consent-gate **error**, never as
 implicit consent — the compiler refuses to compile a Reflex Set whose consent could not be
 positively established, rather than defaulting to "allowed."
+
+**Symptom: a Reflex Set audits `reflex.set.compile_refused` and stops updating.** The most common
+cause is a target device whose `device_class` is missing or not exactly `"server"`, with no chain
+consent covering the dangerous Reaction. Check the device's tags and, if it genuinely has no end
+user, tag it `device_class=server`; if it does, add an `interaction.*` Reaction gated `on_success`
+before the dangerous step instead.
 
 ---
 
