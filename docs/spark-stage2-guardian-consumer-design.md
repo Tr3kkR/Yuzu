@@ -783,15 +783,20 @@ settled via Astra (codex opine) + Fable (advisor) review, both checked against
    (non-spark) agent has a live, empty Application on every push - gating on the
    Application's existence alone would make every non-spark agent in the fleet emit
    `arm_pending=0`/`arm_failed=0`, read by a fleet consumer as "spark arming, healthy"
-   on agents not running spark at all. `arm_failed` does NOT
-   decrement in place within one application (`resolved_failed` is increment-only), but
-   it already resets to 0 whenever `decide_retry()` returns `Reapply` on a generation
-   that previously failed, which begins a FRESH application - that Reapply path is
-   driven by the existing ~25s `full_sync` retry cadence and is live TODAY, independent
-   of PR-5. So: "decreases on application replacement, which already happens on an
-   ordinary retry of a generation that saw a failure" - not "monotonic until PR-5".
-   Same-application late-success recovery (a still-pending receipt flipping from Failed
-   to Committed without a new application) remains PR-5's job.
+   on agents not running spark at all. **As implemented (rung 9c PR-5d, concern 2,
+   arm-recovery)**: `arm_failed` now decrements in place within one application for
+   exactly ONE case - a Wedged receipt whose exact (rule_id, generation) incarnation
+   is later ADOPTED by the runtime (PR-5d's own concern 1) is detected by
+   `drain_locked()`'s own recovery scan (`GuardianSparkRuntime::receipt_recovered()`)
+   and its contribution is cleared; every OTHER non-Committed status (Failed,
+   CongestionExpired, Withdrawn, Stopped) still only ever increments it within one
+   application, exactly as before PR-5d. It also still resets to 0 whenever
+   `decide_retry()` returns `Reapply` on a generation that previously failed, which
+   begins a FRESH application - that Reapply path is driven by the existing ~25s
+   `full_sync` retry cadence and predates PR-5d. Recovery is scoped to THIS
+   application's own bookkeeping only (`Application::failed_receipts`) - a durable,
+   cross-application "last known outcome for every currently-desired rule" gauge
+   remains 5e's own scope, not delivered here.
 2. **The physical-orphan ceiling (R5.1) ships as a plain, monitor-only counter now**
    (`yuzu.guardian_io_arm_disarm_rejected_ceiling`, off
    `GuardianIoExecutor::Counters::rejected_ceiling`, summed across IO classes for the
