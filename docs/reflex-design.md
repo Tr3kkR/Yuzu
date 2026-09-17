@@ -286,22 +286,77 @@ Reflex-specific (`reflex_outcomes`, R3/R10), never the router.
 Both prefixes are recognized by the executions-ladder skip rule below; they are not interchangeable
 and a future reader must not assume one implies the other.
 
-## Agent runtime contract
+## Generation, undeploy, and push semantics
+
+**A server-side compile refusal HOLDS the agent's last accepted generation — it is never expressed
+as a `full_sync` removal.** `full_sync=true` **replaces the agent's entire active Reflex Set
+collection with exactly what the message contains** — so a refused set silently *omitted* from a
+`full_sync=true` push is not "held," it is **disarmed fleet-wide** the moment that push lands (this
+was the design's own internal contradiction between "generation held" and "full_sync replaces": they
+cannot both be true of the same omission). The actual rule: when a compile refusal exists, the
+server does **not** advance to a new `full_sync=true` snapshot for the affected agents at all — it
+either (a) resends the prior, still-valid `full_sync` snapshot (refused set correctly absent because
+it was never in a valid snapshot to begin with) or (b) sends a `full_sync=false` delta that leaves
+the refused set's last-known-armed state untouched. R9 picks one of (a)/(b) and states it in its own
+implementation notes; this document's job is only to rule out the third, silently-broken option
+(treating omission-from-`full_sync` as equivalent to "held").
+
+- **Identical generation is a no-op.** If the agent's already-applied generation matches the
+  incoming push's generation, the agent applies nothing and re-arms nothing — an ordinary reconnect
+  that re-delivers the same snapshot must not spuriously re-fire `fire_on_arm` Reflexes or reset
+  cooldown/hourly-cap state.
+- **The agent rejects a push carrying a lower generation than its currently-applied one** (two
+  deployers racing, or a reordered redelivery) — a monotonic-generation floor, checked before any
+  apply.
+- **Undeploy/disable aborts in-flight chains and drains the queue**, reporting
+  `reflex.aborted{undeploy}` for every chain that was running or queued at the moment of undeploy —
+  "undeploy complete" is never reported while a dangerous Reaction is still executing on the
+  agent's worker pool.
+- **Per-Reaction completion is recorded, not just the chain's terminal outcome** — a crash mid-chain
+  (Reaction 1 of 4 applied, agent restarts) leaves a durable record of *which* Reactions actually
+  ran, so a later operator/automation pass has something to reconcile against, rather than a device
+  silently wedged half-applied with no record of what happened.
+- **Deleting the last (or only) Reflex Set for an agent still pushes an empty `full_sync=true`** —
+  there is no such thing as "nothing to push, so nothing is sent"; an empty collection is a real,
+  delivered state, so an agent that was offline during the delete does not keep a stale dangerous
+  chain armed indefinitely with no server record of the deletion ever reaching it.
+- **Cooldown, hourly-cap, and fired/suppressed counters are journal-persisted, not in-memory-only** —
+  they survive an agent restart and are **not** reset by re-arm (re-applying the same or a newer
+  generation never gives a rate-limited Reflex a fresh budget it would not otherwise have earned).
+- **The agent trusts the server (mTLS channel identity) for push authenticity and never independently
+  re-verifies the `digest` field** — `digest` is a server-side approval-binding and compile-integrity
+  mechanism (D9), not a second authentication layer the agent is expected to check; this is stated
+  explicitly so no later slice adds agent-side digest verification believing it closes a gap that
+  does not exist on the agent's trust boundary.
+- **A pre-Reflex agent build** (one that predates `__reflex__` support entirely) reports "plugin not
+  found" for `push_sets`/`get_status`, and — because it never composes the `yuzu.reflex_generation`
+  heartbeat tag — the server-side reconcile that would solicit `get_status` never fires for it either.
+  Such an agent's Reflex state is therefore reported as a fixed terminal status, **`unsupported`**
+  (distinguishable from `--reflex-disable`, which does compose the tag with `yuzu.reflex_disabled=1`,
+  and from "offline," which is a connectivity state, not a capability state).
+
+Runtime shape (unchanged claims, restated alongside the semantics above):
 
 - Reflex is a **queued** SparkEngine consumer (ADR-0021 Decision 3) — never inline. Per-Reflex-Set
   concurrency is 1 (serialized chain execution within a set); a worker pool of 2 serves all sets.
-- Detached, bounded reaction workers are counted into the agent's hard-exit grace sum
-  (`active_detached_workers()`, alongside Guardian's own IO/send workers) — a Reaction stuck in a
-  blocking syscall cannot be joined or force-cancelled, so it must stay counted, never silently
-  dropped from the sum (the same ORPHAN-EXIT CONTRACT `docs/yuzu-guardian-design-v1.1.md` §24
-  documents for Guardian's send executor).
+  **Reflex maintains its own arm/disarm chokepoint** — analogous to, but a *separate* seam from,
+  Guardian's `GuardianEngine::reconcile_rule_locked()` (which is Guardian's own seam, not reusable by
+  Reflex) — and its `stop()` is **sticky**: once stopped, Reflex does not re-arm without an explicit
+  restart, matching the Spark/Guardian precedent.
+- Detached, bounded reaction workers are counted into the agent's hard-exit grace sum — the same sum
+  `GuardianEngine::active_io_workers()` feeds today (`guardian_engine.cpp`), summed alongside
+  Guardian's own IO/send workers and Reflex's reaction workers under one name; **there is no
+  `active_detached_workers()` rename** — a Reaction stuck in a blocking syscall cannot be joined or
+  force-cancelled, so it must stay counted, never silently dropped from the sum (the same
+  ORPHAN-EXIT CONTRACT `docs/yuzu-guardian-design-v1.1.md` §24 documents for Guardian's send
+  executor).
 - A chain in progress is journaled with a `chain:` marker; on agent restart, an in-flight marker is
   **aborted, never resumed** (`reflex.aborted{restart}` outcome) — Reflex chains are not
   crash-resumable.
-- `event_id` sequence numbers are boot-nonce'd (see above).
-- `full_sync=true` on `ReflexSetPush` **replaces** the agent's entire active Reflex Set collection;
-  `full_sync=false` is a delta merge. A per-set compile/digest failure on the server holds that
-  set's generation (it is simply omitted from the push) rather than partially applying a stale set.
+- `event_id` sequence numbers are boot-nonce'd (see above), with the nonce sourced from a **CSPRNG,
+  at least 64 bits wide** — a low-entropy (e.g. boot-second-derived) nonce risks an `event_id`
+  collision across a crash-loop, which the store's PK-dedup would then silently drop as a
+  "redelivery" of an unrelated event.
 - Any Reflex maintenance work sharing a joined thread (journal paging, etc.) must carry its own
   `steady_clock` cadence — time-paced, never wake-paced (§24's journal-maintenance invariant applies
   verbatim; R8's `ReflexOutcomeJournal::maintenance_tick` implements this).
