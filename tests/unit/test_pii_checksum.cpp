@@ -182,13 +182,27 @@ TEST_CASE("validate_named: algorithms explicitly flagged non-validatable always 
 
 // ── VIN / IMEI (widely-published, deterministic algorithms) ────────────
 
-TEST_CASE("vin_iso3779_weighted: I, O, Q transliterate to -1 (never valid in a VIN)",
+TEST_CASE("vin_iso3779_transliterate: I, O, Q transliterate to -1 (never valid in a VIN)",
           "[pii][checksum][vin]") {
     CHECK(vin_iso3779_transliterate('I') == -1);
     CHECK(vin_iso3779_transliterate('O') == -1);
     CHECK(vin_iso3779_transliterate('Q') == -1);
     CHECK(vin_iso3779_transliterate('A') == 1);
     CHECK(vin_iso3779_transliterate('9') == 9);
+}
+
+// The test above (previously misnamed "vin_iso3779_weighted") only ever
+// exercised the transliteration helper -- vin_iso3779_weighted() itself,
+// the actual checksum function every "vin.*" rule dispatches to, had zero
+// coverage. "1M8GDM9AXKP042788" is the standard textbook VIN check-digit
+// worked example (check digit 'X' at position 9); hand-verified here
+// against this file's own weights/transliteration table (weighted sum
+// 351, 351 mod 11 = 10 -> 'X').
+TEST_CASE("vin_iso3779_weighted: real worked-example VIN validates", "[pii][checksum][vin]") {
+    CHECK(vin_iso3779_weighted("1M8GDM9AXKP042788"));
+    CHECK_FALSE(vin_iso3779_weighted("1M8GDM9A0KP042788")); // wrong check digit
+    CHECK_FALSE(vin_iso3779_weighted("1M8GDM9AXKP04278"));  // 16 chars, wrong length
+    CHECK_FALSE(vin_iso3779_weighted("1M8GDM9AXKP0I2788")); // contains 'I' — never valid
 }
 
 TEST_CASE("imei_luhn: requires exactly 15 digits", "[pii][checksum][imei]") {

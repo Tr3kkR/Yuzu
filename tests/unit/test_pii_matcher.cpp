@@ -209,6 +209,7 @@ Rule make_rule(std::string id, std::string pattern, std::optional<std::string> c
 
 TEST_CASE("scan_text: a checksum PASS is reported at HIGH confidence", "[pii][matcher][scan]") {
     std::vector<Rule> rules = {make_rule("cc.visa", R"(4\d{15})", "luhn")};
+    rules[0].category = "financial"; // mask_value()'s last-4-reveal is financial-only
     auto compiled = compile_rules(rules);
     REQUIRE(compiled.size() == 1);
 
@@ -219,6 +220,21 @@ TEST_CASE("scan_text: a checksum PASS is reported at HIGH confidence", "[pii][ma
     CHECK(findings[0].line_number == 1);
     CHECK(findings[0].masked_value.find("1111") != std::string::npos);
     CHECK(findings[0].masked_value != "4111111111111111"); // never the raw value
+}
+
+TEST_CASE("scan_text: a non-financial category is masked completely, no last-4 reveal",
+         "[pii][matcher][scan]") {
+    // generic.date_of_birth's real category is "identity", not
+    // "financial" — SSNs/national IDs shouldn't get the payment-card
+    // "ending in 1234" convention.
+    std::vector<Rule> rules = {make_rule("id.ssn", R"(\d{9})", std::nullopt, {"ssn"})};
+    rules[0].category = "identity";
+    auto compiled = compile_rules(rules);
+    REQUIRE(compiled.size() == 1);
+
+    auto findings = scan_text(compiled, "ssn: 123456789 on file");
+    REQUIRE(findings.size() == 1);
+    CHECK(findings[0].masked_value == "*********"); // fully masked, no digits revealed
 }
 
 TEST_CASE("scan_text: a checksum FAILURE is dropped entirely, not just downgraded",

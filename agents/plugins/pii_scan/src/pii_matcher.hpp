@@ -59,13 +59,23 @@ struct Finding {
     std::vector<std::string> compliance_tags;
 };
 
-// Masks a matched value for reporting: shows at most the last 4
-// characters, replaces everything else with '*' (preserving length so an
-// operator can gauge the format without seeing the value). Values of 4
-// characters or fewer are fully masked — too little entropy to safely
-// reveal any of it.
-inline std::string mask_value(std::string_view raw) {
-    if (raw.size() <= 4)
+// Masks a matched value for reporting. For `category == "financial"`
+// (payment cards, IBAN, bank routing) this shows at most the last 4
+// characters and replaces everything else with '*', preserving length so
+// an operator can gauge the format without seeing the value -- "ending in
+// 1234" is an accepted, PCI-DSS-compatible disclosure convention for
+// payment cards specifically. Every OTHER category (national IDs, SSNs,
+// passports, driver's licences, ...) is masked COMPLETELY: this
+// last-4-reveal rule used to apply uniformly across every category with
+// no exception, which meant an SSN or national-ID finding also disclosed
+// its true last 4 digits -- fine for a card number ending, but not an
+// accepted convention for a government identifier, and higher entropy
+// leakage per finding than the "masked, not confidential" contract this
+// function documents at the top of the file implies. Values of 4
+// characters or fewer are always fully masked regardless of category —
+// too little entropy to safely reveal any of it either way.
+inline std::string mask_value(std::string_view raw, std::string_view category = "financial") {
+    if (raw.size() <= 4 || category != "financial")
         return std::string(raw.size(), '*');
     std::string out(raw.size() - 4, '*');
     out += raw.substr(raw.size() - 4);
@@ -140,24 +150,43 @@ inline std::vector<CompiledRule> compile_rules(const std::vector<Rule>& rules,
     return compiled;
 }
 
+// Default per-call findings cap for scan_text() below. An overly loose
+// rule pattern (no checksum, no anchoring) against a large or adversarial
+// text blob can otherwise produce an unbounded number of findings from a
+// single call — reproduced empirically against a real embedded rule:
+// 10MB of unstructured content generated over a million findings in a
+// few seconds of CPU, all built into one in-memory vector before any
+// output happened, with the oversized result then discarded downstream
+// anyway. 5000 is generous for any genuine file (a real document doesn't
+// contain thousands of distinct PII-shaped values) while keeping a
+// pathological or adversarial input's cost bounded.
+inline constexpr size_t kDefaultMaxFindingsPerScan = 5000;
+
 // Scans `text` (the full content of one file, or any text blob) against
-// every compiled rule and returns findings. `source_label` is carried
-// only for the caller's own diagnostics (e.g. a file path) — it is not
-// stored on the Finding itself, since this function has no concept of
-// "file" beyond the text it was given.
+// every compiled rule and returns findings, stopping once `max_findings`
+// is reached (the caller can distinguish "stopped early" from "genuinely
+// found this many" by checking `findings.size() == max_findings`, though
+// with the default cap that coincidence is vanishingly unlikely for real
+// content). `source_label` is carried only for the caller's own
+// diagnostics (e.g. a file path) — it is not stored on the Finding
+// itself, since this function has no concept of "file" beyond the text
+// it was given.
 inline std::vector<Finding> scan_text(const std::vector<CompiledRule>& compiled_rules,
-                                      std::string_view text) {
+                                      std::string_view text,
+                                      size_t max_findings = kDefaultMaxFindingsPerScan) {
     std::vector<Finding> findings;
     auto lines = detail::split_lines(text);
 
-    for (size_t line_idx = 0; line_idx < lines.size(); ++line_idx) {
+    for (size_t line_idx = 0; line_idx < lines.size() && findings.size() < max_findings; ++line_idx) {
         std::string_view line = lines[line_idx];
         if (line.empty())
             continue;
 
         for (const auto& cr : compiled_rules) {
+            if (findings.size() >= max_findings)
+                break;
             size_t pos = 0;
-            while (pos <= line.size()) {
+            while (pos <= line.size() && findings.size() < max_findings) {
                 re2::StringPiece piece(line.data(), line.size());
                 re2::StringPiece submatch;
                 if (!cr.regex->Match(piece, pos, line.size(), re2::RE2::UNANCHORED, &submatch, 1))
@@ -185,19 +214,31 @@ inline std::vector<Finding> scan_text(const std::vector<CompiledRule>& compiled_
                     continue;
                 }
 
+                bool keyword_on_line = detail::any_keyword_on_line(cr.rule->confidence_keywords, line);
+                if (cr.rule->require_keyword && !checksum_result.has_value() && !keyword_on_line) {
+                    // require_keyword: true means this rule's shape alone
+                    // is documented as too weak to report on its own (see
+                    // e.g. generic.date_of_birth's own notes) — drop
+                    // entirely rather than falling through to LOW, unless
+                    // either a real checksum already confirmed it or a
+                    // confidenceKeyword is present on the same line.
+                    pos = match_end;
+                    continue;
+                }
+
                 Finding f;
                 f.rule_id = cr.rule->id;
                 f.display_name = cr.rule->display_name;
                 f.category = cr.rule->category;
                 f.severity = cr.rule->severity;
                 f.source_confidence = cr.rule->source_confidence;
-                f.masked_value = mask_value(matched_text);
+                f.masked_value = mask_value(matched_text, cr.rule->category);
                 f.line_number = line_idx + 1;
                 f.compliance_tags = cr.rule->compliance_tags;
 
                 if (checksum_result.has_value() && checksum_result.value()) {
                     f.finding_confidence = "HIGH";
-                } else if (detail::any_keyword_on_line(cr.rule->confidence_keywords, line)) {
+                } else if (keyword_on_line) {
                     f.finding_confidence = "MEDIUM";
                 } else {
                     f.finding_confidence = "LOW";

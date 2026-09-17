@@ -12,7 +12,12 @@ rules:
   - id: generic.credit_card.visa
     displayName: "Credit Card — Visa"
     category: financial
-    pattern: '4\d{3}[ -]?\d{4}[ -]?\d{4}[ -]?(\d{3})?'
+    # The declared length is [13, 16, 19] (13 = old short Visa, 16 =
+    # standard, 19 = newer extended range); the trailing group below is
+    # ordered longest-alternative-first so a full 19- or 16-digit number
+    # isn't truncated to a partial 13-digit match (which would run Luhn
+    # against the wrong, truncated digit string and drop a real card).
+    pattern: '4\d{3}[ -]?\d{4}[ -]?\d{4}(?:[ -]?\d{4}[ -]?\d{3}|[ -]?\d{4}|\d)'
     length: [13, 16, 19]
     checksum: luhn
     confidenceKeywords: ["card", "visa", "cvv", "expiry", "exp date"]
@@ -105,7 +110,12 @@ rules:
   - id: generic.bank_routing_aba_us
     displayName: "US Bank Routing Number (ABA)"
     category: financial
-    pattern: '\d{9}'
+    # Word-boundary anchored: an unanchored `\d{9}` can fragment-match the
+    # leading 9 digits of any longer digit string (e.g. a 16-digit card
+    # number), with roughly a 1-in-10 chance of the fragment coincidentally
+    # passing its own mod-10 checksum and being promoted to a HIGH-
+    # confidence, GLBA-tagged false finding.
+    pattern: '\b\d{9}\b'
     checksum: us_aba_routing_weighted
     confidenceKeywords: ["routing number", "aba", "wire transfer"]
     severity: high
@@ -216,10 +226,11 @@ rules:
     pattern: '\b(?:0[1-9]|[12]\d|3[01])[/.-](?:0[1-9]|1[0-2])[/.-](?:19|20)\d{2}\b'
     checksum: null
     confidenceKeywords: ["dob", "date of birth", "born", "birthdate"]
+    requireKeyword: true
     severity: medium
     complianceTags: [GDPR, CCPA]
     sourceConfidence: HIGH
-    notes: "Extremely weak shape alone (matches any date) — REQUIRE a confidenceKeyword hit before reporting, otherwise expect huge false-positive volume against log timestamps, expiry dates, etc."
+    notes: "Extremely weak shape alone (matches any date) — requireKeyword: true means scan_text() DROPS a match entirely (never even at LOW) unless a confidenceKeyword is found on the same line, otherwise expect huge false-positive volume against log timestamps, expiry dates, etc."
 
   - id: generic.crypto_wallet_btc_legacy
     displayName: "Bitcoin Address — Legacy (P2PKH/P2SH, Base58Check)"

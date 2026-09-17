@@ -1,6 +1,6 @@
 ## Sensitive-Data (PII) Discovery Definitions
 ## Audits files against a research-backed ruleset of financial, passport,
-## driver's-licence, and national-identifier formats (~45 countries) with
+## driver's-licence, and national-identifier formats (60 countries) with
 ## real checksum validation where one publicly exists. Audit-only, never
 ## stores raw matched values (findings carry a masked value only).
 ## Plugin: pii_scan | Actions: scan, enable_realtime, disable_realtime
@@ -23,7 +23,7 @@ metadata:
   description: >
     One-shot scan of the given file/directory paths against the pii_scan
     ruleset (credit cards, IBAN, ICAO passport MRZ, driver's licences,
-    and national identifiers for ~45 countries). Structured identifiers
+    and national identifiers for 60 countries). Structured identifiers
     with a real checksum are validated (Luhn, IBAN mod-97, Verhoeff,
     ICAO MRZ composite check digits, and ~30 country-specific
     algorithms) — a shape match that fails its checksum is dropped, not

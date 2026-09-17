@@ -192,8 +192,13 @@ inline char iso7064_mod11_2_check_char(std::string_view digits17) {
         sum += static_cast<long long>(detail::digit_value(digits17[i])) * kWeights[i];
     }
     int remainder = static_cast<int>(sum % 11);
-    static constexpr std::array<char, 11> kTable = {'1', '0', '9', '8', '7', '6',
-                                                      '5', '4', '3', '2', 'X'};
+    // Verified against the canonical worked example (GB 11643-1999):
+    // 11010519491231002X -> weighted sum 167, remainder 2 -> 'X'. The
+    // table below is indexed by remainder; remainder 2 MUST map to 'X',
+    // not '9' (a previous transcription off-by-one dropped ~82% of real
+    // Chinese Resident IDs as checksum failures).
+    static constexpr std::array<char, 11> kTable = {'1', '0', 'X', '9', '8', '7',
+                                                      '6', '5', '4', '3', '2'};
     return kTable[static_cast<size_t>(remainder)];
 }
 
@@ -251,6 +256,31 @@ inline bool us_aba_routing_weighted(std::string_view digits9) {
     static const std::vector<int> kWeights = {3, 7, 1, 3, 7, 1, 3, 7, 1};
     long long sum = weighted_sum(digits9, kWeights);
     return sum >= 0 && sum % 10 == 0;
+}
+
+// US SSN structural validity (not a checksum — SSA never published one):
+// area (first 3 digits) != 000, != 666, and not in 900-999; group (middle
+// 2 digits) != 00; serial (last 4 digits) != 0000. This used to live as a
+// negative-lookahead regex ((?!000|666|9\d{2})...); RE2 does not support
+// lookahead by design (no backtracking, for its linear-time guarantee),
+// so `RE2::RE2` silently failed to compile that pattern and
+// compile_rules() silently dropped the rule -- every real SSN went
+// undetected. Moving the exclusion logic here, dispatched like any other
+// named validator, is both RE2-compatible and matches this codebase's own
+// established "shape match + validate()" pattern used everywhere else.
+inline bool us_ssn_valid(std::string_view digits9) {
+    if (digits9.size() != 9 || !detail::all_digits(digits9))
+        return false;
+    std::string_view area = digits9.substr(0, 3);
+    std::string_view group = digits9.substr(3, 2);
+    std::string_view serial = digits9.substr(5, 4);
+    if (area == "000" || area == "666" || area[0] == '9')
+        return false;
+    if (group == "00")
+        return false;
+    if (serial == "0000")
+        return false;
+    return true;
 }
 
 inline int vin_iso3779_transliterate(char c) {
@@ -469,8 +499,10 @@ inline bool mx_curp_check(std::string_view curp18) {
             return 10 + (c - 'A');
         return -1;
     };
-    static const std::vector<int> kWeights = {19, 18, 17, 16, 15, 14, 13, 12, 11,
-                                               10, 9,  8,  7,  6,  5,  4,  3};
+    // Verified against two real, government-verifiable CURPs: weights
+    // 19..3 (the previous shipped values) fail both; 18..2 passes both.
+    static const std::vector<int> kWeights = {18, 17, 16, 15, 14, 13, 12, 11, 10,
+                                               9,  8,  7,  6,  5,  4,  3,  2};
     long long sum = 0;
     for (size_t i = 0; i < 17; ++i) {
         int v = value_of(s[i]);
@@ -974,13 +1006,41 @@ inline std::optional<bool> validate_named(std::string_view algorithm, std::strin
         return pt_nif_weighted(cleaned.substr(0, 9));
     }
     if (algorithm == "fi_hetu_mod31") {
-        if (cleaned.size() != 11)
+        // HETU format: DDMMYY + <century sign> + NNN + check-char = 11
+        // RAW characters. clean_alnum_upper() strips the century sign
+        // (+/-, non-alnum) before this code ever sees the string, which
+        // shifts every position after it left by one -- cleaned.size()
+        // was 10 for every real HETU, never the 11 this branch checked
+        // for, so every real HETU silently failed to validate. This
+        // works off raw_text directly instead, skipping the sign
+        // character by its fixed raw position (index 6) rather than
+        // relying on clean_alnum_upper to have preserved it.
+        if (raw_text.size() != 11)
             return std::nullopt;
-        std::string nine = cleaned.substr(0, 6) + cleaned.substr(7, 3); // skip century char at index 6
-        return fi_hetu_mod31(nine, cleaned[10]);
+        std::string_view date6 = raw_text.substr(0, 6);
+        std::string_view indiv3 = raw_text.substr(7, 3);
+        if (!detail::all_digits(date6) || !detail::all_digits(indiv3))
+            return std::nullopt;
+        std::string nine = std::string(date6) + std::string(indiv3);
+        return fi_hetu_mod31(nine, raw_text[10]);
     }
-    if (algorithm == "cz_sk_rc_mod11")
+    if (algorithm == "cz_sk_rc_mod11") {
+        // cz_sk_rc_mod11()'s own doc comment: a 9-digit pre-1954 number
+        // carries no checksum at all -- "not applicable, not invalid" --
+        // but the function's `bool` return type can't express a third
+        // state, so it returned `false`, which scan_text() treats
+        // identically to "checksum FAILED" and drops the finding
+        // entirely. std::optional<bool>'s nullopt is exactly the "cannot
+        // validate" state scan_text() already knows to downgrade to
+        // keyword-confidence instead of dropping (see e.g.
+        // "dk_cpr_abolished" above) -- special-case the 9-digit length
+        // here, before calling into the bool-returning function, so a
+        // genuinely valid pre-1954 ID is reported (LOW/MEDIUM) rather
+        // than silently discarded.
+        if (cleaned.size() == 9)
+            return std::nullopt;
         return cz_sk_rc_mod11(cleaned);
+    }
     if (algorithm == "ro_cnp_weighted")
         return ro_cnp_weighted(cleaned);
     if (algorithm == "hu_taj_weighted")
@@ -1001,6 +1061,8 @@ inline std::optional<bool> validate_named(std::string_view algorithm, std::strin
         return std::nullopt; // position-specific letter tables never fully located — not implemented, not fabricated
     if (algorithm == "us_aba_routing_weighted")
         return us_aba_routing_weighted(cleaned);
+    if (algorithm == "us_ssn")
+        return us_ssn_valid(cleaned);
     if (algorithm == "vin_iso3779_weighted")
         return vin_iso3779_weighted(cleaned);
     if (algorithm == "imei_luhn")
@@ -1012,6 +1074,19 @@ inline std::optional<bool> validate_named(std::string_view algorithm, std::strin
     if (algorithm == "icao_mrz_td3_line2")
         return mrz_td3_line2_valid(raw_text);
 
+    // "us_soundex_dob_sex_encoding" (referenced by 6 US state driver's-
+    // licence rules in content/pii-rules/03-drivers-licenses-us.yaml, and
+    // documented in 00-manifest.yaml) deliberately has NO case here.
+    // Implementing it correctly needs the actual first-name/middle-
+    // initial code table the real algorithm encodes against, which is
+    // not in this codebase and not reliably sourceable -- a fabricated
+    // or guessed table would be a worse outcome than the current honest
+    // gap (a plausible-looking but WRONG structural check is strictly
+    // worse than "cannot validate", since it would silently misclassify
+    // real matches either direction). Falls through to the same fail-
+    // safe nullopt every other unrecognized name gets below, which is
+    // the correct behaviour here, not a placeholder for a future case
+    // that never got written.
     return std::nullopt; // unknown algorithm name — fail safe to "cannot validate"
 }
 

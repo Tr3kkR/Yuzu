@@ -3,7 +3,7 @@
  *
  * Audits text files against a research-backed ruleset (credit cards,
  * IBAN, ICAO passport MRZ, driver's licences, and national identifiers
- * for ~45 countries — see content/pii-rules/00-manifest.yaml) using
+ * for 60 countries — see content/pii-rules/00-manifest.yaml) using
  * RE2 shape matching plus real checksum validation where one exists.
  * Never stores or emits a raw matched value — findings carry a masked
  * value only (see pii_matcher.hpp mask_value()).
@@ -119,12 +119,21 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     },
 };
 
+// Escapes '|' (the output row delimiter) and '\n'/'\r' (which would
+// otherwise split one row into multiple physical output lines) so a
+// filename containing either cannot forge extra rows/columns in the
+// pipe-delimited output stream. Result-integrity only, not confidentiality
+// -- the raw PII value itself is never in this stream (see mask_value()).
 std::string escape_pipes(std::string_view s) {
     std::string out;
     out.reserve(s.size());
     for (char c : s) {
         if (c == '|')
             out += "\\|";
+        else if (c == '\n')
+            out += "\\n";
+        else if (c == '\r')
+            out += "\\r";
         else
             out += c;
     }
@@ -226,10 +235,17 @@ std::vector<Finding> scan_one_file(yuzu::CommandContext& ctx, yuzu::PluginContex
     if (content) {
         findings = scan_text(engine.compiled, *content);
         output_findings(ctx, findings, file.path);
-    }
 
-    if (incremental && pctx) {
-        pctx->storage_set(cache_key, fingerprint(file.path, file.size_bytes));
+        // Only mark "scanned" on a SUCCESSFUL read. This used to run
+        // unconditionally, including when read_file_text() returned
+        // nullopt (a transient I/O error -- lock contention, a permission
+        // race, the file vanishing mid-scan) -- a file that failed to
+        // read once got marked scanned anyway, and then silently skipped
+        // on every future incremental scan until its size or mtime
+        // happened to change, even though it was never actually read.
+        if (incremental && pctx) {
+            pctx->storage_set(cache_key, fingerprint(file.path, file.size_bytes));
+        }
     }
     return findings;
 }
@@ -256,22 +272,51 @@ void run_scan(yuzu::CommandContext& ctx, YuzuPluginContext* raw_ctx, yuzu::Param
     }
 
     Engine engine = build_engine(jurisdictions);
+    if (engine.compiled.empty()) {
+        // A malformed or empty compiled ruleset used to fall through
+        // silently: run_scan() proceeded anyway and reported a clean
+        // "N scanned, 0 findings" -- indistinguishable from a genuinely
+        // clean scan of real files, when in fact NOTHING was ever
+        // actually checked against anything. Report this honestly as an
+        // unavailable result instead of a false-clean one.
+        ctx.write_output(
+            "ERROR|LOW|config|pii_scan.no_rules_compiled||0||the compiled ruleset is empty -- "
+            "nothing was checked against any file");
+        ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_UNKNOWN,
+                              "pii_scan:scan");
+        return;
+    }
 
     ScanConfig cfg;
     cfg.roots = paths;
     cfg.scan_all_extensions = all_ext;
 
-    auto files = enumerate_files(cfg);
+    auto enum_result = enumerate_files(cfg);
+    const auto& files = enum_result.files;
     ctx.report_progress(0);
     size_t total_findings = 0;
     for (size_t i = 0; i < files.size(); ++i) {
         total_findings += scan_one_file(ctx, pctx, engine, files[i], incremental).size();
-        if (files.size() > 0) {
+        if (!files.empty()) {
             ctx.report_progress(static_cast<int>((i + 1) * 100 / files.size()));
         }
     }
     ctx.write_output(std::format("INFO|HIGH|summary|pii_scan.summary||0|{} files scanned, {} findings|",
                                  files.size(), total_findings));
+
+    // CC-07 typed result status (ABI v4+): a plugin that never calls this
+    // leaves every scan reporting YUZU_RESULT_STATUS_UNDECLARED, which
+    // reads identically whether the scan genuinely completed or silently
+    // gave up partway through (e.g. the walk's own wall-clock deadline, or
+    // a root whose file-count cap was reached) -- indistinguishable from a
+    // clean, complete result. Report which one actually happened.
+    if (enum_result.truncated_by_deadline || files.size() >= cfg.max_files_per_scan) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              "pii_scan:scan");
+    } else {
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL,
+                              "pii_scan:scan");
+    }
 }
 
 } // namespace
@@ -318,9 +363,21 @@ public:
         }
 
         if (action == "enable_realtime") {
-            std::string watch_path(params.get("watch_path", ""));
+            // Reads the operator-facing parameter name declared in
+            // content/definitions/pii_scan.yaml ("watchPath"). This used
+            // to read "watch_path" (a different name) -- every real
+            // dispatch of the shipped InstructionDefinition failed with
+            // pii_scan.no_watch_path, since the YAML-declared parameter
+            // never arrived under that key. The internal trigger
+            // config_json below still uses the literal key "watch_path"
+            // deliberately -- that is the agent Trigger Engine's own
+            // wire-protocol field name for a filesystem trigger (see
+            // plugin.h's register_trigger doc comment), a different,
+            // lower-level contract this operator-facing parameter name
+            // must not be confused with.
+            std::string watch_path(params.get("watchPath", ""));
             if (watch_path.empty()) {
-                ctx.write_output("ERROR|LOW|config|pii_scan.no_watch_path||0||`watch_path` parameter required");
+                ctx.write_output("ERROR|LOW|config|pii_scan.no_watch_path||0||`watchPath` parameter required");
                 return 1;
             }
             std::string jurisdictions(params.get("jurisdictions", ""));
@@ -356,9 +413,9 @@ public:
         }
 
         if (action == "disable_realtime") {
-            std::string watch_path(params.get("watch_path", ""));
+            std::string watch_path(params.get("watchPath", ""));
             if (watch_path.empty()) {
-                ctx.write_output("ERROR|LOW|config|pii_scan.no_watch_path||0||`watch_path` parameter required");
+                ctx.write_output("ERROR|LOW|config|pii_scan.no_watch_path||0||`watchPath` parameter required");
                 return 1;
             }
             std::string trigger_id = derive_trigger_id(watch_path);

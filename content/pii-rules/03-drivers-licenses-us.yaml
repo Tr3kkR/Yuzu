@@ -81,8 +81,9 @@ rules:
     name: Delaware
     pattern: '\d{1,7}'
     checksum: null
+    severity: medium
     sourceConfidence: MEDIUM
-    notes: "Variable length, no documented leading-zero-padding requirement."
+    notes: "Variable length, no documented leading-zero-padding requirement. Severity deliberately lowered from the state-DL default (high): a bare 1-7 digit number with no checksum and no distinguishing structure matches almost any short number (phone extension, zip code, counter) -- HIGH would overstate confidence for what is, without a nearby keyword, a very weak signal."
 
   - state: DC
     name: "District of Columbia"

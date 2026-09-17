@@ -27,8 +27,18 @@
 ///     in this catalogue.
 ///   - `enable_realtime` — registers a STANDING filesystem trigger
 ///     (`agent's TriggerEngine`, `pii_scan_plugin.cpp`'s `enable_realtime`
-///     action) that persists across agent restarts and causes ongoing,
-///     unattended re-scans of a directory tree. Classified Mutating/
+///     action) that causes ongoing, unattended re-scans of a directory
+///     tree for as long as the agent process keeps running. NOTE:
+///     `TriggerEngine::register_trigger` is purely in-memory -- there is
+///     no load/save/persist path anywhere in this codebase -- so an
+///     agent restart silently and permanently stops realtime scanning
+///     with no operator-visible signal; an earlier version of this
+///     comment claimed the trigger "persists across agent restarts",
+///     which was never true. The risk_tier reasoning below does not
+///     depend on that false claim (it's about installing unattended,
+///     ongoing behaviour while the agent process is alive, not about
+///     restart survival), so the classification itself is unaffected --
+///     only the prose was wrong. Classified Mutating/
 ///     Reversible (undone by `disable_realtime`) rather than Destructive:
 ///     it changes agent-local trigger configuration, not host or network
 ///     state, and carries a compensating action. `Security:Write`,

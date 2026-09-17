@@ -33,6 +33,24 @@ struct Rule {
     std::vector<std::string> confidence_keywords;
     std::string source_confidence; // "HIGH" | "MEDIUM" | "MEDIUM_HIGH" | "LOW_MEDIUM" | "LOW" | "NONE"
     std::optional<std::string> notes;
+    // Real example values this rule's own YAML declares itself
+    // (`knownTestValues`) — currently only populated for the four
+    // generic payment-card rules. Empty for every rule that doesn't
+    // declare any. Consumed by test_pii_ruleset_integrity.cpp to
+    // actually run these through the real compiled engine, rather than
+    // leaving them as unread YAML documentation nothing ever executes.
+    std::vector<std::string> known_test_values;
+    // When true, a match with no checksum result (no checksum defined,
+    // or the checksum function returned "cannot validate") is DROPPED
+    // entirely unless a confidenceKeyword is found on the same line --
+    // never reported at LOW. For a rule whose shape alone is extremely
+    // weak evidence (e.g. generic.date_of_birth's bare "any date" shape,
+    // which would otherwise flood real findings against log timestamps
+    // and expiry dates), this is the difference between the rule's own
+    // documented intent and what scan_text() actually did: this flag
+    // used to be describable only in a rule's free-text `notes` field,
+    // which the engine never read.
+    bool require_keyword = false;
 };
 
 // ── Jurisdiction / region filtering ──────────────────────────────────────
@@ -149,6 +167,18 @@ inline std::vector<Rule> parse_rules_json(std::string_view json_text) {
         if (!item.contains("id") || !item.contains("pattern"))
             continue;
 
+        // A per-field TYPE mismatch (a field present with the wrong JSON
+        // type -- e.g. a boolean where a string was expected, the
+        // "Norway problem" class of bug) makes nlohmann::json's
+        // .value<T>()/.get<T>() throw type_error, not return a default.
+        // The outer catch above only guards the top-level parse() call,
+        // so one malformed FIELD anywhere in the array used to be an
+        // uncaught exception propagating out of this function entirely
+        // — not the documented "one bad rule can't take down the whole
+        // ruleset" behaviour this function's own header comment
+        // promises, but every OTHER real rule in the array going unparsed
+        // too. Catch per-item, skip just the offending entry.
+        try {
         Rule r;
         r.id = item.value("id", "");
         r.display_name = item.value("displayName", r.id);
@@ -176,8 +206,18 @@ inline std::vector<Rule> parse_rules_json(std::string_view json_text) {
         r.source_confidence = item.value("sourceConfidence", "MEDIUM");
         if (item.contains("notes") && !item.at("notes").is_null())
             r.notes = item.at("notes").get<std::string>();
+        if (item.contains("knownTestValues") && item.at("knownTestValues").is_array()) {
+            for (const auto& v : item.at("knownTestValues")) {
+                if (v.is_string())
+                    r.known_test_values.push_back(v.get<std::string>());
+            }
+        }
+        r.require_keyword = item.value("requireKeyword", false);
 
         rules.push_back(std::move(r));
+        } catch (const nlohmann::json::exception&) {
+            continue; // this one entry's field types were malformed — skip it, keep the rest
+        }
     }
 
     return rules;

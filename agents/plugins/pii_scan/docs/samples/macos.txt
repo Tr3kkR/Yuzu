@@ -1,12 +1,12 @@
-captured: macos not built · bare-metal · 2026-09-16 · not measured (capture did not complete) · leg-hash pending
+captured: macos not built by the plugin author · bare-metal · 2026-09-16 · not measured (capture did not complete in this authoring environment) · leg-hash pending
 == action=scan
-[not captured] agent-context: this plugin was developed and built on Windows only in this environment — no macOS build exists to capture against. See docs/samples/windows.txt for why even the Windows leg's capture did not complete.
+[not captured] agent-context: this authoring/CI environment is Windows-only, so no macOS capture was performed here. A macOS-side reviewer of this PR did successfully build and capture this action independently — that capture is not reproduced verbatim in this file since this file records what THIS environment produced, but it confirms a real macOS capture is achievable; a maintainer with macOS access should replace this placeholder with the real captured output (`--stamp macos` after capturing).
 
 == action=enable_realtime
-[not captured] agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+[not captured] agent-context: no macOS build was performed in this authoring environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
 
 == action=disable_realtime
-[not captured] agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
+[not captured] agent-context: no macOS build was performed in this authoring environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.
 
 == action=scan_path
-[not captured] agent-context: no macOS build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.
+[not captured] agent-context: no macOS build was performed in this authoring environment; scan_path routes to the identical run_scan handler `scan` uses, and a macOS reviewer of this PR captured that handler successfully via `scan` (see above).

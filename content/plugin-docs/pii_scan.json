@@ -156,7 +156,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "One-shot scan of the given file/directory paths against the pii_scan ruleset (credit cards, IBAN, ICAO passport MRZ, driver's licences, and national identifiers for ~45 countries). Structured identifiers with a real checksum are validated (Luhn, IBAN mod-97, Verhoeff, ICAO MRZ composite check digits, and ~30 country-specific algorithms) — a shape match that fails its checksum is dropped, not just downgraded, since a checksum-verifiable identifier that fails its checksum is very unlikely to be a real instance of that type. Plain-text/structured-text files only in this version (binary document formats like PDF/DOCX need format-specific text extraction this plugin does not do). Findings never carry the raw matched value — only a masked form (last 4 characters, e.g. \"***********1111\").",
+      "description": "One-shot scan of the given file/directory paths against the pii_scan ruleset (credit cards, IBAN, ICAO passport MRZ, driver's licences, and national identifiers for 60 countries). Structured identifiers with a real checksum are validated (Luhn, IBAN mod-97, Verhoeff, ICAO MRZ composite check digits, and ~30 country-specific algorithms) — a shape match that fails its checksum is dropped, not just downgraded, since a checksum-verifiable identifier that fails its checksum is very unlikely to be a real instance of that type. Plain-text/structured-text files only in this version (binary document formats like PDF/DOCX need format-specific text extraction this plugin does not do). Findings never carry the raw matched value — only a masked form (last 4 characters, e.g. \"***********1111\").",
       "display_name": "Scan Files for Sensitive Data (PII)",
       "execute_roles": [
         "endpoint-admin",
@@ -176,7 +176,7 @@
     }
   ],
   "description": "Sensitive-data (PII) discovery — audits files against a research-backed ruleset of financial, passport, driver's-licence, and national-ID identifiers with real checksum validation. Audit-only, never stores raw matched values.",
-  "how_it_works": "`scan` walks the operator-supplied `paths` (files or directories), reads each plain-text file under a size cap, and matches its content line-by-line against the embedded ruleset (`content/pii-rules/*.yaml`, ~190 rules across ~45 countries — see `content/pii-rules/00-manifest.yaml`) using RE2. A shape match against a rule with a checksum is validated (Luhn, IBAN mod-97, Verhoeff, ICAO MRZ composite check digits, and ~30 country-specific algorithms); a checksum FAILURE drops the finding entirely rather than downgrading it, since a checksummed identifier that fails its own checksum is very unlikely to be a real instance of that type. A rule with no checksum (or one that can't be computed from the match) falls back to keyword-proximity confidence (MEDIUM with a nearby keyword, LOW without). An optional `jurisdictions` filter (country codes, state-prefixed codes, or region presets) scopes which rules apply; generic identifiers (cards, IBAN, email) always apply. Findings never carry the raw matched value — only a masked form (`mask_value()`: last 4 characters kept, the rest replaced with `*`). `enable_realtime`/`disable_realtime` register or remove a standing agent filesystem trigger (mtime-polling on the watched directory) that re-invokes `scan` when new files appear; this plugin deliberately does NOT attempt on-access (on-read, scan-before-open) interception — that needs a kernel-level hook (Windows minifilter, Linux `fanotify` permission events, macOS Endpoint Security AUTH events), a categorically larger undertaking pushing toward the EDR-style capability set Yuzu is not building.",
+  "how_it_works": "`scan` walks the operator-supplied `paths` (files or directories), reads each plain-text file under a size cap, and matches its content line-by-line against the embedded ruleset (`content/pii-rules/*.yaml`, ~190 rules across 60 countries — see `content/pii-rules/00-manifest.yaml`) using RE2. A shape match against a rule with a checksum is validated (Luhn, IBAN mod-97, Verhoeff, ICAO MRZ composite check digits, and ~30 country-specific algorithms); a checksum FAILURE drops the finding entirely rather than downgrading it, since a checksummed identifier that fails its own checksum is very unlikely to be a real instance of that type. A rule with no checksum (or one that can't be computed from the match) falls back to keyword-proximity confidence (MEDIUM with a nearby keyword, LOW without). An optional `jurisdictions` filter (country codes, state-prefixed codes, or region presets) scopes which rules apply; generic identifiers (cards, IBAN, email) always apply. Findings never carry the raw matched value — only a masked form (`mask_value()`: last 4 characters kept, the rest replaced with `*`). `enable_realtime`/`disable_realtime` register or remove a standing agent filesystem trigger (mtime-polling on the watched directory) that re-invokes `scan` when new files appear; this plugin deliberately does NOT attempt on-access (on-read, scan-before-open) interception — that needs a kernel-level hook (Windows minifilter, Linux `fanotify` permission events, macOS Endpoint Security AUTH events), a categorically larger undertaking pushing toward the EDR-style capability set Yuzu is not building.",
   "inputs": [
     {
       "constraints": null,
@@ -500,7 +500,25 @@
       "completeness": "Partial",
       "provenance": "`pii_scan:config`",
       "status": "`ERROR`",
-      "when": "A required parameter (`paths` on `scan`/`scan_path`; `watch_path` on `enable_realtime`/`disable_realtime`) was missing or empty, or an unknown action was dispatched."
+      "when": "A required parameter (`paths` on `scan`/`scan_path`; `watchPath` on `enable_realtime`/`disable_realtime`) was missing or empty, or an unknown action was dispatched."
+    },
+    {
+      "completeness": "Full",
+      "provenance": "`pii_scan:scan`",
+      "status": "`OK`",
+      "when": "The walk enumerated every configured root to completion (no deadline truncation, file-count cap not reached)."
+    },
+    {
+      "completeness": "Partial",
+      "provenance": "`pii_scan:scan`",
+      "status": "`CONSTRAINED`",
+      "when": "The walk stopped early — either its own wall-clock deadline elapsed, or `max_files_per_scan` was reached — before every root was fully enumerated. Never reported as a false-clean `OK`."
+    },
+    {
+      "completeness": "Unknown",
+      "provenance": "`pii_scan:scan`",
+      "status": "`UNAVAILABLE`",
+      "when": "The compiled ruleset was empty (a malformed/corrupt embedded ruleset) — nothing was actually checked against any file, reported honestly rather than as a false-clean \"0 findings\"."
     }
   ],
   "samples": {
@@ -560,7 +578,7 @@
       "actions": [
         {
           "action": "scan",
-          "not_captured": "agent-context: this plugin was developed and built on Windows only in this environment — no macOS build exists to capture against. See docs/samples/windows.txt for why even the Windows leg's capture did not complete.",
+          "not_captured": "agent-context: this authoring/CI environment is Windows-only, so no macOS capture was performed here. A macOS-side reviewer of this PR did successfully build and capture this action independently — that capture is not reproduced verbatim in this file since this file records what THIS environment produced, but it confirms a real macOS capture is achievable; a maintainer with macOS access should replace this placeholder with the real captured output (`--stamp macos` after capturing).",
           "params": "",
           "rc": 0,
           "result_status": null,
@@ -570,7 +588,7 @@
         },
         {
           "action": "enable_realtime",
-          "not_captured": "agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.",
+          "not_captured": "agent-context: no macOS build was performed in this authoring environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.",
           "params": "",
           "rc": 0,
           "result_status": null,
@@ -580,7 +598,7 @@
         },
         {
           "action": "disable_realtime",
-          "not_captured": "agent-context: no macOS build exists in this environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.",
+          "not_captured": "agent-context: no macOS build was performed in this authoring environment; also needs a live TriggerEngine plugin-capture does not provide regardless of platform.",
           "params": "",
           "rc": 0,
           "result_status": null,
@@ -590,7 +608,7 @@
         },
         {
           "action": "scan_path",
-          "not_captured": "agent-context: no macOS build exists in this environment; scan_path routes to the identical run_scan handler `scan` uses.",
+          "not_captured": "agent-context: no macOS build was performed in this authoring environment; scan_path routes to the identical run_scan handler `scan` uses, and a macOS reviewer of this PR captured that handler successfully via `scan` (see above).",
           "params": "",
           "rc": 0,
           "result_status": null,
@@ -604,8 +622,8 @@
         "host_class": "bare-metal",
         "leg_hash": "pending",
         "os": "macos",
-        "os_version": "not built",
-        "privilege": "not measured (capture did not complete)"
+        "os_version": "not built by the plugin author",
+        "privilege": "not measured (capture did not complete in this authoring environment)"
       }
     },
     "windows": {
@@ -715,7 +733,10 @@
       "agents/plugins/pii_scan/src/pii_scan_plugin.cpp"
     ],
     "privilege_row": false,
-    "tests": []
+    "tests": [
+      "tests/test_pii_scan_param_names.py",
+      "tests/unit/test_pii_scan_collect.cpp"
+    ]
   },
   "version": "1.0.0",
   "where_the_data_goes": [

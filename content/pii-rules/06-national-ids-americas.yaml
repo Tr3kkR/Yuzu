@@ -15,8 +15,17 @@ countries:
       - id: us.ssn
         displayName: "Social Security Number (SSN)"
         category: national_id
-        pattern: '(?!000|666|9\d{2})\d{3}[- ]?(?!00)\d{2}[- ]?(?!0000)\d{4}'
-        checksum: null
+        # Shape-only: the area/group/serial exclusion rules (area not
+        # 000/666/900-999, group not 00, serial not 0000) used to be
+        # negative-lookahead assertions here, but RE2 does not support
+        # lookahead by design (no backtracking, for its linear-time
+        # guarantee) -- that pattern silently failed to compile and
+        # compile_rules() silently dropped the whole rule, so every real
+        # SSN went undetected. The exclusion logic now lives in
+        # us_ssn_valid() (pii_checksum.hpp), dispatched via `checksum`
+        # below like every other named validator.
+        pattern: '\d{3}[- ]?\d{2}[- ]?\d{4}'
+        checksum: us_ssn
         exclusions: "Area 000/666/900-999 invalid; group 00 invalid; serial 0000 invalid."
         confidenceKeywords: ["ssn", "social security"]
         severity: high

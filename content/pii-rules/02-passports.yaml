@@ -29,7 +29,14 @@ metadata:
 mrzFormats:
   - id: passport.mrz.td3
     displayName: "MRZ — TD3 (standard passport booklet, 2 lines × 44 chars)"
-    checksum: icao_mrz_check_digit
+    # This top-level `checksum:` field is documentation only -- the
+    # embedding script (embed_pii_rules.py's normalize_passports())
+    # hardcodes "icao_mrz_td3_line2" for line2 specifically (the only
+    # line with a real composite check digit spanning multiple fields;
+    # see pii_checksum.hpp's mrz_td3_line2_valid()) and does not read
+    # this field. Named to match what's actually dispatched so a reader
+    # of this file isn't misled about which algorithm name is live.
+    checksum: icao_mrz_td3_line2
     severity: critical
     complianceTags: [GDPR, CCPA]
     sourceConfidence: HIGH

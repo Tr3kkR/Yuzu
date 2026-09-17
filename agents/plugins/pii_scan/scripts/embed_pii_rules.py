@@ -62,6 +62,8 @@ def flat_rule(
     confidence_keywords: list[str] | None = None,
     source_confidence: str = "MEDIUM",
     notes: str | None = None,
+    known_test_values: list[str] | None = None,
+    require_keyword: bool = False,
     source_file: str,
 ) -> dict | None:
     if not pattern:
@@ -81,6 +83,8 @@ def flat_rule(
         "confidenceKeywords": confidence_keywords or list(DEFAULT_CONFIDENCE_KEYWORDS),
         "sourceConfidence": source_confidence,
         "notes": notes,
+        "knownTestValues": known_test_values or [],
+        "requireKeyword": require_keyword,
         "sourceFile": source_file,
     }
 
@@ -100,6 +104,8 @@ def normalize_generic(doc: dict, source_file: str) -> list[dict]:
             confidence_keywords=r.get("confidenceKeywords"),
             source_confidence=r.get("sourceConfidence", "MEDIUM"),
             notes=r.get("notes"),
+            known_test_values=r.get("knownTestValues"),
+            require_keyword=r.get("requireKeyword", False),
             source_file=source_file,
         )
         if rule:
@@ -164,7 +170,7 @@ def normalize_us_dl(doc: dict, source_file: str) -> list[dict]:
         common = dict(
             jurisdiction=f"US-{state}",
             category="drivers_license",
-            severity="high",
+            severity=r.get("severity", "high"),
             compliance_tags=["GDPR", "CCPA"],
             confidence_keywords=["driver's license", "driver license", "dl number", "license number"],
             source_file=source_file,

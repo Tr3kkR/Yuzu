@@ -312,6 +312,36 @@ else
   endif
 endif
 
+# pii_scan's embedded ruleset custom_target, declared at project-root
+# scope (same reason as re2_dep above: Meson's subdir() scoping doesn't
+# propagate a subdir-local variable to a SIBLING subdir) — BOTH
+# agents/plugins/pii_scan/meson.build (the plugin's own shared_library)
+# and tests/meson.build (the real-embedded-ruleset integrity test,
+# test_pii_ruleset_integrity.cpp) need to reference the same
+# custom_target; declaring it twice under the same output name would be
+# a duplicate-target error.
+pii_embed_python = find_program('python3', 'python')
+_pii_yaml_probe = run_command(pii_embed_python, '-c', 'import yaml', check: false)
+if _pii_yaml_probe.returncode() != 0
+  error(
+    'PyYAML is required to embed the pii_scan ruleset but is not importable from '
+    + pii_embed_python.full_path() + '. Install with `pip install pyyaml` (Linux/macOS) or '
+    + '`pacman -S python-yaml` (MSYS2). See agents/plugins/pii_scan/scripts/embed_pii_rules.py.'
+  )
+endif
+
+pii_rules_embed = custom_target(
+  'bundled_pii_rules',
+  output: 'bundled_pii_rules.cpp',
+  command: [
+    pii_embed_python,
+    files('agents/plugins/pii_scan/scripts/embed_pii_rules.py'),
+    meson.project_source_root() / 'content' / 'pii-rules',
+    '@OUTPUT@',
+  ],
+  build_always_stale: true,  # always re-scan content/pii-rules/ for edits
+)
+
 add_project_arguments('-DSPDLOG_COMPILED_LIB', language: 'cpp')
 spdlog_dep      = dependency('spdlog',        required: true, include_type: 'system')
 nlohmann_dep    = dependency('nlohmann_json', required: true, include_type: 'system')

@@ -247,6 +247,8 @@ agent_test_exe = executable(
     'unit/test_vuln_rules.cpp',
     'unit/test_pii_checksum.cpp',
     'unit/test_pii_matcher.cpp',
+    'unit/test_pii_ruleset_integrity.cpp',
+    'unit/test_pii_scan_collect.cpp',
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
     'unit/test_kv_store.cpp',
@@ -481,6 +483,9 @@ agent_test_exe = executable(
     'unit/test_posix_dir_walk.cpp',     # PR #4154 round-8 remediation: shared capped
                                         # directory-walk primitive (agents/shared/posix_dir_walk.hpp)
   ),
+  pii_rules_embed,  # generated bundled_pii_rules.cpp — kEmbeddedPiiRulesJson, root-scope
+                     # custom_target (see meson.build's own comment) — test_pii_ruleset_integrity.cpp
+                     # parses/compiles the REAL embedded ruleset, not just hand-written fixtures.
   include_directories: [
     include_directories('../agents/plugins/vuln_scan/src'),  # cve_rules.hpp
     include_directories('../agents/plugins/pii_scan/src'),  # pii_checksum/pii_rules/pii_matcher.hpp (pure logic)
@@ -2197,6 +2202,16 @@ test('capability catalogue completeness',
 test('capability gate consistency',
   _python3_test,
   args: [files('test_capability_gate_consistency.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# pii_scan definition<->plugin parameter-name drift gate — see the
+# script's own docstring for the real bug (watchPath vs watch_path) this
+# exists to catch structurally.
+test('pii_scan parameter name consistency',
+  _python3_test,
+  args: [files('test_pii_scan_param_names.py')],
   suite: 'docs',
   timeout: 30,
 )

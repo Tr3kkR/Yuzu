@@ -103,7 +103,13 @@ countries:
       - id: pl.pesel
         displayName: PESEL
         category: national_id
-        pattern: '\d{2}(0[1-9]|1[0-2]|2[1-9]|3[0-2]|4[1-9]|5[0-2]|6[1-9]|7[0-2]|8[1-9]|9[0-2])\d{5}'
+        # PESEL is 11 digits (YYMMDD + 4-digit serial + 1 check digit);
+        # this pattern previously captured only 9 (YY + century-encoded-MM
+        # + 5 more), omitting the DD field entirely -- pl_pesel_weighted()
+        # requires exactly 11 digits, so every real PESEL was structurally
+        # undetectable and the truncated 9-digit fragment got matched and
+        # misreported under an unrelated country's rule instead.
+        pattern: '\d{2}(0[1-9]|1[0-2]|2[1-9]|3[0-2]|4[1-9]|5[0-2]|6[1-9]|7[0-2]|8[1-9]|9[0-2])\d{2}\d{5}'
         checksum: pl_pesel_weighted
         confidenceKeywords: ["pesel"]
         severity: high
