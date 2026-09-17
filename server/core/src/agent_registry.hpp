@@ -1032,6 +1032,20 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
+
+    /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
+    /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},
+    /// cleared then rebuilt every sweep (absent-not-zero), mirroring the
+    /// existing yuzu_fleet_net_*{os} pattern. Pure export over data
+    /// recompute_metrics already accumulated — no snapshots_/mu_ access, so
+    /// it's static. `*_os` maps are non-const: set_stats-style helpers sort
+    /// their vector in place.
+    static void recompute_perf_os_gauges(
+        yuzu::MetricsRegistry& metrics,
+        std::unordered_map<std::string, int>& reporting_os,
+        std::unordered_map<std::string, std::vector<double>>& cpu_os,
+        std::unordered_map<std::string, std::vector<double>>& commit_os,
+        std::unordered_map<std::string, std::vector<double>>& disk_lat_os);
 };
 
 } // namespace yuzu::server::detail
