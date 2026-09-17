@@ -460,9 +460,18 @@ TEST_CASE("sweep_stale_scratch_dirs: a scratch dir held open without FILE_SHARE_
 
     // Held open WITHOUT FILE_SHARE_DELETE, sharing for read only --
     // execution_artifacts_win.cpp's own open_scratch_dir_handle share mode,
-    // the exact protection a live dispatch relies on.
-    const HANDLE raw = CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ, nullptr,
-                                   OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    // the exact protection a live dispatch relies on. DELETE is REQUESTED
+    // (never exercised) to match that function's real DesiredAccess: real
+    // Windows only counts a handle as a "Deleter" in its per-object
+    // share-access bookkeeping when the handle's OWN DesiredAccess claims
+    // DELETE -- a FILE_READ_ATTRIBUTES-only handle's lack of
+    // FILE_SHARE_DELETE is never enforced against a later opener, however
+    // that later opener's own access mask reads. Confirmed empirically on
+    // real Windows/MSVC: this test failed before open_scratch_dir_handle
+    // was corrected to also request DELETE.
+    const HANDLE raw =
+        CreateFileW(dir.c_str(), FILE_READ_ATTRIBUTES | DELETE, FILE_SHARE_READ, nullptr,
+                    OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     REQUIRE(raw != INVALID_HANDLE_VALUE);
     {
         yuzu::agent::confined_fs::WinHandle held(raw);
