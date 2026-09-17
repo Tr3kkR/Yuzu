@@ -349,8 +349,9 @@ std::string GuardianSparkRuntime::abandon_claim_locked(const std::string& key,
         claim->end = stopping ? ClaimEnd::Stopped : ClaimEnd::WaiterTimedOutDispatched;
         // rung 9c PR-5d (concern 1): a genuine (non-stopping) wedge is the ONLY
         // case adoption ever applies to - R5.5's stopping-time disarm is
-        // unconditional and never consults this map (late_adopt below requires
-        // !stopping_). The map entry itself was already inserted above, before
+        // unconditional and never consults this map (on_arm_complete's own
+        // wedge_may_adopt requires !stopping_). The map entry itself was already
+        // inserted above, before
         // any of this branch's irreversible mutation - by the time `end`
         // settles to WaiterTimedOutDispatched here, wedged_by_rule_ and
         // is_retained_wedge() already agree, atomically, rather than by a

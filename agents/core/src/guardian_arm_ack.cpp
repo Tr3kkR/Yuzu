@@ -185,11 +185,10 @@ std::size_t GuardianArmAckLedger::drain_locked(GuardianSparkRuntime& runtime,
         if (runtime.receipt_recovered(it->second)) {
             // Clears THIS application's own resolved_failed contribution only -
             // never failed_out/arm_failures_, which is a cumulative fleet-visible
-            // audit counter and must never decrement (routed-concerns.md's
-            // Compliance evaluation pipeline row and this file's own header both
-            // treat "how many arm failures have ever happened" and "does the
-            // CURRENT application's generation may advance" as distinct
-            // questions; only the latter recovers here).
+            // audit counter and must never decrement (this file's own header
+            // treats "how many arm failures have ever happened" and "can the
+            // CURRENT application's generation advance" as distinct questions;
+            // only the latter recovers here).
             if (current_->resolved_failed > 0)
                 --current_->resolved_failed;
             it = current_->failed_receipts.erase(it);

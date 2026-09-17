@@ -487,7 +487,15 @@ whose backend call was never attempted. (b) **Late results apply by CURRENT DESI
 STATE, not by acknowledgment status.** A late success on a still-wanted rule commits
 normally (subscription retained, `yuzu.guardian_arm_failed` cleared for that rule, its
 "armed" record staged per R5.4); a late success on a withdrawn, replaced, or stopping
-rule is disarmed - no leak either way. This is not a reversal of #3816 (PR #3979):
+rule is disarmed - no leak either way. **Narrower carve-out, governance-adjudicated
+(architect, rung 9c PR-5d /governance run):** when a DIFFERENT rule_id already shares
+the wedged claim's key and is LIVE at the moment the late success lands, the wedged
+claim's own subscription is not independently adopted - the live sibling's ordinary
+commit path handles the key (one shared watcher), and the wedged claim's own distinct
+assertion is not evaluated again until the next full-sync Reapply (~25 s), not
+immediately. This is a real, bounded gap in "commits normally," not a leak (no
+subscription is lost or duplicated) - see R5.3 as implemented below for the exact
+`live.empty()` guard. This is not a reversal of #3816 (PR #3979):
 #3816's invariant (exactly-once result delivery, no leaked subscription) survives
 intact; what changes is that `on_abandoned`'s disarm goes from unconditional to
 conditional on "rule no longer wanted", because R5 removes the synchronous-wait model
@@ -704,7 +712,26 @@ together in prose but which do not share one signal in code:
   unconditional call in `attach_core()` - without that ordering, every
   reobservation would transit the withdrawal lookup and deactivate its own
   claim's `rg->active`, since `detach_rule_locked(rule_id)` runs on every
-  `attach_core()` call regardless of what the call turns out to be.
+  `attach_core()` call regardless of what the call turns out to be. **As
+  implemented after governance Gate 7 (rung 9c PR-5d /governance run, round
+  2):** an intervening `detach_all()` (a routine full-sync retry's own
+  teardown) deactivates `rg->active` and clears the `wedged_by_rule_` locator
+  for every currently-wedged claim UNCONDITIONALLY, including one whose rule
+  is still present in the replacement desired set - the hoisted Reobserved
+  branch is what restores candidacy for exactly that case, since reaching
+  Reobserved is itself proof the rule is still desired right now. The restore
+  writes the fallible, node-allocating `wedged_by_rule_.insert_or_assign()`
+  call BEFORE the (then-noexcept) `rg->active = true` write - matching the
+  file's own commit-or-rollback discipline (never an irreversible mutation
+  ahead of a fallible one) - so a throw there leaves `rg->active` untouched
+  and the NEXT reobservation retries, rather than permanently disabling
+  adoption for that rule (the shape governance Gate 2-4 found and Gate 7
+  closed). `on_arm_complete`'s own adoption branch additionally verifies,
+  rather than merely trusts, that nothing else has taken ownership of the
+  rule_id in the meantime: it refuses adoption outright (falling through to
+  the ordinary disarm path, logged at WARN) if `rules_` already holds ANY
+  entry for that rule_id - defense-in-depth against exactly the invariant
+  violation the fault-injection fix above closes.
 - **Arm-recovery telemetry (does the CURRENT application's `arm_failed`
   clear).** `GuardianArmAckLedger` retains the `ArmReceipt` for any receipt
   `drain_locked()` resolves to `Wedged` specifically (`Application::
@@ -726,6 +753,23 @@ is the durable, cross-application "last known arm outcome for every currently-
 desired rule" gauge a fleet-wide dashboard would need; that stronger semantic,
 plus the K-bound retry-then-waive acknowledgment policy and `arm_failed`'s
 reason/phase breakdown, remain rung 9c PR-5e's scope, unbuilt here.
+
+**Known accepted residual (governance Gate 4/8, rung 9c PR-5d /governance run,
+independently traced and REFUTED as permanent):** a withdraw immediately
+followed by a re-add of the identical (rule_id, spec) can race the still-
+in-flight original claim's own eventual `on_arm_complete` - if the withdrawal's
+`rg->active = false` is observed by `on_arm_complete`'s adopt-check BEFORE the
+immediate re-add's Reobserved-restore runs, the restore reactivates a claim
+whose disposal is already decided (a compensating disarm is owed). This is
+NOT permanent: the disarm is bounded by the same I/O-completion class as the
+original `arm()` call, `finalize_arm_compensation()` unconditionally pops the
+claim from its key's FIFO once that disarm completes regardless of
+`rg->active`'s value, and the re-add caller receives the ORIGINAL wedge's own
+already-decided outcome synchronously (never blocks, never silently succeeds)
+- so the practical effect is a bounded window in which one re-add attempt on
+that key returns a stale answer instead of triggering a fresh arm, self-
+healing on the next full-sync Reapply. Tracked as a SHOULD-severity follow-up
+(a regression test pinning this exact interleaving), not a merge blocker.
 
 **A late FAILURE (refusal, not success) on a still-desired wedged rule is a
 no-op by construction, not a third mechanism**: the claim was already terminal
