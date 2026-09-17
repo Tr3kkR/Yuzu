@@ -685,6 +685,32 @@ TEST_CASE("from-instruction-result: an oversized instruction_id is refused, "
             std::string::npos);
 }
 
+TEST_CASE("from-instruction-result: a 256-byte instruction_id passes the "
+          "length guard and reaches the not-found fallback",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // The 256-byte boundary itself must be ACCEPTED (only >256 is rejected,
+    // per kInstructionIdMaxLen) - but InstructionStore caps a real
+    // definition id at 128 characters, so no registered instruction can
+    // ever be 256 bytes long. Proving acceptance-at-the-boundary therefore
+    // means proving the length check did NOT fire (no "must be at most 256
+    // bytes" message) and the request instead reaches the pre-existing
+    // INSTRUCTION_NOT_FOUND 404, not that it dispatched.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(256, 'q');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 404);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") ==
+            std::string::npos);
+    REQUIRE(j["error"]["message"].get<std::string>().find("INSTRUCTION_NOT_FOUND") !=
+            std::string::npos);
+}
+
 TEST_CASE("from-instruction-result: an over-keyed params object is refused, "
           "never dispatched",
           "[pg][result_set][async][instruction][security][4373]") {
@@ -747,17 +773,28 @@ TEST_CASE("from-instruction-result: an oversized params value is refused, "
 
 TEST_CASE("from-instruction-result: exact-boundary params are accepted and dispatched",
           "[pg][result_set][async][instruction][security][4373]") {
+    // Scoped to params (32 keys, each key/value padded to its exact byte
+    // cap) - a real registered instruction_id is a short generated string,
+    // never anywhere near the 256-byte instruction_id cap, so that
+    // boundary isn't exercisable on the accept side without a test-only
+    // custom-id seam InstructionStore doesn't have. The reject side
+    // (257 bytes, above) plus the `>` (never `>=`) comparator already
+    // prove that boundary.
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     REQUIRE(pool.valid());
     AsyncHarness h(pool);
     auto iid = make_instruction(*h.instr);
     nlohmann::json body;
-    body["instruction_id"] = std::string(256, 'q');  // wrong id, but within bound
+    body["instruction_id"] = iid;
     nlohmann::json params = nlohmann::json::object();
     for (int i = 0; i < 32; ++i)
-        params[std::format("{:0<256}", std::format("k{}", i))] = std::string(65536, 'v');
-    body["instruction_id"] = iid;
+        // Fixed-width numeric prefix ("k000".."k031") keeps every key unique
+        // before the 'x' fill pads it to the exact 256-byte cap - a '0' fill
+        // on a bare "k{}" would collide (e.g. "k1"+zeros == "k10"+zeros),
+        // silently shrinking this to fewer than 32 distinct keys.
+        params[std::format("{:x<256}", std::format("k{:03d}", i))] = std::string(65536, 'v');
+    REQUIRE(params.size() == 32);
     body["params"] = params;
     int status = 0;
     h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);

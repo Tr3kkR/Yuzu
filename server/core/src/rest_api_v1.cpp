@@ -9552,10 +9552,6 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
-                      if (!instruction_store || !instruction_store->is_open()) {
-                          rs_err(res, 503, "instruction store not available");
-                          return;
-                      }
                       // #2437-class guard: raw-text depth check before parse, same
                       // as the identical guard on POST /api/v1/result-sets above.
                       if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
@@ -9573,15 +9569,17 @@ void RestApiV1::register_routes(
                           return;
                       }
                       // #4373-class fix: this route had no bound at all on instruction_id
-                      // or params (unlike the sql-bearing from-tar-query route two producers
-                      // up, which caps sql at creation time) - an ordinary authenticated
+                      // or params (unlike the sql-bearing from-tar-query route directly
+                      // above, which caps sql at creation time) - an ordinary authenticated
                       // caller with plain Execution:Execute could dispatch fleet-wide with
                       // an oversized instruction_id or an over-keyed/oversized params object
                       // in ONE step, no smuggle-via-create-then-reeval needed. Same caps
                       // MCP's create_result_set_from_instruction_result already enforces at
-                      // creation time; checked here ahead of the instruction_store gate
-                      // below, since a malformed/oversized field is a permanent client error
-                      // regardless of backend availability.
+                      // creation time. Checked here, ahead of the instruction_store gate
+                      // moved below (Gate 3 architect finding: the gate was originally
+                      // above this validation, same fix as the from-inventory-query route's
+                      // own Gate 4 reordering), since a malformed/oversized field is a
+                      // permanent client error regardless of backend availability.
                       if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
                           rs_err(res, 400,
                                  std::format(
@@ -9621,6 +9619,15 @@ void RestApiV1::register_routes(
                                   return;
                               }
                           }
+                      }
+                      // Gate 3 architect finding: moved below the client-input validation
+                      // above (instruction_id/params bounds) - same reasoning as the
+                      // from-inventory-query route's Gate 4 fix: a malformed/oversized
+                      // field is a permanent client error regardless of backend
+                      // availability, so a caller retrying this 503 would never succeed.
+                      if (!instruction_store || !instruction_store->is_open()) {
+                          rs_err(res, 503, "instruction store not available");
+                          return;
                       }
                       // ADR-0058: get_definition now returns std::expected — distinguish a
                       // genuine DB error (503) from "no such instruction" (404, unchanged).

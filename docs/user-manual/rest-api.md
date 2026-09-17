@@ -5776,7 +5776,7 @@ exception.
 | Status | Reason |
 |---|---|
 | 400 | `RESULT_SET_BAD_PARENT` — `parent_id` supplied but names no parent; or missing `sql` / `instruction_id` |
-| 400 | On `from-instruction-result` or `re-eval`: `instruction_id` exceeds 256 bytes, or `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
+| 400 | `RESULT_SET_BAD_REQUEST`: on `from-instruction-result` or `re-eval`, `instruction_id` exceeds 256 bytes, or `params` exceeds 32 keys / a key exceeds 256 bytes / a value exceeds 64 KiB. On `re-eval` only, the original's `sql` may also exceed 100 KiB (#4373) |
 | 404 | Unknown `instruction_id`, unknown parent set, or (on re-eval) a set the caller does not own |
 | 429 | `RESULT_SET_QUOTA_EXCEEDED` — owner is at the per-owner set cap |
 | 500 | `RESULT_SET_GATE_UNCONFIGURED` — the server's dispatch-visibility gate is not wired. Fails **closed**: nothing is dispatched, and the refusal is audited. An operator seeing this has a server misconfiguration, not an authorization problem |
