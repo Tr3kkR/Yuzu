@@ -74,9 +74,12 @@ invalid_name_fixture_plugin = shared_library(
 )
 
 # PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
-# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors;
-# agents/core links no IOKit on darwin, so the test exe must pull the frameworks
-# itself. Darwin-only; empty elsewhere.
+# <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors.
+# agent-core links IOKit/CoreFoundation itself as of A0 (agents/core/meson.build's
+# darwin arm), but the test exe still pulls its own copy here -- meson deps
+# don't transitively propagate framework link flags to a shared_library
+# consumer's -isystem in every configuration, so this stays a belt-and-braces
+# direct probe. Darwin-only; empty elsewhere.
 agent_test_native_deps = []
 agent_test_native_args = []
 if host_machine.system() == 'darwin'
@@ -92,6 +95,11 @@ if host_machine.system() == 'darwin'
     agent_test_native_deps += agent_test_security_dep
     agent_test_native_args += ['-DYUZU_HAVE_SECURITY_FRAMEWORK']
   endif
+  # Endpoint Security (A0): shared top-level probe, so a darwin test TU that
+  # includes agent-core's ES-dependent headers (es_client.hpp today; a full
+  # shared ES client in a later slice) compiles the same way core itself does.
+  agent_test_native_deps += endpoint_security_deps
+  agent_test_native_args += endpoint_security_args
 elif host_machine.system() == 'windows'
   # test_icmp_probe.cpp (Wave 2 WP-0): ws2_32 for WSAStartup/getaddrinfo/
   # htons, iphlpapi for IcmpCreateFile/IcmpCloseHandle -- icmp_probe.hpp's
