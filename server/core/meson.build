@@ -584,6 +584,10 @@ yuzu_server_core_lib = static_library(
     'src/product_registry_store.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
+    'src/app_usage_store.cpp',           # Wave 7b PR7b.2
+    'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
+    'src/app_usage_routes.cpp',          # Wave 7b PR7b.2
+    'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)
     'src/device_ci_ingestion.cpp',
     'src/device_inventory_store.cpp',
     'src/agent_decommission.cpp',

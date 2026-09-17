@@ -86,6 +86,7 @@ namespace yuzu::server {
 class HttpRouteSink; // #2542 PR-6: register_routes(HttpRouteSink&, ...) overload
 class SoftwareInventoryStore; // typed daily-sync software store (ADR-0016)
 class SoftwareLicensingStore; // ADR-0024 discovery store (query_software_licenses)
+class AppUsageStore; // wave 7 PR7.2 app-usage projection (get_agent_app_usage)
 // EnginePrincipalStore backs BOTH the PR 4.2 role-assignment MCP twins
 // (assign_engine_role/unassign_engine_role/list_engine_roles) AND the PR 4.3
 // engine-principal lifecycle tools (ADR-1005 item 2b). Forward-declared
@@ -889,7 +890,12 @@ public:
                             // use, so all three surfaces can never disagree. Trailing
                             // optional dep; nullptr leaves both tools on the pre-seam
                             // "internal error"/unwired degrade.
-                            std::shared_ptr<const DeviceApi> device_api = nullptr);
+                            std::shared_ptr<const DeviceApi> device_api = nullptr,
+                            // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                            // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                            // (kept last across the device_api merge) so adding it can never shift a
+                            // later positional caller's arguments.
+                            AppUsageStore* app_usage_store = nullptr);
 
     /// Build the GET/DELETE handlers for /mcp/v1/ (Streamable HTTP transport).
     /// Separate builders so tests can drive them without the httplib acceptor
@@ -1004,7 +1010,11 @@ public:
                          std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
                          // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
                          // forwarded to it for `list_agents`/`get_agent_details`.
-                         std::shared_ptr<const DeviceApi> device_api = nullptr);
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
+                         // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
+                         AppUsageStore* app_usage_store = nullptr);
 
     /// HttpRouteSink overload — testable in-process via TestRouteSink (no httplib
     /// acceptor; the #438 TSan trap). The httplib::Server& overload above wraps
@@ -1068,7 +1078,11 @@ public:
                          std::shared_ptr<const ComplianceApi> compliance_api = nullptr,
                          // ADR-0031 WS-A4 wave 2: see build_handler's doc comment above —
                          // forwarded to it for `list_agents`/`get_agent_details`.
-                         std::shared_ptr<const DeviceApi> device_api = nullptr);
+                         std::shared_ptr<const DeviceApi> device_api = nullptr,
+                         // wave 7 PR7.2: backs the get_agent_app_usage discovery read (the MCP twin
+                         // of GET /api/v1/forensics/agents/{id}/app-usage). TRUE last parameter
+                         // (kept last across the device_api merge).
+                         AppUsageStore* app_usage_store = nullptr);
 
 private:
     // ── Engine-principal lifecycle wiring (ADR-1005 item 2b, plan PR 4.3) ──

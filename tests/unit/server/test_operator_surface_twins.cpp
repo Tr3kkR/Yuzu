@@ -557,6 +557,10 @@ constexpr TwinRow kExpectedTwins[] = {
     {"create_software_deployment", "SoftwareDeployment", "Execute", false},
     {"rollback_software_deployment", "SoftwareDeployment", "Execute", false},
     {"cancel_software_deployment", "SoftwareDeployment", "Execute", false},
+    // Wave 7 PR7.2 — app-usage read surface. Pinned against
+    // app_usage_routes.cpp's own gate (GET /api/v1/forensics/agents/{id}/
+    // app-usage), same (securable, operation) the MCP twin enforces.
+    {"get_agent_app_usage", "Forensics", "Read", true},
 };
 
 } // namespace

@@ -157,20 +157,23 @@ constexpr FloorPair kExpectedFloorPairs[] = {
     // doesn't silently widen admin-only to any-authenticated-user.
     {"Enrollment", "Read"},
     {"OidcConfig", "Read"},
+    // Wave 7 PR7.2 (app_usage) — see authz_topology_floor.hpp's kTopologyFloor
+    // comment for the rationale.
+    {"Forensics", "Read"},
 };
 
 } // namespace
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the ten documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the nine floored pairs (a change to kTopologyFloor's
+    // Positive: the ten floored pairs (a change to kTopologyFloor's
     // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
     // added the four Settings read-twin securables to the original three;
-    // #4031 added Enrollment/OidcConfig — see authz_topology_floor.hpp's
-    // file-header note on why these PRs extended this floor beyond its
-    // original "authorization topology" framing.
+    // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics — see
+    // authz_topology_floor.hpp's file-header note on why these PRs extended
+    // this floor beyond its original "authorization topology" framing.
     CHECK(topology_floor_applies("AccessReview", "Read"));
     CHECK(topology_floor_applies("UserManagement", "Read"));
     CHECK(topology_floor_applies("EnginePrincipal", "Read"));
@@ -180,6 +183,7 @@ TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored
     CHECK(topology_floor_applies("AnalyticsConfig", "Read"));
     CHECK(topology_floor_applies("Enrollment", "Read"));
     CHECK(topology_floor_applies("OidcConfig", "Read"));
+    CHECK(topology_floor_applies("Forensics", "Read"));
 
     // Negative: a representative spread of pairs that must NOT be floored —
     // proves the set is narrow, not "every Read" or "every op on these
@@ -192,11 +196,12 @@ TEST_CASE("topology_floor_applies: exactly the nine documented pairs are floored
     CHECK_FALSE(topology_floor_applies("PluginConfig", "Read")); // unrelated securable, not floored
     CHECK_FALSE(topology_floor_applies("Directory", "Read")); // #4031: NOT floored, see PR notes
     CHECK_FALSE(topology_floor_applies("Enrollment", "Write"));
+    CHECK_FALSE(topology_floor_applies("Forensics", "Write"));
 
-    // Cardinality lock: a tenth pair silently added to kTopologyFloor
+    // Cardinality lock: an eleventh pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 9);
+    CHECK(std::size(kTopologyFloor) == 10);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────
@@ -534,6 +539,45 @@ TEST_CASE("require_permission: an engine principal is still denied Read on every
         httplib::Response res;
         INFO("securable=" << entry.securable << " operation=" << entry.operation);
         CHECK_FALSE(ar.require_permission(req, res, entry.securable, entry.operation));
+        CHECK(res.status == 403);
+    }
+}
+
+// ── 11. Forensics:Read (Wave 7 PR7.2) — the new pair's own matrix ────────
+//
+// Forensics is deliberately absent from the Viewer read-list (rbac_store.cpp
+// seed_defaults) — Administrator-only by design (docs/authz-model.md §4).
+// This locks all three legs the app_usage read path depends on: the
+// RBAC-off admin allow (the ordinary admin-role fast path, unaffected by the
+// floor), the RBAC-on seeded-Administrator allow (the floor must never run
+// ahead of a live grant — same principle section 5 locks for AccessReview),
+// and the RBAC-on no-grant deny (a plain user, even with RBAC on, never
+// gets Forensics:Read without an explicit grant).
+
+TEST_CASE("require_permission: Forensics:Read — RBAC-off admin allowed, RBAC-on seeded "
+          "Administrator grant allowed, RBAC-on no grant denied",
+          "[pg][authz][floor]") {
+    FloorFixture fix;
+
+    SECTION("RBAC off: an admin cookie session is allowed") {
+        auto req = fix.session_request("oscar", auth::Role::admin);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "Forensics", "Read"));
+    }
+
+    SECTION("RBAC on: a user assigned the seeded Administrator role is allowed") {
+        REQUIRE(fix.rbac_store.assign_role({"user", "peggy", "Administrator"}).has_value());
+        fix.rbac_store.set_rbac_enabled(true);
+        auto req = fix.session_request("peggy", auth::Role::user);
+        httplib::Response res;
+        CHECK(fix.ar->require_permission(req, res, "Forensics", "Read"));
+    }
+
+    SECTION("RBAC on: a non-admin with no Forensics grant is denied") {
+        fix.rbac_store.set_rbac_enabled(true);
+        auto req = fix.session_request("quentin", auth::Role::user);
+        httplib::Response res;
+        CHECK_FALSE(fix.ar->require_permission(req, res, "Forensics", "Read"));
         CHECK(res.status == 403);
     }
 }

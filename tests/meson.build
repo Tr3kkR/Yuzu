@@ -1223,6 +1223,7 @@ if build_server
       'unit/server/test_openapi_spec_completeness.cpp',   # #3991 F1: ADR-0031 INV-31-4 / #842 unit-test half
       'unit/server/test_rest_software_packages.cpp',
       'unit/server/test_rest_inventory_software.cpp',
+      'unit/server/test_rest_dex_app_perf_devices.cpp',   # version-row "which devices" drill: GET /api/v1/dex/perf/app/devices
       'unit/server/test_rest_devices.cpp',   # #4033 (#2146 Batch A): GET /api/v1/devices[/{id}] + agent-count-preview
       'unit/server/test_group_agent_count_preview.cpp',   # #4033: pure shared create-group-preview model
       'unit/server/test_rest_sessions.cpp',
@@ -1284,6 +1285,9 @@ if build_server
       'unit/server/test_product_registry_store.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
+      'unit/server/test_app_usage_store.cpp',       # Wave 7b PR7b.2
+      'unit/server/test_app_usage_ingestion.cpp',   # Wave 7b PR7b.2
+      'unit/server/test_app_usage_routes.cpp',      # Wave 7b PR7b.2
       'unit/server/test_device_inventory_store.cpp',
       'unit/server/test_agent_decommission.cpp',
       'unit/server/test_app_perf_daily_store.cpp',

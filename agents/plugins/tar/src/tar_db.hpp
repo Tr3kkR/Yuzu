@@ -256,6 +256,11 @@ struct ProcPerfRow {
     int instances{0};
     double cpu_pct{0.0};
     int64_t ws_bytes{0};
+    /// Kernel thread (Linux PF_KTHREAD) / Windows System process (pid 4) —
+    /// see tar_proc_perf.hpp's "Kernel-thread marker" note. Recorded
+    /// unfiltered here (this tier keeps kernel threads); the daily app-perf
+    /// rollup (sync_source_app_perf.cpp) filters on it.
+    bool is_kthread{false};
 };
 
 /// One module_live row (M2 — image/DLL/driver load capture). `action` and

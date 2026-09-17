@@ -28,6 +28,7 @@
 
 #include <yuzu/server/auth.hpp>
 
+#include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_model.hpp"
 
@@ -420,6 +421,27 @@ public:
     /// be empty → the scope selector is omitted (whole-fleet only).
     using GroupListFn = std::function<std::vector<DexGroupOption>()>;
 
+    /// The version-drill "which devices" fragment's SOLE authorization gate —
+    /// the injected-callback twin of `AuthRoutes::require_fleet_read`
+    /// (authz_gates.hpp), identical shape/contract to `RestApiV1::FleetReadFn` /
+    /// `McpServer::FleetReadFn` (server.cpp wires the SAME conversion lambda into
+    /// all three surfaces so they cannot drift). Deliberately NOT `perm_fn_` +
+    /// `resolve_visible` (this file's pre-existing `VisibleSetFn`, username-keyed
+    /// on `Infrastructure:Read`) — that pairing is the exact confinement gap this
+    /// gate exists to avoid for a route whose rows carry `agent_id` (see the
+    /// fragment's own registration comment). Trailing optional dep, appended
+    /// after `group_list_fn` to keep every existing `register_routes` call site
+    /// source-stable; `{}` (the default) makes the new fragment answer an honest
+    /// "unavailable" placeholder rather than silently falling back to a weaker
+    /// gate — an unwired gate is misconfiguration, never "no filter" (matches
+    /// `RestApiV1`/`McpServer`'s own unwired contract for the identical seam,
+    /// adapted to this dashboard surface's 200-not-503 fragment posture since
+    /// htmx drops 4xx/5xx bodies).
+    using FleetReadFn =
+        std::function<authz::FleetReadGate(const httplib::Request&, httplib::Response&,
+                                           const std::string& securable_type,
+                                           const std::string& operation)>;
+
     /// Register the DEX routes. The page shell is auth-only static chrome; the
     /// data-bearing fragments gate on GuaranteedState:Read (same securable as the
     /// Guardian read surface — a dedicated DEX:Read perm is deferred). `store` may
@@ -431,7 +453,7 @@ public:
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
-                         GroupListFn group_list_fn = {});
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
     /// HttpRouteSink overload — same registration against the polymorphic seam so
     /// the handlers are unit-testable in-process via TestRouteSink (no httplib
@@ -441,7 +463,7 @@ public:
                          DispatchFn dispatch_fn = {}, ResponsesFn responses_fn = {},
                          PerfFn perf_fn = {}, ScopedPermFn scoped_perm_fn = {},
                          VisibleSetFn visible_set_fn = {}, AppPerfProviders app_perf_providers = {},
-                         GroupListFn group_list_fn = {});
+                         GroupListFn group_list_fn = {}, FleetReadFn fleet_read_fn = {});
 
 private:
     /// Deny a service-scoped API token on a fleet-wide fragment that names more
@@ -474,6 +496,7 @@ private:
     PerfFn perf_fn_;
     AppPerfProviders app_perf_providers_;
     GroupListFn group_list_fn_;
+    FleetReadFn fleet_read_fn_;
 };
 
 } // namespace yuzu::server
