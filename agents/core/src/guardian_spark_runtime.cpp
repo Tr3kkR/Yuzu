@@ -2598,7 +2598,7 @@ std::shared_ptr<GuardianSparkRuntime::KeyClaim>
 GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string_view lifecycle_kind) {
     // rung 9c PR-5d (concern 1, 5th occurrence of this branch's own fail-open class -
     // found by THIS governance run's own Gate 4 unhappy-path pass, independently
-    // confirmed by cpp-safety; unlike the prior three occurrences, not raised by an
+    // confirmed by cpp-safety; unlike the prior four occurrences, not raised by an
     // external reviewer and not a finding from an earlier Gate 2/3/7/8 round). This
     // block - deactivate rule_id's currently-wedged claim, if any, via the
     // wedged_by_rule_ locator (see that map's own doc comment for what populates it
@@ -2633,8 +2633,8 @@ GuardianSparkRuntime::detach_rule_locked(const std::string& rule_id, std::string
     // itself is fine, it is only THIS lookup, the one thing that would have read it
     // and deactivated claim A, that never ran. Claim A's rg->active stayed wrongly
     // true past the withdrawal that should have deactivated it - the same fail-open
-    // shape as the three prior occurrences on this branch (a claim's adoption
-    // candidacy silently outliving a real withdrawal), at a fourth structurally
+    // shape as the four prior occurrences on this branch (a claim's adoption
+    // candidacy silently outliving a real withdrawal), at a fifth structurally
     // distinct site: not a map-insert ordering or a same-key collision this time,
     // but an early return that skips a LATER cleanup block entirely.
     //
