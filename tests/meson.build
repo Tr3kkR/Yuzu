@@ -862,15 +862,12 @@ elif host_machine.system() == 'darwin'
   # present in both the Command Line Tools SDK and the full Xcode SDK --
   # "needs full Xcode" is a myth, see docs/darwin-compat.md's ES row).
   # The live client never starts in CI (unentitled) so the pure-mapping + clean-
-  # fallback tests run regardless; the ES TU only links the framework where it
-  # exists. Mirror the plugin's capability detection (docs/darwin-compat.md).
-  es_test_dep = dependency('appleframeworks', modules: ['EndpointSecurity'], required: false, include_type: 'system')
-  if es_test_dep.found()
-    tar_test_deps += es_test_dep
-    tar_test_deps += cxx.find_library('bsm')
-    # -fblocks required for the ES block literal in tar_proc_es.cpp (see plugin meson).
-    tar_test_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
-  endif
+  # fallback tests run regardless. Threads the SHARED top-level probe
+  # (meson.build's endpoint_security_dep/_deps/_args) through -- governance
+  # A0 fix round: a second, independent ES probe here duplicated the single
+  # top-level one this exe otherwise shares with agent-core and TAR.
+  tar_test_deps += endpoint_security_deps
+  tar_test_cpp_args += endpoint_security_args
   # Wave 6 PR6.3: test_tar_removable.cpp calls make_removable_cursor_source(), so
   # this exe compiles the removable collector — which on darwin needs its
   # DiskArbitration Objective-C++ TU and framework, exactly as the plugin does.
