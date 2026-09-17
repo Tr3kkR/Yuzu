@@ -776,6 +776,41 @@ devices always appear as an explicit "(untagged)" residual row.
 
 ---
 
+## Recipe: Reflex consent gate (`device_class`)
+
+The Reflex system (`docs/reflex-design.md`, ADR-0021 Decision 4 — design-only as of this writing,
+see `docs/roadmap.md` Phase 20) needs to know which devices have no end user present to consent to
+a prompt, so a consequential automated Reaction can safely `proceed`-on-exhaustion instead of
+waiting on someone who will never see it. That classification is the free-form tag key
+`device_class`, with a closed vocabulary of two values:
+
+- `device_class=server` — no end user is normally present; a dangerous Reflex Reaction *may* use
+  `proceed`-on-exhaustion escalation on this device.
+- `device_class=workstation` — an end user is normally present; a dangerous Reaction may only fire
+  with prior in-chain consent (an `interaction.*` Reaction gated `on_success` earlier in the same
+  chain) — it may never proceed unattended.
+
+`device_class` is **not** one of the four structured categories (`role` / `environment` /
+`location` / `service`) — it has no entry in `tag-categories` and is not schema-validated the way
+`environment`'s `Dev`/`UAT`/`Production` values are. The `server`/`workstation` vocabulary is
+enforced entirely by the Reflex consent-gate reader (`consent_satisfied_by_tags`), not by
+`TagStore`. **An untagged device is treated as `workstation` — fail-closed** — Reflex never infers
+"no user present" from the absence of a tag.
+
+Tag a device as a server (no end user present):
+
+```bash
+curl -s -X PUT "$YUZU/api/v1/tags" -b "$COOKIE" \
+  -H "Content-Type: application/json" \
+  -d '{"agent_id": "db-prod-01", "key": "device_class", "value": "server"}'
+```
+
+An unreadable `TagStore` read at evaluation time is treated as a consent-gate **error**, never as
+implicit consent — the compiler refuses to compile a Reflex Set whose consent could not be
+positively established, rather than defaulting to "allowed."
+
+---
+
 ## Troubleshooting
 
 ### "invalid value for category" error when setting a tag
