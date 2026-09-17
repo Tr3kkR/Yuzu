@@ -1748,9 +1748,18 @@ private:
     /// entry uncorrected today - a fault injected before on_arm_complete()'s
     /// own erase at (b) (the `fault_here_for_test(1)` seam), and the compensating/
     /// finalize path that pops a claim without consulting this map - both are
-    /// contained by the identity-check below and by insert_or_assign()
-    /// overwriting on a later same-rule wedge, never a correctness issue, only
-    /// a residual stale entry.
+    /// contained by the identity-check below: a STALE entry (one whose claim has
+    /// already resolved) is harmless because every consequential read
+    /// `.lock()`s and identity-checks it. External review correction (PR #4485,
+    /// fjarvis): a later same-rule wedge overwriting this map is NOT
+    /// automatically harmless the way a stale entry is - if the entry being
+    /// overwritten still names a LIVE, unresolved claim on a DIFFERENT key (an
+    /// ordinary flip-flop redeploy can wedge the same rule_id on two keys at
+    /// once), an unguarded overwrite orphans that live claim with no way for a
+    /// future withdrawal to ever find it again. The Reobserved-restore branch's
+    /// own insert_or_assign() call now guards against exactly this by
+    /// deactivating any different, still-live claim it is about to displace
+    /// before overwriting its entry - see that call site's own comment.
     /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
     /// claim alive after claims_ itself has already dropped it (a defensive
     /// belt-and-braces should erasure at (a)/(b)/(c) above ever be missed on

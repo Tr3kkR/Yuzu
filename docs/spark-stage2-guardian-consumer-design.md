@@ -780,10 +780,17 @@ claim from its key's FIFO once that disarm completes regardless of
 `rg->active`'s value, and the re-add caller receives the ORIGINAL wedge's own
 already-decided outcome synchronously (never blocks, never silently succeeds)
 - so the practical effect is a bounded window in which one re-add attempt on
-that key returns a stale answer instead of triggering a fresh arm, self-
-healing on the next full-sync Reapply. Tracked as #4472 (a regression test
-pinning this exact interleaving, and a decision on whether it becomes a named
-Spark-flip-ladder precondition), not a merge blocker.
+that key returns a stale answer instead of triggering a fresh arm. External
+review precision correction (PR #4485, fjarvis): the healing clock is NOT a
+flat ~25s cadence - it starts at the compensating disarm's own I/O completion,
+which is bounded by each mechanism's own `watch()`/`unwatch()` contract
+(`spark_mechanism.hpp`'s per-type-serialised, CATASTROPHIC-tier "must bound
+blocking OS work" invariant - unchanged and unweakened by this PR), not by the
+25s full-sync interval itself; the next full-sync Reapply is simply what
+eventually re-desires the key once that disarm has landed, on whatever cadence
+already governs this codebase's pre-existing disarm path. Tracked as #4472 (a
+regression test pinning this exact interleaving, and a decision on whether it
+becomes a named Spark-flip-ladder precondition), not a merge blocker.
 
 **A late FAILURE (refusal, not success) on a still-desired wedged rule is a
 no-op by construction, not a third mechanism**: the claim was already terminal
