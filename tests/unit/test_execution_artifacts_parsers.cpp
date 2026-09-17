@@ -773,6 +773,17 @@ TEST_CASE("parse_prefetch: RECONSTRUCTION-only negatives -- truncated header, un
         CHECK(r.error().token == "oversize_count");
     }
 
+    SECTION("two volumes, each individually well under kPrefetchMaxFileRefs, but their SUM "
+            "exceeds it -- the running total_refs cap is a separate check from each entry's "
+            "own per-entry cap, and mutation-testing confirmed removing it left every existing "
+            "test green (neither entry alone ever tripped oversize_count)") {
+        auto buf = build_valid_prefetch_v31_blob_with_volumes({40000, 30000});
+        Result<PrefetchResult> r{PrefetchResult{}};
+        REQUIRE_NOTHROW(r = parse_prefetch(buf));
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().token == "oversize_count");
+    }
+
     SECTION("two volumes: entry 0 is well-formed, entry 1's refs-block offset is corrupted -- "
             "the walk must fail on entry 1, not silently stop after entry 0") {
         auto buf = build_valid_prefetch_v31_blob_with_volumes({5, 7});

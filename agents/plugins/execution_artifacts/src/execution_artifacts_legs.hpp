@@ -38,10 +38,12 @@ namespace yuzu::execution_artifacts {
 // code (CC-07 contract, same as every other plugin in this repo).
 
 int collect_shimcache(yuzu::CommandContext& ctx);
-// `data_dir` is the agent's configured `agent.data_dir` (empty if unset --
-// see execution_artifacts_win.cpp's amcache_dest_dir for the fallback);
-// only the amcache leg needs it, since it's the only one that writes a
-// scratch file to disk.
+// `data_dir` is the agent's configured `agent.data_dir` -- the parent
+// directory execution_artifacts_win.cpp's collect_amcache creates its
+// per-dispatch random scratch directory under. Empty if unset, which
+// collect_amcache reports as constrained|data_dir_unset (no fallback
+// location); only the amcache leg needs it, since it's the only one that
+// writes a scratch file to disk.
 int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir);
 int collect_prefetch(yuzu::CommandContext& ctx);
 

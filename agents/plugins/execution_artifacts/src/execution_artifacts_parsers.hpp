@@ -612,8 +612,9 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
 
     // file_ref_count: the TOTAL number of NTFS file references SUMMED
     // across EVERY declared volume entry (README.md / execution_artifacts.
-    // yaml's documented "Number of file-reference entries in the
-    // file-information block" -- whole-file, not volume-0-only). Every
+    // yaml's documented "Total number of NTFS file references, summed
+    // across every declared volume entry in the file-information block
+    // (not just the first)" -- whole-file, not volume-0-only). Every
     // entry is walked and bounds-checked; a truncated or over-cap value in
     // ANY entry fails the whole parse with a named reason rather than
     // silently under-counting or defaulting to 0 -- indistinguishable from

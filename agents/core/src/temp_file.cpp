@@ -108,8 +108,17 @@ extern "C" {
 
 YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, const char* directory,
                                       char* path_out, size_t path_out_size) {
-    if (!path_out || path_out_size == 0)
+    if (!path_out || path_out_size == 0) {
+#ifdef _WIN32
+        // This guard runs before the platform split below, so it isn't
+        // covered by any of that code's own SetLastError() calls -- without
+        // this, a caller relying on the "always meaningful on failure"
+        // contract documented in sdk/include/yuzu/plugin.h would read
+        // whatever stale, unrelated code happened to be left over.
+        SetLastError(ERROR_INVALID_PARAMETER);
+#endif
         return -1;
+    }
 
     const char* pfx = (prefix && prefix[0]) ? prefix : "yuzu-";
     const char* sfx = (suffix && suffix[0]) ? suffix : ".tmp";
@@ -198,8 +207,13 @@ YUZU_EXPORT int yuzu_create_temp_file(const char* prefix, const char* suffix, co
 
 YUZU_EXPORT int yuzu_create_temp_dir(const char* prefix, const char* directory, char* path_out,
                                      size_t path_out_size) {
-    if (!path_out || path_out_size == 0)
+    if (!path_out || path_out_size == 0) {
+#ifdef _WIN32
+        // See the identical guard/comment in yuzu_create_temp_file above.
+        SetLastError(ERROR_INVALID_PARAMETER);
+#endif
         return -1;
+    }
 
     const char* pfx = (prefix && prefix[0]) ? prefix : "yuzu-";
 

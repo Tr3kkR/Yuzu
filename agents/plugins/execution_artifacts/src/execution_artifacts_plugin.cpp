@@ -169,8 +169,10 @@ public:
 
 private:
     // Captured at init() (tar_plugin.cpp:565-581's precedent); only the
-    // amcache leg consumes it (execution_artifacts_win.cpp's
-    // amcache_dest_dir), empty when agent.data_dir is unset.
+    // amcache leg consumes it (execution_artifacts_win.cpp's collect_amcache,
+    // as the parent directory for its per-dispatch random scratch
+    // directory), empty when agent.data_dir is unset -- collect_amcache
+    // hard-fails constrained|data_dir_unset in that case, no fallback.
     std::string data_dir_;
 };
 
