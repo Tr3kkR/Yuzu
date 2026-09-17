@@ -76,9 +76,21 @@ TEST_CASE("cpu_busy_pct rejects invalid input, a field regression, and zero elap
     CHECK_FALSE(cpu_busy_pct(base, CpuTicks{}).has_value());   // cur invalid
     CHECK_FALSE(cpu_busy_pct(base, base).has_value());         // zero elapsed
 
-    CpuTicks regressed = base;
-    regressed.system = base.system - 1;
-    CHECK_FALSE(cpu_busy_pct(base, regressed).has_value()); // per-field regression
+    // Every field is its own independently monotonic counter (unlike
+    // yuzu::agent::lnx::CpuJiffies's single derived total) — each one regressing on
+    // its own must reject, not just the field the original case happened to pick.
+    CpuTicks r = base;
+    r.user = base.user - 1;
+    CHECK_FALSE(cpu_busy_pct(base, r).has_value()); // user regression
+    r = base;
+    r.system = base.system - 1;
+    CHECK_FALSE(cpu_busy_pct(base, r).has_value()); // system regression
+    r = base;
+    r.nice = base.nice - 1;
+    CHECK_FALSE(cpu_busy_pct(base, r).has_value()); // nice regression
+    r = base;
+    r.idle = base.idle - 1;
+    CHECK_FALSE(cpu_busy_pct(base, r).has_value()); // idle regression
 }
 
 // ── disk_await_ms — pure, every host ─────────────────────────────────────────
@@ -119,9 +131,21 @@ TEST_CASE("disk_await_ms rejects invalid input and a counter regression", "[dex]
     CHECK_FALSE(disk_await_ms(DiskTotals{}, base).has_value());
     CHECK_FALSE(disk_await_ms(base, DiskTotals{}).has_value());
 
-    DiskTotals regressed = base;
-    regressed.reads = base.reads - 1;
-    CHECK_FALSE(disk_await_ms(base, regressed).has_value());
+    // Every field disk_await_ms actually reads (reads/writes/read_time_ns/write_time_ns)
+    // is checked for regression independently — each one regressing on its own must
+    // reject, not just the field the original case happened to pick.
+    DiskTotals r = base;
+    r.reads = base.reads - 1;
+    CHECK_FALSE(disk_await_ms(base, r).has_value()); // reads regression
+    r = base;
+    r.writes = base.writes - 1;
+    CHECK_FALSE(disk_await_ms(base, r).has_value()); // writes regression
+    r = base;
+    r.read_time_ns = base.read_time_ns - 1;
+    CHECK_FALSE(disk_await_ms(base, r).has_value()); // read_time_ns regression
+    r = base;
+    r.write_time_ns = base.write_time_ns - 1;
+    CHECK_FALSE(disk_await_ms(base, r).has_value()); // write_time_ns regression
 }
 
 // ── memory_pressure_pct — pure, every host ───────────────────────────────────
