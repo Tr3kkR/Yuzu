@@ -341,7 +341,16 @@ struct DeleteScan {
 ///
 /// The residual fstatat-then-unlinkat window (POSIX has no unlink-by-fd) is
 /// narrowed to the identity-verified microseconds between the two calls, but
-/// not closed. confined_fs_posix.cpp:348-366 documents a STRONGER mitigation
+/// not closed. That window is narrower still than it first looks: for a
+/// symlink entry, the recheck itself is three non-atomic syscalls
+/// (fstatat(NOFOLLOW) for the link's own identity, readlinkat for its text,
+/// fstatat(follow) for the target's identity), so a content-preserving
+/// swap timed strictly between the first and the other two can in principle
+/// glue a stale own-inode to fresh text/target that still happens to equal
+/// at_match -- governance Gate 4 (UP-1) traced this and found it bounded:
+/// the replacement must preserve both link text and target identity to pass
+/// at all, so the entry actually removed is semantically equivalent to the
+/// one matched: no wrong-file deletion results. confined_fs_posix.cpp:348-366 documents a STRONGER mitigation
 /// for its own (different) delete-with-byte-cap problem -- capture-then-
 /// measure: renameat the entry to an unpredictable name, then measure and
 /// unlink THAT name -- and that comment is explicit that even THAT only
