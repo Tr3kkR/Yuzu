@@ -556,14 +556,29 @@ public:
     /// `synthesize_token_session` — never client-controllable); rotation is
     /// refused unless they are EQUAL (not "no broader than" — an ordering
     /// needs a tier-lattice assumption a future tier could break) to the
-    /// freshly-read predecessor's own `mcp_tier`/`scope_service`. A cookie
-    /// or JIT-elevated interactive caller carries empty tier/scope, which
-    /// matches an untiered predecessor naturally — no special-casing. The
-    /// refusal is folded into the SAME "no such token to rotate" wording
-    /// used for absent/not-owned so this is not an authority-probing
-    /// oracle. Enforced authoritatively under the advisory-locked
-    /// transaction against a FRESH re-read of the predecessor row; the
-    /// pre-txn check below is an early-rejection mirror only.
+    /// freshly-read predecessor's own `mcp_tier`/`scope_service`, WITH ONE
+    /// #2963 exception: a caller presenting empty `""`/`""` (a plain cookie
+    /// or JIT-elevated interactive session, holding no standing tier/scope
+    /// authority at all) may rotate ANY of its own tokens regardless of
+    /// THAT token's tier/scope — see `caller_may_act_on_tiered_token`'s doc
+    /// comment (api_token_store.cpp) for why this is a single special case,
+    /// not a tier lattice: such a caller already holds a strict superset of
+    /// what any tiered/scoped token can do, and the successor still
+    /// inherits the TOKEN's own narrower tier/scope verbatim, never the
+    /// caller's — nothing is escalated. This is what makes it possible to
+    /// rotate a possibly-compromised MCP-tiered or service-scoped token
+    /// from an ordinary dashboard session, which could not reach it before
+    /// #2963 (the tier-equality check made it structurally unrotatable
+    /// except by presenting that exact token's own credential — backwards
+    /// precisely when the reason to rotate is that the secret may be
+    /// compromised). Every OTHER pairing (a caller holding SOME non-empty
+    /// tier/scope against a predecessor with a DIFFERENT one) still refuses
+    /// on exact equality, no lattice. The refusal is folded into the SAME
+    /// "no such token to rotate" wording used for absent/not-owned so this
+    /// is not an authority-probing oracle. Enforced authoritatively under
+    /// the advisory-locked transaction against a FRESH re-read of the
+    /// predecessor row; the pre-txn check below is an early-rejection
+    /// mirror only.
     ///
     /// `caller_mcp_tier`/`caller_scope_service` are REQUIRED, not defaulted
     /// (governance Gate 8 fix) — an untiered `""`/`""` is the predecessor
@@ -599,12 +614,16 @@ public:
     /// read reasoning, distinct from the principal-scoped original.
     ///
     /// `caller_mcp_tier`/`caller_scope_service` re-check the SAME
-    /// authority-inheritance invariant `rotate_token` enforces, as DEFENCE
-    /// IN DEPTH ONLY — a successor's tier/scope are fixed at mint time and
-    /// cannot legitimately diverge from what the caller who initiated the
-    /// rotation already held, so `rotate_token`'s own guard is the
-    /// load-bearing one; this catches only a hypothetical future bypass of
-    /// it, never a live path today. REQUIRED, not defaulted, for the same
+    /// authority-inheritance invariant `rotate_token` enforces, INCLUDING
+    /// the #2963 empty-tier/scope exception (see that doc comment) — as
+    /// DEFENCE IN DEPTH ONLY — a successor's tier/scope are fixed at mint
+    /// time and cannot legitimately diverge from what the caller who
+    /// initiated the rotation already held, so `rotate_token`'s own guard
+    /// is the load-bearing one; this catches only a hypothetical future
+    /// bypass of it, never a live path today. Both checks MUST stay in sync
+    /// — a caller that can successfully `rotate_token` must also be able to
+    /// `confirm_token_rotation` the SAME pair, or the two calls disagree on
+    /// an identical caller/token. REQUIRED, not defaulted, for the same
     /// reason as `rotate_token`'s own pair (governance Gate 8 fix) — see
     /// that doc comment.
     ///
