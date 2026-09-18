@@ -93,7 +93,21 @@ get_agent(Request, Ctx) ->
 
     case yuzu_gw_registry:lookup(AgentId) of
         {ok, Pid} ->
-            case yuzu_gw_agent:get_info(Pid) of
+            %% GOVERNANCE FINDING (external PR review): `lookup/1`'s cross-node
+            %% `pg` fallback (`lookup_remote/1`, HA WS-4 4.3a) never verifies a
+            %% REMOTE member's liveness — it trusts `pg`'s own asynchronous
+            %% cleanup (see that function's doc comment). A stale pid reaching
+            %% here therefore makes `gen_statem:call/3` below raise
+            %% `exit({noproc, _})` (dead process) or `exit({nodedown, _})` /
+            %% `exit({noconnection, _})` (node genuinely disconnected) instead
+            %% of returning `{error, _}` — uncaught, that would crash this
+            %% grpcbox request handler instead of reaching either `case`
+            %% branch below. The router's fire-and-forget dispatch path
+            %% self-heals the same staleness via the 300s `fanout_timeout`;
+            %% this synchronous RPC has no such fallback and must map it to
+            %% the same NOT_FOUND response the `error` branch already
+            %% produces for "never was connected".
+            try yuzu_gw_agent:get_info(Pid) of
                 {ok, Info} ->
                     Plugins = [#{name => P} || P <- maps:get(plugins, Info, [])],
                     Response = #{
@@ -109,6 +123,13 @@ get_agent(Request, Ctx) ->
                     {error, #{status => 13,
                               message => iolist_to_binary(
                                   io_lib:format("Agent query failed: ~p", [Reason]))}}
+            catch
+                exit:{noproc, _} ->
+                    {error, #{status => 5,  %% NOT_FOUND
+                              message => <<"Agent not connected">>}};
+                exit:{Reason, _} when Reason =:= nodedown; Reason =:= noconnection ->
+                    {error, #{status => 5,  %% NOT_FOUND
+                              message => <<"Agent not connected">>}}
             end;
         error ->
             {error, #{status => 5,  %% NOT_FOUND

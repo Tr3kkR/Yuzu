@@ -396,8 +396,8 @@ bullets below. **What remains OUT of scope for 4.2b**: multi-cluster gateway fan
 `gw_mgmt_stub_`), the durable cross-replica session lookup (#4246 #3, re-homed to WS-5) — the reader
 stays FALLBACK-ONLY and behaviorally inert until that lands and makes a local miss actually mean
 something on a multi-replica deployment — and `gateway_node` convergence reconcile (4.4). The #4324
-per-home stream-generation fence (re-scoped from #4246 #4) is now CLOSED (pending merge — see the
-#4324 status paragraph below); 4.2b's review RE-VERIFIED the once-per-session property this section
+per-home stream-generation fence (re-scoped from #4246 #4) is now CLOSED and MERGED to `origin/dev`
+(PR #4492, `c37306113`, 2026-09-17 — see the #4324 status paragraph below); 4.2b's review RE-VERIFIED the once-per-session property this section
 already established before landing the reader (see the design-obligations bullet on #4 above and the
 4.2b status paragraph below for the re-verification citation), and #4324's own slice re-verified it a
 second time before making the fence live (`governance.d/ha-ws4-4324-stream-fence-reverification.md`).
@@ -466,8 +466,9 @@ alert-rule halves** (#4 RE-SCOPED, not closed — see its bullet):**
   `yuzu_gw_registry:take_pending/1`'s atomic `ets:take/2` (unchanged by the merged 4.2a, PR #4299), and
   the concurrent-barrier test in `yuzu_gw_registry_tests.erl` (exactly one winner across many
   barrier-released rounds) is still present and green. Tracked in #4324 (re-scoped from #4246 item #4) —
-  4.2b landed only the re-verification; **the per-home fence itself is CLOSED as of #4324's own slice**
-  (pending merge; see the #4324 status paragraph below): `StreamStatusNotification.stream_home_id`
+  4.2b landed only the re-verification; **the per-home fence itself is CLOSED as of #4324's own slice,
+  MERGED to `origin/dev`** (PR #4492, `c37306113`, 2026-09-17; see the #4324 status paragraph below):
+  `StreamStatusNotification.stream_home_id`
   (field 8, opaque per-connection-instance id minted once per `yuzu_gw_agent` process, task 1,
   `46f1e72b6`), `GatewayRouteStore`'s asymmetric tombstone predicate on the new nullable
   `stream_home_id` column (task 2, `4b248b504`, migration v3), and `gateway_service_impl.cpp`'s
@@ -589,16 +590,27 @@ also what makes the reader behaviorally live, since only then can a directory ro
 replica's own in-memory registry), and 4.4 (`gateway_node` convergence reconcile, replay-response
 writeback). The #4324 per-home stream-generation fence itself is now CLOSED — see below.
 
-**Status (#4324, 2026-09-17, pending merge on `feat/ha-ws4-4324-stream-fence`): the per-home
+**4.3a update (2026-09-18): the intra-cluster half of 4.3 is DONE** — per-agent `pg`-group agent→node
+lookup within one Erlang gateway cluster (`yuzu_gw_registry.erl`'s `lookup/1`/`lookup_remote/1`), the
+`fanout_terminal` cross-node-routing fix (`yuzu_gw_agent.erl`), and `remote_dispatched` telemetry
+(`yuzu_gw_router.erl`) — component-complete-and-INERT pending `#4555` (gateway multi-node cluster
+formation, entirely unimplemented in production). The pre-CONNECT-race ordering gap is **NOT**
+"deliberately left open" as this paragraph previously stated — it is RESOLVED as unreachable BY
+INVARIANT (see the #4324 status paragraph's PR-review-fix note below for the full resolution).
+Remaining WS-4 work is the REST of 4.3 (cross-cluster gateway fan-out — today one `gw_mgmt_stub_` —
+**and** `#4555` cluster formation itself, not fan-out logic alone) and 4.4.
+
+**Status (#4324, MERGED to `origin/dev` — PR #4492, `c37306113`, 2026-09-17T22:05:58Z): the per-home
 stream-generation fence is CLOSED end-to-end**, three tasks: task 1 (`46f1e72b6`) adds
 `StreamStatusNotification.stream_home_id = 8` to the canonical proto and both gateway-vendored
 mirrors — an opaque id the gateway mints once per `yuzu_gw_agent` process instance
 (`string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(16)))`, 32 hex chars) and stamps on both
 the CONNECTED and DISCONNECTED notification that instance ever sends; task 2 (`4b248b504`) adds a
 nullable `agent_routes.stream_home_id` column (migration v3) plus the ASYMMETRIC tombstone predicate
-`stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')` to `GatewayRouteStore::deregister` — an
-unstamped (legacy) incoming DISCONNECTED may only tear down a row whose stored home id is also
-unstamped, never a row a stamped CONNECTED has since re-homed, which is what makes this safe across a
+**`stream_home_id IS NULL OR stream_home_id = $3`** (fixed pre-merge, see the PR-review-fix note below —
+an earlier, buggy form of this predicate required the incoming value to also be empty) to
+`GatewayRouteStore::deregister` — a STAMPED stored home id requires an EXACT match to be torn down,
+never a row a stamped CONNECTED has since re-homed, which is what makes this safe across a
 rolling gateway upgrade (mixed old/new-build nodes is the normal state of one); task 3 (`feabccea7`)
 wires the caller's real `stream_home_id` through `AgentRegistry::set_gateway_route`/a new
 `gateway_stream_home_id()` accessor and restructures `gateway_service_impl.cpp`'s `NotifyStreamStatus`
@@ -614,12 +626,36 @@ a genuine stale-home mismatch counts as
 in `tests/unit/server/test_gateway_route_wiring.cpp`. This slice's review RE-VERIFIED the
 once-per-session property a second time before making the fence live
 (`governance.d/ha-ws4-4324-stream-fence-reverification.md`) — no regression found, same conclusion as
-4.2b's own re-verification. **Deliberately NOT closed by #4324**: if a stale `DISCONNECTED(home1)`
+4.2b's own re-verification. **PR-review fix, pre-merge (HIGH)**: external reviewer FortitudeEtc
+(Codex+Kimi panel, with empirical reproduction) found the task-2 predicate's ORIGINAL form —
+`stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')` — wrongly required the incoming value to
+also be empty before a stored-NULL row admitted it. Under the single-producer invariant a stored-NULL
+home does not only mean "legacy, never stamped" — it can equally mean "this session's own
+`announce_connected` (from CONNECTED) hasn't run yet," since the gateway dispatches CONNECTED and
+DISCONNECTED as two independently `spawn_monitor`'d RPC workers with no ordering guarantee between
+them. So an ORDINARY connect/disconnect (no re-home, just the first and only pair for a brand-new
+session) could have its DISCONNECTED reach the server before its own paired CONNECTED; the original
+predicate rejected that stamped, legitimate DISCONNECTED, the deregister/fence silently no-opped, and
+the delayed CONNECTED then published a route for an already-dead stream — a regression vs. the
+pre-#4324 unfenced behavior, reachable under ordinary operational churn with only the first pair
+(distinct from, and reachable without, the FORWARD NOTE gaps below, which all require a second
+CONNECTED/DISCONNECTED pair for the same session). Fixed to `stream_home_id IS NULL OR stream_home_id
+= $3` (commit `f7f12bd59`), mirrored identically in the in-memory fence
+(`gateway_service_impl.cpp`'s `home_matches`); a targeted Gate 8 re-review then caught a second stale
+copy of the old predicate formula on `deregister()`'s own declaration comment (`5160e0eeb`, doc-only).
+Both commits landed pre-merge in the same PR #4492. **Deliberately NOT closed by #4324**: if a stale `DISCONNECTED(home1)`
 arrives BEFORE a live re-home's `CONNECTED(home2)` — two independent RPCs, no ordering guarantee
 between them — the tombstone still wins and `announce_connected`'s `ON CONFLICT DO NOTHING` fallback
 cannot re-arm a tombstoned row, so the re-home is silently unroutable in the directory until the next
-full `ProxyRegister`; left for 4.3 to resolve, via `register_fresh`'s ordered epoch or an explicit
-re-arm path (see `gateway_route_store.hpp`'s file-header FORWARD NOTE for #4324's 4.3). The
+full `ProxyRegister`. **Resolution UPDATED (WS-4 4.3a design review, 2026-09-18)**: the previously-stated
+"`register_fresh`'s ordered epoch or an explicit re-arm path" was the WRONG mechanism — a
+gateway-synthesized fresh session on re-home starves the agent's own heartbeat lease renewal,
+reproducing the `#4246` #6 desync deliberately. `gateway_route_store.hpp`'s file-header FORWARD NOTE
+now states the actual resolution: this gap is unreachable BY INVARIANT (agent-driven reconnect + the
+gateway's `NOT_FOUND` refusal on an unknown session mean no producer of a same-session different-home
+`CONNECTED` exists or is planned), backed by a standing design constraint on 4.3/4.4 plus a
+server-side tripwire (folds into `#4464`), not a new CAS primitive. See that file's FORWARD NOTE for
+the full resolution. The
 `duplicate_connected` positive tripwire on
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` that #4324's own issue checklist
 explicitly deferred (it needs a `gateway_sessions_` value-type change reaching several call sites) is
