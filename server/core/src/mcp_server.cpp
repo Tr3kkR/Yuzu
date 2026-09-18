@@ -981,8 +981,9 @@ static const ToolDef kTools[] = {
      "(re-eval of those source kinds is not yet supported; sync sources are a tracked "
      "follow-up). If the stored source_payload nests past the JSON depth guard (#4493), the "
      "row is healed in place (payload discarded, status/members untouched) as a side effect "
-     "of the rejection, so a later re-eval attempt is refused for a different reason instead "
-     "of repeating the same depth error. REST v1 twin: POST /api/v1/result-sets/{id}/re-eval. "
+     "of the rejection, so a later re-eval attempt is refused for a different reason (no "
+     "re-runnable source) instead of repeating the same depth error. REST v1 twin: POST "
+     "/api/v1/result-sets/{id}/re-eval. "
      "NEVER re-send this call on a timeout or error.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
