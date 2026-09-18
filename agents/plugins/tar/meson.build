@@ -79,13 +79,11 @@ elif host_machine.system() == 'linux'
             + 'the power source sleep/wake leg degrades to AC-state polling only unconditionally')
   endif
 elif host_machine.system() == 'darwin'
-  # Endpoint Security process stream (tar_proc_es). The ES framework ships only
-  # with the FULL Xcode SDK, not the Command Line Tools SDK, so detect it: where
-  # present, compile the real ES client (-DYUZU_HAVE_ENDPOINT_SECURITY) and link
-  # the framework + libbsm (audit_token_to_pid / audit_token_to_ruid); where
-  # absent, tar_proc_es.cpp compiles its no-op path and the agent falls back to
-  # the sysctl process poll. See docs/darwin-compat.md.
-  es_dep = dependency('appleframeworks', modules: ['EndpointSecurity'], required: false, include_type: 'system')
+  # Current full Xcode SDKs ship Endpoint Security as a header directory plus
+  # libEndpointSecurity.tbd, not an EndpointSecurity.framework bundle. CLT omits
+  # both, so resolve the linker name to compile the real client only on a full
+  # SDK; otherwise the source uses its no-op path and sysctl polling fallback.
+  es_dep = cxx.find_library('EndpointSecurity', required: false)
   if es_dep.found()
     tar_deps += es_dep
     tar_deps += cxx.find_library('bsm')
@@ -94,7 +92,7 @@ elif host_machine.system() == 'darwin'
     # so without this the real ES path fails to compile on a full-Xcode build.
     tar_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
   else
-    message('TAR: EndpointSecurity framework not found (full Xcode SDK required) — '
+    message('TAR: EndpointSecurity SDK library not found (full Xcode required) — '
             + 'process streaming compiles as a no-op; agent uses the sysctl poll.')
   endif
   # Wave 6 PR6.3: DiskArbitration attach/detach lives in an Objective-C++ TU —
@@ -116,6 +114,7 @@ shared_library(
   include_directories: include_directories('../../shared', '../../core/src', '../../../common/include'),
   cpp_args: tar_cpp_args,
   objcpp_args: tar_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   dependencies: tar_deps,
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',

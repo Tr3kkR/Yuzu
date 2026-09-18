@@ -184,6 +184,60 @@ TEST_CASE("rollback_if_needed returns true when .old exists but NO verified mark
     REQUIRE_FALSE(fs::exists(old_path));
 }
 
+TEST_CASE("disabled startup maintenance leaves executable-adjacent rollback files untouched",
+          "[updater][maintenance][no-auto-update]") {
+    TempUpdaterDir tmp("disabled_maintenance");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    const auto exe_path = dir / "yuzu-agent.exe";
+    const auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    const auto exe_path = dir / "yuzu-agent";
+    const auto old_path = dir / "yuzu-agent.old";
+#endif
+    const auto marker_path = dir / ".yuzu-update-verified";
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+    write_fake_binary(marker_path);
+
+    UpdateConfig config;
+    config.enabled = false;
+    Updater updater(config, "test-agent", "0.1.0", "macos", "arm64", exe_path);
+
+    REQUIRE_FALSE(updater.perform_startup_maintenance());
+    REQUIRE(fs::exists(exe_path));
+    REQUIRE(fs::exists(old_path));
+    REQUIRE(fs::exists(marker_path));
+}
+
+TEST_CASE("enabled startup maintenance retains rollback and cleanup semantics",
+          "[updater][maintenance]") {
+    TempUpdaterDir tmp("enabled_maintenance");
+    const auto& dir = tmp.guard.path;
+
+#ifdef _WIN32
+    const auto exe_path = dir / "yuzu-agent.exe";
+    const auto old_path = dir / "yuzu-agent.old.exe";
+#else
+    const auto exe_path = dir / "yuzu-agent";
+    const auto old_path = dir / "yuzu-agent.old";
+#endif
+    const auto marker_path = dir / ".yuzu-update-verified";
+    write_fake_binary(exe_path);
+    write_fake_binary(old_path);
+    write_fake_binary(marker_path);
+
+    UpdateConfig config;
+    config.enabled = true;
+    Updater updater(config, "test-agent", "0.1.0", "macos", "arm64", exe_path);
+
+    REQUIRE_FALSE(updater.perform_startup_maintenance());
+    REQUIRE(fs::exists(exe_path));
+    REQUIRE_FALSE(fs::exists(old_path));
+    REQUIRE_FALSE(fs::exists(marker_path));
+}
+
 // ── Construction ────────────────────────────────────────────────────────────
 
 TEST_CASE("Updater constructs without error", "[updater][construct]") {

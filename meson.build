@@ -429,6 +429,10 @@ if host_os == 'darwin'
     _apple_objcpp_std, '-fvisibility=hidden', '-fobjc-arc',
     '-mmacosx-version-min=13.3',
   ]
+  # Meson selects the Objective-C++ linker for a target containing a .mm TU;
+  # cpp_link_args from the native file do not reach that link. Keep the emitted
+  # LC_BUILD_VERSION aligned with the compilation floor.
+  apple_objcpp_link_args = ['-mmacosx-version-min=13.3']
 endif
 
 # ── Proto codegen ─────────────────────────────────────────────────────────────

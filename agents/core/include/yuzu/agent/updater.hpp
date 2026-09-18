@@ -98,6 +98,13 @@ public:
     /// On startup: if .old exists and current binary seems broken, roll back.
     [[nodiscard]] bool rollback_if_needed();
 
+    /// Run the startup rollback/cleanup protocol when OTA is enabled.
+    ///
+    /// A disabled updater is a no-write mode: it must not inspect or alter files
+    /// adjacent to the executable. This matters for a sealed macOS app bundle,
+    /// where even the rollback marker would invalidate the code signature.
+    [[nodiscard]] bool perform_startup_maintenance();
+
     void stop() noexcept;
 
 private:

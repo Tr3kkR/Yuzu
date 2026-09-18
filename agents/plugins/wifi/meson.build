@@ -55,6 +55,7 @@ wifi_plugin_lib = shared_library(
   dependencies: wifi_deps,
   cpp_args: wifi_cpp_args,
   objcpp_args: wifi_objcpp_args,
+  link_args: host_machine.system() == 'darwin' ? apple_objcpp_link_args : [],
   install: true,
   install_dir: get_option('libdir') / 'yuzu' / 'plugins',
 )
