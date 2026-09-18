@@ -2146,8 +2146,30 @@ private:
                         // coverage, whether or not this is an "edge" for the
                         // emit/fault channels below — round-4 MF1's
                         // unconditional-staging rule.
-                        established.push_back(
-                            {cmd.key, inc_slot, Clock::now(), w->coverage, this_key_epoch});
+                        //
+                        // w->fired guard (adversarial-review finding, post-
+                        // round-4): the one-shot NotifyServiceStatusChangeW
+                        // registration is CONSUMED the instant the OS
+                        // delivers it (notify_cb sets `fired`), but this
+                        // drain runs BEFORE the fired-flag scan below that
+                        // re-arms it and corrects `w->coverage` — an APC for
+                        // THIS watch can land during an unrelated Add's own
+                        // begin_probe/teardown_watch SleepEx(0,TRUE) earlier
+                        // in THIS SAME drain. Between those two points
+                        // `w->coverage` still reads the stale pre-fire value
+                        // (typically Notification) even though no live
+                        // registration currently exists for it. Reporting
+                        // that stale value here would first-wins-stamp the
+                        // adopting incarnation's established_at from a
+                        // registration that was already consumed — a
+                        // timestamp the later fired-scan's own correction
+                        // (None on a failed re-arm) can never retract. Fold
+                        // `fired` into the reported value rather than
+                        // `w->coverage` alone: the fired-scan itself re-
+                        // stages the truth once it actually re-arms.
+                        established.push_back({cmd.key, inc_slot, Clock::now(),
+                                               w->fired ? SparkCoverage::None : w->coverage,
+                                               this_key_epoch});
                         // Same UP-2 fix as the Linux mechanism: hand a
                         // newly-coalescing key the fault status too, not just
                         // the cached state.
