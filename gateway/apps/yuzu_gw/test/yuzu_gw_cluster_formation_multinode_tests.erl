@@ -96,6 +96,41 @@ do_tick_survives_an_unreachable_target_test_() ->
         end
     end}.
 
+%% Regression pin for the governance-round BLOCKING fix (`ExternalTargets =
+%% Targets -- [node()]` in do_tick/1): a resolved target list that includes
+%% THIS node's own address must not count itself into `peers_resolved` —
+%% `nodes()` never includes self by Erlang definition, so counting self on
+%% the resolved side made the gauge permanently 1 higher than
+%% `peers_connected` on every healthy cluster, and the shipped
+%% `YuzuGatewayClusterPartiallyFormed` alert would never have cleared.
+%% `node()` and a bogus unreachable target together: only the bogus one
+%% should count.
+do_tick_excludes_self_from_peers_resolved_test_() ->
+    {timeout, 30, fun() ->
+        yuzu_gw_registry_multinode_tests:ensure_distributed(),
+        Self = self(),
+        HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        telemetry:attach(
+            HandlerId,
+            [yuzu, gw, cluster, peers_resolved],
+            fun(_Event, Measurements, _Meta, _Config) ->
+                Self ! {peers_resolved, Measurements}
+            end,
+            #{}),
+        try
+            Bogus = list_to_atom("yuzu_gw_definitely_not_running@127.0.0.1"),
+            ok = yuzu_gw_cluster_discovery:do_tick([node(), Bogus]),
+            Received = receive
+                {peers_resolved, Meas} -> Meas
+            after 2000 ->
+                {error, timeout}
+            end,
+            ?assertEqual(#{count => 1}, Received)
+        after
+            telemetry:detach(HandlerId)
+        end
+    end}.
+
 %%%===================================================================
 %%% Running gen_server — monitor_nodes wiring fires telemetry
 %%%===================================================================
@@ -105,9 +140,19 @@ do_tick_survives_an_unreachable_target_test_() ->
 %% connect_node, standing in for what do_tick/1 does internally — must be
 %% observed via net_kernel:monitor_nodes(true) and telemetered as
 %% [yuzu, gw, cluster, node_up]/[node_down].
+%% Pins `cluster_seed_nodes` to a harmless static value before starting the
+%% gen_server (Fable pre-push review, #4555): `init/1` self-ticks
+%% immediately, and an empty `cluster_seed_nodes` falls through to a REAL
+%% `inet_res:lookup("gateway", in, a)` against the seed DNS name default —
+%% on a CI host with a blackholed/absent resolver this can take up to
+%% 2s x 3 retries, which could stall this test's own 5s `await_telemetry`
+%% bound for reasons having nothing to do with what it's testing. The
+%% static override skips DNS entirely.
 running_server_telemeters_nodeup_and_nodedown_test_() ->
     {timeout, 30, fun() ->
         yuzu_gw_registry_multinode_tests:ensure_distributed(),
+        PrevSeedNodes = application:get_env(yuzu_gw, cluster_seed_nodes, []),
+        application:set_env(yuzu_gw, cluster_seed_nodes, [<<"127.0.0.1">>]),
         {DiscoveryPid, StartedHere} = case yuzu_gw_cluster_discovery:start_link() of
             {ok, Pid}                       -> {Pid, true};
             {error, {already_started, Pid}} -> {Pid, false}
@@ -144,7 +189,8 @@ running_server_telemeters_nodeup_and_nodedown_test_() ->
             case StartedHere of
                 true  -> unlink(DiscoveryPid), exit(DiscoveryPid, kill);
                 false -> ok
-            end
+            end,
+            application:set_env(yuzu_gw, cluster_seed_nodes, PrevSeedNodes)
         end
     end}.
 

@@ -433,12 +433,23 @@ bypasses the length check too.
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
 distribution listener range **TCP 9100-9105** (`inet_dist_listen_min`/`_max`
-in `config/sys.config`) reachable between every node — this is a FIXED
-6-port range (one listener per node), so it also caps a single cluster at 6
-gateway nodes today. Both EPMD and the distribution range should be
-firewalled to ONLY the other gateway nodes, never exposed publicly — the
-cookie is the authentication, but a closed network is still the first line
-of defense.
+in `config/sys.config`) reachable between every node. This range is
+per-HOST, not per-cluster: one container is one network namespace, so every
+containerized node binds the same first port (9100) with no collision — the
+6-port range only matters for a dev/test rig running multiple gateway nodes
+on ONE host, where each needs its own port from the range. Both EPMD and the
+distribution range should be firewalled to ONLY the other gateway nodes,
+never exposed publicly — the cookie is the authentication, but a closed
+network is still the first line of defense.
+
+> **IPv4-only.** Cluster discovery (DNS seed-name resolution, the
+> entrypoint's local-interface intersection, and the static
+> `YUZU_GW_SEED_NODES` override) is IPv4-only in this release. An
+> IPv6-only Docker network degrades to N isolated single-node gateways —
+> each resolves zero peers and boots standalone (fail-open, per design),
+> rather than failing to start. `yuzu_gw_cluster_peers_resolved` staying
+> at 0 is the signal to check for this. AAAA support is tracked as a
+> follow-up.
 
 > **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
 > boot guard and restores the unauthenticated inter-node RPC surface (#659); it
