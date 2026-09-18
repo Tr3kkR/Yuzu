@@ -32,6 +32,18 @@ TEST_CASE("decode_launchctl_row: a trailing-garbage PID is rejected, not truncat
     CHECK_FALSE(row.pid.has_value()); // stoll would have silently accepted "12"
 }
 
+TEST_CASE("decode_launchctl_row: a PID exceeding int64_t range is rejected, "
+          "not wrapped or truncated (qe4-1, governance A0 round-4)",
+          "[launchctl_list]") {
+    // from_chars's own result_out_of_range branch -- distinct from the
+    // partial-match branch the two tests above exercise (res.ec == std::errc{}
+    // fails here for a different reason: the digits are all valid, but the
+    // value itself doesn't fit int64_t). Previously unexercised.
+    auto row = decode_launchctl_row("99999999999999999999\t0\tcom.example.svc");
+    CHECK_FALSE(row.pid.has_value());
+    CHECK(row.label == "com.example.svc");
+}
+
 TEST_CASE("decode_launchctl_row: a dash status decodes to 0, not a parse attempt",
           "[launchctl_list]") {
     auto row = decode_launchctl_row("1190\t-\tcom.example.svc");
