@@ -1841,6 +1841,43 @@ TEST_CASE("POST /api/v1/result-sets: a body nested past the depth limit is rejec
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
 
+TEST_CASE("POST /api/v1/result-sets: a type-mismatched name is refused with 400, "
+          "never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][security][4406]") {
+    // Gate 8 sibling-sweep finding: this generic create route has the same
+    // unguarded body.value("name", "") shape as from-tar-query/
+    // from-instruction-result did before #4406's fix, but was never part of
+    // that sweep since it's a synchronous direct-create path, not one of the
+    // three async producers.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":123})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: a type-mismatched source_kind is refused with "
+          "400, never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][security][4406]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":"x","source_kind":123})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("source_kind must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
 TEST_CASE("from-tar-query: a body nested past the depth limit is rejected before dispatch",
           "[pg][result_set][async][tar][security][depth]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);

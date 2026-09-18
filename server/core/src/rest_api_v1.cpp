@@ -9166,6 +9166,18 @@ void RestApiV1::register_routes(
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
                 return;
             }
+            // Gate 8 sibling-sweep finding: the two producer routes' identical
+            // body.value("name", "") shape threw uncaught on a type-mismatched
+            // field (#4406) - this generic create route has the same shape on
+            // BOTH name and source_kind and was never part of that sweep.
+            if (body.contains("name") && !body["name"].is_string()) {
+                rs_err(res, 400, "name must be a JSON string");
+                return;
+            }
+            if (body.contains("source_kind") && !body["source_kind"].is_string()) {
+                rs_err(res, 400, "source_kind must be a JSON string");
+                return;
+            }
             CreateRequest cr;
             cr.owner_principal = session->username;
             cr.name = body.value("name", "");
