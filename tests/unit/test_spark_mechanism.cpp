@@ -7443,8 +7443,9 @@ TEST_CASE("Service mechanism (direct): a live service transition re-reports Noti
     mech->stop();
 }
 
-TEST_CASE("Service mechanism (direct): a parked probe reports nothing; release delivers a "
-          "Notification report carrying the watch's token, timestamped after release (M4a)",
+TEST_CASE("Service mechanism (direct): a parked probe's None-on-teardown report lands "
+          "immediately, before the probe even resolves; release delivers a Notification "
+          "report carrying the watch's token (M4a)",
           "[spark][mechanism][windows]") {
     auto mech = make_service_mechanism();
     REQUIRE(mech != nullptr);
@@ -7460,10 +7461,20 @@ TEST_CASE("Service mechanism (direct): a parked probe reports nothing; release d
 
     const auto spec = service_spec("Winmgmt");
     const std::string key = spark_key(spec);
-    const auto before_launch = std::chrono::steady_clock::now();
     REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
     REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
-    CHECK(got.established_count() == 0); // parked — no report yet
+    // begin_probe()'s own unconditional None stage (right after
+    // teardown_watch, BEFORE probe_lane_.launch()) lands synchronously on the
+    // Add — it does not wait for the probe to resolve. By the time the probe
+    // has provably parked, exactly the initial None report already exists.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    {
+        std::lock_guard lk(got.mu);
+        REQUIRE(got.established.size() >= 1);
+        CHECK(std::get<0>(got.established[0]) == key);
+        CHECK(std::get<1>(got.established[0]) == 1);
+        CHECK(std::get<2>(got.established[0]) == SparkCoverage::None);
+    }
 
     gate.release();
     REQUIRE(eventually([&] { return got.notification_count_for(key) >= 1; }, 3000ms));
@@ -7472,17 +7483,16 @@ TEST_CASE("Service mechanism (direct): a parked probe reports nothing; release d
     // immediate-callback re-arm on a real, live-changing Winmgmt can add
     // further positive reports beyond the first): every report for this key
     // carries token 1 (the only incarnation this mechanism instance ever
-    // watched it under), and no report predates the release.
+    // watched it under) — the initial None (asserted above) included.
     {
         std::lock_guard lk(got.mu);
         for (const auto& [k, inc, cov] : got.established) {
             if (k != key)
                 continue;
             CHECK(inc == 1);
-            CHECK(cov != SparkCoverage::None); // never rejected-by-construction
+            (void)cov;
         }
     }
-    (void)before_launch; // steady_clock ordering already covered by E-series established_at checks
 
     mech->stop();
 }
@@ -7509,6 +7519,16 @@ TEST_CASE("Service mechanism (direct): a probe parked for a retired watch's toke
     // RETIRED, never resolved.
     REQUIRE(mech->watch_incarnation(key, spec.params, 1).has_value());
     REQUIRE(eventually([&] { return gate.parked.load() == 1; }, 2000ms));
+    // begin_probe()'s own unconditional None stage lands for token 1 too,
+    // before its probe even resolves — snapshot how many reports exist so
+    // the oracle below only checks reports produced AFTER the retirement,
+    // not this legitimate token-1 report.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    std::size_t baseline = 0;
+    {
+        std::lock_guard lk(got.mu);
+        baseline = got.established.size();
+    }
 
     mech->unwatch(key);
     // Re-watch under a NEW token while the OLD probe is STILL parked — the
@@ -7520,11 +7540,14 @@ TEST_CASE("Service mechanism (direct): a probe parked for a retired watch's toke
                     // retirement) and lets token 2's own probe proceed
     REQUIRE(eventually([&] { return got.notification_count_for(key) >= 1; }, 3000ms));
 
-    // Every report for this key after the unwatch carries the NEW token —
-    // the retired watch's result is silently discarded, never misattributed.
+    // Every report for this key produced AFTER the retirement carries the
+    // NEW token — the retired watch's result is silently discarded, never
+    // misattributed.
     {
         std::lock_guard lk(got.mu);
-        for (const auto& [k, inc, cov] : got.established) {
+        REQUIRE(got.established.size() > baseline);
+        for (std::size_t i = baseline; i < got.established.size(); ++i) {
+            const auto& [k, inc, cov] = got.established[i];
             if (k != key)
                 continue;
             CHECK(inc == 2);

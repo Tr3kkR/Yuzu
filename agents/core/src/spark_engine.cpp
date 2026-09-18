@@ -993,7 +993,8 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 // them. The unconditional mech->unwatch(key) just above already
                 // prevents any resource leak from OUR failed watch either way.
                 auto it = armed_.find(key);
-                if (it != armed_.end() && it->second.incarnation == my_inc) {
+                const bool still_ours = (it != armed_.end() && it->second.incarnation == my_inc);
+                if (still_ours) {
                     try {
                         lost_ev.key = key;
                         lost_ev.type = spec.type;
@@ -1007,13 +1008,24 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                     }
                     drop_key_locked(key); // allocates nothing, cannot throw
                 }
+                // #4340: message reuse, deliberate. When the entry is no longer
+                // ours (a successor's fresh arm already superseded it), THIS
+                // caller's own subscription doesn't exist regardless of the
+                // mechanism's technical outcome — from this caller's view it was
+                // disarmed before its watch could be armed, the identical fact
+                // the live gate above reports. Reuse disarmed_mid_arm_msg (already
+                // built, above, before mu_ was ever taken) rather than complete a
+                // NEW string on this path for a mechanism error the caller's
+                // subscription no longer depends on. Bookkeeping is already clean
+                // either way; when still_ours, the message is completed from the
+                // pre-sized buffer — a mechanism error is caller-controlled in
+                // length, so concatenating it here would put an unbounded
+                // allocation past the commit and break the property the whole
+                // layer rests on.
+                watch_failed = true;
+                watch_fail_result =
+                    still_ours ? watch_fail_msg.finish(w.error()) : std::move(disarmed_mid_arm_msg);
             }
-            // Bookkeeping is already clean, but the message is still completed from
-            // the pre-sized buffer: a mechanism error is caller-controlled in length,
-            // so concatenating it here would put an unbounded allocation past the
-            // commit and break the property the whole layer rests on.
-            watch_failed = true;
-            watch_fail_result = watch_fail_msg.finish(w.error());
         }
     }
     if (watch_failed) {
