@@ -24,6 +24,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <stdexcept>
@@ -748,4 +749,77 @@ TEST_CASE("ResultSetStore: pin enforces kMaxPinsPerOwner, per owner", "[pg][resu
     auto bob_pin = store.pin(bobs->id);
     REQUIRE(bob_pin.has_value());
     CHECK(bob_pin->pinned);
+}
+
+// json-dump-depth-guard fix (#2437-class): mark_failed's whole job is to
+// merge a failure reason into source_payload and write it back, and
+// nlohmann::json::dump() is unboundedly recursive. It has no HTTP
+// request/response of its own to answer with a 400 (today it has no
+// production caller at all - a store method ahead of a future caller, not a
+// currently-wired background thread, per governance Gate 4/6), so it cannot
+// simply reject: it must still transition the row to `failed` while never
+// re-dumping a payload that could crash the process.
+TEST_CASE("ResultSetStore: mark_failed merges a failure reason into a healthy "
+          "pending row",
+          "[pg][result_set][mark_failed]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "healthy-pending");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = R"({"sql":"SELECT 1"})";
+    auto rs = store.create_pending(r, "exec-ok");
+    REQUIRE(rs.has_value());
+
+    store.mark_failed(rs->id, "no agents reached");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload["failure"] == "no agents reached");
+    // The original payload is PRESERVED (merged into), not discarded, when it
+    // is safely shallow: only a nesting-limit violation triggers discard.
+    CHECK(payload["sql"] == "SELECT 1");
+}
+
+TEST_CASE("ResultSetStore: mark_failed heals a source_payload nested past the "
+          "depth limit instead of re-dumping it",
+          "[pg][result_set][mark_failed][security][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "poisoned-pending");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    // A raw string, never materialised as a live nlohmann::json object at
+    // this depth. kMcpMaxJsonDepth is 32; 40 is comfortably past it and still
+    // trivially safe to construct/dump directly in this test process,
+    // orders of magnitude short of the ~100,000-level depth that actually
+    // SIGSEGVs the real dump() call this guard exists to prevent.
+    r.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto rs = store.create_pending(r, "exec-poisoned");
+    REQUIRE(rs.has_value());
+
+    // This call must not crash (obviously, since we get to make the
+    // assertions below) AND must not leave the poisoned tree in place.
+    store.mark_failed(rs->id, "dispatch error");
+
+    auto got = get_ok(store, rs->id);
+    REQUIRE(got.has_value());
+    CHECK(got->status == ResultSetStatus::Failed);
+    // Healed: the row is now safely shallow, not the original poisoned tree.
+    auto payload = nlohmann::json::parse(got->source_payload, nullptr, false);
+    REQUIRE_FALSE(payload.is_discarded());
+    REQUIRE(payload.is_object());
+    CHECK(payload["failure"] == "dispatch error");
+    CHECK(payload.contains("note"));
+    CHECK_FALSE(payload.contains("sql"));
+    CHECK_FALSE(payload.contains("junk"));
 }

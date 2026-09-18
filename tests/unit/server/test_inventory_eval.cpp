@@ -713,6 +713,40 @@ TEST_CASE("InventoryEval: malformed JSON skipped", "[inventory_eval][edge]") {
     CHECK(results[0].agent_id == "agent-2");
 }
 
+// #2437-class guard: data_json nesting past kMcpMaxJsonDepth must be skipped
+// BEFORE the parse, exactly like a genuine parse error above. Deliberately
+// uses "exists" (matches on presence alone, not value) with the deep nesting
+// INSIDE the "os" field's own value rather than at the top level - this is
+// what makes the test discriminate: json_path would fail to resolve "os" on
+// a top-level array (wrong container kind) regardless of the guard, so that
+// shape can't prove anything. With "os" holding the deep structure, an
+// "exists" check that reaches eval_condition unguarded calls
+// json_value_to_string's dump() fallback on the parsed tree - the exact
+// unboundedly-recursive call that would SIGSEGV the whole process at the
+// real ~100,000-level attack depth - and would spuriously COUNT this record
+// as a match. The guard must exclude it before that call is ever made.
+// Reachability-proxy depth (36 > kMcpMaxJsonDepth's 32), never the real
+// attack depth. This one function backs BOTH evaluate_inventory() callers
+// (the REST from-inventory-query route and the MCP
+// create_result_set_from_inventory_query tool), so this single test covers
+// both transports.
+TEST_CASE("InventoryEval: over-deep data_json skipped before it can spuriously match or "
+          "reach the dump() fallback, a healthy matching record is still returned",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records = {
+        {"agent-1|hw", poisoned},
+        {"agent-2|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    auto results = evaluate_inventory(req, records);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-2");
+}
+
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {
     Records records = {
         {"badkey_no_pipe", R"({"os": "Linux"})"},

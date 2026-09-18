@@ -1,7 +1,7 @@
 #pragma once
 
 // test_real_capability_registry.hpp — the REAL `CommandCapabilityRegistry`,
-// composed from the same seven capability-declaration spans the production site
+// composed from the same fourteen capability-declaration spans the production site
 // composes, for route-handler fixtures that must wire a `ClassifyFn`.
 //
 // WHY A SHARED HEADER. PR6.0b gave `DashboardRoutes` a `ClassifyFn` with the
@@ -9,8 +9,8 @@
 // classifier refuses every `/api/dashboard/execute` dispatch rather than
 // silently reverting the Destructive targeting gate. That makes "compose the
 // real registry" a thing more than one route fixture needs, and a per-fixture
-// copy of the seven-span composition is the drift a shared seam exists to
-// remove: an eighth catalogue fragment added to production and to only some
+// copy of the fourteen-span composition is the drift a shared seam exists to
+// remove: a new catalogue fragment added to production and to only some
 // of the copies would leave the stragglers classifying real pairs as
 // `Unclassified` — an honest-looking miss that is actually a stale fixture.
 //
@@ -30,8 +30,10 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
 #include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
+#include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "command_capability.hpp"
 
 #include <string_view>
@@ -53,8 +55,10 @@ inline const yuzu::server::CommandCapabilityRegistry& real_capability_registry()
         capdecls::plugin_action_catalogue_filesystem_posture(),
         capdecls::plugin_action_catalogue_power_health(),
         capdecls::plugin_action_catalogue_autoruns(),
+        capdecls::plugin_action_catalogue_app_usage(),
         capdecls::plugin_action_catalogue_execution_artifacts(),
         capdecls::plugin_action_catalogue_windows_optional_features(),
+        capdecls::plugin_action_catalogue_printing(),
         capdecls::core_dispatch_capabilities(),
     };
     return reg;

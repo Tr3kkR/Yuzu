@@ -15,6 +15,7 @@
                               // get_guardian_rule_status twins
 #include "guardian_push_builder.hpp"  // guardian_guard_supported_on_platform / platform_display_name / os_target_matches
 #include "guardian_rule_spec.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial — mints/reuses X-Correlation-Id so
                                      // header and body always agree
 #include "secure_random.hpp"
@@ -2144,9 +2145,25 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
         return "<a class=\"gp-back\" href=\"/guardian\">&larr; All guards</a>"
                "<div class=\"gp-placeholder\"><b>Guard not found</b></div>";
 
+    // #2437-class guard: check nesting on the RAW stored spec_json text
+    // BEFORE any parse of it below - spark_type_of's own parse, and the
+    // "what it checks" parse further down that feeds render_assertion_values'
+    // as_str(), which dump()s any non-string params value. B1/B2 close the
+    // REST write side (both create and update reject an over-deep body
+    // before derive_rule_spec), but this read path stays reachable against a
+    // row written before that fix shipped, or by direct DB manipulation - a
+    // routine page load must not crash the whole process. Treat a poisoned
+    // spec_json as unusable for rendering rather than partially parsing it;
+    // the rest of this page (fleet compliance, device census) does not
+    // depend on spec_json and still renders normally. This is a read-only
+    // display decision: it does not heal/rewrite the stored row, which this
+    // function does not own.
+    const bool spec_poisoned =
+        !spec_json.empty() && mcp::json_exceeds_depth(spec_json, mcp::kMcpMaxJsonDepth);
+
     // Parsed once, outside the per-agent loop below (#4252): the input to
     // guardian::guardian_guard_supported_on_platform's guard-type-aware check.
-    const std::string spark_type = spark_type_of(spec_json);
+    const std::string spark_type = spec_poisoned ? std::string{} : spark_type_of(spec_json);
 
     const std::string mode = enforcing ? "Enforce" : "Observe";
     const std::string mode_color = enforcing ? "var(--yellow)" : "#a5d6ff";
@@ -2167,8 +2184,11 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
     }
 
     // "What it checks" — parse the structured spec for the assertion values.
+    // Skipped entirely when spec_poisoned (see the guard above): values_html
+    // stays empty and the "What it checks" section below renders the
+    // explicit invalid-data state instead of attempting the parse.
     std::string values_html;
-    if (!spec_json.empty())
+    if (!spec_poisoned && !spec_json.empty())
         if (auto j = nlohmann::json::parse(spec_json, nullptr, false); j.is_object())
             values_html = render_assertion_values(j.value("assertion", nlohmann::json::object()), mode_color);
 
@@ -2296,7 +2316,13 @@ std::string GuardianRoutes::render_guard_page_fragment(const std::string& guard_
 
     // What it checks.
     h += "<div class=\"gp-sech\">What it checks</div>";
-    if (values_html.empty()) {
+    if (spec_poisoned) {
+        // Distinct from "not available" below: this Guard DOES have a
+        // stored structured spec, but it cannot be safely parsed/displayed
+        // (#2437-class). Must never read as "no spec" or "guard not found".
+        h += "<div class=\"gp-note\">This Guard's stored spec could not be displayed "
+             "(invalid data).</div>";
+    } else if (values_html.empty()) {
         h += "<div class=\"gp-note\">This Guard's structured spec is not available.</div>";
     } else {
         h += "<div class=\"gp-spec\"><div class=\"k\">Mode</div><div style=\"color:" + mode_color +
