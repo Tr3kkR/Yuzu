@@ -10,7 +10,8 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
-#include "dex_read_model.hpp" // #4035: shared REST+MCP builders (device score, device app-perf, ...)
+#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
+#include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model

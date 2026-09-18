@@ -1,7 +1,8 @@
+#include "dex_read_builders.hpp" // the store-reaching build_dex_*_model + dex_device_app_perf_json (defined here)
 #include "dex_read_model.hpp"
 
 #include "app_perf_daily_store.hpp" // AppPerfDailyRow full def (gap-#2 device app-perf serializer)
-#include "dex_routes.hpp" // dex_device_score + the DEX read-model builders' store reads
+#include "dex_window.hpp" // dex_normalize_os_filter (PURE) -- replaces the dropped dex_routes.hpp
 #include "guaranteed_state_store.hpp" // GuaranteedStateStore methods -- no longer transitive via dex_read_model.hpp
 
 #include <nlohmann/json.hpp>

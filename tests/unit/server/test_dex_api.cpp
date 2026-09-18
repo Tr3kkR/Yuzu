@@ -15,7 +15,8 @@
 
 #include "dex_api_local.hpp"
 
-#include "dex_read_model.hpp"          // build_dex_*_model parity oracles
+#include "dex_read_builders.hpp"        // build_dex_*_model parity oracles (store-reaching)
+#include "dex_read_model.hpp"          // the pure model structs
 #include "dex_routes.hpp"              // dex_iso_since / dex_window_to_days
 #include "guaranteed_state_store.hpp"  // seed + direct-read parity oracles
 #include "pg/pg_pool.hpp"

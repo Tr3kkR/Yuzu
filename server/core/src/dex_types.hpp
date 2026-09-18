@@ -14,13 +14,24 @@
 /// exporting these types transitively, so every existing includer is
 /// unaffected (ODR-safe relocation, not a duplication).
 ///
-/// Two groups live here:
+/// Three groups live here:
 ///   1. The DEX read-model aggregations over `guardian_observations`
 ///      (relocated verbatim from `guaranteed_state_store.hpp`).
 ///   2. `DexFleet` / `DexSignalGroup` — the cross-store fleet denominator and
 ///      the display-family descriptor (relocated verbatim from
 ///      `dex_routes.hpp`; both are pure PODs the store header never needed).
+///   3. The pure signal-catalogue accessors and health/roll-up COMPUTATION
+///      over the above types (`dex_signal_groups`, `dex_catalogued_type_count`,
+///      `dex_family_index`, `dex_obs_platforms`, `dex_family_rollup` +
+///      `DexFamilyRollup`, `dex_family_health_deduction`, `dex_compute_health`
+///      + `DexHealthResult`) — pure functions over groups 1–2 only, relocated
+///      from `dex_routes.hpp` (PR #4582) so `dex_read_model.cpp` no longer needs
+///      that httplib-coupled header. Unlike the sibling `*_types.hpp` (pure PODs
+///      only), this header therefore also hosts pure computation; a dedicated
+///      `dex_catalogue.hpp` is a legitimate future split (not required — the
+///      store-type-free seam property holds either way).
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -163,5 +174,69 @@ struct DexSignalGroup {
     const char* name;
     std::vector<const char*> types;
 };
+
+// ── Signal-catalogue accessors ───────────────────────────────────────────────
+// PURE accessors over the static server-side signal catalogue — they return
+// only pure types (a DexSignalGroup vector / size_t / int), so they belong with
+// DexSignalGroup here, not in the httplib-coupled dex_routes.hpp. Relocated
+// (declarations) from dex_routes.hpp (PR #4582 FIX 4) so dex_read_model.cpp can
+// call dex_signal_groups() without including dex_routes.hpp (which pulls
+// <httplib.h>); dex_routes.hpp re-includes this header, so its own callers are
+// unaffected. Definitions are unchanged in their .cpp.
+
+/// The catalogued signal types, grouped for display — the server-side mirror of
+/// the agent catalogue (keep in sync; the paired drift-net tests bite).
+const std::vector<DexSignalGroup>& dex_signal_groups();
+
+/// Total catalogued display types (sum over the groups).
+std::size_t dex_catalogued_type_count();
+
+/// obs_type -> index into dex_signal_groups(), or -1 when uncatalogued. Shared
+/// by the Trends fragment's family x day matrix and (#4035) its REST/MCP twin.
+int dex_family_index(const std::string& obs_type);
+
+/// Per-obs_type platform coverage: which OSes collect this signal type today.
+std::vector<std::string> dex_obs_platforms(const std::string& obs_type);
+
+// ── PURE catalogue roll-up + health computation (over DexSignalGroup/
+//    DexSignalCount only; no store, no httplib) — relocated from dex_routes.hpp
+//    (PR #4582 FIX 4) so dex_read_model.cpp can call them without that
+//    httplib-coupled header. dex_routes.hpp re-includes this header, so its
+//    own callers are unaffected; definitions are unchanged in their .cpp.
+
+/// One family's rolled-up signal counts — the shared basis both the Catalogue
+/// grid and the health-score deduction read.
+struct DexFamilyRollup {
+    int64_t events = 0;
+    int active = 0;
+    int total = 0;
+    int64_t max_signal_devices = 0; ///< #1374: max of member signals, not the family union
+    const DexSignalCount* top = nullptr;
+    bool benign = false;
+};
+DexFamilyRollup dex_family_rollup(const DexSignalGroup& g,
+                                  const std::vector<DexSignalCount>& signals);
+
+/// One family's health deduction (the per-family term of dex_compute_health,
+/// "default" preset).
+double dex_family_health_deduction(const DexSignalGroup& g,
+                                   const std::vector<DexSignalCount>& signals, int64_t N);
+
+/// The composite-health result: score (100 − Σ deductions; -1 when N<=0) + the
+/// per-family deduction breakdown.
+struct DexHealthResult {
+    double score = -1.0;
+    struct Ded {
+        std::string name, sev;
+        double deduction = 0.0;
+    };
+    std::vector<Ded> deds;
+};
+
+/// PURE: the shared health-score computation — the Health page and the Overview
+/// hub's health teaser both call this (`preset` = default/stability/
+/// productivity/security).
+DexHealthResult dex_compute_health(const std::vector<DexSignalCount>& signals, int64_t N,
+                                   const std::string& preset);
 
 } // namespace yuzu::server

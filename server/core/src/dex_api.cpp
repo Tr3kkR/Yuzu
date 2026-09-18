@@ -1,6 +1,7 @@
 #include "dex_api_local.hpp"
 
-#include "dex_read_model.hpp" // the shared build_dex_*_model helpers
+#include "dex_read_builders.hpp" // the shared build_dex_*_model helpers (store-reaching)
+#include "dex_read_model.hpp"    // the pure model structs
 #include "dex_window.hpp"     // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (PURE)
 #include "guaranteed_state_store.hpp" // the builder-less signal reads
 

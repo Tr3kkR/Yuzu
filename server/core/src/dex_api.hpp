@@ -4,12 +4,19 @@
 /// The FIFTH per-family in-process API seam for the presentation/core/engine
 /// split (ADR-0031, WS-A4), covering the DEX **signals / experience-score**
 /// surface — the GuaranteedStateStore-backed `/api/v1/dex/*` resources.
-/// Abstract, ZERO store-shaped dependencies — it includes only the now-pure
-/// `dex_read_model.hpp` (which pulls `dex_types.hpp`, the relocated DEX leaf
-/// PODs) + std, so a future presentation-side client can include it without
-/// dragging the server's `guaranteed_state_store.hpp` (a CATASTROPHIC
-/// Guardian/Guaranteed-State header) or `dex_routes.hpp` (which pulls
-/// `<httplib.h>`) along.
+/// Abstract, ZERO store-shaped dependencies — it includes only the pure
+/// `dex_read_model.hpp` (pure model structs + model-only serializers, which
+/// pulls `dex_types.hpp`, the relocated DEX leaf PODs) + std. Its transitive
+/// include closure NAMES NO STORE TYPE (`GuaranteedStateStore`,
+/// `AppPerfDailyRow`, …) — matching its four sibling abstract headers and
+/// enforced by check-seam-closure.py's abstract-header store-type probe. This
+/// held only after PR #4582 split the store-reaching `build_dex_*_model(...)`
+/// builders out of `dex_read_model.hpp` into the core-only
+/// `dex_read_builders.hpp`; before that this header transitively named
+/// `GuaranteedStateStore`. So a future presentation-side client can include
+/// this without dragging the server's `guaranteed_state_store.hpp` (a
+/// CATASTROPHIC Guardian/Guaranteed-State header) or `dex_routes.hpp` (which
+/// pulls `<httplib.h>`) along.
 ///
 /// Each method == ONE public DEX signals resource so a presentation/MCP caller
 /// consumes only what the public, versioned core API serves (ADR-0031 B3,

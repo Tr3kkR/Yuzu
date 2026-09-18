@@ -52,7 +52,8 @@
 #include "deployment_routes.hpp"        // deploy_preview_json (shared REST/MCP builder, #4036)
 #include "preflight_routes.hpp"         // preflight_run_row_json (shared REST/MCP builder, #4036)
 #include "preflight_run_store.hpp"      // PreflightRunStore (fwd-declared only in mcp_server.hpp)
-#include "dex_read_model.hpp"    // #4035: shared REST+MCP builders (device score, device app-perf, ...)
+#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
+#include "dex_read_model.hpp"    // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "auth_routes.hpp"      // detail::sanitize_detail_value — audit-string sanitiser
 #include "rest_a4_envelope.hpp"         // detail::make_correlation_id (A4 error.data, #1463)

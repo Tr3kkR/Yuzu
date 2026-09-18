@@ -126,8 +126,19 @@ EXPECTED_IMPL_TUS = [
     "server/core/src/compliance_api.cpp",
     "server/core/src/device_api.cpp",
     "server/core/src/dex_api.cpp",
+    "server/core/src/dex_read_model.cpp",
 ]
-EXPECTED_IMPL_HTTPLIB_ALLOWED = {"event_bus.hpp"}
+EXPECTED_IMPL_HTTPLIB_ALLOWED = {"server/core/src/event_bus.hpp"}
+# Abstract-header store-type probe (PR #4582 FIX 3).
+EXPECTED_ABSTRACT_API_HEADERS = [
+    "server/core/src/network_api.hpp",
+    "server/core/src/verify_api.hpp",
+    "server/core/src/compliance_api.hpp",
+    "server/core/src/device_api.hpp",
+    "server/core/src/dex_api.hpp",
+]
+EXPECTED_EXTRA_STORE_TYPE_TOKENS = ["AppPerfDailyRow", "AuthDB", "AgentRegistry",
+                                    "ExecutionTracker", "PgPool"]
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -169,6 +180,14 @@ def main() -> int:
     if mod.IMPL_HTTPLIB_ALLOWED != EXPECTED_IMPL_HTTPLIB_ALLOWED:
         _fail(f"IMPL_HTTPLIB_ALLOWED {mod.IMPL_HTTPLIB_ALLOWED!r} != "
               f"frozen {EXPECTED_IMPL_HTTPLIB_ALLOWED!r}", failures)
+
+    # 2c. Abstract-header store-type probe constants pinned (PR #4582 FIX 3).
+    if mod.ABSTRACT_API_HEADERS != EXPECTED_ABSTRACT_API_HEADERS:
+        _fail(f"ABSTRACT_API_HEADERS {mod.ABSTRACT_API_HEADERS!r} != "
+              f"frozen {EXPECTED_ABSTRACT_API_HEADERS!r}", failures)
+    if mod.EXTRA_STORE_TYPE_TOKENS != EXPECTED_EXTRA_STORE_TYPE_TOKENS:
+        _fail(f"EXTRA_STORE_TYPE_TOKENS {mod.EXTRA_STORE_TYPE_TOKENS!r} != "
+              f"frozen {EXPECTED_EXTRA_STORE_TYPE_TOKENS!r}", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
@@ -348,6 +367,99 @@ def main() -> int:
             _fail("check_impl_purity flagged a synthetic *_api.cpp reaching httplib ONLY "
                   "via the allowlisted event_bus.hpp - the documented core-SSE exemption "
                   "is not honoured", failures)
+
+        # 13. ABSTRACT-HEADER STORE-TYPE POSITIVE PROBE (PR #4582 FIX 3): a
+        #     synthetic abstract `*_api.hpp` whose closure includes a header that
+        #     NAMES a store type (a forward-declared `class FooStore;` + a
+        #     store-pointer signature) must fire — this is the exact class of bug
+        #     dex_api.hpp shipped (it named GuaranteedStateStore via the bundled
+        #     builders). The store-HEADER patterns can't see it: there is no
+        #     `*_store.hpp` in the closure, only the NAME.
+        # A forward-declared store class + a store-pointer signature, and NO
+        # `*_store.hpp` in the closure — exactly the dex_api.hpp/PR #4582 shape.
+        (src / "abs_model.hpp").write_text(
+            "#pragma once\n"
+            "namespace yuzu::server {\n"
+            "class FooStore;\n"
+            "int build_it(FooStore* s);\n"
+            "}\n",
+            encoding="utf-8")
+        (src / "abs_probe_api.hpp").write_text(
+            '#pragma once\n#include "abs_model.hpp"\n', encoding="utf-8")
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            ok = mod.check_abstract_headers_store_type_free(
+                ["server/core/src/abs_probe_api.hpp"], roots=roots)
+        diag = captured.getvalue()
+        if ok:
+            _fail("check_abstract_headers_store_type_free did not fire on a synthetic abstract "
+                  "header whose closure forward-declares a `*Store` type - the store-type gap "
+                  "(the dex_api.hpp/PR #4582 bug) is unguarded", failures)
+        elif "FooStore" not in diag:
+            _fail(f"abstract-header probe fired but did not name the store token; stderr: {diag!r}",
+                  failures)
+
+        # 14. ABSTRACT-HEADER EXTRA-TOKEN POSITIVE PROBE: a store ROW type that
+        #     does NOT end in "Store" (the EXTRA_STORE_TYPE_TOKENS list, e.g.
+        #     AppPerfDailyRow) named in code must also fire.
+        (src / "abs_row_api.hpp").write_text(
+            "#pragma once\n"
+            "namespace yuzu::server {\n"
+            "struct AppPerfDailyRow;\n"
+            "int use_row(const AppPerfDailyRow& r);\n"
+            "}\n",
+            encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mod.check_abstract_headers_store_type_free(
+                ["server/core/src/abs_row_api.hpp"], roots=roots)
+        if ok:
+            _fail("check_abstract_headers_store_type_free did not fire on a synthetic abstract "
+                  "header naming an EXTRA store-row token (AppPerfDailyRow)", failures)
+
+        # 15. ABSTRACT-HEADER NEGATIVE CONTROL + COMMENT-STRIP: a header that
+        #     mentions a store type ONLY in a comment (never in code) must PASS.
+        #     This is load-bearing: the real dex_api.hpp banner names
+        #     `GuaranteedStateStore` in prose, and MUST NOT false-fire. Proves the
+        #     probe scans code, not comments, and discriminates (does not just
+        #     fail everything).
+        (src / "abs_clean_api.hpp").write_text(
+            "#pragma once\n"
+            "/// This seam names NO store type in code, though this doc comment\n"
+            "/// mentions GuaranteedStateStore and AppPerfDailyRow by name.\n"
+            "namespace yuzu::server { class CleanApi { public: virtual ~CleanApi() = default; }; }\n",
+            encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = mod.check_abstract_headers_store_type_free(
+                ["server/core/src/abs_clean_api.hpp"], roots=roots)
+        if not ok:
+            _fail("check_abstract_headers_store_type_free fired on a header that names store "
+                  "types ONLY in comments - it is not comment-stripping, so the real dex_api.hpp "
+                  "banner would false-fire (over-firing / not discriminating)", failures)
+
+        # 16. STRING-LITERAL OVER-STRIP GUARD (#4582 Fable review): a store token
+        #     in CODE that follows a string literal containing `//` on the SAME
+        #     line must still FIRE. Before literals were blanked ahead of comment
+        #     stripping, the `//` inside the literal was treated as a line comment
+        #     and over-stripped the real store token after it - a silent bypass of
+        #     the exact class this probe guards. Must fire and name the token.
+        (src / "abs_litbypass_api.hpp").write_text(
+            "#pragma once\n"
+            "namespace yuzu::server {\n"
+            'const char* kUrl = "http://h"; class BazStore;\n'
+            "int build_baz(BazStore* s);\n"
+            "}\n",
+            encoding="utf-8")
+        captured16 = io.StringIO()
+        with contextlib.redirect_stderr(captured16):
+            ok = mod.check_abstract_headers_store_type_free(
+                ["server/core/src/abs_litbypass_api.hpp"], roots=roots)
+        if ok:
+            _fail("check_abstract_headers_store_type_free did not fire on a store token following "
+                  "a `//`-bearing string literal - _strip_comments over-strips the literal as a "
+                  "comment, reopening the store-type bypass (#4582)", failures)
+        elif "BazStore" not in captured16.getvalue():
+            _fail(f"literal-over-strip probe fired but did not name the token; stderr: "
+                  f"{captured16.getvalue()!r}", failures)
 
     if failures:
         print(f"\n{len(failures)} seam-closure self-test failure(s).", file=sys.stderr)
