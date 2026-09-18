@@ -719,7 +719,13 @@ differs only by address, an A record already carries exactly the needed informat
 would forfeit the "free with Compose's `--scale`" property (Compose auto-populates A records for a
 scaled service; nothing auto-populates a TXT record, so an operator would be back to hand-maintaining a
 list on every scale change — the static-list option this decision otherwise avoids, just relocated into
-DNS).
+DNS). **Correction (Fable design review, 2026-09-18): the "free with Compose `--scale`" premise is false
+for every shipped Compose file as they stand today** — all five gateway service definitions
+(`docker-compose.reference-gateway.yml:97`, `.full-uat.yml`, `.viz-uat.yml`, `.demo.yml`) pin
+`container_name:` (which Compose refuses to scale) and host-publish `50051`/`8081`/`9568` (which would
+collide across replicas). This is a real, currently-false claim, not a hypothetical — see the new
+scale-capable-rig decision below, which `#4555` must ship alongside the mechanism for the premise to
+hold in practice.
 
 **Decision: gateway node identity becomes dynamic — fixed short name, host part resolved at boot —
 rather than the current hardcoded-per-node scheme.** `vm.args.src`'s literal-per-node `-name` is
@@ -727,43 +733,105 @@ incompatible with Compose's `--scale`: every scaled replica boots from the ident
 environment, so they cannot each carry a distinct hardcoded name. Gateway nodes are genuinely
 interchangeable (no operator-assigned per-node identity is needed beyond address), so the fix is
 foundational rather than incidental to discovery: every node uses the same short name (e.g. `yuzu_gw`),
-with the host part **auto-detected at boot** via the node's own resolvable hostname (which, under
-Docker/Compose, already resolves back to the container's own address with zero configuration) — overridable
-by an explicit `YUZU_GW_ADVERTISE_ADDR` env var for a bare-VM/multi-NIC deployment where auto-detection
-is ambiguous, or a container behind NAT where the internal address isn't what peers should dial. The
-override silently wins when set, the same "sensible auto-default, explicit env var wins" shape
-`YUZU_GW_CLUSTER_ID` already uses.
+with the host part **resolved at boot to an IP LITERAL — never a hostname string.** **Correction (Fable
+design review): the original wording here ("auto-detected via the node's own resolvable hostname")
+does not interoperate with A-record-based dialing and would have been unreachable in practice.** The
+dialer only ever has the IPs a seed-name lookup returned, and constructs peer node atoms as
+`yuzu_gw@<ip>`; the OTP distribution handshake (`dist_util:recv_challenge`) requires the target's own
+registered name to match the dialed name EXACTLY, and a Docker PTR lookup on a container's IP returns
+the container name, not a matching short-ID hostname, so reverse-resolving a hostname back from an IP
+does not rescue this. The corrected self-address determination is: `YUZU_GW_ADVERTISE_ADDR` if set
+(explicit override, unchanged from the original decision) → else the address obtained by intersecting
+the seed name's own resolved set with this node's local interfaces (`inet:getifaddrs()`) — i.e. "which
+of the addresses my peers would also see, is one of mine" — → else resolve this node's own hostname to
+an IP (not use the hostname string itself) as a last resort. `YUZU_GW_SEED_NODES` entries (the static
+override) are likewise addresses, expanded to `yuzu_gw@<addr>`, never bare names. Two-nodes-on-one-host
+dev/test rigs keep a short-name override (matching the 4.3a `peer`-based test suite's own
+`peer:random_name`-with-shortnames pattern, `yuzu_gw_registry_multinode_tests.erl`), since two nodes
+literally sharing one address need distinguishing names — this is the one case "nodes are interchangeable,
+identity is address-only" does not cover, and it is a test/dev-only exception, not a normal-operation path.
 
-**Decision: fail-open on discovery failure, with an indefinite fixed-interval retry — no backoff.** A
-node that resolves zero peers at boot (DNS failure, empty result, timeout) boots anyway as a
-standalone/single-member cluster and keeps retrying in the background, rather than refusing to start.
-The gateway's job is agent-facing availability; per-cluster clustering is an internal routing
-optimization the gateway does not need in order to correctly serve the agents already connected to it,
-and `#4555` must be a strict improvement over today's zero-clustering behavior, never a new way for a
-discovery hiccup to become an agent-facing outage. The retry loop uses a **fixed interval, indefinitely**
-(matching this codebase's existing retry idiom — `await_net_kernel_start`, `await_connected`,
-`await_lookup` are all fixed-interval, not exponential backoff) rather than exponential backoff: DNS
-query volume at this scale is negligible, while slow convergence after a deliberate operator scale-up
-is the failure mode that actually matters operationally.
+**Decision: WHERE dynamic naming happens must preserve the existing distribution-cookie boot guard's
+ordering (Fable design review finding, not in the original interview).** relx's `.src` config
+substitution cannot run code, so "resolve an address, then set `-name`" needs either (a) an entrypoint
+wrapper that computes `YUZU_GW_ADVERTISE_ADDR` and substitutes it into `vm.args.src`'s `-name
+yuzu_gw@${YUZU_GW_ADVERTISE_ADDR}` before the relx boot script starts the (already-distributed) VM, or
+(b) starting the VM non-distributed and calling `net_kernel:start/2` from application code once the
+address is known. **(a) is the required shape for `#4555`**: `yuzu_gw_app:check_distribution_cookie/0`
+(`yuzu_gw_app.erl:28`) runs at application boot and its `evaluate_cookie('nonode@nohost', _, _) -> ok`
+clause (`:93-94`) is written assuming distribution is already up by the time application code runs — under
+shape (b) that clause silently short-circuits the guard into a no-op on every production boot, reopening
+`#659` (the known-cookie fail-closed guard) as dead code. If a future change genuinely needs shape (b)
+for some other reason, moving the cookie check to run strictly after `net_kernel:start/2` succeeds is a
+required part of that same change, not an incidental cleanup.
 
-**Decision: `#4555` is boot-time formation only — periodic re-resolution and ongoing membership
-convergence are explicitly 4.4's scope, not this slice's.** Erlang distribution connections are
-symmetric once established: a newly-added node resolves its own peer list at *its own* boot and dials
-outward, so already-running nodes see it without needing to poll for it themselves, and a departing
-node is handled by Erlang's own connection-loss detection (`net_ticktime`), not by discovery at all.
-Periodic re-resolution to catch a peer that failed to find *this* node first (DNS propagation lag, a
-transient failure on the new node's own boot) is real but is convergence/health-tracking work the
-delivery matrix already scopes to 4.4 (`gateway_node` convergence + replay-session writeback) and the
-blueprint's own planned `yuzu_gw_cluster` adjacency-table gen_server — `#4555` stays scoped to exactly
-what its name says.
+**Decision: a minimum distribution-cookie length floor ships in this same slice (Fable design review
+finding, not in the original interview).** DNS-sourced dial targets change the distribution-cookie
+threat model in one specific way beyond the existing boot guard: the OTP handshake has the INITIATOR
+send `MD5(cookie ‖ peer_challenge)` first, before the peer proves anything back — so anything able to
+influence what the seed name resolves to (a compromised/misconfigured DNS answer) gets an offline
+brute-force oracle against the cookie from a legitimately-configured node dialing out, which an inbound
+attacker against a normal listener never gets. `evaluate_cookie` (`yuzu_gw_app.erl:95-106`) today only
+denylists a few known-default substrings — a short custom cookie of any other value passes. `#4555`
+adds a minimum length floor (Fable's suggested figure: 32 chars) to that check, keeping the existing
+`YUZU_GW_ALLOW_DEFAULT_COOKIE` dev/CI override as the escape valve (no shipped Compose file sets a
+custom cookie today — all currently rely on that override, so this floor cannot regress an existing
+production deployment that already has a real cookie configured, only one relying on the override, which
+is explicitly documented as insecure already). A CIDR/RFC1918 allow-list on resolved addresses was
+considered and **rejected** as the wrong control here: a DMZ or a cloud VPC subnet is also RFC1918-shaped,
+so "private range" is not the same predicate as "inside my trust zone" (`CONTEXT.md`'s own "Gateway
+cluster" term already states clusters must not span a DMZ or a WAN) — the cookie is the actual security
+boundary and should be strengthened directly rather than proxied through an address-range heuristic that
+doesn't track the real one. Migrating the distribution protocol itself to `-proto_dist inet_tls` over the
+internal CA is filed as a follow-up, not this slice's scope. `#4555` also pins
+`inet_dist_listen_min`/`inet_dist_listen_max` in the kernel config (today the distribution port is
+randomly chosen per boot and therefore unfirewallable on a bare-VM deployment) and documents that fixed
+range as what an operator firewalls alongside the existing mgmt-plane (`:50063`) and agent-edge
+(`:50051`) guidance.
 
-**Decision: ship one minimal metric now** (a connected-peer-count gauge, e.g.
-`yuzu_gw_cluster_peers_connected`), rather than deferring all observability to WS-11. Fail-open boot
-semantics mean a misconfigured seed name fails *silently* by design — the node boots fine and serves its
-own agents fine — so without a signal, an operator has no way to notice a cluster that's supposed to
-have three members is actually running as three isolated singles. WS-11 (leader epoch, replica lag,
-split-brain alerting) remains the home for cross-cutting HA-state observability; this is one narrow
-gauge closing the one silent-failure mode this specific mechanism introduces.
+**Decision: `#4555` ships a scale-capable reference Compose rig alongside the mechanism (Fable design
+review finding).** Per the correction above, no shipped Compose file can actually exercise `--scale
+gateway=N` today (`container_name:` blocks it; host-published `50051`/`8081`/`9568` would collide across
+replicas). Without a rig that can actually scale, the "free with Compose" property this whole design leans
+on is unverifiable in this repo, and a future reader has nothing to run to confirm the mechanism works.
+`#4555` therefore drops `container_name:` and the host-published gateway ports on at least one reference
+Compose variant suited to demonstrating a multi-node cluster (agents inside the same Compose network
+reach a scaled `gateway` service by its DNS name/port directly — they do not need the host-publish that a
+single-node demo rig uses for host-side access).
+
+**Decision: `#4555` owns an always-on discovery/redial loop, not a boot-time-only attempt — periodic
+adjacency/health tracking remains 4.4's scope (revised from the original interview finding, Fable design
+review).** The original reasoning — "Erlang distribution connections are symmetric once established, so
+a newly-added node dialing outward at its own boot suffices" — does not hold in this codebase specifically:
+`gateway/config/sys.config` and `sys.config.prod` both set **`{connect_all, false}`** (the blueprint's own
+prescription, deliberately chosen to avoid transitive auto-mesh gossip). With `connect_all` false, `pg`
+(which 4.3a's `lookup_remote/1` depends on) only ever sees membership across nodes THIS node has itself
+connected to — there is no `global`-driven self-healing of a partial mesh. A node that reaches only some
+of its resolvable peers at boot (a peer's `epmd` up but its own node not yet registered at the moment of
+the dial attempt, a transient DNS timeout, a `net_ticktime` disconnect after a network blip) stays
+permanently partially-meshed with nothing to ever redial it — the fail-open decision above already says
+the node "keeps retrying in the background," and an always-on retry loop **is** a periodic re-resolver;
+the only real design freedom was ever its stop condition, and "stop on first success" was the actual gap.
+`#4555`'s loop is therefore: on a **fixed interval, indefinitely** (unchanged from the original
+retry-cadence decision — no backoff, matching this codebase's existing fixed-interval retry idiom), resolve
+the seed name (or use the static override), subtract already-connected nodes, and `net_kernel:connect_node/1`
+each remaining address — a no-op against an already-connected peer, so the steady-state cost is one DNS
+query plus N cheap no-ops per interval. This loop is the full extent of `#4555`'s scope: it owns *whether
+a mesh forms and stays formed*, not *what a node knows about its peers' health/load* (adjacency table,
+CPU/memory gossip, latency-based rebalancing) — that remains 4.4's `yuzu_gw_cluster` gen_server, layered
+on top of the mesh this loop maintains.
+
+**Decision: ship two metrics plus an alert, not one gauge (revised from the original interview finding,
+Fable design review).** A single connected-peer-count gauge cannot distinguish "resolved 3 peers, connected
+to only 1" (a real problem — most likely a per-pair cookie mismatch, since `net_kernel:connect_node/1`
+reports that failure mode only as a bare `false`, no detail) from "resolved 1" (a different problem — wrong
+seed name, or a genuinely single-node deployment, which is not itself an error). `#4555` ships
+`yuzu_gw_cluster_peers_resolved` and `yuzu_gw_cluster_peers_connected` as separate gauges, plus a
+`yuzu_gw_cluster_connect_failures_total` counter, and a `docs/prometheus/yuzu-alerts.yml` rule firing when
+`peers_resolved - peers_connected > 0` holds for a sustained window (routed to `sre` + `architect` per
+`docs/observability-conventions.md`, same as every other alert-rule change) — closing the same
+fail-open-means-silent-by-design gap the original single-gauge decision identified, but with enough
+resolution for an operator to tell which runbook applies.
 
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
