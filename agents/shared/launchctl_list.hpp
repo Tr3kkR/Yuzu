@@ -27,6 +27,7 @@
  */
 
 #include <charconv>
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -68,8 +69,8 @@ struct LaunchctlParseResult {
 /// contains one, but a malformed/4+-field row is decoded rather than
 /// mis-split). Fewer than 2 tabs in the line -- 1-field row (no tabs at all)
 /// or 2-field row (one tab) -- yields whichever fields were present and an
-/// empty label for the rest; never throws. `std::from_chars` on the raw
-/// field, not `std::stoll`/`std::stoi`: a PARTIAL numeric match (e.g.
+/// empty label for the rest; never throws on malformed input. `std::from_chars`
+/// on the raw field, not `std::stoll`/`std::stoi`: a PARTIAL numeric match (e.g.
 /// "12abc", or "0x1A" -- from_chars stops at the "x", not a hex parse) is
 /// rejected as unparsable (pid -> nullopt, status -> 0), never silently
 /// truncated to the numeric prefix the way stoll/stoi would.
