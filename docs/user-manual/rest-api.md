@@ -5733,9 +5733,12 @@ follow-up)** A candidate inventory record excluded because its `data_json`
 failed to parse as JSON at all gets the SAME **503** treatment
 ("inventory record(s) excluded for failing to parse as JSON ... refusing to
 materialise a result set narrower than the true match set"), as a
-distinctly-named sibling refusal (checked, and thus reported, independently
-of the depth-guard one above) - the two causes are different and a caller
-retrying after fixing one must not be told the other has cleared too.
+distinctly-named sibling refusal, checked in a fixed sequence AFTER the
+depth-guard one above: a candidate set carrying both problems reports only
+the depth-guard (`poison_excluded`) refusal on that call, and the
+parse-error refusal surfaces on a subsequent retry once the poisoned record
+is fixed - so a caller is always told which cause remains, never that both
+have cleared at once.
 
 **Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
 route had NO authorization check of any kind before this fix, CWE-862: any

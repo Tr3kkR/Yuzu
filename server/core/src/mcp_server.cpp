@@ -933,8 +933,11 @@ static const ToolDef kTools[] = {
      "credentials can later read back. If any candidate inventory record was excluded for "
      "nesting past the JSON depth guard (the exclusion check runs before condition matching, "
      "so a record's plugin/fields need not relate to the query's conditions to trigger it), "
-     "this call refuses (kInternalError) rather than materialise a result set narrower than "
-     "the true match set (#4496). REST v1 twin: POST /api/v1/result-sets/from-inventory-query.",
+     "or for failing to parse as JSON at all, this call refuses (kInternalError) rather than "
+     "materialise a result set narrower than the true match set (#4496, extended by the #4496 "
+     "follow-up for the parse-error cause; each cause is its own distinctly-named refusal "
+     "reason - query_truncated/poison_excluded/parse_error_excluded). REST v1 twin: "
+     "POST /api/v1/result-sets/from-inventory-query.",
      R"j({"type":"object","properties":{"name":{"type":"string","maxLength":256},"combine":{"type":"string","enum":["all","any"],"default":"all"},"conditions":{"type":"array","items":{"type":"object","properties":{"plugin":{"type":"string","maxLength":64},"field":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}}}},"parent_id":{"type":"string","maxLength":64,"description":"An owned result set whose CURRENT members narrow the candidate set"}},"required":["conditions"]})j",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},

@@ -897,6 +897,37 @@ TEST_CASE("InventoryEval: excluded_by_parse_error is zeroed on the kMaxInventory
     CHECK(excluded_by_parse_error == 0);
 }
 
+// #4496 follow-up (Gate 8 targeted re-review, quality-engineer): the two
+// exclusion out-params are documented (inventory_eval.hpp) as "counted
+// separately so an operator can tell WHICH guard excluded a record" - a
+// claim only actually exercised when BOTH causes are present in the SAME
+// call. Every other test in this file (and the REST/MCP route-level tests)
+// exercises one cause at a time; this pins that both counters accumulate
+// independently within a single evaluate_inventory() call, and that the
+// healthy record still matches regardless of which other records were
+// excluded and for which reason.
+TEST_CASE("InventoryEval: excluded_by_depth and excluded_by_parse_error accumulate "
+          "independently when both causes are present in the same call",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records = {
+        {"agent-1|hw", poisoned},
+        {"agent-2|hw", "not valid json {{{"},
+        {"agent-3|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth, &excluded_by_parse_error);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-3");
+    CHECK(excluded_by_depth == 1);
+    CHECK(excluded_by_parse_error == 1);
+}
+
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {
     Records records = {
         {"badkey_no_pipe", R"({"os": "Linux"})"},
