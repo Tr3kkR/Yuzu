@@ -1079,12 +1079,22 @@ groups:
           summary: "A dispatch-targeting or result-set-producer request was rejected - see description for the specific reason"
           description: >-
             yuzu_server_dispatch_target_rejected_total is non-zero on
-            {{ $labels.route }} (reason={{ $labels.reason }}). A client supplied
-            agent_ids, scope or parent_id that names no device - it believes it is
-            targeting specific machines and is not. Before #2500 these calls
-            dispatched to the ENTIRE FLEET and returned success, so any non-zero
-            rate here is a near-miss worth reading, not just a validation
-            failure - hence >3/15m rather than the MCP twin's >20. It is
+            {{ $labels.route }} (reason={{ $labels.reason }}). This counter
+            covers TWO different shapes, not one - read reason before assuming
+            which: for most reasons, a client supplied agent_ids, scope or
+            parent_id that names no device - it believes it is targeting
+            specific machines and is not, a caller-side targeting mistake
+            audited as a |denied event. For reason=
+            "query_truncated"/"poison_excluded"/"parse_error_excluded"
+            specifically (route="result_set_inventory_query"), it is the
+            OPPOSITE - a well-formed, correctly-targeted request refused
+            because the server's own stored data failed a read-side guard, a
+            server-side data-quality refusal audited as a |failure event (see
+            below for the full detail on that shape). For the caller-mistake
+            shape: before #2500 these calls dispatched to the ENTIRE FLEET and
+            returned success, so any non-zero rate here is a near-miss worth
+            reading, not just a validation failure - hence >3/15m rather than
+            the MCP twin's >20. It is
             deliberately NOT >0: a single malformed curl would page, the rule
             would be silenced within a week, and the genuine near-miss it exists
             for would be silenced with it. The AUDIT row is the durable

@@ -25683,6 +25683,115 @@ TEST_CASE("MCP create_result_set_from_inventory_query: no malformed record prese
     CHECK(members[0] == "agent-healthy");
 }
 
+// #4541 review (minor finding): create_result_set_from_inventory_query's
+// served tools/list description needed two separate governance-driven fixes
+// during #4496's own review (187db8433 shipped it naming ONLY the
+// depth-guard refusal cause; 6fc64e639's Gate 8 re-review caught that drift
+// and added the parse-error cause) but had no regression test pinning the
+// corrected wording. Pins the two facts an agentic caller relies on: BOTH
+// refusal causes are named, and the three distinctly-named reason strings a
+// caller might see in a 503/kInternalError are enumerated.
+TEST_CASE("MCP create_result_set_from_inventory_query: served description names both the "
+          "depth-guard AND parse-error refusal causes (#4496 + follow-up, regression for "
+          "6fc64e639's Gate 8 fix)",
+          "[mcp][integration][result-sets][inventory]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+
+    const nlohmann::json* tool = nullptr;
+    for (const auto& t : body["result"]["tools"])
+        if (t["name"] == "create_result_set_from_inventory_query") {
+            tool = &t;
+            break;
+        }
+    REQUIRE(tool != nullptr);
+    const auto desc = (*tool)["description"].get<std::string>();
+    INFO("description = " << desc);
+    CHECK(desc.find("nesting past the JSON depth guard") != std::string::npos);
+    CHECK(desc.find("failing to parse as JSON at all") != std::string::npos);
+    CHECK(desc.find("query_truncated") != std::string::npos);
+    CHECK(desc.find("poison_excluded") != std::string::npos);
+    CHECK(desc.find("parse_error_excluded") != std::string::npos);
+}
+
+// #4541 review (Important finding 2): MCP twin of the REST combined-cause
+// test in test_rest_result_sets_async.cpp - a poisoned AND a malformed record
+// in the SAME call must report poison_excluded, never parse_error_excluded
+// (evaluate_inventory() checks poison first), matching the documented
+// caller-facing contract (docs/user-manual/rest-api.md: "a caller is always
+// told which cause remains, never that both have cleared at once"). Only a
+// unit-level test previously asserted the two out-param counts directly;
+// this proves the actual error body, audit detail AND metric reason at the
+// MCP tool layer.
+TEST_CASE("MCP create_result_set_from_inventory_query: a poisoned AND a malformed record in "
+          "the same call reports poison_excluded, never parse_error_excluded",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    yuzu::MetricsRegistry reg;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.metrics_for_test = &reg;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"combined-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // no crash
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("nesting too deeply") != std::string::npos);
+    CHECK(message.find("failing to parse") == std::string::npos);
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    bool saw_parse_error_failure = false;
+    for (const auto& d : ts.audit_details) {
+        if (d.find("poison_excluded") != std::string::npos)
+            saw_poison_failure = true;
+        if (d.find("parse_error_excluded") != std::string::npos)
+            saw_parse_error_failure = true;
+    }
+    CHECK(saw_poison_failure);
+    CHECK_FALSE(saw_parse_error_failure);
+    CHECK(reg.counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"}, {"reason", "poison_excluded"}})
+              .value() == 1.0);
+    CHECK(reg.counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"},
+                        {"reason", "parse_error_excluded"}})
+              .value() == 0.0);
+}
+
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "
           "family), never silently treated as absent",
           "[mcp][integration][result-sets][scope]") {

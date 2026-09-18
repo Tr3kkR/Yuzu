@@ -1280,6 +1280,86 @@ TEST_CASE("from-inventory-query: no malformed record present -- matching members
     CHECK(members[0] == "agent-healthy");
 }
 
+// #4541 review (Important finding 2): both producer tests above seed only
+// ONE excluded cause at a time. `evaluate_inventory()` checks poison BEFORE
+// parse-error (see its own excluded_by_depth/excluded_by_parse_error
+// ordering), so a record set carrying BOTH problems must always report
+// poison_excluded and never parse_error_excluded - a caller-facing contract
+// docs/user-manual/rest-api.md states explicitly ("a caller is always told
+// which cause remains, never that both have cleared at once"). Only a
+// unit-level test (test_inventory_eval.cpp's "excluded_by_depth and
+// excluded_by_parse_error accumulate independently") asserted the two
+// out-param counts directly; this proves the actual 503 body, audit detail
+// AND metric reason at the route layer, when both fire in the same call.
+TEST_CASE("from-inventory-query: a poisoned AND a malformed record in the same call reports "
+          "poison_excluded, never parse_error_excluded",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"combined-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 503);
+    REQUIRE(body.contains("error"));
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("nesting too deeply") != std::string::npos);
+    CHECK(message.find("failing to parse") == std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    bool saw_parse_error_failure = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "result_set.create" && a.result == "failure") {
+            if (a.detail.find("poison_excluded") != std::string::npos)
+                saw_poison_failure = true;
+            if (a.detail.find("parse_error_excluded") != std::string::npos)
+                saw_parse_error_failure = true;
+        }
+    }
+    CHECK(saw_poison_failure);
+    CHECK_FALSE(saw_parse_error_failure);
+    // #4541 review minor: assert the metric counter reason too, not just
+    // status/audit - kReasonPoisonExcluded/kReasonParseErrorExcluded
+    // (dispatch_target_shape.hpp) label yuzu_server_dispatch_target_rejected_total.
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"}, {"reason", "poison_excluded"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"},
+                        {"reason", "parse_error_excluded"}})
+              .value() == 0.0);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // #4496: POST /api/v1/inventory/evaluate -- the read-only third caller of
 // evaluate_inventory(). Unlike the two producers above, this route is a

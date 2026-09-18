@@ -458,6 +458,13 @@ for a restart to force-resend against. Diagnose via
 `yuzu_inventory_ingest_total{source="__generic__",outcome="rejected_depth"}`
 (non-zero means at least one agent has hit this) and the accompanying
 `spdlog::warn` log line, which names the real agent/plugin identifiers.
+This is a WRITE-TIME rejection (the source blob never reaches `InventoryStore`
+at all); the distinct READ-TIME signal for a record that already made it into
+the store but is excluded when a later query evaluates it (over-nested or
+malformed `data_json`, #4496 + follow-up) is documented under
+[REST API → `POST /api/v1/inventory/evaluate`](rest-api.md#post-apiv1inventoryevaluate)
+- the two share a root cause (an over-depth or otherwise unparseable
+generic-inventory blob) but different remediation ladders.
 
 **A `need_full` spike right after deploying the blob-v2 release is expected.**
 The v2 contract reformats the canonical content hash (12 fields instead of 4),
