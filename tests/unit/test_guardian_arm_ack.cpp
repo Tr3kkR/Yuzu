@@ -1409,23 +1409,30 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): K-eligibility linearizes at the 
 TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent "
           "poller racing the actual production completion path never observes an "
           "inconsistent (status, wedge_eligible) pair (rung 9c PR-5e, #4221, PR "
-          "#4529 review finding)",
+          "#4529 review finding, round 2 - fixed per cpp-safety/security-guardian/"
+          "cpp-expert convergent findings)",
           "[spark][ack]") {
     // Unlike the sequential test above, this races a REAL background reader
     // against the REAL production completion path (a genuine backend refusal
     // resolving on its own detached worker) - no test hook stands in for the
     // race, so this exercises actual concurrency, not settled-then-read
-    // ordering. The only two invariants a correct atomic combined-read can ever
-    // provide, and that a reverted two-separate-lock-acquisitions version could
-    // violate: (1) `status` never regresses from Wedged back to Pending once
-    // observed Wedged (`end` is sticky by design - a poll catching a stale
-    // Pending after a later poll already saw Wedged is impossible either way,
-    // but the reverse - Wedged then a LATER poll reading Pending - would mean
-    // the two sub-reads came from different instants entirely); (2) once a
-    // poll observes `status == Wedged && !wedge_eligible` (settled to a genuine
-    // refusal, no longer still-claimed), no LATER poll on the same receipt ever
-    // observes `wedge_eligible == true` again - eligibility only ever narrows
-    // for one episode, it cannot un-settle.
+    // ordering. The poller starts BEFORE expire_overdue_claims() (cpp-expert
+    // finding, round 2): `end` is sticky and unique - once Wedged, `status`
+    // never changes again for this receipt, so a poller started AFTER the
+    // Pending->Wedged transition can only ever race `wedge_eligible`'s own
+    // later true->false narrowing, never the transition a split two-call
+    // accessor would actually mishandle. Starting earlier makes BOTH
+    // sub-fields of the pair genuinely in flight together at least once:
+    // (1) `status` observed Pending, then later Wedged, NEVER the reverse for
+    // the same receipt - a poll reading Pending strictly after an EARLIER
+    // poll already read Wedged would mean the two sub-reads of THAT later
+    // pair came from different instants than each other, not merely from
+    // different instants than real time (`end` is one-way: None -> a
+    // terminal value, never back); (2) once a poll observes
+    // `status == Wedged && !wedge_eligible` (settled to a genuine refusal,
+    // no longer still-claimed), no LATER poll ever observes
+    // `wedge_eligible == true` again for the same receipt - eligibility only
+    // ever narrows for one episode, it cannot un-settle.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     b->hang_next_arm.store(true);
@@ -1435,30 +1442,60 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
     auto receipt = accept(*rt, "r1");
     REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
-    REQUIRE(rt->expire_overdue_claims() == 1);
-    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
-    REQUIRE(rt->receipt_wedge_k_eligible(receipt));
 
     std::atomic<bool> stop{false};
     std::atomic<int> poll_count{0};
     std::atomic<bool> saw_pending_after_wedged{false};
     std::atomic<bool> saw_eligible_after_settled_ineligible{false};
+    std::atomic<bool> observed_wedge_transition{false}; // proves the Pending->Wedged
+        // race was genuinely sampled at least once, not just assumed - a poller
+        // starved until after expire_overdue_claims() already ran would silently
+        // never exercise invariant (1) at all
+    std::atomic<bool> observed_settled_ineligible{false}; // same purpose for
+        // invariant (2) - cpp-safety finding: without this, a poller starved
+        // during the post-settle window would pass CHECK_FALSE below vacuously
     std::thread poller{[&] {
-        bool ever_settled_ineligible = false;
         bool ever_wedged = false;
+        bool ever_settled_ineligible = false;
         while (!stop.load(std::memory_order_relaxed)) {
             const auto wa = rt->receipt_status_wedge_aware(receipt);
             poll_count.fetch_add(1, std::memory_order_relaxed);
             if (ever_wedged && wa.status == GuardianSparkRuntime::ReceiptStatus::Pending)
                 saw_pending_after_wedged.store(true, std::memory_order_relaxed);
-            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged)
+            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged) {
+                if (!ever_wedged)
+                    observed_wedge_transition.store(true, std::memory_order_relaxed);
                 ever_wedged = true;
+            }
             if (ever_settled_ineligible && wa.wedge_eligible)
                 saw_eligible_after_settled_ineligible.store(true, std::memory_order_relaxed);
-            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged && !wa.wedge_eligible)
+            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged && !wa.wedge_eligible) {
+                if (!ever_settled_ineligible)
+                    observed_settled_ineligible.store(true, std::memory_order_relaxed);
                 ever_settled_ineligible = true;
+            }
         }
     }};
+    // cpp-safety/security-guardian/cpp-expert (round 2, all three independently):
+    // a REQUIRE between `poller`'s construction and its join can throw and unwind
+    // past a still-joinable std::thread, which calls std::terminate() rather than
+    // failing this one test - the exact hazard class this file's sibling
+    // (test_guardian_engine_spark_reconcile.cpp) already guards against via a
+    // local RAII type, and the shared, promoted fix for it here:
+    // yuzu::test::ScopeExit (test_helpers.hpp, already included transitively).
+    // Declared immediately after `poller` so it destructs FIRST on any unwind
+    // path (reverse declaration order) - sets `stop` before joining, since the
+    // poll loop only exits on that flag (joining first would deadlock the
+    // unwind).
+    yuzu::test::ScopeExit poller_guard{[&] {
+        stop.store(true, std::memory_order_relaxed);
+        if (poller.joinable())
+            poller.join();
+    }};
+
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_wedge_k_eligible(receipt));
 
     // The real completion, racing the poller above on its own detached worker -
     // not test-hook-gated.
@@ -1468,12 +1505,16 @@ TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent
                                    std::chrono::seconds(10)));
     // Let a further batch of polls land against the now-settled state before
     // stopping, so the "stays false" half of invariant (2) is actually
-    // exercised, not just the single instant of transition.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // exercised, not just the single instant of transition (cpp-safety finding:
+    // scaled by kSpinScale like every other timing bound in this file, not a
+    // bare literal).
+    std::this_thread::sleep_for(std::chrono::milliseconds(50) * yuzu::test::kSpinScale);
     stop.store(true, std::memory_order_relaxed);
     poller.join();
 
     CHECK(poll_count.load(std::memory_order_relaxed) > 0);
+    CHECK(observed_wedge_transition.load(std::memory_order_relaxed)); // race actually happened
+    CHECK(observed_settled_ineligible.load(std::memory_order_relaxed)); // ditto
     CHECK_FALSE(saw_pending_after_wedged.load(std::memory_order_relaxed));
     CHECK_FALSE(saw_eligible_after_settled_ineligible.load(std::memory_order_relaxed));
     CHECK(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // still sticky
