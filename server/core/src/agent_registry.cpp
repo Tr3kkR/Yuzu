@@ -420,7 +420,8 @@ void AgentRegistry::clear_stream_if_session(const std::string& agent_id,
 }
 
 void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::string& node,
-                                      std::vector<std::string> capabilities) {
+                                      std::vector<std::string> capabilities,
+                                      std::string stream_home_id) {
     std::shared_ptr<AgentSession> session;
     {
         std::lock_guard lock(mu_);
@@ -438,6 +439,10 @@ void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     // deny). Both fields are published together, under the SAME lock
     // `send_to`/`send_to_all` already read them under, so there is exactly
     // one lock domain and no publish step in between for a reader to land in.
+    // HA WS-4 #4324: `stream_home_id` joins the same atomic publish for the
+    // same reason — folding it into a second lock acquisition would
+    // reintroduce exactly the M1 hazard this comment describes, one field
+    // later.
     std::lock_guard slock(session->stream_mu);
     session->gateway_node = node;
     // PLAN item 5: a full REPLACE, never a merge — a reconnect behind an
@@ -445,6 +450,22 @@ void AgentRegistry::set_gateway_route(const std::string& agent_id, const std::st
     // capabilities a prior connection advertised but this one does not.
     session->gateway_wire_capabilities =
         std::unordered_set<std::string>(capabilities.begin(), capabilities.end());
+    session->gateway_stream_home_id = std::move(stream_home_id);
+}
+
+std::optional<std::string>
+AgentRegistry::gateway_stream_home_id(const std::string& agent_id,
+                                      const std::string& session_id) const {
+    std::shared_ptr<AgentSession> session;
+    {
+        std::lock_guard lock(mu_);
+        auto it = agents_.find(agent_id);
+        if (it == agents_.end() || it->second->session_id != session_id)
+            return std::nullopt;
+        session = it->second;
+    }
+    std::lock_guard slock(session->stream_mu);
+    return session->gateway_stream_home_id;
 }
 
 void AgentRegistry::clear_gateway_wire_capabilities(const std::string& agent_id) {
@@ -925,6 +946,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
         // sccm
+        // peripherals
+        {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
+        {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
+        {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // storage

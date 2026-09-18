@@ -104,7 +104,7 @@ flowchart LR
 | OS | Runs as | Extra grant needed | Measured | If the read is refused |
 |---|---|---|---|---|
 | Windows | Agent service account, granted `SeBackupPrivilege` (read regardless of DACL) and `Performance Log Users` group membership (`docs/agent-privilege-model.md:94`) | **None beyond install-time grants.** `SeBackupPrivilege` and the ETW-enabling group membership are already provisioned; the `software` source needs no extra privilege beyond the account's existing registry-read access. | 2026-09-07, bare-metal, captured as `SYSTEM` — broader privilege than the deployed service account; no OS-level read was reached in this capture (see Caveats) | Not observed in this capture. The Windows legs never fall back to a poll (they are all `supported`, not `constrained`) — a refused read would surface as an `error\|` line from the underlying Win32 call, not a degrade. |
-| macOS | **root** (LaunchDaemon, no `UserName` — `docs/agent-privilege-model.md:94`) | Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`tar_proc_es.cpp:118-121,327-328`). | 2026-09-07, bare-metal, captured at **euid 501 (jsmith)** — unprivileged; the root LaunchDaemon path was not exercised by this capture. | A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`tar_proc_es.cpp:327-328`). |
+| macOS | **root** (LaunchDaemon, no `UserName` — `docs/agent-privilege-model.md:94`) | Endpoint Security process capture needs root **and** the `com.apple.developer.endpoint-security.client` entitlement; without both, `es_new_client`/`es_subscribe` fails and the process/tcp legs self-heal to the `KERN_PROC_ALL`/`proc_pidfdinfo` poll (`tar_proc_es.cpp:302-307`). | 2026-09-07, bare-metal, captured at **euid 501 (jsmith)** — unprivileged; the root LaunchDaemon path was not exercised by this capture. | A missing entitlement/privilege never blocks the leg outright — it logs a warning and falls back to the poll (`tar_proc_es.cpp:302-307`). |
 | Linux | Agent account with `cap_dac_read_search` set on the binary (`docs/agent-privilege-model.md:94`); not root | None beyond the binary capability. Service enumeration (`systemctl`) runs as bounded argv under the agent account, not elevated. | 2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed `cap_dac_read_search` account. | Not observed in this capture. |
 
 Binaries/subprocesses/network: `systemctl list-units --type=service --all --plain --no-pager --no-legend` and
@@ -114,7 +114,7 @@ executes `smbstatus` for the mapdrive collector, `tar_mapdrive_collector.cpp:111
 Windows ETW session on provider `Microsoft-Windows-Kernel-Process`
 (`tar_proc_etw.cpp:48-49,337,349,370,383,397`) and a second ETW session for module-load capture
 (`tar_module_etw.cpp:458-498`); an in-process macOS Endpoint Security client
-(`tar_proc_es.cpp:313-314,327`); raw sockets — `PF_SYSTEM`/`SYSPROTO_CONTROL` for the macOS nstat
+(`tar_proc_es.cpp:295-300,309-314`); raw sockets — `PF_SYSTEM`/`SYSPROTO_CONTROL` for the macOS nstat
 client (`tar_netqual_nstat.cpp:906,938`) and `AF_NETLINK`/`NETLINK_SOCK_DIAG` on Linux
 (`tar_network_collector.cpp:529`). No `popen`, `CreateProcess`, or `posix_spawn` call exists
 anywhere in the plugin's 48 source files.

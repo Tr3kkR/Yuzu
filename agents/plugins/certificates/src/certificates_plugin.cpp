@@ -33,8 +33,10 @@
 
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <format>
@@ -1261,6 +1263,25 @@ CheckedCommandResult run_bounded_checked(const std::vector<std::string>& argv,
     return out;
 }
 
+// Test-only fault-injection seam (#4374): lets a test prove a login-keychain
+// read spawn site was REACHED or SUPPRESSED without spawning anything and
+// without reading the host's real login keychain. Read per call (never
+// cached) so one test process can point successive dispatches at different
+// fixtures. When YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE is set
+// and non-empty, returns a failed CheckedCommandResult carrying the env
+// value (truncated to 200 bytes) as failure_detail; otherwise nullopt, and
+// the caller spawns exactly as today.
+std::optional<CheckedCommandResult> injected_login_keychain_read_failure() {
+    const char* override_detail =
+        std::getenv("YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE");
+    if (override_detail == nullptr || override_detail[0] == '\0')
+        return std::nullopt;
+    CheckedCommandResult injected;
+    injected.ok = false;
+    injected.failure_detail = std::string(override_detail).substr(0, 200);
+    return injected;
+}
+
 // ── System/root keychain read: bounded SecItem via agent-core (#3246, #2318a) ──
 //
 // System.keychain and SystemRootCertificates.keychain ONLY -- the login
@@ -1491,21 +1512,31 @@ ConsoleUserResolution resolve_console_user(
         out.degrade_reason = "console-user lookup skipped: action deadline exceeded";
         return out;
     }
-    // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
-    // SystemConfiguration IS linkable here, deliberately not used (device-
-    // vs session-owner semantics), see manifest
-    auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
-                                           yuzu::agent::SubprocessOptions{
-                                               .deadline = stat_deadline},
-                                           "console-user stat /dev/console");
-    if (!stat_result.ok) {
-        // The `stat` spawn itself failed/timed out -- we do not KNOW whether
-        // anyone is at the console, so we must not answer as though we do.
-        out.outcome = ConsoleUserOutcome::kDegraded;
-        out.degrade_reason = "console-user lookup failed (stat /dev/console)";
-        return out;
+    std::string username;
+    // Test-only seam (#4374): a substitute for the `stat` spawn's OUTPUT
+    // only, never a bypass of the validation below -- read per call (never
+    // cached), so a single test process can point successive dispatches at
+    // different fixtures.
+    if (const char* override_user = std::getenv("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE");
+        override_user != nullptr && override_user[0] != '\0') {
+        username = override_user;
+    } else {
+        // sink: certificates/resolve_console_user#1 — rung-2 runner argv;
+        // SystemConfiguration IS linkable here, deliberately not used (device-
+        // vs session-owner semantics), see manifest
+        auto stat_result = run_bounded_checked({"/usr/bin/stat", "-f%Su", "/dev/console"},
+                                               yuzu::agent::SubprocessOptions{
+                                                   .deadline = stat_deadline},
+                                               "console-user stat /dev/console");
+        if (!stat_result.ok) {
+            // The `stat` spawn itself failed/timed out -- we do not KNOW whether
+            // anyone is at the console, so we must not answer as though we do.
+            out.outcome = ConsoleUserOutcome::kDegraded;
+            out.degrade_reason = "console-user lookup failed (stat /dev/console)";
+            return out;
+        }
+        username = yuzu::macos::parse_console_user_output(stat_result.output);
     }
-    auto username = yuzu::macos::parse_console_user_output(stat_result.output);
     if (yuzu::macos::is_no_console_user(username)) {
         out.outcome = ConsoleUserOutcome::kNoSession; // a real, definite answer
         return out;
@@ -1614,6 +1645,44 @@ bool emit_keychain_rows_macos(yuzu::CommandContext& ctx, const std::string& pem,
     return true;
 }
 
+// #2318b: re-confirm the console session owner immediately before a
+// login-keychain spawn -- resolve_console_user() above ran a Directory
+// Services lookup that can itself take seconds; this in-process
+// ::stat("/dev/console") needs none, so the window between "who is logged
+// in" and "whose keychain are we about to read" -- a fast-user-switch could
+// change it in between -- shrinks from tens of seconds to microseconds. Not
+// eliminated: see classify_console_owner_recheck's own comment. No new spawn
+// is added by this check, so it adds no sink-manifest row. The single
+// ::stat("/dev/console") site for both list_certs_macos and
+// details_cert_macos.
+struct ConsoleOwnerSnapshot {
+    bool ok = false;
+    unsigned long long uid = 0;
+};
+
+ConsoleOwnerSnapshot snapshot_console_owner() {
+    // Test-only seam (#4374), read per call (never cached): a substitute for
+    // the ::stat() OUTPUT only. The whole value must be digits and fully
+    // consumed by std::from_chars -- any parse failure yields ok=false, the
+    // same "unknown" answer a failed ::stat produces.
+    if (const char* override_uid =
+            std::getenv("YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE");
+        override_uid != nullptr && override_uid[0] != '\0') {
+        ConsoleOwnerSnapshot out;
+        std::string_view value(override_uid);
+        auto [ptr, ec] = std::from_chars(value.data(), value.data() + value.size(), out.uid);
+        out.ok = (ec == std::errc{} && ptr == value.data() + value.size());
+        if (!out.ok)
+            out.uid = 0;
+        return out;
+    }
+    struct stat console_st {};
+    ConsoleOwnerSnapshot out;
+    out.ok = ::stat("/dev/console", &console_st) == 0;
+    out.uid = static_cast<unsigned long long>(console_st.st_uid);
+    return out;
+}
+
 void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                       int expiring_days) {
     ctx.write_output("subject|issuer|thumbprint|not_before|not_after|serial|store|key_usage");
@@ -1710,20 +1779,10 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
         // uid/username resolve_console_user() had already validated: defensive
         // only, and a genuinely different (internal) fault. Reporting both as
         // "command construction failed" told the operator the wrong thing.
-        // #2318b: re-confirm the console session owner immediately before
-        // this spawn. resolve_console_user() above ran a Directory Services
-        // lookup that can itself take seconds; the in-process
-        // ::stat("/dev/console") here needs none, so the window between
-        // "who is logged in" and "whose keychain are we about to read" -- a
-        // fast-user-switch could change it in between -- shrinks from tens
-        // of seconds to microseconds. Not eliminated: see
-        // classify_console_owner_recheck's own comment. No new spawn is
-        // added by this check, so it adds no sink-manifest row.
-        struct stat console_st {};
-        const bool console_stat_ok = ::stat("/dev/console", &console_st) == 0;
-        switch (classify_console_owner_recheck(
-            console_stat_ok, static_cast<unsigned long long>(console_st.st_uid),
-            console_user->uid)) {
+        // #2318b: re-confirm the console session owner -- see
+        // snapshot_console_owner's own comment for the full rationale.
+        auto owner = snapshot_console_owner();
+        switch (classify_console_owner_recheck(owner.ok, owner.uid, console_user->uid)) {
         case ConsoleOwnerRecheck::kChanged:
             ctx.write_output("not_available|console user changed");
             mark_result_partial(ctx, "login-keychain", "console user changed");
@@ -1763,10 +1822,13 @@ void list_certs_macos(yuzu::CommandContext& ctx, std::string_view store_filter,
                     // stderr). The launchctl/sudo/security session hop itself
                     // never needed a shell -- it execs fine as plain argv.
                     // sink: certificates/list_certs_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
-                    auto login_result = run_bounded_checked(
-                        argv,
-                        yuzu::agent::SubprocessOptions{.deadline = read_deadline},
-                        "login keychain read");
+                    auto injected = injected_login_keychain_read_failure();
+                    auto login_result = injected ? std::move(*injected)
+                                                  : run_bounded_checked(
+                                                        argv,
+                                                        yuzu::agent::SubprocessOptions{
+                                                            .deadline = read_deadline},
+                                                        "login keychain read");
                     if (login_result.ok) {
                         if (!emit_keychain_rows_macos(ctx, login_result.output, "login.keychain-db",
                                                       expiring_days, action_deadline)) {
@@ -1969,15 +2031,10 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
     }
 
     if (plan.want_login) {
-        // #2318b: re-confirm the console session owner immediately before
-        // this spawn -- see list_certs_macos's matching comment for the full
-        // rationale (resolve_console_user's DS lookup vs. this in-process
-        // stat, the shrunk-not-eliminated race window, no new sink row).
-        struct stat console_st {};
-        const bool console_stat_ok = ::stat("/dev/console", &console_st) == 0;
-        switch (classify_console_owner_recheck(
-            console_stat_ok, static_cast<unsigned long long>(console_st.st_uid),
-            console_user->uid)) {
+        // #2318b: re-confirm the console session owner -- see
+        // snapshot_console_owner's own comment for the full rationale.
+        auto owner = snapshot_console_owner();
+        switch (classify_console_owner_recheck(owner.ok, owner.uid, console_user->uid)) {
         case ConsoleOwnerRecheck::kChanged:
             if (!read_failed) {
                 read_failed = true;
@@ -2026,10 +2083,13 @@ void details_cert_macos(yuzu::CommandContext& ctx, std::string_view thumbprint,
                     // tilde expansion is replaced by
                     // resolve_passwd_entry's bounded passwd lookup above.
                     // sink: certificates/details_cert_macos#1 — rung-2 runner argv (launchctl asuser + sudo -u session hop), see manifest
-                    auto login_result = run_bounded_checked(
-                        argv,
-                        yuzu::agent::SubprocessOptions{.deadline = read_deadline},
-                        "login keychain read");
+                    auto injected = injected_login_keychain_read_failure();
+                    auto login_result = injected ? std::move(*injected)
+                                                  : run_bounded_checked(
+                                                        argv,
+                                                        yuzu::agent::SubprocessOptions{
+                                                            .deadline = read_deadline},
+                                                        "login keychain read");
                     if (!login_result.ok) {
                         if (!read_failed) {
                             read_failed = true;

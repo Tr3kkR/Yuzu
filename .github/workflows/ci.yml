@@ -400,6 +400,22 @@ jobs:
             exit 1
           }
 
+      # Portable-path gate (ws91 P91-7, Architect ruling 2026-09-08). Pure
+      # `git ls-files` scan -- no build deps -- so it belongs here beside the
+      # other preflight gates. Fails on any tracked path Windows/NTFS cannot
+      # represent (a ':' -- the recurring offender for sysfs/PCI/MAC-
+      # address-shaped fixture data -- or `* ? " < > |` or a trailing '.'/' '
+      # on any path component): P91-5's Linux sysfs fixture tree shipped 35
+      # such paths and broke `git checkout` on every Windows host, the-rig
+      # and the "Windows MSVC ${{ matrix.build_type }}" self-hosted CI
+      # checkout job (this file's build matrix, below) included. Selftest
+      # first (fixture-level proof the predicate still discriminates
+      # clean/seeded paths), then the real scan over the tree.
+      - name: Portable path gate (ws91 P91-7)
+        run: |
+          bash scripts/ci/check-portable-paths.sh --selftest
+          bash scripts/ci/check-portable-paths.sh
+
       # Hermetic shell-gate tests on the PR fast-path. The compose-version gate
       # otherwise only runs at release time, so a regex regression would surface
       # too late (after the full build matrix). No build deps — just bash.
@@ -986,10 +1002,49 @@ jobs:
         # added shard D, carved from B's [body_cap] tests — + the mcp bridge
         # teardown budget test + the pg shard partition invariant, #3443
         # Phase 1 — needs no Postgres DSN,
-        # --list-tests only enumerates TEST_CASE macros). Both UNCAPPED (no
-        # --num-processes) since neither touches Postgres. Only the pg-tagged
-        # invocations (full shards or smoke, #3443 Phase 2) go through their
-        # own dedicated steps below.
+        # --list-tests only enumerates TEST_CASE macros). Both now pass
+        # --num-processes 2 (2026-09-18, extends #3443). The old reasoning
+        # here ("UNCAPPED since neither touches Postgres") conflated
+        # Postgres contention with the WITHIN-job meson fan-out #3443 already
+        # proved on the pg shards below: uncapped `meson test` spawns every
+        # registered test() entry through its own cpu_count()-based worker
+        # pool, blind to this box's cgroup-confined CPU count, regardless of
+        # whether any of those entries touch Postgres. Evidence this actually
+        # fires here: on two independently-diagnosed CI runs (PR #4532 run
+        # 35307458479, PR #4566 run 35361987460, no diff in common), THIS
+        # invocation's own testlog.txt shows exactly ONE Catch2 case failing
+        # each time, both async/timing assertions in the spark/guardian
+        # suite (a 10s spin_until that never resolved; an ArmOutcomeKind/
+        # ReceiptStatus mismatch in an async wedge test) - consistent with
+        # CPU steal flipping a real-time assertion, not a Postgres-specific
+        # mechanism. --num-processes 2 matches the value already established
+        # for this box's pg-shard step below rather than inventing a new
+        # one.
+        #
+        # CORRECTION (build-ci review, 2026-09-18): the much larger ~20-case
+        # "blocked" list CI actually reports for those same two runs
+        # (content_dist/script_exec/event_logs/wifi/windows_updates/
+        # software_actions/license_scan) is NOT produced by this meson
+        # invocation and this flag does not touch it - it comes from
+        # flake-retry.py's catch2_failed_cases() classifier, which re-runs
+        # the WHOLE failed binary a second time, SOLO, as a bare subprocess
+        # outside meson's own test orchestrator, to enumerate failing case
+        # names for the retry pass. Why that solo re-run fails ~20 different
+        # cases than the original invocation above is NOT diagnosed (see
+        # #4580) - candidates include cross-job box contention during the
+        # solo re-run, shared-fixture/test-order pollution, or resource
+        # pressure from running the 3300+-case suite twice back to back;
+        # none confirmed. This cap is shipped on the single-case evidence
+        # above; do not read it as a fix for the classifier cascade.
+        #
+        # Cross-job with-test-slot.sh gating is deliberately NOT added here
+        # yet: this step's aggregate duration is
+        # still short, so the within-job cap is the single-axis fix shipped
+        # first, per this file's own "ship and measure one axis at a time"
+        # practice - watch ci-suite-stats for this leg before adding the
+        # cross-job gate too. The pg-tagged invocations (full shards or
+        # smoke, #3443 Phase 2) still separately go through with-test-slot.sh
+        # below; this step does not.
         # YUZU_TEST_PROGRESS (governance follow-up, #4153 round 4): previously only
         # enabled on the nightly windows-asan leg, so a hang in this leg's agent
         # suite - the exact class #2345/#4018 recurred as - had no per-test
@@ -1005,8 +1060,8 @@ jobs:
           export YUZU_TEST_PROGRESS_FILE="$GITHUB_WORKSPACE/build-linux-${{ matrix.compiler }}-${{ matrix.build_type }}/meson-logs/progress.log"
           mkdir -p "$(dirname "$YUZU_TEST_PROGRESS_FILE")"
           rm -f "$YUZU_TEST_PROGRESS_FILE"
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --suite agent --suite docs --suite proto --suite tar --suite gateway
-          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 --suite agent --suite docs --suite proto --suite tar --suite gateway
+          python3 scripts/ci/flake-retry.py --builddir build-linux-${{ matrix.compiler }}-${{ matrix.build_type }} -- --print-errorlogs --num-processes 2 "server unit tests shard A" "server unit tests shard B" "server unit tests shard C" "server unit tests shard D" "mcp bridge teardown allocation budget" "server pg shard partition invariant"
 
       - name: Test (pg shards, full)
         if: matrix.pg_mode == 'full'
