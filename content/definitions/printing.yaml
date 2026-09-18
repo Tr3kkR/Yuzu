@@ -1,0 +1,192 @@
+## Printing Definitions
+## Reports printers and their queued jobs.
+## Plugin: printing | Actions: printers, jobs
+##
+## Sources by platform:
+##   Windows: winspool EnumPrintersW/EnumJobsW level 2.
+##   macOS/Linux: raw IPP (RFC 8010) over the CUPS Unix domain socket via
+##            cpp-httplib — no libcups. Reads fall back to TCP
+##            localhost:631 when no socket is found.
+##
+## A focused follow-up PR on top of this one adds a `clear_queue` action
+## (Destructive+Irreversible, role-gated) that cancels one job by the
+## `job_id` this definition's `jobs` action reports.
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.printing.printers
+  displayName: List Printers
+  version: 1.0.0
+  description: >
+    Lists every printer known to the local print system: name, state
+    (idle/processing/stopped/unknown), state reasons, whether it is the
+    system default, make and model, uri/port, and queued job count.
+  tags: [printing, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: printing
+    action: printers
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    # printer|<name>|<state>|<state_reasons>|<is_default>|<make_model>|<uri>|<queued_jobs>
+    columns:
+      - name: name
+        type: string
+        description: 'Printer name/identifier as reported by the platform mechanism.'
+        example: Office-LaserJet
+        platforms: [windows, linux, darwin]
+      - name: state
+        type: string
+        description: 'Reported printer state. Values: idle, processing, stopped, unknown.'
+        example: idle
+        platforms: [windows, linux, darwin]
+      - name: state_reasons
+        type: string
+        description: 'Comma-joined printer-state-reasons keywords, or "-" when none reported. winspool has no equivalent vocabulary and always reports "-".'
+        example: "-"
+        platforms: [windows, linux, darwin]
+      - name: is_default
+        type: boolean
+        description: 'Whether this is the system default printer. Values: 1, 0 — a digit, never true/false.'
+        example: "1"
+        platforms: [windows, linux, darwin]
+      - name: make_model
+        type: string
+        description: 'Make/model string (IPP printer-make-and-model, or the winspool driver name), or "-" when unavailable.'
+        example: "Local Raw Printer"
+        platforms: [windows, linux, darwin]
+      - name: uri
+        type: string
+        description: 'Printer URI (IPP printer-uri-supported, or the winspool port name), or "-" when unavailable.'
+        example: "ipp://localhost/printers/Office-LaserJet"
+        platforms: [windows, linux, darwin]
+      - name: queued_jobs
+        type: int64
+        description: 'Number of jobs currently queued on this printer. Values: 0 or greater, or -1 (unknown — the mechanism did not report a count).'
+        example: "0"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "List printers"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [printing]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: crossplatform.printing.jobs
+  displayName: List Print Jobs
+  version: 1.0.0
+  description: >
+    Lists queued print jobs, optionally filtered to one printer: printer,
+    job id, owner, document name, status, submission time (ISO-8601 UTC),
+    and size in bytes. The document field is the job's user-supplied
+    title/filename — it is treated as instruction-result user content
+    (server instruction-result retention only; never forwarded to
+    daily-sync, TAR, or DEX). It exists so an operator can identify
+    individual jobs — a focused follow-up PR adds a clear_queue action
+    that targets one job by this id.
+  tags: [printing, inventory]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: printing
+    action: jobs
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      printer:
+        type: string
+        displayName: Printer Name
+        description: 'Optional printer name to filter to. When omitted, jobs across every printer are listed.'
+        validation:
+          maxLength: 256
+
+  result:
+    # job|<printer>|<job_id>|<owner>|<document>|<status>|<submitted_at>|<size_bytes>
+    columns:
+      - name: printer
+        type: string
+        description: 'The printer this job is queued on (URI on the IPP leg, printer name on Windows), or "-" when unavailable.'
+        example: "ipp://localhost/printers/Office-LaserJet"
+        platforms: [windows, linux, darwin]
+      - name: job_id
+        type: int64
+        description: 'Job identifier. Values: 1 or greater.'
+        example: "42"
+        platforms: [windows, linux, darwin]
+      - name: owner
+        type: string
+        description: 'The submitting user, or "-" when unavailable.'
+        example: alex
+        platforms: [windows, linux, darwin]
+      - name: document
+        type: string
+        description: 'The job''s document name/title, or "-" when unavailable. User content — see this definition''s retention note above.'
+        example: hosts
+        platforms: [windows, linux, darwin]
+      - name: status
+        type: string
+        description: 'Job status. Values: pending, held, processing, stopped, canceled, aborted, completed, unknown.'
+        example: processing
+        platforms: [windows, linux, darwin]
+      - name: submitted_at
+        type: string
+        description: 'ISO-8601 UTC submission timestamp, or "-" when unavailable.'
+        example: "2026-09-08T12:00:00Z"
+        platforms: [windows, linux, darwin]
+      - name: size_bytes
+        type: int64
+        description: 'Job size in bytes, or -1 (unknown).'
+        example: "1024"
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "List print jobs{{#if printer}} on {{printer}}{{/if}}"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 1.0.0
+    requiredPlugins: [printing]
+
+status:
+  phase: active
