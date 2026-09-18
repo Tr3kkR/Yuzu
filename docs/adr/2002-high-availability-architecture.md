@@ -396,8 +396,8 @@ bullets below. **What remains OUT of scope for 4.2b**: multi-cluster gateway fan
 `gw_mgmt_stub_`), the durable cross-replica session lookup (#4246 #3, re-homed to WS-5) — the reader
 stays FALLBACK-ONLY and behaviorally inert until that lands and makes a local miss actually mean
 something on a multi-replica deployment — and `gateway_node` convergence reconcile (4.4). The #4324
-per-home stream-generation fence (re-scoped from #4246 #4) is now CLOSED (pending merge — see the
-#4324 status paragraph below); 4.2b's review RE-VERIFIED the once-per-session property this section
+per-home stream-generation fence (re-scoped from #4246 #4) is now CLOSED and MERGED to `origin/dev`
+(PR #4492, `c37306113`, 2026-09-17 — see the #4324 status paragraph below); 4.2b's review RE-VERIFIED the once-per-session property this section
 already established before landing the reader (see the design-obligations bullet on #4 above and the
 4.2b status paragraph below for the re-verification citation), and #4324's own slice re-verified it a
 second time before making the fence live (`governance.d/ha-ws4-4324-stream-fence-reverification.md`).
@@ -589,6 +589,16 @@ status paragraph below), the durable cross-replica session lookup (#4246 #3, re-
 also what makes the reader behaviorally live, since only then can a directory row outlive the writing
 replica's own in-memory registry), and 4.4 (`gateway_node` convergence reconcile, replay-response
 writeback). The #4324 per-home stream-generation fence itself is now CLOSED — see below.
+
+**4.3a update (2026-09-18): the intra-cluster half of 4.3 is DONE** — per-agent `pg`-group agent→node
+lookup within one Erlang gateway cluster (`yuzu_gw_registry.erl`'s `lookup/1`/`lookup_remote/1`), the
+`fanout_terminal` cross-node-routing fix (`yuzu_gw_agent.erl`), and `remote_dispatched` telemetry
+(`yuzu_gw_router.erl`) — component-complete-and-INERT pending `#4555` (gateway multi-node cluster
+formation, entirely unimplemented in production). The pre-CONNECT-race ordering gap is **NOT**
+"deliberately left open" as this paragraph previously stated — it is RESOLVED as unreachable BY
+INVARIANT (see the #4324 status paragraph's PR-review-fix note below for the full resolution).
+Remaining WS-4 work is the REST of 4.3 (cross-cluster gateway fan-out — today one `gw_mgmt_stub_` —
+**and** `#4555` cluster formation itself, not fan-out logic alone) and 4.4.
 
 **Status (#4324, MERGED to `origin/dev` — PR #4492, `c37306113`, 2026-09-17T22:05:58Z): the per-home
 stream-generation fence is CLOSED end-to-end**, three tasks: task 1 (`46f1e72b6`) adds
