@@ -1190,6 +1190,31 @@ completes and is not a valid proxy for it. The diagnostic script's completeness 
 own log line from that count, since a no-op returns the same `rules_size()` figure
 without a single real arm occurring.
 
+**Rung 9c PR-6 item 1 — a positive-establishment channel now exists (Service-scoped),
+2026-09-18.** R5.7 above still needs its own T2 arm-confirmation timestamp from the
+runtime, but the raw fact it would need to read from is no longer entirely missing at
+the mechanism layer: `SparkEngine::subscription_establishment(id)` is a pull query
+returning `armed_at` / an optional `established_at` (first Notification-coverage report
+for the subscription's CURRENT incarnation, never re-stamped by a later recovery) /
+the mechanism's current tri-state `SparkCoverage` (`None`/`Notification`/`Poll`). Wired
+for the **Service** mechanism only, on both platforms (Linux sd-bus, Windows SCM) — a
+Service watch's `watch()` call returning success carries zero information about
+establishment (its `NotifyServiceStatusChangeW`/`PropertiesChanged` registration is
+what this channel actually observes), so it was the mechanism with the most acute gap.
+**Registry and File are explicitly out of scope here and tracked separately as #4340**
+— both have a weaker but non-zero implicit signal via `arm()`'s own success/failure
+(Registry can still return success while an establishment probe is outstanding past the
+caller-wait budget; File can accept a definite failure into observable retry state
+rather than rejecting it), which is why they were not folded into this same PR.
+**Latency caveat, carried forward for R5.7's own future use of this channel:**
+`established_at` is stamped by the MECHANISM at the point it commits successful
+notification coverage, not at the moment `report_established` is dispatched to a
+consumer, and Windows's own dispatch is bounded by `kServicePollCadence` (a 50ms wait
+CAP the mechanism's alertable wait clamps to whenever any probe is outstanding — not a
+fixed delay; commands/APCs can wake the thread earlier). Do not compare Service's
+poll-mediated establishment timestamp against a future Registry/File wiring's
+caller-wait-bounded path as if they measured the same thing.
+
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 
 7.7b was first planned as one PR folding the #2237 send-path items and #2238 test

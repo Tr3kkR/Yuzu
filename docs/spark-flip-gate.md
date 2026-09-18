@@ -336,7 +336,7 @@ corrected #2012 row in §5's register for the full per-mechanism status, includi
 correction that Service never actually had the hazard this row originally described, and the
 re-verification (ruling 16, 2026-09-12) that unblocked this track's own PR-2.
 
-**Ladder status, updated 2026-09-14** (this track's OWN PR-0 through PR-6, not to be
+**Ladder status, updated 2026-09-18** (this track's OWN PR-0 through PR-6, not to be
 confused with the 7.7b-split's own "PR-2 (thin cutover)" a few sections up in this same
 doc - two different PRs share the name; see "Why it doesn't gate on #2233" above):
 **PR-0 (done, #4130)
@@ -369,17 +369,30 @@ during the #2233 item 3 governance sweep, re-surfaced while investigating this P
 `rollback_spark_wiring_locked()` resets `spark_runtime_` without waiting for
 `active_backend_op_workers()==0`) - this doc's own §3 row 3 already rules it
 non-flip-gating; cited in the R5.5 stamp, not re-investigated or fixed here) →
-PR-5 (fault/K-bound logic, a 5-PR sub-ladder 5a-5e, 5a-5d merged and 5e
-implemented/not yet merged - 5a #4359 (up-101/cs-103), 5b #4381
+PR-5 (fault/K-bound logic, a 5-PR sub-ladder 5a-5e, **ALL FIVE MERGED** - 5a
+#4359 (up-101/cs-103), 5b #4381
 (up-3/up-4/ch-1/up-5, see status paragraph below), 5c #4417 (up-2, see status
 paragraph below), 5d #4485 (late-result adoption by current desired state,
 R5.3's arm-recovery telemetry mechanism - see
 `docs/spark-stage2-guardian-consumer-design.md`'s "as implemented (rung 9c
-PR-5d)" stamp), 5e #4221 (K=3 wedge waiver / decision 1 closeout, plus #4279's
-disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp;
-implemented, not yet merged as of this writing) - see acceptance criteria
-below) → PR-6 (Service readiness signal + a re-run of the #3990
-diagnostic's methodology against the full landed ladder, not started).** PR-2 settled
+PR-5d)" stamp), 5e **#4529, merged 2026-09-18T13:18:55Z (`869ea6a29d14`)**
+(K=3 wedge waiver / decision 1 closeout, plus #4279's
+disposition below - see that doc's "as implemented (rung 9c PR-5e)" stamp) -
+see acceptance criteria below) → **PR-6 item 1 (Service positive-establishment
+signal) - IMPLEMENTED, not yet merged** (branch
+`feat/spark-9c-pr6-item1-establishment-signal`, off `origin/dev @ 7ff742f19`):
+`SparkIncarnation`/`SparkCoverage`/`SubscriptionEstablishment` (`spark.hpp`),
+the additive `ISparkMechanism::watch_incarnation()`/`set_established_sink()`
+seam, both Service mechanisms (Linux sd-bus, Windows SCM) wired to report
+tri-state coverage at every real transition, and
+`SparkEngine::subscription_establishment(id)` as the pull query. Full E1-E15
++ M1-M6 test matrix (E2/E4/E13/E14/E15/M1/M6 mutation-verified); Windows half
+written but NOT compiled in the implementing sandbox (no Windows toolchain
+there) - DGRHP verification is a separate, tracked step before merge. **Item
+2 (a re-run of the #3990 diagnostic's methodology against the full landed
+ladder, using this channel's real per-key timestamp) is a SEPARATE,
+not-yet-started piece of work, depends on item 1 landing first** - do not
+read "PR-6 item 1 implemented" as "PR-6 done".** PR-2 settled
 §R5.3's previously-open "resolved" definition: resolved = backend `arm()` success AND
 Guardian's own generation-commit, not OS-watch establishment -
 `docs/spark-stage2-guardian-consumer-design.md` §R5.2-R5.4 updated to describe the
