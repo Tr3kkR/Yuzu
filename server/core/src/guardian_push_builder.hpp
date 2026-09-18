@@ -128,9 +128,10 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
 // persistently-poisoned rule can no longer mask, or reset, a DIFFERENT
 // poisoned rule's own log cadence - the #4497 "cross-rule masking" defect.
 //
-// THE RECORDED DESIGN DECISION (#4497 acceptance criterion 1 - an external
-// architecture consultation was run on this question; this is the outcome,
-// not one option among several):
+// THE RECORDED DESIGN DECISION (#4497 acceptance criterion 1 - this decision
+// followed an external architecture consultation; this comment is the
+// complete record of that outcome, not one option among several, and no
+// separate transcript or linked artifact exists beyond it):
 //
 //   - A rule_id absent from the cache logs immediately, then enters the
 //     cache.
