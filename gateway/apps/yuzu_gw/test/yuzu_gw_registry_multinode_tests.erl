@@ -205,101 +205,100 @@ remote_agent_loop() ->
 %%
 %% GOVERNANCE FINDING, ROUND 2 (external PR review): the first fix here
 %% (replacing a blocking `os:cmd("epmd -daemon")` with a non-blocking
-%% `open_port/2` spawn) did NOT fully resolve the Windows CI hang — a
-%% second Windows CI run, after that fix, still hung for the FULL 600s
-%% meson-level suite timeout with zero test progress printed (vs. the
-%% FIRST failure's clean 70s-fixture-timeout with partial progress
-%% visible). Something in this bootstrap sequence still blocks
-%% indefinitely on Windows, and it could not be reproduced or diagnosed
-%% locally (no Windows box in this environment; every local rebar3/
-%% dialyzer/eunit run and a standalone escript reproducing the exact
-%% cold-start sequence passed clean on Linux both before and after the
-%% first fix).
+%% `open_port/2` spawn of `epmd.exe -daemon` directly) did NOT resolve the
+%% Windows CI hang, and a follow-up `spawn_monitor`+hard-timeout wrapper
+%% around the whole bootstrap (round 3) ALSO didn't — two more Windows CI
+%% rounds each hung for the FULL 600s meson-level suite timeout with zero
+%% test progress printed.
 %%
-%% Rather than guess again at which specific platform primitive is
-%% still wrong and spend another ~15-minute CI round-trip finding out,
-%% this bootstrap now runs inside a SEPARATELY MONITORED process under
-%% a hard wall-clock bound. If it does not complete within the bound —
-%% for ANY reason, on ANY current or future platform — `ensure_distributed/0`
-%% raises a normal `error/1` (a fast, clearly-diagnosed FAILURE of just
-%% this module's 4 tests, reported in seconds) instead of the calling
-%% test hanging until an OUTER timeout (a per-fixture timeout, or worse,
-%% the full suite-level meson timeout) cancels the whole eunit run and
-%% takes every OTHER gateway test down with it. `node()` becoming
-%% distributed is a VM-GLOBAL effect, not a property of the calling
-%% process, so doing the actual `net_kernel:start/2` inside a throwaway
-%% worker process is safe — the effect persists after that worker exits.
+%% GOVERNANCE FINDING, ROUND 3 (Fable/enterprise-architect adjudication,
+%% source-verified against OTP's win32 emulator + epmd + erlexec sources):
+%% the hang is NOT inside `net_kernel:start/2` or this bootstrap at all —
+%% eunit's own `{timeout, 30, ...}` wrapper on every test in this module
+%% already bounds an in-test hang (round 1's failure, a clean ~70s partial
+%% run with a `timed out` stack trace pointing at the old `os:cmd` call,
+%% proves that bound fires correctly). Rounds 2-3's 600s hang is OUTSIDE
+%% any test body, which rules out the bootstrap/`peer`/`erpc` calls as the
+%% cause. The actual mechanism: `open_port({spawn_executable, Epmd}, ...)`
+%% makes `epmd.exe` a PORT CHILD of this BEAM. On Windows, epmd's own
+%% `-daemon` handling either re-spawns itself detached (duplicating the
+%% port's pipe handles into a parentless grandchild) or runs in-process
+%% forever — either way a long-lived external process is now tied to this
+%% VM's port table. The round-3 fix's `exit(Pid, kill)` on its bounding
+%% worker (or eunit's own kill on a cancelled test) can then hit the win32
+%% spawn driver's `stop()` path, which does `TerminateProcess` followed by
+%% an INFINITE `WaitForSingleObject` on a pipe-reader thread — uninterruptible
+%% if the pipe's far end is held by anything other than the direct port
+%% child. A hard timeout around this bootstrap doesn't help: it bounds our
+%% own OBSERVATION of the call, not the underlying stuck OS resource, and
+%% the kill it issues is plausibly what triggers the wedge in the first
+%% place. Fixed by not opening a port to epmd at all — see
+%% `ensure_epmd_running/0` below, which uses the same mechanism OTP's own
+%% `erlexec` and rebar3's `rebar_dist_utils:start_epmd/0` use on every
+%% platform: a short-lived `erl` child process (no inherited pipe handles),
+%% waited on to completion rather than fired-and-forgotten via a port.
 ensure_distributed() ->
     case node() of
         nonode@nohost ->
-            %% 10s, not the full per-test 30s budget (`{timeout, 30, ...}`
-            %% on every test in this module) — leaves headroom for the
-            %% REST of a test (peer connection, lookup propagation waits)
-            %% to still run and fail cleanly within that 30s budget rather
-            %% than racing this bound against the outer eunit timeout.
-            case bounded_bootstrap_distribution(10000) of
-                ok -> ok;
+            ensure_epmd_running(),
+            %% `erlang:unique_integer/1` alone is unique per-VM, not across
+            %% VMs — on a shared CI box running multiple runner agents as
+            %% one OS identity (#1871), two concurrent `rebar3 eunit`
+            %% invocations could mint the same node name. Salt with
+            %% `os:getpid/0` too, matching `peer:random_name/1`'s pattern.
+            Name = list_to_atom("yuzu_gw_multinode_test_" ++ os:getpid() ++ "_" ++
+                                integer_to_list(erlang:unique_integer([positive]))),
+            case await_net_kernel_start(Name, 100) of
+                {ok, _} -> ok;
                 {error, Reason} -> error({distribution_bootstrap_failed, Reason})
             end;
         _ ->
             ok
     end.
 
-bounded_bootstrap_distribution(TimeoutMs) ->
-    Parent = self(),
-    {Pid, Ref} = spawn_monitor(fun() ->
-        ensure_epmd_running(),
-        %% `erlang:unique_integer/1` alone is unique per-VM, not across
-        %% VMs — on a shared CI box running multiple runner agents as one
-        %% OS identity (#1871), two concurrent `rebar3 eunit` invocations
-        %% could mint the same node name. Salt with `os:getpid/0` too,
-        %% matching `peer:random_name/1`'s own pattern below.
-        Name = list_to_atom("yuzu_gw_multinode_test_" ++ os:getpid() ++ "_" ++
-                            integer_to_list(erlang:unique_integer([positive]))),
-        Result = await_net_kernel_start(Name, 100),
-        Parent ! {self(), Result}
-    end),
-    receive
-        {Pid, {ok, _}} ->
-            demonitor(Ref, [flush]),
-            ok;
-        {Pid, {error, _} = Err} ->
-            demonitor(Ref, [flush]),
-            Err;
-        {'DOWN', Ref, process, Pid, DownReason} ->
-            {error, {bootstrap_process_died, DownReason}}
-    after TimeoutMs ->
-        exit(Pid, kill),
-        demonitor(Ref, [flush]),
-        {error, timeout}
-    end.
-
-%% `os:cmd("epmd -daemon")` (the FIRST fix's predecessor) HANGS Windows
-%% CI: `os:cmd/1` waits for the spawned process's output stream to
-%% close before returning — on POSIX, `epmd -daemon` detaches (closes
-%% inherited handles) once it's up, so the pipe closes and `os:cmd`
-%% returns promptly; `epmd.exe -daemon` on Windows does not detach the
-%% same way, so the pipe never closes and `os:cmd` blocks forever.
-%% `open_port/2` is fire-and-forget on every platform — nothing here
-%% reads from or waits on the port. `nouse_stdio` avoids setting up a
-%% pipe at all. Whatever is STILL blocking on Windows after this change
-%% (see the governance-finding-round-2 comment above `ensure_distributed/0`)
-%% is now bounded by that function's timeout regardless.
-%%
-%% NOTE: `net_kernel:start/2` does NOT start epmd itself if it isn't
-%% already running — `erl_epmd` is a pure TCP CLIENT to an already-running
-%% epmd (verified empirically: without a live epmd, `net_kernel:start/2`
-%% fails immediately with `{error, {shutdown, ... nodistribution}}`, not a
-%% delayed retry) — so this step cannot simply be deleted.
+%% Start epmd the way OTP's own `erlexec` does on Windows
+%% (`start_epmd_daemon`, `erts/etc/common/erlexec.c`) and the way rebar3
+%% itself bootstraps distribution (`rebar_dist_utils:start_epmd/0`): spawn
+%% a short-lived, throwaway named `erl` node and let ITS OWN normal startup
+%% sequence start epmd via `CreateProcess`/`fork`+`exec` with non-inherited
+%% handles — no port, no pipe, nothing tied to THIS BEAM's port table for
+%% epmd to outlive. We don't care whether the child's own distribution
+%% boot fully succeeds (epmd may not have finished binding yet on the
+%% child's first attempt) — only that epmd ends up running, which
+%% `await_net_kernel_start/2` below then polls for from this VM.
 ensure_epmd_running() ->
-    case os:find_executable("epmd") of
+    case find_erl_executable() of
         false ->
-            %% Not on PATH — let net_kernel:start fail loudly with its own
+            %% Not found — let net_kernel:start fail loudly with its own
             %% clear error rather than silently no-op here.
             ok;
-        Epmd ->
-            open_port({spawn_executable, Epmd}, [{args, ["-daemon"]}, nouse_stdio]),
-            ok
+        Erl ->
+            Name = "yuzu_gw_epmd_boot_" ++ os:getpid(),
+            Port = open_port({spawn_executable, Erl},
+                              [{args, ["-sname", Name, "-noinput", "-eval", "halt(0)."]},
+                               exit_status, hide, stderr_to_stdout]),
+            receive
+                {Port, {exit_status, _}} -> ok
+            after 15000 ->
+                %% The child failing to exit promptly doesn't block this
+                %% test forever — proceed and let the caller's own
+                %% net_kernel retry loop report the real failure.
+                catch port_close(Port),
+                ok
+            end
+    end.
+
+%% Prefer this node's OWN `erl` launcher (same OTP install, same
+%% platform-correct erlexec) over a bare PATH lookup.
+find_erl_executable() ->
+    Candidate = filename:join([code:root_dir(), "bin", "erl"]),
+    case filelib:is_regular(Candidate) of
+        true -> Candidate;
+        false ->
+            case filelib:is_regular(Candidate ++ ".exe") of
+                true -> Candidate ++ ".exe";
+                false -> os:find_executable("erl")
+            end
     end.
 
 %% epmd needs a moment to actually bind its port after `ensure_epmd_running/0`
