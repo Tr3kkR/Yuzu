@@ -17,6 +17,8 @@
 #include <limits>
 
 #if defined(__APPLE__)
+#include <yuzu/agent/scoped_ioobject.hpp>
+
 #include <IOKit/IOKitLib.h>
 #include <IOKit/storage/IOBlockStorageDriver.h>
 #include <sys/sysctl.h>
@@ -226,17 +228,19 @@ TEST_CASE("read_vm_snapshot's total matches an independent hw.memsize read",
 TEST_CASE("read_disk_totals reads real IOBlockStorageDriver counters", "[dex][macos][perf][darwin]") {
     // Verify driver presence INDEPENDENTLY of read_disk_totals() itself, so SKIP() means
     // "genuinely nothing to read on this runner" rather than silently masking a real
-    // read_disk_totals defect behind the same call this test is meant to pin.
+    // read_disk_totals defect behind the same call this test is meant to pin. RAII-owned
+    // via ScopedIOObject (never a manual IOObjectRelease in new code — the same idiom
+    // production code uses, agents/plugins/disk_actions/src/disk_actions_macos.cpp).
     io_iterator_t raw_it{};
     REQUIRE(IOServiceGetMatchingServices(kIOMainPortDefault,
                                          IOServiceMatching(kIOBlockStorageDriverClass),
                                          &raw_it) == KERN_SUCCESS);
+    yuzu::agent::ScopedIOObject it{raw_it};
     int driver_count = 0;
-    for (io_object_t raw_obj; (raw_obj = IOIteratorNext(raw_it));) {
-        IOObjectRelease(raw_obj);
+    for (io_object_t raw_obj; (raw_obj = IOIteratorNext(it.get()));) {
+        yuzu::agent::ScopedIOObject obj{raw_obj};
         ++driver_count;
     }
-    IOObjectRelease(raw_it);
     if (driver_count == 0) {
         SKIP("no IOBlockStorageDriver rows on this runner (VM/CI host)");
     }
