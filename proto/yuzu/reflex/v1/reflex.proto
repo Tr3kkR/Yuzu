@@ -144,6 +144,20 @@ message ReflexSetPush {
   repeated ReflexSet sets = 1;
   bool full_sync = 2;  // true = replace the agent's entire active Reflex Set collection
   uint64 generation = 3;
+
+  // Explicit per-set removal, meaningful ONLY when full_sync=false. A
+  // full_sync=true push never needs this: "not present in `sets`" already
+  // means "removed" because full_sync replaces the whole collection. A
+  // full_sync=false DELTA has the opposite omission convention — a set_id
+  // absent from `sets` is UNTOUCHED (left exactly as last applied), which
+  // gives a delta no way to say "remove this one" without this field.
+  // Consent-loss and undeploy are the two removal causes (see
+  // docs/reflex-design.md "Generation, undeploy, and push semantics"); a
+  // compile REFUSAL is never a removal cause and never appears here — a
+  // refused set is simply absent from both `sets` and `removed_set_ids`, so
+  // it is held untouched even in the same delta that removes an unrelated
+  // set_id. Ignored (must be empty) when full_sync=true.
+  repeated string removed_set_ids = 4;
 }
 
 // Per-reflex runtime state, nested in ReflexSetStatus.
