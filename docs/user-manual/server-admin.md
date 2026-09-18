@@ -2054,6 +2054,16 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 ---
 
+### vNEXT — `certificates` `delete` on Windows fails closed instead of silently switching stores (#4377) (breaking)
+
+**What changed.** The `security.certificates.delete` action on Windows opened the named store under the `LOCAL_MACHINE` hive; if that open failed, it silently retried under `CURRENT_USER` and deleted there if a same-named store existed and matched. `delete` now opens `LOCAL_MACHINE` only — a failure to open there reports `error|<store> store could not be opened; nothing removed` (non-zero exit, `status|not_found` never returned in this case) and removes nothing, rather than falling back. `list`/`details` are unaffected in kind — they keep the `CURRENT_USER` read fallback, and now disclose it more completely (an explicit output row and a `CONSTRAINED`/`PARTIAL` result whenever a store fell back, an earlier store couldn't be opened, or its enumeration was incomplete, not only when the final match itself came from the fallback).
+
+**Who this affects.** Any deployment where a `delete` automation's target `LOCAL_MACHINE` store can become unopenable (a permissions misconfiguration, a corrupted store) **and** a same-named `CURRENT_USER` store exists on the same host. Before this fix, that combination made `delete` silently remove a certificate from a store the caller never named — which is the bug this closes, not a regression. Automation that only checked for a non-zero exit code was already correctly informed on every OTHER failure path; this is the one combination where the old behavior masked a wrong-target delete with an apparent success.
+
+**Before upgrading, check whether this affects you.** If your `delete` automation for Windows hosts does not already treat a non-zero exit / an `error|...` result as a hard failure requiring investigation, add that check now. There is no way to pre-check for the specific `LOCAL_MACHINE`-unopenable-with-a-`CURRENT_USER`-fallback condition from outside the action itself; the fix is unconditional and has no opt-out.
+
+---
+
 ## Settings Page
 
 The Settings page is the primary administrative interface. It is accessible only to users with the **admin** role and is rendered server-side using HTMX.
