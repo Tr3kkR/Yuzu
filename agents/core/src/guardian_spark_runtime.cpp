@@ -3312,7 +3312,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                 accepted = outbox_.enqueue_all(std::move(entries)); // both-or-neither
             }
             if (!accepted)
-                continue; // outbox full: eval stays pending (nothing committed), convergence retries
+                continue; // outbox full: RuleEvalState scratch stays uncommitted (nothing
+                          // written to rg->eval/last_unhealthy_emit), so eval retries the
+                          // identical read next pass. The M1 demotion bookkeeping above
+                          // already ran on this same read, unaffected by the rejection (#2992).
             if (had_entries)
                 enqueued_any = true;
 

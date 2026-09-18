@@ -1451,16 +1451,18 @@ TEST_CASE("M1 demotion: a mixed demoted/non-demoted pending set on one key keeps
 
 // --- #2992: M1 backstops can be permanently starved for the rules they protect ---
 //
-// Both M1 mitigations (errored-refresh 6b, priority-lane demotion 6c) make their
-// commit decisions inside evaluate_key's commit section, gated behind the pre-existing
-// `!accepted -> continue` (outbox full) and, for 6c, behind `reason ==
-// EvalReason::Convergence`. These four cases pin two distinct ways that leaves 6c
-// unreachable for exactly the rules it exists to protect: (1) a rule whose every pass
-// is rejected at the outbox cap never reaches the demotion block at all (it sits above
-// the `continue`), so it retries the identical read at priority-lane cadence forever;
-// (2) the elapsed-time arm is evaluated only inside the Convergence-reason branch, so a
-// key driven by Event-reason evals alone never demotes no matter how much time passes.
-// Each case asserts the STUCK state first (true both before and after the fix, proving
+// Before the fix below, both M1 mitigations (errored-refresh 6b, priority-lane
+// demotion 6c) made their commit decisions inside evaluate_key's commit section,
+// gated behind the pre-existing `!accepted -> continue` (outbox full) and, for 6c,
+// behind `reason == EvalReason::Convergence`. These four cases pin two distinct ways
+// that previously left 6c unreachable for exactly the rules it exists to protect:
+// (1) a rule whose every pass was rejected at the outbox cap never reached the
+// demotion block at all (it sat above the `continue`), so it retried the identical
+// read at priority-lane cadence forever; (2) the elapsed-time arm was evaluated only
+// inside the Convergence-reason branch, so a key driven by Event-reason evals alone
+// never demoted no matter how much time passed. At HEAD, demotion runs on the read
+// outcome ahead of the enqueue accept/reject decision (#2992's fix), so both are
+// reachable. Each case asserts the STUCK state first (true both before and after the fix, proving
 // the scenario is real and that nothing was lost) and the PROGRESS state second (red on
 // origin/dev, green after the fix hoists the demotion bookkeeping above the accept
 // check and decouples time_due from the Convergence-reason gate).
