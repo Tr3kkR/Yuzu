@@ -55,6 +55,7 @@ tus=(
     agents/plugins/disk_actions/src/disk_actions_win.cpp
     agents/plugins/power_health/src/power_health_plugin.cpp
     agents/plugins/autoruns/src/autoruns_win.cpp
+    agents/plugins/peripherals/src/peripherals_win.cpp
     agents/plugins/tar/src/tar_removable_collector.cpp
     agents/plugins/execution_artifacts/src/execution_artifacts_win.cpp
     agents/core/src/dism_bounded_call.cpp
