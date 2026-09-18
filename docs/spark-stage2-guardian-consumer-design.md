@@ -796,6 +796,33 @@ explicit narrowing below.
   including the `is_sha256_hex()` sentinel guard) and carries the saturated
   count forward only on an exact match; any distinct identity, or no prior
   application at all, resets to 0.
+- **A specific rule's own wedge can therefore be waived on its very first
+  observation, if the sequence counter was already primed by an unrelated,
+  now-cleared failure (governance Gate 4, unhappy-path finding, confirmed
+  against decision 1's own framing - not a defect).** Because the counter
+  tracks identical-PUSH-CONTENT re-observations rather than any one rule's
+  own persistence, a sibling rule's ordinary `CongestionExpired`/
+  `AdmissionRejected`/genuine-refusal failure on reapplies 1-2 - which holds
+  the generation unconditionally while it lasts, per "K is not a
+  generation-wide liveness bound" above - still counts toward
+  `reapply_count` once it clears, even though that specific failure was
+  never Wedged and never entered `failed_receipts`. If a DIFFERENT rule then
+  wedges for the first time on reapply 3, with the sibling now resolved,
+  `resolved_failed == failed_receipts.size()` holds for that one rule and
+  `reapply_count` is already at K - waiving a wedge this ledger has only
+  ever observed once. This is the direct, reviewed consequence of decision
+  1 rejecting a finer-grained per-rule/per-episode retry-credit ledger as
+  more invasive than the `Application` struct supports (see "Does not add
+  per-rule/per-episode retry-credit accounting" in this PR's delivery plan)
+  - `reapply_count` measures "how many times has the operator re-sent this
+  exact content," not "how many times has this specific wedge itself been
+  independently reconfirmed." The single safety invariant K-waiver must
+  never violate - a waived receipt is, AT THE MOMENT OF WAIVER, still
+  genuinely Wedged and still its key's FIFO-front claim - holds regardless
+  of how `reapply_count` reached its threshold; what this consequence
+  affects is only how MANY of the operator's own retries a freshly-wedged
+  rule is guaranteed before that can happen, not whether the waiver itself
+  is sound.
 - **The K-eligibility gap the original design language did not anticipate.**
   A naive predicate ("every remaining `resolved_failed` entry is present in
   `failed_receipts`") is necessary but NOT sufficient: `ClaimEnd::

@@ -1272,12 +1272,18 @@ public:
     /// incarnation, not a newer or older one that happens to share the rule_id.
     /// `end`/`receipt_status()` never change on adoption (the sticky-Wedged
     /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
-    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal a ledger's
-    /// own maintenance drain uses to notice a late-success recovery on a claim it
-    /// is still holding as a retained failure - see GuardianArmAckLedger::
-    /// drain_locked(). False for a default-constructed / empty receipt (nothing
-    /// to recover) and false for any receipt whose claim was never adopted.
-    /// registry_mu_ taken internally.
+    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal for
+    /// noticing a late-success recovery on a claim still held as a retained
+    /// failure. rung 9c PR-5e (#4221, K-bound closeout - governance Gate 4/
+    /// consistency-auditor finding): `GuardianArmAckLedger::drain_locked()`'s
+    /// recovery-scan loop, this accessor's own original motivating caller, now
+    /// calls the atomic `receipt_recovery_status()` below instead (this standalone
+    /// accessor's own two-call combination with `receipt_wedge_k_eligible()` has a
+    /// TOCTOU `receipt_recovery_status()`'s own doc comment explains) - this
+    /// accessor stays live standalone API, currently with no production caller.
+    /// False for a default-constructed / empty receipt (nothing to recover) and
+    /// false for any receipt whose claim was never adopted. registry_mu_ taken
+    /// internally.
     [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
 
     /// rung 9c PR-5e (#4221, K-bound closeout): true iff `receipt`'s own claim is a

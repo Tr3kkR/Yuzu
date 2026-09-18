@@ -716,8 +716,9 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): concern 2 (rung 9c PR-5d) - a W
                                    std::chrono::seconds(10)));
     CHECK(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // sticky
 
-    // Second drain: the recovery scan notices the adoption via receipt_recovered()
-    // and clears this rule's own resolved_failed contribution - failed_out (the
+    // Second drain: the recovery scan notices the adoption via
+    // receipt_recovery_status() and clears this rule's own resolved_failed
+    // contribution - failed_out (the
     // cumulative fleet-visible counter) does NOT move, since this is a recovery,
     // not a new failure.
     std::size_t failed_out2 = 0;
@@ -1040,6 +1041,94 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): a non-Wedged failure blocks K-wa
         REQUIRE(s.has_value());
         CHECK(s->failed == 2);
     }
+}
+
+TEST_CASE("GuardianArmAckLedger::can_advance(): reapply_count funded by an unrelated, "
+          "now-cleared sibling failure legitimately K-waives a wedge this ledger has "
+          "only ever observed once (governance Gate 4, unhappy-path finding - confirmed "
+          "against decision 1's own framing as deliberate, not a defect; see "
+          "docs/spark-stage2-guardian-consumer-design.md's R5.3 Mechanism section)",
+          "[spark][ack]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); }
+    } cleanup{b.get()};
+
+    const std::string digest(64, 'f');
+    GuardianArmAckLedger ledger;
+
+    // Application 1 (the original push, reapply_count starts at 0): r2 fails
+    // ordinarily (BackendRefused - never Wedged, never enters failed_receipts).
+    // r1 is not part of the push at all yet - standing in for "this rule was
+    // fine (or simply not yet in the policy) through the last 3 pushes," so it
+    // has not wedged, or even been observed, even once.
+    ledger.begin_application(1, digest, false, 1);
+    CHECK(ledger.reapply_count_for_test() == 0);
+    b->fail_arm.store(true);
+    {
+        auto r2 = accept(*rt, "r2", "/b");
+        REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); },
+                                       std::chrono::seconds(10)));
+        ledger.add_pending("r2", r2);
+    }
+    CHECK(ledger.drain_locked(*rt, 10) == 1);
+    CHECK(ledger.failed_receipt_count_for_test() == 0); // r2 never Wedged
+    CHECK_FALSE(ledger.can_advance()); // r2's ordinary failure alone holds it
+
+    // Reapplies 1-3 (3 MORE identical begin_application() calls - matching the
+    // DELIVERY-PLAN's own recorded semantics: K requires four established
+    // applications in total, not three pushes including the original): r2 keeps
+    // failing ordinarily every time, funding reapply_count purely off its own
+    // now-repeated (but never Wedged) refusal.
+    for (int i = 1; i <= 3; ++i) {
+        ledger.begin_application(1, digest, false, 1);
+        CHECK(ledger.reapply_count_for_test() == static_cast<std::size_t>(i));
+        auto re_r2 = accept(*rt, "r2", "/b");
+        REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(re_r2); },
+                                       std::chrono::seconds(10)));
+        ledger.add_pending("r2", re_r2);
+        CHECK(ledger.drain_locked(*rt, 10) == 1);
+        CHECK(ledger.failed_receipt_count_for_test() == 0); // r2 never Wedged
+        CHECK_FALSE(ledger.can_advance()); // r2's ordinary failure alone holds it
+    }
+    REQUIRE(ledger.reapply_count_for_test() == 3); // funded purely by r2's own reapplies
+
+    // Reapply 3 (the funded application): r2's own failure finally clears, and
+    // r1 - a DIFFERENT rule, wedging for the very first time this ledger has
+    // ever observed it - hangs past its deadline.
+    ledger.begin_application(1, digest, false, 2);
+    b->fail_arm.store(false);
+    b->hang_next_arm.store(true);
+    auto r1 = accept(*rt, "r1", "/a");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    auto r2 = accept(*rt, "r2", "/b");
+    REQUIRE(yuzu::test::spin_until([&] { return rt->is_terminal(r2); }, std::chrono::seconds(10)));
+    CHECK(rt->receipt_status(r2) == GuardianSparkRuntime::ReceiptStatus::Committed);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1); // only r1 - r2 already resolved
+    REQUIRE(rt->receipt_status(r1) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_wedge_k_eligible(r1));
+
+    ledger.add_pending("r1", r1);
+    ledger.add_pending("r2", r2);
+    CHECK(ledger.drain_locked(*rt, 10) == 2);
+    CHECK(ledger.failed_receipt_count_for_test() == 1); // only r1's first-ever Wedged observation
+
+    // The consequence this test pins: r1's wedge is waived despite being observed
+    // as Wedged only this once, because reapply_count already reached K purely
+    // from r2's earlier, unrelated, now-cleared ordinary failures - matching the
+    // design doc's "a specific rule's own wedge can therefore be waived on its
+    // very first observation" paragraph. This is decision 1's own reviewed
+    // tradeoff (a per-content-sequence counter, not a per-rule/per-episode
+    // credit ledger) - not a TOCTOU, not a stale classification, and it does not
+    // violate the one invariant K-waiver must never violate: r1 IS, at this exact
+    // moment, still genuinely Wedged and still its key's FIFO-front claim.
+    CHECK(ledger.can_advance());
 }
 
 TEST_CASE("GuardianArmAckLedger::begin_application(): reapply_count resets to 0 on "

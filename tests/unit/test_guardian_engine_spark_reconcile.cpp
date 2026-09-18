@@ -3508,6 +3508,11 @@ TEST_CASE("rung 9c PR-5e (#4221): K-bound waives a persistently Wedged-only rule
         dr = yuzu::agent::guardian_dispatch_push_bytes_for_test(*f.engine, push_bytes);
         REQUIRE(dr.exit_code == 0);
         f.engine->journal_maintenance_tick();
+        // governance Gate 4/happy-path finding: assert the intermediate ticks too,
+        // not just before/after the loop - proves the waiver genuinely fires at
+        // exactly the 3rd retry, not one (or more) retries early.
+        if (i < 2)
+            CHECK(f.engine->policy_generation() == 0);
     }
 
     // The 3rd retry installed reapply_count == 3 == K, and the single remaining

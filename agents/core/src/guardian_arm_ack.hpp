@@ -349,8 +349,9 @@ private:
         /// locked() resolved to Wedged, retained (NOT the other failure statuses -
         /// nothing else can spontaneously become committed later) so a LATER
         /// drain_locked() call can notice via GuardianSparkRuntime::
-        /// receipt_recovered() that the runtime has since adopted it (rung 9c
-        /// PR-5d's own concern 1) and clear its contribution to resolved_failed -
+        /// receipt_recovery_status() (rung 9c PR-5e's atomic accessor - see below)
+        /// that the runtime has since adopted it (rung 9c PR-5d's own concern 1)
+        /// and clear its contribution to resolved_failed -
         /// scoped to THIS application's own bookkeeping only: begin_application()/
         /// retire() replace `current_` wholesale (see the file header), so a
         /// receipt whose application was superseded before recovering is simply
