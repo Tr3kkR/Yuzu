@@ -465,6 +465,18 @@ now-false basis).** The two causes are split:
   (Reaction 1 of 4 applied, agent restarts) leaves a durable record of *which* Reactions actually
   ran, so a later operator/automation pass has something to reconcile against, rather than a device
   silently wedged half-applied with no record of what happened.
+- **A half-applied chain (the `reflex.aborted{restart}` case above) is never resumed and never
+  compensated.** There is no re-entry point that picks a chain back up from Reaction 2 of 4, and no
+  agent-side rollback of Reaction 1's effect — "aborted, never resumed" (Runtime shape, below) means
+  exactly what it says: the chain that was interrupted is simply over. The chain **re-runs in full
+  only on a NEW qualifying Spark edge** (a fresh fire, subject to the Reflex's own cooldown/hourly-cap
+  budget like any other fire) — never as a resumption of the interrupted attempt. **This makes
+  idempotent-on-reapply an authoring requirement for every Reaction in a chain**, one the compiler's
+  safety chokepoint cannot enforce (it is a semantic property of the plugin action, not a syntactic
+  one visible in the YAML): a Reaction that is not safe to run twice must not be authored into a
+  chain a crash could leave half-applied and later re-fire whole. An operator's only visibility into
+  a half-applied chain is the `reflex.aborted{restart}` outcome row itself plus the per-Reaction
+  completion records above — there is no separate "partial chain" surface.
 - **Deleting the last (or only) Reflex Set for an agent still pushes an empty `full_sync=true`** —
   there is no such thing as "nothing to push, so nothing is sent"; an empty collection is a real,
   delivered state, so an agent that was offline during the delete does not keep a stale dangerous
@@ -563,10 +575,13 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
 - **Reflex outcomes get their own lane/quota inside the shared outbox** — a burst of Reflex
   `suppressed_sampled`/`fired` events (up to 32 reflexes × their own `max_per_hour` caps, across
   potentially several event types each) must not be able to fill the outbox and cause Guardian's own
-  drift/remediation evidence to back up or drop. The exact quota shape (a reserved slot count, a
-  priority tier, or a per-family drop-oldest policy) is an R6/R8 implementation decision; this
-  document's job is to require that *some* such guard exists, not to leave the shared outbox
-  first-come-first-served across two independent, differently-volumed event sources.
+  drift/remediation evidence to back up or drop. **The interim ordering rule, effective from R0:
+  under backpressure, Guardian drift and remediation events are enqueued ahead of Reflex events** —
+  Guardian is the compliance-enforcement plane and Reflex outcomes are a lower-priority evidentiary
+  stream sharing its wire, so a full outbox drops or defers Reflex events first, never the reverse.
+  The exact numeric reservation (a reserved slot count, a priority tier, or a per-family drop-oldest
+  policy) is an R6/R8 implementation decision; only the *ordering itself* is settled here, so no
+  implementation slice can pick a scheme that starves Guardian instead.
 - **Every Reaction's `capture_output` is capped at 4 KiB, but the outcome as a whole is capped to fit
   the ingest clamp.** `GuaranteedStateEvent.detail_json` (which carries the whole `ReflexOutcome` as
   JSON) is subject to the server's existing ~16 KiB ingest clamp; today an over-cap `detail_json` is
@@ -655,7 +670,16 @@ when `--reflex-disable`; sparse per-reflex counters omitted (not zeroed) when un
 
 Fleet Prometheus families (R13): gauges
 `yuzu_fleet_reflex_{reporting,disabled,sets_armed,unsupported}{os}`; counters
-`yuzu_fleet_reflex_{fired,completed,failed,timeouts,queue_dropped,events_missed}_total{os}`
+`yuzu_fleet_reflex_{fired,completed,failed,timeouts,queue_dropped,events_missed}_total{os}` plus
+`yuzu_fleet_reflex_aborted_total{os,reason}` — the `reason` label follows
+`docs/observability-conventions.md`'s standard bounded-label, pre-seeded-to-0 convention (the same
+shape as `yuzu_nvd_sync_failures_total{reason}` and the `InstructionStore`/`RuntimeConfigStore`
+degrade families), one series per named `reflex.aborted{<reason>}` cause used elsewhere in this
+document (`restart`, `undeploy`, `unresolvable_fact` today; the set is open the same way the causes
+themselves are, so a later slice adding a new abort cause adds its series here rather than leaving
+it uncounted) — this is what makes the "every fire produces exactly one terminal row, or the loss is
+signaled" guarantee below actually hold for a plain watchdog/timeout abort that follows no sequence
+gap, which previously had no fleet-level signal at all
 (server-held, last-seen-delta with reset detection — a genuinely new fleet-metric shape this
 document introduces, not a precedented one; R13 documents it in
 `docs/observability-conventions.md` alongside landing it, since neither of that doc's two existing
@@ -679,7 +703,7 @@ partially-disjoint vocabularies above are read together rather than cross-refere
 | `reflex.completed` | — (implicit: fired without failed/timed_out/aborted) | — | `yuzu_fleet_reflex_completed_total` |
 | `reflex.failed` | — | — | `yuzu_fleet_reflex_failed_total` |
 | `reflex.timed_out` | — | — | `yuzu_fleet_reflex_timeouts_total` |
-| `reflex.aborted` | — | — | — *(no dedicated fleet counter today; folded into `events_missed` if the abort followed a seq gap, otherwise uncounted at fleet level — an R13 gap, not silently claimed covered)* |
+| `reflex.aborted` | — | — | `yuzu_fleet_reflex_aborted_total` *(reason-labelled; every abort increments this regardless of cause; one that ALSO follows a SparkEvent seq gap additionally increments `events_missed` — the two are not mutually exclusive, they count different things)* |
 | `reflex.suppressed_sampled` | `suppressed_total` (agent-local, independent of sampling — see above) | — | `yuzu_fleet_reflex_events_missed_total` *(the sampled subset only; `suppressed_total` itself does not ride the fleet metric, only the per-device status)* |
 | *(SparkEvent seq gap, no fired event)* | — | — | `yuzu_fleet_reflex_events_missed_total` |
 | *(outbox drop)* | — | — | `yuzu_fleet_reflex_queue_dropped_total` |
@@ -688,7 +712,12 @@ partially-disjoint vocabularies above are read together rather than cross-refere
 per-event counters, and have no row above by design.
 
 SOC 2 rows (R13): CC6/CC8 two-person deploy control; CC7.2 change-detection evidence via the
-outcome journal.
+outcome journal — **conditional on "Outbox sharing and ingest limits" above: every fire produces
+exactly one terminal outcome row, or the loss is signaled** (the `yuzu_fleet_reflex_aborted_total`
+reservation just above is part of what makes the "signaled" half hold). If that precondition cannot
+be guaranteed in a given implementation, this CC7.2 claim must be narrowed or withdrawn in that
+slice's own PR text per the same rule stated there — it is not carried forward silently just because
+it is also written here.
 
 ## Pending routed-concern row (NOT added to `.claude/routed-concerns.md` — see reason below)
 
