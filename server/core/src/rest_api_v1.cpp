@@ -16,6 +16,7 @@
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
 #include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
 #include "event_bus.hpp"
@@ -1465,14 +1466,14 @@ const std::string& openapi_spec() {
       "post": {"summary": "Create a result set from an async dispatched TAR SQL query", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set (the ONLY per-device authorization on this dispatch surface). Dispatches sql to the tar plugin in parent_id's scope (or __all__ when parent_id is omitted); SQL is sandboxed agent-side by the read-only TarDatabase::execute_user_query authorizer (#760/#631), the server only length-checks (max 100 KiB). Membership is every agent that returned ≥ 1 row, or every responder when include_empty=true. Async — lands a pending row the maintenance thread materialises once the dispatched execution reaches a terminal state; poll GET /result-sets/{id} or subscribe to /api/v1/events on the execution.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["sql"], "properties": {"sql": {"type": "string", "maxLength": 100000}, "include_empty": {"type": "boolean", "default": false, "description": "Include responders with zero matching rows in membership"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing/empty sql, sql exceeds 100 KiB, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — the server's dispatch-visibility gate is not wired; fails closed, nothing dispatched"}, "503": {"description": "RESULT_SET_NO_AGENTS (no agents reached in scope), or dispatch unavailable/failed"}}}
     },
     "/result-sets/from-instruction-result": {
-      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
+      "post": {"summary": "Create a result set from an async dispatched InstructionDefinition", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute, confined per-device via the caller's derived visible set. Dispatches instruction_id in parent_id's scope (or __all__); membership is the responders whose output row satisfies the operator-supplied matcher (column/op/value). Async, same pending/materialise contract as from-tar-query.", "requestBody": {"required": true, "content": {"application/json": {"schema": {"type": "object", "required": ["instruction_id"], "properties": {"instruction_id": {"type": "string"}, "params": {"type": "object", "description": "InstructionDefinition parameters, string or JSON-stringified values"}, "matcher": {"type": "object", "description": "{column, op, value} — selects which responders join the set"}, "parent_id": {"type": "string"}, "name": {"type": "string"}}}}}}, "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Invalid JSON, missing instruction_id, instruction_id/params exceeds its bound (#4373), or parent_id supplied but names no parent set (RESULT_SET_BAD_PARENT)"}, "404": {"description": "Unknown instruction_id, or parent_id not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "Instruction store unavailable, RESULT_SET_NO_AGENTS, or dispatch unavailable/failed"}}}
     },
     "/result-sets/{id}": {
       "get": {"summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped (non-owner is indistinguishable from missing — existence-oracle-safe 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
       "delete": {"summary": "Delete a result set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403). A pinned set must be unpinned first.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "{deleted: true}"}, "403": {"description": "Result-set delete denied to a service-scoped token"}, "404": {"description": "Not found or not owned by the caller, OR the delete itself failed after ownership was confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found"}, "409": {"description": "RESULT_SET_PINNED — unpin the set first"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership (read stage only)"}}}
     },
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Original carries no re-runnable source (e.g. sql/instruction_id missing), or the source_kind is not yet supported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -8713,7 +8714,10 @@ void RestApiV1::register_routes(
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
-                      auto results = evaluate_inventory(eval_req, records);
+                      std::size_t excluded_by_poison = 0;
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
                       JArr arr;
                       for (const auto& r : results) {
                           arr.add(JObj()
@@ -8728,19 +8732,39 @@ void RestApiV1::register_routes(
                       // simply not have been read (same flag name as the
                       // typed-store route, result_truncated_by_cap). Same
                       // data/pagination/meta shape as list_json, plus the flag.
-                      if (inv_truncated) {
+                      //
+                      // #4496: a poisoned (over-nested) record excluded by
+                      // evaluate_inventory()'s #2437-class depth guard is the
+                      // same "the caller sees fewer matches than actually
+                      // exist" shape as a capped read - surfaced the same way,
+                      // as `results_excluded_by_poison` (count, present only
+                      // when non-zero, same convention as `result_truncated_by_cap`).
+                      //
+                      // #4496 follow-up: a record excluded because its
+                      // data_json failed to parse at all is the SAME shape,
+                      // a different cause - surfaced as its own
+                      // `results_excluded_by_parse_error` field, kept separate
+                      // from `results_excluded_by_poison` so a caller can
+                      // tell WHICH guard excluded a record.
+                      if (inv_truncated || excluded_by_poison > 0 || excluded_by_parse_error > 0) {
                           auto pag = JObj()
                                          .add("total", static_cast<int64_t>(results.size()))
                                          .add("start", int64_t{0})
                                          .add("page_size", int64_t{50})
                                          .str();
-                          res.set_content(JObj()
-                                              .raw("data", arr.str())
-                                              .add("result_truncated_by_cap", true)
-                                              .raw("pagination", pag)
-                                              .raw("meta", R"({"api_version":"v1"})")
-                                              .str(),
-                                          "application/json");
+                          JObj envelope;
+                          envelope.raw("data", arr.str());
+                          if (inv_truncated)
+                              envelope.add("result_truncated_by_cap", true);
+                          if (excluded_by_poison > 0)
+                              envelope.add("results_excluded_by_poison",
+                                           static_cast<int64_t>(excluded_by_poison));
+                          if (excluded_by_parse_error > 0)
+                              envelope.add("results_excluded_by_parse_error",
+                                           static_cast<int64_t>(excluded_by_parse_error));
+                          envelope.raw("pagination", pag);
+                          envelope.raw("meta", R"({"api_version":"v1"})");
+                          res.set_content(envelope.str(), "application/json");
                           return;
                       }
                       res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
@@ -9165,6 +9189,40 @@ void RestApiV1::register_routes(
                 rs_err(res, 400, "invalid JSON: body must be a JSON object");
                 return;
             }
+            // Gate 8 sibling-sweep finding: the two producer routes' identical
+            // body.value("name", "") shape threw uncaught on a type-mismatched
+            // field (#4406) - this generic create route has the same shape on
+            // BOTH name and source_kind and was never part of that sweep.
+            if (body.contains("name")) {
+                if (!body["name"].is_string()) {
+                    rs_err(res, 400, "name must be a JSON string");
+                    return;
+                }
+                // PR review finding: this header's own kResultSetNameMaxLen is
+                // MCP's enforced length cap for the same field - REST fixed the
+                // type-confusion crash but never applied the matching length
+                // bound, contradicting this PR's own "same caps as MCP" claim.
+                if (body["name"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetNameMaxLen) {
+                    rs_err(res, 400,
+                           std::format("name must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetNameMaxLen));
+                    return;
+                }
+            }
+            if (body.contains("source_kind")) {
+                if (!body["source_kind"].is_string()) {
+                    rs_err(res, 400, "source_kind must be a JSON string");
+                    return;
+                }
+                if (body["source_kind"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetSourceKindMaxLen) {
+                    rs_err(res, 400,
+                           std::format("source_kind must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetSourceKindMaxLen));
+                    return;
+                }
+            }
             CreateRequest cr;
             cr.owner_principal = session->username;
             cr.name = body.value("name", "");
@@ -9252,8 +9310,8 @@ void RestApiV1::register_routes(
                           bool ok = true;
                           if (audit_fn)
                               ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
-                                            "source_kind=inventory_query reason=" +
-                                                std::string(reason));
+                                            "reason=" + std::string(reason) +
+                                                " source_kind=inventory_query");
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
@@ -9349,9 +9407,20 @@ void RestApiV1::register_routes(
                                  "parent set; omit it entirely to search all devices");
                           return;
                       }
-                      if (body.contains("name") && !body["name"].is_string()) {
-                          rs_err(res, 400, "name must be a JSON string");
-                          return;
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       // Gate 4 unhappy-path fix: moved below the client-input
                       // validation above (combine/conditions/parent_id/name) - a
@@ -9407,7 +9476,13 @@ void RestApiV1::register_routes(
                           // silently changes who gets acted on (#2500/#2492
                           // dispatch-targeting invariant class). 503 rather
                           // than a partial set; raising the cap / keyset
-                          // pagination is the tracked follow-up.
+                          // pagination is the tracked follow-up (#2633).
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonQueryTruncated)}})
+                                  .increment();
                           audit_failure("query_truncated");
                           rs_err(res, 503,
                                  "inventory query truncated at the row or byte cap - refusing to "
@@ -9424,7 +9499,54 @@ void RestApiV1::register_routes(
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
-                      auto results = evaluate_inventory(eval_req, records);
+                      // #4496: fold poison-exclusion into the SAME M1
+                      // dispatch-targeting-invariant refusal as inv_truncated
+                      // just above, rather than a silent flag - this producer
+                      // MATERIALISES the matched set into a durable result set
+                      // other operators/dispatches consume later; a flag on
+                      // this 201 response would never reach them, so a
+                      // narrowed target set here gets the same hard-refuse
+                      // treatment as a capped read, not the softer
+                      // flag-on-response posture the two read-only routes
+                      // (POST /api/inventory/query, POST
+                      // /api/v1/inventory/evaluate) use instead.
+                      std::size_t excluded_by_poison = 0;
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
+                      if (excluded_by_poison > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonPoisonExcluded)}})
+                                  .increment();
+                          audit_failure("poison_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for nesting too deeply - refusing "
+                                 "to materialise a result set narrower than the true match set");
+                          return;
+                      }
+                      // #4496 follow-up: same M1 refusal as the poison check
+                      // above, for the sibling cause - a record whose
+                      // data_json failed to parse at all. Kept as a SEPARATE
+                      // check (not folded into the condition above) so the
+                      // metric reason, audit detail and error message all
+                      // name the actual cause rather than conflating the two.
+                      if (excluded_by_parse_error > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonParseErrorExcluded)}})
+                                  .increment();
+                          audit_failure("parse_error_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for failing to parse as JSON - "
+                                 "refusing to materialise a result set narrower than the true "
+                                 "match set");
+                          return;
+                      }
                       std::unordered_set<std::string> seen;
                       std::vector<std::string> members;
                       for (const auto& r : results) {
@@ -9494,7 +9616,13 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
-                      std::string sql = body.value("sql", "");
+                      // #4406 fix: .value() throws nlohmann::json::type_error on a
+                      // type-mismatched 'sql' (e.g. a number) rather than coercing -
+                      // guard with is_string() first, same as re-eval's identical
+                      // guard on this field and MCP's create_result_set_from_tar_query.
+                      std::string sql =
+                          (body.contains("sql") && body["sql"].is_string()) ? body.value("sql", "")
+                                                                             : "";
                       if (sql.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'sql' is required");
                           return;
@@ -9510,6 +9638,27 @@ void RestApiV1::register_routes(
                       if (body.contains("include_empty") && !body["include_empty"].is_boolean()) {
                           rs_err(res, 400, "include_empty must be a JSON boolean");
                           return;
+                      }
+                      // Adversarial-review finding: body.value("name", "") below threw
+                      // uncaught on a type-mismatched name (e.g. a number) - the same
+                      // #4406 mechanism this PR fixed for sql/instruction_id, on the
+                      // exact same routes, just missed for this sibling optional field.
+                      // Same guard shape as the from-inventory-query route's name check
+                      // above and this route's own include_empty check just above.
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       const bool include_empty = body.value("include_empty", false);
                       nlohmann::json matcher =
@@ -9551,10 +9700,6 @@ void RestApiV1::register_routes(
                       // confined and these were the last ones left.
                       if (!perm_fn(req, res, "Execution", "Execute"))
                           return;
-                      if (!instruction_store || !instruction_store->is_open()) {
-                          rs_err(res, 503, "instruction store not available");
-                          return;
-                      }
                       // #2437-class guard: raw-text depth check before parse, same
                       // as the identical guard on POST /api/v1/result-sets above.
                       if (mcp::json_exceeds_depth(req.body, mcp::kMcpMaxJsonDepth)) {
@@ -9566,9 +9711,112 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "invalid JSON: body must be a JSON object");
                           return;
                       }
-                      std::string instruction_id = body.value("instruction_id", "");
+                      // Gate 4 unhappy-path finding: the other three near-identical
+                      // instruction_id/sql extractions in this file (re-eval's two
+                      // branches, MCP's own reevaluate_result_set) all guard with
+                      // is_string() first - this one didn't, so a type-mismatched
+                      // instruction_id (e.g. a number or object) threw an uncaught
+                      // nlohmann::json::type_error -> an unguarded HTTP 500 instead of
+                      // a clean 400 (this is the #4406 defect class, distinct from the
+                      // #2437-class JSON-depth-guard convention used elsewhere in this
+                      // file - there is no server-wide exception handler, per line
+                      // ~11368's guardian-route comment).
+                      std::string instruction_id =
+                          (body.contains("instruction_id") && body["instruction_id"].is_string())
+                              ? body.value("instruction_id", "")
+                              : "";
                       if (instruction_id.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
+                          return;
+                      }
+                      // Adversarial-review finding: the same #4406-class gap as
+                      // instruction_id above, on the sibling optional 'name' field
+                      // this route also passes unguarded to run_async below.
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
+                      }
+                      // #4373-class fix: this route had no bound at all on instruction_id
+                      // or params (unlike the sql-bearing from-tar-query route directly
+                      // above, which caps sql at creation time) - an ordinary authenticated
+                      // caller with plain Execution:Execute could dispatch fleet-wide with
+                      // an oversized instruction_id or an over-keyed/oversized params object
+                      // in ONE step, no smuggle-via-create-then-reeval needed. Same caps
+                      // MCP's create_result_set_from_instruction_result already enforces at
+                      // creation time. Checked here, ahead of the instruction_store gate
+                      // moved below (Gate 3 architect finding: the gate was originally
+                      // above this validation, same fix as the from-inventory-query route's
+                      // own Gate 4 reordering), since a malformed/oversized field is a
+                      // permanent client error regardless of backend availability.
+                      if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
+                          rs_err(res, 400,
+                                 std::format(
+                                     "RESULT_SET_BAD_REQUEST: instruction_id must be at most {} "
+                                     "bytes",
+                                     yuzu::server::mcp::kInstructionIdMaxLen));
+                          return;
+                      }
+                      // Gate 4 unhappy-path finding: a present-but-non-object `params`
+                      // (string/array/number) skipped every check below AND the
+                      // params-map-build loop further down, so it silently dispatched
+                      // with an EMPTY params map while persisting the oversized/wrong-
+                      // shaped value verbatim into source_payload, unbounded and
+                      // re-parsed on every future re-eval. Reject it outright instead
+                      // of silently ignoring it.
+                      if (body.contains("params") && !body["params"].is_object()) {
+                          rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'params' must be a JSON object");
+                          return;
+                      }
+                      if (body.contains("params") && body["params"].is_object()) {
+                          const auto& p = body["params"];
+                          if (p.size() > yuzu::server::mcp::kExecInstrParamCountMax) {
+                              rs_err(res, 400,
+                                     std::format(
+                                         "RESULT_SET_BAD_REQUEST: params must have at most {} "
+                                         "keys",
+                                         yuzu::server::mcp::kExecInstrParamCountMax));
+                              return;
+                          }
+                          for (const auto& [k, v] : p.items()) {
+                              if (k.size() > yuzu::server::mcp::kExecInstrParamKeyMaxLen) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: a params key exceeds {} "
+                                             "bytes",
+                                             yuzu::server::mcp::kExecInstrParamKeyMaxLen));
+                                  return;
+                              }
+                              const std::size_t vlen =
+                                  v.is_string() ? v.get_ref<const std::string&>().size()
+                                                : v.dump().size();
+                              if (vlen > yuzu::server::mcp::kExecInstrParamValueMaxLen) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: a params value exceeds {} "
+                                             "bytes",
+                                             yuzu::server::mcp::kExecInstrParamValueMaxLen));
+                                  return;
+                              }
+                          }
+                      }
+                      // Gate 3 architect finding: moved below the client-input validation
+                      // above (instruction_id/params bounds) - same reasoning as the
+                      // from-inventory-query route's Gate 4 fix: a malformed/oversized
+                      // field is a permanent client error regardless of backend
+                      // availability, so a caller retrying this 503 would never succeed.
+                      if (!instruction_store || !instruction_store->is_open()) {
+                          rs_err(res, 503, "instruction store not available");
                           return;
                       }
                       // ADR-0058: get_definition now returns std::expected — distinguish a
@@ -9658,7 +9906,19 @@ void RestApiV1::register_routes(
                           : orig->name.ends_with(" (re-eval)") ? orig->name
                                                                : (orig->name + " (re-eval)");
                       if (orig->source_kind == source_kind::kTarQuery) {
-                          std::string sql = sp.is_object() ? sp.value("sql", "") : "";
+                          // #4373 fix: sp.value("sql", "") throws nlohmann::json::type_error
+                          // on a type mismatch rather than coercing - orig->source_payload
+                          // isn't caller-supplied on THIS call, but a row minted via the
+                          // generic (uncapped) create_result_set constructor can carry an
+                          // arbitrary source_payload with a non-string "sql", the same
+                          // #2500-class row the SQL-size cap two lines below exists to
+                          // catch. Treat a non-string sql the same as absent: the empty
+                          // check just below already has the right error for that. Mirrors
+                          // the identical guard on reevaluate_result_set (mcp_server.cpp).
+                          std::string sql =
+                              (sp.is_object() && sp.contains("sql") && sp["sql"].is_string())
+                                  ? sp.value("sql", "")
+                                  : "";
                           if (sql.empty()) {
                               rs_err(res, 400, "RESULT_SET_BAD_REQUEST: original carries no SQL");
                               return;
@@ -9678,8 +9938,74 @@ void RestApiV1::register_routes(
                                     source_kind::kTarQuery, orig->source_payload, orig->matcher,
                                     synth, reeval_name);
                       } else if (orig->source_kind == source_kind::kInstructionResult) {
+                          // Same type-confusion guard as the sql field above.
                           std::string instruction_id =
-                              sp.is_object() ? sp.value("instruction_id", "") : "";
+                              (sp.is_object() && sp.contains("instruction_id") &&
+                               sp["instruction_id"].is_string())
+                                  ? sp.value("instruction_id", "")
+                                  : "";
+                          // #4373 fix: re-apply the SAME caps MCP's
+                          // create_result_set_from_instruction_result enforces at creation
+                          // time (REST's own from-instruction-result route now enforces the
+                          // same caps too, added above in this same change; that route's
+                          // type-confusion defect, #4406, is also fixed above in this
+                          // change), and the SAME fix MCP's reevaluate_result_set
+                          // already got (PR #4394) - checked
+                          // here ahead of the instruction_store gate below, since a
+                          // malformed/oversized field is a permanent client error
+                          // regardless of backend availability. `orig` may have been minted
+                          // via the uncapped POST /api/v1/result-sets (no source_kind
+                          // allowlist there) - without this, re-eval would smuggle an
+                          // over-keyed or oversized params object past those caps, then
+                          // dispatch it fleet-wide, and an oversized instruction_id would
+                          // reach instruction_store's lookup unbounded.
+                          if (instruction_id.size() > yuzu::server::mcp::kInstructionIdMaxLen) {
+                              rs_err(res, 400,
+                                     std::format(
+                                         "RESULT_SET_BAD_REQUEST: instruction_id must be at "
+                                         "most {} bytes",
+                                         yuzu::server::mcp::kInstructionIdMaxLen));
+                              return;
+                          }
+                          // Gate 4 unhappy-path fix: same present-but-non-object gap
+                          // as the creation route above - reject rather than
+                          // silently dispatch with an empty params map.
+                          if (sp.contains("params") && !sp["params"].is_object()) {
+                              rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'params' must be a JSON object");
+                              return;
+                          }
+                          if (sp.contains("params") && sp["params"].is_object()) {
+                              const auto& p = sp["params"];
+                              if (p.size() > yuzu::server::mcp::kExecInstrParamCountMax) {
+                                  rs_err(res, 400,
+                                         std::format(
+                                             "RESULT_SET_BAD_REQUEST: params must have at most "
+                                             "{} keys",
+                                             yuzu::server::mcp::kExecInstrParamCountMax));
+                                  return;
+                              }
+                              for (const auto& [k, v] : p.items()) {
+                                  if (k.size() > yuzu::server::mcp::kExecInstrParamKeyMaxLen) {
+                                      rs_err(res, 400,
+                                             std::format(
+                                                 "RESULT_SET_BAD_REQUEST: a params key exceeds "
+                                                 "{} bytes",
+                                                 yuzu::server::mcp::kExecInstrParamKeyMaxLen));
+                                      return;
+                                  }
+                                  const std::size_t vlen =
+                                      v.is_string() ? v.get_ref<const std::string&>().size()
+                                                    : v.dump().size();
+                                  if (vlen > yuzu::server::mcp::kExecInstrParamValueMaxLen) {
+                                      rs_err(res, 400,
+                                             std::format(
+                                                 "RESULT_SET_BAD_REQUEST: a params value "
+                                                 "exceeds {} bytes",
+                                                 yuzu::server::mcp::kExecInstrParamValueMaxLen));
+                                      return;
+                                  }
+                              }
+                          }
                           // ADR-0058: get_definition now returns std::expected — a genuine DB
                           // error 503s distinctly; a not-found/store-unavailable/empty-id
                           // condition keeps the pre-migration 400 collapse.

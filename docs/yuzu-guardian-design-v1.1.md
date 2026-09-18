@@ -2406,8 +2406,17 @@ elif host_machine.system() == 'darwin'
     'remediation_macos.cpp',
   )
   guardian_deps += [
-    dependency('appleframeworks', modules: ['CoreFoundation', 'Security', 'EndpointSecurity']),
+    dependency('appleframeworks', modules: ['CoreFoundation', 'Security']),
   ]
+  # EndpointSecurity is NOT an .framework bundle (it ships as
+  # usr/lib/libEndpointSecurity.tbd + usr/include/EndpointSecurity/ on both
+  # the Command Line Tools and full Xcode SDKs) -- `dependency('appleframeworks',
+  # modules: ['EndpointSecurity'])` never succeeds against it (this was a real
+  # probe defect elsewhere in the tree, fixed macOS Spark/Reflex/DEX programme
+  # A0.5, 2026-09). Consume the shared top-level probe instead, like
+  # agents/core/meson.build's own darwin branch does:
+  guardian_deps += endpoint_security_deps
+  guardian_args += endpoint_security_args
 endif
 ```
 
