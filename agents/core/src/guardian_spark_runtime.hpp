@@ -310,16 +310,17 @@ public:
         /// granularity floors at the owning convergence lane's sweep cadence (file:
         /// ~600s) since a refresh can only fire on a committed re-evaluation.
         std::uint64_t errored_refresh_ms{300'000};
-        /// M1 item (b): consecutive COMMITTED Convergence-reason Unknown sweeps after
-        /// which a still-pending-initial rule is demoted off the 5s priority lane to
-        /// its normal type-lane cadence (the read flood, not the wire flood - errored_
-        /// refresh_ms above already bounds the wire side). 0 disables the sweep-count
-        /// demotion arm.
+        /// M1 item (b): consecutive Convergence-reason Unknown READS (committed or
+        /// outbox-rejected - #2992) after which a still-pending-initial rule is
+        /// demoted off the 5s priority lane to its normal type-lane cadence (the read
+        /// flood, not the wire flood - errored_refresh_ms above already bounds the
+        /// wire side). 0 disables the sweep-count demotion arm.
         std::uint64_t pending_demote_sweeps{12};
         /// Elapsed-time companion to pending_demote_sweeps: demote once this much time
         /// has passed since the rule first went pending, even if convergence sweeps
-        /// were sparse (Event-driven eval alone never advances the sweep counter). 0
-        /// disables the elapsed-time demotion arm.
+        /// were sparse (Event-driven eval alone never advances the sweep counter).
+        /// Checked on every Unknown pass regardless of reason or enqueue outcome
+        /// (#2992). 0 disables the elapsed-time demotion arm.
         std::uint64_t pending_demote_ms{120'000};
     };
 
@@ -589,10 +590,10 @@ public:
         return unhealthy_refreshed_.load(std::memory_order_relaxed);
     }
     /// M1 item (b): rule_ids demoted off the 5s convergence priority lane to their
-    /// normal type-lane cadence after pending_demote_sweeps consecutive committed
-    /// Convergence-reason Unknowns or pending_demote_ms elapsed, whichever first. A
-    /// counted metric, not a silent behavior change (Option-A: every loss/suppression/
-    /// resource-shedding channel is observable).
+    /// normal type-lane cadence after pending_demote_sweeps consecutive Convergence-
+    /// reason Unknown reads (committed or outbox-rejected - #2992) or pending_demote_ms
+    /// elapsed, whichever first. A counted metric, not a silent behavior change
+    /// (Option-A: every loss/suppression/resource-shedding channel is observable).
     [[nodiscard]] std::uint64_t priority_demoted() const noexcept {
         return priority_demoted_.load(std::memory_order_relaxed);
     }
@@ -1001,9 +1002,14 @@ private:
     /// keys_with_pending_initial()'s priority-lane worklist. A demoted rule keeps
     /// converging (and keeps re-arming errored_refresh_ms) at its normal type-lane
     /// cadence, which is what makes 6b the staleness backstop for 6c.
+    /// commit_new_generation_locked() reseeds this fresh (first_seen=attach_now,
+    /// unknown_sweeps=0, demoted=false) on EVERY generation commit for a rule_id, not
+    /// only on first attach - a same-rule_id content-plane push mid-demotion-episode
+    /// restarts the demotion clock rather than carrying prior progress forward.
     struct PendingState {
         std::chrono::steady_clock::time_point first_seen{};
-        std::uint64_t unknown_sweeps{0}; ///< committed Convergence-reason Unknowns since first_seen
+        std::uint64_t unknown_sweeps{0}; ///< Convergence-reason Unknown reads since first_seen
+                                         ///< (committed or outbox-rejected - #2992)
         bool demoted{false};
     };
 

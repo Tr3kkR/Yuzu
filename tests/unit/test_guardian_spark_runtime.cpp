@@ -1449,6 +1449,233 @@ TEST_CASE("M1 demotion: a mixed demoted/non-demoted pending set on one key keeps
     REQUIRE(rt->keys_with_pending_initial().empty()); // both demoted now -> key fully off
 }
 
+// --- #2992: M1 backstops can be permanently starved for the rules they protect ---
+//
+// Before the fix below, both M1 mitigations (errored-refresh 6b, priority-lane
+// demotion 6c) made their commit decisions inside evaluate_key's commit section,
+// gated behind the pre-existing `!accepted -> continue` (outbox full) and, for 6c,
+// behind `reason == EvalReason::Convergence`. These four cases pin two distinct ways
+// that previously left 6c unreachable for exactly the rules it exists to protect:
+// (1) a rule whose every pass was rejected at the outbox cap never reached the
+// demotion block at all (it sat above the `continue`), so it retried the identical
+// read at priority-lane cadence forever; (2) the elapsed-time arm was evaluated only
+// inside the Convergence-reason branch, so a key driven by Event-reason evals alone
+// never demoted no matter how much time passed. At HEAD, demotion runs on the read
+// outcome ahead of the enqueue accept/reject decision (#2992's fix), so both are
+// reachable. Each case asserts the STUCK state first (true both before and after the
+// fix, proving the scenario is real and that nothing was lost) and the PROGRESS state
+// second (red on origin/dev, green after the fix hoists the demotion bookkeeping above
+// the accept check and decouples time_due from the Convergence-reason gate).
+
+TEST_CASE("M1 demotion: chronically-full outbox, sweep arm still demotes (#2992 CH-1a)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2; // the floor
+    cfg.pending_demote_sweeps = 3;
+    cfg.pending_demote_ms = 0; // isolate the sweep arm under rejection
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+
+    // Fill the outbox with two unrelated drifts so rc's own entries are never NEW keys
+    // the cap has room for.
+    rt->attach_rule("r1", file_spec("/x"), file_exists_rule("r1", /*present=*/false), true);
+    rt->attach_rule("r2", file_spec("/y"), file_exists_rule("r2", /*present=*/false), true);
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(spark_key(file_spec("/x")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/y")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    const int reads_before = r->reads.load();
+    const auto drops_before = rt->outbox_backpressure_drops();
+
+    // Sweeps 1-2: below the sweep_due threshold, still fully stuck.
+    for (int i = 0; i < 2; ++i) {
+        sc.advance(5'000);
+        rt->evaluate_key(kc, EvalReason::Convergence);
+    }
+    CHECK(rt->outbox_size() == 2);
+    CHECK(rt->status_for_rule("rc")->in_unknown == false); // edge still owed - nothing committed
+    CHECK(rt->pending_initial(kc) == std::vector<std::string>{"rc"});
+    CHECK(rt->unhealthy_suppressed() == 0);
+    CHECK(rt->unhealthy_refreshed() == 0);
+    CHECK(rt->priority_demoted() == 0); // 2 sweeps < 3, arm not due yet
+
+    // Sweep 3: RED on origin/dev - the rejected-enqueue `continue` sits above the
+    // demotion block, so the counter never even advances, let alone crosses 3.
+    sc.advance(5'000);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    CHECK(rt->priority_demoted() == 1);
+    CHECK(rt->pending_demoted_for_test(kc) == std::vector<std::string>{"rc"});
+    const auto worklist = rt->keys_with_pending_initial();
+    CHECK(std::find(worklist.begin(), worklist.end(), kc) == worklist.end());
+
+    // Sweeps 4-20: no double count, and the outbox/edge state is still untouched.
+    for (int i = 0; i < 17; ++i) {
+        sc.advance(5'000);
+        rt->evaluate_key(kc, EvalReason::Convergence);
+    }
+    CHECK(rt->priority_demoted() == 1);
+    CHECK(rt->outbox_size() == 2);
+    CHECK(rt->outbox_backpressure_drops() - drops_before == 20);
+    CHECK(r->reads.load() - reads_before == 20);
+    CHECK(rt->status_for_rule("rc")->in_unknown == false);
+    CHECK(rt->unhealthy_suppressed() == 0);
+    CHECK(rt->unhealthy_refreshed() == 0);
+
+    // The edge is not lost: draining frees a slot and the still-first edge lands.
+    drain_all(*rt);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    const auto edge = drain_all(*rt);
+    REQUIRE(edge.size() == 1);
+    CHECK(edge[0].domain == OutboxDomain::Health);
+    CHECK(edge[0].healthy == false);
+    CHECK(edge[0].health_detail == "io");
+    CHECK(rt->status_for_rule("rc")->in_unknown == true);
+    CHECK(rt->unhealthy_suppressed() == 0);
+
+    // 6b starts post-drain, exactly as it does today.
+    sc.advance(300'000);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    CHECK(rt->unhealthy_refreshed() == 1);
+}
+
+TEST_CASE("M1 demotion: chronically-full outbox, elapsed-time arm still demotes "
+          "(#2992 CH-1a-time)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2;       // the floor
+    cfg.pending_demote_sweeps = 0; // isolate the elapsed-time arm
+    cfg.pending_demote_ms = 120'000;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+
+    rt->attach_rule("r1", file_spec("/x"), file_exists_rule("r1", /*present=*/false), true);
+    rt->attach_rule("r2", file_spec("/y"), file_exists_rule("r2", /*present=*/false), true);
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(spark_key(file_spec("/x")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/y")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    sc.advance(119'999);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    CHECK(rt->outbox_size() == 2);
+    CHECK(rt->status_for_rule("rc")->in_unknown == false);
+    CHECK(rt->priority_demoted() == 0); // not yet 120s since first_seen
+
+    // now - first_seen == 120'000: RED on origin/dev, same shape as CH-1a - the
+    // rejected-enqueue `continue` sits above the demotion block regardless of what
+    // gates time_due inside it.
+    sc.advance(1);
+    rt->evaluate_key(kc, EvalReason::Convergence);
+    CHECK(rt->priority_demoted() == 1);
+    CHECK(rt->pending_demoted_for_test(kc) == std::vector<std::string>{"rc"});
+    const auto worklist = rt->keys_with_pending_initial();
+    CHECK(std::find(worklist.begin(), worklist.end(), kc) == worklist.end());
+
+    CHECK(rt->outbox_size() == 2); // still nothing landed on the wire
+    CHECK(rt->unhealthy_suppressed() == 0);
+    CHECK(rt->unhealthy_refreshed() == 0);
+}
+
+TEST_CASE("M1 demotion: Event-only passes still demote on elapsed time (#2992 CH-2)",
+          "[spark][runtime]") {
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.pending_demote_sweeps = 0; // isolate the elapsed-time arm
+    cfg.pending_demote_ms = 120'000;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+    const auto key = spark_key(file_spec("/a"));
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    rt->evaluate_key(key, EvalReason::Event); // edge @ t=0, commits normally
+    REQUIRE(drain_all(*rt).size() == 1);
+
+    sc.advance(60'000);
+    rt->evaluate_key(key, EvalReason::Event); // repeat Unknown, suppressed, commits
+    CHECK(rt->unhealthy_suppressed() == 1);
+    CHECK(rt->priority_demoted() == 0); // not yet 120s
+
+    // now - first_seen == 120'000: RED on origin/dev - time_due is only ever evaluated
+    // inside the `reason == EvalReason::Convergence` branch, so an Event-reason pass
+    // never reaches it no matter how much time has elapsed.
+    sc.advance(60'000);
+    rt->evaluate_key(key, EvalReason::Event);
+    CHECK(rt->unhealthy_suppressed() == 2); // Event path's commit semantics unchanged
+    CHECK(rt->priority_demoted() == 1);
+    CHECK(rt->pending_demoted_for_test(key) == std::vector<std::string>{"r1"});
+    CHECK(rt->keys_with_pending_initial().empty());
+
+    // A later Convergence pass does not double-count.
+    rt->evaluate_key(key, EvalReason::Convergence);
+    CHECK(rt->priority_demoted() == 1);
+}
+
+TEST_CASE("M1 demotion: chronically-full outbox + Event-only passes, elapsed-time arm "
+          "(#2992 combined)",
+          "[spark][runtime]") {
+    // Discriminates "moved above the accept check" from "moved out of the Convergence
+    // gate": fixing only one half leaves this stuck (the rejected pass never reaches the
+    // demotion block at all, so an Event-only reason never even gets a chance to matter).
+    SettableClock sc;
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    GuardianSparkRuntime::Config cfg;
+    cfg.outbox_capacity = 2;       // the floor
+    cfg.pending_demote_sweeps = 0; // isolate the elapsed-time arm
+    cfg.pending_demote_ms = 120'000;
+    auto rt = make_rt_with_clock(r, b, sc, cfg);
+
+    rt->attach_rule("r1", file_spec("/x"), file_exists_rule("r1", /*present=*/false), true);
+    rt->attach_rule("r2", file_spec("/y"), file_exists_rule("r2", /*present=*/false), true);
+    r->file = read_known(FileSnapshot{.exists = true});
+    rt->evaluate_key(spark_key(file_spec("/x")), EvalReason::Initial);
+    rt->evaluate_key(spark_key(file_spec("/y")), EvalReason::Initial);
+    REQUIRE(rt->outbox_size() == 2);
+
+    const auto kc = spark_key(file_spec("/c"));
+    rt->attach_rule("rc", file_spec("/c"), file_exists_rule("rc", /*present=*/true), true);
+    r->file = read_unknown<FileSnapshot>("io");
+
+    rt->evaluate_key(kc, EvalReason::Event); // t=0, rejected
+    CHECK(rt->outbox_size() == 2);
+    CHECK(rt->status_for_rule("rc")->in_unknown == false);
+    CHECK(rt->priority_demoted() == 0);
+
+    sc.advance(60'000);
+    rt->evaluate_key(kc, EvalReason::Event); // t=60s, rejected
+    CHECK(rt->outbox_size() == 2);
+    CHECK(rt->status_for_rule("rc")->in_unknown == false);
+    CHECK(rt->priority_demoted() == 0);
+
+    // t=120s, rejected: RED on origin/dev under either half of the fix alone.
+    sc.advance(60'000);
+    rt->evaluate_key(kc, EvalReason::Event);
+    CHECK(rt->priority_demoted() == 1);
+    CHECK(rt->pending_demoted_for_test(kc) == std::vector<std::string>{"rc"});
+    const auto worklist = rt->keys_with_pending_initial();
+    CHECK(std::find(worklist.begin(), worklist.end(), kc) == worklist.end());
+
+    CHECK(rt->outbox_size() == 2); // still nothing landed on the wire
+    CHECK(rt->status_for_rule("rc")->in_unknown == false);
+    CHECK(rt->unhealthy_suppressed() == 0);
+    CHECK(rt->unhealthy_refreshed() == 0);
+}
+
 // --- F11: flood measurement, production defaults (#2298) --------------------------
 //
 // These three cases drive the F5 6b/6c mechanisms end-to-end at PRODUCTION DEFAULT
