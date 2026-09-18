@@ -3278,6 +3278,32 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                                      (now - scratch.last_unhealthy_emit) >=
                                          std::chrono::milliseconds(cfg_.errored_refresh_ms);
 
+            // M1 item (b), decided on the READ outcome (this pass observed Unknown),
+            // independent of the WIRE-side accept/reject check below (#2992). A
+            // rejected enqueue still consumed a read - a rule whose first edge is
+            // perpetually rejected at the outbox cap must still eventually leave the
+            // 5s priority lane, not retry the identical read forever - and the
+            // elapsed-time arm is a clock, not a sweep count, so it is checked on
+            // EVERY Unknown pass regardless of reason. Only the sweep COUNTER stays
+            // Convergence-only: an Event-reason eval (an OS-level change notification,
+            // not a poll) must not fast-demote a rule that is merely noisy.
+            if (out.status == EvalStatus::Unhealthy) {
+                const auto pit = pk->pending_initial.find(rg->assertion.rule_id);
+                if (pit != pk->pending_initial.end() && !pit->second.demoted) {
+                    if (reason == EvalReason::Convergence)
+                        ++pit->second.unknown_sweeps;
+                    const bool sweep_due = cfg_.pending_demote_sweeps > 0 &&
+                                          pit->second.unknown_sweeps >= cfg_.pending_demote_sweeps;
+                    const bool time_due = cfg_.pending_demote_ms > 0 &&
+                                          (now - pit->second.first_seen) >=
+                                              std::chrono::milliseconds(cfg_.pending_demote_ms);
+                    if (sweep_due || time_due) {
+                        pit->second.demoted = true;
+                        priority_demoted_.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
             std::vector<OutboxEntry> entries = build_entries(*rg, out, agent_id, refresh_due);
             const bool had_entries = !entries.empty(); // captured BEFORE the move below
             bool accepted = true;
@@ -3309,27 +3335,10 @@ void GuardianSparkRuntime::evaluate_key(const std::string& key, EvalReason reaso
                     unhealthy_suppressed_.fetch_add(1, std::memory_order_relaxed);
             }
             // A Known verdict (Emit or steady-Silent) satisfies the initial eval; an
-            // Unknown does not (it still owes a real verdict).
+            // Unknown does not (it still owes a real verdict). The demotion bookkeeping
+            // for the Unknown case already ran above, on the read outcome.
             if (out.status != EvalStatus::Unhealthy) {
                 pk->pending_initial.erase(rg->assertion.rule_id);
-            } else if (reason == EvalReason::Convergence) {
-                // M1 item (b): only a COMMITTED Convergence-reason Unknown advances the
-                // demotion clock - an Event-reason eval (an OS-level change notification,
-                // not a poll) must not fast-demote a rule that is merely noisy, and a
-                // rejected-enqueue pass (continue above) never reaches here at all.
-                const auto pit = pk->pending_initial.find(rg->assertion.rule_id);
-                if (pit != pk->pending_initial.end() && !pit->second.demoted) {
-                    ++pit->second.unknown_sweeps;
-                    const bool sweep_due = cfg_.pending_demote_sweeps > 0 &&
-                                          pit->second.unknown_sweeps >= cfg_.pending_demote_sweeps;
-                    const bool time_due = cfg_.pending_demote_ms > 0 &&
-                                          (now - pit->second.first_seen) >=
-                                              std::chrono::milliseconds(cfg_.pending_demote_ms);
-                    if (sweep_due || time_due) {
-                        pit->second.demoted = true;
-                        priority_demoted_.fetch_add(1, std::memory_order_relaxed);
-                    }
-                }
             }
         }
         if (enqueued_any)
