@@ -35,10 +35,13 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <format>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "printing_ipp.hpp"
@@ -61,7 +64,6 @@
 #else
 #include <httplib.h>
 
-#include <cstdio>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -89,6 +91,12 @@ constexpr DWORD kReadDesiredAccess = PRINTER_ACCESS_USE;
 // but-fine queue instead of a distinguishable CONSTRAINED/PARTIAL result.
 constexpr std::string_view kTokEnumPrintersFailed = "windows:winspool:enum_printers_failed";
 constexpr std::string_view kTokJobEnumFailed = "windows:winspool:enum_jobs_failed";
+// Round-4 review minor: a denied/failed OpenPrinterW is a different failure
+// point than EnumJobsW itself failing -- folding both under the enum token
+// mislabels the actual failing call for triage. Used only when every
+// per-printer job-read problem in one dispatch was an open failure, never an
+// enum one (see do_jobs's token-selection comment).
+constexpr std::string_view kTokOpenPrinterFailed = "windows:winspool:open_printer_failed";
 
 // Round-3 review Should-fix: EnumPrintersW/EnumJobsW are plain synchronous
 // calls with no cancellation of their own. PRINTER_ENUM_CONNECTIONS
@@ -101,6 +109,41 @@ constexpr std::string_view kTokJobEnumFailed = "windows:winspool:enum_jobs_faile
 // class -- neither enum function holds an OS handle across the timeout
 // boundary that a caller would need to synchronize against on abandonment.
 constexpr std::chrono::milliseconds kSpoolerCallTimeout{5000};
+
+// Round-4 review blocker (fjarvis + Codex, cross-examined): bounded_call is a
+// header-only template, so instantiating it here compiles the ENTIRE
+// detached-thread body -- spawn, condvar logic, enum_printers_raw_impl()
+// itself -- into printing.dll. plugin.hpp:245's shutdown() contract says a
+// background thread that may still be running past the bounded wait's
+// timeout "must never touch this plugin's own code or statics after that
+// point (dlclose/FreeLibrary can unmap them while it runs)". This plugin's
+// original shutdown() was a bare no-op, so 100% of a timed-out call's
+// residual work could run into an unmapped DSO -- a MODULE-lifetime hazard,
+// distinct from the OS-handle-lifetime one kMaxJobsPerPrinter's own comment
+// discusses below (that one is about enum_jobs_raw's live HANDLE; this one
+// is about the .dll's own code/statics).
+//
+// power_health_plugin.cpp establishes the fix for exactly this primitive:
+// g_outstanding_calls/OutstandingGuard/bounded_call_tracked() below are
+// copied from there verbatim in shape (see that file's own comment on why
+// the guard decrements on the CALLING thread only, never from inside
+// bounded_call()'s detached thread) -- shutdown() pairs with it via the same
+// bounded 2x-timeout quiesce.
+std::atomic<int> g_outstanding_calls{0};
+
+class OutstandingGuard {
+public:
+    OutstandingGuard() noexcept { ++g_outstanding_calls; }
+    ~OutstandingGuard() noexcept { --g_outstanding_calls; }
+    OutstandingGuard(const OutstandingGuard&) = delete;
+    OutstandingGuard& operator=(const OutstandingGuard&) = delete;
+};
+
+template <typename Fn>
+auto bounded_call_tracked(Fn fn) -> std::optional<std::invoke_result_t<Fn>> {
+    OutstandingGuard guard;
+    return yuzu::shared::bounded_call(kSpoolerCallTimeout, std::move(fn));
+}
 
 // Move-only RAII owner for an HPRINTER (PH-015-style ownership rule, same
 // shape as power_health's DirHandle / the repo's other Scoped* wrappers):
@@ -213,7 +256,7 @@ struct JobEnumRaw {
 // distinguish them, and PrinterEnumRaw's default-constructed ok=false
 // already means exactly that.
 [[nodiscard]] PrinterEnumRaw enum_printers_raw() {
-    auto result = yuzu::shared::bounded_call(kSpoolerCallTimeout, enum_printers_raw_impl);
+    auto result = bounded_call_tracked(enum_printers_raw_impl);
     return result ? std::move(*result) : PrinterEnumRaw{};
 }
 
@@ -306,12 +349,23 @@ constexpr DWORD kMaxJobsPerPrinter = 5000;
     return row;
 }
 
+// Round-4 review minor: last_error==0 on a !ok result means the bounded wait
+// itself gave up (timeout or ceiling-rejection, see enum_printers_raw's own
+// comment) -- EnumPrintersW was never actually reached, so it never called
+// SetLastError at all. Reporting that bare as "GetLastError=0" reads like
+// "the call succeeded with no error", the opposite of what happened.
+[[nodiscard]] std::string format_printer_enum_failure(DWORD last_error) {
+    if (last_error == 0)
+        return "EnumPrintersW bounded call timed out or was rejected (never reached the win32 "
+               "call)";
+    return std::format("EnumPrintersW failed, GetLastError={}", last_error);
+}
+
 int do_printers(yuzu::CommandContext& ctx) {
     const auto raw = enum_printers_raw();
     if (!raw.ok) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               std::format("EnumPrintersW failed or timed out, GetLastError={}",
-                                           raw.last_error));
+                               format_printer_enum_failure(raw.last_error));
         ctx.write_output(std::format("printer|unavailable|{}", kTokEnumPrintersFailed));
         return 0;
     }
@@ -344,8 +398,7 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     const auto raw_printers = enum_printers_raw();
     if (!raw_printers.ok) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                               std::format("EnumPrintersW failed or timed out, GetLastError={}",
-                                           raw_printers.last_error));
+                               format_printer_enum_failure(raw_printers.last_error));
         ctx.write_output(std::format("job|unavailable|{}", kTokEnumPrintersFailed));
         return 0;
     }
@@ -358,7 +411,20 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     // complete picture. A single printer's own queue being unreadable stays
     // a per-printer skip, not a whole-action failure (existing design), but
     // it is no longer a SILENT one.
-    bool any_job_read_failed = false;
+    //
+    // Round-4 review: split into two signals so the aggregate token names
+    // the actual failing call (minor) and so a TRUNCATED-but-successful read
+    // is treated the same as an outright failed one (should-fix) --
+    // `enum_incomplete` covers both: enum_jobs_raw() itself failing, and
+    // enum_jobs_raw() succeeding but returning fewer rows than the printer's
+    // own queue depth (`pi.cJobs`, sampled by the same enum_printers_raw()
+    // call moments earlier) says exist. EnumJobsW's NoJobs parameter
+    // (kMaxJobsPerPrinter) is a requested MAXIMUM, not a completeness proof
+    // -- a queue past that cap returns exactly the cap's worth of rows,
+    // which the old code reported as OK/FULL, contradicting this plugin's
+    // own "never present a partial read as complete" design.
+    bool any_open_failed = false;
+    bool any_enum_incomplete = false;
     for (const auto& pi : raw_printers.items) {
         const std::string name = pi.pPrinterName != nullptr ? yuzu::win::from_wide(pi.pPrinterName) : "";
         if (!filter_printer.empty() && name != filter_printer)
@@ -366,25 +432,35 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
 
         auto handle = open_printer(pi.pPrinterName != nullptr ? pi.pPrinterName : L"", kReadDesiredAccess);
         if (!handle) {
-            any_job_read_failed = true;
+            any_open_failed = true;
             continue; // this printer's jobs are simply unavailable; not a whole-action failure
         }
         const auto jobs = enum_jobs_raw(handle->get());
         if (!jobs.ok) {
-            any_job_read_failed = true;
+            any_enum_incomplete = true;
             continue;
         }
+        if (jobs.items.size() < pi.cJobs)
+            any_enum_incomplete = true; // truncated at kMaxJobsPerPrinter; not the full queue
         for (const auto& j : jobs.items) {
             any = true;
             ctx.write_output(format_job_row(job_row_from_info(name, j)));
         }
     }
 
+    // enum_incomplete outranks open_failed when both occurred in one
+    // dispatch: a truncated/failed enumeration is the more actionable signal
+    // (it means real job data was dropped), while an open failure alone
+    // means that printer contributed nothing either way.
+    const bool any_job_read_failed = any_open_failed || any_enum_incomplete;
+    const std::string_view failure_token =
+        any_enum_incomplete ? kTokJobEnumFailed : kTokOpenPrinterFailed;
+
     if (!any) {
         if (any_job_read_failed) {
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                    "one or more printers' job queues could not be read");
-            ctx.write_output(std::format("job|unavailable|{}", kTokJobEnumFailed));
+            ctx.write_output(std::format("job|unavailable|{}", failure_token));
         } else {
             ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
             ctx.write_output("job|none");
@@ -691,7 +767,40 @@ public:
     }
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
+
+#ifdef _WIN32
+    // Round-4 review blocker: short BOUNDED quiesce (plugin.hpp:245),
+    // mirroring power_health_plugin.cpp's shutdown() shape exactly -- wait up
+    // to 2x kSpoolerCallTimeout for g_outstanding_calls to drain (every
+    // individual bounded_call_tracked() wait resolves, one way or another,
+    // within kSpoolerCallTimeout by construction, so 2x always covers the
+    // last in-flight one with margin), then log any residue and return.
+    // Never an unbounded join.
+    //
+    // What this does NOT close -- and cannot, without a cancellable winspool
+    // API, which doesn't exist -- is bounded_call()'s own pre-existing
+    // residual: a call that has already timed out may still be physically
+    // running enum_printers_raw_impl() on bounded_call()'s own detached
+    // thread past this function's return. That is bounded_wait.hpp's own
+    // governance-accepted hazard, identical in kind to every other plugin
+    // using this primitive (discovery_plugin.cpp, power_health_plugin.cpp);
+    // this quiesce narrows the window, it doesn't eliminate it.
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
+        const auto deadline = std::chrono::steady_clock::now() + 2 * kSpoolerCallTimeout;
+        while (g_outstanding_calls.load(std::memory_order_relaxed) > 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        if (const int residue = g_outstanding_calls.load(std::memory_order_relaxed); residue > 0) {
+            std::fprintf(stderr,
+                          "printing: shutdown quiesce timed out with %d bounded call(s) still "
+                          "outstanding\n",
+                          residue);
+        }
+    }
+#else
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
+#endif
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "printers")
