@@ -102,6 +102,12 @@ yuzu_agent_core_dep = declare_dependency(
     # only through this dependency object (A2's macOS launchd Spark mechanism,
     # sec2-2/UP2-4 governance A0 fix round) must be able to resolve that
     # transitive include without separately re-adding '../shared' itself.
+    # ADDITIVE-ONLY, on purpose (bci3-2, governance A0 fix round): this is
+    # the LAST entry in the list, so it can only resolve a basename no
+    # earlier root (include/, sdk/include, common/include) already provides
+    # -- it can never shadow one of them. Keep it last; reordering this list
+    # would turn an additive-only -I into a potentially-shadowing one with
+    # no compiler signal either way.
     include_directories('../shared'),
   ],
 )
