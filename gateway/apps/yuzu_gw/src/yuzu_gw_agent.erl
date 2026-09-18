@@ -44,7 +44,14 @@
     plugins     :: [binary()],
     pending     :: #{binary() => {pid(), reference(), integer()}},  %% command_id => {reply_to, fanout_ref, dispatched_at}
     connected_at :: integer() | undefined,
-    peer_addr   :: binary()
+    peer_addr   :: binary(),
+    %% Opaque random id minted ONCE per process instance (HA WS-4, #4324) —
+    %% stamped on both the CONNECTED (init/1) and DISCONNECTED (do_cleanup)
+    %% StreamStatusNotification this process ever sends, so the server can
+    %% fence a stale DISCONNECTED from a torn-down placement against a
+    %% newer re-home reusing the same session id. NOT a counter — must stay
+    %% collision-safe across gateway nodes and mixed-version clusters.
+    stream_home_id :: binary()
 }).
 
 %%%===================================================================
@@ -85,6 +92,13 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
     %% still works — replay just skips agents whose req is empty.
     RegisterReq = maps:get(register_req, Args, #{}),
 
+    %% Opaque per-process-instance id (HA WS-4, #4324): minted once here,
+    %% never regenerated, and reused verbatim on the DISCONNECTED
+    %% notification in do_cleanup/1. A CSPRNG value, not a counter —
+    %% erlang:unique_integer/1 was rejected as per-BEAM-node and therefore
+    %% collision-prone across gateway cluster nodes.
+    StreamHomeId = string:lowercase(binary:encode_hex(crypto:strong_rand_bytes(16))),
+
     %% Monitor the stream handler process.
     StreamMon = case StreamPid of
         undefined -> undefined;
@@ -101,7 +115,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
         plugins     = Plugins,
         pending     = #{},
         connected_at = erlang:system_time(millisecond),
-        peer_addr   = PeerAddr
+        peer_addr   = PeerAddr,
+        stream_home_id = StreamHomeId
     },
 
     %% Register in routing table and join pg groups. The RegisterRequest
@@ -126,7 +141,8 @@ init(#{agent_id := AgentId, agent_info := AgentInfo,
                 [AgentId, PeerAddr, SessionId]),
 
     %% Notify C++ server about the stream connection.
-    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr),
+    yuzu_gw_upstream:notify_stream_status(AgentId, SessionId, connected, PeerAddr,
+                                           StreamHomeId),
 
     case StreamPid of
         undefined -> {ok, connecting, Data};
@@ -304,7 +320,7 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
 
 do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                   connected_at = ConnectedAt, pending = Pending,
-                  peer_addr = PeerAddr}) ->
+                  peer_addr = PeerAddr, stream_home_id = StreamHomeId}) ->
     %% Deregister from routing table and pg groups.
     yuzu_gw_registry:deregister_agent(AgentId),
 
@@ -327,11 +343,14 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
                       #{count => 1, duration_ms => Duration},
                       #{agent_id => AgentId, reason => normal}),
 
-    %% Notify C++ server.
+    %% Notify C++ server. Same StreamHomeId minted at CONNECTED (init/1) —
+    %% never a freshly-minted value — so the server can match this
+    %% DISCONNECTED to the placement it actually tears down (HA WS-4).
     yuzu_gw_upstream:notify_stream_status(AgentId,
                                            SessionId,
                                            disconnected,
-                                           PeerAddr),
+                                           PeerAddr,
+                                           StreamHomeId),
 
     %% Notify WatchEvents subscribers.
     notify_watchers(#{agent_id    => AgentId,
