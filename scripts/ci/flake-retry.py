@@ -292,11 +292,40 @@ def _cmd_for_case_retry(cmd):
     return [stripped[0]] + [a for a in stripped[1:] if a != "--allow-running-no-tests"]
 
 
-def _run(cmd, env, workdir, extra=None, timeout=None):
+_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+
+
+def _meson_test_env(builddir):
+    """Env additions replicating `meson test`'s own launch contract for a
+    test() binary (#4580 root cause). `meson test` always sets
+    MESON_BUILD_ROOT/MESON_SOURCE_ROOT and runs with CWD at the build root
+    (never introspectable — meson injects these at launch time, not part of
+    a test() entry's own declared `env`/`cmd`); a large fraction of this
+    suite locates its build-output plugin .so/.dylib via exactly these two
+    vars (grep tests/unit/*.cpp for MESON_BUILD_ROOT — dozens of call sites,
+    several with an explicit "under meson test, this is always set" comment,
+    e.g. test_disk_actions_local_dispatcher.cpp). A caller re-invoking the
+    test BINARY directly, bypassing `meson test` itself, must replicate this
+    contract or every such test fails deterministically on its
+    plugin-not-found fallback, indistinguishable from a real regression —
+    this was the actual mechanism behind #4580's ~20-case cascade, not CI
+    concurrency: every case in the cascade shared this exact fallback path,
+    at time=0.000 (never touched real logic), across three independent
+    occurrences with unrelated original failures (PRs #4532/#4566/#4583)."""
+    return {
+        "MESON_BUILD_ROOT": os.path.abspath(builddir),
+        "MESON_SOURCE_ROOT": _REPO_ROOT,
+    }
+
+
+def _run(cmd, env, workdir, builddir=None, extra=None, timeout=None):
     e = dict(os.environ)
+    if builddir:
+        e.update(_meson_test_env(builddir))
     e.update(env or {})
+    cwd = workdir or (os.path.abspath(builddir) if builddir else None)
     return subprocess.run(
-        cmd + (extra or []), env=e, cwd=workdir or None,
+        cmd + (extra or []), env=e, cwd=cwd,
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -392,7 +421,7 @@ def catch2_failed_cases(test, this_os, builddir=None):
     fd, xml_path = tempfile.mkstemp(suffix=".catch2.xml")
     os.close(fd)
     try:
-        _run(cmd, test.get("env"), test.get("workdir"),
+        _run(cmd, test.get("env"), test.get("workdir"), builddir,
              extra=["--reporter", "junit", "--out", xml_path],
              timeout=test.get("timeout") or None)
         if not os.path.getsize(xml_path):
@@ -409,12 +438,12 @@ def catch2_failed_cases(test, this_os, builddir=None):
             pass
 
 
-def retry_case(test, case, retries):
+def retry_case(test, case, retries, builddir=None):
     """Return the 1-based retry attempt that passed, or 0 if none passed."""
     cmd = _cmd_for_case_retry(test.get("cmd") or [])
     for attempt in range(1, retries + 1):
         try:
-            result = _run(cmd, test.get("env"), test.get("workdir"), extra=[case],
+            result = _run(cmd, test.get("env"), test.get("workdir"), builddir, extra=[case],
                           timeout=test.get("timeout") or None)
         except subprocess.TimeoutExpired:
             continue
@@ -567,7 +596,7 @@ def main(argv=None):
             if entry is None:
                 blocked.append(case)
                 continue
-            passed_attempt = retry_case(test, case, args.retries)
+            passed_attempt = retry_case(test, case, args.retries, args.builddir)
             if passed_attempt:
                 cross = "all" in entry.get("platforms", [])
                 recovered.append((case, cross, passed_attempt))
