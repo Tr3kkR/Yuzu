@@ -400,8 +400,16 @@ if host_os == 'darwin'
     endpoint_security_deps += cxx.find_library('bsm')
     endpoint_security_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
   else
-    message('EndpointSecurity SDK not found (no ES SDK found on this host) -- '
-          + 'ES-dependent code compiles as a no-op on this host.')
+    # rd-1 (governance A0 round-4, MEDIUM): this branch fires on EVERY host,
+    # SDK present or not -- see the accurate CORRECTION comment 8 lines above
+    # (the appleframeworks probe can never find EndpointSecurity, because it
+    # is not a `.framework` bundle). The previous wording here ("EndpointSecurity
+    # SDK not found") claimed the opposite and could resurrect the exact
+    # "needs full Xcode SDK" myth this A0 slice exists to correct.
+    message('EndpointSecurity probe cannot succeed on this SDK shape (appleframeworks '
+          + 'has no EndpointSecurity.framework to find -- see the CORRECTION comment '
+          + 'above; the SDK itself may well have the lib+header pair) -- ES-dependent '
+          + 'code compiles as a no-op on this host.')
   endif
 
   # ── Reusable per-target Apple frameworks + Objective-C++/ARC template ──────
