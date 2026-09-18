@@ -254,6 +254,36 @@ groups:
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b).
+      # Fail-open boot semantics (a node that resolves zero peers still boots
+      # and serves its own agents fine) mean a misconfigured seed name fails
+      # SILENTLY by design — this is the one alert closing that gap. A
+      # sustained resolved>connected gap most often means a distribution-
+      # cookie mismatch across replicas (connect_node/1 reports failure only
+      # as a bare `false`, no reason code) — see
+      # yuzu_gw_cluster_connect_failures_total for the corroborating signal.
+      # `resolved == 0` is NOT itself alerted here — it is the expected,
+      # correct state for a genuinely single-node deployment.
+      - alert: YuzuGatewayClusterPartiallyFormed
+        expr: |
+          yuzu_gw_cluster_peers_resolved - yuzu_gw_cluster_peers_connected > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway cluster partially formed on {{ $labels.node }} ({{ $value }} peer(s) resolved but not connected)"
+          description: >-
+            The cluster-formation redial loop (yuzu_gw_cluster_discovery) has
+            resolved more peer addresses than it has successfully connected
+            to for at least 10 minutes on {{ $labels.node }}. FIRST
+            REMEDIATION: check yuzu_gw_cluster_connect_failures_total's rate
+            — a non-zero rate alongside this gap most often means a
+            distribution cookie mismatch across replicas (YUZU_GW_COOKIE must
+            be IDENTICAL across every node in the cluster); otherwise check
+            network reachability to the unconnected peer(s) on the
+            distribution port range (default 9100-9105, config/sys.config's
+            inet_dist_listen_min/max) and epmd (4369). See ADR-2002 §7b.
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected

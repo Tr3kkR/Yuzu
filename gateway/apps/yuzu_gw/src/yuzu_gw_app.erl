@@ -84,10 +84,22 @@ check_distribution_cookie() ->
     Allow = os:getenv("YUZU_GW_ALLOW_DEFAULT_COOKIE") =:= "1",
     evaluate_cookie(node(), erlang:get_cookie(), Allow).
 
+%% Minimum distribution-cookie length (HA WS-4 #4555, ADR-2002 §7b). DNS-sourced
+%% discovery makes this node DIAL OUT to addresses it did not choose by hand —
+%% and the OTP distribution handshake has the INITIATOR send
+%% MD5(cookie ‖ peer_challenge) first, before the peer proves anything back. So
+%% anything able to influence what the seed name resolves to (a compromised or
+%% misconfigured DNS answer) gets an offline brute-force oracle against the
+%% cookie from a legitimately-configured node dialing out — a stronger position
+%% than an inbound attacker against a normal listener ever gets. 32 chars
+%% matches the `openssl rand -hex 32` this module's own guidance already
+%% recommends operators generate.
+-define(MIN_COOKIE_LENGTH, 32).
+
 %% @doc Pure cookie policy decision — exported for testing.
 %% A non-distributed node ('nonode@nohost') has no inter-node attack surface,
-%% so any cookie is accepted. Otherwise the known-default and empty cookies
-%% are rejected unless explicitly overridden for dev/CI.
+%% so any cookie is accepted. Otherwise the known-default, empty, and
+%% too-short cookies are rejected unless explicitly overridden for dev/CI.
 -spec evaluate_cookie(node(), atom(), boolean()) ->
           ok | {error, insecure_distribution_cookie}.
 evaluate_cookie('nonode@nohost', _Cookie, _Allow) ->
@@ -101,10 +113,24 @@ evaluate_cookie(_Node, Cookie, Allow) ->
     %% unsubstituted `${...}` env placeholder. Substring (not exact) match is
     %% the #659 UP-1 hardening: an exact-match list would let the unsubstituted
     %% literal through and silently re-open the unauthenticated-RPC surface.
-    Insecure = CookieStr =:= ""
+    IsDefault = CookieStr =:= ""
         orelse string:find(CookieStr, "yuzu_gw_secret_change_me") =/= nomatch
         orelse string:find(CookieStr, "${") =/= nomatch,
+    TooShort = not IsDefault andalso length(CookieStr) < ?MIN_COOKIE_LENGTH,
+    Insecure = IsDefault orelse TooShort,
     case {Insecure, Allow} of
+        {true, false} when TooShort ->
+            logger:critical(
+                "Refusing to start: Erlang distribution cookie is shorter than "
+                "~p characters. DNS-based cluster discovery (#4555) means this "
+                "node dials addresses it did not choose by hand, and the "
+                "distribution handshake's INITIATOR sends the cookie hash "
+                "first — a short cookie is brute-forceable offline from a "
+                "legitimate node dialing out. Set a strong unique cookie via "
+                "the YUZU_GW_COOKIE environment variable (e.g. `openssl rand "
+                "-hex 32`). Dev/CI may override with "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1.", [?MIN_COOKIE_LENGTH]),
+            {error, insecure_distribution_cookie};
         {true, false} ->
             logger:critical(
                 "Refusing to start: Erlang distribution cookie is the insecure default. "
@@ -116,7 +142,7 @@ evaluate_cookie(_Node, Cookie, Allow) ->
             {error, insecure_distribution_cookie};
         {true, true} ->
             logger:warning(
-                "Erlang distribution cookie is the insecure default, but "
+                "Erlang distribution cookie is insecure (default or too short), but "
                 "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only)."),
             ok;
         {false, _} ->
@@ -196,6 +222,16 @@ apply_env_overrides() ->
         %% HA WS-4 4.1 — trust-zone/region cluster id (ADR-2002 §7), stamped
         %% on every StreamStatusNotification (yuzu_gw_upstream:handle_cast/2).
         {"YUZU_GW_CLUSTER_ID", cluster_id, fun list_to_binary/1},
+        %% HA WS-4 #4555 — gateway cluster FORMATION config (ADR-2002 §7b).
+        {"YUZU_GW_SEED_DNS_NAME", cluster_seed_dns_name, fun list_to_binary/1},
+        %% Explicit peer list; when non-empty REPLACES DNS resolution outright
+        %% (never merged). "10.0.0.1,10.0.0.2" -> [<<"10.0.0.1">>, <<"10.0.0.2">>].
+        {"YUZU_GW_SEED_NODES", cluster_seed_nodes, fun(V) ->
+            [list_to_binary(string:trim(N))
+             || N <- string:split(V, ",", all), string:trim(N) =/= ""]
+        end},
+        {"YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS", cluster_redial_interval_ms,
+         fun list_to_integer/1},
         {"YUZU_GW_TLS_ENABLED", tls_enabled, fun
             ("true")  -> true;
             ("false") -> false;

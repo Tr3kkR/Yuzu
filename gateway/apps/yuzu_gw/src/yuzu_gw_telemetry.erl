@@ -50,6 +50,16 @@
     [yuzu, gw, cluster, node_down],
     [yuzu, gw, cluster, rebalance],
 
+    %% Cluster formation (HA WS-4 #4555, ADR-2002 §7b) — distinct from the
+    %% node_up/node_down pair above (which fire per net_kernel monitor event):
+    %% these are per-tick snapshots from yuzu_gw_cluster_discovery's redial
+    %% loop, letting an operator distinguish "wrong seed name" (resolved=0)
+    %% from "cookie mismatch across some replicas" (resolved > connected > 0,
+    %% since connect_node/1 only ever reports a bare `false` with no reason).
+    [yuzu, gw, cluster, peers_resolved],
+    [yuzu, gw, cluster, peers_connected],
+    [yuzu, gw, cluster, connect_failed],
+
     %% BEAM VM
     [yuzu, gw, vm, process_count],
     [yuzu, gw, vm, memory],
@@ -190,6 +200,15 @@ handle_event([yuzu, gw, cluster, node_down], _Measurements, Meta, _Config) ->
 handle_event([yuzu, gw, cluster, rebalance], #{moved_agents := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_cluster_rebalanced_agents_total, [], N);
 
+handle_event([yuzu, gw, cluster, peers_resolved], #{count := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_cluster_peers_resolved, [node()], N);
+
+handle_event([yuzu, gw, cluster, peers_connected], #{count := N}, _Meta, _Config) ->
+    prometheus_gauge:set(yuzu_gw_cluster_peers_connected, [node()], N);
+
+handle_event([yuzu, gw, cluster, connect_failed], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_cluster_connect_failures_total, [], N);
+
 handle_event([yuzu, gw, vm, process_count], #{count := N}, _Meta, _Config) ->
     prometheus_gauge:set(yuzu_gw_beam_process_count, [node()], N);
 
@@ -257,6 +276,13 @@ declare_metrics() ->
         {name, yuzu_gw_cluster_rebalanced_agents_total},
         {labels, []},
         {help, "Total agents moved during rebalancing"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_cluster_connect_failures_total},
+        {labels, []},
+        {help, "Total net_kernel:connect_node/1 failures from the cluster "
+               "discovery redial loop (#4555) — a sustained non-zero rate "
+               "alongside a resolved/connected gap most often means a "
+               "distribution-cookie mismatch across replicas"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_total},
         {labels, []},
@@ -353,6 +379,21 @@ declare_metrics() ->
         {labels, [node]},
         {help, "Agents still queued for registration replay (0 = idle; "
                "a persistently non-zero value indicates a replay storm)"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_cluster_peers_resolved},
+        {labels, [node]},
+        {help, "Peer addresses found by the cluster discovery redial loop's "
+               "most recent tick (#4555) — 0 means the seed name/list "
+               "resolved nothing, which is expected for a genuinely "
+               "single-node deployment"}]),
+    prometheus_gauge:declare([
+        {name, yuzu_gw_cluster_peers_connected},
+        {labels, [node]},
+        {help, "Distribution-connected peer nodes (length(nodes())) as of "
+               "the cluster discovery redial loop's most recent tick "
+               "(#4555) — compare against peers_resolved to distinguish a "
+               "wrong seed name (resolved=0) from a partial mesh (resolved "
+               "> connected > 0, most often a cookie mismatch)"}]),
 
     ok.
 

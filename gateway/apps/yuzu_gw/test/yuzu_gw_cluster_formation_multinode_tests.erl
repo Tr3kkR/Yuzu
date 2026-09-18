@@ -1,0 +1,161 @@
+%%%-------------------------------------------------------------------
+%%% @doc Genuine multi-node tests for HA WS-4 `#4555` gateway cluster
+%%% formation (ADR-2002 §7b) — a real OTP `peer` connecting via
+%%% `yuzu_gw_cluster_discovery`'s actual mechanism, not a mock.
+%%%
+%%% WHY THIS DOESN'T TEST THE "SAME SHORT NAME" PRODUCTION CONVENTION
+%%% DIRECTLY: `yuzu_gw_cluster_discovery:resolve_targets/0` constructs every
+%%% dial target as `<this node's own short name>@<resolved address>` — correct
+%%% for the real deployment shape (every gateway replica is the identical
+%%% image, same short name, different container/address, different EPMD
+%%% instance per container). On ONE eunit test host there is exactly ONE
+%%% shared EPMD instance, and EPMD registration is keyed by short name ALONE
+%%% — two live nodes cannot share a short name on one EPMD regardless of what
+%%% host/address string is attached to the name. So the "same short name"
+%%% convention is fundamentally untestable with two real peer processes on
+%%% one CI host; it is provable only in a genuinely multi-host/multi-container
+%%% topology (the HA WS-4 #4555 scale-capable reference Compose rig).
+%%%
+%%% What IS both real and testable here, and what these tests cover instead:
+%%% the mechanism `resolve_targets/0` feeds INTO — `do_tick/1`'s
+%%% `net_kernel:connect_node/1` call against a real target actually forms a
+%%% distributed connection, and the running gen_server's
+%%% `net_kernel:monitor_nodes(true)` wiring actually observes and telemeters
+%%% that connection (and its loss) once formed, regardless of which side
+%%% initiated it. `do_tick/1` takes an explicit target list precisely so this
+%%% suite can pass it a peer's REAL node name directly, sidestepping the
+%%% same-short-name construction this file's own module doc explains cannot
+%%% be exercised locally.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(yuzu_gw_cluster_formation_multinode_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+%%%===================================================================
+%%% do_tick/1 — a real connect_node against a real peer
+%%%===================================================================
+
+%% `peer:start_link/1`'s DEFAULT connection mode establishes the origin<->peer
+%% distribution connection itself as part of starting up (empirically
+%% confirmed — a fresh default-mode peer is already in `nodes()` immediately
+%% after `start_peer/0` returns) — the wrong starting state to test do_tick/1
+%% FORMING a new connection. `start_disconnected_peer/0` uses
+%% `connection => standard_io` instead: the peer's OWN control channel runs
+%% over stdio, independent of distribution, so the node starts genuinely
+%% NOT distribution-connected AND survives an explicit disconnect (a
+%% default-mode peer's control channel IS the distribution link, so
+%% disconnecting one self-terminates the peer — empirically confirmed, and
+%% the reason this test does not simply disconnect a `start_peer/0` peer
+%% instead).
+do_tick_connects_a_genuinely_disconnected_peer_test_() ->
+    {timeout, 30, fun() ->
+        yuzu_gw_registry_multinode_tests:ensure_distributed(),
+        {ok, Peer, PeerNode} = start_disconnected_peer(),
+        try
+            ?assertNot(lists:member(PeerNode, nodes())),
+            ok = yuzu_gw_cluster_discovery:do_tick([PeerNode]),
+            ?assert(lists:member(PeerNode, nodes()))
+        after
+            stop_peer(Peer)
+        end
+    end}.
+
+%% A target that cannot possibly resolve to a live node is a clean,
+%% non-crashing failure — do_tick/1 must survive it and still report the
+%% (zero) connected count via telemetry, not raise.
+do_tick_survives_an_unreachable_target_test_() ->
+    {timeout, 30, fun() ->
+        yuzu_gw_registry_multinode_tests:ensure_distributed(),
+        Bogus = list_to_atom("yuzu_gw_definitely_not_running@127.0.0.1"),
+        ?assertEqual(ok, yuzu_gw_cluster_discovery:do_tick([Bogus])),
+        ?assertNot(lists:member(Bogus, nodes()))
+    end}.
+
+%%%===================================================================
+%%% Running gen_server — monitor_nodes wiring fires telemetry
+%%%===================================================================
+
+%% Once yuzu_gw_cluster_discovery is running (and this VM is distributed), a
+%% connection formed by ANY means — here, the test process itself calling
+%% connect_node, standing in for what do_tick/1 does internally — must be
+%% observed via net_kernel:monitor_nodes(true) and telemetered as
+%% [yuzu, gw, cluster, node_up]/[node_down].
+running_server_telemeters_nodeup_and_nodedown_test_() ->
+    {timeout, 30, fun() ->
+        yuzu_gw_registry_multinode_tests:ensure_distributed(),
+        {DiscoveryPid, StartedHere} = case yuzu_gw_cluster_discovery:start_link() of
+            {ok, Pid}                       -> {Pid, true};
+            {error, {already_started, Pid}} -> {Pid, false}
+        end,
+        Self = self(),
+        HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        telemetry:attach_many(
+            HandlerId,
+            [[yuzu, gw, cluster, node_up], [yuzu, gw, cluster, node_down]],
+            fun(Event, _Measurements, Meta, _Config) ->
+                Self ! {telemetry, Event, Meta}
+            end,
+            #{}),
+        try
+            {ok, Peer, PeerNode} = start_peer(),
+            true = net_kernel:connect_node(PeerNode),
+            ?assertEqual(
+                ok,
+                await_telemetry([yuzu, gw, cluster, node_up], PeerNode, 5000)),
+            stop_peer(Peer),
+            ?assertEqual(
+                ok,
+                await_telemetry([yuzu, gw, cluster, node_down], PeerNode, 15000))
+        after
+            telemetry:detach(HandlerId),
+            case StartedHere of
+                true  -> unlink(DiscoveryPid), exit(DiscoveryPid, kill);
+                false -> ok
+            end
+        end
+    end}.
+
+%%%===================================================================
+%%% Helpers
+%%%===================================================================
+
+await_telemetry(_Event, _PeerNode, TimeoutMs) when TimeoutMs =< 0 ->
+    {error, timeout};
+await_telemetry(Event, PeerNode, TimeoutMs) ->
+    ExpectedNodeLabel = list_to_binary(atom_to_list(PeerNode)),
+    Start = erlang:monotonic_time(millisecond),
+    receive
+        {telemetry, Event, #{node := ExpectedNodeLabel}} ->
+            ok;
+        {telemetry, _OtherEvent, _Meta} ->
+            Elapsed = erlang:monotonic_time(millisecond) - Start,
+            await_telemetry(Event, PeerNode, TimeoutMs - Elapsed)
+    after TimeoutMs ->
+        {error, timeout}
+    end.
+
+%% Default connection mode — auto-connects via distribution as part of
+%% starting. Used where the test wants an already-live peer to observe or
+%% dial (redundantly and harmlessly) against.
+start_peer() ->
+    {ok, Peer, PeerNode} = peer:start_link(#{
+        name => peer:random_name(?MODULE),
+        args => ["-pa" | code:get_path()]
+    }),
+    {ok, Peer, PeerNode}.
+
+%% `connection => standard_io` — the peer's control channel is stdio, not
+%% distribution, so the node starts genuinely disconnected and survives an
+%% explicit `erlang:disconnect_node/1` (a default-mode peer does not — see
+%% do_tick_connects_a_genuinely_disconnected_peer_test_'s comment).
+start_disconnected_peer() ->
+    {ok, Peer, PeerNode} = peer:start_link(#{
+        name => peer:random_name(?MODULE),
+        connection => standard_io,
+        args => ["-pa" | code:get_path()]
+    }),
+    {ok, Peer, PeerNode}.
+
+stop_peer(Peer) ->
+    catch peer:stop(Peer),
+    ok.

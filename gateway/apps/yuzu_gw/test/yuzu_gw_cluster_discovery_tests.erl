@@ -1,0 +1,103 @@
+%%%-------------------------------------------------------------------
+%%% @doc Unit tests for yuzu_gw_cluster_discovery — HA WS-4 `#4555` gateway
+%%% cluster formation (ADR-2002 §7b).
+%%%
+%%% Real multi-node mesh formation (two live `peer` nodes actually connecting
+%%% via this module's redial loop) is exercised by
+%%% `yuzu_gw_cluster_formation_multinode_tests.erl`, mirroring the empirical
+%%% rigor the HA WS-4 4.3a review required for distributed-Erlang claims. This
+%%% module covers the PURE logic in isolation — no real DNS lookup, no real
+%%% distribution — so a CI sandbox's network posture can never make these
+%%% flaky.
+%%% @end
+%%%-------------------------------------------------------------------
+-module(yuzu_gw_cluster_discovery_tests).
+-include_lib("eunit/include/eunit.hrl").
+
+%%%===================================================================
+%%% own_short_name/1 — pure
+%%%===================================================================
+
+own_short_name_splits_at_at_sign_test() ->
+    ?assertEqual("yuzu_gw", yuzu_gw_cluster_discovery:own_short_name('yuzu_gw@10.0.0.5')).
+
+%% The eunit runner's own non-distributed sentinel node name DOES contain an
+%% '@' (it is spelled 'nonode@nohost'), so it splits like any other node atom.
+own_short_name_handles_nonode_sentinel_test() ->
+    ?assertEqual("nonode",
+                 yuzu_gw_cluster_discovery:own_short_name('nonode@nohost')).
+
+%% A genuinely '@'-free atom (not a real node() shape, but a defined input)
+%% falls back to the whole atom's string form rather than crashing.
+own_short_name_handles_no_at_sign_test() ->
+    ?assertEqual("malformed",
+                 yuzu_gw_cluster_discovery:own_short_name(malformed)).
+
+own_short_name_zero_arity_matches_node_test() ->
+    ?assertEqual(yuzu_gw_cluster_discovery:own_short_name(node()),
+                 yuzu_gw_cluster_discovery:own_short_name()).
+
+%%%===================================================================
+%%% targets_from_addrs/1 — pure
+%%%===================================================================
+
+targets_from_addrs_empty_test() ->
+    ?assertEqual([], yuzu_gw_cluster_discovery:targets_from_addrs([])).
+
+targets_from_addrs_uses_own_short_name_test() ->
+    Short = yuzu_gw_cluster_discovery:own_short_name(),
+    Expected = [list_to_atom(Short ++ "@10.0.0.1"), list_to_atom(Short ++ "@10.0.0.2")],
+    ?assertEqual(Expected,
+        yuzu_gw_cluster_discovery:targets_from_addrs(["10.0.0.1", "10.0.0.2"])).
+
+%%%===================================================================
+%%% resolve_targets/0 — static-override path (deterministic; no network)
+%%%===================================================================
+
+resolve_targets_static_override_test_() ->
+    {setup,
+     fun() ->
+         Prev = application:get_env(yuzu_gw, cluster_seed_nodes, []),
+         application:set_env(yuzu_gw, cluster_seed_nodes,
+                              [<<"10.1.2.3">>, <<"10.1.2.4">>]),
+         Prev
+     end,
+     fun(Prev) -> application:set_env(yuzu_gw, cluster_seed_nodes, Prev) end,
+     fun(_Prev) ->
+         [{"replaces DNS resolution outright with the explicit list",
+           fun() ->
+               Short = yuzu_gw_cluster_discovery:own_short_name(),
+               Expected = [list_to_atom(Short ++ "@10.1.2.3"),
+                           list_to_atom(Short ++ "@10.1.2.4")],
+               ?assertEqual(Expected, yuzu_gw_cluster_discovery:resolve_targets())
+           end}]
+     end}.
+
+%% An empty static-override list falls through to DNS resolution (exercised
+%% here only as far as "does not crash and returns a list" — the seed name
+%% defaults to "gateway", which will not resolve in a CI sandbox, and that
+%% empty-result case IS the fail-open behavior under test: no peers found is
+%% not an error).
+resolve_targets_empty_static_falls_through_without_crashing_test_() ->
+    {setup,
+     fun() -> application:get_env(yuzu_gw, cluster_seed_nodes, []) end,
+     fun(Prev) -> application:set_env(yuzu_gw, cluster_seed_nodes, Prev) end,
+     fun(_Prev) ->
+         [{"empty static list does not crash and returns a list",
+           fun() ->
+               application:set_env(yuzu_gw, cluster_seed_nodes, []),
+               Result = yuzu_gw_cluster_discovery:resolve_targets(),
+               ?assert(is_list(Result))
+           end}]
+     end}.
+
+%% NOTE: a supervised-start test deliberately does NOT live here. This
+%% eunit suite runs every test module in ONE shared VM, and
+%% yuzu_gw_registry_multinode_tests.erl's ensure_distributed/0 (HA WS-4
+%% 4.3a) turns that shared VM distributed and never reverts it (a known,
+%% tracked hygiene gap, #4575 item 1) — so whether node() is
+%% 'nonode@nohost' by the time THIS module's tests run depends on eunit's
+%% module execution order, which this suite must not assume either way.
+%% Starting yuzu_gw_cluster_discovery for real, in a genuinely distributed
+%% VM with a controlled peer to actually connect to, is covered instead by
+%% yuzu_gw_cluster_formation_multinode_tests.erl.

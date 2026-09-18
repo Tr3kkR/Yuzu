@@ -264,9 +264,31 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
     %% every StreamStatusNotification sent upstream so the server's
     %% routing directory can record which cluster owns an agent's live
     %% stream. Override: YUZU_GW_CLUSTER_ID
-    {cluster_id, <<"default">>}
+    {cluster_id, <<"default">>},
+
+    %% HA WS-4 #4555 -- gateway multi-node cluster FORMATION (ADR-2002 §7b),
+    %% distinct from cluster_id above: what to RESOLVE to find peer
+    %% addresses, not the logical cluster identifier. Override:
+    %% YUZU_GW_SEED_DNS_NAME
+    {cluster_seed_dns_name, <<"gateway">>},
+
+    %% Explicit peer address list; when non-empty REPLACES DNS resolution
+    %% outright (never merged). Override: YUZU_GW_SEED_NODES
+    %% (e.g. "10.0.0.1,10.0.0.2")
+    {cluster_seed_nodes, []},
+
+    %% Always-on redial loop interval (ms), fixed, no backoff. Override:
+    %% YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS
+    {cluster_redial_interval_ms, 5000}
 ]}
 ```
+
+**`YUZU_GW_ADVERTISE_ADDR`** (env var only, no `sys.config` key — consumed by
+`deploy/docker/gateway-entrypoint.sh` before the BEAM starts, not by
+application code): overrides auto-detection of this node's own advertised
+distribution address. Needed on a bare-VM/multi-NIC host or a container
+behind NAT where auto-detection is ambiguous or wrong; every gateway node
+otherwise auto-detects it with zero configuration under Docker Compose.
 
 ### TLS posture (M1)
 
@@ -388,6 +410,15 @@ unauthenticated RCE (#659). For local dev/CI where distribution is not
 exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
 in a cluster must share the same cookie.
 
+The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4
+`#4555`): DNS-based cluster discovery means a node dials addresses it did not
+choose by hand, and the distribution handshake's initiator sends the cookie
+hash first — a short cookie is brute-forceable offline from a
+legitimately-dialing node, a materially different exposure than a hand-typed
+static seed list carried. `openssl rand -hex 32` above already clears this
+floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
+bypasses the length check too.
+
 > **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
 > boot guard and restores the unauthenticated inter-node RPC surface (#659); it
 > exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
@@ -501,17 +532,43 @@ Test-only dependencies (loaded in the `test` profile):
 
 ## Gateway Clustering
 
-> **Status: PLANNED -- NOT YET IMPLEMENTED (Issue 7.1.1)**
+> **Status: cluster FORMATION implemented (HA WS-4 `#4555`, ADR-2002 §7b);
+> adjacency/load-shedding/latency-redistribution below remain PLANNED
+> (Issue 7.1.1 / WS-4 4.4).**
 
-The current gateway runs as a single Erlang node. Planned clustering support
-will enable multiple gateway nodes to form a distributed cluster for
-horizontal scaling and fault tolerance.
+Multiple gateway nodes now form a real distributed-Erlang mesh: each node
+runs an always-on redial loop (`yuzu_gw_cluster_discovery`) that resolves
+peer addresses — by default a DNS lookup on a configurable seed name
+(`YUZU_GW_SEED_DNS_NAME`, default `gateway`, matching the reference Compose
+service name — a scaled `docker compose up --scale gateway=N` needs zero
+extra config), or an explicit `YUZU_GW_SEED_NODES` address list for a no-DNS
+deployment — and connects to each via `net_kernel:connect_node/1`, forever,
+on a fixed interval (no backoff). Every gateway replica shares one fixed
+short name and is distinguished only by an address resolved at boot
+(`YUZU_GW_ADVERTISE_ADDR`, auto-detected by default); nodes are otherwise
+interchangeable. A node that finds no peers boots standalone anyway and
+keeps retrying — cluster formation is fail-open, never a new way for a
+discovery hiccup to become an agent-facing outage. See ADR-2002 §7b for the
+full mechanism-choice record and `docker-compose.reference-gateway-cluster.yml`
+for a runnable demo.
+
+Forming the mesh is what makes HA WS-4 4.3a's per-agent cross-node `pg`
+routing (agents connecting to a *different* node than the one dispatching a
+command) actually take effect — before `#4555`, that routing code was
+component-complete but inert, since `pg` group membership only replicates
+across *connected* nodes.
+
+**Not yet implemented** — the adjacency table, load-shedding, and
+latency-based redistribution features below, which build ON TOP OF the mesh
+`#4555` forms, remain the rest of WS-4 4.3 and 4.4:
 
 > **Note:** the `cluster_id` config key (see [Configuration](#configuration))
-> already exists and is stamped onto every `StreamStatusNotification` as a
-> routing-directory tag (HA WS-4 4.1, ADR-2002 §7) — but multi-node gateway
-> clustering as described below is not yet implemented; today `cluster_id`
-> only labels which trust-zone/region a single gateway node belongs to.
+> is a separate, logical trust-zone/region identifier — a database key for
+> the routing directory (HA WS-4 4.1, ADR-2002 §7) — distinct from
+> `YUZU_GW_SEED_DNS_NAME` above, which is what to *resolve* to find peers.
+> Two gateway nodes can share a `cluster_id` without being meshed, or (in a
+> misconfiguration) be meshed without sharing one — the mesh and the logical
+> cluster identity are independently configured.
 
 ### Planned Features
 
@@ -569,6 +626,9 @@ that are actually emitted are listed.
 | `yuzu_gw_upstream_rpc_errors_total` | counter | Upstream RPC errors (labels `rpc_name`, `code`) |
 | `yuzu_gw_registration_replay_total` | counter | Agents re-proxied upstream by the registration-replay drip after an upstream reconnect |
 | `yuzu_gw_registration_replay_queue_depth` | gauge | Agents still queued for registration replay (0 = idle, label `node`). A persistently non-zero value indicates a replay that never drains — alert on it. |
+| `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
+| `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
+| `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in
@@ -579,9 +639,12 @@ for the canonical catalogue.
 
 | Metric | Type | Description |
 |---|---|---|
-| `yuzu_gw_cluster_nodes` | gauge | Number of nodes in the gateway cluster |
 | `yuzu_gw_agent_migrations_total` | counter | Agents migrated between nodes |
 | `yuzu_gw_goaway_sent_total` | counter | GOAWAY frames sent for load shedding |
+
+(`yuzu_gw_cluster_nodes` — cluster size — is superseded by
+`yuzu_gw_cluster_peers_connected` above, shipped with `#4555`; this node's
+total cluster size is `peers_connected + 1`.)
 
 ### Scrape Configuration
 

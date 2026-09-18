@@ -6,8 +6,10 @@
 %%%   2. yuzu_gw_upstream          — gRPC client + circuit breaker
 %%%   3. yuzu_gw_heartbeat_buffer  — dedicated heartbeat batching worker
 %%%   4. yuzu_gw_router            — command fanout coordinator
-%%%   5. yuzu_gw_health            — HTTP health/readiness endpoint
-%%%   6. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
+%%%   5. yuzu_gw_gauge             — periodic VM/agent gauge emitter
+%%%   6. yuzu_gw_cluster_discovery — cluster-formation redial loop (#4555)
+%%%   7. yuzu_gw_health            — HTTP health/readiness endpoint
+%%%   8. yuzu_gw_agent_sup         — simple_one_for_one for agent processes
 %%% @end
 %%%-------------------------------------------------------------------
 -module(yuzu_gw_sup).
@@ -77,6 +79,16 @@ init([]) ->
 
         #{id       => yuzu_gw_gauge,
           start    => {yuzu_gw_gauge, start_link, []},
+          restart  => permanent,
+          shutdown => 5000,
+          type     => worker},
+
+        %% HA WS-4 #4555 — always-on cluster-formation redial loop (ADR-2002
+        %% §7b). `permanent` restart is the loop's entire "own supervision
+        %% strategy": a crash here restarts a fresh gen_server that
+        %% immediately re-ticks, same as every other worker in this tree.
+        #{id       => yuzu_gw_cluster_discovery,
+          start    => {yuzu_gw_cluster_discovery, start_link, []},
           restart  => permanent,
           shutdown => 5000,
           type     => worker},
