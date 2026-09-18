@@ -172,11 +172,15 @@ launchctl_rows_to_services(std::span<const yuzu::shared::LaunchctlRow> rows) {
 /// -- blank lines already dropped and a trailing '\r' already stripped by
 /// the runner) straight into this file's ServiceParseResult vocabulary.
 /// Composes the shared raw row parser with launchctl_rows_to_services()
-/// above; behaviourally identical to the pre-A0 inline body for every input
-/// this file's tests exercise. A structurally malformed header (UP-6 --
+/// above; behaviourally identical to the pre-A0 inline body for a
+/// well-formed capture (governance A0 fix round, cpp3-2: this is now FALSE
+/// for a zero-line capture -- UP2-2 flipped that case's `malformed` from
+/// false to true, a deliberate behaviour change from the pre-A0 body, not a
+/// pure refactor). A structurally malformed header (UP-6 --
 /// yuzu::shared::parse_launchctl_list's own `malformed`, e.g. a missing or
-/// preamble-preceded header row) propagates through as `malformed` here too,
-/// on top of the per-row BR-service-001 check.
+/// preamble-preceded header row, OR an empty capture, UP2-2) propagates
+/// through as `malformed` here too, on top of the per-row BR-service-001
+/// check.
 inline ServiceParseResult parse_launchctl_list(const std::vector<std::string>& lines) {
     auto raw = yuzu::shared::parse_launchctl_list(lines);
     auto out = launchctl_rows_to_services(raw.rows);
