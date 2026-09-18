@@ -134,7 +134,15 @@ TEST_CASE("parse_systemctl_list_units: real --plain capture has no marker column
 // ── parse_launchctl_list ─────────────────────────────────────────────────────
 
 TEST_CASE("parse_launchctl_list: empty input yields empty output", "[tar_service]") {
-    CHECK(parse_launchctl_list({}).entries.empty());
+    auto result = parse_launchctl_list({});
+    CHECK(result.entries.empty());
+    // UP2-2 (governance A0 fix round, HIGH): a zero-line capture is
+    // malformed, not a genuine "no services" answer -- a real launchctl
+    // list exit-0 invocation always emits at least the header row. This
+    // case's expectation flipped false->true in the same fix; lock it at
+    // this layer too (sec3-2/qe3-2/C2-3 -- the raw-parser layer already
+    // asserts it, but this tar-layer wrapper case was left unasserted).
+    CHECK(result.malformed);
 }
 
 TEST_CASE("parse_launchctl_list: header-only input yields empty output", "[tar_service]") {
