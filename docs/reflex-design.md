@@ -225,7 +225,7 @@ drift.** If the content changes between review and approve (an editor saves a ne
 the approval call's digest no longer matches the row's *current* digest, and the server returns a
 `409` — approving stale content is not silently accepted as approving the current row. The digest is
 also **recomputed and compared at every compile** (`reflex_push_builder.cpp`), fail-closed on
-mismatch or absence: see "Generation and undeploy semantics" below for the exact push-time refusal
+mismatch or absence: see "Generation, undeploy, and push semantics" below for the exact push-time refusal
 behavior (a stale/invalid-digest set is never silently downgraded, and a `reflex.set.compile_refused`
 critical audit event fires).
 
@@ -386,7 +386,7 @@ server-side by counting `suppressed_sampled` events — sampling means most supp
 event at all (that is the point of sampling), so a server-derived count would systematically
 undercount. `suppressed_total` in `ReflexStatus`/`ReflexSetStatus` is the agent's own running
 counter of every suppression, journal-persisted (see "Generation, undeploy, and push semantics"
-above), independent of how many of those suppressions were *also* sampled into an emitted event.
+below), independent of how many of those suppressions were *also* sampled into an emitted event.
 
 **Upgrading agents before servers is UNSAFE; server-first is mandatory, not merely preferred.**
 `family` (field 21) and its closed-set validation at the ingest router are both **new in this same
