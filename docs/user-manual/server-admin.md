@@ -208,6 +208,35 @@ For Docker, automated, and quick-start deployments, the following `yuzu-server.c
 
 ## Upgrade Notes
 
+### vNEXT — human API-token self-rotation is now reachable under the default config, and covers your own MCP-tiered/scoped tokens (#2963; NOT breaking)
+
+New, non-breaking, purely additive. No operator action required.
+
+Before this change, `POST /api/v1/tokens/{id}/rotate`/`.../confirm` (and the
+MCP twins `rotate_api_token`/`confirm_api_token_rotation`) composed the
+shipped RBAC-off default with the store's self-service-only ownership check
+into something reachable by nobody but an admin out of the box — a plain
+non-admin owner of a token got `403` trying to rotate their own credential.
+Separately, a dashboard/cookie session could never rotate or confirm its own
+MCP-tiered or service-scoped token — only that exact token's own credential
+could, which was backwards precisely when the token's secret is under
+suspicion.
+
+**What changes:** any authenticated, non-admin owner of a token can now
+self-rotate it under the default configuration, and a plain interactive
+session can now rotate/confirm any of its own tokens regardless of that
+token's own tier/scope. Nothing that previously succeeded now fails — this
+only widens which previously-403/400'd callers now get `200`. The minted
+successor still always inherits the token's own tier/scope and expiry
+verbatim; no caller can mint a credential broader than the one it replaces.
+A token within 24 hours of its own expiry still cannot be rotated (mint a
+new one instead) — unchanged, by design.
+
+See `docs/user-manual/authentication.md` "Rotating a Token" for the full
+operator-facing detail, and
+`docs/security-reviews/2963-token-rotation-default-permission-2026-09-17.md`
+for the decision record.
+
 ### vNEXT — the server now elects a background-work leader at startup (HA WS-3; NOT breaking)
 
 New, non-breaking, and inert on a single-server deployment. As one step toward
