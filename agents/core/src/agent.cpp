@@ -46,6 +46,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "sync_source_app_perf.hpp"           // DEX app-perf-over-time B1 source
 #include "sync_source_device_ci.hpp"          // ADR-0016 device-CI inventory source
 #include "sync_source_software_licensing.hpp" // SLE (ADR-0024) software_licensing source
+#include "sync_source_app_usage.hpp"          // Wave 7 PR7.2 app_usage (last_used) source
 #include "dex_event.hpp" // SignalObservation -> GuaranteedStateEvent mapping (proto-aware)
 #include "dex_linux_proc.hpp" // A4 Linux heartbeat perf reads (parse_proc_stat / parse_commit_pct)
 #include "dex_perf_breach.hpp" // A4: heartbeat device-utilization tags (perf counter reads)
@@ -2123,6 +2124,9 @@ public:
                     const YuzuPluginDescriptor* netcfg_descriptor = nullptr;
                     // SLE (ADR-0024): the software_licensing source's backing plugin.
                     const YuzuPluginDescriptor* license_descriptor = nullptr;
+                    // Wave 7 PR7.2: the app_usage source's backing plugin (last-used
+                    // state, read-only over TAR's usage_daily fold).
+                    const YuzuPluginDescriptor* app_usage_descriptor = nullptr;
                     for (const auto& handle : plugins_) {
                         const std::string_view pname{handle.descriptor()->name};
                         if (pname == "installed_apps")
@@ -2139,6 +2143,8 @@ public:
                             netcfg_descriptor = handle.descriptor();
                         else if (pname == "license_scan")
                             license_descriptor = handle.descriptor();
+                        else if (pname == "app_usage")
+                            app_usage_descriptor = handle.descriptor();
                     }
                     if (cfg_.inventory_disable) {
                         // Deploy-time opt-out (ADR-0016 / works-council co-determination
@@ -2147,13 +2153,14 @@ public:
                         spdlog::info("Daily-sync disabled (--inventory-disable / "
                                      "YUZU_AGENT_INVENTORY_DISABLE) — no inventory collected or "
                                      "pushed (sources: installed_software, app_perf, device_ci, "
-                                     "software_licensing)");
+                                     "software_licensing, app_usage)");
                     } else {
                     sync_stop_.store(false, std::memory_order_release);
                     auto sync_stub = pb::AgentService::NewStub(channel);
                     sync_thread_ = std::thread([this, ia_descriptor, tar_descriptor, hw_descriptor,
                                                 devid_descriptor, osinfo_descriptor,
                                                 netcfg_descriptor, license_descriptor,
+                                                app_usage_descriptor,
                                                 sync_stub = std::move(sync_stub)]() {
                         auto should_stop = [this]() {
                             return stop_requested_.load(std::memory_order_acquire) ||
@@ -2251,15 +2258,23 @@ public:
                             scheduler.add_source(make_software_licensing_source(
                                 license_descriptor, std::move(lic_cfg)));
                         }
+                        // Wave 7 PR7.2: per-executable last-used state, derived from TAR's
+                        // usage_daily fold via the read-only app_usage plugin. Idles when
+                        // the app_usage plugin isn't loaded (null descriptor) or TAR's usage
+                        // source is disabled (constrained capture — skipped, not idled).
+                        // Registered here (before installed_software) rather than last: it's
+                        // a fast, local SQLite read, not the slow collector the reorder below
+                        // exists to deprioritize.
+                        scheduler.add_source(make_app_usage_source(app_usage_descriptor));
                         // Registers LAST (round-3 item 4 / sync-speed fix): SyncScheduler's
                         // per-forced-source immediate-RPC pass (tick()) processes forced
                         // indices in ascending registration order, so when the header's
-                        // "Sync now" forces ALL FOUR sources at once (kAllSources), the
-                        // three fast collectors above report back to the server before this
-                        // one's — installed_software's macOS leg alone can take several
-                        // seconds (system_profiler + per-package pkgutil spawns) — even
-                        // starts. Registration order carries NO persisted meaning (KV keys
-                        // and request_now()'s name match are both name-keyed, per
+                        // "Sync now" forces every source at once (kAllSources), the faster
+                        // collectors above report back to the server before this one's —
+                        // installed_software's macOS leg alone can take several seconds
+                        // (system_profiler + per-package pkgutil spawns) — even starts.
+                        // Registration order carries NO persisted meaning (KV keys and
+                        // request_now()'s name match are both name-keyed, per
                         // sync_scheduler.hpp's own contract), so this reorder is safe.
                         scheduler.add_source(make_installed_software_source(ia_descriptor));
                         // Publish AFTER the last add_source: request_now() reads sources_
@@ -2268,8 +2283,8 @@ public:
                             std::lock_guard<std::mutex> lk(sync_sched_mu_);
                             sync_scheduler_ = scheduler_ptr;
                         }
-                        spdlog::info("Daily-sync thread started (sources=4: installed_software, "
-                                     "app_perf, device_ci, software_licensing)");
+                        spdlog::info("Daily-sync thread started (sources=5: installed_software, "
+                                     "app_perf, device_ci, software_licensing, app_usage)");
                         while (!should_stop()) {
                             auto now_secs = std::chrono::duration_cast<std::chrono::seconds>(
                                                 std::chrono::system_clock::now().time_since_epoch())

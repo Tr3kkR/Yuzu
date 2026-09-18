@@ -54,6 +54,12 @@
 /// EXTEND this set, never fork it — a second copy of a floor set is exactly
 /// the kind of drift the repo's other chokepoints (`dispatch_confined_arms.hpp`,
 /// `principal_quota_gate.hpp`) exist to prevent.
+///
+/// `legacy_self_service_allow.hpp` is this file's counterpart in the SAME two
+/// legacy branches (#2963) — checked in the same order, at the same two call
+/// sites — but widening rather than flooring: a narrow, self-targeted
+/// exception from the "non-Read needs admin" rule, never overriding this
+/// floor (a floored pair can never also be self-service-exempt).
 namespace yuzu::server {
 
 /// One (securable, operation) pair in the topology floor.

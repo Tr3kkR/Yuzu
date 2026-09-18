@@ -1,5 +1,7 @@
 #include "workflow_model.hpp"
 
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
+
 namespace yuzu::server {
 
 namespace {
@@ -95,6 +97,16 @@ void strip_agents_reached(nlohmann::json& j) {
 } // namespace
 
 nlohmann::json confined_workflow_step_result_json(const std::string& result_json, bool confined) {
+    // #2437-class guard: check nesting on the RAW stored text BEFORE parse.
+    // WorkflowEngine's own dispatch-result write path (workflow_engine.cpp)
+    // guards against a poisoned result reaching this column, but that
+    // write-side guard cannot heal a row already stored before it shipped,
+    // or one written by direct DB manipulation - this read path stays
+    // reachable against such a row, and every OTHER stored-data read path in
+    // this fix (Guardian dashboard, result-set re-eval, inventory reads,
+    // discovery catalogs) got the same treatment for the same reason.
+    if (mcp::json_exceeds_depth(result_json, mcp::kMcpMaxJsonDepth))
+        return nlohmann::json{{"error", "stored result exceeded maximum JSON nesting depth"}};
     auto result = nlohmann::json::parse(result_json, nullptr, false);
     if (result.is_discarded())
         return nullptr;
