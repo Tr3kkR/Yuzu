@@ -296,6 +296,46 @@ std::optional<DiskTotals> sum_block_storage_stats_empty_iterator_for_test() {
     return sum_block_storage_stats(it.get());
 }
 
+namespace {
+
+// Sets `key` in `dict` to a CFNumber wrapping `*value`, or leaves it entirely absent when
+// `value` is nullopt — the omission that drives read_driver_stats()'s kSkip arm.
+void set_stat_key_for_test(CFMutableDictionaryRef dict, CFStringRef key,
+                            std::optional<std::int64_t> value) {
+    if (!value)
+        return;
+    ScopedCFRef<CFNumberRef> num{CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &*value)};
+    CFDictionarySetValue(dict, key, num.get());
+}
+
+} // namespace
+
+DriverStatFixtureResult read_driver_stats_for_test(
+    std::optional<std::int64_t> bytes_read, std::optional<std::int64_t> bytes_written,
+    std::optional<std::int64_t> reads, std::optional<std::int64_t> writes,
+    std::optional<std::int64_t> read_time_ns, std::optional<std::int64_t> write_time_ns) {
+    ScopedCFRef<CFMutableDictionaryRef> dict{CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks)};
+    set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey), bytes_read);
+    set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey),
+                          bytes_written);
+    set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsReadsKey), reads);
+    set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsWritesKey), writes);
+    set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsTotalReadTimeKey),
+                          read_time_ns);
+    set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsTotalWriteTimeKey),
+                          write_time_ns);
+
+    DiskTotals accumulated{};
+    const auto outcome = read_driver_stats(dict.get(), accumulated);
+    DriverStatFixtureResult result;
+    result.skipped = (outcome == DriverStatOutcome::kSkip);
+    result.corrupt = (outcome == DriverStatOutcome::kCorrupt);
+    if (outcome == DriverStatOutcome::kAccumulated)
+        result.accumulated = accumulated;
+    return result;
+}
+
 std::optional<int> read_memorystatus_level() {
     // Reuses the sysctl_value<T> helper declared above (read_vm_snapshot's block) —
     // one copy per TU, not one per call site.

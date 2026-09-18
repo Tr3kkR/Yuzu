@@ -291,6 +291,39 @@ TEST_CASE("sum_block_storage_stats's empty-iterator arm reports invalid",
     CHECK_FALSE(out->valid);
 }
 
+TEST_CASE("read_driver_stats's kSkip/kCorrupt/kAccumulated arms via a CF-dictionary fixture",
+          "[dex][macos][perf][darwin]") {
+    // Governance C-3: no live driver on this box's IOKit registry has a malformed or
+    // corrupt "Statistics" dict, so kSkip and kCorrupt are otherwise unreachable from a
+    // test here. Drives the SAME read_driver_stats() the production walk uses via a real
+    // CFDictionary built from these six values, so the key-reading/type-checking code is
+    // genuinely exercised, not reimplemented.
+
+    SECTION("all six keys present and non-negative -> kAccumulated") {
+        const auto r = read_driver_stats_for_test(100, 200, 10, 20, 1'000, 2'000);
+        CHECK_FALSE(r.skipped);
+        CHECK_FALSE(r.corrupt);
+        CHECK(r.accumulated.read_bytes == 100);
+        CHECK(r.accumulated.write_bytes == 200);
+        CHECK(r.accumulated.reads == 10);
+        CHECK(r.accumulated.writes == 20);
+        CHECK(r.accumulated.read_time_ns == 1'000);
+        CHECK(r.accumulated.write_time_ns == 2'000);
+    }
+
+    SECTION("one key omitted -> kSkip, not fatal") {
+        const auto r = read_driver_stats_for_test(100, 200, 10, 20, 1'000, std::nullopt);
+        CHECK(r.skipped);
+        CHECK_FALSE(r.corrupt);
+    }
+
+    SECTION("one negative value among six present keys -> kCorrupt") {
+        const auto r = read_driver_stats_for_test(100, 200, 10, 20, 1'000, -1);
+        CHECK_FALSE(r.skipped);
+        CHECK(r.corrupt);
+    }
+}
+
 TEST_CASE("read_memorystatus_level reads a value in [0,100]", "[dex][macos][perf][darwin]") {
     const auto level = read_memorystatus_level();
     require_or_skip(level.has_value(), "read_memorystatus_level");

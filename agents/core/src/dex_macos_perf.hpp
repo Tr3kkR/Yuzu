@@ -164,6 +164,29 @@ YUZU_EXPORT DiskTotals read_disk_totals();
 /// on the IOServiceGetMatchingServices lookup itself failing (inconclusive either way —
 /// distinct from a present DiskTotals with valid==false, the arm this seam pins).
 YUZU_EXPORT std::optional<DiskTotals> sum_block_storage_stats_empty_iterator_for_test();
+
+/// TEST-ONLY result of read_driver_stats_for_test(): mirrors the file-private
+/// read_driver_stats()'s tri-state contract without exposing its production-only
+/// DriverStatOutcome enum. Exactly one of `skipped`/`corrupt` is true, or neither (in
+/// which case `accumulated` holds the reduction); never more than one.
+struct DriverStatFixtureResult {
+    bool skipped{false};
+    bool corrupt{false};
+    DiskTotals accumulated{};
+};
+
+/// TEST-ONLY seam pinning the file-private read_driver_stats()'s kSkip and kCorrupt arms
+/// (governance C-3): no live driver on this box's IOKit registry reaches either — every
+/// real "Statistics" dict here carries all 6 keys with non-negative values. Builds a real
+/// CFDictionary with the same 6 keys read_driver_stats() reads and runs it through that
+/// SAME function, so the production key-reading/type-checking code is genuinely
+/// exercised, not reimplemented. Each of the six parameters is nullopt to OMIT that key
+/// (drives kSkip when any one is omitted) or a value (negative among six otherwise-present
+/// keys drives kCorrupt; six non-negative values drive kAccumulated).
+YUZU_EXPORT DriverStatFixtureResult read_driver_stats_for_test(
+    std::optional<std::int64_t> bytes_read, std::optional<std::int64_t> bytes_written,
+    std::optional<std::int64_t> reads, std::optional<std::int64_t> writes,
+    std::optional<std::int64_t> read_time_ns, std::optional<std::int64_t> write_time_ns);
 #endif
 
 /// Darwin: one sysctlbyname("kern.memorystatus_level") read. nullopt on failure, on
