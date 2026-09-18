@@ -205,7 +205,8 @@ DriverStatOutcome read_driver_stats(CFDictionaryRef dict, DiskTotals& out) {
     return DriverStatOutcome::kAccumulated;
 }
 
-// File-private: read_disk_totals() below is the only caller. Sums every
+// File-private: read_disk_totals() below is the only PRODUCTION caller (the test-only
+// sum_block_storage_stats_empty_iterator_for_test() is the walk's other caller). Sums every
 // IOBlockStorageDriver's "Statistics" dict reachable from `it` via read_driver_stats().
 DiskTotals sum_block_storage_stats(io_iterator_t it) {
     DiskTotals out;
