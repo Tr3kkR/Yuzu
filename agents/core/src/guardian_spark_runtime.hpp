@@ -665,6 +665,24 @@ public:
     [[nodiscard]] std::uint64_t wedged_reobservations() const noexcept {
         return wedged_reobservations_.load(std::memory_order_relaxed);
     }
+    /// Governance Gate 8 fix (rung 9c PR-5d /governance run): a wedged claim's
+    /// late arm success was refused adoption because `rules_` already held an
+    /// entry for its rule_id - NOT necessarily a bug. Reachable via entirely
+    /// ordinary desired-state churn, no fault injection needed: rule R wedges on
+    /// key A; R is redeployed to key B (commits normally, `rules_[R]` now live on
+    /// B); R is redeployed BACK to key A while the ORIGINAL key-A arm is still
+    /// in flight - `is_retained_wedge()` never consults `rg->active`, so the
+    /// still-outstanding claim is genuinely re-observed and its adoption
+    /// candidacy restored; when that original arm eventually completes, this
+    /// counter increments and the stale success is safely disarmed instead of
+    /// being adopted over the live key-B generation. A sustained, climbing rate
+    /// is worth investigating (a rule redeploying faster than its own arm calls
+    /// resolve), but a nonzero count alone is NOT itself evidence of a bug -
+    /// unlike wedged_refusals_/wedged_reobservations_ above, whose triggers are
+    /// narrower. Lock-free.
+    [[nodiscard]] std::uint64_t wedge_adopt_stale_refused() const noexcept {
+        return wedge_adopt_stale_refused_.load(std::memory_order_relaxed);
+    }
     /// rung 9c R5.2: completion-callback drains whose OWN bookkeeping threw (not a
     /// commit throw, which is delivered to the waiter) - the firewall published a
     /// terminal outcome on every claim and dropped the entry. Lock-free.
@@ -763,6 +781,19 @@ public:
     /// index_->remove_rule's own key-copy allocation would, BEFORE the mapping or the
     /// claim's index_held flag is touched.
     void set_index_remove_fault_for_test(bool on) noexcept;
+    /// rung 9c PR-5d adversarial-review fault seam (Blocker 2, widened at Gate 7 to
+    /// cover Blocker 1's own reorder fix): consumed once by WHICHEVER of the two
+    /// wedged_by_rule_.insert_or_assign() call sites reaches it first -
+    /// abandon_claim_locked()'s dispatched (non-Queued), non-stopping path, OR
+    /// attach_core()'s Reobserved-restore branch. Throws std::bad_alloc where that
+    /// insert's node allocation would, BEFORE the site's own irreversible write
+    /// (abandon_claim_locked: release_claim_index_locked/waiter_abandoned/end;
+    /// attach_core: rg->active=true). Proves a throw at either site leaves its
+    /// claim completely untouched/retry-safe rather than stranding a partially-
+    /// abandoned or wrongly-reactivated, adoption-eligible claim with no locator
+    /// entry to find it. A test driving one site must not assume the other is
+    /// unconsumed - the flag is one-shot across BOTH.
+    void set_wedge_locator_fault_for_test(bool on) noexcept;
     /// R5.2 detach post-mutation fault seam (adversarial re-review r3 C4): consumed
     /// once by the next detach_rule_locked. 1 = std::bad_alloc where the lifecycle-kind
     /// string copy allocates (now BEFORE the durable mutation: the detach fails cleanly
@@ -1211,6 +1242,19 @@ public:
     ReceiptStatus receipt_status(const ArmReceipt& receipt) const;
     /// Convenience: receipt_status(receipt) != ReceiptStatus::Pending.
     bool is_terminal(const ArmReceipt& receipt) const;
+    /// rung 9c PR-5d (concern 2, arm-recovery): true iff `receipt`'s own claim has
+    /// been ADOPTED - i.e. rules_ currently carries a live generation for that
+    /// claim's rule_id AND it is EXACTLY this claim's own (rule_id, generation)
+    /// incarnation, not a newer or older one that happens to share the rule_id.
+    /// `end`/`receipt_status()` never change on adoption (the sticky-Wedged
+    /// receipt stays Wedged - a per-episode historical fact, docs/spark-stage2-
+    /// guardian-consumer-design.md R5.3), so this is a SEPARATE signal a ledger's
+    /// own maintenance drain uses to notice a late-success recovery on a claim it
+    /// is still holding as a retained failure - see GuardianArmAckLedger::
+    /// drain_locked(). False for a default-constructed / empty receipt (nothing
+    /// to recover) and false for any receipt whose claim was never adopted.
+    /// registry_mu_ taken internally.
+    [[nodiscard]] bool receipt_recovered(const ArmReceipt& receipt) const;
 
     enum class ArmOutcomeKind { Armed, Accepted };
     /// The non-waiting attach_rule() overload's success result. Never encodes
@@ -1672,6 +1716,89 @@ private:
     /// keys_/index_/rules_ above). See KeyClaim's doc; empty in steady state, an entry
     /// exists only while a key has an arm or disarm in flight, queued, or retained.
     std::unordered_map<std::string, KeyClaimQueue> claims_;
+    /// rung 9c PR-5d (concern 1, adoption): a locator from rule_id to its currently
+    /// wedged claim, if any - registry_mu_-guarded, same as claims_/rules_/index_
+    /// above. Populated by TWO sites, corrected here (this comment previously said
+    /// "Populated ONLY by abandon_claim_locked()", which is false and has been
+    /// since 2131dc973 ("Adversarial-review Blocker 1", rung 9c PR-5d) first gave
+    /// the Reobserved-restore branch its own insert_or_assign() - well before
+    /// 1cd9a0772, which only added a cross-key GUARD around that pre-existing
+    /// insert, not the insert itself; a pre-existing stale claim in this comment,
+    /// not introduced by either fix): (1) abandon_claim_locked() the instant a
+    /// claim's `end` settles to the sticky ClaimEnd::WaiterTimedOutDispatched
+    /// (never for a stopping-time abandonment - R5.5's disarm-unconditionally
+    /// policy never needs this); and (2) attach_core()'s Reobserved-restore branch,
+    /// which re-inserts a still-wedged claim an intervening detach_all() sweep (or
+    /// detach_rule_locked()) already erased from this map, the moment the SAME
+    /// (rule_id, spec) is genuinely reobserved - see that branch's own comment for
+    /// why reaching Reobserved is itself proof the rule is still desired. Exists
+    /// because a wedged claim is UNREACHABLE by any other lookup
+    /// detach_rule_locked()/detach_all() already have: it is neither in index_
+    /// (abandon_claim_locked releases that mapping unconditionally, before this map
+    /// is ever populated) nor in rules_ (it was never committed) - and
+    /// detach_rule_locked()'s own Case 0 FIFO scan deliberately EXCLUDES a
+    /// waiter_abandoned claim (see that function's own comment: "the search
+    /// excludes withdrawn AND abandoned claims"), which is exactly correct for
+    /// Case 0's own purpose but means a withdrawal of a purely-wedged rule_id
+    /// would otherwise be a silent no-op that on_arm_complete's own late-adoption
+    /// check (is_retained_wedge() + KeyClaim::rg->active) could never learn about.
+    /// Erased (a) by detach_rule_locked() the moment it deactivates the entry's
+    /// rg->active - withdrawal ends the claim's adoption candidacy. Rung 9c PR-5d
+    /// (concern 1, 5th occurrence): this erasure runs UNCONDITIONALLY, FIRST,
+    /// before detach_rule_locked()'s own Case 0 FIFO scan even starts - not, as an
+    /// earlier version of this fix had it, only reached when Case 0 fell through
+    /// without matching anything (Case 0 `return nullptr;`s from inside its own
+    /// loop on a match, which used to skip this erasure entirely whenever a
+    /// DIFFERENT, non-abandoned claim for the same rule_id was live on another key
+    /// - see detach_rule_locked()'s own header comment for the reachable
+    /// interleaving and the proof the two blocks can never match the same claim);
+    /// erased likewise by detach_all()'s own equivalent, unconditional sweep;
+    /// (b) by on_arm_complete() the instant the wedge actually resolves (adopted
+    /// or not) - the episode is over either way and a stale entry must not
+    /// outlive the claim object it names; and (c) by
+    /// reclassify_dispatching_race_locked() when it corrects a claim's `end` away
+    /// from WaiterTimedOutDispatched (it is no longer a retained wedge once
+    /// that happens). Adversarial-review correction (rung 9c PR-5d follow-up):
+    /// a same-rule_id/same-spec Reobserved retry DOES reinstate a still-wedged
+    /// claim whose rg->active was deactivated by an intervening full-sync
+    /// detach_all() sweep - see attach_core()'s Reobserved branch, added as the
+    /// fix for exactly that case (a rule genuinely still desired must not
+    /// permanently lose adoption candidacy just because a routine retry's
+    /// blanket teardown ran first). Two narrower paths can still leave a stale
+    /// entry uncorrected today - a fault injected before on_arm_complete()'s
+    /// own erase at (b) (the `fault_here_for_test(1)` seam), and the compensating/
+    /// finalize path that pops a claim without consulting this map - both are
+    /// contained by the identity-check below: a STALE entry (one whose claim has
+    /// already resolved) is harmless because every consequential read
+    /// `.lock()`s and identity-checks it. External review correction (PR #4485,
+    /// fjarvis): a later same-rule wedge overwriting this map is NOT
+    /// automatically harmless the way a stale entry is - if the entry being
+    /// overwritten still names a LIVE, unresolved claim on a DIFFERENT key (an
+    /// ordinary flip-flop redeploy can wedge the same rule_id on two keys at
+    /// once), an unguarded overwrite orphans that live claim with no way for a
+    /// future withdrawal to ever find it again. Both of this map's writers now
+    /// guard against exactly this, in OPPOSITE directions, because the claim
+    /// each one is about to insert carries opposite provenance:
+    /// attach_core()'s Reobserved-restore branch inserts `pre_head`, a claim
+    /// just re-observed for the (rule_id, spec) the caller currently wants -
+    /// definitionally the desired claim - so it deactivates whatever DIFFERENT,
+    /// still-live claim it is about to DISPLACE, then overwrites the entry
+    /// unconditionally; abandon_claim_locked()'s wedge branch inserts `claim`, a
+    /// claim that just TIMED OUT and carries no such signal, so instead it
+    /// checks whether the map already names a different, still-live claim (that
+    /// occupant can only have arrived via a LATER attach_core() call, so it is
+    /// provably the fresher generation) and, if so, deactivates the INCOMING
+    /// `claim` and leaves the map's existing entry untouched rather than
+    /// overwriting it. See each call site's own comment for the full
+    /// interleaving and the fallible-first ordering that makes each guard
+    /// retry-safe under an insert-time throw.
+    /// weak_ptr, not shared_ptr: this map must never be what keeps a resolved
+    /// claim alive after claims_ itself has already dropped it (a defensive
+    /// belt-and-braces should erasure at (a)/(b)/(c) above ever be missed on
+    /// some future edit, including the two known-stale paths just named) - a
+    /// caller consulting this map .lock()s it and treats a dead weak_ptr
+    /// exactly like "not found".
+    std::unordered_map<std::string, std::weak_ptr<KeyClaim>> wedged_by_rule_;
     /// ONE runtime-wide CV (paired with registry_mu_) for every claim waiter: per-key
     /// CVs have an entry-lifetime problem (erased while a waiter references them),
     /// and production has at most one waiter at a time (GuardianEngine's mtx_); the
@@ -1820,8 +1947,19 @@ private:
     void reclassify_dispatching_race_locked(KeyClaim& claim, ClaimEnd real_end) noexcept {
         assert(claim.kind == ClaimKind::Arm);
         if (claim.dispatch == ClaimDispatch::Dispatching &&
-            claim.end == ClaimEnd::WaiterTimedOutDispatched)
+            claim.end == ClaimEnd::WaiterTimedOutDispatched) {
             claim.end = real_end;
+            // Adversarial-review minor fix (rung 9c PR-5d follow-up): this claim
+            // is no longer a retained wedge once `end` is corrected away from
+            // WaiterTimedOutDispatched - drop its wedged_by_rule_ entry too, so
+            // "erased the instant the wedge resolves" holds here as well, not
+            // only on the ordinary on_arm_complete path. Identity-checked: only
+            // erase if the map still points at THIS claim (a same-rule_id
+            // re-wedge could already have overwritten the entry).
+            if (const auto wit = wedged_by_rule_.find(claim.rule_id);
+                wit != wedged_by_rule_.end() && wit->second.lock().get() == &claim)
+                wedged_by_rule_.erase(wit);
+        }
     }
     /// rung 9c PR-5b hardening (this governance run): std::atomic<int> elements
     /// (was a plain std::array<int, kIoClassCount>) specifically so a
@@ -1844,6 +1982,10 @@ private:
     /// claim. Same "internal-only, rides #3415" scope as the pair above.
     std::atomic<std::uint64_t> wedged_refusals_{0};
     std::atomic<std::uint64_t> wedged_reobservations_{0};
+    /// Governance Gate 8 fix (rung 9c PR-5d /governance run): see
+    /// wedge_adopt_stale_refused()'s own doc comment - same "internal-only,
+    /// rides #3415" scope as the pair above.
+    std::atomic<std::uint64_t> wedge_adopt_stale_refused_{0};
 
     std::atomic<std::uint64_t> backend_op_timeouts_{0};   ///< arm/disarm calls that hit cfg_.backend_op_deadline
     std::atomic<std::uint64_t> backend_op_queued_{0};     ///< R5.2: attach_rule queued behind a same-key claim
@@ -1860,6 +2002,7 @@ private:
     std::atomic<int> drain_fault_point_for_test_{0};  ///< see the setter
     std::atomic<bool> detach_fault_for_test_{false};  ///< see the setter
     std::atomic<bool> index_remove_fault_for_test_{false}; ///< see the setter
+    std::atomic<bool> wedge_locator_fault_for_test_{false}; ///< see the setter
     std::atomic<std::uint64_t> detach_post_commit_failures_{0}; ///< r3 C4: contained drop_rule throw
     std::atomic<int> detach_post_fault_point_for_test_{0}; ///< see the setter
     /// Seam body for set_detach_post_fault_point_for_test; consumed once at `point`.
@@ -1876,6 +2019,11 @@ private:
     /// Seam body for set_detach_fault_for_test; consumed once.
     void detach_fault_here_for_test() {
         if (detach_fault_for_test_.exchange(false))
+            throw std::bad_alloc{};
+    }
+    /// Seam body for set_wedge_locator_fault_for_test; consumed once.
+    void wedge_locator_fault_here_for_test() {
+        if (wedge_locator_fault_for_test_.exchange(false))
             throw std::bad_alloc{};
     }
 
