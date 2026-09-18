@@ -132,8 +132,12 @@ delivery/ops workstreams the three-model review surfaced as missing.
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
 4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged) + `#4324` per-home
 stream-generation fence (PR #4492, merge commit `c37306113`, 2026-09-17T22:05:58Z,
-**MERGED**), WS-7 (#3627), WS-10 10.1/10.2. Next gate items: WS-4 (4.3/4.4),
-WS-5, WS-6, WS-8-readyz.**
+**MERGED**), WS-7 (#3627), WS-10 10.1/10.2. **4.3a DONE** (intra-cluster `pg`-group
+agent→node lookup + the `fanout_terminal` cross-node fix + `remote_dispatched`
+telemetry — code-complete, empirically verified, but COMPONENT-COMPLETE-AND-INERT:
+no gateway multi-node cluster-formation mechanism exists in production, `#4555`).
+Next gate items: the rest of WS-4 (4.3 cross-cluster fan-out + `#4555` cluster
+formation itself + 4.4), WS-5, WS-6, WS-8-readyz.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -184,6 +188,34 @@ WS-5, WS-6, WS-8-readyz.**
 > tombstones the row — see `gateway_route_store.hpp`'s FORWARD NOTE), left
 > for 4.3; and the `duplicate_connected` desync tripwire, deferred to its own
 > follow-up, `#4464`.
+>
+> **WS-4 4.3a update (2026-09-18):** the intra-cluster half of 4.3 (agent→node
+> routing WITHIN one Erlang gateway cluster, distinct from cross-cluster
+> fan-out) is **DONE** — `yuzu_gw_registry.erl`'s `lookup/1` gains a per-agent
+> `pg` group (`{agent, AgentId}`) cross-node fallback on a local ETS miss;
+> `yuzu_gw_agent.erl` fixes a latent bug the design review found
+> (`fanout_terminal` was routed to the LOCAL node's router, stranding a
+> cross-node fanout for the full 300s timeout — now routed to
+> `{yuzu_gw_router, node(ReplyTo)}`); `yuzu_gw_router.erl` adds
+> `remote_dispatched` telemetry. Design per ADR-2002 §7's own mechanism list
+> (a per-agent `pg` group), NOT the dead `hash_ring_vnodes` config
+> (`#4556`) or a server-supplied hint (both rejected by design review).
+> Verified: `rebar3 compile`/`dialyzer` clean, full eunit suite green, a new
+> OTP-`peer`-based 2-node test suite (4 tests) run 40+ times with zero
+> flakes after two governance-round fixes (a false-green local-preference
+> test, and a `pg`-propagation-delay race in the fanout-completion test).
+> Also updates `gateway_route_store.hpp`'s `#4324` FORWARD NOTE: the
+> pre-CONNECT-race ordering gap left open above is now resolved as
+> unreachable BY INVARIANT (agent-driven reconnect + the gateway's
+> `NOT_FOUND` refusal on an unknown session — no producer of a same-session
+> different-home CONNECTED exists or is planned), replacing the
+> previously-stated `register_fresh`-ordered-epoch/CAS resolution with a
+> standing design constraint + a server-side tripwire folding into `#4464`.
+> **COMPONENT-COMPLETE-AND-INERT**: zero gateway cluster-formation code
+> exists in production (`#4555`), so this has no effect on any deployed
+> cluster yet. Remaining WS-4 work: the rest of 4.3 (cross-cluster gateway
+> fan-out — today one `gw_mgmt_stub_`) **and** `#4555` cluster formation
+> itself, plus 4.4 (`gateway_node` convergence + replay-session writeback).
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially
 > changes the status of a workstream here MUST update its row **and** re-stamp the
@@ -200,7 +232,7 @@ WS-5, WS-6, WS-8-readyz.**
 | **WS-1** | Server-plane state → Postgres: (1a) sessions DB-time; (1b) `execution_tracker`+command-correlation atomic counters; (1c) HA-critical store subset | migration ladder (serializes at the migration-version counter) | **Y** | `authdb`+`security-guardian` (1a); `architect`+`sre`+`cpp-safety` (1b/1c) | P0 | **done — 1a+1b+1c** |
 | **WS-2** | (2a) durable **event outbox** + NOTIFY fan-out [monolith-OK]; (2b) **core→presentation event spine** [*defers to ADR-1005*]; MCP session/replay durability | 2a: WS-1(1b); 2b: ADR-1005 split | **Y** (2a) | `architect`+`sre`+`security-guardian`(MCP)+`docs-writer` | P1 | **2a done (2a-1 + 2a-2 #3924); 2b/MCP outstanding** |
 | **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
-| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence all MERGED to `origin/dev` (PR #4492, `c37306113`, 2026-09-17); 4.3/4.4/WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
+| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence all MERGED to `origin/dev` (PR #4492, `c37306113`, 2026-09-17); 4.3a DONE (intra-cluster `pg`-group lookup, code-complete but INERT pending `#4555` cluster formation); rest of 4.3 (cross-cluster fan-out + `#4555` itself) / 4.4 / WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | planned |
 | **WS-6** | PKI/CA HA: CA key → `SecretCodec` blob in PG, `CaStore` → PG, **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG | **WS-1(`ca_store`), WS-3** | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` | P1 | planned |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
@@ -259,10 +291,14 @@ constraint. Delivery phases (dependency-ordered):
 cites are authoritative):
 - **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3
   (3.1–3.4, #4011/#4134/#4169/#4194), WS-4 4.1+4.2a+4.2b+`#4324` (PR #4492,
-  merged), WS-7 (#3627), WS-10 10.1/10.2. The storage axis is complete.
-- The **highest-leverage next** is **WS-4 4.3/4.4** (net-new distributed
-  intra-cluster agent→node routing, `gateway_node` convergence, and the
-  pre-CONNECT-race ordering gap `#4324` left open) — it also unblocks the
+  merged) + 4.3a (intra-cluster `pg`-group agent→node lookup, code-complete
+  but component-complete-and-INERT pending `#4555`), WS-7 (#3627),
+  WS-10 10.1/10.2. The storage axis is complete.
+- The **highest-leverage next** is the **rest of WS-4** — cross-cluster
+  gateway fan-out (today one `gw_mgmt_stub_`), `#4555` (gateway multi-node
+  cluster formation — zero `net_kernel`/`net_adm` code exists in production
+  today, and 4.3a has no effect until this ships), and 4.4 (`gateway_node`
+  convergence + replay-session writeback) — it also unblocks the
   cross-replica session lookup that WS-5 needs. Then the remaining gate set:
   **WS-5** (presence), **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free
   cross-replica reconnect (durable outbox replay) is the open 2a-2 follow-up.

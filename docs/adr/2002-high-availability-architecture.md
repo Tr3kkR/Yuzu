@@ -637,8 +637,15 @@ Both commits landed pre-merge in the same PR #4492. **Deliberately NOT closed by
 arrives BEFORE a live re-home's `CONNECTED(home2)` — two independent RPCs, no ordering guarantee
 between them — the tombstone still wins and `announce_connected`'s `ON CONFLICT DO NOTHING` fallback
 cannot re-arm a tombstoned row, so the re-home is silently unroutable in the directory until the next
-full `ProxyRegister`; left for 4.3 to resolve, via `register_fresh`'s ordered epoch or an explicit
-re-arm path (see `gateway_route_store.hpp`'s file-header FORWARD NOTE for #4324's 4.3). The
+full `ProxyRegister`. **Resolution UPDATED (WS-4 4.3a design review, 2026-09-18)**: the previously-stated
+"`register_fresh`'s ordered epoch or an explicit re-arm path" was the WRONG mechanism — a
+gateway-synthesized fresh session on re-home starves the agent's own heartbeat lease renewal,
+reproducing the `#4246` #6 desync deliberately. `gateway_route_store.hpp`'s file-header FORWARD NOTE
+now states the actual resolution: this gap is unreachable BY INVARIANT (agent-driven reconnect + the
+gateway's `NOT_FOUND` refusal on an unknown session mean no producer of a same-session different-home
+`CONNECTED` exists or is planned), backed by a standing design constraint on 4.3/4.4 plus a
+server-side tripwire (folds into `#4464`), not a new CAS primitive. See that file's FORWARD NOTE for
+the full resolution. The
 `duplicate_connected` positive tripwire on
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` that #4324's own issue checklist
 explicitly deferred (it needs a `gateway_sessions_` value-type change reaching several call sites) is
