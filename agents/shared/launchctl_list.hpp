@@ -51,13 +51,18 @@ struct LaunchctlRow {
 };
 
 /// Result of parse_launchctl_list(): the decoded rows plus whether the input
-/// was structurally trustworthy at all. `malformed` is a STRUCTURAL check
-/// only -- line 0 must be exactly "PID\tStatus\tLabel" (a preamble line
-/// before the real header, or a header-less capture where the first line is
-/// already data, both fail this) -- distinct from a per-row policy decision
-/// like BR-service-001 (an individual row with an empty label), which stays
-/// the caller's job. `rows` is empty whenever `malformed` is true -- nothing
-/// past an unrecognised header is trustworthy enough to decode.
+/// was structurally trustworthy at all. `malformed` is a STRUCTURAL check,
+/// with TWO independent triggers (governance A0 fix round, UP2-2): line 0
+/// must be exactly "PID\tStatus\tLabel" (a preamble line before the real
+/// header, or a header-less capture where the first line is already data,
+/// both fail this) -- OR `lines` is empty outright, which a real exit-0
+/// `launchctl list` capture never produces (it always emits at least the
+/// header row), so zero lines is itself a sign of a corrupted/truncated
+/// capture, not a genuine zero-services answer. Distinct from a per-row
+/// policy decision like BR-service-001 (an individual row with an empty
+/// label), which stays the caller's job. `rows` is empty whenever
+/// `malformed` is true -- nothing past an unrecognised or absent header is
+/// trustworthy enough to decode.
 struct LaunchctlParseResult {
     std::vector<LaunchctlRow> rows;
     bool malformed{false};
@@ -67,9 +72,13 @@ struct LaunchctlParseResult {
 /// FIRST two tabs only -- the label field is everything after the second tab
 /// verbatim, including any further literal tabs (a genuine label never
 /// contains one, but a malformed/4+-field row is decoded rather than
-/// mis-split). Fewer than 2 tabs in the line -- 1-field row (no tabs at all)
-/// or 2-field row (one tab) -- yields whichever fields were present and an
-/// empty label for the rest; never throws on malformed input. `std::from_chars`
+/// mis-split). Fewer than 2 tabs in the line never throws, but the two
+/// shapes differ: a 1-field row (no tabs at all) decodes NOTHING -- the
+/// whole line is discarded and a default LaunchctlRow{} comes back, pid and
+/// status included, because there is no PID column to read a pid from; a
+/// 2-field row (one tab) DOES decode pid+status below, leaving only the
+/// label empty (no consumer reads pid off a label-less row today, so this
+/// asymmetry is latent, not observed). `std::from_chars`
 /// on the raw field, not `std::stoll`/`std::stoi`: a PARTIAL numeric match (e.g.
 /// "12abc", or "0x1A" -- from_chars stops at the "x", not a hex parse) is
 /// rejected as unparsable (pid -> nullopt, status -> 0), never silently
@@ -132,6 +141,10 @@ parse_launchctl_list(std::span<const std::string> lines) {
         out.malformed = true;
         return out;
     }
+    // Safe only because both early returns above guarantee lines.size() >= 1
+    // here -- if either guard is ever removed or reordered, this silently
+    // becomes a SIZE_MAX reserve() (unsigned underflow on an empty span) with
+    // no compiler signal, not a caught exception.
     out.rows.reserve(lines.size() - 1);
     for (std::size_t i = 1; i < lines.size(); ++i)
         out.rows.push_back(decode_launchctl_row(lines[i]));
