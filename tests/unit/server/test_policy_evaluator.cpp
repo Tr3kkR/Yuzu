@@ -77,6 +77,21 @@ std::string out_json2(const std::string& c1, const std::string& v1, const std::s
            v2 + R"("}]})";
 }
 
+// A structurally-valid result envelope (#2437-class depth guard regression)
+// whose single row value is a JSON array nested `depth` levels deep, e.g.
+// {"columns":[{"name":"col","type":"string"}],"rows":[{"col":[[[[...]]]]}]}.
+// Built as a flat repeated-bracket string -- NEVER anywhere near the real
+// ~100,000-level attack depth this guard exists to reject; `depth` in these
+// tests is 35, comfortably past kMcpMaxJsonDepth (32) while staying a trivial
+// allocation. Before the fix, this reaches parse_result's structured-result
+// branch, which calls nlohmann::json::dump() on the non-string "col" value --
+// the unboundedly-recursive call the guard exists to prevent ever reaching.
+std::string out_json_deep(const std::string& col, int depth) {
+    return R"({"columns":[{"name":")" + col + R"(","type":"string"}],"rows":[{")" + col + R"(":)" +
+           std::string(static_cast<size_t>(depth), '[') +
+           std::string(static_cast<size_t>(depth), ']') + R"(}]})";
+}
+
 struct Harness {
     // PolicyStore (ADR-0056) and InstructionStore (ADR-0058) are both migrated
     // Postgres stores now — share the same pool/database as ResponseStore
@@ -467,6 +482,88 @@ TEST_CASE("policy evaluator: CEL evaluation error -> error", "[pg][policy][evalu
     ev.tick(true);
 
     CHECK(h.status_of(pid, "agentA") == "error");
+}
+
+TEST_CASE("policy evaluator: depth-exceeded r.output -> error, never compliant "
+          "(#2437-class guard, fail-closed)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    // agentA: legitimate, shallow, compliant response for the SAME policy/CEL
+    // -- the positive control proving the guard does not disturb the happy
+    // path.
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    // agentB: a structurally-valid result envelope whose "hostname" value
+    // nests past the depth guard -- see out_json_deep's own comment for why
+    // 35 levels is a safe reachability proxy, not the real attack depth.
+    h.canned["agentB|checkp"] = {1, out_json_deep("hostname", 35)};
+    auto pid = h.author("result.hostname != ''");
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20; // past grace
+    ev.tick(true);
+
+    // Positive control: the shallow response for the SAME policy/CEL still
+    // evaluates normally.
+    CHECK(h.status_of(pid, "agentA") == "compliant");
+
+    // The depth-exceeded response must land on the evaluator's existing
+    // "could not evaluate" outcome ("error", the same status a failed check
+    // or a misconfigured empty-CEL policy already produces above), and must
+    // explicitly NOT be "compliant" -- an agent deliberately reporting
+    // unparseable-by-depth output must not be able to force a false
+    // compliant verdict.
+    const std::string agentB_status = h.status_of(pid, "agentB");
+    CHECK(agentB_status == "error");
+    CHECK(agentB_status != "compliant");
+}
+
+TEST_CASE("policy evaluator: a depth-poisoned response cannot ride along with a "
+          "legitimate non_compliant sibling into auto-selected remediation "
+          "(#2437-class guard, fail-closed)",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    // agentA: legitimate non_compliant response.
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "")};
+    // agentB: depth-exceeded poisoned response. Must resolve to "error" --
+    // never "non_compliant" (which would make it eligible for the
+    // auto-selected remediation below, i.e. authorize a remediation action
+    // off a response this evaluator could not actually parse) and never
+    // "compliant" (which would silently suppress remediation for a
+    // genuinely-unevaluable device).
+    h.canned["agentB|checkp"] = {1, out_json_deep("hostname", 35)};
+    auto pid = h.author("result.hostname != ''", /*with_fix=*/true);
+    h.canned["agentA|fixp"] = {1, "ok"};
+    h.canned["agentB|fixp"] = {1, "ok"}; // wired up, but must never be dispatched to
+
+    PolicyEvaluator ev(h.deps());
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK(h.status_of(pid, "agentA") == "non_compliant");
+    CHECK(h.status_of(pid, "agentB") == "error");
+
+    // remediate() with an empty agent list auto-selects every agent whose
+    // status is exactly "non_compliant" (get_policy_agent_statuses walk).
+    // The poisoned agentB's "error" status must be excluded from that
+    // selection entirely -- the overall remediation batch must reflect
+    // "could not fully evaluate" for agentB rather than silently folding it
+    // in as either a pass or a remediation target.
+    const int dispatch_calls_before = h.dispatch_calls;
+    auto rr = ev.remediate(pid, {});
+    REQUIRE(rr.ok);
+    CHECK(rr.agents == 1); // agentA only -- agentB was never selected
+    CHECK(h.dispatch_calls == dispatch_calls_before + 1); // one fix dispatch, agentA only
+    CHECK(h.dispatched_plugins.back() == "fixp");
+
+    // agentB was never targeted: still sitting at "error", never moved to
+    // "fixing".
+    CHECK(h.status_of(pid, "agentB") == "error");
 }
 
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {

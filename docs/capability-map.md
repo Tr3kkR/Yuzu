@@ -31,7 +31,7 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `193 25 51 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> → `194 25 50 269`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
 > awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` ``. The former "New (Ph 8-16)" interim
 > row is retired — those phases are now ordinary domains 25-31, and 2026 additions land as
 > domains 32-39 rather than an undifferentiated bucket. **Domains 32-39 were verified for
@@ -65,16 +65,16 @@ Each capability is rated on two axes:
 ```
 Foundation   [==============================--]  55/59 done  (93%) (1 partial)
 Advanced     [========================--------]  129/175 done (74%) (21 partial)
-Future       [========------------------------]  9/35 done   (26%) (3 partial)
+Future       [=========-----------------------]  10/35 done  (29%) (3 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [=======================---------]  193/269 done (72%) (25 partial)
+Overall      [=======================---------]  194/269 done (72%) (25 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
 |--------|:-----:|:----:|:-------:|:-----------:|
 | 1. Agent Lifecycle Management | 9 | 9 | 0 | 0 |
 | 2. Command Execution and Orchestration | 13 | 13 | 0 | 0 |
-| 3. Device and Endpoint Information | 10 | 8 | 1 | 1 |
+| 3. Device and Endpoint Information | 10 | 9 | 1 | 0 |
 | 4. Network Information and Discovery | 11 | 9 | 0 | 2 |
 | 5. Process and Service Management | 5 | 2 | 0 | 3 |
 | 6. User and Session Management | 5 | 5 | 0 | 0 |
@@ -112,7 +112,7 @@ Overall      [=======================---------]  193/269 done (72%) (25 partial)
 | 38. Server Storage Substrate — PostgreSQL | 4 | 4 | 0 | 0 |
 | 39. Headless Platform — Engine Principals & On-Behalf-Of (ADR-1005) | 3 | 3 | 0 | 0 |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
-| **TOTAL** | **269** | **193** | **25** | **51** |
+| **TOTAL** | **269** | **194** | **25** | **50** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.0 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -268,9 +268,9 @@ Implemented as a special-purpose tag via the device tagging system (`TagStore`).
 
 > **Gap:** macOS is `kPlanned` (returns empty). Linux inbound requires Samba installed; Windows inbound-history over-captures (all type-3 network logons, not only SMB).
 
-### 3.9 Printer Inventory :x: `T3`
+### 3.9 Printer Inventory :white_check_mark: `T3` *(verified 2026-09-15)*
 
-Not implemented. Enumerate connected printers for asset tracking.
+`printing` agent plugin. `printers`/`jobs` enumerate local/connected printers and their not-completed queued jobs via IPP over the CUPS Unix socket (macOS/Linux) or winspool (Windows) — no libcups. See `agents/plugins/printing/README.md`.
 
 ### 3.10 Device Tagging (Key-Value Metadata) :white_check_mark: `T2` *(verified 2026-09-10)*
 
@@ -1647,6 +1647,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | storage | Y | Y | Y | Agent KV |
 | asset_tags | Y | Y | Y | Device Mgmt |
 | tags | Y | Y | Y | Device Mgmt |
+| printing | Y | Y | Y | Device Mgmt |
 | agent_logging | Y | Y | Y | Agent Mgmt |
 | agent_actions | Y | Y | Y | Agent Mgmt |
 | diagnostics | Y | Y | Y | Agent Mgmt |
@@ -1657,7 +1658,7 @@ verbs, SOC 2 evidence rows, REST + MCP CRUD, and an HTMX `/reflex` dashboard rou
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 | app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**49 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-07 (`ls -d agents/plugins/*/` = 51 directories, minus `example` + `chargen` = 49; the previous "44" undercounted 8 shipped plugins — `disk_actions`, `disk_space`, `filesystem_posture`, `license_scan`, `netprobe`, `power_health`, `rdp_control`, `tags` — none of which were in the table). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
+**51 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-15 (`ls -d agents/plugins/*/` = 53 directories, minus `example` + `chargen` = 51; the 2026-09-07 count of 49 predates Wave 9 PR9.1b's `printing`, plus one further plugin that landed between the two recounts). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
 
 ---
 

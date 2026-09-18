@@ -2706,6 +2706,33 @@ groups:
             signals a malformed/abusive/corrupted agent — check the agent version and the
             warn-level "carries too many sources" server logs for the agent_id.
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuInventoryGenericBlobRejectedDepth
+        # json-dump-depth-guard fix: outcome=rejected_depth is a SEPARATE outcome
+        # from outcome=rejected above (whole-report source-cap) - it fires once
+        # per generic (non-typed) source blob that nests past kMcpMaxJsonDepth
+        # (32), never for a whole-report rejection. Kept as its own alert for
+        # the same reason it is kept as its own outcome value: aliasing it onto
+        # YuzuInventoryReportRejected's runbook would send an operator hunting
+        # a >64-source report that does not exist. The source label is always
+        # the fixed sentinel "__generic__", never the agent's real plugin name.
+        expr: |
+          sum(rate(yuzu_inventory_ingest_total{outcome="rejected_depth"}[15m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Generic inventory rejecting over-depth source blobs"
+          description: >-
+            yuzu_inventory_ingest_total{source="__generic__",outcome="rejected_depth"}
+            is non-zero: one or more agents are reporting a generic (non-typed)
+            inventory source blob that nests deeper than kMcpMaxJsonDepth (32) -
+            this blob is skipped (the rest of the report is still acknowledged),
+            never dumped, so it cannot crash the process, but the source stays
+            permanently absent from InventoryStore until the plugin stops
+            emitting the over-depth shape (see docs/user-manual/inventory.md's
+            Troubleshooting section). Check the warn-level "nests too deeply"
+            server logs for the agent_id and plugin name.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuGenericInventoryPersistenceDropped
         # Generic InventoryStore ingest is intentionally fail-soft. Alert on a
         # sustained rate, not a single event: transient pool pressure can
