@@ -290,8 +290,16 @@ TEST_CASE("read_disk_totals reads real IOBlockStorageDriver counters", "[dex][ma
         SKIP("no IOBlockStorageDriver reported a completed read on this runner (VM/CI host)");
     }
 
+    // REQUIRE, not require_or_skip (governance xp-5): by this point independent_reads > 0
+    // has ALREADY proven something on this host really did read data — reusing the exact
+    // same independent probe the C-9 fix added, not a second one. A require_or_skip here
+    // would let a future is_physical_storage_driver regression that excludes every real
+    // physical disk (the invariant this test exists to catch) SKIP green instead of
+    // failing — a false green on exactly the failure this test was added for. Distinct
+    // from read_cpu_ticks/read_vm_snapshot/read_memorystatus_level above, which have no
+    // equivalent independent proof-of-availability and so correctly stay require_or_skip.
     const auto disk = read_disk_totals();
-    require_or_skip(disk.valid, "read_disk_totals");
+    REQUIRE(disk.valid);
     CHECK(disk.reads > 0);
 }
 
