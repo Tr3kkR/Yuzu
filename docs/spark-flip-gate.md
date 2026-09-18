@@ -386,9 +386,25 @@ the additive `ISparkMechanism::watch_incarnation()`/`set_established_sink()`
 seam, both Service mechanisms (Linux sd-bus, Windows SCM) wired to report
 tri-state coverage at every real transition, and
 `SparkEngine::subscription_establishment(id)` as the pull query. Full E1-E15
-+ M1-M6 test matrix (E2/E4/E13/E14/E15/M1/M6 mutation-verified); Windows half
-written but NOT compiled in the implementing sandbox (no Windows toolchain
-there) - DGRHP verification is a separate, tracked step before merge. **Item
++ M1-M6 test matrix, E2/E4/E13/E14/E15/M1/M6 genuinely mutation-verified
+(break the fix, confirm red, restore, confirm green) - **M6 twice**: an
+initial baseline-snapshot design was itself caught as still partly vacuous
+before it ever ran on real hardware (two independent race/window hazards a
+subsequent review turned up), replaced with a bounded-count oracle, and
+mutation-verified clean on DGRHP with zero flake across 5 baseline / 3
+mutated / 3 restored repeated runs. Full DGRHP Windows/MSVC verification is
+DONE, not a remaining step: `[spark]` is 718/718 test cases (15774
+assertions) clean at HEAD, run repeatedly across this branch's fix history.
+A two-phase adversarial review (Kimi K3 + Codex Sol, both dynamic/compiled)
+found and this branch fixed 6 issues before this status was written - 2
+HIGH (the Windows M4a/M4b test bugs above, and M6's own vacuous oracle, both
+described above), 1 MEDIUM (a Windows-only fired-one-shot race in the
+coalesce/adoption branch, `w->fired ? SparkCoverage::None : w->coverage` at
+the Add-drain adoption site - NOT independently unit-tested, no test seam
+currently forces the specific cross-watch APC timing; flagged as a residual
+test gap), 3 LOW (a docs R4 caveat, a changelog naming convention, a
+diagnostic-message reuse detail) - all fixed, see this branch's commit
+history from `afbdaf0bd` onward for the exact diffs and reasoning. **Item
 2 (a re-run of the #3990 diagnostic's methodology against the full landed
 ladder, using this channel's real per-key timestamp) is a SEPARATE,
 not-yet-started piece of work, depends on item 1 landing first** - do not
