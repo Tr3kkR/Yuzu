@@ -309,6 +309,12 @@ TEST_CASE("build_agent_push: enforce on a denylisted key is downgraded to audit 
 // -> proto marshal (that split is exactly M7's point, see the file header) -
 // neither call site does any further per-rule processing on the result, so
 // pinning behaviour here covers both consumer paths with no live server/DB.
+// NOTE: this TEST_CASE originates the literal rule_id "poisoned", also
+// reused by the later "a repeated attempt against the same poisoned row..."
+// TEST_CASE in this file - harmless today since neither asserts on log
+// cadence for it, but a future test asserting should_log()/log-line
+// behavior for either must pick a distinct rule_id or account for the
+// shared g_exclusion_sampler.
 TEST_CASE("build_agent_push: a rule nested past the depth guard is excluded; "
           "other rules in the same batch still push normally",
           "[guardian_push_builder][security][depth]") {
@@ -662,9 +668,10 @@ TEST_CASE("RuleExclusionSampler: at-capacity paces correctly, kCapacity+1 is a h
                 if (sampler.should_log(r))
                     ++logged;
             INFO("pass " << pass);
-            // Every rule evicts its predecessor's slot right before that
-            // predecessor's own next turn in the SAME pass, so EVERY rule
-            // logs on EVERY pass - not "somewhat more often than 60s".
+            // Inserting rule K evicts the slot belonging to the rule visited
+            // NEXT in this pass (not a "predecessor"), so that rule is
+            // already evicted by the time its own turn comes up - EVERY rule
+            // logs on EVERY pass, not "somewhat more often than 60s".
             CHECK(logged == rules.size());
         }
     }

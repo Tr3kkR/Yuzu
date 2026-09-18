@@ -146,9 +146,13 @@ filter_deployed_members(const std::vector<GuaranteedStateRuleRow>& rules,
 //   - Inserting a rule_id beyond kCapacity evicts the least-recently-OBSERVED
 //     entry, NOT the least-recently-PERMITTED-TO-LOG one - the two differ in
 //     general: every observation, permitted or not, splices an entry to the
-//     front, so a rule under continuous exclusion pressure stays "hot" (never
-//     evicted) even while its own log line stays silenced by kRepeatInterval.
-//     Eviction happens only when a rule_id stops being observed entirely.
+//     front, so a rule under continuous exclusion pressure normally stays
+//     "hot" even while its own log line stays silenced by kRepeatInterval.
+//     It is evicted only when it is the least-recently-observed entry AT THE
+//     MOMENT a new distinct rule_id is inserted into a full cache - i.e. when
+//     kCapacity distinct OTHER rule_ids intervene between two of its own
+//     observations. That precondition is rare in normal operation but is
+//     exactly what happens, on every pass, in limitation (1) below.
 //     An evicted rule_id subsequently encountered is therefore treated as a
 //     fresh first-observation and logs immediately again.
 //   - This deliberately fixes #4497's OTHER symptom too (throughput-scaling
