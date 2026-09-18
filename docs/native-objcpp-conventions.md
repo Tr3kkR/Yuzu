@@ -136,11 +136,13 @@ decision, not part of the shared template:
   is not an `.framework` bundle at all (it ships as
   `usr/lib/libEndpointSecurity.tbd` + `usr/include/EndpointSecurity/`, present
   in BOTH the Command Line Tools and full Xcode SDKs), so probing it via
-  `dependency('appleframeworks', modules: ['EndpointSecurity'])` — as
-  `agents/plugins/tar/meson.build` currently does — is a probe DEFECT, not a
-  legitimate optional-framework pattern: see `docs/darwin-compat.md`'s
-  EndpointSecurity row and the `feat/macos-spark-a0.5-es-probe` fix slice for
-  the corrected `cxx.find_library()`/`cxx.has_header()` form.
+  `dependency('appleframeworks', modules: ['EndpointSecurity'])` — as the
+  top-level `meson.build`'s shared ES probe currently does (TAR's own
+  `meson.build` only consumes the shared result, it does not probe itself)
+  — is a probe DEFECT, not a legitimate optional-framework pattern: see
+  `docs/darwin-compat.md`'s EndpointSecurity row and the
+  `feat/macos-spark-a0.5-es-probe` fix slice for the corrected
+  `cxx.find_library()`/`cxx.has_header()` form.
 
 ## Coverage
 

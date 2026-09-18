@@ -371,7 +371,7 @@ bool ProcEsCollector::stalled() const noexcept {
 
 } // namespace yuzu::tar
 
-#else // no Endpoint Security (non-Apple, or macOS without the Xcode SDK framework)
+#else // no Endpoint Security (non-Apple, or the build-time ES probe found no ES SDK)
 
 namespace yuzu::tar {
 
