@@ -36,8 +36,10 @@ elif host_machine.system() == 'darwin'
   # so this dependency() call is required: true — a failure here is a real
   # toolchain problem, not an optional-capability fallback. (EndpointSecurity
   # is NOT a counter-example of an SDK-gated framework — despite a long-
-  # standing myth, it ships lib+header in both SDKs too; its current
-  # required:false probe is a defect, not a legitimate full-Xcode gate — see
+  # standing myth, it ships lib+header in both SDKs too; its top-level probe
+  # (A0.5, macOS Spark/Reflex/DEX programme) now correctly finds it on either
+  # SDK via cxx.find_library()+cxx.has_header() instead of the broken
+  # required:false appleframeworks probe it used to be — see
   # docs/darwin-compat.md's EndpointSecurity row.) See docs/darwin-compat.md
   # and docs/native-objcpp-conventions.md.
   wifi_sources += files('src/wifi_corewlan.mm')
