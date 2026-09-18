@@ -317,10 +317,14 @@ std::vector<ServiceInfo> enumerate_services_impl(const RunSubprocessFn& run) {
 
     auto parsed = parse_launchctl_list(res.lines);
     if (parsed.malformed) {
-        // BR-service-001: same policy as the systemctl leg above.
-        spdlog::error("TAR: service snapshot incomplete (launchctl produced a malformed row) -- "
-                      "skipping diff, retaining previous baseline");
-        throw yuzu::tar::IncompleteCaptureError("TAR: launchctl produced a malformed row");
+        // `malformed` covers THREE distinct causes -- a missing/garbled
+        // header (UP-6), zero lines at all despite exit 0 (UP2-2), and a
+        // per-row BR-service-001 defect -- none of which is specifically
+        // "a malformed row", so the message names the capture as a whole
+        // (governance A0 fix round, UP2-5).
+        spdlog::error("TAR: service snapshot incomplete (launchctl produced a malformed "
+                      "capture) -- skipping diff, retaining previous baseline");
+        throw yuzu::tar::IncompleteCaptureError("TAR: launchctl produced a malformed capture");
     }
     return std::move(parsed.entries);
 }
