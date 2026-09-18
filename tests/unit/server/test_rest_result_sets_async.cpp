@@ -21,6 +21,7 @@
 #include "inventory_store.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rest_api_v1.hpp"
 #include "result_set_store.hpp"
 #include "test_route_sink.hpp"
@@ -29,6 +30,7 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -42,9 +44,23 @@
 #include "../test_helpers.hpp"
 
 using namespace yuzu::server;
+using yuzu::server::pg::PgConn;
 using yuzu::server::pg::PgPool;
+using yuzu::server::pg::PgResult;
 
 namespace {
+
+// Run a raw SQL statement against the test database on a second connection --
+// same idiom as test_result_set_store.cpp's own helper -- lets a test install
+// a trigger that simulates a concurrent delete racing heal_poisoned_payload's
+// own SELECT/UPDATE pair (#4540).
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
 
 // ResultSetStore is now a migrated Postgres store (ADR-0036) — shares the
 // "resultset" template key with test_result_set_store.cpp (identical setup).
@@ -1349,4 +1365,108 @@ TEST_CASE("re-eval: a stored source_payload nested past the depth limit is refus
             return a.action == "result_set.heal" && a.result == "success";
         });
     CHECK(heal_audited);
+}
+
+// #4540 (Important finding 2): documented in the OpenAPI description for this
+// route -- a poisoned row's FIRST re-eval heals it in place and reports the
+// depth-guard rejection; a SECOND re-eval on the now-healed row hits a
+// different, less-specific refusal ("no re-runnable source") rather than
+// repeating the same depth error. Pins today's actual fallthrough behavior so
+// a future change to the error path cannot silently drift from what the docs
+// promise with nothing in CI to catch it.
+TEST_CASE("re-eval: a second re-eval on an already-healed row gets a "
+          "different, less-specific error than the first",
+          "[pg][result_set][async][reeval][depth]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "poisoned-twice-reevaled";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status1 = 0;
+    auto body1 = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status1);
+    CHECK(status1 == 400);
+    REQUIRE(body1.contains("error"));
+    const std::string msg1 = body1["error"]["message"].get<std::string>();
+    CHECK(msg1.find("has been discarded") != std::string::npos);
+
+    // The row is healed now (a live-but-empty {"note": ...} payload with no
+    // "sql" key), so this second call takes a completely different refusal
+    // path -- "original carries no SQL", never the depth guard again.
+    int status2 = 0;
+    auto body2 = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status2);
+    CHECK(status2 == 400);
+    REQUIRE(body2.contains("error"));
+    const std::string msg2 = body2["error"]["message"].get<std::string>();
+    CHECK(msg2.find("carries no SQL") != std::string::npos);
+
+    CHECK(msg1 != msg2);
+}
+
+// #4540 (BLOCKING finding 2 route-level coverage): the /re-eval route must
+// never claim the poisoned payload "has been discarded" when the underlying
+// heal_poisoned_payload write did not actually happen. Simulated the same
+// way as the dedicated store-level race test (test_result_set_store.cpp): a
+// BEFORE UPDATE trigger deletes the row instead of letting heal's own UPDATE
+// apply, so from the route's own depth-check read the row looks present and
+// poisoned, and by the time the store's UPDATE runs it is already gone -- the
+// same window a real concurrent delete_set/GC sweep opens.
+TEST_CASE("re-eval: a heal that loses the race to a concurrent delete is a "
+          "different 400 body and a result_set.heal|failure audit, never success",
+          "[pg][result_set][async][reeval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "vanishes-mid-heal";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + nested_array(40) + "}";
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    exec_sql(db.dsn(),
+             "CREATE OR REPLACE FUNCTION test_4540_route_vanish_mid_heal() RETURNS trigger AS $$ "
+             "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+             "END; $$ LANGUAGE plpgsql");
+    exec_sql(db.dsn(), "CREATE TRIGGER test_4540_route_vanish_mid_heal BEFORE UPDATE ON "
+                        "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                        "test_4540_route_vanish_mid_heal()");
+
+    int status = 0;
+    auto body = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    // Distinct wording from the successful-heal 400 above ("has been
+    // discarded") -- the caller must never be told a write happened that
+    // didn't.
+    REQUIRE(body.contains("error"));
+    REQUIRE(body["error"].contains("message"));
+    CHECK(body["error"]["message"].get<std::string>().find("heal attempt failed") !=
+          std::string::npos);
+
+    exec_sql(db.dsn(),
+             "DROP TRIGGER test_4540_route_vanish_mid_heal ON result_set_store.result_sets");
+    exec_sql(db.dsn(), "DROP FUNCTION test_4540_route_vanish_mid_heal()");
+
+    // The row is genuinely gone -- the trigger's own DELETE really ran.
+    CHECK_FALSE(get_ok(*h.store, seeded->id).has_value());
+
+    const bool heal_failure_audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [&](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.heal" && a.result == "failure";
+        });
+    CHECK(heal_failure_audited);
+    const bool heal_success_audited =
+        std::any_of(h.audits.begin(), h.audits.end(), [&](const AsyncHarness::AuditCall& a) {
+            return a.action == "result_set.heal" && a.result == "success";
+        });
+    CHECK_FALSE(heal_success_audited);
 }

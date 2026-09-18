@@ -25399,6 +25399,100 @@ TEST_CASE("MCP reevaluate_result_set: a stored source_payload nested past the de
           ts.audit_log.end());
 }
 
+// #4540 (BLOCKING finding 2 route-level coverage, MCP twin of the REST test
+// in test_rest_result_sets_async.cpp): heal_poisoned_payload's own UPDATE
+// must never be reported as a success when a concurrent delete removed the
+// row first. Simulated deterministically with a BEFORE UPDATE trigger that
+// deletes the row instead of letting the store's UPDATE apply -- from
+// reevaluate_result_set's own depth-check read the row looks present and
+// poisoned, and by the time heal_poisoned_payload's UPDATE runs it is
+// already gone, the same window a real concurrent delete_result_set/GC sweep
+// opens.
+TEST_CASE("MCP reevaluate_result_set: a heal that loses the race to a "
+          "concurrent delete is a JSON-RPC error and a result_set.heal|failure "
+          "audit, never success",
+          "[pg][mcp][integration][result-sets][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    yuzu::test::ResultSetStorePg rs_bundle;
+
+    CreateRequest cr;
+    cr.owner_principal = "test-user"; // McpTestServer's default session principal
+    cr.name = "vanishes-mid-heal";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload =
+        std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') + std::string(40, ']') + "}";
+    auto seeded = rs_bundle.get()->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    yuzu::server::pg::PgConn conn{PQconnectdb(rs_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    {
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "CREATE OR REPLACE FUNCTION test_4540_mcp_vanish_mid_heal() RETURNS trigger AS $$ "
+            "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+            "END; $$ LANGUAGE plpgsql")};
+        REQUIRE(r.ok());
+    }
+    {
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "CREATE TRIGGER test_4540_mcp_vanish_mid_heal BEFORE UPDATE ON "
+                               "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                               "test_4540_mcp_vanish_mid_heal()")};
+        REQUIRE(r.ok());
+    }
+
+    bool dispatched = false;
+    auto dispatch =
+        [&](const std::string&, const std::string&, const std::vector<std::string>&,
+            const std::string&, const std::unordered_map<std::string, std::string>&,
+            const std::string&,
+            const yuzu::server::DispatchCaller&) -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd-should-not-happen"};
+    };
+
+    McpTestServer ts;
+    ts.execution_tracker_for_test = tracker_bundle.get();
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.start_with_dispatch(dispatch, "operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"reevaluate_result_set","arguments":{"id":")" +
+        seeded->id + R"("}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body.contains("error"));
+    // Distinct wording from the successful-heal error above ("too deeply and
+    // has been discarded") -- the caller must never be told a write happened
+    // that didn't.
+    CHECK(body["error"]["message"].get<std::string>().find("heal attempt failed") !=
+          std::string::npos);
+    CHECK_FALSE(dispatched);
+
+    {
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(),
+            "DROP TRIGGER test_4540_mcp_vanish_mid_heal ON result_set_store.result_sets")};
+        REQUIRE(r.ok());
+    }
+    {
+        yuzu::server::pg::PgResult r{
+            PQexec(conn.get(), "DROP FUNCTION test_4540_mcp_vanish_mid_heal()")};
+        REQUIRE(r.ok());
+    }
+
+    // The row is genuinely gone -- the trigger's own DELETE really ran.
+    auto gone_result = rs_bundle.get()->get(seeded->id);
+    REQUIRE(gone_result.has_value());
+    CHECK_FALSE(gone_result->has_value());
+
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "result_set.heal|failure") !=
+          ts.audit_log.end());
+    CHECK(std::find(ts.audit_log.begin(), ts.audit_log.end(), "result_set.heal|success") ==
+          ts.audit_log.end());
+}
+
 // Gate 6 sre finding (#4364 re-review): the params-bound recheck just above
 // ran AFTER the instruction_store availability gate, unlike every sibling
 // ordering fix in this same PR - during a concurrent instruction_store
