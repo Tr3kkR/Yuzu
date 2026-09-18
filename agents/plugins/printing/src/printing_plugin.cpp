@@ -33,6 +33,7 @@
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -56,6 +57,7 @@
 #pragma comment(lib, "winspool.lib")
 
 #include "win_str.hpp" // yuzu::win::from_wide/to_wide — ../../shared include dir
+#include "bounded_wait.hpp" // yuzu::shared::bounded_call — ../../shared include dir
 #else
 #include <httplib.h>
 
@@ -79,6 +81,26 @@ uint32_t next_request_id() {
 // Used to open the handle for every read (EnumJobsW/GetJobW). Confirmed by
 // P93-2's the-rig measurement.
 constexpr DWORD kReadDesiredAccess = PRINTER_ACCESS_USE;
+
+// Round-3 review Should-fix: failure tokens for the Windows leg, mirroring
+// the POSIX leg's <os>:<source>:<detail> taxonomy (kTokConnectFailed et al.
+// below in the #else block) -- the Windows leg previously never called
+// set_result_status() at all, so every failure silently read as an empty-
+// but-fine queue instead of a distinguishable CONSTRAINED/PARTIAL result.
+constexpr std::string_view kTokEnumPrintersFailed = "windows:winspool:enum_printers_failed";
+constexpr std::string_view kTokJobEnumFailed = "windows:winspool:enum_jobs_failed";
+
+// Round-3 review Should-fix: EnumPrintersW/EnumJobsW are plain synchronous
+// calls with no cancellation of their own. PRINTER_ENUM_CONNECTIONS
+// specifically requests enumeration of network-connected printer mappings,
+// which Windows documents as able to block for an extended period against
+// an unreachable print server -- bounding the WAIT (yuzu::shared::
+// bounded_call, agents/shared/bounded_wait.hpp) keeps a stuck spooler from
+// pinning this plugin's dispatch thread indefinitely. This is an
+// availability bound only, not the dism_bounded_call.hpp plugin-unload UAF
+// class -- neither enum function holds an OS handle across the timeout
+// boundary that a caller would need to synchronize against on abandonment.
+constexpr std::chrono::milliseconds kSpoolerCallTimeout{5000};
 
 // Move-only RAII owner for an HPRINTER (PH-015-style ownership rule, same
 // shape as power_health's DirHandle / the repo's other Scoped* wrappers):
@@ -129,33 +151,70 @@ private:
 // caller holds this result; returning the structs alone left every pointer
 // dangling into a buffer freed at function return (heap-use-after-free on
 // every field read by do_printers/do_jobs — fixed here, the-rig build).
+// Round-3 review Should-fix: `ok` distinguishes "the call genuinely found
+// zero items" (ok=true, items empty) from "the win32 call itself failed"
+// (ok=false) -- an empty PrinterEnumRaw{} used to mean both, which is
+// exactly the false-empty failure mode the POSIX leg's transport/decode/
+// status checks were built to avoid. `last_error` is GetLastError() from
+// whichever call failed, folded into the CONSTRAINED status detail string.
 struct PrinterEnumRaw {
     std::vector<PRINTER_INFO_2W> items;
     std::vector<std::byte> backing;
+    bool ok = false;
+    DWORD last_error = 0;
 };
 
 struct JobEnumRaw {
     std::vector<JOB_INFO_2W> items;
     std::vector<std::byte> backing;
+    bool ok = false;
+    DWORD last_error = 0;
 };
 
-// EnumPrintersW's standard two-call pattern: size, allocate, fill.
-[[nodiscard]] PrinterEnumRaw enum_printers_raw() {
+// EnumPrintersW's standard two-call pattern: size, allocate, fill. A first
+// call that SUCCEEDS with needed==0 means genuinely zero printers (ok=true,
+// empty); a first call that FAILS with needed==0 is a real error, never
+// silently treated as "no printers" (contrast the pre-fix version, which
+// returned an indistinguishable empty result either way).
+[[nodiscard]] PrinterEnumRaw enum_printers_raw_impl() {
+    PrinterEnumRaw result;
     DWORD needed = 0, returned = 0;
-    EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, nullptr, 2, nullptr, 0, &needed,
-                  &returned);
-    if (needed == 0)
-        return {};
+    if (EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, nullptr, 2, nullptr, 0,
+                       &needed, &returned)) {
+        result.ok = true; // zero-size success: genuinely no printers
+        return result;
+    }
+    if (needed == 0) {
+        result.last_error = GetLastError();
+        return result;
+    }
     std::vector<std::byte> buf(needed);
     if (!EnumPrintersW(PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS, nullptr, 2,
-                        reinterpret_cast<LPBYTE>(buf.data()), needed, &needed, &returned))
-        return {};
+                        reinterpret_cast<LPBYTE>(buf.data()), needed, &needed, &returned)) {
+        result.last_error = GetLastError();
+        return result;
+    }
     std::vector<PRINTER_INFO_2W> out;
     out.reserve(returned);
     auto* items = reinterpret_cast<PRINTER_INFO_2W*>(buf.data());
     for (DWORD i = 0; i < returned; ++i)
         out.push_back(items[i]);
-    return PrinterEnumRaw{std::move(out), std::move(buf)};
+    result.items = std::move(out);
+    result.backing = std::move(buf);
+    result.ok = true;
+    return result;
+}
+
+// Bounds the WAIT on enum_printers_raw_impl() -- PRINTER_ENUM_CONNECTIONS
+// can block against an unreachable network print server (see
+// kSpoolerCallTimeout's own comment above). A timeout or ceiling-rejection
+// both fold into the same not-ok, no-GetLastError() outcome as a genuine
+// win32 failure -- the caller's CONSTRAINED path doesn't need to
+// distinguish them, and PrinterEnumRaw's default-constructed ok=false
+// already means exactly that.
+[[nodiscard]] PrinterEnumRaw enum_printers_raw() {
+    auto result = yuzu::shared::bounded_call(kSpoolerCallTimeout, enum_printers_raw_impl);
+    return result ? std::move(*result) : PrinterEnumRaw{};
 }
 
 [[nodiscard]] std::wstring default_printer_name_raw() {
@@ -169,21 +228,48 @@ struct JobEnumRaw {
     return std::wstring(buf.data());
 }
 
+// Round-3 review Should-fix: caps the row count EnumJobsW is asked to
+// return, matching the POSIX leg's own bounded design intent (no leg had an
+// explicit cap before this). Deliberately NOT wrapped in bounded_call()
+// like enum_printers_raw() above -- unlike that function, this one is
+// handed a live HANDLE the CALLER owns and closes immediately on return
+// (PrinterHandle's destructor, do_jobs's per-printer loop); bounded_call()
+// abandoning a timed-out call would race that close against the still-
+// running detached thread's use of the same handle (bounded_wait.hpp's own
+// documented caller contract: "closing the handle races a live call").
+// Retrofitting that safely needs the caller to defer ClosePrinter() past
+// any possible in-flight detached use, which is a larger structural change
+// than this non-blocking finding calls for -- the row cap alone bounds the
+// call's OWN cost without touching handle lifetime.
+constexpr DWORD kMaxJobsPerPrinter = 5000;
+
 // EnumJobsW's standard two-call pattern over an already-open printer handle.
 [[nodiscard]] JobEnumRaw enum_jobs_raw(HANDLE h) {
+    JobEnumRaw result;
     DWORD needed = 0, returned = 0;
-    EnumJobsW(h, 0, 0xFFFFFFFFu, 2, nullptr, 0, &needed, &returned);
-    if (needed == 0)
-        return {};
+    if (EnumJobsW(h, 0, kMaxJobsPerPrinter, 2, nullptr, 0, &needed, &returned)) {
+        result.ok = true; // zero-size success: genuinely no queued jobs
+        return result;
+    }
+    if (needed == 0) {
+        result.last_error = GetLastError();
+        return result;
+    }
     std::vector<std::byte> buf(needed);
-    if (!EnumJobsW(h, 0, 0xFFFFFFFFu, 2, reinterpret_cast<LPBYTE>(buf.data()), needed, &needed, &returned))
-        return {};
+    if (!EnumJobsW(h, 0, kMaxJobsPerPrinter, 2, reinterpret_cast<LPBYTE>(buf.data()), needed,
+                    &needed, &returned)) {
+        result.last_error = GetLastError();
+        return result;
+    }
     std::vector<JOB_INFO_2W> out;
     out.reserve(returned);
     auto* items = reinterpret_cast<JOB_INFO_2W*>(buf.data());
     for (DWORD i = 0; i < returned; ++i)
         out.push_back(items[i]);
-    return JobEnumRaw{std::move(out), std::move(buf)};
+    result.items = std::move(out);
+    result.backing = std::move(buf);
+    result.ok = true;
+    return result;
 }
 
 // JOB_INFO_2W's `Submitted` is the spooler's local wall-clock time at
@@ -222,9 +308,17 @@ struct JobEnumRaw {
 
 int do_printers(yuzu::CommandContext& ctx) {
     const auto raw = enum_printers_raw();
+    if (!raw.ok) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               std::format("EnumPrintersW failed or timed out, GetLastError={}",
+                                           raw.last_error));
+        ctx.write_output(std::format("printer|unavailable|{}", kTokEnumPrintersFailed));
+        return 0;
+    }
     const std::wstring default_name = default_printer_name_raw();
 
     if (raw.items.empty()) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
         ctx.write_output("printer|none");
         return 0;
     }
@@ -241,31 +335,69 @@ int do_printers(yuzu::CommandContext& ctx) {
         row.queued_jobs = static_cast<int64_t>(pi.cJobs);
         ctx.write_output(format_printer_row(row));
     }
+    ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
     return 0;
 }
 
 int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     const std::string filter_printer{params.get("printer")};
     const auto raw_printers = enum_printers_raw();
+    if (!raw_printers.ok) {
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                               std::format("EnumPrintersW failed or timed out, GetLastError={}",
+                                           raw_printers.last_error));
+        ctx.write_output(std::format("job|unavailable|{}", kTokEnumPrintersFailed));
+        return 0;
+    }
 
     bool any = false;
+    // Round-3 review Should-fix: tracks whether ANY per-printer job read
+    // failed (open_printer denied, or enum_jobs_raw() itself failing) so the
+    // action's overall result_status can surface CONSTRAINED/PARTIAL rather
+    // than reporting a subset of printers' queues as though it were the
+    // complete picture. A single printer's own queue being unreadable stays
+    // a per-printer skip, not a whole-action failure (existing design), but
+    // it is no longer a SILENT one.
+    bool any_job_read_failed = false;
     for (const auto& pi : raw_printers.items) {
         const std::string name = pi.pPrinterName != nullptr ? yuzu::win::from_wide(pi.pPrinterName) : "";
         if (!filter_printer.empty() && name != filter_printer)
             continue;
 
         auto handle = open_printer(pi.pPrinterName != nullptr ? pi.pPrinterName : L"", kReadDesiredAccess);
-        if (!handle)
+        if (!handle) {
+            any_job_read_failed = true;
             continue; // this printer's jobs are simply unavailable; not a whole-action failure
+        }
         const auto jobs = enum_jobs_raw(handle->get());
+        if (!jobs.ok) {
+            any_job_read_failed = true;
+            continue;
+        }
         for (const auto& j : jobs.items) {
             any = true;
             ctx.write_output(format_job_row(job_row_from_info(name, j)));
         }
     }
 
-    if (!any)
-        ctx.write_output("job|none");
+    if (!any) {
+        if (any_job_read_failed) {
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                   "one or more printers' job queues could not be read");
+            ctx.write_output(std::format("job|unavailable|{}", kTokJobEnumFailed));
+        } else {
+            ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+            ctx.write_output("job|none");
+        }
+        return 0;
+    }
+    if (any_job_read_failed) {
+        ctx.set_result_status(
+            YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+            "one or more printers' job queues could not be read; partial results only");
+    } else {
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+    }
     return 0;
 }
 
@@ -479,13 +611,13 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     if (!result.transport_ok) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "Get-Jobs: transport failed");
-        ctx.write_output(std::format("printer|unavailable|{}", kTokConnectFailed));
+        ctx.write_output(std::format("job|unavailable|{}", kTokConnectFailed));
         return 0;
     }
     if (!result.message) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                "Get-Jobs: response did not decode");
-        ctx.write_output(std::format("printer|unavailable|{}", kTokDecodeFailed));
+        ctx.write_output(std::format("job|unavailable|{}", kTokDecodeFailed));
         return 0;
     }
     // RFC 8010 successful-* is 0x0000-0x00FF -- a status outside that range
@@ -493,7 +625,7 @@ int do_jobs(yuzu::CommandContext& ctx, const yuzu::Params& params) {
     if (result.message->op_or_status > 0x00FF) {
         ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                std::format("Get-Jobs: unexpected status 0x{:04x}", result.message->op_or_status));
-        ctx.write_output(std::format("printer|unavailable|{}", kTokUnexpectedStatus));
+        ctx.write_output(std::format("job|unavailable|{}", kTokUnexpectedStatus));
         return 0;
     }
 

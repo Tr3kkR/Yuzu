@@ -1582,6 +1582,9 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | quarantine | Y | Y | Y | Security |
 | certificates | Y | Y | Y | Security |
 | rdp_control | Y | - | - | Security |
+| autoruns | Y | Y | Y | Security |
+| app_usage | Y | Y | Y | Security |
+| execution_artifacts | Y | - | - | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | Y | Y | Y | File System |
 | registry | Y | - | - | System Config |
@@ -1605,7 +1608,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 | software_usage | Y | Y | Y | Software | *Planned (Phase 12)* |
 | app_control | Y | Y | - | Security | *Planned (Phase 12)* |
 
-**51 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-15 (`ls -d agents/plugins/*/` = 53 directories, minus `example` + `chargen` = 51; the 2026-09-07 count of 49 predates Wave 9 PR9.1b's `printing`, plus one further plugin that landed between the two recounts). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
+**54 plugins** (+ 2 planned) — covering hardware, network, security, filesystem, registry, WMI, WiFi, WoL, IOC, quarantine, certificates, content distribution, user interaction, and more. Includes cross-platform and Windows-only plugins; the two test/debug plugins (`chargen`, `example`) appear in the table but are excluded from the headline count. Per-OS cells follow `docs/os-capability-matrix.md` (2026-09-07; a partial 🟡 leg is shown as Y — the matrix carries the per-action detail). Recount verified 2026-09-18 (`ls -d agents/plugins/*/` = 56 directories, minus `example` + `chargen` = 54; the 2026-09-15 count of 51 predated `app_usage`, `autoruns`, and `execution_artifacts` merging into `dev` — added here as three new rows, all `Security` category, per-OS support read directly from each plugin's own `YuzuActionDescriptor` legs). `software_usage` / `app_control` remain aspirational — confirmed no such directories exist under `agents/plugins/` as of this baseline.
 
 ---
 
