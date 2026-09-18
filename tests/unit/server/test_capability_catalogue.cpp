@@ -30,6 +30,7 @@
 #include "capability_decls/plugin_action_catalogue_app_usage.hpp"
 #include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
+#include "capability_decls/plugin_action_catalogue_peripherals.hpp"
 #include "capability_decls/plugin_action_catalogue_printing.hpp"
 #include "command_capability.hpp"
 
@@ -137,6 +138,7 @@ struct LabeledSpan {
         {"app_usage", capdecls::plugin_action_catalogue_app_usage(), false},
         {"execution_artifacts", capdecls::plugin_action_catalogue_execution_artifacts(), false},
         {"windows_optional_features", capdecls::plugin_action_catalogue_windows_optional_features(), false},
+        {"peripherals", capdecls::plugin_action_catalogue_peripherals(), false},
         {"printing", capdecls::plugin_action_catalogue_printing(), false},
         {"core", capdecls::core_dispatch_capabilities(), true},
     };
@@ -146,7 +148,7 @@ struct LabeledSpan {
     // CommandCapabilityRegistry's constructor only accepts a brace-enclosed
     // std::initializer_list (see command_capability.hpp), so this can't be
     // built from the vector programmatically — it mirrors all_labeled_sources()
-    // literally, fourteen sources exactly as a live composition site would use.
+    // literally, fifteen sources exactly as a live composition site would use.
     return CommandCapabilityRegistry{
         capdecls::plugin_action_catalogue_content_dist(),
         capdecls::plugin_action_catalogue_a(),
@@ -160,6 +162,7 @@ struct LabeledSpan {
         capdecls::plugin_action_catalogue_app_usage(),
         capdecls::plugin_action_catalogue_execution_artifacts(),
         capdecls::plugin_action_catalogue_windows_optional_features(),
+        capdecls::plugin_action_catalogue_peripherals(),
         capdecls::plugin_action_catalogue_printing(),
         capdecls::core_dispatch_capabilities(),
     };
