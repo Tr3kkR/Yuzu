@@ -262,8 +262,11 @@ TEST_CASE("sum_block_storage_stats's empty-iterator arm reports invalid",
     // Deterministic seam (governance Gate 3 SHOULD finding): a bogus IOKit service class
     // matches nothing, independent of this box's real (non-empty) driver population, so
     // the "zero drivers matched -> valid stays false" arm is pinned regardless of runner.
+    // REQUIRE the lookup itself succeeded (nullopt there is inconclusive, not a pin) —
+    // only then does out->valid==false actually pin the arm this test names.
     const auto out = sum_block_storage_stats_empty_iterator_for_test();
-    CHECK_FALSE(out.valid);
+    REQUIRE(out.has_value());
+    CHECK_FALSE(out->valid);
 }
 
 TEST_CASE("read_memorystatus_level reads a value in [0,100]", "[dex][macos][perf][darwin]") {

@@ -146,8 +146,10 @@ YUZU_EXPORT DiskTotals read_disk_totals();
 /// genuinely-empty-iterator arm (zero drivers matched -> valid stays false)
 /// deterministically, via an IOKit service class guaranteed to match nothing —
 /// independent of the live driver population, which read_disk_totals()'s own caller
-/// (this box has real drivers) cannot control. Never used outside tests.
-YUZU_EXPORT DiskTotals sum_block_storage_stats_empty_iterator_for_test();
+/// (this box has real drivers) cannot control. Never used outside tests. Returns nullopt
+/// on the IOServiceGetMatchingServices lookup itself failing (inconclusive either way —
+/// distinct from a present DiskTotals with valid==false, the arm this seam pins).
+YUZU_EXPORT std::optional<DiskTotals> sum_block_storage_stats_empty_iterator_for_test();
 #endif
 
 /// Darwin: one sysctlbyname("kern.memorystatus_level") read. nullopt on failure or on

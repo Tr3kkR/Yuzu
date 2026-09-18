@@ -237,17 +237,18 @@ DiskTotals read_disk_totals() {
     return sum_block_storage_stats(it.get());
 }
 
-DiskTotals sum_block_storage_stats_empty_iterator_for_test() {
+std::optional<DiskTotals> sum_block_storage_stats_empty_iterator_for_test() {
     // "YuzuNonexistentDriverClassForTest" matches no IOKit service by construction —
     // IOServiceGetMatchingServices still succeeds, handing back a real iterator that
-    // IOIteratorNext immediately exhausts, so sum_block_storage_stats()'s "zero drivers
-    // -> valid stays false" arm is pinned deterministically (this box has real
+    // IOIteratorNext immediately hands back IO_OBJECT_NULL (not an "exhausted" iterator
+    // to release — nothing was ever produced), so sum_block_storage_stats()'s "zero
+    // drivers -> valid stays false" arm is pinned deterministically (this box has real
     // IOBlockStorageDriver rows, so that arm is otherwise unreachable from a test here).
     io_iterator_t raw_it{};
     if (IOServiceGetMatchingServices(kIOMainPortDefault,
                                      IOServiceMatching("YuzuNonexistentDriverClassForTest"),
                                      &raw_it) != KERN_SUCCESS)
-        return {}; // lookup itself failed — inconclusive, not a pin either way
+        return std::nullopt; // lookup itself failed — inconclusive, distinct from a pin
     ScopedIOObject it{raw_it};
     return sum_block_storage_stats(it.get());
 }
