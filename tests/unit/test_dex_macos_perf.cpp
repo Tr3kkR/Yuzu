@@ -17,6 +17,7 @@
 #include <limits>
 
 #if defined(__APPLE__)
+#include <yuzu/agent/scoped_cfref.hpp>
 #include <yuzu/agent/scoped_ioobject.hpp>
 
 #include <IOKit/IOKitLib.h>
@@ -258,20 +259,35 @@ TEST_CASE("read_disk_totals reads real IOBlockStorageDriver counters", "[dex][ma
     // Verify driver presence INDEPENDENTLY of read_disk_totals() itself, so SKIP() means
     // "genuinely nothing to read on this runner" rather than silently masking a real
     // read_disk_totals defect behind the same call this test is meant to pin. RAII-owned
-    // via ScopedIOObject (never a manual IOObjectRelease in new code — the same idiom
-    // production code uses, agents/plugins/disk_actions/src/disk_actions_macos.cpp).
+    // via ScopedIOObject/ScopedCFRef (never a manual IOObjectRelease/CFRelease in new
+    // code — the same idiom production code uses,
+    // agents/plugins/disk_actions/src/disk_actions_macos.cpp). Sums each driver's own
+    // "Operations (Read)" key directly rather than merely counting drivers (governance
+    // C-9): a bare driver-presence guard could pass on a freshly-booted host with zero
+    // completed reads, then fail the CHECK below for an unrelated reason — this way the
+    // guard and the assertion test the SAME condition.
     io_iterator_t raw_it{};
     REQUIRE(IOServiceGetMatchingServices(kIOMainPortDefault,
                                          IOServiceMatching(kIOBlockStorageDriverClass),
                                          &raw_it) == KERN_SUCCESS);
     yuzu::agent::ScopedIOObject it{raw_it};
-    int driver_count = 0;
+    std::int64_t independent_reads = 0;
     for (io_object_t raw_obj; (raw_obj = IOIteratorNext(it.get()));) {
         yuzu::agent::ScopedIOObject obj{raw_obj};
-        ++driver_count;
+        yuzu::agent::ScopedCFRef<CFTypeRef> stats{IORegistryEntryCreateCFProperty(
+            obj.get(), CFSTR(kIOBlockStorageDriverStatisticsKey), kCFAllocatorDefault, 0)};
+        if (!stats || CFGetTypeID(stats.get()) != CFDictionaryGetTypeID())
+            continue;
+        auto num = static_cast<CFNumberRef>(
+            CFDictionaryGetValue(static_cast<CFDictionaryRef>(stats.get()),
+                                 CFSTR(kIOBlockStorageDriverStatisticsReadsKey)));
+        std::int64_t reads = 0;
+        if (num && CFGetTypeID(num) == CFNumberGetTypeID() &&
+            CFNumberGetValue(num, kCFNumberSInt64Type, &reads) && reads > 0)
+            independent_reads += reads;
     }
-    if (driver_count == 0) {
-        SKIP("no IOBlockStorageDriver rows on this runner (VM/CI host)");
+    if (independent_reads == 0) {
+        SKIP("no IOBlockStorageDriver reported a completed read on this runner (VM/CI host)");
     }
 
     const auto disk = read_disk_totals();
