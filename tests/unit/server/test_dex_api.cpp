@@ -152,3 +152,74 @@ TEST_CASE("DexApi: fleet-dependent reads use the injected FleetFn", "[pg][dex_ap
     (void)api->overview("7d", /*visible=*/nullptr);
     CHECK(fleet_called); // the seam obtains the fleet from the injected FleetFn
 }
+
+// Direct DexApi-level parity for the remaining builder-backed methods — each
+// seam method output equals the corresponding build_dex_*_model(store,...)
+// output on the same seeded data (the [dex] REST suite covers these
+// indirectly; this matches the verify template's method-level parity). The
+// fleet-dependent methods use the SAME fixed DexFleet the builder is handed.
+TEST_CASE("DexApi: builder-backed methods match their shared builders", "[pg][dex_api]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, dex_api_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+    seed_crash(store, "e1", "a1", "notepad.exe", "windows", kTs);
+    seed_crash(store, "e2", "a2", "notepad.exe", "windows", kTs);
+
+    const DexFleet fleet{1, 1, {"windows"}};
+    auto api = make_local_dex_api(&store, [&]() { return fleet; });
+    const std::string w = "7d";
+    const std::string since = yuzu::server::dex_iso_since(yuzu::server::dex_window_to_days(w));
+
+    SECTION("device_history") {
+        const auto a = api->device_history("a1", w);
+        const auto b = yuzu::server::build_dex_device_history_model(&store, "a1", w, since);
+        CHECK(a.agent_id == b.agent_id);
+        CHECK(a.window == b.window);
+        CHECK(a.history.size() == b.history.size());
+    }
+    SECTION("observation") {
+        const auto a = api->observation("a1", "e1");
+        const auto b = yuzu::server::build_dex_observation_model(&store, "a1", "e1");
+        REQUIRE(a.has_value() == b.has_value());
+        if (a)
+            CHECK(a->event_id == b->event_id);
+        // A foreign/absent event_id resolves to nullopt on both paths.
+        CHECK_FALSE(api->observation("a2", "e1").has_value()); // e1 belongs to a1
+    }
+    SECTION("app") {
+        const auto a = api->app("notepad.exe", w, /*visible=*/nullptr);
+        const auto b = yuzu::server::build_dex_app_model(&store, "notepad.exe", w, since, nullptr);
+        CHECK(a.process_name == b.process_name);
+        CHECK(a.devices.size() == b.devices.size());
+        CHECK(a.modules.size() == b.modules.size());
+    }
+    SECTION("catalogue_group") {
+        // "App reliability" is a real dex_signal_groups() family (process.crashed
+        // is a member), so both paths return a present model.
+        const auto a = api->catalogue_group("App reliability", "all", w);
+        const auto b = yuzu::server::build_dex_catalogue_group_model(&store, "App reliability",
+                                                                     "all", fleet, w, since);
+        REQUIRE(a.has_value() == b.has_value());
+        if (a) {
+            CHECK(a->group_name == b->group_name);
+            CHECK(a->total_type_count == b->total_type_count);
+        }
+        // An unknown family is nullopt on both.
+        CHECK_FALSE(api->catalogue_group("no-such-family", "all", w).has_value());
+    }
+    SECTION("health") {
+        const auto a = api->health("default", w);
+        const auto b = yuzu::server::build_dex_health_model(&store, fleet, "default", w, since);
+        CHECK(a.score == b.score);
+        CHECK(a.reporting == b.reporting);
+        CHECK(a.band == b.band);
+    }
+    SECTION("trends") {
+        const auto a = api->trends(w);
+        const auto b = yuzu::server::build_dex_trends_model(&store, fleet, w, since);
+        CHECK(a.window == b.window);
+        CHECK(a.days.size() == b.days.size());
+        CHECK(a.families.size() == b.families.size());
+    }
+}

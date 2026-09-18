@@ -506,10 +506,10 @@ public:
         std::shared_ptr<const DeviceApi> device_api = nullptr,
         // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API
         // seam — backs the GuaranteedStateStore-backed GET /api/v1/dex/*
-        // signal/experience reads (the SAME assembly the dashboard fragments
-        // and the MCP DEX signal tools build). nullptr = the DEX signal
-        // handlers fall back to the shared build_dex_*_model helpers directly
-        // (byte-identical), so a caller that has not wired it is unaffected.
+        // signal/experience reads (the SAME instance the MCP DEX signal tools
+        // use). The DEX signal handlers REQUIRE it: nullptr → those routes
+        // answer 503, equivalent to the old `!guaranteed_state_store` readiness
+        // guard (server.cpp wires this iff the store is present).
         std::shared_ptr<const DexApi> dex_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
@@ -604,7 +604,7 @@ public:
         // above; identical trailing-optional-dep, 503-when-unwired contract.
         std::shared_ptr<const DeviceApi> device_api = nullptr,
         // ADR-0031 WS-A4 (fifth family): see the production overload's doc
-        // comment above; identical trailing-optional-dep, fall-back-when-unwired.
+        // comment above; identical trailing-optional-dep, required-or-503.
         std::shared_ptr<const DexApi> dex_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing

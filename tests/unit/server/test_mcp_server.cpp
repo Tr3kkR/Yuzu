@@ -1469,7 +1469,8 @@ private:
         // test's GuaranteedStateStore + fleet, so the DEX signal MCP tools
         // exercise the SEAM path (production wires it identically). Gated on
         // store presence exactly like server.cpp — no store → null api → the
-        // tools' store-unavailable branch (their gate is unchanged).
+        // tools' harmonized `!dex_api_` readiness guard returns the
+        // store-unavailable error.
         if (guaranteed_state_store_for_test)
             mcp.set_dex_api(yuzu::server::make_local_dex_api(
                 guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));

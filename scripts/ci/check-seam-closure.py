@@ -238,8 +238,9 @@ FAMILIES = {
     # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
     # `dex_routes.cpp` / `device_lens_routes.cpp` are multi-family / mixed TUs
     # and stay INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the
-    # other families' twin-registration files. REST routes through `DexApi`
-    # today; the MCP / dashboard / device-lens rewire is tracked as follow-up.
+    # other families' twin-registration files. REST and MCP both route through
+    # `DexApi`; the dashboard fragments and the /fragments/device/dex lens are
+    # deferred (follow-up).
     "dex": {
         "tus": [
             "server/core/src/dex_types.hpp",

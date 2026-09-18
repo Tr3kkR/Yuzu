@@ -18295,9 +18295,10 @@ private:
             // three GET /api/v1/devices[/{id}] siblings never disagree.
             device_api,
             // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — the DEX
-            // signal/experience handlers route their model assembly through
-            // this (falling back to the shared build_dex_*_model helpers when
-            // unwired, byte-identical).
+            // signal/experience handlers require this and answer 503 when it is
+            // null (constructed above iff the store is present, so `!dex_api`
+            // is the exact readiness signal the old `!guaranteed_state_store`
+            // guard was).
             dex_api);
 
         // -- Register MCP server routes ----------------------------------------

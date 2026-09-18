@@ -673,12 +673,13 @@ public:
     void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
 
     /// ADR-0031 WS-A4 (fifth family): the SAME in-process DEX signals API seam
-    /// the REST `/api/v1/dex/*` handlers and the dashboard consume — server.cpp
-    /// wires the IDENTICAL instance so the MCP DEX signal tools can never
-    /// disagree with REST/dashboard on the signal/experience model. Unset
-    /// (nullptr) makes the DEX signal tools answer the same "store unavailable"
-    /// error their `!guaranteed_state_store` guard used to (readiness gate),
-    /// mirroring verify_api's null→error contract.
+    /// the REST `/api/v1/dex/*` handlers use — server.cpp wires the IDENTICAL
+    /// instance so the MCP DEX signal tools can never disagree with REST on the
+    /// signal/experience model. The DEX signal tools REQUIRE it: their
+    /// harmonized `if (!dex_api_)` readiness guard returns the "Guaranteed State
+    /// store unavailable" error when it is null — server.cpp wires it iff the
+    /// store is present, so null ⟺ store absent, mirroring verify_api's
+    /// null→error contract.
     void set_dex_api(std::shared_ptr<const DexApi> a) { dex_api_ = std::move(a); }
 
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set

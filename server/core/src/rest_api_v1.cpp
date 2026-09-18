@@ -12180,9 +12180,9 @@ void RestApiV1::register_routes(
                      return;
                  }
 
-                 // ADR-0031 WS-A4: route the four raw signal-detail reads through
-                 // the DexApi seam (falling back to the direct store reads when
-                 // unwired, byte-identical — same obs_type/since/limit/os_scope).
+                 // ADR-0031 WS-A4: the four raw signal-detail reads, bundled by
+                 // the DexApi seam (the impl derives since + normalizes os the
+                 // same way; os_scope below still feeds the response "os" field).
                  const DexSignalDetailModel detail =
                      dex_api->signal_detail(obs_type, window, os_raw, limit);
                  JArr subjects;
