@@ -1107,11 +1107,15 @@ same caps MCP's `create_result_set_from_instruction_result`/`reevaluate_result_s
 | `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched (params) or reached an unbounded store lookup then 400 (instruction_id) | `400` |
 | `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `params` present but not a JSON object (a string, array, or number) | dispatched/re-dispatched with an EMPTY params map, silently discarding it | `400` |
 | `POST /api/v1/result-sets/from-tar-query` or `from-instruction-result` | `name` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets` (the generic/synchronous create route) | `name` or `source_kind` present but not a JSON string | uncaught exception, bare `500` | `400` |
 
-**Who this affects.** Only a caller already sending a field past these bounds - the same bounds
-MCP's equivalent tools enforce (MCP's handler-side bounds landed within days of this fix, in the
-same unreleased cycle, not a long-standing MCP/REST gap). No supported flow constructs an `instruction_id` or
-`params` object anywhere near these limits, so no compliant client is affected.
+**Who this affects.** Callers sending a field past a numeric/count bound (`instruction_id`,
+`params` count/key-length/value-length, both at the same values MCP's equivalent tools enforce -
+MCP's handler-side bounds landed within days of this fix, in the same unreleased cycle, not a
+long-standing MCP/REST gap), AND separately callers sending a wrong-typed `params`, `name`, or
+`source_kind` (not a numeric bound at all - a shape/type mismatch, always rejected regardless of
+size). No supported flow constructs any of these fields anywhere near the numeric limits or with
+the wrong JSON type, so no compliant client is affected either way.
 
 ### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
 
