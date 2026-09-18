@@ -946,6 +946,10 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         {"windows_optional_features.list", "List Windows optional OS features with enabled/disabled/pending state (DISM)"},
         {"windows_optional_features.info", "Describe one Windows optional feature: display name, state, restart requirement (DISM)"},
         // sccm
+        // peripherals
+        {"peripherals.usb", "List attached USB devices (vendor/product ids, class, names, serial, hub flag)"},
+        {"peripherals.pci", "List PCI devices (vendor/device/class codes, driver)"},
+        {"peripherals.thunderbolt", "List Thunderbolt/USB4 controllers and attached devices"},
         {"sccm.client_version", "Check if SCCM client is installed and report version"},
         {"sccm.site", "Get SCCM site assignment info"},
         // storage
