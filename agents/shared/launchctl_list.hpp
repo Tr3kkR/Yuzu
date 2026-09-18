@@ -106,20 +106,27 @@ struct LaunchctlParseResult {
 
 /// Parse the line-split stdout of `launchctl list` (blank lines already
 /// dropped, a trailing '\r' already stripped by the caller -- matches
-/// SubprocessResult::lines' contract). An empty `lines` yields an empty,
-/// non-malformed result (no output at all is not the same as garbage
-/// output). Otherwise line 0 MUST be exactly "PID\tStatus\tLabel" -- a
-/// preamble line before the real header, or a header-less capture, is
-/// rejected wholesale (`malformed = true`, `rows` empty) rather than
-/// decoded starting from the wrong line (UP-6, governance A0 fix round:
+/// SubprocessResult::lines' contract). An EMPTY `lines` is ALSO malformed
+/// (governance A0 fix round, UP2-2, HIGH): a real `launchctl list` exit-0
+/// capture always emits at least the header row, so zero lines at all is
+/// itself a sign of a corrupted/truncated capture, never a genuine
+/// zero-services answer -- treating it as valid-empty would make TAR's
+/// diff read it as "every previously-known service just disappeared",
+/// overwrite the baseline with nothing, then storm every one back as
+/// freshly `added` on the next real capture. Otherwise line 0 MUST be
+/// exactly "PID\tStatus\tLabel" -- a preamble line before the real header,
+/// or a header-less capture, is rejected wholesale (`malformed = true`,
+/// `rows` empty) rather than decoded starting from the wrong line (UP-6:
 /// silently decoding from a wrong offset would misattribute every
 /// subsequent field). Every row after a valid header decodes via
-/// decode_launchctl_row(), which never throws.
+/// decode_launchctl_row(), which never throws on malformed input.
 [[nodiscard]] inline LaunchctlParseResult
 parse_launchctl_list(std::span<const std::string> lines) {
     LaunchctlParseResult out;
-    if (lines.empty())
+    if (lines.empty()) {
+        out.malformed = true;
         return out;
+    }
     if (lines[0] != "PID\tStatus\tLabel") {
         out.malformed = true;
         return out;

@@ -67,11 +67,16 @@ TEST_CASE("decode_launchctl_row: a literal tab inside the label is preserved "
     CHECK(row.label == "com.example\tweird.label");
 }
 
-TEST_CASE("parse_launchctl_list: empty input yields an empty, non-malformed result",
+TEST_CASE("parse_launchctl_list: empty input (zero lines) is malformed, not a "
+          "genuine zero-services answer",
           "[launchctl_list]") {
+    // UP2-2 (governance A0 fix round, HIGH): a real exit-0 capture always
+    // has at least the header row, so zero lines signals a corrupted
+    // capture -- treating it as valid-empty would storm TAR's diff (every
+    // known service reads as removed, then re-added next tick).
     auto result = parse_launchctl_list({});
     CHECK(result.rows.empty());
-    CHECK_FALSE(result.malformed); // no output at all is not garbage output
+    CHECK(result.malformed);
 }
 
 TEST_CASE("parse_launchctl_list: header-only input yields empty rows, not malformed",
