@@ -674,6 +674,97 @@ so scope resolution and the `yuzu_agents_connected` gauge are coherent across th
 than per-instance. This is its own workstream, not a
 side-effect of the routing directory.
 
+### 7b. Gateway cluster formation mechanism (`#4555` design, 2026-09-18)
+`#4555` established that gateway multi-node cluster formation is **entirely unimplemented** — no
+`net_kernel`/`net_adm`/peer-discovery code exists anywhere in `gateway/`, `gateway/config/vm.args.src`
+hardcodes `-name yuzu_gw1@127.0.0.1` with a comment telling the operator to hand-edit it per node, and
+`docs/erlang-gateway-blueprint.md`'s three named discovery options (static seed nodes / Kubernetes
+headless service / AWS Cloud Map or Consul) are documented target-state, never built. This makes 4.3a's
+`pg`-based cross-node routing (§7 above) component-complete-and-inert: `pg` group membership only
+replicates across *connected* distributed-Erlang nodes, and nothing connects any today. This subsection
+records the mechanism-choice decisions for closing that gap, made via a structured design interview
+(`/grill-with-docs`) rather than picking from the blueprint's three options by inspection.
+
+**Decision: target only the static/DNS-based discovery family for v1 — no Kubernetes or cloud-registry
+discovery.** Yuzu ships zero Kubernetes deployment artifacts (no manifests, no Helm chart) anywhere in
+the repo; every shipped topology is Docker Compose plus native Linux/Windows/macOS packaging, and the
+precedent for "how a multi-node HA component ships" (WS-7, HA Postgres) is a Compose profile
+(Patroni+etcd+HAProxy), not a Kubernetes one. Building Kubernetes- or cloud-provider-specific discovery
+against a deployment target this repo cannot validate would be speculative work; the blueprint's Option
+B/C remain a documented, explicitly deferred, pluggable future seam (same shape as the coordination
+substrate's own Postgres-default-pluggable-for-SaaS pattern, §3 above) rather than v1 scope.
+
+**Decision: peer discovery resolves DNS A records for a configurable seed name, not Kubernetes-specific
+`inet_res` code.** The blueprint frames "static seed nodes" and "Kubernetes headless service via
+`inet_res`" as separate options, but the underlying *mechanism* of the latter is just "resolve a DNS
+name, get back multiple A records" — Docker Compose's own embedded DNS already does exactly this for a
+scaled service (`docker compose up --scale gateway=N` resolves the service name to one A record per
+replica) with zero Kubernetes-specific code and zero new infrastructure. A gateway node therefore
+resolves a seed name (`YUZU_GW_SEED_DNS_NAME`, default `gateway` — matching the reference Compose
+service name) to a set of addresses and attempts `net_kernel:connect_node/1` against each. This name is
+a **separate config value from `cluster_id`** — `cluster_id` is a logical/database identifier an
+operator names freely (a key into the Postgres routing directory), while the seed name is constrained by
+whatever the deployment's actual DNS/Compose naming is; coupling the two forces an operator's freely-chosen
+logical name to also be infrastructure's literal hostname (or vice versa). A separate
+`YUZU_GW_SEED_NODES` env var (an explicit comma-separated address list), when set, **replaces DNS
+resolution outright rather than merging with it** — a merge would let two independently-configured
+sources silently interact (a leftover test override quietly contributing addresses alongside a working
+DNS setup); "when set, this wins outright, full stop" is a simpler invariant, covering the air-gapped /
+no-DNS / hand-pinned-IPs deployment case.
+
+**Decision: plain A records, not TXT.** A TXT record could carry an explicit, free-form peer list
+(including full node names, not just addresses) — but this only has value if a node's identity needs
+more than its address. It doesn't (see below): once every replica shares one fixed short name and
+differs only by address, an A record already carries exactly the needed information, and choosing TXT
+would forfeit the "free with Compose's `--scale`" property (Compose auto-populates A records for a
+scaled service; nothing auto-populates a TXT record, so an operator would be back to hand-maintaining a
+list on every scale change — the static-list option this decision otherwise avoids, just relocated into
+DNS).
+
+**Decision: gateway node identity becomes dynamic — fixed short name, host part resolved at boot —
+rather than the current hardcoded-per-node scheme.** `vm.args.src`'s literal-per-node `-name` is
+incompatible with Compose's `--scale`: every scaled replica boots from the identical image and
+environment, so they cannot each carry a distinct hardcoded name. Gateway nodes are genuinely
+interchangeable (no operator-assigned per-node identity is needed beyond address), so the fix is
+foundational rather than incidental to discovery: every node uses the same short name (e.g. `yuzu_gw`),
+with the host part **auto-detected at boot** via the node's own resolvable hostname (which, under
+Docker/Compose, already resolves back to the container's own address with zero configuration) — overridable
+by an explicit `YUZU_GW_ADVERTISE_ADDR` env var for a bare-VM/multi-NIC deployment where auto-detection
+is ambiguous, or a container behind NAT where the internal address isn't what peers should dial. The
+override silently wins when set, the same "sensible auto-default, explicit env var wins" shape
+`YUZU_GW_CLUSTER_ID` already uses.
+
+**Decision: fail-open on discovery failure, with an indefinite fixed-interval retry — no backoff.** A
+node that resolves zero peers at boot (DNS failure, empty result, timeout) boots anyway as a
+standalone/single-member cluster and keeps retrying in the background, rather than refusing to start.
+The gateway's job is agent-facing availability; per-cluster clustering is an internal routing
+optimization the gateway does not need in order to correctly serve the agents already connected to it,
+and `#4555` must be a strict improvement over today's zero-clustering behavior, never a new way for a
+discovery hiccup to become an agent-facing outage. The retry loop uses a **fixed interval, indefinitely**
+(matching this codebase's existing retry idiom — `await_net_kernel_start`, `await_connected`,
+`await_lookup` are all fixed-interval, not exponential backoff) rather than exponential backoff: DNS
+query volume at this scale is negligible, while slow convergence after a deliberate operator scale-up
+is the failure mode that actually matters operationally.
+
+**Decision: `#4555` is boot-time formation only — periodic re-resolution and ongoing membership
+convergence are explicitly 4.4's scope, not this slice's.** Erlang distribution connections are
+symmetric once established: a newly-added node resolves its own peer list at *its own* boot and dials
+outward, so already-running nodes see it without needing to poll for it themselves, and a departing
+node is handled by Erlang's own connection-loss detection (`net_ticktime`), not by discovery at all.
+Periodic re-resolution to catch a peer that failed to find *this* node first (DNS propagation lag, a
+transient failure on the new node's own boot) is real but is convergence/health-tracking work the
+delivery matrix already scopes to 4.4 (`gateway_node` convergence + replay-session writeback) and the
+blueprint's own planned `yuzu_gw_cluster` adjacency-table gen_server — `#4555` stays scoped to exactly
+what its name says.
+
+**Decision: ship one minimal metric now** (a connected-peer-count gauge, e.g.
+`yuzu_gw_cluster_peers_connected`), rather than deferring all observability to WS-11. Fail-open boot
+semantics mean a misconfigured seed name fails *silently* by design — the node boots fine and serves its
+own agents fine — so without a signal, an operator has no way to notice a cluster that's supposed to
+have three members is actually running as three isolated singles. WS-11 (leader epoch, replica lag,
+split-brain alerting) remains the home for cross-cutting HA-state observability; this is one narrow
+gauge closing the one silent-failure mode this specific mechanism introduces.
+
 ### 8. PKI / CA high availability (Q8)
 Collapse CA HA into the KEK problem, with the versioning/rollout gaps review surfaced:
 - **CA root key → `SecretCodec`-wrapped blob in Postgres** (ADR-0010); distributing the key reduces
