@@ -161,6 +161,7 @@
 #include "capability_decls/plugin_action_catalogue_filesystem_posture.hpp"
 #include "capability_decls/plugin_action_catalogue_power_health.hpp"
 #include "capability_decls/plugin_action_catalogue_autoruns.hpp"
+#include "capability_decls/plugin_action_catalogue_app_usage.hpp"
 #include "capability_decls/plugin_action_catalogue_execution_artifacts.hpp"
 #include "capability_decls/plugin_action_catalogue_windows_optional_features.hpp"
 #include "mcp_input_bounds.hpp" // kExecInstrBoundReasons — the boot pre-seed iterates it (#2437)
@@ -19052,6 +19053,7 @@ private:
         yuzu::server::capdecls::plugin_action_catalogue_filesystem_posture(),
         yuzu::server::capdecls::plugin_action_catalogue_power_health(),
         yuzu::server::capdecls::plugin_action_catalogue_autoruns(),
+        yuzu::server::capdecls::plugin_action_catalogue_app_usage(),
         yuzu::server::capdecls::plugin_action_catalogue_execution_artifacts(),
         yuzu::server::capdecls::plugin_action_catalogue_windows_optional_features(),
     };
