@@ -128,17 +128,12 @@ Source of truth: `docs/ha-delivery-matrix.md`. Read it before this skill
 claims a status. WS-0…WS-10 come from ADR-2002 §Decomposition; WS-11…WS-14 are
 delivery/ops workstreams the three-model review surfaced as missing.
 
-**Verified 2026-09-17 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
+**Verified 2026-09-18 (against `origin/dev`): DONE — WS-0 (#3662), WS-1 (1a+1b+1c),
 WS-2a (2a-1 + 2a-2 #3924), WS-3 (3.1–3.4 — #4011/#4134/#4169/#4194), WS-4 4.1 +
-4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged), WS-7 (#3627),
-WS-10 10.1/10.2. In flight: WS-4 `#4324` (the per-home stream-generation
-fence — fenced agent→cluster routing directory, writer-path hardening,
-per-site fail-closed posture, and the directory wired into confined dispatch
-FALLBACK-ONLY (changes zero monolith routing outcomes) + the
-`route_unreadable` outbox/cascade consumer + both alert-rule halves, PLUS the
-per-home fence itself closing `#4246` item #4, built on
-`feat/ha-ws4-4324-stream-fence`; **not yet merged to `origin/dev`**). Next
-gate items: WS-4 (4.3/4.4), WS-5, WS-6, WS-8-readyz.**
+4.2a + 4.2b Tasks A–D (#4245/#4299/#4344/#4355, merged) + `#4324` per-home
+stream-generation fence (PR #4492, merge commit `c37306113`, 2026-09-17T22:05:58Z,
+**MERGED**), WS-7 (#3627), WS-10 10.1/10.2. Next gate items: WS-4 (4.3/4.4),
+WS-5, WS-6, WS-8-readyz.**
 >
 > **WS-4 4.2a update (2026-09-13, PR #4299 round-5 review):** `#4246` item #4
 > (same-session late-DISCONNECTED tombstoning a newer re-home) is **RE-SCOPED,
@@ -160,21 +155,35 @@ gate items: WS-4 (4.3/4.4), WS-5, WS-6, WS-8-readyz.**
 > to the first slice that re-CONNECTs under a reused session id
 > (4.3/4.4/`#4246` #6).
 >
-> **WS-4 `#4324` update (2026-09-17, pending merge on
-> `feat/ha-ws4-4324-stream-fence`):** the per-home stream-generation fence is
-> **CLOSED end-to-end** — task 1 (`46f1e72b6`, `StreamStatusNotification.stream_home_id`
-> wire field + Erlang producer), task 2 (`4b248b504`, `GatewayRouteStore`'s
-> nullable `stream_home_id` column + asymmetric tombstone predicate, migration
-> v3), task 3 (`feabccea7`, `NotifyStreamStatus`'s DISCONNECTED branch
-> resolving the fence once, before any teardown effect, against
+> **WS-4 `#4324` update (2026-09-17, MERGED — PR #4492, `c37306113`):** the
+> per-home stream-generation fence is **CLOSED end-to-end** — task 1
+> (`46f1e72b6`, `StreamStatusNotification.stream_home_id` wire field + Erlang
+> producer), task 2 (`4b248b504`, `GatewayRouteStore`'s nullable
+> `stream_home_id` column + asymmetric tombstone predicate, migration v3),
+> task 3 (`feabccea7`, `NotifyStreamStatus`'s DISCONNECTED branch resolving
+> the fence once, before any teardown effect, against
 > `AgentRegistry::gateway_stream_home_id`). Re-verified the once-per-session
 > property a second time before landing
 > (`governance.d/ha-ws4-4324-stream-fence-reverification.md`) — no regression.
-> Deliberately NOT closed: the pre-CONNECT-race ordering gap (a stale
-> DISCONNECTED landing before its matching live CONNECTED still tombstones the
-> row — see `gateway_route_store.hpp`'s FORWARD NOTE), left for 4.3; and the
-> `duplicate_connected` desync tripwire, deferred to its own follow-up,
-> `#4464`.
+> **Pre-merge PR-review fix (HIGH):** external reviewer FortitudeEtc
+> (Codex+Kimi, empirical reproduction) found task 2's original predicate —
+> `stream_home_id = $3 OR (stream_home_id IS NULL AND $3 = '')` — wrongly
+> required the incoming value to also be empty before a stored-NULL row
+> admitted it; a stored-NULL home can also mean "this session's own
+> `announce_connected` hasn't run yet" (CONNECTED/DISCONNECTED are two
+> independently `spawn_monitor`'d RPCs with no ordering guarantee), so an
+> ORDINARY (non-re-home) connect/disconnect could have its DISCONNECTED
+> arrive first, get misclassified `stale_home`, and let a delayed CONNECTED
+> publish a route for an already-dead stream — reachable with only the FIRST
+> CONNECTED/DISCONNECTED pair, no second one needed. Fixed to
+> `stream_home_id IS NULL OR stream_home_id = $3` (`f7f12bd59`, mirrored in
+> the in-memory fence); a Gate 8 re-review caught a second stale copy of the
+> old formula in a doc comment (`5160e0eeb`). Both landed pre-merge in the
+> same PR. Deliberately NOT closed: the pre-CONNECT-race ordering gap (a
+> stale DISCONNECTED landing before its matching live CONNECTED still
+> tombstones the row — see `gateway_route_store.hpp`'s FORWARD NOTE), left
+> for 4.3; and the `duplicate_connected` desync tripwire, deferred to its own
+> follow-up, `#4464`.
 
 > **⚠️ Standing instruction — update on close.** Every PR that closes or materially
 > changes the status of a workstream here MUST update its row **and** re-stamp the
@@ -191,7 +200,7 @@ gate items: WS-4 (4.3/4.4), WS-5, WS-6, WS-8-readyz.**
 | **WS-1** | Server-plane state → Postgres: (1a) sessions DB-time; (1b) `execution_tracker`+command-correlation atomic counters; (1c) HA-critical store subset | migration ladder (serializes at the migration-version counter) | **Y** | `authdb`+`security-guardian` (1a); `architect`+`sre`+`cpp-safety` (1b/1c) | P0 | **done — 1a+1b+1c** |
 | **WS-2** | (2a) durable **event outbox** + NOTIFY fan-out [monolith-OK]; (2b) **core→presentation event spine** [*defers to ADR-1005*]; MCP session/replay durability | 2a: WS-1(1b); 2b: ADR-1005 split | **Y** (2a) | `architect`+`sre`+`security-guardian`(MCP)+`docs-writer` | P1 | **2a done (2a-1 + 2a-2 #3924); 2b/MCP outstanding** |
 | **WS-3** | Coordination seam: **fenced `LeaderElector`** (monotonic epoch in claim txn) + leader/**transactional-outbox**/receiver-idempotency worker refactor incl. policy remediation | **WS-0, WS-1, WS-2(2a)** | **Y** | `architect`+`cpp-safety`+`security-guardian` | P1 | **3.1 done (#4011); 3.2 done (#4134); 3.3 done (#4169); 3.4 done (#4194)** |
-| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D merged; `#4324` per-home stream-generation fence done, pending merge (`feat/ha-ws4-4324-stream-fence`); 4.3/4.4/WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
+| **WS-4** | Gateway routing + multi-cluster: fenced `agent→cluster` directory, **net-new distributed intra-cluster agent→node routing**, `gateway_node` convergence | **WS-1, WS-3, WS-0** | **Y** | `gateway-erlang`+`security-guardian`+`architect`+`cpp-safety` | P1 | **4.1 + 4.2a + 4.2b Tasks A–D + `#4324` per-home stream-generation fence all MERGED to `origin/dev` (PR #4492, `c37306113`, 2026-09-17); 4.3/4.4/WS-5 cross-replica lookup remain — see `docs/ha-delivery-matrix.md`** |
 | **WS-5** | Shared agent presence / health / **scope-eval population** across core replicas | **WS-4, WS-1, WS-3, WS-10** | **Y** | `security-guardian`+`architect`+`sre`+`docs-writer` | P1 | planned |
 | **WS-6** | PKI/CA HA: CA key → `SecretCodec` blob in PG, `CaStore` → PG, **durable CRL numbering + publication state machine**, KEK versioning/rollout/rollback, enrollment → PG | **WS-1(`ca_store`), WS-3** | **Y** | `security-guardian`+`cpp-safety`+`docs-writer` | P1 | planned |
 | **WS-7** | **HA-PG delivery**: Patroni+etcd+HAProxy Compose profile, selectable durability (3-node quorum default, distinct failure domains), operator-plane LB profile | — (storage axis; parallel) | **N** | `release-deploy`+`build-ci`+`sre` | P1 | **done (PR #3627 merged to dev)** |
@@ -246,13 +255,15 @@ constraint. Delivery phases (dependency-ordered):
    replica; then `WS-12` (cutover/DR), `WS-14` (security/capacity). `WS-2b`
    (spine) and `WS-8` tier-split readyz land with the ADR-1005 split.
 
-**Suggested next slices** (as of 2026-09-07 — `docs/ha-delivery-matrix.md` row
+**Suggested next slices** (as of 2026-09-18 — `docs/ha-delivery-matrix.md` row
 cites are authoritative):
-- **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3 3.1
-  (#4011), WS-7 (#3627), WS-10 10.1/10.2. The storage axis is complete.
-- The **highest-leverage next** is **WS-3 3.2** (gate the singleton loops
-  leader-only) — it unblocks WS-10's `fenced-leader-only` enforcement (10.3) and
-  WS-5's presence work. Then the remaining gate set: **WS-4** (gateway routing),
+- **Done:** WS-0 (#3662), WS-1 (1a+1b+1c), WS-2a (2a-1 + 2a-2 #3924), WS-3
+  (3.1–3.4, #4011/#4134/#4169/#4194), WS-4 4.1+4.2a+4.2b+`#4324` (PR #4492,
+  merged), WS-7 (#3627), WS-10 10.1/10.2. The storage axis is complete.
+- The **highest-leverage next** is **WS-4 4.3/4.4** (net-new distributed
+  intra-cluster agent→node routing, `gateway_node` convergence, and the
+  pre-CONNECT-race ordering gap `#4324` left open) — it also unblocks the
+  cross-replica session lookup that WS-5 needs. Then the remaining gate set:
   **WS-5** (presence), **WS-6** (PKI), **WS-8**-readyz (P0). A loss-free
   cross-replica reconnect (durable outbox replay) is the open 2a-2 follow-up.
 
