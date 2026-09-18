@@ -80,17 +80,25 @@ prefers_local_over_remote_test_() ->
             AgentId = <<"multinode-prefer-local">>,
             RemotePid = spawn_holder(PeerNode),
 
-            %% Register locally through the real API (ETS + pg join)...
-            ok = yuzu_gw_registry:register_agent(AgentId, LocalPid, undefined, [],
-                                                 <<"localhost">>),
-            %% ...and join the SAME pg group from the peer, simulating the
-            %% re-home overlap window without needing a second full
-            %% registry round-trip (register_agent/6 would also try to
-            %% insert into the PEER's own ETS, which is fine, but the
-            %% group-membership overlap is the only thing this test needs).
+            %% Join the pg group directly for BOTH pids, bypassing
+            %% register_agent's ETS insert entirely. GOVERNANCE FINDING
+            %% (quality-engineer, false-green): an earlier version of this
+            %% test called register_agent/6 for LocalPid, which ALSO
+            %% inserts into local ETS — lookup/1's fast ETS branch then
+            %% returns {ok, LocalPid} immediately and lookup_remote/1 (the
+            %% function this test claims to exercise) is never reached.
+            %% Deleting or inverting lookup_remote's local-preference
+            %% filter would not have failed that version of the test.
+            %% Joining pg directly, with NO local ETS row, forces lookup/1
+            %% to genuinely fall through to lookup_remote/1 with two live
+            %% members (one local, one remote) for it to choose between.
+            ok = pg:join(?PG_SCOPE, {agent, AgentId}, LocalPid),
             ok = erpc:call(PeerNode, pg, join, [?PG_SCOPE, {agent, AgentId}, RemotePid]),
 
-            ?assertEqual({ok, LocalPid}, yuzu_gw_registry:lookup(AgentId))
+            %% Same pg cross-node propagation-delay accommodation as
+            %% remote_lookup_test_ above — the peer's join needs time to
+            %% replicate back to this node's pg scope.
+            ?assertEqual({ok, LocalPid}, await_lookup(AgentId, LocalPid, 100))
         after
             stop_peer(Peer),
             catch exit(LocalPid, kill)
@@ -144,6 +152,15 @@ cross_node_fanout_completes_promptly_test_() ->
                                        [fun remote_agent_loop/0]),
             ok = erpc:call(PeerNode, yuzu_gw_registry, register_agent,
                            [AgentId, RemoteAgentPid, undefined, [], <<"peerhost">>]),
+
+            %% Same pg cross-node propagation-delay accommodation as the
+            %% other tests in this module: wait for THIS node's pg scope
+            %% to see the peer's join before dispatching, or send_command
+            %% races the registration and dispatches to nobody (Dispatched
+            %% =:= 0 -> a hardcoded targets => 0 completion, distinct from
+            %% the bug this test exists to catch — found flaky in CI-style
+            %% back-to-back runs before this wait was added).
+            ?assertEqual({ok, RemoteAgentPid}, await_lookup(AgentId, RemoteAgentPid, 100)),
 
             CommandReq = #{command_id => <<"cmd-1">>, plugin => <<"test">>,
                            action => <<"noop">>, payload => <<>>},
