@@ -825,7 +825,10 @@ so treat this file as the correction point if they ever do:
 > consent** — all five `interaction.*` actions are themselves dangerous
 > (`ExecuteGate::AdminOrApproval`), so a chain-consent rule cannot bootstrap its own first consent;
 > chain consent is a future extension, not yet designed, and no `interaction.*` Reaction can run on a
-> workstation-class device in v1; (2) **digest-bound two-person approval**
+> workstation-class device in v1. **Because that tag is v1's ENTIRE consent boundary, writing
+> `device_class` is not a bare `Tag:Write`**: it requires `Reflex:Write` or admin, is audited under
+> `reflex.device_class.tag_set`, and EXTENDS `authz::service_scope_may_mutate_tag_key` (checked
+> BEFORE the scoped gate, value-blind) — never a parallel gate; (2) **digest-bound two-person approval**
 > (D9) from a DISTINCT HUMAN ROOT (ADR-0033 §7), recomputed and compared at every compile, 409 on
 > review-time drift, fail-closed on mismatch — break-glass is a NEW, not-yet-built ApprovalManager
 > capability; (3) Reflex Reaction EXECUTION (never `push_sets`, which IS a dispatch site) is

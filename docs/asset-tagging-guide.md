@@ -829,9 +829,13 @@ positively established, rather than defaulting to "allowed."
 **Symptom: a Reflex Set audits `reflex.set.compile_refused` and stops updating (HOLD, not disarm).**
 This is the outcome for a *new* Reflex Set, or an edit to an existing one, that never establishes
 consent — the set is held at its last accepted generation (or never deployed at all, if it has none)
-rather than being pushed. The cause is always a target device whose `device_class` is missing or not
-exactly `"server"` — in v1 there is no second path to check: either tag the device `device_class=
-server` if it genuinely has no end user, or narrow the assignment to exclude it. There is
+rather than being pushed. The most common cause is a target device whose `device_class` is missing or not
+exactly `"server"` — in v1 there is no second consent path to check: either tag the device
+`device_class=server` if it genuinely has no end user, or narrow the assignment to exclude it.
+**Check the audit event's own reason before re-tagging**, because two other refusals share this
+verb: an **unreadable `TagStore`**, which is an evaluation error and never consent (`docs/reflex-
+design.md`, "Consent gate (D4)"), and a **validation or digest-drift refusal** of a new generation,
+which has nothing to do with consent at all (same file, "Generation, undeploy, and push semantics"). There is
 deliberately no "add an `interaction.*` Reaction to consent instead" option in v1 — see "Consent
 gate (D4)" in `docs/reflex-design.md` for why that does not work. **This is a different case from an
 already-armed set LOSING consent** (re-tagging a device from `server` to `workstation`,
