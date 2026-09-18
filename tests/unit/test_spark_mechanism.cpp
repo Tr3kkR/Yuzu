@@ -7689,22 +7689,6 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     const std::string key = spark_key(spec_a);
     REQUIRE(mech->watch_incarnation(key, spec_a.params, 7).has_value());
 
-    // begin_probe()'s own unconditional None stage lands for token 7
-    // immediately on the Add — synchronously, before the probe (and its
-    // injected throw) even runs. Snapshot how many established reports
-    // exist right after that legitimate pre-throw report lands, so the
-    // H15 oracle below (adversarial-review finding: an unbaselined
-    // any_of() here passed vacuously off THIS report alone, even with
-    // resolve_probe's own WorkerThrew-branch None stage mutation-tested
-    // OUT) only credits a None report produced by the WorkerThrew
-    // outcome itself — the same baseline shape as M4b's.
-    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
-    std::size_t established_baseline = 0;
-    {
-        std::lock_guard lk(got.mu);
-        established_baseline = got.established.size();
-    }
-
     // Contained: the throw is a genuine backend failure (never WorkerThrew
     // silently discarded), and dispatches a fault — proving the mechanism's
     // own dispatch loop survives it, rather than crashing or wedging.
@@ -7735,19 +7719,35 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     // key also stages None coverage for it — the established channel must
     // not stay silent (or stuck at a stale positive) just because the
     // backend failure classification is "never a false Stopped", which is a
-    // statement about the RUN-STATE emit channel, not about coverage. Only
-    // a report AFTER established_baseline counts — the pre-throw begin_probe
-    // report snapshotted above must not let this pass vacuously.
+    // statement about the RUN-STATE emit channel, not about coverage.
+    //
+    // Counted, not baselined (adversarial-review finding, post-synthesis
+    // correction of an earlier baseline-snapshot draft of this test): TWO
+    // distinct None reports for (key, incarnation 7) must land within this
+    // window — begin_probe()'s own unconditional pre-throw stage (:1601)
+    // PLUS resolve_probe()'s WorkerThrew-branch stage (:1759, the row this
+    // test actually exists to pin). A baseline snapshot taken after
+    // confirming only the first has two independent failure modes a count
+    // does not: the probe lane's injected throw resolves near-instantly, so
+    // a snapshot read a few instructions after the first None is confirmed
+    // can race past the second one too and produce a false RED on correct
+    // code; and the window must stay short enough that :1759's OWN 30s
+    // retry cadence (kAbsentRetryMs) cannot contribute a masking THIRD
+    // None via a fresh begin_probe() call if :1759 is genuinely missing —
+    // 3s is comfortably inside that margin. Falsifier: removing ONLY
+    // resolve_probe's `stage_coverage(w, SparkCoverage::None, established)`
+    // call at spark_service.cpp:1759 must drop this count to exactly 1
+    // within the same 3s window (mutation-verified on DGRHP).
     CHECK(eventually(
         [&] {
             std::lock_guard lk(got.mu);
-            for (std::size_t i = established_baseline; i < got.established.size(); ++i) {
-                const auto& e = got.established[i];
+            std::size_t none_count = 0;
+            for (const auto& e : got.established) {
                 if (std::get<0>(e) == key && std::get<1>(e) == 7 &&
                     std::get<2>(e) == SparkCoverage::None)
-                    return true;
+                    ++none_count;
             }
-            return false;
+            return none_count >= 2;
         },
         3000ms));
     mech->stop();
