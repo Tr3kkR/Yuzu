@@ -583,9 +583,10 @@ struct RestGsHarness {
                             // unwired defaults (fail-closed / legacy-open
                             // respectively) are correct no-ops here.
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
-                            // #4035: reads dex_fleet_override_ LIVE at request
-                            // time (see that field's doc comment).
-                            RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }},
+                            // ADR-0031 WS-A4 (fifth family): the dex_fleet_fn
+                            // register_routes param is retired — the DEX handlers
+                            // get the fleet via the DexApi seam (dex_api_local
+                            // above, wired with dex_fleet_override_).
                             // #4035 hardening (governance): reads
                             // dex_visible_override_ LIVE at request time
                             // (ignores `username` — this stub doesn't model

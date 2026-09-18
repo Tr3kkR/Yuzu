@@ -1,7 +1,7 @@
 #include "dex_api_local.hpp"
 
 #include "dex_read_model.hpp" // the shared build_dex_*_model helpers
-#include "dex_routes.hpp"     // dex_window_to_days / dex_iso_since / dex_normalize_os_filter
+#include "dex_window.hpp"     // dex_window_to_days / dex_iso_since / dex_normalize_os_filter (PURE)
 #include "guaranteed_state_store.hpp" // the builder-less signal reads
 
 #include <string>

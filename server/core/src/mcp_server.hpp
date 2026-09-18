@@ -32,7 +32,6 @@
 #include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
-#include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
 #include "network_perf_model.hpp"
 #include "execution_tracker.hpp"
 #include "execution_statistics_model.hpp" // #2146 Batch B3: shared REST+MCP statistics builders
@@ -661,17 +660,6 @@ public:
         response_visible_set_fn_ = std::move(fn);
     }
 
-    /// #4035: the SAME cross-store fleet provider `DexRoutes`/`RestApiV1`
-    /// already receive (see `RestApiV1::DexFleetFn`'s doc comment,
-    /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda into all
-    /// three surfaces so the dashboard fragment, the REST twin, and this MCP
-    /// twin can never read a different fleet snapshot for the same request.
-    /// Unset (default-constructed) degrades the fleet-dependent DEX tools
-    /// (get_dex_health/get_dex_trends/get_dex_overview/get_dex_catalogue_group)
-    /// to their "no reporting agents" suppressed shape — never a crash.
-    using DexFleetFn = std::function<DexFleet()>;
-    void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
-
     /// ADR-0031 WS-A4 (fifth family): the SAME in-process DEX signals API seam
     /// the REST `/api/v1/dex/*` handlers use — server.cpp wires the IDENTICAL
     /// instance so the MCP DEX signal tools can never disagree with REST on the
@@ -1146,8 +1134,6 @@ private:
     DashboardRoutes* dashboard_routes_{nullptr};
     // #4033 — see set_response_visible_set_fn above.
     ResponseVisibleSetFn response_visible_set_fn_;
-    // #4035 — see set_dex_fleet_fn above.
-    DexFleetFn dex_fleet_fn_;
     // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
     std::shared_ptr<const DexApi> dex_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.

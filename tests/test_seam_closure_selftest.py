@@ -112,6 +112,22 @@ EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     # widening. Probe 7 below proves it actually fires.
     "*_api_local.hpp",
 ]
+# --- Impl-purity rule constants (ADR-0031 WS-A4, Fable review). Pinned so a
+# --- narrowing (dropping an impl TU, weakening the presentation-header set, or
+# --- silently widening the httplib allowlist) is a loud, reviewed change.
+EXPECTED_IMPL_FORBIDDEN_HEADER_PATTERNS = [
+    "*_routes.hpp",
+    "*_view_types.hpp",
+    "*_ui.hpp",
+]
+EXPECTED_IMPL_TUS = [
+    "server/core/src/network_api.cpp",
+    "server/core/src/verify_api.cpp",
+    "server/core/src/compliance_api.cpp",
+    "server/core/src/device_api.cpp",
+    "server/core/src/dex_api.cpp",
+]
+EXPECTED_IMPL_HTTPLIB_ALLOWED = {"event_bus.hpp"}
 
 
 def _fail(msg: str, failures: list) -> None:
@@ -140,6 +156,19 @@ def main() -> int:
     if mod.FORBIDDEN_HEADER_PATTERNS != EXPECTED_FORBIDDEN_HEADER_PATTERNS:
         _fail(f"FORBIDDEN_HEADER_PATTERNS {mod.FORBIDDEN_HEADER_PATTERNS!r} != "
               f"frozen {EXPECTED_FORBIDDEN_HEADER_PATTERNS!r}", failures)
+
+    # 2b. Impl-purity constants pinned (ADR-0031 WS-A4). A dropped impl TU, a
+    #     weakened presentation-header set, or a silently-widened httplib
+    #     allowlist would let a core *_api.cpp re-acquire a presentation/httplib
+    #     dependency with nothing else noticing.
+    if mod.IMPL_FORBIDDEN_HEADER_PATTERNS != EXPECTED_IMPL_FORBIDDEN_HEADER_PATTERNS:
+        _fail(f"IMPL_FORBIDDEN_HEADER_PATTERNS {mod.IMPL_FORBIDDEN_HEADER_PATTERNS!r} != "
+              f"frozen {EXPECTED_IMPL_FORBIDDEN_HEADER_PATTERNS!r}", failures)
+    if mod.IMPL_TUS != EXPECTED_IMPL_TUS:
+        _fail(f"IMPL_TUS {mod.IMPL_TUS!r} != frozen {EXPECTED_IMPL_TUS!r}", failures)
+    if mod.IMPL_HTTPLIB_ALLOWED != EXPECTED_IMPL_HTTPLIB_ALLOWED:
+        _fail(f"IMPL_HTTPLIB_ALLOWED {mod.IMPL_HTTPLIB_ALLOWED!r} != "
+              f"frozen {EXPECTED_IMPL_HTTPLIB_ALLOWED!r}", failures)
 
     # 3. Missing-family-member HARD ERROR: a declared TU that does not exist
     #    on disk must fail the family check, never be silently skipped.
@@ -262,6 +291,63 @@ def main() -> int:
             _fail("check_family flagged a synthetic TU including only the "
                   "ABSTRACT fake_api.hpp - the *_api_local.hpp pattern is "
                   "over-firing onto the abstract half of the seam", failures)
+
+        # 9. IMPL-PURITY POSITIVE PROBE (presentation header): a synthetic core
+        #    `*_api.cpp` whose closure reaches a `*_routes.hpp` presentation
+        #    header must be flagged by check_impl_purity - this is the exact
+        #    dex_api.cpp -> dex_routes.hpp inversion the rule exists to catch.
+        (src / "probe_routes.hpp").write_text("#pragma once\nint route();\n", encoding="utf-8")
+        (src / "impl_probe_api.cpp").write_text(
+            '#include "probe_routes.hpp"\nint main() {}\n', encoding="utf-8")
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            ok = mod.check_impl_purity(["server/core/src/impl_probe_api.cpp"], roots=roots)
+        diag = captured.getvalue()
+        if ok:
+            _fail("check_impl_purity did not fire on a synthetic *_api.cpp reaching a "
+                  "*_routes.hpp presentation header - the core->presentation inversion "
+                  "rule is inert", failures)
+        elif "*_routes.hpp" not in diag:
+            _fail(f"check_impl_purity fired but did not name the presentation pattern; "
+                  f"stderr was: {diag!r}", failures)
+
+        # 10. IMPL-PURITY POSITIVE PROBE (direct httplib): a synthetic core
+        #     `*_api.cpp` that directly includes <httplib.h> must be flagged (it
+        #     is NOT event_bus.hpp, so the allowlist does not exempt it).
+        (src / "impl_httplib_api.cpp").write_text(
+            "#include <httplib.h>\nint main() {}\n", encoding="utf-8")
+        captured = io.StringIO()
+        with contextlib.redirect_stderr(captured):
+            ok = mod.check_impl_purity(["server/core/src/impl_httplib_api.cpp"], roots=roots)
+        if ok:
+            _fail("check_impl_purity did not fire on a synthetic *_api.cpp that directly "
+                  "includes <httplib.h> - the transport-layer ban is inert", failures)
+
+        # 11. IMPL-PURITY NEGATIVE CONTROL (store is ALLOWED for an impl): a
+        #     synthetic `*_api.cpp` reaching ONLY a `*_store.hpp` must PASS -
+        #     the impl is the store-backed side of the seam, so this proves
+        #     impl-purity discriminates (bans presentation, permits stores)
+        #     rather than banning everything a family header rule bans.
+        ok = mod.check_impl_purity(["server/core/src/probe_routes.cpp"], roots=roots)
+        if not ok:
+            _fail("check_impl_purity flagged a synthetic *_api.cpp reaching only a "
+                  "*_store.hpp header - it must PERMIT stores (the impl is the "
+                  "store-backed side of the seam)", failures)
+
+        # 12. IMPL-PURITY ALLOWLIST CONTROL: a synthetic core header named
+        #     event_bus.hpp that pulls <httplib.h>, reached by an *_api.cpp,
+        #     must PASS - proving the documented pre-existing core-SSE exemption
+        #     works (and only for that name; probe 10 proves any other httplib
+        #     path still fires).
+        (src / "event_bus.hpp").write_text("#pragma once\n#include <httplib.h>\n",
+                                            encoding="utf-8")
+        (src / "impl_eventbus_api.cpp").write_text(
+            '#include "event_bus.hpp"\nint main() {}\n', encoding="utf-8")
+        ok = mod.check_impl_purity(["server/core/src/impl_eventbus_api.cpp"], roots=roots)
+        if not ok:
+            _fail("check_impl_purity flagged a synthetic *_api.cpp reaching httplib ONLY "
+                  "via the allowlisted event_bus.hpp - the documented core-SSE exemption "
+                  "is not honoured", failures)
 
     if failures:
         print(f"\n{len(failures)} seam-closure self-test failure(s).", file=sys.stderr)

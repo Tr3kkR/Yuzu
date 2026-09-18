@@ -15891,10 +15891,10 @@ private:
         //
         // #4035: extracted into a named variable (was inline at the
         // DexRoutes::register_routes call site below) so the SAME provider is
-        // also passed to RestApiV1::register_routes's dex_fleet_fn param —
-        // the new GET /api/v1/dex/{health,trends,overview,catalogue/group}
-        // REST twins read the identical fleet snapshot the dashboard renders
-        // against, never a second independently-computed copy.
+        // also handed to make_local_dex_api's FleetFn — the DexApi behind the
+        // GET /api/v1/dex/{health,trends,overview,catalogue/group} REST twins
+        // (and their MCP twins) reads the identical fleet snapshot the
+        // dashboard renders against, never a second independently-computed copy.
         auto dex_fleet_fn = [this]() -> DexFleet {
             DexFleet f;
             const auto ids = registry_.all_ids();
@@ -18272,11 +18272,11 @@ private:
             // /fragments/create-group-form fragment cannot disagree on scope
             // for the same caller.
             response_visible_set_fn,
-            // #4035: the SAME DexFleet provider DexRoutes::register_routes
-            // above already received — see its doc comment (defined once,
-            // just above the DexRoutes registration) for why this must be
-            // the identical lambda, not a second copy.
-            dex_fleet_fn,
+            // ADR-0031 WS-A4 (fifth family): the former dex_fleet_fn arg is
+            // RETIRED — the DEX read handlers obtain the fleet through the
+            // DexApi seam's own FleetFn (wired into make_local_dex_api below),
+            // not through a register_routes param. The `dex_fleet_fn` local is
+            // still LIVE for DexRoutes (dashboard) + make_local_dex_api.
             // #4035 review fix (colleague review, BLOCKING): a DEDICATED
             // GuaranteedState:Read-scoped resolver (defined above, see its
             // own doc comment) — NOT the SAME visible_set_fn
@@ -18491,11 +18491,10 @@ private:
             // preview_management_group_agent_count cannot disagree with its
             // REST/fragment siblings for the same caller.
             mcp_server_->set_response_visible_set_fn(response_visible_set_fn);
-            // #4035: the SAME DexFleet provider DexRoutes/RestApiV1 already
-            // received above — see its doc comment (defined once, just above
-            // the DexRoutes registration) for why this must be the identical
-            // lambda, not a second copy.
-            mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
+            // ADR-0031 WS-A4 (fifth family): the MCP DEX signal tools obtain the
+            // fleet denominator through the DexApi seam's own FleetFn (wired into
+            // make_local_dex_api below), so the former mcp_server_->set_dex_fleet_fn
+            // wiring is retired — the tools no longer read a McpServer fleet member.
             // ADR-0031 WS-A4 (fifth family): the SAME DexApi seam instance the
             // REST /api/v1/dex/* handlers use (constructed above, gated on
             // store presence), so the MCP DEX signal tools and REST never

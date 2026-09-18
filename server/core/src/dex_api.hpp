@@ -18,13 +18,22 @@
 /// Adding a method here without a corresponding public REST/MCP resource would
 /// reintroduce a private core API and defeat the seam.
 ///
-/// SCOPE (resolved in the WS-A4 plan): this seam fronts the GSS-backed signals
-/// reads ONLY. Deliberately EXCLUDED and left where they are —
-///   - `GET /api/v1/dex/devices/{id}/live` — a bounded live-registry poll, not
-///     a GuaranteedStateStore read (its own tiny seam later);
-///   - everything under `/api/v1/dex/perf/*` and
-///     `GET /api/v1/dex/devices/{id}/app-perf` — the app-perf-over-time surface
-///     (backed by the B1/B2 app_perf stores), the future `DexPerfApi` (Seam 2).
+/// SCOPE — this seam fronts the DEX **signals / experience-score** resources:
+/// the per-device experience score + signal summary, the fleet signal rollup /
+/// per-signal drill / per-OS coverage, the app blast-radius / stability list,
+/// the catalogue-group / health / trends / overview read models, and the raw
+/// per-device signal history + single-observation detail. The cut is by
+/// RESOURCE sub-namespace + DATA CLASS (identity/experience signal reads),
+/// distinct from the app-perf-over-time percentile-series class below.
+///
+/// Deliberately NOT in this seam:
+///   - `GET /api/v1/dex/perf/compare` is ALREADY the `VerifyApi` seam (the
+///     `/auto` VERIFY before/after comparison) — NOT a future surface.
+///   - the remaining `/api/v1/dex/perf/*` resources and
+///     `GET /api/v1/dex/devices/{id}/app-perf` are the app-perf-over-time
+///     (percentile-series) data class — the planned `DexPerfApi` (Seam 2).
+///   - `GET /api/v1/dex/devices/{id}/live` is a bounded live-registry poll, not
+///     a stored read at all (its own tiny seam later).
 ///
 /// The store-backed factory (`make_local_dex_api`) lives in the core-only
 /// `dex_api_local.hpp` — this header names no store type at all.

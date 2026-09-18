@@ -32,6 +32,7 @@
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_model.hpp"
 #include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
+#include "dex_window.hpp" // ADR-0031 WS-A4: dex_window_to_days/dex_iso_since/dex_normalize_os_filter (pure)
 
 #include <httplib.h>
 
@@ -66,20 +67,11 @@ int dex_family_index(const std::string& obs_type);
 /// Friendly display label for an obs_type — hoisted to `dex_view_types.hpp`
 /// (store-free; see that header for the doc comment).
 
-/// Shared window-selector resolvers — the single source of truth for how both the
-/// dashboard fragments and the `/api/v1/dex/*` REST surface interpret the window
-/// token. `dex_window_to_days` maps "24h"/"7d"/"30d"/"all" (anything else → 7d) to
-/// a day count (0 = "all"). `dex_iso_since` (day count -> ISO-8601 UTC cutoff) is
-/// hoisted to `dex_view_types.hpp` — thin wrappers over the dashboard's internal
-/// helpers so REST and HTMX can never drift on the window vocabulary.
-int dex_window_to_days(const std::string& window);
-
-/// Normalises a REST/MCP `os` filter param to a store-ready platform token:
-/// "windows"/"linux"/"macos" pass through; anything else (including "all" or
-/// empty) returns "" = all-OS. The single source of truth so the machine
-/// surfaces' DEX OS-scoping stays identical to the dashboard drilldown (A1
-/// dashboard-parity, #C-DEX-1 follow-up).
-std::string dex_normalize_os_filter(const std::string& os);
+// `dex_window_to_days` / `dex_iso_since` / `dex_normalize_os_filter` — the shared
+// window-selector + OS-filter resolvers — are now declared in the pure
+// `dex_window.hpp` (included above), so the core `DexApi` impl can resolve a
+// window/os token without pulling this httplib-coupled header. Re-exported here
+// transitively; every existing caller is unaffected.
 
 /// Render the DEX overview fragment (the content hx-get'd into the page shell):
 /// headline rate + coverage + crash facts + top apps / modules / devices + per-OS

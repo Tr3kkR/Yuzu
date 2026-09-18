@@ -161,6 +161,45 @@ FORBIDDEN_HEADER_PATTERNS = [
     "*_api_local.hpp",
 ]
 
+# ── Impl-purity rule (ADR-0031 WS-A4, Fable review) ──────────────────────────
+# A CORE `*_api.cpp` implementation is the store-backed side of the seam, so it
+# legitimately reaches stores (network/verify/compliance/device/dex `_api.cpp`
+# all include their family's stores). What it MUST NOT reach is the
+# PRESENTATION / transport layer: a route header (`*_routes.hpp`), a view-type
+# header (`*_view_types.hpp`), a renderer (`*_ui.hpp`), or `<httplib.h>`. The
+# core→presentation include inversion this rule prevents shipped once (dex_api.cpp
+# `#include "dex_routes.hpp"` for the window resolvers, which transitively pulled
+# httplib) and the store-only FORBIDDEN_HEADER_PATTERNS above could not catch it
+# — a route header is not a store header. `httplib.h` is EXTERNAL (resolves to
+# no in-tree path, so the closure walk never visits it as a Path); it is caught
+# by an include-SPELLING scan across the closure instead of the resolved-path
+# match the other patterns use.
+IMPL_FORBIDDEN_HEADER_PATTERNS = [
+    "*_routes.hpp",
+    "*_view_types.hpp",
+    "*_ui.hpp",
+]
+IMPL_TUS = [
+    "server/core/src/network_api.cpp",
+    "server/core/src/verify_api.cpp",
+    "server/core/src/compliance_api.cpp",
+    "server/core/src/device_api.cpp",
+    "server/core/src/dex_api.cpp",
+]
+# `<httplib.h>` allowlist for the impl-purity scan: one PRE-EXISTING core coupling.
+# `event_bus.hpp` is a CORE SSE primitive (the legacy `GET /events` content-provider
+# bus + `StreamBudget`) that includes `<httplib.h>` for `httplib::DataSink&`.
+# `network_api.cpp` and `device_api.cpp` reach it TRANSITIVELY through their own
+# stores (not through any presentation header) — a core→core dependency that
+# predates this seam and is NOT the presentation-inversion this rule targets.
+# Exempting it by name keeps the transitive-httplib ban meaningful for any NEW
+# path while not forcing an out-of-scope network/device refactor; the broader
+# "should a core *_api.cpp transitively touch httplib via a core SSE primitive"
+# question is a WS-B2 physical-split concern (core owns no httplib once extracted),
+# out of scope for this seam and tracked as #4579, not this round.
+# `dex_api.cpp` reaches NEITHER event_bus.hpp NOR httplib — its fix is fully clean.
+IMPL_HTTPLIB_ALLOWED = {"event_bus.hpp"}
+
 # ── Family definitions ────────────────────────────────────────────────────
 # Five families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
 # #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
@@ -416,6 +455,58 @@ def check_family(name: str, tus: list[str], roots: Roots = DEFAULT_ROOTS,
     return ok
 
 
+def _includes_httplib(path: Path) -> bool:
+    """True if `path` has a `#include` of httplib.h (angle or quote). Used to
+    detect the EXTERNAL header the closure walk never visits as a resolved
+    Path (see check_impl_purity)."""
+    for _is_angle, name in parse_includes(path):
+        if Path(name).name == "httplib.h":
+            return True
+    return False
+
+
+def check_impl_purity(tus: list[str], roots: Roots = DEFAULT_ROOTS) -> bool:
+    """Every family's `*_api.cpp` impl TU must NOT reach a presentation /
+    transport header — `*_routes.hpp`, `*_view_types.hpp`, `*_ui.hpp`, or
+    `<httplib.h>` — anywhere in its transitive include closure. The impl is the
+    store-backed side of the seam (it legitimately reaches stores), so this is a
+    DIFFERENT forbidden set from the family rule; a route/view/ui header is not a
+    store header, which is exactly why the store-only patterns missed the
+    dex_api.cpp -> dex_routes.hpp -> httplib inversion. A missing declared TU is
+    a HARD ERROR (same posture as check_family)."""
+    ok = True
+    for rel in tus:
+        tu = (roots.root / rel).resolve()
+        if not tu.is_file():
+            gh("error", f"check-seam-closure: impl-purity: expected impl TU not found: {rel}")
+            ok = False
+            continue
+        visited, parent, _unresolved = closure(tu, roots)
+        # (a) presentation in-tree headers via resolved-path basename match.
+        for f in sorted(visited, key=str):
+            hit, pat = is_forbidden_header(f, roots.root, patterns=IMPL_FORBIDDEN_HEADER_PATTERNS)
+            if not hit:
+                continue
+            chain = chain_to(f, parent, tu)
+            chain_str = " -> ".join(str(c.relative_to(roots.root)) for c in chain)
+            gh("error",
+               f"check-seam-closure: impl-purity: {rel} reaches presentation header "
+               f"{f.relative_to(roots.root)} (matches {pat!r}) via include chain: {chain_str}")
+            ok = False
+        # (b) <httplib.h> via include-SPELLING scan (external -> never a visited Path),
+        #     minus the IMPL_HTTPLIB_ALLOWED pre-existing core-SSE coupling.
+        for f in sorted({tu} | visited, key=str):
+            if f.name in IMPL_HTTPLIB_ALLOWED:
+                continue
+            if _includes_httplib(f):
+                gh("error",
+                   f"check-seam-closure: impl-purity: {rel} reaches <httplib.h> via "
+                   f"{f.relative_to(roots.root)} — a core *_api.cpp must not depend on "
+                   f"the httplib transport layer")
+                ok = False
+    return ok
+
+
 def run_check() -> int:
     ok = True
     checked = 0
@@ -423,10 +514,15 @@ def run_check() -> int:
         checked += 1
         if not check_family(name, spec["tus"]):
             ok = False
+    impl_ok = check_impl_purity(IMPL_TUS)
+    if not impl_ok:
+        ok = False
     if ok:
         print(f"check-seam-closure: OK ({checked} famil"
-              f"{'y' if checked == 1 else 'ies'} checked, all closures free "
-              f"of store-layer and core-only `*_api_local.hpp` headers)")
+              f"{'y' if checked == 1 else 'ies'} header-closure checked + "
+              f"{len(IMPL_TUS)} impl TUs impl-purity checked; all closures free "
+              f"of store-layer / core-only `*_api_local.hpp` headers and impls "
+              f"free of presentation/httplib headers)")
     return 0 if ok else 1
 
 
