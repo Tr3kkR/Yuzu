@@ -8714,7 +8714,10 @@ void RestApiV1::register_routes(
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
-                      auto results = evaluate_inventory(eval_req, records);
+                      std::size_t excluded_by_poison = 0;
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
                       JArr arr;
                       for (const auto& r : results) {
                           arr.add(JObj()
@@ -8729,19 +8732,39 @@ void RestApiV1::register_routes(
                       // simply not have been read (same flag name as the
                       // typed-store route, result_truncated_by_cap). Same
                       // data/pagination/meta shape as list_json, plus the flag.
-                      if (inv_truncated) {
+                      //
+                      // #4496: a poisoned (over-nested) record excluded by
+                      // evaluate_inventory()'s #2437-class depth guard is the
+                      // same "the caller sees fewer matches than actually
+                      // exist" shape as a capped read - surfaced the same way,
+                      // as `results_excluded_by_poison` (count, present only
+                      // when non-zero, same convention as `result_truncated_by_cap`).
+                      //
+                      // #4496 follow-up: a record excluded because its
+                      // data_json failed to parse at all is the SAME shape,
+                      // a different cause - surfaced as its own
+                      // `results_excluded_by_parse_error` field, kept separate
+                      // from `results_excluded_by_poison` so a caller can
+                      // tell WHICH guard excluded a record.
+                      if (inv_truncated || excluded_by_poison > 0 || excluded_by_parse_error > 0) {
                           auto pag = JObj()
                                          .add("total", static_cast<int64_t>(results.size()))
                                          .add("start", int64_t{0})
                                          .add("page_size", int64_t{50})
                                          .str();
-                          res.set_content(JObj()
-                                              .raw("data", arr.str())
-                                              .add("result_truncated_by_cap", true)
-                                              .raw("pagination", pag)
-                                              .raw("meta", R"({"api_version":"v1"})")
-                                              .str(),
-                                          "application/json");
+                          JObj envelope;
+                          envelope.raw("data", arr.str());
+                          if (inv_truncated)
+                              envelope.add("result_truncated_by_cap", true);
+                          if (excluded_by_poison > 0)
+                              envelope.add("results_excluded_by_poison",
+                                           static_cast<int64_t>(excluded_by_poison));
+                          if (excluded_by_parse_error > 0)
+                              envelope.add("results_excluded_by_parse_error",
+                                           static_cast<int64_t>(excluded_by_parse_error));
+                          envelope.raw("pagination", pag);
+                          envelope.raw("meta", R"({"api_version":"v1"})");
+                          res.set_content(envelope.str(), "application/json");
                           return;
                       }
                       res.set_content(list_json(arr.str(), static_cast<int64_t>(results.size())),
@@ -9287,8 +9310,8 @@ void RestApiV1::register_routes(
                           bool ok = true;
                           if (audit_fn)
                               ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
-                                            "source_kind=inventory_query reason=" +
-                                                std::string(reason));
+                                            "reason=" + std::string(reason) +
+                                                " source_kind=inventory_query");
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
@@ -9453,7 +9476,13 @@ void RestApiV1::register_routes(
                           // silently changes who gets acted on (#2500/#2492
                           // dispatch-targeting invariant class). 503 rather
                           // than a partial set; raising the cap / keyset
-                          // pagination is the tracked follow-up.
+                          // pagination is the tracked follow-up (#2633).
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonQueryTruncated)}})
+                                  .increment();
                           audit_failure("query_truncated");
                           rs_err(res, 503,
                                  "inventory query truncated at the row or byte cap - refusing to "
@@ -9470,7 +9499,54 @@ void RestApiV1::register_routes(
                           records.emplace_back(r.agent_id + "|" + r.plugin, r.data_json);
                       }
 
-                      auto results = evaluate_inventory(eval_req, records);
+                      // #4496: fold poison-exclusion into the SAME M1
+                      // dispatch-targeting-invariant refusal as inv_truncated
+                      // just above, rather than a silent flag - this producer
+                      // MATERIALISES the matched set into a durable result set
+                      // other operators/dispatches consume later; a flag on
+                      // this 201 response would never reach them, so a
+                      // narrowed target set here gets the same hard-refuse
+                      // treatment as a capped read, not the softer
+                      // flag-on-response posture the two read-only routes
+                      // (POST /api/inventory/query, POST
+                      // /api/v1/inventory/evaluate) use instead.
+                      std::size_t excluded_by_poison = 0;
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
+                      if (excluded_by_poison > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonPoisonExcluded)}})
+                                  .increment();
+                          audit_failure("poison_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for nesting too deeply - refusing "
+                                 "to materialise a result set narrower than the true match set");
+                          return;
+                      }
+                      // #4496 follow-up: same M1 refusal as the poison check
+                      // above, for the sibling cause - a record whose
+                      // data_json failed to parse at all. Kept as a SEPARATE
+                      // check (not folded into the condition above) so the
+                      // metric reason, audit detail and error message all
+                      // name the actual cause rather than conflating the two.
+                      if (excluded_by_parse_error > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonParseErrorExcluded)}})
+                                  .increment();
+                          audit_failure("parse_error_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for failing to parse as JSON - "
+                                 "refusing to materialise a result set narrower than the true "
+                                 "match set");
+                          return;
+                      }
                       std::unordered_set<std::string> seen;
                       std::vector<std::string> members;
                       for (const auto& r : results) {

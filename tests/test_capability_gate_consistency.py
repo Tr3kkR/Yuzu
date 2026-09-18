@@ -94,6 +94,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_app_usage.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_execution_artifacts.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_windows_optional_features.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_peripherals.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp",
 ]
 # 4 + 5 + 45 + 55 + 34 + 42 + 2 + 3 + 4 — see command_capability.hpp's fragment
@@ -112,12 +113,13 @@ FRAGMENT_FILES = [
 # Wave 7b PR7b.3: +3 app_usage (summary/last_used/foreground).
 # Wave 7b PR7b.1: +3 execution_artifacts (shimcache/amcache/prefetch).
 # Wave 9 PR9.2b: +2 windows_optional_features (list/info).
+# Wave 9 PR9.1a: +3 peripherals (usb/pci/thunderbolt).
 # Wave 9 PR9.1b: +2 printing (printers/jobs) — clear_queue follows in a
 # focused follow-up PR on top of this one.
 # Running total: 194 (base, already includes __sync__.now — see above) +
 # 2 (autoruns) + 3 (app_usage) + 3 (execution_artifacts) +
-# 2 (windows_optional_features) + 2 (printing) = 206.
-EXPECTED_TOTAL_ROWS = 206
+# 2 (windows_optional_features) + 3 (peripherals) + 2 (printing) = 209.
+EXPECTED_TOTAL_ROWS = 209
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

@@ -126,47 +126,73 @@
 /// the FORWARD NOTE immediately below for what 4.3/4.4 must add before
 /// same-session re-home makes that second-pair producer real.
 ///
-/// FORWARD NOTE for #4324's 4.3/4.4 (none of the three directions below are
-/// reachable today — all three require a producer of a SECOND
-/// CONNECTED/DISCONNECTED pair for the SAME session id, which does not exist
-/// until live re-home ships; this is distinct from the PREDICATE FIX above,
-/// which was reachable with only the first, ordinary pair and is already
-/// fixed):
+/// FORWARD NOTE for #4324's 4.3/4.4, RESOLVED (enterprise-architect
+/// adjudication, 2026-09-18, confidence HIGH, spot-checked against the cited
+/// call sites): all three directions below share ONE precondition — a
+/// same-session, different-home CONNECTED (`CONNECTED(S, home2)` published
+/// for a session `S` already at `home1`) — and NO producer of that
+/// precondition exists today, nor is one planned for 4.3/4.4. The agent
+/// reconnect loop always re-`Register`s on a new connection (a new
+/// `session_id`, `agent.cpp`'s Register-retry loop), and the gateway's
+/// `Subscribe` REFUSES any presented session with no pending registration
+/// (`yuzu_gw_agent_service.erl`, `NOT_FOUND` on a `take_pending` miss) — a
+/// gRPC stream cannot migrate BEAM nodes, so a physical stream move is
+/// ALWAYS agent-reconnect-shaped: new session, new `stream_home_id`. The
+/// EARLIER draft of this note proposed "the gateway mints a fresh session on
+/// re-home" as a design choice; that was WRONG — a gateway-synthesized
+/// session the agent does not hold starves on the next heartbeat (heartbeats
+/// carry the agent's OWN `session_id_`; `BatchHeartbeat` excludes an unknown
+/// session from `renew_leases`), reproducing the `#4246` #6 S′-vs-S desync
+/// deliberately. The invariant is agent-driven reconnect, never a
+/// server/gateway-synthesized session substitution.
 ///
-/// (a) STORE-SIDE ordering gap: if a stale `DISCONNECTED(home1)` lands
-/// BEFORE the new `CONNECTED(home2)` arrives (two independent RPCs with no
-/// ordering guarantee between them), the tombstone wins and
-/// `announce_connected`'s `ON CONFLICT DO NOTHING` fallback cannot re-arm an
-/// existing tombstoned row — the re-home is silently unroutable in the
-/// directory until the next full ProxyRegister.
+/// (a) STORE-SIDE ordering: unreachable — `home2` never gets a CONNECTED
+/// under a `session_id` that already published `home1`; a genuine re-home
+/// arrives as `register_fresh(S_new)`, not `CONNECTED(S, home2)`.
 ///
-/// (b) IN-MEMORY check-then-act gap (adversarial review, 2026-09-17): even
-/// with (a) resolved, a stale `DISCONNECTED(home1)` that reads
-/// `stored_home == home1` and PASSES the fence, followed by a genuine
-/// `CONNECTED(home2)` publishing home2 for the same session BEFORE the
-/// DISCONNECTED's teardown effects run, causes the (correctly-admitted-at-
-/// the-time-of-its-check) stale DISCONNECTED to tear down home2's live
-/// registry session and session-map entry. The durable directory row
-/// survives (its `UPDATE ... WHERE` predicate is a single atomic
-/// statement), but in-memory dispatch for that agent breaks until
-/// reconnect/lease-TTL self-heal. This is the SAME class of gap as (a) —
-/// documented, currently unreachable, 4.3/4.4-scoped — one interleaving
-/// direction later.
+/// (b) IN-MEMORY check-then-act: unreachable, and closed WITHOUT a new CAS
+/// primitive — the check-then-act window only matters when ONE `session_id`
+/// key is shared across two homes. With a distinct `session_id` per
+/// placement, every DISCONNECTED-branch effect is already an individually
+/// atomic, session-guarded conditional (`remove_agent_if_session`,
+/// `clear_stream_if_session`, `gateway_stream_home_id`'s nullopt-on-mismatch,
+/// the store's session-guarded `deregister` UPDATE, `gateway_sessions_`
+/// erase-by-key) — a stale `DISCONNECTED(S_old, home1)` interleaved anywhere
+/// around `register_agent(S_new)`/`CONNECTED(S_new, home2)` either no-ops
+/// per effect or tears down only `S_old` state, never `S_new`'s.
 ///
-/// (c) CONNECTED-reorder gap: `set_gateway_route`'s in-memory publish is an
-/// unconditional REPLACE and `announce_connected`'s UPDATE is session-guarded
-/// only (no home/epoch ordering) — a late/reordered `CONNECTED(home1)`
-/// arriving AFTER `CONNECTED(home2)` for the same session silently re-points
-/// both stores back to a dead home until the next DISCONNECTED or the 90s
-/// lease TTL/reaper self-heals it.
+/// (c) CONNECTED-reorder: unreachable for the same reason as (a) — there is
+/// no second CONNECTED for the same session to reorder against.
 ///
-/// 4.3/4.4 must either route every re-home through `register_fresh` (which
-/// mints a fresh, strictly-ordered epoch — resolving (a) and (c)) and add a
-/// single home-CAS registry primitive gating the DISCONNECTED-branch
-/// teardown as one atomic conditional operation keyed on
-/// `(agent_id, session_id, stream_home_id)` (resolving (b)), or define
-/// equivalent ordering/re-arm guarantees; do not assume the equality fence
-/// alone makes live re-home safe in any of the three directions above.
+/// STANDING INVARIANT (load-bearing going forward, not just historical
+/// analysis): 4.3/4.4 MUST NOT introduce ANY path that emits
+/// `CONNECTED(S, home2)` for a session `S` already published at `home1` —
+/// every physical placement change is agent-originated re-`Register`. This
+/// replaces the former "atomic home-CAS primitive" acceptance criterion
+/// (`#4490`) with a server-side TRIPWIRE instead: a CONNECTED for a known
+/// `(agent_id, session_id)` whose stored `stream_home_id` is non-empty and
+/// differs from the incoming one must be REJECTED (not published) and
+/// counted (folds into `#4464`'s `duplicate_connected` tripwire), backed by
+/// a deterministic interleaving test (the existing
+/// `register_agent_interleave_hook_for_test_` seam) proving a stale
+/// `DISCONNECTED(S_old, home1)` interleaved at every point of
+/// `register_agent(S_new)`/`map_session`/`CONNECTED(S_new, home2)` leaves
+/// `S_new` live in registry, store, and `gateway_sessions_`. `4.4`'s `#4246`
+/// #6 fix (session writeback) must follow the same rule: mechanism (c) must
+/// ADOPT the presented session into `gateway_sessions_`/registry only if the
+/// directory `renew_leases` call matched >= 1 row (a store-side CAS proving
+/// the row still belongs to that session) — NEVER write back a
+/// server-minted session to a gateway whose agent still holds the original.
+///
+/// WOULD REOPEN THIS: a 4.3 design where the logical home (the
+/// `yuzu_gw_agent` process / `stream_home_id`) moves or is re-spawned
+/// WITHOUT the agent reconnecting — e.g. a node-A-holds-socket/
+/// node-B-owns-agent proxy hop. That would create a same-session
+/// different-home producer this analysis assumes does not exist, and the
+/// full atomic home-CAS primitive + store-side re-arm this note originally
+/// proposed would become necessary again. Treat "no such producer" as a
+/// design CONSTRAINT on 4.3, not an assumption to re-verify only after the
+/// fact.
 ///
 /// `renew_leases` is a single batched statement, correlated on BOTH
 /// `agent_id` AND `session_id` (a parallel-array unnest() join — #4246 #10) —

@@ -1764,14 +1764,24 @@ TEST_CASE("from-inventory-query: matched membership is confined to the caller's 
 // test_inventory_eval.cpp, which is the actual code under test and proves
 // reachability directly). "exists" matches on presence alone, so it is
 // answered TRUE for the poisoned record's "field1" whether the guard runs
-// or not, making device_count the deciding, guard-dependent signal here too
-// (2 without the guard, 1 with it). Real structural nesting, NOT brackets
-// inside a string literal: json_exceeds_depth deliberately does not count
-// bracket characters inside a string value as structure. Reachability-proxy
-// depth (36 > kMcpMaxJsonDepth's 32), never the real ~100,000-level attack
-// depth.
-TEST_CASE("from-inventory-query: a poisoned stored data_json is excluded from matching "
-          "membership, a healthy matching agent is still included, no crash",
+// or not, making the response status the deciding, guard-dependent signal
+// here too (a crash without the guard, a clean 503 with it). Real structural
+// nesting, NOT brackets inside a string literal: json_exceeds_depth
+// deliberately does not count bracket characters inside a string value as
+// structure. Reachability-proxy depth (36 > kMcpMaxJsonDepth's 32), never
+// the real ~100,000-level attack depth.
+//
+// #4496: this producer MATERIALISES its match set into a durable result set
+// other operators/dispatches consume later, so poison-exclusion is folded
+// into the SAME M1 dispatch-targeting-invariant refusal as a byte-capped read
+// (see "from-inventory-query refuses a byte-capped read without creating a
+// set" above, the direct precedent) rather than a flag on a 201 - a flag on
+// this response would never reach a downstream consumer of the created set.
+// This test previously asserted the OPPOSITE (a 201 with the poisoned agent
+// silently dropped from membership); #4496 replaces that silent narrowing
+// with an explicit refusal.
+TEST_CASE("from-inventory-query: a poisoned stored data_json refuses the request rather "
+          "than silently materialising a narrowed set, no crash",
           "[pg][result_set][async][inventory][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1802,18 +1812,401 @@ TEST_CASE("from-inventory-query: a poisoned stored data_json is excluded from ma
     AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
 
     int status = 0;
-    auto body = h.post(
+    h.post(
         "/api/v1/result-sets/from-inventory-query",
         R"({"name":"depth-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
         status);
-    REQUIRE(status == 201); // no crash
+    REQUIRE(status == 503); // no crash, and no silently-narrowed set either
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("poison_excluded") != std::string::npos)
+            saw_poison_failure = true;
+    CHECK(saw_poison_failure);
+}
+
+// #4496: the healthy-only sibling of the test above - proves the refusal is
+// specific to an actual poisoned record, not a false-positive that fires on
+// every from-inventory-query call after this fix.
+TEST_CASE("from-inventory-query: no poisoned record present -- matching membership is "
+          "materialised normally",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"depth-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 201);
     CHECK(body["data"]["device_count"] == 1);
-    // Confirm identity, not just count: the created set must contain the
-    // healthy agent and MUST NOT contain the poisoned one.
     std::string next;
     auto members = h.store->members(body["data"]["id"].get<std::string>(), "", 10, next);
     REQUIRE(members.size() == 1);
     CHECK(members[0] == "agent-healthy");
+}
+
+// #4496 follow-up: the sibling of the poisoned-record test above, for the
+// OTHER cause evaluate_inventory() can exclude a record for -- a genuine
+// JSON parse error rather than over-nesting. Seeded directly via SQL
+// (bypassing the gateway write-side guard, which checks nesting depth only,
+// not general JSON validity) to prove this read-side guard independently.
+// Uses "exists" for the same discriminating reason as the poisoned test: a
+// caller who wrote "==" could not tell a guarded exclusion from an ordinary
+// no-match.
+TEST_CASE("from-inventory-query: a malformed stored data_json refuses the request rather "
+          "than silently materialising a narrowed set, no crash",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"parse-error-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 503); // no crash, and no silently-narrowed set either
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_parse_error_failure = false;
+    for (const auto& a : h.audits)
+        if (a.action == "result_set.create" && a.result == "failure" &&
+            a.detail.find("parse_error_excluded") != std::string::npos)
+            saw_parse_error_failure = true;
+    CHECK(saw_parse_error_failure);
+}
+
+// #4496 follow-up: the healthy-only sibling of the test above - proves the
+// refusal is specific to an actual malformed record, not a false-positive
+// that fires on every from-inventory-query call after this fix.
+TEST_CASE("from-inventory-query: no malformed record present -- matching membership is "
+          "materialised normally",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"parse-error-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 201);
+    CHECK(body["data"]["device_count"] == 1);
+    std::string next;
+    auto members = h.store->members(body["data"]["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
+}
+
+// #4541 review (Important finding 2): both producer tests above seed only
+// ONE excluded cause at a time. `evaluate_inventory()` checks poison BEFORE
+// parse-error (see its own excluded_by_depth/excluded_by_parse_error
+// ordering), so a record set carrying BOTH problems must always report
+// poison_excluded and never parse_error_excluded - a caller-facing contract
+// docs/user-manual/rest-api.md states explicitly ("a caller is always told
+// which cause remains, never that both have cleared at once"). Only a
+// unit-level test (test_inventory_eval.cpp's "excluded_by_depth and
+// excluded_by_parse_error accumulate independently") asserted the two
+// out-param counts directly; this proves the actual 503 body, audit detail
+// AND metric reason at the route layer, when both fire in the same call.
+TEST_CASE("from-inventory-query: a poisoned AND a malformed record in the same call reports "
+          "poison_excluded, never parse_error_excluded",
+          "[pg][result_set][async][inventory][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/result-sets/from-inventory-query",
+        R"({"name":"combined-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 503);
+    REQUIRE(body.contains("error"));
+    const auto message = body["error"]["message"].get<std::string>();
+    CHECK(message.find("nesting too deeply") != std::string::npos);
+    CHECK(message.find("failing to parse") == std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+    bool saw_poison_failure = false;
+    bool saw_parse_error_failure = false;
+    for (const auto& a : h.audits) {
+        if (a.action == "result_set.create" && a.result == "failure") {
+            if (a.detail.find("poison_excluded") != std::string::npos)
+                saw_poison_failure = true;
+            if (a.detail.find("parse_error_excluded") != std::string::npos)
+                saw_parse_error_failure = true;
+        }
+    }
+    CHECK(saw_poison_failure);
+    CHECK_FALSE(saw_parse_error_failure);
+    // #4541 review minor: assert the metric counter reason too, not just
+    // status/audit - kReasonPoisonExcluded/kReasonParseErrorExcluded
+    // (dispatch_target_shape.hpp) label yuzu_server_dispatch_target_rejected_total.
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"}, {"reason", "poison_excluded"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "result_set_inventory_query"},
+                        {"reason", "parse_error_excluded"}})
+              .value() == 0.0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #4496: POST /api/v1/inventory/evaluate -- the read-only third caller of
+// evaluate_inventory(). Unlike the two producers above, this route is a
+// synchronous READ (no durable artifact materialised downstream), so it
+// surfaces poison-exclusion as a `results_excluded_by_poison` count on the
+// response rather than refusing the request. This harness's `fleet_read_fn`
+// gates the same route as from-inventory-query above, so AsyncHarness is
+// reused rather than a new fixture.
+// ═══════════════════════════════════════════════════════════════════════════
+
+TEST_CASE("POST /api/v1/inventory/evaluate: a poisoned record is flagged via "
+          "results_excluded_by_poison, a healthy matching agent is still returned",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    const std::string poisoned_json =
+        R"({"field1":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_poisoned = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', $2, 1)",
+            std::vector<std::string>{"agent-poisoned", poisoned_json});
+        REQUIRE(seeded_poisoned.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200); // no crash, no refusal on this read-only route
+    REQUIRE(body["data"].is_array());
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["agent_id"] == "agent-healthy");
+    CHECK(body["results_excluded_by_poison"] == 1);
+}
+
+// #4496: the healthy-only sibling of the test above - proves the field is
+// absent, not merely 0-but-present-as-a-false-positive, when nothing was
+// excluded (same "absent when zero" convention as `result_truncated_by_cap`
+// on this route).
+TEST_CASE("POST /api/v1/inventory/evaluate: no poisoned record present -- "
+          "results_excluded_by_poison is absent from the response",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200);
+    REQUIRE(body["data"].size() == 1);
+    CHECK_FALSE(body.contains("results_excluded_by_poison"));
+}
+
+// #4496 follow-up: the sibling of the two `results_excluded_by_poison` tests
+// above, for the OTHER exclusion cause -- a genuine JSON parse error.
+TEST_CASE("POST /api/v1/inventory/evaluate: a malformed record is flagged via "
+          "results_excluded_by_parse_error, a healthy matching agent is still returned",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200); // no crash, no refusal on this read-only route
+    REQUIRE(body["data"].is_array());
+    REQUIRE(body["data"].size() == 1);
+    CHECK(body["data"][0]["agent_id"] == "agent-healthy");
+    CHECK(body["results_excluded_by_parse_error"] == 1);
+}
+
+// #4496 follow-up: the healthy-only sibling of the test above - proves the
+// field is absent, not merely 0-but-present-as-a-false-positive, when
+// nothing was excluded.
+TEST_CASE("POST /api/v1/inventory/evaluate: no malformed record present -- "
+          "results_excluded_by_parse_error is absent from the response",
+          "[pg][result_set][inventory][inventory_eval][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+
+    InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    AsyncHarness h(pool, /*with_dispatch=*/true, &inventory);
+
+    int status = 0;
+    auto body = h.post(
+        "/api/v1/inventory/evaluate",
+        R"({"conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]})",
+        status);
+    REQUIRE(status == 200);
+    REQUIRE(body["data"].size() == 1);
+    CHECK_FALSE(body.contains("results_excluded_by_parse_error"));
 }
 
 TEST_CASE("owner-scoped result-set routes: a service-scoped token is denied on all 8",

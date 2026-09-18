@@ -5716,7 +5716,29 @@ One behavior worth calling out here: when the underlying inventory read hits
 the server row cap or 8 MiB aggregate payload cap, the route returns **503**
 ("inventory query truncated ... refusing to materialise a partial result set") rather than
 persisting a silently-incomplete set — a fleet-targeting set is never silently
-narrowed.
+narrowed. **(#4496)** A candidate inventory record excluded by the JSON depth
+guard (a poisoned/over-nested `data_json` row; the exclusion check runs
+before condition matching, so a record's plugin/fields need not relate to
+the query's conditions to trigger it; see json-dump-depth-guard below) gets
+the identical treatment: the route returns **503**
+("inventory record(s) excluded for nesting too deeply ... refusing to
+materialise a result set narrower than the true match set") rather than
+silently dropping the poisoned agent from membership: this is a
+DELIBERATE choice, unlike the read-only `POST /api/v1/inventory/evaluate` and
+`POST /api/inventory/query` routes below, which surface the same exclusion as
+a `results_excluded_by_poison` count field, this route materialises its
+match set into a *durable* result set other operators/dispatches consume
+later, so a flag on this response would never reach them. **(#4496
+follow-up)** A candidate inventory record excluded because its `data_json`
+failed to parse as JSON at all gets the SAME **503** treatment
+("inventory record(s) excluded for failing to parse as JSON ... refusing to
+materialise a result set narrower than the true match set"), as a
+distinctly-named sibling refusal, checked in a fixed sequence AFTER the
+depth-guard one above: a candidate set carrying both problems reports only
+the depth-guard (`poison_excluded`) refusal on that call, and the
+parse-error refusal surfaces on a subsequent retry once the poisoned record
+is fixed - so a caller is always told which cause remains, never that both
+have cleared at once.
 
 **Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
 route had NO authorization check of any kind before this fix, CWE-862: any
@@ -5889,6 +5911,26 @@ read hit its row cap (5,000 for this route) or 8 MiB aggregate payload cap:
 absent devices may simply not have
 been read rather than not matching. (The typed software route carries the same
 flag inside `data` — placement alignment is tracked with #2633.)
+
+`results_excluded_by_poison` (integer, optional, #4496): emitted at the same
+top level, present and non-zero when one or more candidate inventory records
+were excluded because their stored `data_json` nested past the JSON depth
+guard (a poisoned/over-nested row; the exclusion check runs before condition
+matching, so a record's plugin/fields need not relate to the query's
+conditions to trigger it; see json-dump-depth-guard below). The returned
+matches may be missing some the caller cannot detect any other way.
+Distinct from `result_truncated_by_cap` (a row/byte cap on the underlying
+read, not a per-record exclusion); either, both, or neither may be present
+on a given response.
+
+`results_excluded_by_parse_error` (integer, optional, #4496 follow-up):
+emitted at the same top level, present and non-zero when one or more
+candidate inventory records were excluded because their stored `data_json`
+failed to parse as JSON at all (a syntax defect, not over-nesting). A
+distinctly-named sibling of `results_excluded_by_poison` above, kept separate
+so a caller can tell WHICH guard excluded a record - the two causes are
+different (malformed JSON vs. over-nested JSON) and both, either, or neither
+may be present on a given response alongside `result_truncated_by_cap`.
 
 **Errors:**
 
@@ -9135,8 +9177,14 @@ valid, else returned as a raw string. `404` if no record exists for that agent+p
 Query inventory records across agents. Request body (all fields optional):
 `{"agent_id": "...", "plugin": "...", "since": <epoch>, "until": <epoch>, "limit": N}`.
 `limit` is capped at 1000 regardless of the requested value. Returns `{"results": [...],
-"count": N, "result_truncated_by_cap": bool}` — `result_truncated_by_cap` is `true` when
-more matching rows existed than `limit` allowed.
+"count": N, "result_truncated_by_cap": bool, "results_excluded_by_poison": N}`.
+`result_truncated_by_cap` is `true` when more matching rows existed than `limit`
+allowed; `results_excluded_by_poison` (#4496) is the count of matching rows
+excluded because their stored `data_json` nested past the JSON depth guard (a
+poisoned/over-nested row), emitted unconditionally (`0` when none were
+excluded) so a short `count` can never be mistaken for "nothing else
+matched": the two truncation causes are otherwise indistinguishable from the
+response alone.
 
 **Storage failure (all three routes):** a null/unopened inventory store returns `503`
 (`{"error":{"code":503,"message":"inventory store not available"}}`); a store that opens
