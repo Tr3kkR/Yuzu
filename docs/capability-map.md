@@ -1550,7 +1550,7 @@ The server rejects — not silently ignores — any on-behalf-of assertion on ev
 |--------|:---:|:-----:|:-----:|----------|
 | os_info | Y | Y | Y | System Info |
 | hardware | Y | Y | Y | System Info |
-| peripherals | Y | Y | Y | System Info | *Windows leg: follow-up PR* |
+| peripherals | - | Y | Y | System Info | *Windows leg: follow-up PR* |
 | device_identity | Y | Y | Y | System Info |
 | status | Y | Y | Y | System Info |
 | power_health | Y | Y | Y | System Info |
