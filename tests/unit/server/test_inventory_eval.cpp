@@ -928,6 +928,38 @@ TEST_CASE("InventoryEval: excluded_by_depth and excluded_by_parse_error accumula
     CHECK(excluded_by_parse_error == 1);
 }
 
+// #4541 review (Important finding 1): the fix capped PER-RECORD LOG DETAIL
+// at kMaxLoggedExclusionsPerCause (10) but must never cap the COUNT itself -
+// the out-param is the caller-facing signal ("N records were excluded"),
+// only the log-line volume is a pure implementation detail. Seeds MORE than
+// the cap for each cause (12) and asserts both out-params still report the
+// real total (12), not the capped log-line count (10) - proves the two are
+// genuinely independent, not the same counter reused for both purposes.
+TEST_CASE("InventoryEval: excluded_by_depth and excluded_by_parse_error report the real "
+          "total even when it exceeds the per-cause log-volume cap",
+          "[inventory_eval][edge][security]") {
+    const std::string poisoned = R"({"os":)" + std::string(35, '[') + std::string(35, ']') + "}";
+    Records records;
+    for (int i = 0; i < 12; ++i) {
+        records.emplace_back("poisoned-" + std::to_string(i) + "|hw", poisoned);
+    }
+    for (int i = 0; i < 12; ++i) {
+        records.emplace_back("malformed-" + std::to_string(i) + "|hw", "not valid json {{{");
+    }
+    records.emplace_back("agent-healthy|hw", R"({"os": "Linux"})");
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_depth = 0;
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth, &excluded_by_parse_error);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-healthy");
+    CHECK(excluded_by_depth == 12);
+    CHECK(excluded_by_parse_error == 12);
+}
+
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {
     Records records = {
         {"badkey_no_pipe", R"({"os": "Linux"})"},
