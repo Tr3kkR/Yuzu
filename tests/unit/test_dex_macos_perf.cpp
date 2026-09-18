@@ -156,6 +156,11 @@ TEST_CASE("memory_pressure_pct is the complement of kern.memorystatus_level, cla
           "[dex][macos][perf]") {
     CHECK(memory_pressure_pct(100) == Catch::Approx(0.0));
     CHECK(memory_pressure_pct(0) == Catch::Approx(100.0));
+    // Out-of-range clamps stay DEFENCE IN DEPTH here (governance C-2): the production
+    // path never reaches this function with an out-of-range level any more —
+    // read_memorystatus_level() now returns nullopt outside [0,100] itself, before this
+    // function ever sees the value — but a caller bypassing that reader must still get a
+    // clamped, never a nonsensical negative/>100, result.
     CHECK(memory_pressure_pct(137) == Catch::Approx(0.0));  // out of range, clamped
     CHECK(memory_pressure_pct(-20) == Catch::Approx(100.0)); // out of range, clamped
 }

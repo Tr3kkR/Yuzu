@@ -166,9 +166,12 @@ YUZU_EXPORT DiskTotals read_disk_totals();
 YUZU_EXPORT std::optional<DiskTotals> sum_block_storage_stats_empty_iterator_for_test();
 #endif
 
-/// Darwin: one sysctlbyname("kern.memorystatus_level") read. nullopt on failure or on
-/// every other platform — the raw kernel scale (0..100), NOT yet reduced by
-/// memory_pressure_pct (the caller composes the two).
+/// Darwin: one sysctlbyname("kern.memorystatus_level") read. nullopt on failure, on
+/// every other platform, OR when the read value falls outside the documented [0,100]
+/// scale (governance C-2 — an out-of-band level must never reach the caller as if it
+/// were plausible; memory_pressure_pct's own clamp is defence in depth for a caller that
+/// bypasses this reader, not a substitute for validating here). The raw kernel scale
+/// (0..100), NOT yet reduced by memory_pressure_pct (the caller composes the two).
 YUZU_EXPORT std::optional<int> read_memorystatus_level();
 
 } // namespace yuzu::agent::macos

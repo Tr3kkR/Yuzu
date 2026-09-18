@@ -292,6 +292,15 @@ std::optional<int> read_memorystatus_level() {
     const auto v = sysctl_value<std::int32_t>("kern.memorystatus_level");
     if (!v)
         return std::nullopt;
+    // Range-validate at the READER (governance C-2): the documented scale is [0,100], and
+    // an out-of-band value (a corrupt read, a future kernel revision) must not reach the
+    // caller as if it were a plausible level — memory_pressure_pct's own clamp stays as
+    // defence in depth for a caller that bypasses this reader, but clamping HERE would
+    // have silently turned a garbage/out-of-range level into a fabricated HEALTHY 0%
+    // pressure reading (100 - clamp(garbage) can land at 0), which is worse than an
+    // honest "no value".
+    if (*v < 0 || *v > 100)
+        return std::nullopt;
     return static_cast<int>(*v);
 }
 
