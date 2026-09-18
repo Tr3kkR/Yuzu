@@ -178,12 +178,26 @@ def run_meson_contract_scenario(label, known_flaky):
             env=env, capture_output=True, text=True,
         )
         expected_root = os.path.abspath(builddir)
+        # MESON_BUILD_ROOT is compared as an exact string: it's just an env
+        # var set to expected_root and read back verbatim, exactly what the
+        # real C++ test code does too (no resolution occurs either side in
+        # production). cwd is compared via realpath: os.getcwd() inside the
+        # child returns the kernel-resolved physical path, which differs
+        # textually from expected_root whenever TMPDIR itself is a symlink
+        # (macOS: /var -> /private/var, so tempfile.TemporaryDirectory()
+        # paths are under /var/folders/... but getcwd() reports
+        # /private/var/folders/...) -- same physical directory, different
+        # string. A bare == here is a real CI-caught false failure (macOS
+        # debug), not a production bug: build-macos under the actual
+        # checkout is never under /tmp, so this symlink shape doesn't occur
+        # in the real CI invocation this test exists to guard.
+        expected_root_real = os.path.realpath(expected_root)
         lines = []
         if os.path.exists(marker):
             with open(marker) as f:
                 lines = [ln.rstrip("\n").split("\t") for ln in f if ln.strip()]
         ok = (r.returncode == 0 and len(lines) >= 2
-              and all(build_root == expected_root and cwd == expected_root
+              and all(build_root == expected_root and os.path.realpath(cwd) == expected_root_real
                       for build_root, cwd in lines))
         status = "PASS" if ok else "FAIL"
         print(f"[{status}] {label}: exit={r.returncode}, {len(lines)} invocation(s) recorded")
