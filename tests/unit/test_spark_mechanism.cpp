@@ -3142,6 +3142,25 @@ TEST_CASE("Service spark (real mechanism): an absent unit gets an initial Stoppe
     REQUIRE(eventually([&] { return got.count() >= 1; }));
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Stopped);
+    // M1 (rung 9c PR-6 item 1): the mechanism must reach SOME real coverage
+    // classification, never stay at the default None forever. EMPIRICALLY
+    // VERIFIED against a real system bus (a standalone sd-bus probe, not
+    // assumed from the D-Bus API docs): systemd's LoadUnit succeeds for ANY
+    // syntactically valid unit name — it lazily creates a stub unit object
+    // with LoadState=not-found rather than erroring — so an absent unit
+    // takes the SAME Resolved -> match -> read path as a present one
+    // (arm_unit's NotFound branch, mapping to Poll, is reserved for the
+    // rarer case where LoadUnit itself fails outright) and typically also
+    // reaches Notification here. Accept either — the property under test is
+    // "no coverage started at None forever, and if Notification, it stamps",
+    // not a specific tri-state value this absence path does not control.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    CHECK(est->established_at.has_value() == (est->coverage == SparkCoverage::Notification));
     engine.disarm(*sub);
     engine.stop();
 }
@@ -3183,6 +3202,18 @@ TEST_CASE("Service spark (real mechanism): two spark keys coalescing onto one un
     CHECK(std::get<ServiceSparkData>(got.at(1).data).state ==
           ServiceRunState::Stopped); // ...same (absent) unit, same resolved state
 
+    // M1 (rung 9c PR-6 item 1): the F4 unified branch reports establishment
+    // for the SECOND (coalescing) key unconditionally — it must NOT be
+    // gated behind the same `uw.last` check the emit above is (a key
+    // coalescing onto an already-resolved unit whose state HASN'T changed
+    // still needs its own establishment report; the emit is edge-gated, the
+    // establishment report is not). See the "absent unit" test above for why
+    // this accepts any non-None coverage rather than a specific value.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*second);
+        return est.has_value() && est->coverage != SparkCoverage::None;
+    }));
+
     engine.disarm(*first);
     engine.disarm(*second);
     engine.stop();
@@ -3210,8 +3241,93 @@ TEST_CASE("Service spark (real mechanism): a real active unit resolves to Runnin
     REQUIRE(eventually([&] { return got.count() >= 1; }));
     REQUIRE(std::holds_alternative<ServiceSparkData>(got.at(0).data));
     CHECK(std::get<ServiceSparkData>(got.at(0).data).state == ServiceRunState::Running);
+    // M1 (rung 9c PR-6 item 1), STRICT: a real, present, resolvable unit MUST
+    // reach Notification coverage, never settle for Poll — Poll here would
+    // mean the mechanism-wide Subscribe() call failed (H7), which on a normal
+    // systemd host is a real finding (a Subscribe-denied host), not an
+    // acceptable degraded mode this test should silently tolerate.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    auto est = engine.subscription_establishment(*sub);
+    REQUIRE(est.has_value());
+    REQUIRE(est->established_at.has_value());
+    CHECK(*est->established_at >= est->armed_at);
     engine.disarm(*sub);
     engine.stop();
+}
+
+TEST_CASE("Service spark (real mechanism): a disarm racing a re-arm (adoption) still lets "
+          "the mechanism report establishment against the fresh incarnation (M1)",
+          "[spark][mechanism][linux]") {
+    SparkEngine engine;
+    REQUIRE(engine.register_mechanism(SparkType::Service, make_service_mechanism()).has_value());
+    Collector got;
+    auto c = engine.register_consumer("c", got.handler());
+    REQUIRE(c.has_value());
+    engine.start();
+
+    auto sub1 = engine.arm(*c, service_spec("systemd-journald.service"));
+    if (!sub1.has_value()) {
+        engine.stop();
+        SUCCEED("service mechanism reports inert (no system bus on this host) — skipping");
+        return;
+    }
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub1);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+
+    // Race a re-arm of the SAME key into disarm()'s teardown window — the M2
+    // staleness recheck skips the stale unwatch, so the real mechanism's
+    // UnitWatch survives untouched ("adoption": same live sd-bus match, a
+    // new engine-side incarnation).
+    std::optional<SparkEngine::SubscriptionId> sub2;
+    bool raced = false;
+    engine.set_disarm_race_hook_for_test([&] {
+        if (raced)
+            return;
+        raced = true;
+        auto again = engine.arm(*c, service_spec("systemd-journald.service"));
+        REQUIRE(again.has_value());
+        sub2 = *again;
+    });
+    engine.disarm(*sub1);
+    engine.set_disarm_race_hook_for_test(nullptr);
+    REQUIRE(raced);
+    REQUIRE(sub2.has_value());
+
+    // The adopted key still reaches Notification under its NEW incarnation
+    // — the F4 unconditional coalesce/adoption report, exercised against the
+    // real mechanism rather than the fake.
+    REQUIRE(eventually([&] {
+        auto est = engine.subscription_establishment(*sub2);
+        return est.has_value() && est->coverage == SparkCoverage::Notification;
+    }));
+    CHECK(engine.subscription_health(*sub2) == SubscriptionHealth::Healthy);
+
+    engine.disarm(*sub2);
+    engine.stop();
+}
+
+TEST_CASE("Service mechanism (Linux, direct): set_established_sink seals at start(), same "
+          "one-way contract as the fake (M2)",
+          "[spark][mechanism][linux]") {
+    auto mech = make_service_mechanism();
+    REQUIRE(mech);
+    CHECK(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->start([](const std::string&, SparkData) {},
+               [](const std::string&, bool, std::string_view) {});
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {}));
+    mech->stop();
+    CHECK_FALSE(mech->set_established_sink(
+        [](const std::string&, SparkIncarnation, std::chrono::steady_clock::time_point,
+          SparkCoverage) {})); // one-way: still sealed after stop()
 }
 
 TEST_CASE("Service spark (real mechanism): fd/thread collapse holds across N absent watches",
