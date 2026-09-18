@@ -1214,6 +1214,23 @@ CAP the mechanism's alertable wait clamps to whenever any probe is outstanding �
 fixed delay; commands/APCs can wake the thread earlier). Do not compare Service's
 poll-mediated establishment timestamp against a future Registry/File wiring's
 caller-wait-bounded path as if they measured the same thing.
+**Windows live-registration-retry blind spot, carried forward for R5.7's own
+future use of this channel:** on a live-registration failure that occurs
+AFTER a successful resolve (`NotifyServiceStatusChangeW` itself failing
+post-`OpenServiceW`), Windows's `begin_probe`→`resolve_probe` retry loop has
+no status-poll fallback — it only re-learns the service's real state from a
+future successful Notify callback. Linux's equivalent failure
+(`sd_bus_match_signal` post-`LoadUnit`) DOES fall back to `read_state()` via
+its backstop reconcile. A service can flip Running↔Stopped **undetected** on
+Windows during this narrow retry window; it cannot on Linux. This asymmetry
+predates this channel (confirmed against the pre-PR base commit `7ff742f19`
+— the fallback was already absent) — this channel only made the gap
+OBSERVABLE (staging `SparkCoverage::None`, honestly, rather than leaving it
+invisible). A future R5.7 consumer treating Windows's `None` in this
+specific window as "confirmed absent" rather than "not yet re-confirmed"
+would be wrong; do not conflate the two without a discriminating signal
+Spark does not currently have (see also the forward-looking
+`SparkCoverage::None` ambiguity note for Registry/File, tracked as #4340).
 **R4 (stale-after-stop), carried forward from the delivery plan's own residual list:**
 after `SparkEngine::stop()`, `subscription_establishment(id)` keeps returning the
 subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A future

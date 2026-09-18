@@ -404,7 +404,19 @@ the Add-drain adoption site - NOT independently unit-tested, no test seam
 currently forces the specific cross-watch APC timing; flagged as a residual
 test gap), 3 LOW (a docs R4 caveat, a changelog naming convention, a
 diagnostic-message reuse detail) - all fixed, see this branch's commit
-history from `afbdaf0bd` onward for the exact diffs and reasoning. **Item
+history from `afbdaf0bd` onward for the exact diffs and reasoning. A
+further governance run on this branch (`7ff742f19..d20aa5020`) found and
+fixed two more coupled defects in commit `e5eb7dc8a` - PR-6 item 1's own
+UP-1(A), an exception-safety `.at()`-throw window in the new per-key
+incarnation/epoch bookkeeping, and PR-6 item 1's own UP-1(B), a
+pre-existing zombie-mechanism admission gate that let a dead
+Service-mechanism worker thread keep silently accepting `arm()` calls and
+returning success forever - both adjudicated LOW today (capped by
+`prefer_spark_` staying false in production, the sole gate on every path
+to this code) but MEDIUM (A) / HIGH (B) post-flip if ever left unfixed at
+that point; full adjudication in
+`governance.d/4340-spark-9c-pr6-item1-establishment-signal.MwM5ht.jsonl`.
+**Item
 2 (a re-run of the #3990 diagnostic's methodology against the full landed
 ladder, using this channel's real per-key timestamp) is a SEPARATE,
 not-yet-started piece of work, depends on item 1 landing first** - do not
