@@ -430,6 +430,62 @@ TEST_CASE("from-tar-query: missing sql is 400, no dispatch", "[pg][result_set][a
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar][security][4406]") {
+    // #4406 fix: body.value("sql", "") threw on a non-string sql rather than
+    // coercing. Same guard shape as the pre-existing include_empty check
+    // above, now applied to sql too.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", R"({"sql":12345})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("'sql' is required") != std::string::npos);
+}
+
+TEST_CASE("from-tar-query: a type-mismatched name is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar][security][4406]") {
+    // Adversarial-review finding: body.value("name", "") at the run_async call
+    // site threw the same way sql/instruction_id did before #4406's fix -
+    // missed in the first pass because name is passed inline as an argument,
+    // not extracted into a named local like the other guarded fields.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j =
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","name":123})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-tar-query: an oversized name is refused with 400, never dispatched",
+          "[pg][result_set][async][tar][security]") {
+    // PR review finding: same missing kResultSetNameMaxLen length cap as
+    // the generic create route's own oversized-name test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["sql"] = "SELECT 1";
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
           "[pg][result_set][async][tar][targeting][security]") {
     // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
@@ -658,6 +714,233 @@ TEST_CASE("from-instruction-result: unknown instruction_id 404s",
     REQUIRE(h.calls.empty());
 }
 
+TEST_CASE("from-instruction-result: a type-mismatched instruction_id is refused with "
+          "400, never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][instruction][security][4406]") {
+    // #4406 fix: body.value("instruction_id", "") threw on a non-string
+    // instruction_id rather than coercing - it now falls through to the
+    // pre-existing "is required" 400, same as an absent field.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j =
+        h.post("/api/v1/result-sets/from-instruction-result", R"({"instruction_id":12345})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("'instruction_id' is required") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a type-mismatched name is refused with 400, "
+          "never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][instruction][security][4406]") {
+    // Adversarial-review finding, same as from-tar-query's sibling test above.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["name"] = 123;
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized name is refused with 400, never "
+          "dispatched",
+          "[pg][result_set][async][instruction][security]") {
+    // PR review finding: same missing kResultSetNameMaxLen length cap as
+    // the generic create route's own oversized-name test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a non-object params is refused with 400, not "
+          "silently dispatched with an empty params map",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // Gate 4 unhappy-path fix: params gated on is_object() skipped every
+    // bound check AND the params-map-build loop, so a string/array/number
+    // params silently dispatched with an EMPTY map while persisting the
+    // wrong-shaped value verbatim and unbounded.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = std::string(4 * 1024 * 1024 - 100, 'A');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("'params' must be a JSON object") !=
+            std::string::npos);
+}
+
+// #4373-class fix, sibling-handler closure (flagged by governance Gate 2's
+// mandatory sibling-handler sweep, PR#4373 follow-on): from-instruction-result
+// had NO bound at all on instruction_id/params at creation time, unlike
+// re-eval which this PR bounds against a stored payload - closing that
+// smuggle-then-reeval path left the DIRECT one-step path open. These four
+// mirror re-eval's own bound-check coverage; each asserts the specific
+// message, since a bare 400+no-dispatch alone doesn't distinguish the NEW
+// bound check from the pre-existing "unknown instruction_id" 404 fallback's
+// neighbouring 400 paths (missing/empty instruction_id, invalid JSON).
+
+TEST_CASE("from-instruction-result: an oversized instruction_id is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(257, 'q');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a 256-byte instruction_id passes the "
+          "length guard and reaches the not-found fallback",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // The 256-byte boundary itself must be ACCEPTED (only >256 is rejected,
+    // per kInstructionIdMaxLen) - but InstructionStore caps a real
+    // definition id at 128 characters, so no registered instruction can
+    // ever be 256 bytes long. Proving acceptance-at-the-boundary therefore
+    // means proving the length check did NOT fire (no "must be at most 256
+    // bytes" message) and the request instead reaches the pre-existing
+    // INSTRUCTION_NOT_FOUND 404, not that it dispatched.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["instruction_id"] = std::string(256, 'q');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 404);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") ==
+            std::string::npos);
+    REQUIRE(j["error"]["message"].get<std::string>().find("INSTRUCTION_NOT_FOUND") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an over-keyed params object is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params[std::format("k{}", i)] = "v";
+    body["params"] = params;
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized params key is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = {{std::string(257, 'k'), "v"}};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params key exceeds 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized params value is refused, "
+          "never dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["params"] = {{"path", std::string(65537, 'z')}};
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: exact-boundary params are accepted and dispatched",
+          "[pg][result_set][async][instruction][security][4373]") {
+    // Scoped to params (32 keys, each key/value padded to its exact byte
+    // cap) - a real registered instruction_id is a short generated string,
+    // never anywhere near the 256-byte instruction_id cap, so that
+    // boundary isn't exercisable on the accept side without a test-only
+    // custom-id seam InstructionStore doesn't have. The reject side
+    // (257 bytes, above) plus the `>` (never `>=`) comparator already
+    // prove that boundary.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 32; ++i)
+        // Fixed-width numeric prefix ("k000".."k031") keeps every key unique
+        // before the 'x' fill pads it to the exact 256-byte cap - a '0' fill
+        // on a bare "k{}" would collide (e.g. "k1"+zeros == "k10"+zeros),
+        // silently shrinking this to fewer than 32 distinct keys.
+        params[std::format("{:x<256}", std::format("k{:03d}", i))] = std::string(65536, 'v');
+    REQUIRE(params.size() == 32);
+    body["params"] = params;
+    int status = 0;
+    h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+}
+
 TEST_CASE("re-eval: tar_query set re-dispatches as a sibling (shares parent)",
           "[pg][result_set][async][reeval]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
@@ -729,6 +1012,382 @@ TEST_CASE("re-eval: an oversized SQL smuggled onto an existing row is refused, "
     nlohmann::json payload;
     payload["sql"] = std::string(100001, 'x');
     cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+// #4373: the kInstructionResult branch was missing the equivalent recheck
+// entirely - a row minted via the uncapped POST /api/v1/result-sets (no
+// source_kind allowlist there) could carry an over-keyed or oversized
+// params object straight past MCP's own bounds (mcp_input_bounds.hpp) and
+// into a fleet-wide dispatch, or an oversized instruction_id straight into
+// instruction_store's lookup unbounded. The seven cases below (four bound
+// cases, two type-confusion cases, and one unparseable-payload case) cover
+// the ones reevaluate_result_set's own fix (PR #4394) already has plus one
+// more (cpp-safety Gate 3 finding on this PR), seeded directly in the
+// store the same way the SQL-cap test above is (never through
+// /from-instruction-result, which has no per-field bound of its own to
+// enforce the smuggled shape at creation time).
+
+TEST_CASE("re-eval: an over-keyed params object smuggled onto an existing "
+          "instruction_result row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    // A REAL, registered instruction_id (never a made-up one): without the
+    // params bound this fix adds, the lookup below succeeds and the old
+    // code reaches run_async, so this proves the bound is what stops the
+    // dispatch, not merely that an unrelated "instruction unavailable" path
+    // happens to also 400.
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    for (int i = 0; i < 33; ++i)
+        params["k" + std::to_string(i)] = "v";
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-overkeyed";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    // #4478's stored-payload depth guard 400s+no-dispatches this same route
+    // before parse, so status==400 + h.calls.empty() alone does not
+    // distinguish this fix's params-count bound from that unrelated guard -
+    // the message is what proves THIS check fired.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("params must have at most 32 keys") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: a non-object params smuggled onto an existing instruction_result "
+          "row is refused, not silently re-dispatched with an empty params map",
+          "[pg][result_set][async][reeval][security][4373]") {
+    // Gate 4 unhappy-path fix: the pre-fix code gated every params bound
+    // check (and the params-map-build loop) on is_object(), so a
+    // string/array/number params silently re-dispatched with an EMPTY map.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = std::string(1024, 'A');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-non-object-params";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("'params' must be a JSON object") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an oversized params value smuggled onto an existing "
+          "instruction_result row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    // Real instruction_id, same reasoning as the over-keyed case above.
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{"k", std::string(65537, 'z')}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-value";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    // Same distinguishing reasoning as the over-keyed case above: assert the
+    // message, not just the status, since #4478's depth guard 400s on this
+    // route too.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: a non-string params value is measured by its dump() size, "
+          "not skipped, smuggled onto an existing instruction_result row",
+          "[pg][result_set][async][reeval]") {
+    // Proves the value-size check measures dump() size for a non-string JSON
+    // value (an object/array), not merely `.is_string()`-gated away - the
+    // exact regression MCP's own reevaluate_result_set fix had a dedicated
+    // SECTION for. Real instruction_id, same reasoning as the two cases above.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{"k", {{"pad", std::string(65537, 'z')}}}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-nonstring-value";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    // Same distinguishing reasoning as the two cases above: assert the
+    // message, since a bare 400+no-dispatch is also what #4478's depth
+    // guard produces on this route.
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params value exceeds 65536 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an oversized instruction_id smuggled onto an existing "
+          "row is refused, never re-dispatched",
+          "[pg][result_set][async][reeval]") {
+    // A bogus, non-existent instruction_id 400s regardless of length via the
+    // pre-existing "original instruction unavailable" fallback (dispatch
+    // needs a real matching InstructionDefinition either way), so status==400
+    // alone does not distinguish this fix's length check from that
+    // pre-existing path - both the fixed and unfixed handler return 400 here.
+    // Asserting the error message names the length bound is what actually
+    // proves the NEW check fired, not the old fallback.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = std::string(257, 'q');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-oversized-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") !=
+            std::string::npos);
+}
+
+// Gate 8 follow-up (post-merge test-gap closure): the seven cases above cover
+// the count/value/instruction_id bounds and the two type-confusion cases, but
+// leave two gaps - no case ever sends a params KEY past its own bound, and no
+// case proves any of the four bounds accepts a request AT its boundary rather
+// than only rejecting past it. The three cases below close those gaps.
+
+TEST_CASE("re-eval: a 257-byte params key smuggled onto an existing "
+          "instruction_result row is refused with the bounds-specific error",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    payload["params"] = {{std::string(257, 'k'), "v"}};
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-overlong-key";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("a params key exceeds 256 bytes") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: an instruction_id of exactly 256 bytes passes the length "
+          "guard and falls through to instruction-unavailable",
+          "[pg][result_set][async][reeval]") {
+    // The 256-byte boundary itself must be ACCEPTED by this fix's length
+    // check (only >256 is rejected, per kInstructionIdMaxLen) - but
+    // InstructionStore::validate_and_prepare caps a real definition id at
+    // 128 characters, so no registered instruction can ever be 256 bytes
+    // long and this can never reach a successful dispatch. Proving
+    // acceptance-at-the-boundary therefore means proving the length check
+    // did NOT fire (no "must be at most 256 bytes" message) and the request
+    // instead reaches the pre-existing not-found fallback, not that it
+    // dispatched.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = std::string(256, 'q');
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-boundary-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+    REQUIRE(j["error"]["message"].get<std::string>().find("must be at most 256 bytes") ==
+            std::string::npos);
+    REQUIRE(j["error"]["message"].get<std::string>().find("original instruction unavailable") !=
+            std::string::npos);
+}
+
+TEST_CASE("re-eval: params at the exact per-field bounds (32 keys, a "
+          "256-byte key, a 65536-byte value) pass and the request dispatches",
+          "[pg][result_set][async][reeval]") {
+    // The positive-boundary twin of the count/key/value rejection cases
+    // above - proves 32 keys, a 256-byte key, and a 65536-byte value are all
+    // ACCEPTED (not merely that 33/257/65537 are rejected), and that an
+    // otherwise-valid request still reaches dispatch once every bound
+    // clears. Real, registered instruction_id (short - InstructionStore
+    // caps ids at 128 bytes, so the instruction_id bound's own accept-side
+    // boundary is covered separately above, not here).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json payload;
+    payload["instruction_id"] = iid;
+    nlohmann::json params = nlohmann::json::object();
+    params[std::string(256, 'k')] = std::string(65536, 'v');
+    for (int i = 0; i < 31; ++i)
+        params["k" + std::to_string(i)] = "v";
+    REQUIRE(params.size() == 32);
+    payload["params"] = params;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-boundary-params";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 202);
+    REQUIRE(h.calls.size() == 1);
+    REQUIRE(h.calls[0].plugin == "filehash");
+    REQUIRE(h.calls[0].action == "check");
+    REQUIRE(h.calls[0].params.at(std::string(256, 'k')) == std::string(65536, 'v'));
+    REQUIRE(j["data"]["source_kind"] == "instruction_result");
+}
+
+TEST_CASE("re-eval: a type-mismatched sql value on a tar_query row is a clean "
+          "400, never an uncaught type_error",
+          "[pg][result_set][async][reeval]") {
+    // nlohmann::json::value("sql", "") throws json::type_error on a type
+    // mismatch rather than coercing - #4373's second finding. Proves the
+    // type-confusion guard actually fires, not merely that the comment says
+    // it should.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["sql"] = 12345;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-type-mismatched-sql";
+    cr.source_kind = std::string(source_kind::kTarQuery);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: a type-mismatched instruction_id value on an "
+          "instruction_result row is a clean 400, never an uncaught type_error",
+          "[pg][result_set][async][reeval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json payload;
+    payload["instruction_id"] = 12345;
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-type-mismatched-instruction-id";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = payload.dump();
+    auto seeded = h.store->create_materialized(cr, {});
+    REQUIRE(seeded.has_value());
+
+    int status = 0;
+    h.post("/api/v1/result-sets/" + seeded->id + "/re-eval", "", status);
+    REQUIRE(status == 400);
+    REQUIRE(h.calls.empty());
+}
+
+TEST_CASE("re-eval: an unparseable source_payload on an instruction_result row "
+          "is a clean 400, never an uncaught exception",
+          "[pg][result_set][async][reeval]") {
+    // orig->source_payload is parsed with nlohmann::json::parse(..., nullptr,
+    // false), which discards (rather than throws) on invalid JSON - proves
+    // that discarded-value path degrades safely on the kInstructionResult
+    // branch too: sp.is_object() is false for a discarded value, so every
+    // field read below falls through to "absent", not a crash.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+
+    CreateRequest cr;
+    cr.owner_principal = "operator-1";
+    cr.name = "legacy-unparseable-payload";
+    cr.source_kind = std::string(source_kind::kInstructionResult);
+    cr.source_payload = "not json";
     auto seeded = h.store->create_materialized(cr, {});
     REQUIRE(seeded.has_value());
 
@@ -1021,6 +1680,26 @@ TEST_CASE("from-inventory-query: an ordinary authorized caller still reaches the
     // does not itself block a legitimately-authorized caller.
     h.post("/api/v1/result-sets/from-inventory-query", R"({"name":"x"})", status);
     CHECK(status == 503);
+}
+
+TEST_CASE("from-inventory-query: an oversized name is refused with 400, never "
+          "reaches the inventory-store gate",
+          "[pg][result_set][async][inventory][security]") {
+    // PR review finding: REST fixed the type-confusion crash on name but
+    // never applied MCP's matching kResultSetNameMaxLen length cap. The
+    // check runs before store availability, so this 400s even with no
+    // inventory store wired (unlike the 503 case just above).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
 }
 
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
@@ -1611,6 +2290,82 @@ TEST_CASE("POST /api/v1/result-sets: a body nested past the depth limit is rejec
         nested_array(40) + "}}";
     h.post("/api/v1/result-sets", body, status);
     CHECK(status == 400);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: a type-mismatched name is refused with 400, "
+          "never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][security][4406]") {
+    // Gate 8 sibling-sweep finding: this generic create route has the same
+    // unguarded body.value("name", "") shape as from-tar-query/
+    // from-instruction-result did before #4406's fix, but was never part of
+    // that sweep since it's a synchronous direct-create path, not one of the
+    // three async producers.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":123})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: a type-mismatched source_kind is refused with "
+          "400, never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][security][4406]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", R"({"name":"x","source_kind":123})", status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("source_kind must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: an oversized name is refused with 400",
+          "[pg][result_set][security]") {
+    // PR review finding: REST fixed the type-confusion crash on name but
+    // never applied MCP's matching kResultSetNameMaxLen length cap.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: an oversized source_kind is refused with 400",
+          "[pg][result_set][security]") {
+    // PR review finding: same missing length cap as name, above, for
+    // kResultSetSourceKindMaxLen (64 bytes, MCP's own enforced value).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = "x";
+    body["source_kind"] = std::string(65, 'k');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("source_kind must be at most 64 bytes") !=
+          std::string::npos);
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
 }
