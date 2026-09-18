@@ -467,6 +467,25 @@ TEST_CASE("from-tar-query: a type-mismatched name is refused with 400, never an 
           std::string::npos);
 }
 
+TEST_CASE("from-tar-query: an oversized name is refused with 400, never dispatched",
+          "[pg][result_set][async][tar][security]") {
+    // PR review finding: same missing kResultSetNameMaxLen length cap as
+    // the generic create route's own oversized-name test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["sql"] = "SELECT 1";
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-tar-query", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
           "[pg][result_set][async][tar][targeting][security]") {
     // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
@@ -731,6 +750,27 @@ TEST_CASE("from-instruction-result: a type-mismatched name is refused with 400, 
     CHECK(status == 400);
     CHECK(h.calls.empty());
     CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: an oversized name is refused with 400, never "
+          "dispatched",
+          "[pg][result_set][async][instruction][security]") {
+    // PR review finding: same missing kResultSetNameMaxLen length cap as
+    // the generic create route's own oversized-name test.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
           std::string::npos);
 }
 
@@ -1642,6 +1682,26 @@ TEST_CASE("from-inventory-query: an ordinary authorized caller still reaches the
     CHECK(status == 503);
 }
 
+TEST_CASE("from-inventory-query: an oversized name is refused with 400, never "
+          "reaches the inventory-store gate",
+          "[pg][result_set][async][inventory][security]") {
+    // PR review finding: REST fixed the type-confusion crash on name but
+    // never applied MCP's matching kResultSetNameMaxLen length cap. The
+    // check runs before store availability, so this 400s even with no
+    // inventory store wired (unlike the 503 case just above).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-inventory-query", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+}
+
 // #2146 Batch B2 Gate 4 unhappy-path fix: the confinement fix itself
 // (authz::in_scope(gate.scope, r.agent_id) narrowing which agents' inventory
 // rows are visible) had zero red -> green test coverage on either transport -
@@ -1873,6 +1933,45 @@ TEST_CASE("POST /api/v1/result-sets: a type-mismatched source_kind is refused wi
     auto j = h.post("/api/v1/result-sets", R"({"name":"x","source_kind":123})", status);
     CHECK(status == 400);
     CHECK(j["error"]["message"].get<std::string>().find("source_kind must be a JSON string") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: an oversized name is refused with 400",
+          "[pg][result_set][security]") {
+    // PR review finding: REST fixed the type-confusion crash on name but
+    // never applied MCP's matching kResultSetNameMaxLen length cap.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = std::string(257, 'n');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("name must be at most 256 bytes") !=
+          std::string::npos);
+    std::string next;
+    CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());
+}
+
+TEST_CASE("POST /api/v1/result-sets: an oversized source_kind is refused with 400",
+          "[pg][result_set][security]") {
+    // PR review finding: same missing length cap as name, above, for
+    // kResultSetSourceKindMaxLen (64 bytes, MCP's own enforced value).
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    nlohmann::json body;
+    body["name"] = "x";
+    body["source_kind"] = std::string(65, 'k');
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(j["error"]["message"].get<std::string>().find("source_kind must be at most 64 bytes") !=
           std::string::npos);
     std::string next;
     CHECK(h.store->list_by_owner("operator-1", "", 50, next).empty());

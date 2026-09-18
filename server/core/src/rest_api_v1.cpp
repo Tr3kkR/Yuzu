@@ -9170,13 +9170,35 @@ void RestApiV1::register_routes(
             // body.value("name", "") shape threw uncaught on a type-mismatched
             // field (#4406) - this generic create route has the same shape on
             // BOTH name and source_kind and was never part of that sweep.
-            if (body.contains("name") && !body["name"].is_string()) {
-                rs_err(res, 400, "name must be a JSON string");
-                return;
+            if (body.contains("name")) {
+                if (!body["name"].is_string()) {
+                    rs_err(res, 400, "name must be a JSON string");
+                    return;
+                }
+                // PR review finding: this header's own kResultSetNameMaxLen is
+                // MCP's enforced length cap for the same field - REST fixed the
+                // type-confusion crash but never applied the matching length
+                // bound, contradicting this PR's own "same caps as MCP" claim.
+                if (body["name"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetNameMaxLen) {
+                    rs_err(res, 400,
+                           std::format("name must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetNameMaxLen));
+                    return;
+                }
             }
-            if (body.contains("source_kind") && !body["source_kind"].is_string()) {
-                rs_err(res, 400, "source_kind must be a JSON string");
-                return;
+            if (body.contains("source_kind")) {
+                if (!body["source_kind"].is_string()) {
+                    rs_err(res, 400, "source_kind must be a JSON string");
+                    return;
+                }
+                if (body["source_kind"].get_ref<const std::string&>().size() >
+                    yuzu::server::mcp::kResultSetSourceKindMaxLen) {
+                    rs_err(res, 400,
+                           std::format("source_kind must be at most {} bytes",
+                                       yuzu::server::mcp::kResultSetSourceKindMaxLen));
+                    return;
+                }
             }
             CreateRequest cr;
             cr.owner_principal = session->username;
@@ -9362,9 +9384,20 @@ void RestApiV1::register_routes(
                                  "parent set; omit it entirely to search all devices");
                           return;
                       }
-                      if (body.contains("name") && !body["name"].is_string()) {
-                          rs_err(res, 400, "name must be a JSON string");
-                          return;
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       // Gate 4 unhappy-path fix: moved below the client-input
                       // validation above (combine/conditions/parent_id/name) - a
@@ -9536,9 +9569,20 @@ void RestApiV1::register_routes(
                       // exact same routes, just missed for this sibling optional field.
                       // Same guard shape as the from-inventory-query route's name check
                       // above and this route's own include_empty check just above.
-                      if (body.contains("name") && !body["name"].is_string()) {
-                          rs_err(res, 400, "name must be a JSON string");
-                          return;
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       const bool include_empty = body.value("include_empty", false);
                       nlohmann::json matcher =
@@ -9612,9 +9656,20 @@ void RestApiV1::register_routes(
                       // Adversarial-review finding: the same #4406-class gap as
                       // instruction_id above, on the sibling optional 'name' field
                       // this route also passes unguarded to run_async below.
-                      if (body.contains("name") && !body["name"].is_string()) {
-                          rs_err(res, 400, "name must be a JSON string");
-                          return;
+                      if (body.contains("name")) {
+                          if (!body["name"].is_string()) {
+                              rs_err(res, 400, "name must be a JSON string");
+                              return;
+                          }
+                          // PR review finding: apply the same MCP-matching
+                          // length cap as the other result-set create routes.
+                          if (body["name"].get_ref<const std::string&>().size() >
+                              yuzu::server::mcp::kResultSetNameMaxLen) {
+                              rs_err(res, 400,
+                                     std::format("name must be at most {} bytes",
+                                                 yuzu::server::mcp::kResultSetNameMaxLen));
+                              return;
+                          }
                       }
                       // #4373-class fix: this route had no bound at all on instruction_id
                       // or params (unlike the sql-bearing from-tar-query route directly

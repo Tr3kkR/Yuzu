@@ -1106,7 +1106,10 @@ same caps MCP's `create_result_set_from_instruction_result`/`reevaluate_result_s
 | `POST /api/v1/result-sets/from-instruction-result` | `params` over 32 keys, a key over 256 bytes, or a value over 64 KiB | dispatched | `400` |
 | `POST /api/v1/result-sets/{id}/re-eval` | same, on a set whose stored `instruction_id`/`params` exceed the caps | re-dispatched (params) or reached an unbounded store lookup then 400 (instruction_id) | `400` |
 | `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `params` present but not a JSON object (a string, array, or number) | dispatched/re-dispatched with an EMPTY params map, silently discarding it | `400` |
+| `POST /api/v1/result-sets/from-tar-query` | `sql` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets/from-instruction-result` or `{id}/re-eval` | `instruction_id` present but not a JSON string | uncaught exception, bare `500` | `400` |
 | `POST /api/v1/result-sets/from-tar-query` or `from-instruction-result` | `name` present but not a JSON string | uncaught exception, bare `500` | `400` |
+| `POST /api/v1/result-sets`, `from-tar-query`, `from-instruction-result`, or `from-inventory-query` | `name` over 256 bytes, or (generic create route only) `source_kind` over 64 bytes | persisted/dispatched unbounded | `400` |
 | `POST /api/v1/result-sets` (the generic/synchronous create route) | `name` or `source_kind` present but not a JSON string | uncaught exception, bare `500` | `400` |
 
 **Who this affects.** Callers sending a field past a numeric/count bound (`instruction_id`,
