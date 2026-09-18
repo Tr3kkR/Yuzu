@@ -202,6 +202,13 @@ struct DiskSparkData {
 ///            compares and remediates on it, so the raw primitive must surface it
 ///            or a consumer goes blind to paused drift); *_PENDING →
 ///            TRANSITIONAL — HELD.
+///   macOS  : `launchctl list` (see agents/shared/launchctl_list.hpp +
+///            agents/core/include/yuzu/agent/launchd_state.hpp) — listed with a
+///            pid → Running; listed without a pid, or absent from the snapshot
+///            → Stopped. Paused is NEVER produced: launchd, like systemd, has
+///            no analogue to the Windows SCM's SERVICE_PAUSED terminal state,
+///            and there is no TRANSITIONAL concept either (a launchctl list
+///            snapshot is a point-in-time terminal read, not a state machine).
 /// Transitional states are held, not emitted: a consumer can neither assert over
 /// nor enforce against a mid-transition state (the guards hold on exactly these),
 /// and emitting them would make every stop/start a multi-event flap each consumer
