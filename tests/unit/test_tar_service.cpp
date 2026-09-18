@@ -411,6 +411,42 @@ TEST_CASE("enumerate_services_impl (macOS/launchctl leg): an output-cap "
     REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
 }
 
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): the malformed-cause "
+          "ternary names the right one of its three shapes (qe4-2, governance "
+          "A0 round-4)",
+          "[tar_service][enumerate]") {
+    // Round 3's cause-discrimination ternary (tar_service_collector.cpp:
+    // 325-334) feeds the thrown IncompleteCaptureError's message -- the
+    // orchestrator's and security-guardian's exhaustiveness proofs (by code
+    // reading) don't substitute for a regression lock (round-4 qe4-2,
+    // SHOULD). Pins which cause string fires for each of the three shapes.
+    auto fake_run_with = [](std::vector<std::string> lines) {
+        return [lines](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+            yuzu::agent::SubprocessResult res;
+            res.tool_ran = true;
+            res.exit_code = 0;
+            res.lines = lines;
+            return res;
+        };
+    };
+
+    auto cause_of = [&](std::vector<std::string> lines) -> std::string {
+        try {
+            enumerate_services_impl(fake_run_with(std::move(lines)));
+        } catch (const yuzu::tar::IncompleteCaptureError& e) {
+            return e.what();
+        }
+        FAIL("expected IncompleteCaptureError");
+        return {};
+    };
+
+    CHECK(cause_of({}).find("zero lines despite exit 0") != std::string::npos);
+    CHECK(cause_of({"1190\t0\tcom.apple.progressd"}).find("missing/garbled header row") !=
+          std::string::npos);
+    CHECK(cause_of({"PID\tStatus\tLabel", "1190\t0"}).find("a per-row defect (empty label)") !=
+          std::string::npos);
+}
+
 TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a non-zero exit "
           "throws IncompleteCaptureError through the real collector entry point",
           "[tar_service][enumerate]") {
