@@ -1102,11 +1102,13 @@ groups:
             it silenced, and take the genuine near-miss signal with it - the
             outcome the >3 threshold above was chosen to avoid. Quarantine
             denials are observed on yuzu_server_quarantine_gate_total and audited
-            as quarantine.dispatch_denied. reason="query_truncated"/"poison_excluded"
-            (#4496, route="result_set_inventory_query") are NOT excluded from the
+            as quarantine.dispatch_denied. reason values
+            "query_truncated"/"poison_excluded"/"parse_error_excluded" (#4496 + follow-up,
+            route="result_set_inventory_query") are NOT excluded from the
             expression, unlike quarantined above: a well-formed, correctly-targeted
             request refused because the underlying inventory read hit its row/byte
-            cap, or a candidate stored record nested past the JSON depth guard, is
+            cap, a candidate stored record nested past the JSON depth guard, or a
+            candidate stored record failed to parse as JSON at all, is
             exactly the near-miss this alert exists to surface, not a caller-input
             mistake like the reasons documented above. Audited as
             result_set.create|failure (not |denied) with the same

@@ -169,12 +169,18 @@ bool eval_condition(const nlohmann::json& data, const InventoryCondition& cond,
 std::vector<InventoryEvalResult> evaluate_inventory(
     const InventoryEvalRequest& req,
     const std::vector<std::pair<std::string, std::string>>& records,
-    std::size_t* excluded_by_depth) {
+    std::size_t* excluded_by_depth,
+    std::size_t* excluded_by_parse_error) {
 
     // #4496: zero the out-param up front (including on the early returns
     // below) so a caller can never read a garbage/stale count.
     if (excluded_by_depth) {
         *excluded_by_depth = 0;
+    }
+    // #4496 follow-up: same zero-up-front discipline for the parse-error
+    // twin.
+    if (excluded_by_parse_error) {
+        *excluded_by_parse_error = 0;
     }
 
     std::vector<InventoryEvalResult> results;
@@ -230,6 +236,20 @@ std::vector<InventoryEvalResult> evaluate_inventory(
         try {
             data = nlohmann::json::parse(data_json);
         } catch (const nlohmann::json::parse_error&) {
+            // #4496 follow-up: a genuinely malformed data_json (syntax
+            // defect, not over-nesting - the depth guard above already
+            // excluded the latter) is the SAME "excluded from evaluation"
+            // hazard #4496 fixed, triggered by a different cause. Count it
+            // separately from excluded_by_depth so a caller can tell WHICH
+            // guard excluded a record. Log identifiers only, never the
+            // payload.
+            spdlog::warn("evaluate_inventory: excluding agent={} plugin={} - data_json failed "
+                        "to parse (malformed JSON)",
+                        onbehalf::sanitize_for_log(record_agent_id, 128),
+                        onbehalf::sanitize_for_log(record_plugin, 128));
+            if (excluded_by_parse_error) {
+                ++(*excluded_by_parse_error);
+            }
             continue;
         }
 

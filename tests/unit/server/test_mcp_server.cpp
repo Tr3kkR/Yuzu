@@ -25593,6 +25593,96 @@ TEST_CASE("MCP create_result_set_from_inventory_query: no poisoned record presen
     CHECK(members[0] == "agent-healthy");
 }
 
+// #4496 follow-up: the sibling of the poisoned-record MCP test above, for the
+// OTHER cause evaluate_inventory() can exclude a record for -- a genuine
+// JSON parse error rather than over-nesting. Same "exists"-condition
+// discriminating rationale as the poisoned test and its REST twin.
+TEST_CASE("MCP create_result_set_from_inventory_query: a malformed stored data_json refuses "
+          "the request rather than silently materialising a narrowed set, no crash",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_malformed = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'not valid json {{{', 1)",
+            std::vector<std::string>{"agent-malformed"});
+        REQUIRE(seeded_malformed.status() == PGRES_COMMAND_OK);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"parse-error-guard","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError); // no crash
+    std::string next;
+    CHECK(rs_bundle->list_by_owner("test-user", "", 50, next).empty());
+}
+
+// #4496 follow-up: the healthy-only sibling of the test above - proves the
+// refusal is specific to an actual malformed record, not a false-positive
+// that fires on every create_result_set_from_inventory_query call after this
+// fix.
+TEST_CASE("MCP create_result_set_from_inventory_query: no malformed record present -- "
+          "matching membership is materialised normally",
+          "[pg][mcp][integration][result-sets][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mcp_rbac_tpl); // unrelated schema; just a live Postgres DSN
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::InventoryStore inventory{pool};
+    REQUIRE(inventory.is_open());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto seeded_healthy = yuzu::server::pg::exec_params(
+            lease.get(),
+            "INSERT INTO inventory_store.inventory_data "
+            "(agent_id, plugin, data_json, collected_at) VALUES ($1, 'custom', "
+            "'{\"field1\":\"match\"}', 1)",
+            std::vector<std::string>{"agent-healthy"});
+        REQUIRE(seeded_healthy.status() == PGRES_COMMAND_OK);
+    }
+
+    yuzu::test::ResultSetStorePg rs_bundle;
+    McpTestServer ts;
+    ts.result_set_store_for_test = rs_bundle.get();
+    ts.inventory_store_for_test = &inventory;
+    ts.start();
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":1,"params":{"name":"create_result_set_from_inventory_query",)"
+        R"("arguments":{"name":"parse-error-guard-healthy","conditions":[{"plugin":"custom","field":"field1","op":"exists","value":""}]}}})");
+    REQUIRE(res);
+    CHECK(res->status == 200); // no crash
+    auto payload = operator_surface_payload(res);
+    CHECK(payload["device_count"] == 1);
+    // Confirm identity, not just count.
+    std::string next;
+    auto members = rs_bundle->members(payload["id"].get<std::string>(), "", 10, next);
+    REQUIRE(members.size() == 1);
+    CHECK(members[0] == "agent-healthy");
+}
+
 TEST_CASE("MCP result-sets: a supplied-but-empty/wrong-type parent_id is refused (#2500 "
           "family), never silently treated as absent",
           "[mcp][integration][result-sets][scope]") {

@@ -8714,7 +8714,9 @@ void RestApiV1::register_routes(
                       }
 
                       std::size_t excluded_by_poison = 0;
-                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison);
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
                       JArr arr;
                       for (const auto& r : results) {
                           arr.add(JObj()
@@ -8736,7 +8738,14 @@ void RestApiV1::register_routes(
                       // exist" shape as a capped read - surfaced the same way,
                       // as `results_excluded_by_poison` (count, present only
                       // when non-zero, same convention as `result_truncated_by_cap`).
-                      if (inv_truncated || excluded_by_poison > 0) {
+                      //
+                      // #4496 follow-up: a record excluded because its
+                      // data_json failed to parse at all is the SAME shape,
+                      // a different cause - surfaced as its own
+                      // `results_excluded_by_parse_error` field, kept separate
+                      // from `results_excluded_by_poison` so a caller can
+                      // tell WHICH guard excluded a record.
+                      if (inv_truncated || excluded_by_poison > 0 || excluded_by_parse_error > 0) {
                           auto pag = JObj()
                                          .add("total", static_cast<int64_t>(results.size()))
                                          .add("start", int64_t{0})
@@ -8749,6 +8758,9 @@ void RestApiV1::register_routes(
                           if (excluded_by_poison > 0)
                               envelope.add("results_excluded_by_poison",
                                            static_cast<int64_t>(excluded_by_poison));
+                          if (excluded_by_parse_error > 0)
+                              envelope.add("results_excluded_by_parse_error",
+                                           static_cast<int64_t>(excluded_by_parse_error));
                           envelope.raw("pagination", pag);
                           envelope.raw("meta", R"({"api_version":"v1"})");
                           res.set_content(envelope.str(), "application/json");
@@ -9453,7 +9465,9 @@ void RestApiV1::register_routes(
                       // (POST /api/inventory/query, POST
                       // /api/v1/inventory/evaluate) use instead.
                       std::size_t excluded_by_poison = 0;
-                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison);
+                      std::size_t excluded_by_parse_error = 0;
+                      auto results = evaluate_inventory(eval_req, records, &excluded_by_poison,
+                                                         &excluded_by_parse_error);
                       if (excluded_by_poison > 0) {
                           if (metrics_registry)
                               metrics_registry
@@ -9465,6 +9479,26 @@ void RestApiV1::register_routes(
                           rs_err(res, 503,
                                  "inventory record(s) excluded for nesting too deeply - refusing "
                                  "to materialise a result set narrower than the true match set");
+                          return;
+                      }
+                      // #4496 follow-up: same M1 refusal as the poison check
+                      // above, for the sibling cause - a record whose
+                      // data_json failed to parse at all. Kept as a SEPARATE
+                      // check (not folded into the condition above) so the
+                      // metric reason, audit detail and error message all
+                      // name the actual cause rather than conflating the two.
+                      if (excluded_by_parse_error > 0) {
+                          if (metrics_registry)
+                              metrics_registry
+                                  ->counter("yuzu_server_dispatch_target_rejected_total",
+                                            {{"route", "result_set_inventory_query"},
+                                             {"reason", std::string(kReasonParseErrorExcluded)}})
+                                  .increment();
+                          audit_failure("parse_error_excluded");
+                          rs_err(res, 503,
+                                 "inventory record(s) excluded for failing to parse as JSON - "
+                                 "refusing to materialise a result set narrower than the true "
+                                 "match set");
                           return;
                       }
                       std::unordered_set<std::string> seen;

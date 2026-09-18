@@ -1082,10 +1082,10 @@ After upgrading, refusals are counted by
 `absent()` stays meaningful) and audited as `command.dispatch|denied`
 (`detail=reason=<reason> <plugin>:<action>`), `instruction.execute|denied`
 (`detail=reason=<reason>`) or `result_set.create|denied`
-(`detail=reason=<reason> source_kind=<kind>`). The same action's `failure` result (#4496, the
+(`detail=reason=<reason> source_kind=<kind>`). The same action's `failure` result (#4496 + follow-up, the
 `POST /api/v1/result-sets/from-inventory-query` producer and its MCP twin) carries
-`detail=reason=store_degraded|query_truncated|poison_excluded source_kind=inventory_query` - only
-the latter two of those three are counted on `yuzu_server_dispatch_target_rejected_total`
+`detail=reason=store_degraded|query_truncated|poison_excluded|parse_error_excluded source_kind=inventory_query` - only
+the latter three of those four are counted on `yuzu_server_dispatch_target_rejected_total`
 (`route="result_set_inventory_query"`); `store_degraded` is a store-availability failure, not a
 targeting-shape refusal, so it is not on this series. The
 `YuzuDispatchTargetRejected` alert fires when the 15-minute increase exceeds 3 — deliberately not
@@ -1093,16 +1093,20 @@ on every single refusal, because a rule that pages on one malformed request gets
 audit rows, not the alert, to find individual offenders.
 
 **`query_truncated`'s failure mode is structural, not a per-record near-miss - plan its runbook
-step separately from `poison_excluded`.** `poison_excluded` is per-record and self-heals once the
-offending record is fixed or excluded. `query_truncated` fires whenever the generic-inventory read
-backing both producer routes exceeds the hard-coded 5,000-row cap or the 8 MiB aggregate payload
-cap - there is no pagination on this path today. On a fleet whose inventory has grown past either
-cap, EVERY subsequent call to `POST /api/v1/result-sets/from-inventory-query` or its MCP twin
-refuses with `query_truncated`, and the alert never clears on its own. If you need to silence
-`YuzuDispatchTargetRejected` on such a fleet before the fix lands, scope the Alertmanager silence
-to `reason="query_truncated"` AND `route="result_set_inventory_query"` specifically - never the
-bare alertname, which would also hide `poison_excluded`, a genuine near-miss signal that must stay
-visible. Tracked fix: **#2633** (`InventoryStore::query` row cap (5000): keyset pagination +
+step separately from `poison_excluded`/`parse_error_excluded`.** `poison_excluded` and
+`parse_error_excluded` are both per-record and self-heal once the offending record is fixed or
+excluded - they are DIFFERENT causes (over-nested `data_json` vs. `data_json` that fails to parse
+as JSON at all), each with its own reason so an operator can tell which guard excluded a record,
+but the same "per-record, self-healing" runbook shape applies to both. `query_truncated` fires
+whenever the generic-inventory read backing both producer routes exceeds the hard-coded 5,000-row
+cap or the 8 MiB aggregate payload cap - there is no pagination on this path today. On a fleet
+whose inventory has grown past either cap, EVERY subsequent call to
+`POST /api/v1/result-sets/from-inventory-query` or its MCP twin refuses with `query_truncated`,
+and the alert never clears on its own. If you need to silence `YuzuDispatchTargetRejected` on such
+a fleet before the fix lands, scope the Alertmanager silence to `reason="query_truncated"` AND
+`route="result_set_inventory_query"` specifically - never the bare alertname, which would also
+hide `poison_excluded`/`parse_error_excluded`, genuine near-miss signals that must stay visible.
+Tracked fix: **#2633** (`InventoryStore::query` row cap (5000): keyset pagination +
 `limit+1` truncation probe).
 
 ### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
@@ -2106,6 +2110,14 @@ A nonzero result means that host's `installed_count` will report a higher number
 **Who this affects.** Any deployment with an existing stored inventory record (`inventory_store.inventory_data`) whose `data_json` nests deeper than the JSON depth guard allows - most likely a row predating the #2437-class write-side guard. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set.
 
 **How to identify the affected record(s).** There is no SQL-level detection query or purge endpoint for this today - the only current signal is a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json nests too deeply (#2437-class)`, emitted once per excluded record on every call that reaches the guard. Watch the server log for this line following a `503` from either route above to identify which agent/plugin's record needs re-collection at the source. Restart the affected agent to force a full resync; if the same WARN line (or a subsequent `poison_excluded` refusal) recurs afterward, the source data itself genuinely exceeds the depth guard and re-collection alone will not clear it - the source plugin needs a fix, or an operator can manually run `DELETE FROM inventory_store.inventory_data WHERE agent_id=... AND plugin=...` (the row repopulates on the next sync cycle if the source data is unchanged).
+
+### vNEXT - a malformed (unparseable) inventory record ALSO now makes the same two result-set producer routes refuse (#4496 follow-up) (breaking)
+
+**What changed.** Same two routes as the entry above (`POST /api/v1/result-sets/from-inventory-query` and the MCP `create_result_set_from_inventory_query` tool), a DIFFERENT trigger: a candidate inventory record whose stored `data_json` fails to parse as JSON at all (a syntax defect, not over-nesting) now also refuses (`503`/`kInternalError`, `reason=parse_error_excluded`) rather than being silently skipped. Kept as a separate, distinctly-named cause from `poison_excluded` above so an operator can tell WHICH guard excluded a record.
+
+**Who this affects.** Any deployment with an existing stored inventory record whose `data_json` is not valid JSON - the write-side depth guard (`gateway_service_impl.cpp`'s `json_exceeds_depth`) checks nesting depth only, not general JSON validity, so a malformed-but-shallow blob has always been able to reach storage. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set. The read-only `POST /api/v1/inventory/evaluate` route instead surfaces this as a `results_excluded_by_parse_error` count field alongside `results_excluded_by_poison` (present only when non-zero), the same posture as the depth-guard entry above. `POST /api/inventory/query` is UNAFFECTED by this specific change: it never calls `evaluate_inventory()` (it lists records by agent/plugin/time metadata, not by evaluating conditions against parsed JSON) and already degrades gracefully on a parse failure, returning the record with its `data` field as a raw string rather than dropping it - there is no narrowed-match-set hazard on that route for this cause.
+
+**How to identify the affected record(s).** Same mechanism as the entry above: a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json failed to parse (malformed JSON)`, emitted once per excluded record. Watch the server log for this line following a `503` (`reason=parse_error_excluded`) from either producer route to identify which agent/plugin's record needs re-collection at the source.
 
 ---
 

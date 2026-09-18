@@ -11492,7 +11492,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (see the REST twin, POST /api/v1/result-sets/from-inventory-query,
                 // which makes the identical choice).
                 std::size_t excluded_by_poison = 0;
-                auto results = yuzu::server::evaluate_inventory(eval_req, records, &excluded_by_poison);
+                std::size_t excluded_by_parse_error = 0;
+                auto results = yuzu::server::evaluate_inventory(
+                    eval_req, records, &excluded_by_poison, &excluded_by_parse_error);
                 if (excluded_by_poison > 0) {
                     if (metrics) {
                         metrics
@@ -11507,6 +11509,32 @@ McpServer::HandlerFn McpServer::build_handler(
                         a4_error(kInternalError,
                                  "inventory record(s) excluded for nesting too deeply - refusing "
                                  "to materialise a result set narrower than the true match set",
+                                 "the excluded record(s) must be corrected at the source "
+                                 "(re-reported by the originating agent)"),
+                        "application/json");
+                    return;
+                }
+                // #4496 follow-up: same M1 refusal as the poison check above,
+                // for the sibling cause - a record whose data_json failed to
+                // parse at all. Kept as a SEPARATE check (not folded into the
+                // condition above) so the metric reason, audit detail and
+                // error message all name the actual cause rather than
+                // conflating the two.
+                if (excluded_by_parse_error > 0) {
+                    if (metrics) {
+                        metrics
+                            ->counter("yuzu_server_dispatch_target_rejected_total",
+                                      {{"route", "result_set_inventory_query"},
+                                       {"reason", std::string(kReasonParseErrorExcluded)}})
+                            .increment();
+                    }
+                    (void)audit_fn(req, "result_set.create", "failure", "ResultSet", "",
+                                   "reason=parse_error_excluded source_kind=inventory_query");
+                    res.set_content(
+                        a4_error(kInternalError,
+                                 "inventory record(s) excluded for failing to parse as JSON - "
+                                 "refusing to materialise a result set narrower than the true "
+                                 "match set",
                                  "the excluded record(s) must be corrected at the source "
                                  "(re-reported by the originating agent)"),
                         "application/json");

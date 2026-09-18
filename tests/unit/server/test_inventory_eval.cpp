@@ -712,11 +712,17 @@ TEST_CASE("InventoryEval: malformed JSON skipped", "[inventory_eval][edge]") {
     // depth-guard exclusion below - excluded_by_depth must stay 0 here, or a
     // caller surfacing the poison-exclusion signal would fire it on ordinary
     // malformed input too.
+    //
+    // #4496 follow-up: the malformed record IS counted, via the separate
+    // excluded_by_parse_error out-param - the two counters must move
+    // independently, never conflated into one signal.
     std::size_t excluded_by_depth = 999;
-    auto results = evaluate_inventory(req, records, &excluded_by_depth);
+    std::size_t excluded_by_parse_error = 999;
+    auto results = evaluate_inventory(req, records, &excluded_by_depth, &excluded_by_parse_error);
     REQUIRE(results.size() == 1);
     CHECK(results[0].agent_id == "agent-2");
     CHECK(excluded_by_depth == 0);
+    CHECK(excluded_by_parse_error == 1);
 }
 
 // #2437-class guard: data_json nesting past kMcpMaxJsonDepth must be skipped
@@ -822,6 +828,73 @@ TEST_CASE("InventoryEval: excluded_by_depth is zeroed on the kMaxInventoryCondit
     auto results = evaluate_inventory(req, records, &excluded_by_depth);
     CHECK(results.empty());
     CHECK(excluded_by_depth == 0);
+}
+
+// #4496 follow-up: the sibling of the four excluded_by_depth tests above, for
+// the excluded_by_parse_error out-param - mirrors their structure exactly,
+// substituting a malformed-JSON record for an over-nested one.
+
+// #4496 follow-up: the sibling of "no poisoned record" above - a caller
+// building a truncation flag off a garbage/uninitialized count would
+// otherwise report a false positive on perfectly healthy input.
+TEST_CASE("InventoryEval: excluded_by_parse_error stays zero when no record is malformed",
+          "[inventory_eval][edge][security]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+        {"agent-2|hw", R"({"os": "Windows"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, nullptr, &excluded_by_parse_error);
+    REQUIRE(results.size() == 2);
+    CHECK(excluded_by_parse_error == 0);
+}
+
+// #4496 follow-up (Gate 7 shape from the depth-guard sibling): the out-param
+// must ACCUMULATE across records, not saturate at 1 - two independently
+// malformed records plus a healthy matching record must leave
+// excluded_by_parse_error at 2, with the healthy record's match still
+// returned.
+TEST_CASE("InventoryEval: excluded_by_parse_error accumulates across multiple malformed "
+          "records",
+          "[inventory_eval][edge][security]") {
+    Records records = {
+        {"agent-1|hw", "not valid json {{{"},
+        {"agent-2|hw", "also not valid ]]]"},
+        {"agent-3|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions = {{"hw", "os", "exists", ""}};
+
+    std::size_t excluded_by_parse_error = 0;
+    auto results = evaluate_inventory(req, records, nullptr, &excluded_by_parse_error);
+    REQUIRE(results.size() == 1);
+    CHECK(results[0].agent_id == "agent-3");
+    CHECK(excluded_by_parse_error == 2);
+}
+
+// #4496 follow-up (Gate 7 shape from the depth-guard sibling): the out-param
+// is zeroed up front so a caller never reads a garbage/stale count - that
+// zeroing must also hold on the kMaxInventoryConditions early-return path,
+// not just the normal loop-exit path.
+TEST_CASE("InventoryEval: excluded_by_parse_error is zeroed on the kMaxInventoryConditions "
+          "early return, not just the loop-exit path",
+          "[inventory_eval][edge]") {
+    Records records = {
+        {"agent-1|hw", R"({"os": "Linux"})"},
+    };
+
+    InventoryEvalRequest req;
+    req.conditions.assign(kMaxInventoryConditions + 1, InventoryCondition{"hw", "os", "exists", ""});
+
+    std::size_t excluded_by_parse_error = 999;
+    auto results = evaluate_inventory(req, records, nullptr, &excluded_by_parse_error);
+    CHECK(results.empty());
+    CHECK(excluded_by_parse_error == 0);
 }
 
 TEST_CASE("InventoryEval: record key without separator skipped", "[inventory_eval][edge]") {

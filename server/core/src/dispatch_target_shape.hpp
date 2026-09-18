@@ -218,6 +218,14 @@ inline constexpr std::string_view kReasonQueryTruncated{"query_truncated"};
 /// #2437-class JSON depth guard rather than the row/byte cap.
 inline constexpr std::string_view kReasonPoisonExcluded{"poison_excluded"};
 
+/// #4496 follow-up: same route and same rationale as `kReasonPoisonExcluded`,
+/// for the sibling refusal when a candidate inventory record was excluded
+/// because its `data_json` failed to parse as JSON at all (a syntax defect,
+/// not over-nesting) - a different failure cause, kept as a distinctly-named
+/// reason so an operator debugging missing results can tell WHICH guard
+/// excluded a record.
+inline constexpr std::string_view kReasonParseErrorExcluded{"parse_error_excluded"};
+
 /// Reject a targeting argument that was SUPPLIED but names nothing.
 ///
 /// Both the type and the emptiness arms matter for the same reason: a handler

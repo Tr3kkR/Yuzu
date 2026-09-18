@@ -5728,7 +5728,14 @@ DELIBERATE choice, unlike the read-only `POST /api/v1/inventory/evaluate` and
 `POST /api/inventory/query` routes below, which surface the same exclusion as
 a `results_excluded_by_poison` count field, this route materialises its
 match set into a *durable* result set other operators/dispatches consume
-later, so a flag on this response would never reach them.
+later, so a flag on this response would never reach them. **(#4496
+follow-up)** A candidate inventory record excluded because its `data_json`
+failed to parse as JSON at all gets the SAME **503** treatment
+("inventory record(s) excluded for failing to parse as JSON ... refusing to
+materialise a result set narrower than the true match set"), as a
+distinctly-named sibling refusal (checked, and thus reported, independently
+of the depth-guard one above) - the two causes are different and a caller
+retrying after fixing one must not be told the other has cleared too.
 
 **Permission:** `Inventory:Read` (guardian-confinement-2298 PR 3 — this
 route had NO authorization check of any kind before this fix, CWE-862: any
@@ -5892,6 +5899,15 @@ matches may be missing some the caller cannot detect any other way.
 Distinct from `result_truncated_by_cap` (a row/byte cap on the underlying
 read, not a per-record exclusion); either, both, or neither may be present
 on a given response.
+
+`results_excluded_by_parse_error` (integer, optional, #4496 follow-up):
+emitted at the same top level, present and non-zero when one or more
+candidate inventory records were excluded because their stored `data_json`
+failed to parse as JSON at all (a syntax defect, not over-nesting). A
+distinctly-named sibling of `results_excluded_by_poison` above, kept separate
+so a caller can tell WHICH guard excluded a record - the two causes are
+different (malformed JSON vs. over-nested JSON) and both, either, or neither
+may be present on a given response alongside `result_truncated_by_cap`.
 
 **Errors:**
 
