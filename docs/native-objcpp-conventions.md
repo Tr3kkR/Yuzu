@@ -129,12 +129,20 @@ decision, not part of the shared template:
   SystemConfiguration, ...). A configure-time failure to find one is a real
   toolchain problem, never a "missing optional Xcode" case — see
   `docs/darwin-compat.md`'s CoreWLAN row.
-- `required: false` — the framework ships **only** with the full Xcode SDK,
-  not the Command Line Tools SDK (`EndpointSecurity` is the standing example,
-  gated in `agents/plugins/tar/meson.build`). Guard the capability behind a
-  `-DYUZU_HAVE_...` define and a runtime/no-op fallback path, exactly as the
-  TAR plugin's ESF integration already does — do not use this template's
-  `required: true` default for a full-Xcode-only framework.
+- `required: false` — the framework genuinely may be absent on a given SDK/
+  build environment. Guard the capability behind a `-DYUZU_HAVE_...` define
+  and a runtime/no-op fallback path. **`EndpointSecurity` is NOT a real
+  example of this case** — despite a long-standing myth in this codebase, it
+  is not an `.framework` bundle at all (it ships as
+  `usr/lib/libEndpointSecurity.tbd` + `usr/include/EndpointSecurity/`, present
+  in BOTH the Command Line Tools and full Xcode SDKs), so probing it via
+  `dependency('appleframeworks', modules: ['EndpointSecurity'])` — as the
+  top-level `meson.build`'s shared ES probe currently does (TAR's own
+  `meson.build` only consumes the shared result, it does not probe itself)
+  — is a probe DEFECT, not a legitimate optional-framework pattern: see
+  `docs/darwin-compat.md`'s EndpointSecurity row and the
+  `feat/macos-spark-a0.5-es-probe` fix slice for the corrected
+  `cxx.find_library()`/`cxx.has_header()` form.
 
 ## Coverage
 

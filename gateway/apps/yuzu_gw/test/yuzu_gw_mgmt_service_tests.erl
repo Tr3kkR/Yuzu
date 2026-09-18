@@ -87,7 +87,7 @@ ctx_setup() ->
     catch meck:unload(yuzu_gw_upstream),
     catch meck:unload(telemetry),
     meck:new(yuzu_gw_upstream, [non_strict, no_link]),
-    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _) -> ok end),
+    meck:expect(yuzu_gw_upstream, notify_stream_status, fun(_, _, _, _, _) -> ok end),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
     ok.
