@@ -70,11 +70,14 @@ std::optional<double> disk_await_ms(const DiskTotals& prev, const DiskTotals& cu
     if (cur.reads < prev.reads || cur.writes < prev.writes ||
         cur.read_time_ns < prev.read_time_ns || cur.write_time_ns < prev.write_time_ns)
         return std::nullopt; // counter regression (reboot/hotplug) — re-baseline
-    const std::uint64_t dops = (cur.reads + cur.writes) - (prev.reads + prev.writes);
+    // Saturating pairwise sums (governance C-5, matching read_driver_stats's own
+    // saturating accumulation): reads+writes or read_time_ns+write_time_ns overflowing
+    // uint64 on either side is astronomically unlikely but costs nothing to guard.
+    const std::uint64_t dops = sat_add(cur.reads, cur.writes) - sat_add(prev.reads, prev.writes);
     if (dops == 0)
         return 0.0; // no I/O this interval — an idle disk is healthy, not slow
-    const std::uint64_t dtime_ns =
-        (cur.read_time_ns + cur.write_time_ns) - (prev.read_time_ns + prev.write_time_ns);
+    const std::uint64_t dtime_ns = sat_add(cur.read_time_ns, cur.write_time_ns) -
+                                    sat_add(prev.read_time_ns, prev.write_time_ns);
     return (static_cast<double>(dtime_ns) / 1e6) / static_cast<double>(dops);
 }
 
