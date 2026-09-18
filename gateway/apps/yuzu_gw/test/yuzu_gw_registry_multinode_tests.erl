@@ -206,7 +206,12 @@ ensure_distributed() ->
     case node() of
         nonode@nohost ->
             os:cmd("epmd -daemon"),
-            Name = list_to_atom("yuzu_gw_multinode_test_" ++
+            %% `erlang:unique_integer/1` alone is unique per-VM, not across
+            %% VMs — on a shared CI box running multiple runner agents as one
+            %% OS identity (#1871), two concurrent `rebar3 eunit` invocations
+            %% could mint the same node name. Salt with `os:getpid/0` too,
+            %% matching `peer:random_name/1`'s own pattern below.
+            Name = list_to_atom("yuzu_gw_multinode_test_" ++ os:getpid() ++ "_" ++
                                 integer_to_list(erlang:unique_integer([positive]))),
             {ok, _} = net_kernel:start(Name, #{name_domain => shortnames}),
             ok;
