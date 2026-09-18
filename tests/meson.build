@@ -75,8 +75,8 @@ invalid_name_fixture_plugin = shared_library(
 
 # PLAN-08: test_native_raii.cpp (PR1.3) includes <IOKit/IOKitLib.h> and
 # <CoreFoundation/CoreFoundation.h> for the ScopedIOObject/ScopedCFRef vectors.
-# agent-core links IOKit/CoreFoundation itself as of A0 (agents/core/meson.build's
-# darwin arm), but the test exe still pulls its own copy here: yuzu_agent_core_dep
+# agent-core links IOKit (a hard dependency, C0) and Security/CoreFoundation (A0's optional
+# probe) itself (agents/core/meson.build's darwin arm), but the test exe still pulls its own copy here: yuzu_agent_core_dep
 # (the declare_dependency() this exe consumes) declares no `dependencies:` kwarg at
 # all, so agent_platform_deps (IOKit/CoreFoundation/Security/ES) never propagates to
 # a consumer regardless of configuration -- not an AppleFrameworks -isystem quirk
@@ -279,6 +279,7 @@ agent_test_exe = executable(
     'unit/test_dex_perf_breach.cpp',
     'unit/test_net_quality_sampler.cpp',
     'unit/test_dex_linux_proc.cpp',
+    'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
