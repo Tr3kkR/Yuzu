@@ -95,6 +95,14 @@ yuzu_agent_core_dep = declare_dependency(
     include_directories('include'),
     include_directories('../../sdk/include'),
     include_directories('../../common/include'),
+    # '../shared': exported here (not just on yuzu_agent_core_lib's own
+    # include_directories) because a PUBLIC agents/core header can itself
+    # depend on an agents/shared/ header -- launchd_state.hpp includes
+    # launchctl_list.hpp -- and an external consumer reaching launchd_state.hpp
+    # only through this dependency object (A2's macOS launchd Spark mechanism,
+    # sec2-2/UP2-4 governance A0 fix round) must be able to resolve that
+    # transitive include without separately re-adding '../shared' itself.
+    include_directories('../shared'),
   ],
 )
 
