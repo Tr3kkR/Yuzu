@@ -346,6 +346,9 @@ agent_test_exe = executable(
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
     'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
+    'unit/test_certificates_macos_actions.cpp',  # WS-B: action-level LocalDispatcher tests for the SecItem
+                                                  # sentinel + console-owner recheck orchestration (#4374 fix
+                                                  # shape 2 + 3); __APPLE__-guarded, empty TU elsewhere.
     'unit/test_passwd_lookup.cpp',       # #3406: bounded passwd resolution (agent-core seam). The
                                           # load-bearing case injects a NEVER-RETURNING lookup and asserts
                                           # the caller is released inside its budget -- the regression that
@@ -640,6 +643,7 @@ agent_test_exe = executable(
   # scripts/ci/check-plugin-spawn-lexical.sh's GRANDFATHERED set.
   link_depends: [
                 abi3_fixture_plugin,
+                certificates_plugin_lib,
                 content_dist_plugin_lib,
                 disk_actions_plugin_lib,
                 device_identity_plugin_lib,

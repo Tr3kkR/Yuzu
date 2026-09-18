@@ -40,6 +40,8 @@
 #include <yuzu/agent/keychain_read.hpp> // yuzu::agent::KeychainReadStatus (B2)
 #include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field -- the REAL SDK function, not replicated (BR-07)
 
+#include "scoped_env.hpp" // yuzu::test::ScopedEnv (B2: the system/root keychain-path override vectors below)
+
 #include <array>
 #include <chrono>
 #include <cstdlib>
@@ -206,6 +208,71 @@ TEST_CASE("system_keychain_path and root_keychain_path are the fixed system path
     CHECK(system_keychain_path() == "/Library/Keychains/System.keychain");
     CHECK(root_keychain_path() ==
          "/System/Library/Keychains/SystemRootCertificates.keychain");
+}
+
+// B2: the test-only injection seams B1 adds so test_certificates_macos_actions.cpp
+// can point the SecItem/console-owner action paths at a fixture keychain and a
+// fixture console session without a real one -- exercised here at the PURE,
+// cross-platform accessor level (no Security.framework, no real environment
+// dependency beyond the env var itself), matching every other vector in this
+// file. A relative override value is deliberately ignored rather than joined
+// against some implicit base: system_keychain_path()/root_keychain_path()'s
+// callers (the SecItem read seam, resolve_delete_keychain_path) always pass
+// the result straight to a keychain-path parameter with no path-resolution
+// step of its own, so a relative override would silently resolve against the
+// daemon's cwd -- exactly the class of bug is_valid_home_dir's own comment
+// above already rejects for the login-keychain path. resolve_delete_keychain_path
+// stays LITERAL under both overrides: a destructive action's target keychain
+// must never move out from under an operator asking for "System"/"MY"/"root"
+// just because a read-path test fixture happens to be armed in the same
+// environment.
+TEST_CASE("system/root keychain overrides redirect reads only; delete resolution stays literal",
+         "[certificates][macos]") {
+    SECTION("SYSTEM override redirects system_keychain_path()") {
+        yuzu::test::ScopedEnv env("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
+                                  "/tmp/yuzu_test_override.keychain");
+        CHECK(system_keychain_path() == "/tmp/yuzu_test_override.keychain");
+    }
+    SECTION("ROOT override redirects root_keychain_path()") {
+        yuzu::test::ScopedEnv env("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                  "/tmp/yuzu_test_override.keychain");
+        CHECK(root_keychain_path() == "/tmp/yuzu_test_override.keychain");
+    }
+    SECTION("a RELATIVE override value is ignored -- the literal path is kept") {
+        yuzu::test::ScopedEnv sys_env("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
+                                      "x.keychain");
+        yuzu::test::ScopedEnv root_env("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                       "x.keychain");
+        CHECK(system_keychain_path() == "/Library/Keychains/System.keychain");
+        CHECK(root_keychain_path() ==
+             "/System/Library/Keychains/SystemRootCertificates.keychain");
+    }
+    SECTION("resolve_delete_keychain_path stays literal while both overrides are set") {
+        // The literal paths, hand-pinned rather than compared against
+        // system_keychain_path()/root_keychain_path() themselves: both
+        // overrides are ALSO armed in this scope, so calling those two
+        // accessors here would just compare the overridden value to itself
+        // and prove nothing about resolve_delete_keychain_path staying
+        // literal.
+        const std::string kLiteralSystemPath = "/Library/Keychains/System.keychain";
+        const std::string kLiteralRootPath =
+            "/System/Library/Keychains/SystemRootCertificates.keychain";
+        yuzu::test::ScopedEnv sys_env("YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE",
+                                      "/tmp/yuzu_test_override.keychain");
+        yuzu::test::ScopedEnv root_env("YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE",
+                                       "/tmp/yuzu_test_override.keychain");
+        auto sys = resolve_delete_keychain_path("System");
+        REQUIRE(sys.has_value());
+        CHECK(*sys == kLiteralSystemPath);
+
+        auto my = resolve_delete_keychain_path("MY");
+        REQUIRE(my.has_value());
+        CHECK(*my == kLiteralSystemPath);
+
+        auto root = resolve_delete_keychain_path("root");
+        REQUIRE(root.has_value());
+        CHECK(*root == kLiteralRootPath);
+    }
 }
 
 TEST_CASE("login_keychain_path builds the keychain path from a resolved home directory",
