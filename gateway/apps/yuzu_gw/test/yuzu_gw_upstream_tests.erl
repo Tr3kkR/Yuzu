@@ -169,7 +169,8 @@ notify_no_crash() ->
             _       -> {error, connection_refused}
         end
     end),
-    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>),
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
     timer:sleep(100),
     %% The upstream process should still be alive.
     ?assert(is_process_alive(whereis(yuzu_gw_upstream))).
@@ -185,7 +186,8 @@ notify_advertises_dispatch_tag_capability() ->
     meck:expect(grpcbox_client, unary, fun(_, _, _, _, _) ->
         {ok, #{acknowledged => true}, #{}}
     end),
-    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>),
+    yuzu_gw_upstream:notify_stream_status(<<"a1">>, <<"s1">>, connected, <<"127.0.0.1">>,
+                                           <<"test-home-1">>),
     timer:sleep(100),
     Calls = meck:history(grpcbox_client),
     NotifyReqs = [Req || {_, {grpcbox_client, unary, [_, Path, Req, _, _]}, _} <- Calls,

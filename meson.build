@@ -370,6 +370,48 @@ if host_os == 'darwin'
   grpcpp_dep  = declare_dependency(dependencies: [grpcpp_dep, corefoundation_dep])
   httplib_dep = declare_dependency(dependencies: [httplib_dep, corefoundation_dep])
 
+  # ── Endpoint Security (shared probe, A0) ────────────────────────────────────
+  # CORRECTION (A0 governance fix round): EndpointSecurity is NOT an
+  # `.framework` bundle -- it ships as `usr/lib/libEndpointSecurity.tbd` +
+  # `usr/include/EndpointSecurity/` in BOTH the Command Line Tools SDK and the
+  # full Xcode SDK. The `dependency('appleframeworks', modules:
+  # ['EndpointSecurity'])` probe below therefore NEVER succeeds on any SDK --
+  # it always falls to the `else` branch below, so the real ES client never
+  # compiles today. The correct probe (`cxx.find_library('EndpointSecurity')`
+  # + `cxx.has_header('EndpointSecurity/EndpointSecurity.h')`) is a separate,
+  # deliberately isolated behaviour change -- see the follow-up slice
+  # (feat/macos-spark-a0.5-es-probe) rather than this comment-only fix. This
+  # is the SINGLE probe site for every ES consumer in the tree: TAR's process
+  # stream (tar_proc_es.cpp) and agent-core's pure ES helpers (es_client.hpp)
+  # both consume endpoint_security_dep/_deps/_args instead of probing
+  # independently (a shared full ES client lands in a later slice). Found:
+  # real ES client compiles (-DYUZU_HAVE_ENDPOINT_SECURITY -fblocks; -fblocks
+  # because the ES client passes an Objective-C block literal to
+  # es_new_client, which Apple Clang does not enable by default for a .cpp
+  # TU) and libbsm links (audit_token_to_pid / audit_token_to_ruid). Absent:
+  # every consumer's #if-guarded no-op path is used instead -- see
+  # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
+  endpoint_security_dep = dependency('appleframeworks', modules: ['EndpointSecurity'],
+                                     required: false, include_type: 'system')
+  endpoint_security_deps = []
+  endpoint_security_args = []
+  if endpoint_security_dep.found()
+    endpoint_security_deps += endpoint_security_dep
+    endpoint_security_deps += cxx.find_library('bsm')
+    endpoint_security_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
+  else
+    # rd-1 (governance A0 round-4, MEDIUM): this branch fires on EVERY host,
+    # SDK present or not -- see the accurate CORRECTION comment 8 lines above
+    # (the appleframeworks probe can never find EndpointSecurity, because it
+    # is not a `.framework` bundle). The previous wording here ("EndpointSecurity
+    # SDK not found") claimed the opposite and could resurrect the exact
+    # "needs full Xcode SDK" myth this A0 slice exists to correct.
+    message('EndpointSecurity probe cannot succeed on this SDK shape (appleframeworks '
+          + 'has no EndpointSecurity.framework to find -- see the CORRECTION comment '
+          + 'above; the SDK itself may well have the lib+header pair) -- ES-dependent '
+          + 'code compiles as a no-op on this host.')
+  endif
+
   # ── Reusable per-target Apple frameworks + Objective-C++/ARC template ──────
   # Meson has no user-defined functions, so "template" here means: the parts
   # of the wifi plugin's pioneering objcpp/ARC pattern (agents/plugins/wifi/
@@ -504,7 +546,10 @@ if build_agent
   subdir('agents/plugins/power_health')
   subdir('agents/plugins/autoruns')  # Wave 7 PR7.1
   subdir('agents/plugins/windows_optional_features')  # Wave 9 PR9.2b
+  subdir('agents/plugins/peripherals')  # Wave 9 PR9.1a
+  subdir('agents/plugins/app_usage')  # Wave 7b PR7b.3
   subdir('agents/plugins/execution_artifacts')  # Wave 7b PR7b.1
+  subdir('agents/plugins/printing')  # Wave 9 PR9.1b
 endif
 
 # ── Server ────────────────────────────────────────────────────────────────────

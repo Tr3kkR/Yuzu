@@ -79,24 +79,13 @@ elif host_machine.system() == 'linux'
             + 'the power source sleep/wake leg degrades to AC-state polling only unconditionally')
   endif
 elif host_machine.system() == 'darwin'
-  # Endpoint Security process stream (tar_proc_es). The ES framework ships only
-  # with the FULL Xcode SDK, not the Command Line Tools SDK, so detect it: where
-  # present, compile the real ES client (-DYUZU_HAVE_ENDPOINT_SECURITY) and link
-  # the framework + libbsm (audit_token_to_pid / audit_token_to_ruid); where
-  # absent, tar_proc_es.cpp compiles its no-op path and the agent falls back to
-  # the sysctl process poll. See docs/darwin-compat.md.
-  es_dep = dependency('appleframeworks', modules: ['EndpointSecurity'], required: false, include_type: 'system')
-  if es_dep.found()
-    tar_deps += es_dep
-    tar_deps += cxx.find_library('bsm')
-    # -fblocks: tar_proc_es.cpp passes an Objective-C block literal (^{...}) to
-    # es_new_client. Apple Clang does NOT enable blocks by default for a .cpp TU,
-    # so without this the real ES path fails to compile on a full-Xcode build.
-    tar_cpp_args += ['-DYUZU_HAVE_ENDPOINT_SECURITY', '-fblocks']
-  else
-    message('TAR: EndpointSecurity framework not found (full Xcode SDK required) — '
-            + 'process streaming compiles as a no-op; agent uses the sysctl poll.')
-  endif
+  # Endpoint Security process stream (tar_proc_es). The probe is hoisted to the
+  # top-level meson.build (A0, endpoint_security_dep/_deps/_args) -- TAR is one
+  # of two consumers (agent-core's es_client.hpp is the other), so it just
+  # threads the shared result through rather than probing independently. See
+  # docs/darwin-compat.md's EndpointSecurity pitfalls-table row.
+  tar_deps += endpoint_security_deps
+  tar_cpp_args += endpoint_security_args
   # Wave 6 PR6.3: DiskArbitration attach/detach lives in an Objective-C++ TU —
   # the worked pattern is wifi/meson.build's wifi_corewlan.mm. apple_objcpp_args
   # is defined ONCE at the top-level meson.build; never re-declare its flags.
