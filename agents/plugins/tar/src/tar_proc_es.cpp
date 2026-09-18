@@ -71,9 +71,10 @@ std::string resolve_uid_cached(std::unordered_map<std::uint32_t, std::string>& c
 // The real ES client compiles only where the ES SDK is detected by meson
 // (-DYUZU_HAVE_ENDPOINT_SECURITY) -- the ES lib+header pair ships in BOTH the
 // Command Line Tools and full Xcode SDKs ("needs full Xcode" is a myth; see
-// docs/darwin-compat.md's EndpointSecurity row). On macOS without an ES SDK
-// detection and on every non-Apple platform, the no-op path below is used and
-// start() returns false so the caller falls back to the sysctl process poll.
+// docs/darwin-compat.md's EndpointSecurity row). On macOS with no ES SDK
+// detected, and on every non-Apple platform, the no-op path below is used
+// and start() returns false so the caller falls back to the sysctl process
+// poll.
 #if defined(__APPLE__) && defined(YUZU_HAVE_ENDPOINT_SECURITY)
 
 #include <EndpointSecurity/EndpointSecurity.h>
