@@ -1,9 +1,14 @@
 #include "guardian_push_builder.hpp"
 
 #include "guardian_rule_spec.hpp" // dangerous_enforce_in_spec (H1 push backstop)
+#include "mcp_jsonrpc.hpp"        // json_exceeds_depth / kMcpMaxJsonDepth (depth guard)
+#include "on_behalf_guard.hpp"    // onbehalf::sanitize_for_log
+#include "yuzu/metrics.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -11,6 +16,51 @@
 namespace yuzu::server::guardian {
 
 namespace {
+
+// Rate-limits the depth-exclusion log line the same way RuntimeConfigStore's
+// read-degrade sampler does (docs/observability-conventions.md's
+// RuntimeConfigStore entry): the counter always increments, but the log only
+// fires on the first occurrence of a new "episode" or every Nth occurrence
+// within a sustained one, so a persisting poisoned row (this function runs on
+// both the periodic heartbeat reconcile and the on-demand push fan-out
+// triggered by a rule create/update/dashboard toggle, for every affected
+// agent) cannot flood the log for as long as it remains unfixed in the store.
+constexpr std::uint64_t kExclusionLogSample = 100;
+constexpr std::int64_t kExclusionEpisodeGapSecs = 60;
+
+std::int64_t now_secs() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+struct ExclusionSampler {
+    std::atomic<std::uint64_t> count{0};
+    std::atomic<std::int64_t> last_ts{0};
+};
+
+// Unlike RuntimeConfigStore's note_read_degrade, this deliberately does NOT
+// also take a MetricsRegistry* and increment a counter itself: the counter
+// increment here has its own always-fires condition (every exclusion, not
+// just sampled ones), so the caller does that separately, right before
+// calling this - a reader porting this pattern elsewhere should not assume
+// the two responsibilities are bundled the way they are in that precedent.
+bool should_log_exclusion(ExclusionSampler& s) {
+    const std::int64_t now = now_secs();
+    const std::int64_t prev = s.last_ts.exchange(now, std::memory_order_relaxed);
+    const std::uint64_t n = s.count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const bool new_episode = prev == 0 || (now - prev) > kExclusionEpisodeGapSecs;
+    return new_episode || (n % kExclusionLogSample) == 0;
+}
+
+// One sampler shared across all rules/agents in this process: unlike
+// RuntimeConfigStore's per-call-site samplers (which exist to stop a hot call
+// site masking a cold one), every exclusion here is the SAME failure shape (a
+// poisoned spec_json), so a single episode clock is the right grain. The
+// metric itself is not labeled per rule id (an open, unbounded set) - only by
+// the fixed `reason` value below - and this sampler paces the log line for
+// every excluded rule together, not per rule.
+ExclusionSampler g_exclusion_sampler;
 
 std::string to_lower(std::string_view s) {
     std::string out(s);
@@ -123,7 +173,7 @@ std::string platform_display_name(std::string_view agent_os) {
 ::yuzu::guardian::v1::GuaranteedStatePush
 build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_view agent_os,
                  const std::function<bool(const std::string& scope_expr)>& in_scope,
-                 bool full_sync, std::uint64_t generation) {
+                 bool full_sync, std::uint64_t generation, ::yuzu::MetricsRegistry* metrics) {
     ::yuzu::guardian::v1::GuaranteedStatePush push;
     push.set_full_sync(full_sync);
     push.set_policy_generation(generation);
@@ -134,6 +184,41 @@ build_agent_push(const std::vector<GuaranteedStateRuleRow>& rules, std::string_v
             continue;
         if (!row.scope_expr.empty() && in_scope && !in_scope(row.scope_expr))
             continue;
+
+        // Depth guard on the raw stored text, before anything below interprets it
+        // (including dangerous_enforce_in_spec's own parse just below, and the
+        // nlohmann::json::parse further down): spec_json is stored,
+        // caller-influenced text that this read path re-parses and re-dumps on
+        // EVERY push/reconcile call, for EVERY rule, on ordinary fleet traffic -
+        // the heartbeat reconcile call site has no operator action in the loop at
+        // all. fill_block()'s params dump() is unboundedly recursive and SIGSEGVs
+        // the whole process well under 1 MiB of nesting; because the poisoned row
+        // persists in the store, an unguarded crash here is a crash-loop on
+        // restart, not a one-time failure. Mirrors json_exceeds_depth's own
+        // "never construct the deep tree" rationale (mcp_jsonrpc.hpp): this rule
+        // is excluded from this agent's push in its entirety (nothing is added
+        // for it, including the header) rather than partially marshalled, so a
+        // single poisoned spec_json cannot block or corrupt the rest of the
+        // batch. This is a structural "too deep to safely parse" rejection only -
+        // it makes no judgment about the (unparsed) content, and it does not
+        // change what dangerous_enforce_in_spec itself considers dangerous.
+        if (!row.spec_json.empty() &&
+            yuzu::server::mcp::json_exceeds_depth(row.spec_json,
+                                                  yuzu::server::mcp::kMcpMaxJsonDepth)) {
+            if (metrics)
+                metrics
+                    ->counter("yuzu_guardian_push_rule_excluded_total",
+                             {{"reason", "depth_exceeded"}})
+                    .increment();
+            if (should_log_exclusion(g_exclusion_sampler))
+                spdlog::error(
+                    "Guardian push: rule {} ('{}') has spec_json nested past the depth "
+                    "guard (max {}); excluding it from this push, cannot be safely parsed",
+                    onbehalf::sanitize_for_log(row.rule_id, 128),
+                    onbehalf::sanitize_for_log(row.name, 128),
+                    yuzu::server::mcp::kMcpMaxJsonDepth);
+            continue;
+        }
 
         auto* r = push.add_rules();
         r->set_rule_id(row.rule_id);
