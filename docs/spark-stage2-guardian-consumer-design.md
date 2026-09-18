@@ -1214,6 +1214,12 @@ CAP the mechanism's alertable wait clamps to whenever any probe is outstanding �
 fixed delay; commands/APCs can wake the thread earlier). Do not compare Service's
 poll-mediated establishment timestamp against a future Registry/File wiring's
 caller-wait-bounded path as if they measured the same thing.
+**R4 (stale-after-stop), carried forward from the delivery plan's own residual list:**
+after `SparkEngine::stop()`, `subscription_establishment(id)` keeps returning the
+subscription's LAST-KNOWN values — stop() does not clear or invalidate them. A future
+R5.7 consumer that cares whether the engine is still live checks `is_running()` itself
+(the query's own doc comment, `spark_engine.hpp`, states this directly); do not read a
+post-stop `established_at`/`coverage` pair as current live coverage.
 
 ## 7.7b split — pre-cutover hardening (settled 2026-07-18)
 

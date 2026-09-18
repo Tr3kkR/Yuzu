@@ -7689,6 +7689,22 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     const std::string key = spark_key(spec_a);
     REQUIRE(mech->watch_incarnation(key, spec_a.params, 7).has_value());
 
+    // begin_probe()'s own unconditional None stage lands for token 7
+    // immediately on the Add — synchronously, before the probe (and its
+    // injected throw) even runs. Snapshot how many established reports
+    // exist right after that legitimate pre-throw report lands, so the
+    // H15 oracle below (adversarial-review finding: an unbaselined
+    // any_of() here passed vacuously off THIS report alone, even with
+    // resolve_probe's own WorkerThrew-branch None stage mutation-tested
+    // OUT) only credits a None report produced by the WorkerThrew
+    // outcome itself — the same baseline shape as M4b's.
+    REQUIRE(eventually([&] { return got.established_count() >= 1; }, 2000ms));
+    std::size_t established_baseline = 0;
+    {
+        std::lock_guard lk(got.mu);
+        established_baseline = got.established.size();
+    }
+
     // Contained: the throw is a genuine backend failure (never WorkerThrew
     // silently discarded), and dispatches a fault — proving the mechanism's
     // own dispatch loop survives it, rather than crashing or wedging.
@@ -7719,15 +7735,19 @@ TEST_CASE("Service mechanism (direct): a throwing establishment probe is a conta
     // key also stages None coverage for it — the established channel must
     // not stay silent (or stuck at a stale positive) just because the
     // backend failure classification is "never a false Stopped", which is a
-    // statement about the RUN-STATE emit channel, not about coverage.
+    // statement about the RUN-STATE emit channel, not about coverage. Only
+    // a report AFTER established_baseline counts — the pre-throw begin_probe
+    // report snapshotted above must not let this pass vacuously.
     CHECK(eventually(
         [&] {
             std::lock_guard lk(got.mu);
-            return std::any_of(got.established.begin(), got.established.end(),
-                               [&](const auto& e) {
-                                   return std::get<0>(e) == key && std::get<1>(e) == 7 &&
-                                          std::get<2>(e) == SparkCoverage::None;
-                               });
+            for (std::size_t i = established_baseline; i < got.established.size(); ++i) {
+                const auto& e = got.established[i];
+                if (std::get<0>(e) == key && std::get<1>(e) == 7 &&
+                    std::get<2>(e) == SparkCoverage::None)
+                    return true;
+            }
+            return false;
         },
         3000ms));
     mech->stop();
