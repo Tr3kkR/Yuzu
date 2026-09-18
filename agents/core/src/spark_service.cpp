@@ -204,6 +204,18 @@ public:
         // itself is single-shot (spark_engine.hpp's own header doc), so no
         // production caller ever needs to re-arm the sink after a stop().
         sink_sealed_ = true;
+        // Governance UP-1(B) hazard (security-guardian Gate-8): this guard reads
+        // the SAME started_ this class's run()-catch blocks now flip to false on
+        // an uncaught worker-thread exception. ISparkMechanism::start() is
+        // documented "called exactly once by SparkEngine::start()" and has
+        // exactly one production call site — E6-capped, not reachable today —
+        // but a hypothetical second start() after a thread death would fall
+        // through here instead of early-returning: it would open a fresh
+        // sd_bus/eventfd over the still-live bus_/wake_fd_ (leaking them) and
+        // then move-assign thread_ over a still-joinable std::thread, which
+        // calls std::terminate(). Do not add a second production call to
+        // SparkEngine::start() without also hardening this guard to match
+        // stop()'s resource-conjunction shape.
         if (started_)
             return; // idempotent
         emit_ = std::move(emit);
@@ -701,12 +713,18 @@ private:
                         uw = it->second.get();
                     }
                     // Exception-safety (governance UP-1(A), adjudicated
-                    // LOW-today/HIGH-post-flip): populate every map
+                    // LOW-today/MEDIUM-post-flip): populate every map
                     // stage_coverage()'s .at() later reads FIRST, insert into
                     // .keys LAST — a bad_alloc between these statements now
-                    // leaves a harmless orphan map entry (cleaned up by the
-                    // next Remove) instead of a .keys member .at() will trip
-                    // on, killing the whole mechanism worker thread.
+                    // leaves a harmless orphan map entry (persists for this
+                    // mechanism instance's lifetime — neither platform's
+                    // stop() clears key_incarnation_/key_epoch_, and no
+                    // Remove/Add for this key ever runs afterward: the SAME
+                    // exception that creates the orphan also propagates
+                    // straight to run()'s own outer catch, permanently
+                    // admission-gating the mechanism via UP-1(B)'s fix below)
+                    // instead of a .keys member .at() will trip on, killing
+                    // the whole mechanism worker thread.
                     // Forward-only rebind (H1): a stale/duplicate Add can
                     // never regress this key's recorded incarnation — H1's
                     // submission ordering (the engine holds this type's
@@ -957,10 +975,10 @@ private:
         // Without this, watch_incarnation() (gated only on started_/inert_, neither
         // of which this catch block otherwise touches) would keep silently queuing
         // Cmd::Add into a pending_ deque nobody will ever drain again, returning
-        // SUCCESS to the engine forever -- a zombie mechanism indistinguishable
+        // SUCCESS to the engine forever — a zombie mechanism indistinguishable
         // from a healthy idle one (I6 false-assurance). started_, NOT inert_: the
         // heartbeat's stats() publishes inert_ fleet-wide ("no system bus" is the
-        // documented common-case meaning) -- flipping it here would misreport a
+        // documented common-case meaning) — flipping it here would misreport a
         // worker-thread-death fault as a boot-time bus-unavailable condition, a
         // DIFFERENT false diagnostic. started_ is unpublished and mu_-guarded like
         // every other write to it in this class.
@@ -979,10 +997,10 @@ private:
         // Without this, watch_incarnation() (gated only on started_/inert_, neither
         // of which this catch block otherwise touches) would keep silently queuing
         // Cmd::Add into a pending_ deque nobody will ever drain again, returning
-        // SUCCESS to the engine forever -- a zombie mechanism indistinguishable
+        // SUCCESS to the engine forever — a zombie mechanism indistinguishable
         // from a healthy idle one (I6 false-assurance). started_, NOT inert_: the
         // heartbeat's stats() publishes inert_ fleet-wide ("no system bus" is the
-        // documented common-case meaning) -- flipping it here would misreport a
+        // documented common-case meaning) — flipping it here would misreport a
         // worker-thread-death fault as a boot-time bus-unavailable condition, a
         // DIFFERENT false diagnostic. started_ is unpublished and mu_-guarded like
         // every other write to it in this class.
@@ -2152,12 +2170,18 @@ private:
                         w = it->second.get();
                     }
                     // Exception-safety (governance UP-1(A), adjudicated
-                    // LOW-today/HIGH-post-flip): populate every map
+                    // LOW-today/MEDIUM-post-flip): populate every map
                     // stage_coverage()'s .at() later reads FIRST, insert into
                     // .keys LAST — a bad_alloc between these statements now
-                    // leaves a harmless orphan map entry (cleaned up by the
-                    // next Remove) instead of a .keys member .at() will trip
-                    // on, killing the whole mechanism worker thread.
+                    // leaves a harmless orphan map entry (persists for this
+                    // mechanism instance's lifetime — neither platform's
+                    // stop() clears key_incarnation_/key_epoch_, and no
+                    // Remove/Add for this key ever runs afterward: the SAME
+                    // exception that creates the orphan also propagates
+                    // straight to run()'s own outer catch, permanently
+                    // admission-gating the mechanism via UP-1(B)'s fix below)
+                    // instead of a .keys member .at() will trip on, killing
+                    // the whole mechanism worker thread.
                     // A fresh subscription epoch for `cmd.key` specifically —
                     // NOT `w->probe_gen` (#2012/#3840 PR-B3 review, round 2):
                     // this is the identity drop_stale() checks, and it must
@@ -2407,11 +2431,11 @@ private:
         // Governance UP-1(B): mark this mechanism no longer accepting new watches.
         // scm_ok_, NOT started_: WindowsServiceMechanism::stop() early-returns on a
         // bare `if (!started_) return` (unlike Linux's resource-conjunction guard)
-        // -- flipping started_ here would make a later stop() skip thread_.join()
+        // — flipping started_ here would make a later stop() skip thread_.join()
         // entirely, and the eventual ~thread() on a still-joinable thread calls
         // std::terminate(). scm_ok_ is atomic (no lock needed), unpublished by
         // stats() (which reads the distinct started_inert_ flag, untouched here),
-        // and is already one of watch_incarnation()'s two admission guards --
+        // and is already one of watch_incarnation()'s two admission guards —
         // flipping it alone correctly makes a future arm() return "SCM unavailable"
         // instead of silently queuing into a dead thread.
         scm_ok_.store(false, std::memory_order_release);
@@ -2427,11 +2451,11 @@ private:
         // Governance UP-1(B): mark this mechanism no longer accepting new watches.
         // scm_ok_, NOT started_: WindowsServiceMechanism::stop() early-returns on a
         // bare `if (!started_) return` (unlike Linux's resource-conjunction guard)
-        // -- flipping started_ here would make a later stop() skip thread_.join()
+        // — flipping started_ here would make a later stop() skip thread_.join()
         // entirely, and the eventual ~thread() on a still-joinable thread calls
         // std::terminate(). scm_ok_ is atomic (no lock needed), unpublished by
         // stats() (which reads the distinct started_inert_ flag, untouched here),
-        // and is already one of watch_incarnation()'s two admission guards --
+        // and is already one of watch_incarnation()'s two admission guards —
         // flipping it alone correctly makes a future arm() return "SCM unavailable"
         // instead of silently queuing into a dead thread.
         scm_ok_.store(false, std::memory_order_release);

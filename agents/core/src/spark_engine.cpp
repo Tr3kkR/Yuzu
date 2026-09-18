@@ -1409,7 +1409,7 @@ void SparkEngine::start() {
                       std::chrono::steady_clock::time_point at, SparkCoverage cov) {
                     report_established(key, inc, at, cov);
                 })) {
-            spdlog::debug("SparkEngine: set_established_sink refused for mechanism type {} -- "
+            spdlog::debug("SparkEngine: set_established_sink refused for mechanism type {} — "
                           "establishment reporting will be unavailable for this type",
                           spark_type_token(type));
         }
