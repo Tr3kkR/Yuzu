@@ -817,11 +817,26 @@ explicit narrowing below.
   tick), and its existing recovery-scan loop (re-validate every RETAINED entry
   every tick, pruning one whose eligibility has since settled to false -
   `resolved_failed` itself is untouched; only K-eligible-set MEMBERSHIP
-  changes) - the recovery-scan loop calls this through
+  changes). Both loops need the SAME atomicity property - one `registry_mu_`
+  acquisition producing both the status and the eligibility bit together -
+  and each has its own combined accessor for it, not a shared one, since they
+  read different status shapes: the recovery-scan loop calls
   `GuardianSparkRuntime::receipt_recovery_status()`, the atomic combination of
   `receipt_wedge_k_eligible()` with `receipt_recovered()` under ONE
   `registry_mu_` acquisition (adversarial-review fix: the two-separate-calls
-  version could drop a genuine concurrent recovery in the gap between them).
+  version could drop a genuine concurrent recovery in the gap between them);
+  the primary per-pending loop calls `GuardianSparkRuntime::
+  receipt_status_wedge_aware()`, the same-shaped atomic combination of the
+  ordinary `receipt_status()` classification with `receipt_wedge_k_eligible()`
+  (governance Gate 3/cpp-safety fix: an earlier version of this loop made the
+  identical two-separate-calls mistake the adversarial review had already
+  caught in the OTHER loop - a genuine claim adoption landing in the gap
+  between the two calls would misclassify the receipt as an ordinary failure
+  while never retaining it in `failed_receipts`, permanently desyncing
+  `resolved_failed` from `failed_receipts.size()` for that application). Both
+  accessors route their shared eligibility predicate through one private
+  helper, `is_wedge_k_eligible_locked()`, so the predicate itself has exactly
+  one definition despite three public call sites.
   `can_advance()` stays a cheap, runtime-free ledger query: `every
   resolved_failed entry counted in failed_receipts` AND `reapply_count >= K`.
   `latched_failure` still blocks unconditionally either way, never folded into

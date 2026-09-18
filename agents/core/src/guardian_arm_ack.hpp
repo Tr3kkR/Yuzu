@@ -361,7 +361,7 @@ private:
         /// R5.3 stamp), not a silent drop.
         ///
         /// rung 9c PR-5e (#4221, K-bound closeout): also re-validated every drain
-        /// tick against GuardianSparkRuntime::receipt_wedge_k_eligible() (see that
+        /// tick against GuardianSparkRuntime::receipt_recovery_status() (see that
         /// accessor's own doc comment) - an entry whose eligibility has since
         /// settled to false (a Dispatching-window race corrected to a genuine
         /// Failed/Stopped/AdmissionRejected outcome, or the claim was popped from

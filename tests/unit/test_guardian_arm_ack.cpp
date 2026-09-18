@@ -1258,6 +1258,10 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): K-eligibility linearizes at the 
     b->hang_next_arm.store(true);
     auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
                                                          std::chrono::milliseconds(50)});
+    struct Cleanup {
+        FakeBackend* backend;
+        ~Cleanup() { backend->release_hang(); } // idempotent - the explicit release below still fires
+    } cleanup{b.get()};
 
     const std::string digest(64, '9');
     auto receipt = accept(*rt, "r1");
