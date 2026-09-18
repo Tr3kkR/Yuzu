@@ -304,11 +304,27 @@ handle_stream_response(ResponseFrame, #data{agent_id = AgentId, pending = Pendin
                     telemetry:execute([yuzu, gw, command, completed],
                                       #{duration_ms => Duration},
                                       #{agent_id => AgentId, plugin => Plugin, status => Status}),
-                    %% Notify router so it can complete the fanout.
-                    case whereis(yuzu_gw_router) of
-                        undefined  -> ok;
-                        RouterPid  -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-                    end,
+                    %% Notify the router that is actually TRACKING this
+                    %% fanout. HA WS-4 4.3a fix: that router lives on the
+                    %% DISPATCHING node, which — once cross-node routing
+                    %% exists (`yuzu_gw_registry:lookup/1`'s `pg` fallback)
+                    %% — is not necessarily THIS (the agent process's) node.
+                    %% `ReplyTo` is the fanout's `CallerPid` (mgmt-service
+                    %% handler process, `yuzu_gw_router.erl`'s `#fanout.from`),
+                    %% always co-located with its own node's `yuzu_gw_router`
+                    %% (`yuzu_gw_router.erl`'s `?SERVER` is a LOCAL-only
+                    %% `gen_server:start_link({local, ...})`) — so
+                    %% `node(ReplyTo)` names the right node. The prior local
+                    %% `whereis(yuzu_gw_router)` silently no-oped on a
+                    %% cross-node dispatch (this agent's OWN node's router,
+                    %% which was never tracking a fanout it didn't originate),
+                    %% stranding the fanout until the 300s `fanout_timeout`
+                    %% fallback — invisible until cross-node routing made this
+                    %% reachable. `{Name, Node} ! Msg` is fire-and-forget: an
+                    %% unreachable node or unregistered name is silently
+                    %% dropped, matching the previous local `undefined -> ok`
+                    %% no-op semantics exactly.
+                    {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId},
                     maps:remove(CmdId, Pending)
             end,
             {keep_state, Data#data{pending = Pending2}};
@@ -328,10 +344,9 @@ do_cleanup(#data{agent_id = AgentId, session_id = SessionId,
     %% and notify router so it can complete fanout tracking.
     maps:foreach(fun(_CmdId, {ReplyTo, FanoutRef, _DispatchedAt}) ->
         ReplyTo ! {command_error, FanoutRef, AgentId, agent_disconnected},
-        case whereis(yuzu_gw_router) of
-            undefined -> ok;
-            RouterPid -> RouterPid ! {fanout_terminal, FanoutRef, AgentId}
-        end
+        %% HA WS-4 4.3a fix: route to the DISPATCHING node's router, same
+        %% reasoning as handle_stream_response/2 above.
+        {yuzu_gw_router, node(ReplyTo)} ! {fanout_terminal, FanoutRef, AgentId}
     end, Pending),
 
     Duration = case ConnectedAt of

@@ -86,16 +86,77 @@ deregister_agent(AgentId) ->
     gen_server:cast(?SERVER, {deregister, AgentId}).
 
 %% @doc Lookup an agent by ID. Returns {ok, Pid} or error.
+%%
+%% HA WS-4 4.3a (intra-cluster routing, ADR-2002 §7): node-local ETS is tried
+%% first (the common case — same node, zero cross-node cost) and remains the
+%% AUTHORITATIVE source for a pid on THIS node. On a local miss, falls back
+%% to the per-agent `pg' group (`{agent, AgentId}', joined/left alongside the
+%% existing `all_agents'/`{plugin, X}' groups below) — `pg' replicates group
+%% membership across every CONNECTED distributed-Erlang node in this
+%% cluster, giving cross-node location transparency `pg' broadcast groups
+%% alone do not provide (see ADR-2002 §7's "per-agent `pg' group, a global
+%% registry, or fan-and-filter" mechanism list — this is the first of the
+%% three). Deliberately NOT a consistent hash ring: `hash_ring_vnodes'
+%% (`gateway/config/sys.config') is for DNS-based connection placement and
+%% rebalancing only (`docs/erlang-gateway-blueprint.md`), explicitly NOT
+%% command routing — see #4556.
+%%
+%% SINGLE-MEMBER DISPATCH RULE (load-bearing): `pg' membership is eventually
+%% consistent, so during a re-home the OLD node's pid and the NEW node's pid
+%% can both be members of `{agent, AgentId}' until the old stream process
+%% actually exits. Dispatching to EVERY member would let one command yield
+%% TWO responses (a real one plus an `agent_disconnected' from the dead
+%% pid) for a single fanout target. Never happens today (agent reconnect is
+%% the only re-home path, ADR-2002 §7 — a physical stream move is always
+%% agent-reconnect-shaped, so at most one live member should exist at
+%% steady state), but the rule holds regardless: pick exactly ONE —
+%% preferring a LOCAL member if any (so `is_process_alive/1`'s liveness
+%% check still applies) — never dispatch to more than one.
 -spec lookup(binary()) -> {ok, pid()} | error.
 lookup(AgentId) ->
     case ets:lookup(?TABLE, AgentId) of
         [{_, Pid, _, _, _, _, _, _}] ->
             case is_process_alive(Pid) of
                 true  -> {ok, Pid};
-                false -> error
+                false -> lookup_remote(AgentId)
             end;
         [] ->
-            error
+            lookup_remote(AgentId)
+    end.
+
+%% @doc Cross-node fallback for lookup/1 — see that function's doc comment
+%% for the group-membership and single-member-dispatch rationale.
+%%
+%% `pg' membership removal on a monitored process's death is ASYNCHRONOUS
+%% relative to any other observer's own death detection (confirmed
+%% empirically: `yuzu_gw_registry_tests:lookup_dead_process/0' — which
+%% waits on its OWN separate monitor's DOWN before asserting — intermittently
+%% still found the dead pid as a live `{agent, AgentId}' pg member here,
+%% because `pg''s internal cleanup hadn't run yet). A LOCAL member is one
+%% this node CAN verify with `is_process_alive/1', so it must be — a dead
+%% local member is filtered out rather than returned. A REMOTE member's
+%% liveness is NOT locally verifiable; it is trusted to `pg''s own
+%% monitoring on ITS node (the same trust boundary the rest of this
+%% fallback already rests on).
+-spec lookup_remote(binary()) -> {ok, pid()} | error.
+lookup_remote(AgentId) ->
+    case pg:get_members(?PG_SCOPE, {agent, AgentId}) of
+        [] ->
+            error;
+        Members ->
+            Self = node(),
+            Live = lists:filter(fun(P) ->
+                node(P) =/= Self orelse is_process_alive(P)
+            end, Members),
+            case lists:filter(fun(P) -> node(P) =:= Self end, Live) of
+                [Local | _] ->
+                    {ok, Local};
+                [] ->
+                    case Live of
+                        [Remote | _] -> {ok, Remote};
+                        []           -> error
+                    end
+            end
     end.
 
 %% @doc Return all agent IDs.
@@ -261,8 +322,11 @@ handle_call({register, AgentId, Pid, SessionId, Plugins, Hostname, RegisterReq},
     ets:insert(?TABLE, {AgentId, Pid, node(Pid), SessionId, Plugins, Now,
                         Hostname, RegisterReq}),
 
-    %% Join pg groups.
+    %% Join pg groups. `{agent, AgentId}` (HA WS-4 4.3a) is the cross-node
+    %% location-transparency group `lookup/1`'s fallback reads — see that
+    %% function's doc comment.
     pg:join(?PG_SCOPE, all_agents, Pid),
+    pg:join(?PG_SCOPE, {agent, AgentId}, Pid),
     lists:foreach(fun(Plugin) ->
         pg:join(?PG_SCOPE, {plugin, Plugin}, Pid)
     end, Plugins),
@@ -339,6 +403,7 @@ do_deregister(AgentId, #state{monitor_refs = Mons} = State) ->
             ets:delete(?TABLE, AgentId),
             %% pg auto-removes on process exit, but leave explicitly for clarity.
             catch pg:leave(?PG_SCOPE, all_agents, Pid),
+            catch pg:leave(?PG_SCOPE, {agent, AgentId}, Pid),
             lists:foreach(fun(Plugin) ->
                 catch pg:leave(?PG_SCOPE, {plugin, Plugin}, Pid)
             end, Plugins),
@@ -354,6 +419,7 @@ maybe_cleanup(AgentId, Mons) ->
     case ets:lookup(?TABLE, AgentId) of
         [{_, OldPid, _, _, OldPlugins, _, _, _}] ->
             catch pg:leave(?PG_SCOPE, all_agents, OldPid),
+            catch pg:leave(?PG_SCOPE, {agent, AgentId}, OldPid),
             lists:foreach(fun(Plugin) ->
                 catch pg:leave(?PG_SCOPE, {plugin, Plugin}, OldPid)
             end, OldPlugins),

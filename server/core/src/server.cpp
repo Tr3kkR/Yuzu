@@ -1430,6 +1430,16 @@ public:
                                   yuzu::server::kReasonParentIdEmpty})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", "result_set_parent"}, {"reason", std::string(reason)}});
+        // #4496 (+ follow-up): the from-inventory-query result-set producer
+        // (REST and its MCP twin) - its OWN reachable set, same discipline as
+        // `result_set_parent` above: this route can only ever emit these
+        // three data-quality reasons, never the targeting-shape ones.
+        for (const auto reason : {yuzu::server::kReasonQueryTruncated,
+                                  yuzu::server::kReasonPoisonExcluded,
+                                  yuzu::server::kReasonParseErrorExcluded})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", "result_set_inventory_query"},
+                              {"reason", std::string(reason)}});
         // `policy_remediate` has its OWN reachable set, not the dispatch routes'.
         // It refuses `scope` outright (PolicyEvaluator::remediate takes only
         // agent_ids), so `scope_type`, `scope_empty` and `target_conflict` can
