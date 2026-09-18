@@ -678,6 +678,89 @@ TEST_CASE("AuthRoutes::require_permission — operator MCP tier IS allowed ApiTo
 }
 
 // ---------------------------------------------------------------------------
+// #2963 legacy (RBAC-off) self-service allowlist: ApiToken:Rotate must be
+// reachable by a plain non-admin, non-MCP-tier caller (a cookie session or an
+// untiered PAT) — composed with the legacy "non-Read needs admin" rule this
+// was previously admin-only for everyone else in the shipped default (RBAC
+// disabled) configuration, defeating the reason the feature exists. Safe
+// because ApiTokenStore::rotate_token/confirm_token_rotation independently
+// refuse any requesting_user other than the resolved row's own
+// principal_id — this gate only decides "may attempt".
+// ---------------------------------------------------------------------------
+
+TEST_CASE("AuthRoutes::require_permission — a plain non-admin, untiered caller IS allowed "
+          "ApiToken:Rotate under RBAC-off (legacy self-service allowlist, #2963)",
+          "[pg][auth_routes][legacy][self_service]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
+    auto raw = fix.api_tokens->create_token("plain-user-pat", "plain_user");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Rotate");
+    CHECK(ok);
+}
+
+TEST_CASE("AuthRoutes::require_permission — the #2963 self-service allowlist does NOT widen "
+          "to a sibling non-Read operation — a plain non-admin caller is still denied "
+          "ApiToken:Write under RBAC-off",
+          "[pg][auth_routes][legacy][self_service]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
+    auto raw = fix.api_tokens->create_token("plain-user-pat-2", "plain_user");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Write");
+    CHECK_FALSE(ok);
+    CHECK(res.status == 403);
+}
+
+TEST_CASE("AuthRoutes::require_scoped_permission — the #2963 self-service allowlist applies "
+          "identically to the scoped variant (kept in sync, per its own comment)",
+          "[pg][auth_routes][legacy][self_service]") {
+    AuthRoutesFixture fix;
+    REQUIRE(fix.auth_mgr.upsert_user("plain_user", "password1234", auth::Role::user));
+    auto raw = fix.api_tokens->create_token("plain-user-pat-3", "plain_user");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_scoped_permission(req, res, "ApiToken", "Rotate", "agent-1");
+    CHECK(ok);
+}
+
+TEST_CASE("AuthRoutes::require_permission — an operator-tier MCP token minted by a "
+          "NON-ADMIN creator now passes ApiToken:Rotate under RBAC-off (#2963's legacy "
+          "allowlist has live effect on MCP too, not just REST — the mcp_tier branch "
+          "falls through to legacy on a passing tier check, it does not return true)",
+          "[pg][auth_routes][legacy][self_service][mcp]") {
+    AuthRoutesFixture fix;
+    // Deliberately NON-admin creator — the pre-existing sibling test at
+    // "operator MCP tier IS allowed ApiToken:Rotate" above uses `test_user`,
+    // which the fixture registers as admin, so it cannot distinguish "the
+    // mcp_tier branch alone admits this" from "it fell through and the
+    // legacy branch's OWN admin-role check admitted it separately" — both
+    // would pass that test. This one pins the actual claim: before #2963,
+    // this exact token (operator tier, non-admin creator, RBAC-off) was
+    // DENIED at the legacy branch after tier_allows() let it fall through;
+    // #2963's legacy self-service allowlist is what makes it pass now.
+    REQUIRE(fix.auth_mgr.upsert_user("plain_operator_user", "password1234", auth::Role::user));
+    auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                   std::chrono::system_clock::now().time_since_epoch()).count();
+    auto raw = fix.api_tokens->create_token("mcp-atr-op-nonadmin", "plain_operator_user",
+                                            now + 3600, "", "operator");
+    REQUIRE(raw.has_value());
+    auto req = request_with_header("Authorization", "Bearer " + *raw);
+    httplib::Response res;
+
+    bool ok = fix.ar->require_permission(req, res, "ApiToken", "Rotate");
+    CHECK(ok);
+}
+
+// ---------------------------------------------------------------------------
 // #4028/#520 security regression guard: an admin-owned MCP token (any tier)
 // must still be blocked from the new settings read-twins' securables, even
 // though those routes gate via require_permission (not require_admin) and

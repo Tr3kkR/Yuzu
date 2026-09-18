@@ -3,6 +3,7 @@
 #include "agent_registry.hpp"
 #include "bundled_content.hpp"
 #include "http_route_sink.hpp"
+#include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "openapi_spec_access.hpp"
 #include "rest_a4_envelope_http.hpp"
 
@@ -238,6 +239,23 @@ DiscoveryDoc build_instructions_catalog(InstructionStore& instruction_store) {
 
     json arr = json::array();
     for (const auto& d : defs) {
+        // #2437-class guard: parameter_schema is stored VERBATIM at write
+        // time (instruction_store.cpp import path) with no depth check
+        // until this branch's own write-side guard shipped - a row written
+        // before that, or via any other write path, still reaches this
+        // read. nlohmann::json::parse handles very deep input fine, so
+        // parsed.is_object() below would be true and the poisoned tree
+        // would be moved into this array unnoticed; build_discovery_doc's
+        // body.dump() further down is the unboundedly recursive call that
+        // would then SIGSEGV the whole catalog response for every OTHER
+        // definition too. Exclude the poisoned definition instead of
+        // crashing the build; log its id, never its payload.
+        if (mcp::json_exceeds_depth(d.parameter_schema, mcp::kMcpMaxJsonDepth)) {
+            spdlog::warn("discover/instructions: excluding instruction definition {} - "
+                         "parameter_schema nests too deeply (#2437-class)",
+                         d.id);
+            continue;
+        }
         json param_schema; // null unless the stored value parses as a JSON object
         auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
         // Attach only an OBJECT schema — a stored value that parses to
@@ -483,6 +501,19 @@ DiscoveryDoc build_plugins_catalog(const yuzu::server::detail::AgentRegistry& ag
             for (const auto& d : *defs_result) {
                 if (d.plugin.empty() || d.action.empty())
                     continue;
+                // #2437-class guard: same hazard as build_instructions_catalog
+                // above - a too-deep stored parameter_schema would otherwise be
+                // moved into schema_by_action below, spliced into an action's
+                // entry further down, and crash on this catalog's own
+                // build_discovery_doc dump(). Skip enrichment for just this
+                // action rather than the whole catalog build; log the
+                // definition id, never its payload.
+                if (mcp::json_exceeds_depth(d.parameter_schema, mcp::kMcpMaxJsonDepth)) {
+                    spdlog::warn("discover/plugins: excluding parameter_schema enrichment for "
+                                "instruction definition {} - nests too deeply (#2437-class)",
+                                d.id);
+                    continue;
+                }
                 auto parsed = json::parse(d.parameter_schema, nullptr, /*allow_exceptions=*/false);
                 // Attach only an OBJECT schema — a stored value that parses to
                 // null/number/array/string is not a usable JSON Schema (UP-9).

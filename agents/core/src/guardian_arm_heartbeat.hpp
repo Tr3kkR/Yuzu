@@ -40,18 +40,26 @@ struct GuardianArmStats {
     std::uint64_t pending{0};
     /// Current application receipts drained to a non-Committed terminal outcome,
     /// still unresolved for acknowledgment purposes
-    /// (GuardianArmAckLedger::Application::resolved_failed). Does NOT decrement in
-    /// place within one application (guardian_arm_ack.cpp's drain_locked() only
-    /// increments it) - but it already resets to 0 whenever decide_retry() returns
-    /// Reapply on a generation that previously failed, which begins a FRESH
-    /// application via begin_application(). That Reapply path is driven by the
-    /// existing ~25s full_sync retry cadence and is live TODAY, independent of PR-5.
-    /// So: "decreases on application replacement, which already happens on an
-    /// ordinary retry of a generation that saw a failure" - NOT "monotonic until
-    /// PR-5". Same-application late-success recovery (a still-pending receipt
-    /// flipping from Failed to Committed without a new application) is PR-5's job,
-    /// not built yet. Zero failed does not itself mean compliant or enforced -
-    /// latched_failure and Service-watcher readiness are separate signals.
+    /// (GuardianArmAckLedger::Application::resolved_failed). Decrements in place
+    /// within one application for exactly ONE case (rung 9c PR-5d, concern 2,
+    /// arm-recovery): a Wedged receipt whose exact (rule_id, generation)
+    /// incarnation is later ADOPTED by the runtime (PR-5d's own concern 1 - a late
+    /// success on a still-desired wedged claim) is detected by drain_locked()'s
+    /// own recovery scan (GuardianSparkRuntime::receipt_recovery_status(), rung
+    /// 9c PR-5e's atomic combination of receipt_recovered() with the K-eligibility
+    /// probe - see that accessor's own doc comment) and its
+    /// contribution here is cleared - every OTHER non-Committed status (Failed,
+    /// CongestionExpired, Withdrawn, Stopped) still only ever increments this
+    /// field within one application, exactly as before. It ALSO still resets to 0
+    /// whenever decide_retry() returns Reapply on a generation that previously
+    /// failed, which begins a FRESH application via begin_application() - that
+    /// Reapply path is driven by the existing ~25s full_sync retry cadence and
+    /// predates PR-5d. Recovery is scoped to THIS application's own bookkeeping
+    /// only (see Application::failed_receipts' own doc comment) - a durable,
+    /// cross-application "last known outcome for every currently-desired rule"
+    /// gauge is a separate, stronger semantic 5e's own scope owns, not delivered
+    /// here. Zero failed does not itself mean compliant or enforced - latched_
+    /// failure and Service-watcher readiness are separate signals.
     std::uint64_t failed{0};
 };
 
