@@ -84,6 +84,31 @@ using SparkEmitFn = std::function<void(const std::string& key, SparkData data)>;
 using SparkFaultFn =
     std::function<void(const std::string& key, bool faulted, std::string_view reason)>;
 
+/// The engine's establishment-signal callback (rung 9c PR-6 item 1) — a positive
+/// answer to "does live OS-level notification coverage exist for this watch right
+/// now," distinct from both `SparkEmitFn` (a real detection fire) and `SparkFaultFn`
+/// (post-arm health, which explicitly no-ops on a same-state call and so cannot
+/// carry a first-establishment edge — see spark.hpp's `SubscriptionEstablishment`
+/// doc comment). A mechanism calls it — from its OWN thread, lock released, NEVER
+/// from inside watch()/unwatch() (the same reentrancy prohibition as emit()/fault()
+/// above) — reporting EVERY coverage transition for `key`, not only the first: a
+/// mechanism that later loses coverage (a fault, a teardown, a backend error) calls
+/// this again with `SparkCoverage::None` so the engine's cached coverage never goes
+/// stale. `incarnation` identifies WHICH watch this report is about (the engine
+/// drops a report whose incarnation no longer matches the key's current one — a
+/// stale report against a superseded or torn-down watch); `at` is the mechanism's
+/// own timestamp taken at the point it committed the transition (source, never
+/// delivery — a queued/polled mechanism's dispatch latency must not leak into the
+/// recorded value). Optional: default `ISparkMechanism::set_established_sink`
+/// installs no sink, so a mechanism that never calls this (every one except the two
+/// Service platform classes, today) is unaffected. Called with the engine lock
+/// released, like emit()/fault() — MAY THROW under the same #2012/#3840 allocation
+/// posture as those two; a mechanism that owns one calls it from a context that can
+/// tolerate the throw (see spark_service.cpp's own containment at each call site).
+using SparkEstablishedFn = std::function<void(const std::string& key, SparkIncarnation incarnation,
+                                              std::chrono::steady_clock::time_point at,
+                                              SparkCoverage coverage)>;
+
 /// Point-in-time mechanism-internal counters (#1979), folded into
 /// SparkEngineStats' mech_* fields by SparkEngine::stats() and surfaced the
 /// same way (agent heartbeat status_tags — no /metrics endpoint). Every field
@@ -158,10 +183,12 @@ struct SparkMechanismStats {
 ///      on the control path, and commit or hand the result off later. Registry
 ///      does this since PR-B1 (spark_registry.cpp, "Ownership / dispatch
 ///      protocol"); File does this since PR-B2 (spark_file.cpp, watch()'s own
-///      caller-wait-budget + off-lock discovery probe). Service's
-///      watch()/unwatch() are already O(1) queue pushes but its SCM
-///      open/notify still run head-of-line on its worker (PR-B3, not yet
-///      landed).
+///      caller-wait-budget + off-lock discovery probe). Service does this
+///      since PR-B3 (spark_service.cpp, Windows half only — the Linux sd-bus
+///      mechanism has no head-of-line OS call to isolate in the first place):
+///      watch()/unwatch() were already O(1) queue pushes, and the SCM
+///      establishment call (OpenServiceW) now runs on a bounded, F3-counted
+///      probe lane rather than head-of-line on the mechanism's one thread.
 ///   2. A mechanism must NEVER call emit()/fault() synchronously from inside
 ///      watch()/unwatch() - not even on an immediate-success path. The engine's
 ///      per-type lock is on that call stack, and an Inline consumer reacting by
@@ -215,6 +242,30 @@ public:
     /// stats() therefore closes an ABBA cycle and can deadlock the agent. All three
     /// shipped mechanisms read only `std::atomic`s here. Keep it that way.
     [[nodiscard]] virtual SparkMechanismStats stats() const { return {}; }
+
+    /// Additive establishment-signal seam (rung 9c PR-6 item 1). Default forwards to
+    /// watch() so every existing mechanism (Registry, File, every test fake) compiles
+    /// and behaves unchanged — the engine ALWAYS calls THIS overload, never the plain
+    /// watch() above, so a mechanism that wants to correlate its establishment reports
+    /// (see SparkEstablishedFn) against a stable identity overrides this one instead.
+    /// A DISTINCT NAME, deliberately not an overload of watch(): an overload would be
+    /// a change to the frozen watch()/unwatch() seam this class's own header comment
+    /// documents as reviewed and settled; a new name is purely additive.
+    [[nodiscard]] virtual std::expected<void, std::string>
+    watch_incarnation(const std::string& key, const SparkParams& params,
+                      SparkIncarnation incarnation) {
+        return watch(key, params);
+    }
+
+    /// Install the establishment-signal sink (rung 9c PR-6 item 1). Default: no sink
+    /// exists to install, returns false — a mechanism that never overrides this has
+    /// nothing to report and every watch_incarnation() call above simply forwards to
+    /// watch(), so there is nothing for a caller to be surprised is missing. A
+    /// mechanism that DOES implement this must seal it at its own start(): once
+    /// started, a later call returns false rather than silently swapping the sink out
+    /// from under an in-flight report (the engine calls this exactly once, before
+    /// start(), so the seal is a defensive one-way latch, not a live requirement).
+    virtual bool set_established_sink(SparkEstablishedFn /*sink*/) { return false; }
 };
 
 /// Platform factory: a real IOCP + ReadDirectoryChangesW file-change mechanism
