@@ -1002,7 +1002,7 @@ private:
     /// keys_with_pending_initial()'s priority-lane worklist. A demoted rule keeps
     /// converging (and keeps re-arming errored_refresh_ms) at its normal type-lane
     /// cadence, which is what makes 6b the staleness backstop for 6c.
-    /// commit_new_generation_locked() reseeds this fresh (first_seen=now,
+    /// commit_new_generation_locked() reseeds this fresh (first_seen=attach_now,
     /// unknown_sweeps=0, demoted=false) on EVERY generation commit for a rule_id, not
     /// only on first attach - a same-rule_id content-plane push mid-demotion-episode
     /// restarts the demotion clock rather than carrying prior progress forward.

@@ -1462,10 +1462,10 @@ TEST_CASE("M1 demotion: a mixed demoted/non-demoted pending set on one key keeps
 // inside the Convergence-reason branch, so a key driven by Event-reason evals alone
 // never demoted no matter how much time passed. At HEAD, demotion runs on the read
 // outcome ahead of the enqueue accept/reject decision (#2992's fix), so both are
-// reachable. Each case asserts the STUCK state first (true both before and after the fix, proving
-// the scenario is real and that nothing was lost) and the PROGRESS state second (red on
-// origin/dev, green after the fix hoists the demotion bookkeeping above the accept
-// check and decouples time_due from the Convergence-reason gate).
+// reachable. Each case asserts the STUCK state first (true both before and after the
+// fix, proving the scenario is real and that nothing was lost) and the PROGRESS state
+// second (red on origin/dev, green after the fix hoists the demotion bookkeeping above
+// the accept check and decouples time_due from the Convergence-reason gate).
 
 TEST_CASE("M1 demotion: chronically-full outbox, sweep arm still demotes (#2992 CH-1a)",
           "[spark][runtime]") {
