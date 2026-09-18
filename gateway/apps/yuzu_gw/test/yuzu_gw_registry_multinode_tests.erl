@@ -205,7 +205,7 @@ remote_agent_loop() ->
 ensure_distributed() ->
     case node() of
         nonode@nohost ->
-            os:cmd("epmd -daemon"),
+            ensure_epmd_running(),
             %% `erlang:unique_integer/1` alone is unique per-VM, not across
             %% VMs — on a shared CI box running multiple runner agents as one
             %% OS identity (#1871), two concurrent `rebar3 eunit` invocations
@@ -213,10 +213,56 @@ ensure_distributed() ->
             %% matching `peer:random_name/1`'s own pattern below.
             Name = list_to_atom("yuzu_gw_multinode_test_" ++ os:getpid() ++ "_" ++
                                 integer_to_list(erlang:unique_integer([positive]))),
-            {ok, _} = net_kernel:start(Name, #{name_domain => shortnames}),
+            {ok, _} = await_net_kernel_start(Name, 100),
             ok;
         _ ->
             ok
+    end.
+
+%% GOVERNANCE FINDING (external PR review, BLOCKING): the original
+%% `os:cmd("epmd -daemon")` HANGS Windows CI. `os:cmd/1` waits for the
+%% spawned process's output stream to close before returning — on POSIX,
+%% `epmd -daemon` detaches (closes inherited handles) once it's up, so the
+%% pipe closes and `os:cmd` returns promptly; `epmd.exe -daemon` on Windows
+%% does not detach the same way, so the pipe never closes and `os:cmd`
+%% blocks forever, hanging the enclosing test's timeout fixture (confirmed:
+%% an orphaned `epmd.exe` process was found still running at Windows CI job
+%% cleanup, and the eunit run's own "One or more tests were cancelled"
+%% message with a 277→249 passed-count drop matches exactly).
+%%
+%% `open_port/2` is fire-and-forget on every platform — nothing here reads
+%% from or waits on the port, so it returns immediately regardless of
+%% whether the child process detaches. `nouse_stdio` avoids setting up a
+%% pipe at all, sidestepping the hang class entirely rather than trying to
+%% detect and work around Windows' different detachment semantics.
+%%
+%% NOTE: `net_kernel:start/2` does NOT start epmd itself if it isn't
+%% already running — `erl_epmd` is a pure TCP CLIENT to an already-running
+%% epmd (verified empirically: without a live epmd, `net_kernel:start/2`
+%% fails immediately with `{error, {shutdown, ... nodistribution}}`, not a
+%% delayed retry) — so this step cannot simply be deleted.
+ensure_epmd_running() ->
+    case os:find_executable("epmd") of
+        false ->
+            %% Not on PATH — let net_kernel:start fail loudly with its own
+            %% clear error rather than silently no-op here.
+            ok;
+        Epmd ->
+            open_port({spawn_executable, Epmd}, [{args, ["-daemon"]}, nouse_stdio]),
+            ok
+    end.
+
+%% epmd needs a moment to actually bind its port after `ensure_epmd_running/0`
+%% returns (which doesn't wait for that) — retry rather than a fixed sleep,
+%% matching this module's other await_* helpers.
+await_net_kernel_start(_Name, 0) ->
+    error(epmd_never_became_ready);
+await_net_kernel_start(Name, Retries) ->
+    case net_kernel:start(Name, #{name_domain => shortnames}) of
+        {ok, _} = Ok -> Ok;
+        {error, _} ->
+            timer:sleep(50),
+            await_net_kernel_start(Name, Retries - 1)
     end.
 
 %% `peer:start_link/1' can return before the distribution handshake with
