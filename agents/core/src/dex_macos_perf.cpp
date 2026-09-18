@@ -146,6 +146,13 @@ VmSnapshot read_vm_snapshot() {
     if (host_statistics64(kHostSelf, HOST_VM_INFO64, reinterpret_cast<host_info64_t>(&vm),
                           &count) != KERN_SUCCESS)
         return {};
+    // `count` is IN/OUT: the kernel updates it to how much of vm_statistics64 it actually
+    // filled, which can be LESS than the caller's HOST_VM_INFO64_COUNT request on an ABI
+    // that predates a field this reader uses (governance C-4). internal_page_count and
+    // compressor_page_count were both added in "rev1" (mach/host_info.h) — reading them
+    // below the rev1 boundary would read past what the kernel actually wrote.
+    if (count < HOST_VM_INFO64_REV1_COUNT)
+        return {};
     vm_size_t page_size = 0;
     if (host_page_size(kHostSelf, &page_size) != KERN_SUCCESS)
         return {};
