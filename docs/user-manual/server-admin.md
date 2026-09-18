@@ -1092,6 +1092,19 @@ targeting-shape refusal, so it is not on this series. The
 on every single refusal, because a rule that pages on one malformed request gets silenced. Use the
 audit rows, not the alert, to find individual offenders.
 
+**`query_truncated`'s failure mode is structural, not a per-record near-miss - plan its runbook
+step separately from `poison_excluded`.** `poison_excluded` is per-record and self-heals once the
+offending record is fixed or excluded. `query_truncated` fires whenever the generic-inventory read
+backing both producer routes exceeds the hard-coded 5,000-row cap or the 8 MiB aggregate payload
+cap - there is no pagination on this path today. On a fleet whose inventory has grown past either
+cap, EVERY subsequent call to `POST /api/v1/result-sets/from-inventory-query` or its MCP twin
+refuses with `query_truncated`, and the alert never clears on its own. If you need to silence
+`YuzuDispatchTargetRejected` on such a fleet before the fix lands, scope the Alertmanager silence
+to `reason="query_truncated"` AND `route="result_set_inventory_query"` specifically - never the
+bare alertname, which would also hide `poison_excluded`, a genuine near-miss signal that must stay
+visible. Tracked fix: **#2633** (`InventoryStore::query` row cap (5000): keyset pagination +
+`limit+1` truncation probe).
+
 ### vNEXT — `POST /mcp/v1/` can now hold its response open as an SSE stream (2f PR 3b)
 
 A `tools/call` for `execute_instruction` that carries `_meta.progressToken` **and**
@@ -2092,7 +2105,7 @@ A nonzero result means that host's `installed_count` will report a higher number
 
 **Who this affects.** Any deployment with an existing stored inventory record (`inventory_store.inventory_data`) whose `data_json` nests deeper than the JSON depth guard allows - most likely a row predating the #2437-class write-side guard. A call to either route above that previously succeeded despite such a record now refuses outright instead of materialising a result set narrower than the true match set.
 
-**How to identify the affected record(s).** There is no SQL-level detection query or purge endpoint for this today - the only current signal is a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json nests too deeply (#2437-class)`, emitted once per excluded record on every call that reaches the guard. Watch the server log for this line following a `503` from either route above to identify which agent/plugin's record needs re-collection at the source.
+**How to identify the affected record(s).** There is no SQL-level detection query or purge endpoint for this today - the only current signal is a server log line at WARN level, `evaluate_inventory: excluding agent=<agent_id> plugin=<plugin> - data_json nests too deeply (#2437-class)`, emitted once per excluded record on every call that reaches the guard. Watch the server log for this line following a `503` from either route above to identify which agent/plugin's record needs re-collection at the source. Restart the affected agent to force a full resync; if the same WARN line (or a subsequent `poison_excluded` refusal) recurs afterward, the source data itself genuinely exceeds the depth guard and re-collection alone will not clear it - the source plugin needs a fix, or an operator can manually run `DELETE FROM inventory_store.inventory_data WHERE agent_id=... AND plugin=...` (the row repopulates on the next sync cycle if the source data is unchanged).
 
 ---
 

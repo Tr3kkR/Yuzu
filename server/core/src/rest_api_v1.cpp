@@ -9263,8 +9263,8 @@ void RestApiV1::register_routes(
                           bool ok = true;
                           if (audit_fn)
                               ok = audit_fn(req, "result_set.create", "failure", "ResultSet", "",
-                                            "source_kind=inventory_query reason=" +
-                                                std::string(reason));
+                                            "reason=" + std::string(reason) +
+                                                " source_kind=inventory_query");
                           if (!ok)
                               res.set_header("Sec-Audit-Failed", "true");
                       };
@@ -9418,7 +9418,7 @@ void RestApiV1::register_routes(
                           // silently changes who gets acted on (#2500/#2492
                           // dispatch-targeting invariant class). 503 rather
                           // than a partial set; raising the cap / keyset
-                          // pagination is the tracked follow-up.
+                          // pagination is the tracked follow-up (#2633).
                           if (metrics_registry)
                               metrics_registry
                                   ->counter("yuzu_server_dispatch_target_rejected_total",
