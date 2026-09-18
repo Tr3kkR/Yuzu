@@ -10,7 +10,7 @@ else
   cert_deps += dependency('openssl', required: true, include_type: 'system')
 endif
 
-shared_library(
+certificates_plugin_lib = shared_library(
   'certificates',
   files('src/certificates_plugin.cpp'),
   name_prefix: '',
