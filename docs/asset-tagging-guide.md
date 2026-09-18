@@ -779,18 +779,22 @@ devices always appear as an explicit "(untagged)" residual row.
 ## Recipe: Reflex consent gate (`device_class`)
 
 The Reflex system (`docs/reflex-design.md`, ADR-0021 Decision 4 — design-only as of this writing,
-see `docs/roadmap.md` Phase 20) needs to know which devices have no end user present to consent to
-a prompt, because a dangerous (consequential) Reflex Reaction is **refused at compile unless chain
-consent or all-server tag consent holds** — this is one unconditional rule, not something an
-escalation policy can widen. That classification is the free-form tag key `device_class`, with a
-closed vocabulary of two values:
+see `docs/roadmap.md` Phase 20) needs to know which devices have no end user present, because a
+dangerous (consequential) Reflex Reaction is **refused at compile unless all-server tag consent
+holds** — this is one unconditional rule, not something an escalation policy can widen, and **v1
+has exactly one consent basis: the asset tag.** (An earlier design draft proposed a second,
+in-chain "prompt the user first" path; it turned out not to bootstrap — the prompting Reaction is
+itself dangerous and would need a consent it cannot have — so v1 ships without it; see
+`docs/reflex-design.md` "Consent gate (D4)" for the full reasoning.) That classification is the
+free-form tag key `device_class`, with a closed vocabulary of two values:
 
 - `device_class=server` — no end user is normally present; a dangerous Reflex Reaction may be
   admitted by tag consent alone on this device.
-- `device_class=workstation` — an end user is normally present; a dangerous Reaction may only fire
-  with prior in-chain consent (an `interaction.*` Reaction gated `on_success` earlier in the same
-  chain, whose result is an affirmative response — a dismissed or no-desktop prompt does **not**
-  count) — it may never fire unattended.
+- `device_class=workstation` — an end user is normally present; **no dangerous Reflex Reaction can
+  run on this device in v1, ever, including any `interaction.*` prompt** (all five `interaction.*`
+  actions are themselves dangerous). This is not a temporary gap to work around — it is v1's actual
+  scope. Reclassify the device `server` if that is genuinely true, or wait for a future chain-consent
+  extension if it is not.
 
 `device_class` is **not** one of the four structured categories (`role` / `environment` /
 `location` / `service`) — it has no entry in `tag-categories` and is not schema-validated the way
@@ -801,13 +805,14 @@ not by `TagStore` schema validation. **The match is exact-byte** against the lit
 so `Server` or `" server"` reads as `workstation`, not `server`. **An untagged device is treated as
 `workstation` — fail-closed** — Reflex never infers "no user present" from the absence of a tag.
 
-**Sequencing: tag before you deploy.** A Reflex Set with a workstation-inclusive assignment and no
-chain consent simply cannot compile — there is no bulk `device_class` import specific to this
-recipe today (no automated pipeline exists yet), so tag your all-server fleet *before* authoring a
-Reflex Set that needs tag consent, the same way you would walk inventory to populate `model` in the
-DEX cohort recipe above. Setting or changing `device_class` requires the `Reflex:Write` permission
-(or admin) — a bare `Tag:Write` grant is not sufficient, because this tag is the sole input to a
-safety-relevant compiler gate.
+**Sequencing: tag before you deploy.** A Reflex Set with a dangerous Reaction and any
+workstation-class device in its resolved assignment simply cannot compile in v1 — there is no
+in-chain fallback and no bulk `device_class` import specific to this recipe today (no automated
+pipeline exists yet), so tag your all-server fleet *before* authoring a Reflex Set that needs tag
+consent, the same way you would walk inventory to populate `model` in the DEX cohort recipe above.
+Setting or changing `device_class` requires the `Reflex:Write` permission (or admin) — a bare
+`Tag:Write` grant is not sufficient, because this tag is the sole input to a safety-relevant
+compiler gate.
 
 Tag a device as a server (no end user present):
 
@@ -824,11 +829,12 @@ positively established, rather than defaulting to "allowed."
 **Symptom: a Reflex Set audits `reflex.set.compile_refused` and stops updating (HOLD, not disarm).**
 This is the outcome for a *new* Reflex Set, or an edit to an existing one, that never establishes
 consent — the set is held at its last accepted generation (or never deployed at all, if it has none)
-rather than being pushed. The most common cause is a target device whose `device_class` is missing
-or not exactly `"server"`, with no chain consent covering the dangerous Reaction. Check the device's
-tags and, if it genuinely has no end user, tag it `device_class=server`; if it does, add an
-`interaction.*` Reaction gated `on_success` before the dangerous step instead. **This is a different
-case from an already-armed set LOSING consent** (re-tagging a device from `server` to `workstation`,
+rather than being pushed. The cause is always a target device whose `device_class` is missing or not
+exactly `"server"` — in v1 there is no second path to check: either tag the device `device_class=
+server` if it genuinely has no end user, or narrow the assignment to exclude it. There is
+deliberately no "add an `interaction.*` Reaction to consent instead" option in v1 — see "Consent
+gate (D4)" in `docs/reflex-design.md` for why that does not work. **This is a different case from an
+already-armed set LOSING consent** (re-tagging a device from `server` to `workstation`,
 or a membership change that pulls a workstation into an all-server assignment) — that recompile does
 not hold anything; it **disarms** the affected device(s) via an explicit, generation-advancing
 removal push (`docs/reflex-design.md` "Generation, undeploy, and push semantics"), because leaving a

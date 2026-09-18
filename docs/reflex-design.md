@@ -204,9 +204,12 @@ non-error outcome — matching how every other plugin-dispatch result is already
 the platform, never a Reflex-specific redefinition. **A timeout counts as failure** — a Reaction
 that exceeds `timeout_ms` never gate-admits a subsequent `on_success` step, and the chain's terminal
 outcome for that Reaction is `timed_out`, distinct from both `completed` and an in-plugin `failed`.
-The consent-gate's stricter "affirmative response TOKEN" rule (see "Consent gate" above) is a
-*further* restriction specific to `interaction.*` Reactions gating a *dangerous* Reaction — it is
-not a redefinition of "success" for ordinary chain gating in general, which this paragraph defines.
+**Not a consent mechanism:** v1's consent gate (see "Consent gate" below) admits a dangerous Reaction
+on tag-consent alone and never reads an ordinary chain's `on_success`/`on_failure` result to do so —
+an earlier draft of this document described a stricter "affirmative response TOKEN" rule for
+`interaction.*` Reactions gating a dangerous Reaction; that rule was chain consent, which is not part
+of v1 (see "Consent gate" below for why), so this paragraph's plain success/failure definition is the
+only rule governing ordinary `on_success`/`on_failure` chain gating.
 
 ## Two-person approval (D9)
 
@@ -255,44 +258,68 @@ write is refused, not applied-but-unlogged.
 
 A **preventive compiler gate**, not an authoring convention, and **one rule with no escalation
 exception**: a dangerous Reaction (per the safety chokepoint above) is **REFUSED at compile unless
-chain-consent or all-server tag-consent holds — independent of any escalation policy.** There is no
-weaker "the compiler only rejects `proceed`-on-exhaustion" reading. Escalation policy (deferred, see
-the grammar section) can only decide *when*, inside a Reflex whose consent basis already holds, an
-already-consented action proceeds — it never widens what a dangerous Reaction may do *without*
-consent. The platform gains an operator-declared device classification via the free-form asset tag
-key `device_class` (`server` | `workstation`) — **declared, never inferred**; see
-`docs/asset-tagging-guide.md` "Recipe: Reflex consent gate." **An unclassified device is
-workstation-class — fail-closed.**
+tag-consent holds — independent of any escalation policy.** There is no weaker "the compiler only
+rejects `proceed`-on-exhaustion" reading. Escalation policy (deferred, see the grammar section) can
+only decide *when*, inside a Reflex whose consent basis already holds, an already-consented action
+proceeds — it never widens what a dangerous Reaction may do *without* consent. The platform gains an
+operator-declared device classification via the free-form asset tag key `device_class` (`server` |
+`workstation`) — **declared, never inferred**; see `docs/asset-tagging-guide.md` "Recipe: Reflex
+consent gate." **An unclassified device is workstation-class — fail-closed.**
 
-`evaluate_consent` (R4) admits a dangerous Reaction under either of:
+**v1 consent basis is the asset tag ONLY.** `evaluate_consent` (R4) admits a dangerous Reaction iff
+**every resolved target device satisfies `device_class == "server"`**, established by a **direct
+`TagStore::get_tag(agent_id, "device_class")` read** (never the scope-DSL's case-insensitive `tag:`
+atom — a different mechanism with different case-folding semantics; see
+`docs/asset-tagging-guide.md`). The match is **exact-byte** against the literal string `"server"`;
+any other value, any differently-cased value, or an absent tag is `"workstation"`. Device-set
+membership (management-group assignment → device ids) resolves via
+`ManagementGroupStore::get_member_agents_in_subtrees`. ADR-0050's fail-closed construction/degrade
+posture applies: an **unreadable** `TagStore` is an evaluation **error**, never treated as `true`.
+Anything else — any resolved target that is not exact-byte `"server"` — is **refused at compile,
+fail-closed**, full stop; there is no second admission path in v1.
 
-1. **Chain consent** — an `interaction.*` Reaction gated `on_success` precedes the dangerous
-   Reaction in the same chain, its `buttons` parameter is **`yesno` or `okcancel`** (never the
-   single-button, no-decline default), and its result is the ONE affirmative response TOKEN that
-   button set can produce: **`response == "yes"` when `buttons == "yesno"`, or `response == "ok"`
-   ONLY when `buttons == "okcancel"`** — **never a bare `response == "ok"` decoupled from which
-   `buttons` produced it**, and never a bare plugin return code. A single-button prompt (no
-   `buttons` param, or `buttons` anything other than `yesno`/`okcancel`) cannot express refusal at
-   all and is therefore never a valid consent Reaction, regardless of its response. A prompt
-   dismissed, defaulted, or shown with no interactive desktop present (Windows session 0; a headless
-   agent) must report a token that is **not** in the affirmative set for its button kind — that case
-   is a **consent FAILURE**, and the chain refuses the dangerous Reaction rather than journaling
-   "consent given" for an unattended dismissal. **This is currently a gap, not yet closed**:
-   `interaction_plugin.cpp`'s Windows `MessageBoxW` failure/no-desktop path (`platform_message_box`,
-   the `default:` arm on an unrecognized return value) reports `response|ok` today — indistinguishable
-   from a real `okcancel` affirmative — instead of a distinct `status|unavailable`. **Fixing that
-   default arm to emit `status|unavailable` is an R5 prerequisite**: `evaluate_consent` (R4) can only
-   apply this rule correctly once the plugin stops conflating "no desktop to prompt" with "user
-   pressed OK."
-2. **Tag consent** — every resolved target device satisfies `device_class == "server"`, established
-   by a **direct `TagStore::get_tag(agent_id, "device_class")` read** (never the scope-DSL's
-   case-insensitive `tag:` atom — a different mechanism with different case-folding semantics; see
-   `docs/asset-tagging-guide.md`). The match is **exact-byte** against the literal string `"server"`;
-   any other value, any differently-cased value, or an absent tag is `"workstation"`. Device-set
-   membership (management-group assignment → device ids) resolves via
-   `ManagementGroupStore::get_member_agents_in_subtrees`. ADR-0050's fail-closed
-   construction/degrade posture applies: an **unreadable** `TagStore` is an evaluation **error**,
-   never treated as `true`.
+**Consequence, stated plainly: in v1, no `interaction.*` Reaction can run on a workstation-class
+device.** All five `interaction.*` actions (`notify`, `message_box`, `input`, `survey`, `set_dnd`;
+`server/core/src/capability_decls/plugin_action_catalogue_d.hpp`) carry `.execute_gate =
+ExecuteGate::AdminOrApproval`, which makes every one of them a "dangerous" Reaction under the safety
+chokepoint's own classifier (`execute_gate != None` — see above) — including `message_box`, chain
+consent's own only consent-eliciting mechanism. A dangerous Reaction on a workstation needs tag
+consent it cannot have (the device is, by definition, not `device_class=="server"`), so v1 refuses
+every `interaction.*` Reaction on a workstation, unconditionally, the same as any other dangerous
+Reaction there. This is not a special case of the gate; it falls straight out of the single rule
+above.
+
+**Chain consent — recorded here as an explicit future extension, NOT part of v1, and here is why.**
+An earlier draft of this document (the R0 brief) added a second admission path: an `interaction.*`
+Reaction gated `on_success`, preceding the dangerous Reaction in the same chain, whose result is an
+affirmative response token (`yes` from `buttons=yesno`, or `ok` ONLY from `buttons=okcancel`) would
+satisfy consent for that one dangerous Reaction. **That path does not work as specified: it cannot
+bootstrap.** Since every `interaction.*` action — including the prompt chain consent itself depends
+on — is *itself* dangerous under the classifier above, admitting it under the chain-consent rule
+would require a *preceding* consent it cannot have; on a workstation with no all-server tag, no
+finite chain can ever acquire its first consent, because the very message that would elicit it is
+gated behind the same rule it exists to satisfy. The owner's actual v1 decision was narrower than
+that draft: **"We have asset tags. Use the asset tags."** Chain consent, if it is ever wanted, needs
+its own design — most plausibly, a distinct classification (or a dedicated, narrower bypass) for
+exactly the specific `interaction.*` Reaction whose sole purpose is eliciting the token that gates a
+*subsequent* dangerous Reaction, separate from `interaction.*` Reactions used for other genuinely
+dangerous purposes (an unsolicited `notify`, say) — but that carve-out is future work, not specified
+here, and v1 ships without it. **R4 note:** if slice R4's own implementation work had already written
+`consent_satisfied_by_chain` and the chain arm of `evaluate_consent` before this contract change
+landed, both must be REMOVED — R4 absorbs this contract change by deleting the chain-consent code
+path entirely, not by leaving it unreachable dead code behind the tag-only gate.
+
+**A related, but now GENERAL, correctness defect — no longer a consent defect, since chain consent
+is not in v1 — stays worth recording as an R5 prerequisite regardless: any future Reaction reading a
+prompt result, on any platform, needs an honest failure signal.** `interaction_plugin.cpp`'s Windows
+`MessageBoxW` failure/no-desktop path (`platform_message_box`, the `default:` arm on an unrecognized
+return value) reports `response|ok` today — indistinguishable from a real `okcancel` affirmative —
+instead of a distinct `status|unavailable` (macOS and Linux already do this correctly: `status|
+not_reachable` and `status|unavailable|<reason>` respectively). This remains an R5 prerequisite for
+whichever slice eventually consumes `interaction.*` results programmatically (chain consent, if and
+when it lands with its own design, or any other future gate reading a prompt's response), but it is
+a plugin honesty bug, not a hole in the D4 consent gate — v1's consent gate never reads an
+`interaction.*` result at all.
 
 **Device-set binding, re-tag, and membership drift.** The two-person approval (D9 below) binds its
 digest to the **resolved device set at approval time**, not group IDs alone — a management-group
@@ -618,7 +645,17 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
   follows a **named retention class** under `common/include/yuzu/audit_retention_rules.hpp`'s
   `classify` (assigned at R10, alongside a stated fail-closed-vs-set-and-proceed decision for the
   write itself — see `device.live.*`'s fail-closed precedent in the routed device-pages concern as
-  the default lens, not an automatic copy).
+  the default lens, not an automatic copy). **`capture_output` is RAW plugin stdout/stderr — it is
+  NOT covered by the "never a SID/username/user path" guarantee above by construction.** A
+  `script_exec`-class Reaction can easily emit a diagnostic line containing a user path
+  (`/home/alice/...`) on stderr with no malicious authoring required, which the bullet above's
+  blanket D10(a) rule otherwise contradicts. This must be closed one of two ways, decided at R6
+  (executor + outcome mapping) and stated in that slice's own PR text, not left implicit: either a
+  **default-deny, per-action typed output projection** is applied before persistence (an action opts
+  in only once its own projection strips identity-shaped content), or `capture_output` is
+  **restricted to the subset of actions that define such a projection**, with every other action's
+  `capture_output` refused at compile. Shipping raw, unprojected capture for every action is not a
+  compliant reading of D10(a).
 - Operator-configurable TTL on Reflex outcomes (D10d) — implemented as a clock-guarded retention
   sweep (`docs/clock-guarded-retention.md`; R10 records the adoption-register row), **bounded below
   by the evidentiary retention floor above** — the TTL can be lengthened by the operator, never
@@ -640,9 +677,45 @@ passes gets its own named row in `kBackgroundJobs` (a new side-effecting pass is
 that array, never a silent addition, per its own header contract) and its dispatch site wraps in
 `leader_gate_permits<background_job_class("<pass>")>(leader_elector_.get())` — the same pattern
 `command_outbox.deliver` and `schedule_runner.tick` use today at their call sites in
-`server.cpp`'s scheduling thread — so the Reflex push/compile loop's fenced claim write is that
-call-site wrapper around the `push_sets` dispatch in the (future) reflex-push background thread,
-not a separate primitive:
+`server.cpp`'s scheduling thread.
+
+**Correction: that call-site wrapper is NOT the fence, and an earlier draft of this section said it
+was — that was wrong and is corrected here.** `leader_gate.hpp`'s own header banner states this in
+caps: **"THIS IS THE ATTEMPT GATE, NOT THE CORRECTNESS FENCE"** (`leader_gate.hpp:18`) —
+`leader_gate_permits<>()` reduces to a lock-free `elector->is_leader()` read, and a momentarily-stale
+leader (a paused-but-not-yet-fenced-out ex-leader) can still pass it. Relying on the wrapper alone as
+the double-dispatch guarantee is exactly the CATASTROPHIC-IF-VIOLATED failure the Fenced-leader-election
+routed concern's clause (1) names: **the actual guarantee against a paused ex-leader is
+`LeaderElector::epoch_fence_sql()`, embedded directly in the durable claim's WRITE, never a cached
+"I am leader" bool.** `command_outbox_store.cpp` is the shipped precedent for the shape:
+`epoch_fence_sql(leader_lock_name, leader_epoch)` is spliced into the `WHERE` clause of the claim's
+own `INSERT`/`UPDATE` statement (`claim_and_enqueue_on`, `command_outbox_store.cpp:148`; `mark_sent`,
+`:307`; `mark_failed`, `:318`) — the fence lives IN the write, not beside it. **The Reflex
+compile/`push_sets` loop (R9) — the `FencedLeaderOnly` row below — MUST follow this same shape**: the
+durable write that claims or advances a device's target Reflex generation (whatever store row R9
+lands to represent "this generation is now committed to push") embeds `epoch_fence_sql(expected_epoch)`
+in that write's own `WHERE`/`INSERT ... WHERE` clause, exactly like `command_outbox_store.cpp` does —
+either as a first-class fenced write of its own, or by routing `push_sets` through the existing
+command-outbox primitive rather than inventing a second one. The `leader_gate_permits<>` wrapper at
+the loop's dispatch site stays required too (clause 2 — it is what stops a non-leader from even
+ATTEMPTING the compile/push in the first place, cheaper than reaching the fenced write on every
+tick), but it is the attempt gate, not the correctness guarantee.
+
+**Per clause 3 of the same routed concern, the OPERATOR-SYNCHRONOUS Reflex deploy path (the REST/MCP
+deploy handler covered in "Chokepoints future routes must clear" above, which runs on whichever
+replica received the request) must NOT be epoch-fenced.** It is arbitrated by its own guarded
+compare-and-swap on the `ReflexSetStore` row (approval-digest match, R9) — the same two-dispatch-planes
+split `PolicyEvaluator::dispatch_due` (leader-gated, fenced) vs `PolicyEvaluator::remediate`
+(operator-synchronous, its own per-`(policy,agent)` CAS, never fenced) already establishes for policy
+remediation. **So there are two distinct Reflex writes, arbitrated two different ways: the REST/MCP
+deploy handler's write to `ReflexSetStore` (operator-synchronous — a guarded CAS, gates on the
+approval digest, never epoch-fenced) is what an operator's deploy call performs; the background
+compile/`push_sets` loop's claim-and-dispatch write (leader-driven — epoch-fenced per above) is what
+turns an already-deployed, already-approved row into an actual push to agents.** Confusing the two
+— fencing the operator path, or leaving the background path merely leader-gated without a fenced
+write — is the violation this correction exists to prevent. R9 pins a paused-ex-leader regression
+test proving a fenced-out replica's push attempt is rejected at the write, not merely skipped at the
+gate.
 
 | Loop | `BackgroundJobClass` | Why |
 |---|---|---|
@@ -747,9 +820,12 @@ so treat this file as the correction point if they ever do:
 > `Push`-is-Guardian-only invariant is unaffected — Reflex never touches `crud_ops[]`/`Push`).
 > CATASTROPHIC: (1) the **consent gate** — a dangerous Reaction (per `dangerous_reactions_in_spec()`,
 > a SIBLING chokepoint to `dangerous_enforce_in_spec`, fed by `CommandCapabilityRegistry::classify`)
-> is REFUSED unless chain-consent (an affirmative interaction.* response TOKEN, never a bare rc) or
-> all-server tag-consent (a direct `TagStore` read, byte-exact `"server"`, unclassified/absent =
-> workstation) holds — independent of escalation policy; (2) **digest-bound two-person approval**
+> is REFUSED unless all-server tag-consent (a direct `TagStore` read, byte-exact `"server"`,
+> unclassified/absent = workstation) holds — independent of escalation policy. **v1 has NO chain
+> consent** — all five `interaction.*` actions are themselves dangerous
+> (`ExecuteGate::AdminOrApproval`), so a chain-consent rule cannot bootstrap its own first consent;
+> chain consent is a future extension, not yet designed, and no `interaction.*` Reaction can run on a
+> workstation-class device in v1; (2) **digest-bound two-person approval**
 > (D9) from a DISTINCT HUMAN ROOT (ADR-0033 §7), recomputed and compared at every compile, 409 on
 > review-time drift, fail-closed on mismatch — break-glass is a NEW, not-yet-built ApprovalManager
 > capability; (3) Reflex Reaction EXECUTION (never `push_sets`, which IS a dispatch site) is
