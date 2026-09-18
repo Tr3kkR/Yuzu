@@ -299,12 +299,19 @@ std::optional<DiskTotals> sum_block_storage_stats_empty_iterator_for_test() {
 namespace {
 
 // Sets `key` in `dict` to a CFNumber wrapping `*value`, or leaves it entirely absent when
-// `value` is nullopt — the omission that drives read_driver_stats()'s kSkip arm.
+// `value` is nullopt — the omission that drives read_driver_stats()'s kSkip arm. Also
+// leaves it absent (rather than crash) if `dict` itself is null (the caller's
+// CFDictionaryCreateMutable failed) or CFNumberCreate fails (governance safe-8: an
+// allocation failure here is an OOM condition, astronomically unlikely, but must fail an
+// assertion, not crash the test binary) — either way the key ends up omitted, which is
+// already a defined, tested code path (kSkip), not a new failure mode to reason about.
 void set_stat_key_for_test(CFMutableDictionaryRef dict, CFStringRef key,
                             std::optional<std::int64_t> value) {
-    if (!value)
+    if (!dict || !value)
         return;
     ScopedCFRef<CFNumberRef> num{CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt64Type, &*value)};
+    if (!num)
+        return;
     CFDictionarySetValue(dict, key, num.get());
 }
 
@@ -316,6 +323,8 @@ DriverStatFixtureResult read_driver_stats_for_test(
     std::optional<std::int64_t> read_time_ns, std::optional<std::int64_t> write_time_ns) {
     ScopedCFRef<CFMutableDictionaryRef> dict{CFDictionaryCreateMutable(
         kCFAllocatorDefault, 6, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks)};
+    if (!dict)
+        return DriverStatFixtureResult{.skipped = true}; // allocation failure — never crash
     set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey), bytes_read);
     set_stat_key_for_test(dict.get(), CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey),
                           bytes_written);
