@@ -119,17 +119,41 @@ do_tick() ->
 do_tick(Targets) ->
     Connected = [node() | nodes()],
     ToDial = Targets -- Connected,
-    Failures = lists:foldl(fun(Target, Acc) ->
+    FailedTargets = lists:foldl(fun(Target, Acc) ->
         case net_kernel:connect_node(Target) of
             true -> Acc;
-            _    -> Acc + 1
+            _    -> [Target | Acc]
         end
-    end, 0, ToDial),
-    telemetry:execute([yuzu, gw, cluster, peers_resolved], #{count => length(Targets)}, #{}),
+    end, [], ToDial),
+    %% Self is a RESOLVED-but-never-DIALED address: DNS naturally returns
+    %% every replica's address, including this node's own (a scaled Compose
+    %% service resolves to all N members). `nodes()` never includes self by
+    %% Erlang definition, so counting self into `peers_resolved` makes it
+    %% permanently 1 higher than `peers_connected` on a fully healthy
+    %% cluster — the `YuzuGatewayClusterPartiallyFormed` alert (`peers_resolved
+    %% - peers_connected > 0`) would never clear. Exclude self so both gauges
+    %% count EXTERNAL peers on the same basis (found + empirically verified,
+    %% HA WS-4 #4555 governance Gate 4 happy-path review).
+    ExternalTargets = Targets -- [node()],
+    telemetry:execute([yuzu, gw, cluster, peers_resolved], #{count => length(ExternalTargets)}, #{}),
     telemetry:execute([yuzu, gw, cluster, peers_connected], #{count => length(nodes())}, #{}),
-    case Failures of
-        0 -> ok;
-        N -> telemetry:execute([yuzu, gw, cluster, connect_failed], #{count => N}, #{})
+    case FailedTargets of
+        [] ->
+            ok;
+        _ ->
+            %% Bounded, state-triggered logging (only on an actual failure,
+            %% never per successful/no-op tick) — telemetry alone left an
+            %% on-call operator with a bare failure COUNT and no peer names
+            %% to act on before Prometheus/Grafana is wired up (consistency-
+            %% auditor C-1 / sre Gate 6 finding, #4555 governance run).
+            logger:warning(
+                "Cluster discovery: failed to connect to ~p peer(s): ~p. "
+                "Check the distribution cookie matches on every node, and "
+                "that the peer's distribution port (9100-9105) and epmd "
+                "(4369) are reachable.",
+                [length(FailedTargets), FailedTargets]),
+            telemetry:execute([yuzu, gw, cluster, connect_failed],
+                               #{count => length(FailedTargets)}, #{})
     end.
 
 %% @doc The current peer node set — an explicit static override
@@ -154,7 +178,10 @@ resolve_targets() ->
 resolve_seed_dns_addrs() ->
     SeedName = application:get_env(yuzu_gw, cluster_seed_dns_name, <<"gateway">>),
     try [inet:ntoa(Addr) || Addr <- inet_res:lookup(binary_to_list(SeedName), in, a)]
-    catch _:_ -> []
+    catch Class:Reason ->
+        logger:debug("Cluster discovery: DNS lookup for seed name ~p failed: ~p:~p",
+                     [SeedName, Class, Reason]),
+        []
     end.
 
 %% @doc Pure: every gateway node shares the SAME short name — nodes are

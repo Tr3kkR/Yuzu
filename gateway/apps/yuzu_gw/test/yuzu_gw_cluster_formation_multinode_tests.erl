@@ -62,13 +62,38 @@ do_tick_connects_a_genuinely_disconnected_peer_test_() ->
 
 %% A target that cannot possibly resolve to a live node is a clean,
 %% non-crashing failure — do_tick/1 must survive it and still report the
-%% (zero) connected count via telemetry, not raise.
+%% (zero) connected count via telemetry, not raise. Also asserts the
+%% `connect_failed` telemetry counter actually FIRES on this path
+%% (quality-engineer finding, #4555 governance run): prior to this test,
+%% zero references to `connect_failed`/`peers_resolved`/`peers_connected`
+%% existed anywhere in this test suite, so the counter the shipped
+%% `YuzuGatewayClusterPartiallyFormed` alert's remediation guidance leans
+%% on was unverified by any test.
 do_tick_survives_an_unreachable_target_test_() ->
     {timeout, 30, fun() ->
         yuzu_gw_registry_multinode_tests:ensure_distributed(),
-        Bogus = list_to_atom("yuzu_gw_definitely_not_running@127.0.0.1"),
-        ?assertEqual(ok, yuzu_gw_cluster_discovery:do_tick([Bogus])),
-        ?assertNot(lists:member(Bogus, nodes()))
+        Self = self(),
+        HandlerId = {?MODULE, erlang:unique_integer([positive])},
+        telemetry:attach(
+            HandlerId,
+            [yuzu, gw, cluster, connect_failed],
+            fun(_Event, Measurements, _Meta, _Config) ->
+                Self ! {connect_failed, Measurements}
+            end,
+            #{}),
+        try
+            Bogus = list_to_atom("yuzu_gw_definitely_not_running@127.0.0.1"),
+            ?assertEqual(ok, yuzu_gw_cluster_discovery:do_tick([Bogus])),
+            ?assertNot(lists:member(Bogus, nodes())),
+            Received = receive
+                {connect_failed, Meas} -> Meas
+            after 2000 ->
+                {error, timeout}
+            end,
+            ?assertEqual(#{count => 1}, Received)
+        after
+            telemetry:detach(HandlerId)
+        end
     end}.
 
 %%%===================================================================
@@ -96,8 +121,15 @@ running_server_telemeters_nodeup_and_nodedown_test_() ->
                 Self ! {telemetry, Event, Meta}
             end,
             #{}),
+        %% Bound BEFORE the try (quality-engineer finding, #4555 governance
+        %% run): if the node_up assertion below fails/times out, the `after`
+        %% clause must still be able to stop the peer -- a zombie distributed
+        %% peer process otherwise survives for the rest of this eunit VM's
+        %% lifetime, matching the sibling convention every OTHER multinode
+        %% test in this file and in yuzu_gw_registry_multinode_tests.erl
+        %% already follows.
+        {ok, Peer, PeerNode} = start_peer(),
         try
-            {ok, Peer, PeerNode} = start_peer(),
             true = net_kernel:connect_node(PeerNode),
             ?assertEqual(
                 ok,
@@ -107,6 +139,7 @@ running_server_telemeters_nodeup_and_nodedown_test_() ->
                 ok,
                 await_telemetry([yuzu, gw, cluster, node_down], PeerNode, 15000))
         after
+            stop_peer(Peer),
             telemetry:detach(HandlerId),
             case StartedHere of
                 true  -> unlink(DiscoveryPid), exit(DiscoveryPid, kill);

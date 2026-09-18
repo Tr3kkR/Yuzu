@@ -12,7 +12,7 @@ single server process.
 - [GatewayUpstream Service](#gatewayupstream-service) -- PARTIALLY IMPLEMENTED
 - [Configuration](#configuration)
 - [Building and Testing](#building-and-testing)
-- [Gateway Clustering](#gateway-clustering) -- PLANNED
+- [Gateway Clustering](#gateway-clustering) -- PARTIALLY IMPLEMENTED
 - [Prometheus Metrics](#prometheus-metrics) -- PARTIALLY IMPLEMENTED
 - [Reference](#reference)
 
@@ -290,6 +290,17 @@ distribution address. Needed on a bare-VM/multi-NIC host or a container
 behind NAT where auto-detection is ambiguous or wrong; every gateway node
 otherwise auto-detects it with zero configuration under Docker Compose.
 
+Auto-detection order (first success wins — useful when debugging why a
+container picked a surprising address):
+1. `YUZU_GW_ADVERTISE_ADDR` itself, if already set — wins outright.
+2. Resolve `YUZU_GW_SEED_DNS_NAME` (default `gateway`) to A records and
+   intersect them with this container's own local interface addresses —
+   "which of the addresses my peers would also see is mine."
+3. Resolve this container's own hostname to an address.
+4. Default `127.0.0.1` (matches the pre-`#4555` single-node behavior).
+
+See `deploy/docker/gateway-entrypoint.sh` for the exact logic.
+
 ### TLS posture (M1)
 
 > **⚠ SECURITY — do not expose the agent listener (`:50051`) to an untrusted
@@ -418,6 +429,16 @@ legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
 floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
 bypasses the length check too.
+
+**Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
+EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
+distribution listener range **TCP 9100-9105** (`inet_dist_listen_min`/`_max`
+in `config/sys.config`) reachable between every node — this is a FIXED
+6-port range (one listener per node), so it also caps a single cluster at 6
+gateway nodes today. Both EPMD and the distribution range should be
+firewalled to ONLY the other gateway nodes, never exposed publicly — the
+cookie is the authentication, but a closed network is still the first line
+of defense.
 
 > **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
 > boot guard and restores the unauthenticated inter-node RPC surface (#659); it
@@ -551,6 +572,14 @@ keeps retrying — cluster formation is fail-open, never a new way for a
 discovery hiccup to become an agent-facing outage. See ADR-2002 §7b for the
 full mechanism-choice record and `docker-compose.reference-gateway-cluster.yml`
 for a runnable demo.
+
+**Retry has no backoff, by design** (self-healing must stay prompt), which
+also means a persistently misconfigured `YUZU_GW_SEED_DNS_NAME` causes every
+node to re-query the seed name every 5s indefinitely — DNS query volume
+scales linearly with cluster size. Bounded/negligible at the reference rig's
+scale; if you operate a cluster large enough for this to matter against
+shared DNS infrastructure, treat the redial interval
+(`YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS`) as a tuning knob.
 
 Forming the mesh is what makes HA WS-4 4.3a's per-agent cross-node `pg`
 routing (agents connecting to a *different* node than the one dispatching a

@@ -141,9 +141,24 @@ evaluate_cookie(_Node, Cookie, Allow) ->
                 "YUZU_GW_ALLOW_DEFAULT_COOKIE=1."),
             {error, insecure_distribution_cookie};
         {true, true} ->
+            %% Name WHICH condition(s) triggered — a bare "default or too
+            %% short" reads as one undifferentiated warning, and an operator
+            %% who set this override for a KNOWN-default cookie (low stakes,
+            %% isolated lab) may not register that a short-but-CUSTOM cookie
+            %% is what's actually flagged, leaving the DNS-dial-out
+            %% brute-force oracle #4555 introduces fully open (unhappy-path
+            %% UP-6, #4555 governance run).
+            Reason = case {IsDefault, TooShort} of
+                {true, true}  -> "the insecure default value AND shorter than the minimum length";
+                {true, false} -> "the insecure default value";
+                {false, true} -> "shorter than the minimum length"
+            end,
             logger:warning(
-                "Erlang distribution cookie is insecure (default or too short), but "
-                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only)."),
+                "Erlang distribution cookie is insecure (~s), but "
+                "YUZU_GW_ALLOW_DEFAULT_COOKIE=1 is set — proceeding (dev/CI only). "
+                "A short custom cookie remains brute-forceable via the DNS-based "
+                "cluster discovery dial-out even with this override set.",
+                [Reason]),
             ok;
         {false, _} ->
             ok
@@ -255,6 +270,32 @@ apply_env_overrides() ->
                 end
         end
     end, Overrides),
+
+    %% HA WS-4 #4555: YUZU_GW_SEED_NODES set but every entry was empty/
+    %% whitespace-only (a stray trailing comma, blank entries) parses to []
+    %% with no error — correct, one bad entry among good ones should not
+    %% abort the whole override — but the generic "ENV override: ... = []"
+    %% info line above is easy to miss and indistinguishable at a skim from
+    %% "operator never set this at all", which silently falls through
+    %% resolve_targets/0 to DNS discovery instead of the intended static
+    %% topology (unhappy-path UP-9, #4555 governance run). Surface it
+    %% distinctly.
+    case os:getenv("YUZU_GW_SEED_NODES") of
+        false ->
+            ok;
+        RawSeedNodes ->
+            case application:get_env(yuzu_gw, cluster_seed_nodes) of
+                {ok, []} ->
+                    logger:warning(
+                        "YUZU_GW_SEED_NODES was set ('~s') but every entry was "
+                        "empty after trimming — falling back to DNS discovery "
+                        "(YUZU_GW_SEED_DNS_NAME) instead of the intended static "
+                        "peer list. Check for a stray comma or blank entry.",
+                        [RawSeedNodes]);
+                _ ->
+                    ok
+            end
+    end,
 
     %% TLS cert overrides (these set the tls proplist)
     apply_tls_overrides().
