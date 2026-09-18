@@ -1,6 +1,8 @@
 #include "dex_read_model.hpp"
 
-#include "dex_routes.hpp" // dex_device_score -- full DexFleet/DexSignalGroup defs live here too
+#include "app_perf_daily_store.hpp" // AppPerfDailyRow full def (gap-#2 device app-perf serializer)
+#include "dex_routes.hpp" // dex_device_score + the DEX read-model builders' store reads
+#include "guaranteed_state_store.hpp" // GuaranteedStateStore methods -- no longer transitive via dex_read_model.hpp
 
 #include <nlohmann/json.hpp>
 

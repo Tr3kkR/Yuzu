@@ -91,6 +91,14 @@ EXPECTED_FAMILIES = {
             "server/core/src/compliance_api_local.hpp",
         ],
     },
+    "dex": {
+        "tus": [
+            "server/core/src/dex_types.hpp",
+            "server/core/src/dex_read_model.hpp",
+            "server/core/src/dex_api.hpp",
+            "server/core/src/dex_api_local.hpp",
+        ],
+    },
 }
 EXPECTED_FORBIDDEN_HEADER_PATTERNS = [
     "*_store.hpp",

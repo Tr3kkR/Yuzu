@@ -6,7 +6,7 @@ ADR-0031's migration step 3 requires that a family's presentation/handler
 translation units do NOT reach a data store directly - they call the
 in-process API instead. This script is the first per-family scaffold for that
 rule (issue tracked under the /split control plane's WS-A4 item 1); today it
-covers four families — `network`, `verify`, `compliance`, `device` (see FAMILIES below).
+covers five families — `network`, `verify`, `compliance`, `device`, `dex` (see FAMILIES below).
 
 WHAT THIS IS: a sound-for-its-stated-claim INCLUDE-CLOSURE check, NOT a full
 static analysis and NOT a substitute for review. The enforceable proxy for
@@ -77,8 +77,8 @@ genuine external/system/vendored header (the C++ stdlib, httplib, spdlog,
 libpq-fe, ...), which by construction cannot define one of this project's own
 store classes, so treating it as opaque there is sound.
 
-FAMILY COVERAGE: today this checks four families — `network`, `verify`, `compliance` and
-`device` — each contributing its dashboard/UI, REST-route (or seamed routes)
+FAMILY COVERAGE: today this checks five families — `network`, `verify`, `compliance`,
+`device` and `dex` — each contributing its dashboard/UI, REST-route (or seamed routes)
 and model translation units, plus the abstract in-process API header and (since
 #4249) the core-only `*_api_local.hpp` factory header. The exact per-family TU
 set is the FAMILIES dict below. Each family's REST-handler TWIN registrations
@@ -162,8 +162,10 @@ FORBIDDEN_HEADER_PATTERNS = [
 ]
 
 # ── Family definitions ────────────────────────────────────────────────────
-# Three families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
-# #4250, the SECOND family) and `compliance` (the THIRD). Each set covers the
+# Five families so far: `network` (WS-A4 item 1's pilot), `verify` (WS-A4
+# #4250, the SECOND family), `compliance` (the THIRD, #4337), `device`
+# (the FOURTH, #4484) and `dex` (the FIFTH — the DEX signals seam). Each set
+# covers the
 # presentation-side TUs plus BOTH halves of the seam header pair: the
 # abstract `*_api.hpp` and the core-only `*_api_local.hpp` (#4249). Enforcing
 # the local header pins its own purity (forward decls only); it cannot
@@ -221,6 +223,29 @@ FAMILIES = {
             "server/core/src/compliance_model.cpp",
             "server/core/src/compliance_api.hpp",
             "server/core/src/compliance_api_local.hpp",
+        ],
+    },
+    # `dex` (ADR-0031 WS-A4, the FIFTH family through the seam) — the DEX
+    # signals / experience-score surface (GuaranteedStateStore-backed
+    # `/api/v1/dex/*` reads). The enforced set is the four PURE seam headers:
+    # `dex_types.hpp` (the relocated DEX leaf PODs), `dex_read_model.hpp` (the
+    # shared build_dex_*_model model header, made pure in slice 1a), and the
+    # abstract/local api pair. Their closures must contain NO store header —
+    # that is the whole point of the relocation out of the CATASTROPHIC
+    # `guaranteed_state_store.hpp`. The IMPL TUs `dex_read_model.cpp` and
+    # `dex_api.cpp` are deliberately OUTSIDE this set: they legitimately reach
+    # the store (they are the core side of the seam), exactly like every other
+    # family's `*_api.cpp`. The CONSUMERS `rest_api_v1.cpp` / `mcp_server.cpp` /
+    # `dex_routes.cpp` / `device_lens_routes.cpp` are multi-family / mixed TUs
+    # and stay INSPECTED-NOT-ENFORCED (reviewed by hand), same posture as the
+    # other families' twin-registration files. REST routes through `DexApi`
+    # today; the MCP / dashboard / device-lens rewire is tracked as follow-up.
+    "dex": {
+        "tus": [
+            "server/core/src/dex_types.hpp",
+            "server/core/src/dex_read_model.hpp",
+            "server/core/src/dex_api.hpp",
+            "server/core/src/dex_api_local.hpp",
         ],
     },
 }

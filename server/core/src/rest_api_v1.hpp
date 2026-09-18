@@ -18,6 +18,7 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4: the public in-process VERIFY API seam
+#include "dex_api.hpp"    // ADR-0031 WS-A4: the public in-process DEX signals API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "dex_routes.hpp" // DexFleet -- the DexFleetFn provider type below
 #include "network_perf_model.hpp"
@@ -502,7 +503,14 @@ public:
         // instance `DeviceRoutes`/MCP `list_agents`+`get_agent_details` use, so
         // REST/dashboard/MCP can never disagree on device identity data.
         // nullptr = both routes answer 503 (provider unwired).
-        std::shared_ptr<const DeviceApi> device_api = nullptr);
+        std::shared_ptr<const DeviceApi> device_api = nullptr,
+        // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API
+        // seam — backs the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads (the SAME assembly the dashboard fragments
+        // and the MCP DEX signal tools build). nullptr = the DEX signal
+        // handlers fall back to the shared build_dex_*_model helpers directly
+        // (byte-identical), so a caller that has not wired it is unaffected.
+        std::shared_ptr<const DexApi> dex_api = nullptr);
 
     /// Sink-based overload — used by tests to register routes against an
     /// in-process TestRouteSink so dispatch happens without httplib::Server's
@@ -594,7 +602,10 @@ public:
         std::shared_ptr<const VerifyApi> verify_api = nullptr,
         // ADR-0031 WS-A4 wave 2: see the production overload's doc comment
         // above; identical trailing-optional-dep, 503-when-unwired contract.
-        std::shared_ptr<const DeviceApi> device_api = nullptr);
+        std::shared_ptr<const DeviceApi> device_api = nullptr,
+        // ADR-0031 WS-A4 (fifth family): see the production overload's doc
+        // comment above; identical trailing-optional-dep, fall-back-when-unwired.
+        std::shared_ptr<const DexApi> dex_api = nullptr);
 
     /// PR 4.3 — engine-principal lifecycle store backing
     /// `/api/v1/engine-principals`, threaded post-construction. (During the

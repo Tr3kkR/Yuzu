@@ -23,14 +23,16 @@
 /// single-observation detail, health score, trends, overview) follow the
 /// same shape.
 ///
-/// `DexFleet`/`DexSignalGroup` (declared in `dex_routes.hpp`, which itself
-/// pulls `<httplib.h>` for the `DexRoutes` route class) are taken by const
-/// reference below and only FORWARD-declared here — this header stays
-/// httplib-free per Rule 1; the .cpp implementation includes `dex_routes.hpp`
-/// for their full definitions, same as `mcp_server.cpp` already does today.
+/// `DexFleet`/`DexSignalGroup` and the DEX leaf value types (DexSignalCount,
+/// DexEntitySummary, GuardianObservationRow, …) now live in the pure
+/// `dex_types.hpp` (included below) — this header stays store-free AND
+/// httplib-free per Rule 1, so it can sit behind the abstract `dex_api.hpp`
+/// seam (ADR-0031 WS-A4) without dragging in a store or `<httplib.h>`. The
+/// gap-#2 device app-perf serializer takes `AppPerfDailyRow` (Seam 2 territory)
+/// by const reference only, so it stays a FORWARD declaration here — the .cpp
+/// includes `app_perf_daily_store.hpp` for the full definition.
 
-#include "guaranteed_state_store.hpp" // DexSignalCount/DexSubjectCount/DexDaySignal/GuardianObservationRow -- httplib-free
-#include "app_perf_daily_store.hpp"   // AppPerfDailyRow (device app-perf drill)
+#include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types + DexFleet/DexSignalGroup (pure)
 
 #include <cstdint>
 #include <optional>
@@ -41,8 +43,7 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
-struct DexFleet;       // dex_routes.hpp -- forward decl only, see file header
-struct DexSignalGroup; // dex_routes.hpp -- forward decl only, see file header
+struct AppPerfDailyRow; // app_perf_daily_store.hpp -- fwd decl only (Seam 2 device app-perf drill); full def in dex_read_model.cpp
 
 // ── MCP-only gap #1: per-device DEX score (/fragments/device/dex, GET /api/v1/dex/devices/{id}) ──
 

@@ -189,6 +189,7 @@
 #include "device_routes.hpp"
 #include "device_lens_routes.hpp"
 #include "device_api_local.hpp" // ADR-0031 WS-A4 wave 2: make_local_device_api
+#include "dex_api_local.hpp"    // ADR-0031 WS-A4 (fifth family): make_local_dex_api
 #include "preflight_eval.hpp"
 #include "deployment_routes.hpp"
 #include "deployment_run_store.hpp"
@@ -16050,6 +16051,19 @@ private:
         // (PreflightRoutes, DeploymentRoutes, TarTreeRoutes, and McpServer's/
         // TarTreeRoutes' `set_all_devices_fn`), unrelated to DeviceRoutes itself.
         auto device_api = make_local_device_api(registry_, tag_store_.get());
+        // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — ONE
+        // instance backing the GuaranteedStateStore-backed GET /api/v1/dex/*
+        // signal/experience reads, wired with the SAME `dex_fleet_fn` closure
+        // (defined above) the DEX fragments/REST/MCP already share, so the
+        // fleet denominator can never diverge between the seam and the
+        // fragments. Passed to RestApiV1::register_routes below.
+        // Gated on store presence so `!dex_api` in the REST handlers is the
+        // exact readiness signal the old `if (!guaranteed_state_store)` 503
+        // guard used: store present → wired; store absent → nullptr → 503
+        // (byte-identical). Mirrors verify_api's "null → 503" contract.
+        std::shared_ptr<yuzu::server::DexApi> dex_api;
+        if (guaranteed_state_store_)
+            dex_api = make_local_dex_api(guaranteed_state_store_.get(), dex_fleet_fn);
         // Per-row/per-page DEX score — wraps dex_device_score against the SAME
         // fixed 7-day window the pre-rewire dashboard code used; dex_device_score
         // itself already returns -1 on a null store, so no separate null-guard is
@@ -18279,7 +18293,12 @@ private:
             // ADR-0031 WS-A4 wave 2: the SAME DeviceApi instance DeviceRoutes
             // above and MCP list_agents/get_agent_details below use, so all
             // three GET /api/v1/devices[/{id}] siblings never disagree.
-            device_api);
+            device_api,
+            // ADR-0031 WS-A4 (fifth family): the DEX signals API seam — the DEX
+            // signal/experience handlers route their model assembly through
+            // this (falling back to the shared build_dex_*_model helpers when
+            // unwired, byte-identical).
+            dex_api);
 
         // -- Register MCP server routes ----------------------------------------
 
@@ -18476,6 +18495,12 @@ private:
             // the DexRoutes registration) for why this must be the identical
             // lambda, not a second copy.
             mcp_server_->set_dex_fleet_fn(dex_fleet_fn);
+            // ADR-0031 WS-A4 (fifth family): the SAME DexApi seam instance the
+            // REST /api/v1/dex/* handlers use (constructed above, gated on
+            // store presence), so the MCP DEX signal tools and REST never
+            // disagree. nullptr when the store is absent → the tools' !dex_api_
+            // readiness guard answers "store unavailable" (byte-identical).
+            mcp_server_->set_dex_api(dex_api);
             // #4035 review fix (colleague review, BLOCKING): the SAME
             // dedicated GuaranteedState:Read-scoped resolver wired into the
             // REST registration's trailing dex_visible_fn param above (see

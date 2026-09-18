@@ -31,6 +31,7 @@
 #include "authz_gates.hpp" // authz::FleetReadGate -- the version-devices fragment's gate
 #include "dex_app_perf_ui.hpp" // DexGroupOption + the app-perf render decls
 #include "dex_perf_model.hpp"
+#include "dex_types.hpp" // ADR-0031 WS-A4: DexFleet/DexSignalGroup + DEX leaf value types (pure)
 
 #include <httplib.h>
 
@@ -47,47 +48,10 @@
 namespace yuzu::server {
 
 class GuaranteedStateStore;
-struct GuardianObservationRow;
-struct DexSignalCount; // guaranteed_state_store.hpp -- forward decl only, see DexFamilyRollup below
 class HttpRouteSink;
 
-/// Fleet-size denominator for the DEX rates — sourced cross-store from the agent
-/// registry (NOT the crash store). `windows_online` remains the established
-/// headline crash-rate denominator (and the "all" catalogue lens's denominator,
-/// kept for continuity); macOS and Linux crash/reliability collectors now exist
-/// too, and the per-OS counters below denominate the catalogue's single-OS
-/// lenses. `total_online` is context. A struct (not a registry dep) keeps
-/// render pure + testable.
-struct DexFleet {
-    int64_t windows_online{0};
-    int64_t total_online{0};
-    /// Distinct OS tokens (lowercased: "windows"/"linux"/"darwin") of the agents
-    /// CONNECTED right now — the coverage scope for the Catalogue's "All connected"
-    /// lens. Empty when nothing is connected.
-    std::vector<std::string> connected_os;
-    /// CONNECTED agents as (agent_id, normalized-os: "windows"/"linux"/"macos").
-    /// The Overview computes a per-device DEX score for each (window-respecting) to
-    /// build the experience distribution AND groups by os for the segment breakdown.
-    /// Kept here (not pre-scored) so only the Overview pays the per-device cost.
-    std::vector<std::pair<std::string, std::string>> connected_agents;
-    /// Per-OS online-agent denominators (#1746) — the same coverage-honest count as
-    /// windows_online, split by platform, so the Catalogue's single-OS filter can
-    /// score a family against THAT OS's own online count instead of borrowing
-    /// windows_online. APPENDED here (not alongside windows_online) so the many
-    /// positional aggregate initializers of this struct across the test suite keep
-    /// compiling unchanged — trailing members default-init to 0.
-    int64_t linux_online{0};
-    int64_t macos_online{0};
-};
-
-/// One display family of the server-side signal catalogue. PUBLIC since F1:
-/// the Settings → DEX alerts panel renders the routable-type list from this
-/// same single source of truth (the /dex Catalogue's grouping).
-struct DexSignalGroup {
-    const char* name;
-    std::vector<const char*> types;
-};
-
+/// `DexFleet` and `DexSignalGroup` were relocated verbatim to the pure
+/// "dex_types.hpp" (included above) for the ADR-0031 WS-A4 DexApi seam.
 /// The catalogued signal types, grouped for display — the server-side mirror
 /// of the agent catalogue (keep in sync; the paired drift-net tests bite).
 const std::vector<DexSignalGroup>& dex_signal_groups();

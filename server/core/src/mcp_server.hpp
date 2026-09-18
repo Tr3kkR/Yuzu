@@ -29,6 +29,7 @@
 #include "dex_perf_model.hpp"
 #include "network_api.hpp" // ADR-0031 WS-A4: the public in-process /network API seam
 #include "verify_api.hpp" // ADR-0031 WS-A4 #4250: the public in-process VERIFY API seam
+#include "dex_api.hpp"    // ADR-0031 WS-A4 (fifth family): the public in-process DEX signals API seam
 #include "compliance_api.hpp" // ADR-0031 WS-A4: the public in-process compliance/policy API seam
 #include "device_api.hpp" // ADR-0031 WS-A4 wave 2: the public in-process DEVICE API seam
 #include "dex_routes.hpp" // #4035: DexFleet -- the DexFleetFn provider seam below
@@ -671,6 +672,15 @@ public:
     using DexFleetFn = std::function<DexFleet()>;
     void set_dex_fleet_fn(DexFleetFn fn) { dex_fleet_fn_ = std::move(fn); }
 
+    /// ADR-0031 WS-A4 (fifth family): the SAME in-process DEX signals API seam
+    /// the REST `/api/v1/dex/*` handlers and the dashboard consume — server.cpp
+    /// wires the IDENTICAL instance so the MCP DEX signal tools can never
+    /// disagree with REST/dashboard on the signal/experience model. Unset
+    /// (nullptr) makes the DEX signal tools answer the same "store unavailable"
+    /// error their `!guaranteed_state_store` guard used to (readiness gate),
+    /// mirroring verify_api's null→error contract.
+    void set_dex_api(std::shared_ptr<const DexApi> a) { dex_api_ = std::move(a); }
+
     /// #4035 hardening (governance): the SAME username-keyed visible-agent-set
     /// resolver `RestApiV1::DexVisibleFn` receives (see its doc comment,
     /// rest_api_v1.hpp) — server.cpp wires the IDENTICAL lambda
@@ -1137,6 +1147,8 @@ private:
     ResponseVisibleSetFn response_visible_set_fn_;
     // #4035 — see set_dex_fleet_fn above.
     DexFleetFn dex_fleet_fn_;
+    // ADR-0031 WS-A4 (fifth family) — see set_dex_api above.
+    std::shared_ptr<const DexApi> dex_api_;
     // #4035 hardening (governance) — see set_dex_visible_fn above.
     DexVisibleFn dex_visible_fn_;
 };
