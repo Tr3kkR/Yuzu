@@ -447,6 +447,26 @@ TEST_CASE("from-tar-query: a type-mismatched sql is refused with 400, never an "
     CHECK(j["error"]["message"].get<std::string>().find("'sql' is required") != std::string::npos);
 }
 
+TEST_CASE("from-tar-query: a type-mismatched name is refused with 400, never an "
+          "uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][tar][security][4406]") {
+    // Adversarial-review finding: body.value("name", "") at the run_async call
+    // site threw the same way sql/instruction_id did before #4406's fix -
+    // missed in the first pass because name is passed inline as an argument,
+    // not extracted into a named local like the other guarded fields.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    int status = 0;
+    auto j =
+        h.post("/api/v1/result-sets/from-tar-query", R"({"sql":"SELECT 1","name":123})", status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
+          std::string::npos);
+}
+
 TEST_CASE("#2500 — a supplied parent_id that names no parent is refused, not widened",
           "[pg][result_set][async][tar][targeting][security]") {
     // PG-port note (merge of #2500's dev-side case into the ADR-0036 branch):
@@ -691,6 +711,26 @@ TEST_CASE("from-instruction-result: a type-mismatched instruction_id is refused 
     CHECK(status == 400);
     CHECK(h.calls.empty());
     CHECK(j["error"]["message"].get<std::string>().find("'instruction_id' is required") !=
+          std::string::npos);
+}
+
+TEST_CASE("from-instruction-result: a type-mismatched name is refused with 400, "
+          "never an uncaught nlohmann::json::type_error",
+          "[pg][result_set][async][instruction][security][4406]") {
+    // Adversarial-review finding, same as from-tar-query's sibling test above.
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    AsyncHarness h(pool);
+    auto iid = make_instruction(*h.instr);
+    nlohmann::json body;
+    body["instruction_id"] = iid;
+    body["name"] = 123;
+    int status = 0;
+    auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+    CHECK(status == 400);
+    CHECK(h.calls.empty());
+    CHECK(j["error"]["message"].get<std::string>().find("name must be a JSON string") !=
           std::string::npos);
 }
 

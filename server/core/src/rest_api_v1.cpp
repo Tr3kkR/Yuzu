@@ -9518,6 +9518,16 @@ void RestApiV1::register_routes(
                           rs_err(res, 400, "include_empty must be a JSON boolean");
                           return;
                       }
+                      // Adversarial-review finding: body.value("name", "") below threw
+                      // uncaught on a type-mismatched name (e.g. a number) - the same
+                      // #4406 mechanism this PR fixed for sql/instruction_id, on the
+                      // exact same routes, just missed for this sibling optional field.
+                      // Same guard shape as the from-inventory-query route's name check
+                      // above and this route's own include_empty check just above.
+                      if (body.contains("name") && !body["name"].is_string()) {
+                          rs_err(res, 400, "name must be a JSON string");
+                          return;
+                      }
                       const bool include_empty = body.value("include_empty", false);
                       nlohmann::json matcher =
                           include_empty ? nlohmann::json{{"kind", "any_response"}}
@@ -9585,6 +9595,13 @@ void RestApiV1::register_routes(
                               : "";
                       if (instruction_id.empty()) {
                           rs_err(res, 400, "RESULT_SET_BAD_REQUEST: 'instruction_id' is required");
+                          return;
+                      }
+                      // Adversarial-review finding: the same #4406-class gap as
+                      // instruction_id above, on the sibling optional 'name' field
+                      // this route also passes unguarded to run_async below.
+                      if (body.contains("name") && !body["name"].is_string()) {
+                          rs_err(res, 400, "name must be a JSON string");
                           return;
                       }
                       // #4373-class fix: this route had no bound at all on instruction_id
