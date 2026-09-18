@@ -147,6 +147,12 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         nlohmann::json arr = nlohmann::json::array();
+        // #4496: count of records excluded by the depth guard below, threaded
+        // into the response as `results_excluded_by_poison` so a caller can
+        // tell "we checked everything and found N matches" apart from "we
+        // checked everything except some excluded records and found N
+        // matches" - the two are indistinguishable from `count` alone.
+        std::size_t excluded_by_poison = 0;
         for (const auto& r : *records) {
             // #2437-class guard: same hazard as the single-record GET above, but
             // here inside a loop over every matched record - one poisoned row
@@ -159,6 +165,7 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
                             "data_json nests too deeply (#2437-class)",
                             onbehalf::sanitize_for_log(r.agent_id, 128),
                             onbehalf::sanitize_for_log(r.plugin, 128));
+                ++excluded_by_poison;
                 continue;
             }
             nlohmann::json data_obj;
@@ -174,7 +181,8 @@ void register_data_inventory_routes(HttpRouteSink& sink, Deps deps) {
         }
         res.set_content(nlohmann::json({{"results", arr},
                                         {"count", arr.size()},
-                                        {"result_truncated_by_cap", inventory_truncated}})
+                                        {"result_truncated_by_cap", inventory_truncated},
+                                        {"results_excluded_by_poison", excluded_by_poison}})
                             .dump(),
                         "application/json");
     });
