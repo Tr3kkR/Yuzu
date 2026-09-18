@@ -1062,15 +1062,23 @@ bool ResultSetStore::heal_poisoned_payload(const std::string& id) {
     // a materialized row's members are real and still scope-walkable
     // (member_set_owned never filters on status), so this only replaces the
     // poisoned blob, never the row's status.
+    // #4540: RETURNING id + an affected-row check, same idiom as
+    // materialize()'s own status-guarded UPDATE above -- a concurrent delete
+    // between the SELECT above and this UPDATE (delete_set on an independent
+    // connection lease, or the TTL GC sweep, either with no shared lock) must
+    // never be reported as a successful heal for a row that no longer exists.
     const nlohmann::json payload{{"note", kPoisonedPayloadNote}};
     pg::PgResult upd = pg::exec_params(
-        lease.get(), "UPDATE result_set_store.result_sets SET source_payload = $1 WHERE id = $2",
+        lease.get(),
+        "UPDATE result_set_store.result_sets SET source_payload = $1 WHERE id = $2 RETURNING id",
         std::vector<std::string>{payload.dump(), id});
-    if (upd.status() != PGRES_COMMAND_OK) {
+    if (upd.status() != PGRES_TUPLES_OK) {
         spdlog::error("ResultSetStore::heal_poisoned_payload: update failed: {}",
                       PQerrorMessage(lease.get()));
         return false;
     }
+    if (PQntuples(upd.get()) == 0)
+        return false; // gone between the SELECT above and this UPDATE
     return true;
 }
 

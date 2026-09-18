@@ -951,3 +951,47 @@ TEST_CASE("ResultSetStore: heal_poisoned_payload also heals an already-failed ro
     CHECK_FALSE(payload.contains("failure"));
     CHECK_FALSE(payload.contains("junk"));
 }
+
+// #4540 (BLOCKING finding 2): heal_poisoned_payload SELECTs the row, then
+// UPDATEs it -- if a concurrent delete_set / GC sweep removes the row in
+// between (both are independent connection leases with no shared lock), the
+// UPDATE must affect zero rows and the method must report that as a failure,
+// never as the success it used to report unconditionally once
+// PGRES_COMMAND_OK was seen. Simulated deterministically with a BEFORE
+// UPDATE trigger that deletes the row instead of letting the update apply --
+// installed only after the row is safely seeded, so from heal's own SELECT
+// the row looks present and poisoned, and by the time its UPDATE statement
+// runs the row is already gone, the same window a real concurrent delete
+// opens.
+TEST_CASE("ResultSetStore: heal_poisoned_payload reports failure (not success) "
+          "when the row is deleted out from under its own UPDATE",
+          "[pg][result_set][heal_poisoned_payload][security][heal_race_4540]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    REQUIRE(pool.valid());
+    ResultSetStore store(pool);
+
+    CreateRequest r = req("alice", "vanishes-mid-heal");
+    r.source_kind = std::string(source_kind::kTarQuery);
+    r.source_payload = std::string(R"({"sql":"SELECT 1","junk":)") + std::string(40, '[') +
+                        std::string(40, ']') + "}";
+    auto rs = store.create_materialized(r, {"dev-a"});
+    REQUIRE(rs.has_value());
+
+    exec_sql(db.dsn(),
+             "CREATE OR REPLACE FUNCTION test_4540_vanish_mid_heal() RETURNS trigger AS $$ "
+             "BEGIN DELETE FROM result_set_store.result_sets WHERE id = OLD.id; RETURN NULL; "
+             "END; $$ LANGUAGE plpgsql");
+    exec_sql(db.dsn(), "CREATE TRIGGER test_4540_vanish_mid_heal BEFORE UPDATE ON "
+                        "result_set_store.result_sets FOR EACH ROW EXECUTE FUNCTION "
+                        "test_4540_vanish_mid_heal()");
+
+    CHECK_FALSE(store.heal_poisoned_payload(rs->id));
+
+    exec_sql(db.dsn(), "DROP TRIGGER test_4540_vanish_mid_heal ON result_set_store.result_sets");
+    exec_sql(db.dsn(), "DROP FUNCTION test_4540_vanish_mid_heal()");
+
+    // The trigger's own DELETE really ran -- the row is genuinely gone, not
+    // merely reporting a mismatched status while still present.
+    CHECK_FALSE(get_ok(store, rs->id).has_value());
+}
