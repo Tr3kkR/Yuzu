@@ -265,7 +265,10 @@ public:
     /// started, a later call returns false rather than silently swapping the sink out
     /// from under an in-flight report (the engine calls this exactly once, before
     /// start(), so the seal is a defensive one-way latch, not a live requirement).
-    virtual bool set_established_sink(SparkEstablishedFn /*sink*/) { return false; }
+    /// [[nodiscard]]: a `false` return means the sink installation was REFUSED
+    /// (already sealed) — the caller must not silently ignore it, since that
+    /// mechanism's establishment reporting is then unavailable for good.
+    [[nodiscard]] virtual bool set_established_sink(SparkEstablishedFn /*sink*/) { return false; }
 };
 
 /// Platform factory: a real IOCP + ReadDirectoryChangesW file-change mechanism

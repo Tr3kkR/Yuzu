@@ -2796,7 +2796,8 @@ TEST_CASE("Establishment: adoption — a disarm racing a re-arm skips the stale 
 }
 
 TEST_CASE("Establishment: [tsan] established_at is never before armed_at under concurrent "
-          "arm/disarm/report (E11)",
+          "arm/report/read (locking discipline, not disarm/re-arm identity -- see E4/E10 "
+          "for that) (E11)",
           "[spark][established][tsan]") {
     SparkEngine engine;
     FakeMechanism* fake = wire_fake(engine, SparkType::Service);

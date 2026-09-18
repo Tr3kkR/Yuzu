@@ -138,7 +138,10 @@ struct PendingFault {
 /// SparkEstablishedFn's own doc comment for the field semantics. `incarnation`
 /// is this key's recorded value in `key_incarnation_` AT THE MOMENT this entry
 /// was staged (Linux has no cross-tick staleness window to guard against — see
-/// the file header's PR-B3 note — so unlike Windows's twin there is no
+/// drop_stale()'s doc comment for the same-tick Remove+Add staging race
+/// Windows's separate `key_epoch` exists to close; Linux's on_props_changed
+/// runs synchronously on the poll thread (see the Cmd::Remove handling
+/// above) so no such window exists — so unlike Windows's twin there is no
 /// separate `key_epoch` to carry).
 struct PendingEstablished {
     std::string key;
@@ -697,12 +700,14 @@ private:
                     } else {
                         uw = it->second.get();
                     }
-                    // no-op if cmd.key is already present — see the unified
-                    // branch below for why that ("adoption") is now handled
-                    // rather than skipped.
-                    uw->keys.insert(cmd.key);
-                    key_unit_.emplace(cmd.key, cmd.unit);
-                    // Forward-only rebind (#4340 H1): a stale/duplicate Add can
+                    // Exception-safety (governance UP-1(A), adjudicated
+                    // LOW-today/HIGH-post-flip): populate every map
+                    // stage_coverage()'s .at() later reads FIRST, insert into
+                    // .keys LAST — a bad_alloc between these statements now
+                    // leaves a harmless orphan map entry (cleaned up by the
+                    // next Remove) instead of a .keys member .at() will trip
+                    // on, killing the whole mechanism worker thread.
+                    // Forward-only rebind (H1): a stale/duplicate Add can
                     // never regress this key's recorded incarnation — H1's
                     // submission ordering (the engine holds this type's
                     // mech-ops lock across check+submit) means one should never
@@ -711,6 +716,11 @@ private:
                     auto& inc_slot = key_incarnation_[cmd.key];
                     if (cmd.incarnation > inc_slot)
                         inc_slot = cmd.incarnation;
+                    key_unit_.emplace(cmd.key, cmd.unit);
+                    // no-op if cmd.key is already present — see the unified
+                    // branch below for why that ("adoption") is now handled
+                    // rather than skipped.
+                    uw->keys.insert(cmd.key);
                     if (is_new_unit) {
                         if (bus_ok_) {
                             arm_unit(bus, *uw, emits, faults, established);
@@ -771,6 +781,11 @@ private:
                     if (uit == units_.end())
                         continue;
                     uit->second->keys.erase(cmd.key);
+                    // Freed synchronously, no Windows-style retiring_/quiescence list
+                    // needed here: on_props_changed() runs synchronously inside
+                    // sd_bus_process() on this SAME poll thread that also processes
+                    // Cmd::Remove, so there is no in-flight-callback window an async
+                    // APC (Windows's NotifyServiceStatusChangeW hazard) could land in.
                     if (uit->second->keys.empty())
                         units_.erase(uit); // slot RAII releases the match here
                 }
@@ -938,6 +953,21 @@ private:
         // mid-loop can never leave a stale positive coverage the engine keeps
         // trusting after this thread is gone.
         invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // Without this, watch_incarnation() (gated only on started_/inert_, neither
+        // of which this catch block otherwise touches) would keep silently queuing
+        // Cmd::Add into a pending_ deque nobody will ever drain again, returning
+        // SUCCESS to the engine forever -- a zombie mechanism indistinguishable
+        // from a healthy idle one (I6 false-assurance). started_, NOT inert_: the
+        // heartbeat's stats() publishes inert_ fleet-wide ("no system bus" is the
+        // documented common-case meaning) -- flipping it here would misreport a
+        // worker-thread-death fault as a boot-time bus-unavailable condition, a
+        // DIFFERENT false diagnostic. started_ is unpublished and mu_-guarded like
+        // every other write to it in this class.
+        {
+            std::lock_guard lk(mu_);
+            started_ = false;
+        }
         try {
             spdlog::error("spark_service: poll thread exception: {} — mechanism stopping",
                           e.what());
@@ -945,6 +975,21 @@ private:
         }
     } catch (...) {
         invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // Without this, watch_incarnation() (gated only on started_/inert_, neither
+        // of which this catch block otherwise touches) would keep silently queuing
+        // Cmd::Add into a pending_ deque nobody will ever drain again, returning
+        // SUCCESS to the engine forever -- a zombie mechanism indistinguishable
+        // from a healthy idle one (I6 false-assurance). started_, NOT inert_: the
+        // heartbeat's stats() publishes inert_ fleet-wide ("no system bus" is the
+        // documented common-case meaning) -- flipping it here would misreport a
+        // worker-thread-death fault as a boot-time bus-unavailable condition, a
+        // DIFFERENT false diagnostic. started_ is unpublished and mu_-guarded like
+        // every other write to it in this class.
+        {
+            std::lock_guard lk(mu_);
+            started_ = false;
+        }
         try {
             spdlog::error("spark_service: poll thread unknown exception — mechanism stopping");
         } catch (...) {
@@ -2106,11 +2151,13 @@ private:
                     } else {
                         w = it->second.get();
                     }
-                    // no-op if cmd.key is already present — see the unified
-                    // branch below for why that ("adoption") is now handled
-                    // rather than skipped.
-                    w->keys.insert(cmd.key);
-                    key_svc_.emplace(cmd.key, folded);
+                    // Exception-safety (governance UP-1(A), adjudicated
+                    // LOW-today/HIGH-post-flip): populate every map
+                    // stage_coverage()'s .at() later reads FIRST, insert into
+                    // .keys LAST — a bad_alloc between these statements now
+                    // leaves a harmless orphan map entry (cleaned up by the
+                    // next Remove) instead of a .keys member .at() will trip
+                    // on, killing the whole mechanism worker thread.
                     // A fresh subscription epoch for `cmd.key` specifically —
                     // NOT `w->probe_gen` (#2012/#3840 PR-B3 review, round 2):
                     // this is the identity drop_stale() checks, and it must
@@ -2125,7 +2172,7 @@ private:
                     // must still be considered stale.
                     const std::uint64_t this_key_epoch = ++gen_;
                     key_epoch_[cmd.key] = this_key_epoch;
-                    // Forward-only rebind (#4340 H1): a stale/duplicate Add can
+                    // Forward-only rebind (H1): a stale/duplicate Add can
                     // never regress this key's recorded incarnation — H1's
                     // submission ordering means one should never actually
                     // arrive here below the current value in production; this
@@ -2133,6 +2180,11 @@ private:
                     auto& inc_slot = key_incarnation_[cmd.key];
                     if (cmd.incarnation > inc_slot)
                         inc_slot = cmd.incarnation;
+                    key_svc_.emplace(cmd.key, folded);
+                    // no-op if cmd.key is already present — see the unified
+                    // branch below for why that ("adoption") is now handled
+                    // rather than skipped.
+                    w->keys.insert(cmd.key);
                     if (is_new) {
                         begin_probe(*w, established);
                     } else {
@@ -2352,6 +2404,17 @@ private:
         // engine keeps trusting after this thread is gone — THEN the existing
         // teardown, THEN the existing log (now wrapped).
         invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // scm_ok_, NOT started_: WindowsServiceMechanism::stop() early-returns on a
+        // bare `if (!started_) return` (unlike Linux's resource-conjunction guard)
+        // -- flipping started_ here would make a later stop() skip thread_.join()
+        // entirely, and the eventual ~thread() on a still-joinable thread calls
+        // std::terminate(). scm_ok_ is atomic (no lock needed), unpublished by
+        // stats() (which reads the distinct started_inert_ flag, untouched here),
+        // and is already one of watch_incarnation()'s two admission guards --
+        // flipping it alone correctly makes a future arm() return "SCM unavailable"
+        // instead of silently queuing into a dead thread.
+        scm_ok_.store(false, std::memory_order_release);
         for (auto& [name, wp] : svcs_)
             teardown_watch(*wp);
         try {
@@ -2361,6 +2424,17 @@ private:
         }
     } catch (...) {
         invalidate_established_noexcept();
+        // Governance UP-1(B): mark this mechanism no longer accepting new watches.
+        // scm_ok_, NOT started_: WindowsServiceMechanism::stop() early-returns on a
+        // bare `if (!started_) return` (unlike Linux's resource-conjunction guard)
+        // -- flipping started_ here would make a later stop() skip thread_.join()
+        // entirely, and the eventual ~thread() on a still-joinable thread calls
+        // std::terminate(). scm_ok_ is atomic (no lock needed), unpublished by
+        // stats() (which reads the distinct started_inert_ flag, untouched here),
+        // and is already one of watch_incarnation()'s two admission guards --
+        // flipping it alone correctly makes a future arm() return "SCM unavailable"
+        // instead of silently queuing into a dead thread.
+        scm_ok_.store(false, std::memory_order_release);
         for (auto& [name, wp] : svcs_)
             teardown_watch(*wp);
         try {
@@ -2391,7 +2465,7 @@ private:
         }
     }
 
-    std::mutex mu_; ///< guards ONLY pending_ + the start/stop flags (scm_ok_ is atomic)
+    std::mutex mu_; ///< guards ONLY pending_, emit_/fault_/established_, started_, sink_sealed_ (scm_ok_ is atomic)
     SparkEmitFn emit_;
     SparkFaultFn fault_;
     /// Establishment-signal sink (rung 9c PR-6 item 1) — set once via

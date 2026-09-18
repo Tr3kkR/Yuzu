@@ -920,7 +920,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
         std::lock_guard ops(mech_ops_mu_by_type_.at(spec.type));
         {
             std::lock_guard lk(mu_);
-            // #4340 E15/H1: an IDENTITY check, not a bare containment check —
+            // E15/H1: an IDENTITY check, not a bare containment check —
             // the key could be present again under a DIFFERENT (superseded)
             // incarnation if a disarm+rearm raced us between our commit above
             // and here (disarm's bookkeeping erase needs only mu_, not `ops`,
@@ -984,7 +984,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                 // function is built on ("losing a log line is strictly better than
                 // unwinding a live arm") applies equally to losing a notification.
                 //
-                // #4340 E14/H1: only if the entry is STILL OURS. A successor's fresh
+                // E14/H1: only if the entry is STILL OURS. A successor's fresh
                 // arm may have already replaced this key (their own watch_incarnation()
                 // call queued behind the `ops` we are still holding — the same race the
                 // live gate above guards) — in that case there is nothing here for US
@@ -1008,7 +1008,7 @@ std::expected<SparkEngine::SubscriptionId, std::string> SparkEngine::arm_impl(Sp
                     }
                     drop_key_locked(key); // allocates nothing, cannot throw
                 }
-                // #4340: message reuse, deliberate. When the entry is no longer
+                // Message reuse, deliberate. When the entry is no longer
                 // ours (a successor's fresh arm already superseded it), THIS
                 // caller's own subscription doesn't exist regardless of the
                 // mechanism's technical outcome — from this caller's view it was
@@ -1346,7 +1346,10 @@ void SparkEngine::start() {
     // their stop() ran, which would destroy them with live threads (Gate-4 UP-1).
     std::lock_guard life(lifecycle_mu_);
     std::size_t armed_count = 0;
-    std::vector<ISparkMechanism*> mechs;
+    // Paired with each mechanism's own SparkType (not just the bare pointer)
+    // so the set_established_sink refusal warning below can name which
+    // mechanism type failed to install (governance cpp-safety Gate-3 LOW).
+    std::vector<std::pair<SparkType, ISparkMechanism*>> mechs;
     struct Replay {
         ISparkMechanism* mech;
         std::string key;
@@ -1390,7 +1393,7 @@ void SparkEngine::start() {
             }
         }
         for (auto& [type, m] : mechanisms_)
-            mechs.push_back(m.get());
+            mechs.push_back({type, m.get()});
         armed_count = armed_.size();
         wheel_thread_ = std::thread([this] { wheel_loop(); });
     }
@@ -1400,12 +1403,16 @@ void SparkEngine::start() {
     // establishment sink is installed BEFORE m->start() — a mechanism that
     // implements it seals against further installation at its own start()
     // (spark_mechanism.hpp's set_established_sink doc comment).
-    for (auto* m : mechs) {
-        m->set_established_sink(
-            [this](const std::string& key, SparkIncarnation inc,
-                  std::chrono::steady_clock::time_point at, SparkCoverage cov) {
-                report_established(key, inc, at, cov);
-            });
+    for (auto& [type, m] : mechs) {
+        if (!m->set_established_sink(
+                [this](const std::string& key, SparkIncarnation inc,
+                      std::chrono::steady_clock::time_point at, SparkCoverage cov) {
+                    report_established(key, inc, at, cov);
+                })) {
+            spdlog::debug("SparkEngine: set_established_sink refused for mechanism type {} -- "
+                          "establishment reporting will be unavailable for this type",
+                          spark_type_token(type));
+        }
         m->start([this](const std::string& key, SparkData data) { emit_event(key, std::move(data)); },
                  [this](const std::string& key, bool faulted, std::string_view reason) {
                      report_fault(key, faulted, reason);
@@ -1434,7 +1441,7 @@ void SparkEngine::start() {
             std::lock_guard ops(mech_ops_mu_by_type_.at(r.type));
             {
                 std::lock_guard lk(mu_);
-                // #4340 E13: an IDENTITY check, not a bare containment check —
+                // E13: an IDENTITY check, not a bare containment check —
                 // a disarm+rearm between the collection pass above (mu_
                 // released since) and here leaves the key CONTAINS but under a
                 // NEWER incarnation; replaying against it would submit a
