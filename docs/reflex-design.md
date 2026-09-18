@@ -267,12 +267,23 @@ workstation-class — fail-closed.**
 `evaluate_consent` (R4) admits a dangerous Reaction under either of:
 
 1. **Chain consent** — an `interaction.*` Reaction gated `on_success` precedes the dangerous
-   Reaction in the same chain, **and its result is an affirmative response TOKEN from the
-   interaction plugin** (e.g. `response == "ok"`), **never a bare plugin return code**. A prompt
+   Reaction in the same chain, its `buttons` parameter is **`yesno` or `okcancel`** (never the
+   single-button, no-decline default), and its result is the ONE affirmative response TOKEN that
+   button set can produce: **`response == "yes"` when `buttons == "yesno"`, or `response == "ok"`
+   ONLY when `buttons == "okcancel"`** — **never a bare `response == "ok"` decoupled from which
+   `buttons` produced it**, and never a bare plugin return code. A single-button prompt (no
+   `buttons` param, or `buttons` anything other than `yesno`/`okcancel`) cannot express refusal at
+   all and is therefore never a valid consent Reaction, regardless of its response. A prompt
    dismissed, defaulted, or shown with no interactive desktop present (Windows session 0; a headless
-   agent) returns `rc == 0` from the plugin but carries **no** affirmative token — that case is a
-   **consent FAILURE**, and the chain refuses the dangerous Reaction rather than journaling "consent
-   given" for an unattended dismissal.
+   agent) must report a token that is **not** in the affirmative set for its button kind — that case
+   is a **consent FAILURE**, and the chain refuses the dangerous Reaction rather than journaling
+   "consent given" for an unattended dismissal. **This is currently a gap, not yet closed**:
+   `interaction_plugin.cpp`'s Windows `MessageBoxW` failure/no-desktop path (`platform_message_box`,
+   the `default:` arm on an unrecognized return value) reports `response|ok` today — indistinguishable
+   from a real `okcancel` affirmative — instead of a distinct `status|unavailable`. **Fixing that
+   default arm to emit `status|unavailable` is an R5 prerequisite**: `evaluate_consent` (R4) can only
+   apply this rule correctly once the plugin stops conflating "no desktop to prompt" with "user
+   pressed OK."
 2. **Tag consent** — every resolved target device satisfies `device_class == "server"`, established
    by a **direct `TagStore::get_tag(agent_id, "device_class")` read** (never the scope-DSL's
    case-insensitive `tag:` atom — a different mechanism with different case-folding semantics; see
@@ -288,8 +299,10 @@ digest to the **resolved device set at approval time**, not group IDs alone — 
 membership growing after approval invalidates it, and the next compile refuses until re-approved
 (see D9). Re-tagging a device (`device_class` changes) or a membership change on an
 already-deployed, already-armed set triggers a **recompile**: the affected set's consent is
-re-evaluated, and if it no longer holds, the set is **disarmed** on the affected device(s) — never
-left silently armed under a now-false consent basis.
+re-evaluated, and if it no longer holds, the set is **disarmed** on the affected device(s) via the
+explicit removal push described in "Generation, undeploy, and push semantics" below (a
+generation-advancing removal, never a compile-refusal HOLD, and never left silently armed under a
+now-false consent basis).
 
 **`device_class` write authorization.** Because `device_class` is the sole input to this
 safety-relevant compiler gate, setting or changing it is **not** a bare `Tag:Write` operation — it
@@ -316,11 +329,18 @@ Two independent legs, both opaque `payload` bytes on the existing `CommandReques
 | Server → Agent | `__reflex__` | `get_status` | (none) |
 | Agent → Server | `__reflex__` | `status` | `ReflexSetStatus` |
 
+`ReflexSetPush.removed_set_ids` carries the explicit removal shape for a `full_sync=false` delta —
+see "Generation, undeploy, and push semantics" below for the full refusal-vs-removal split; it is
+unused (must be empty) on a `full_sync=true` push, where omission from `sets` already means removed.
+
 **`push_sets` IS a `DispatchCaller`/system-reserved-dispatch site — it copies the
 `__guard__.push_rules` pattern exactly, never the "Reaction execution is not a dispatch" ruling
 above (that ruling covers agent-local Reaction firing only).** Concretely: the server builds a
-`SystemReservedPush`-class `DispatchCaller{.system = true, .principal_is_admin = true}` (mirroring
-`push_rules`'s construction), carries its own `capdecl` row in the capability declarations so the
+`SystemReservedPush`-class `DispatchCaller{.system = true}` (mirroring `push_rules`'s real
+construction — `.principal_is_admin` is NOT set; `agent_registry.hpp`'s `classify_and_authorize_dispatch`
+returns before reaching the admin/provenance arm for a `system` caller, so the flag would be inert
+either way, and no `approval_provenance` list entry is needed for this site), carries its own
+`capdecl` row in the capability declarations so the
 `consteval` sweep classifies it rather than leaving it an unclassified miss, and goes through
 `send_system_reserved` (`dispatch_confined_arms.hpp`) like every other system-originated push. R9
 decides explicitly, at implementation time, whether `push_sets` is **quarantine-gated** (subject to
@@ -368,13 +388,20 @@ undercount. `suppressed_total` in `ReflexStatus`/`ReflexSetStatus` is the agent'
 counter of every suppression, journal-persisted (see "Generation, undeploy, and push semantics"
 above), independent of how many of those suppressions were *also* sampled into an emitted event.
 
-**Upgrade ordering is server-before-agent.** The server must accept `family` (and the additive
-`set_id`/`reflex_id` fields) before any agent build that sets them is rolled out — an old server
-talking to a new agent sees `family=""` never happens by construction (it would see the real value
-and, if not yet upgraded, refuse it per the closed-set rule above rather than silently mis-filing it
-as Guardian drift); a new server talking to an old agent sees `family=""` correctly resolves to
-`"guardian"`. The reverse ordering (agent-before-server) is what the closed-set-at-ingest rule
-exists to make safe *if* it ever happens, but it is not the intended rollout order.
+**Upgrading agents before servers is UNSAFE; server-first is mandatory, not merely preferred.**
+`family` (field 21) and its closed-set validation at the ingest router are both **new in this same
+change** — an old (pre-Reflex) server's `guardian_ingest.cpp` reads `family` nowhere at all, so the
+closed-set rule above does not exist on it to do any refusing. Sent field 21 arrives at an old
+server as an unrecognized protobuf field, is dropped by the parser, and the row is read exactly as
+if `family` had never been set — which resolves to the proto3 default `"guardian"`. **The practical
+consequence: an old server files a Reflex outcome as a Guardian drift event**, not as a refusal and
+not as a visible error — a silent misfiling, the opposite of the fail-loud behavior the closed-set
+rule is meant to provide once it exists. That rule only protects the *reverse-safe* direction: a new
+server talking to an old agent, where `family=""` correctly and intentionally resolves to
+`"guardian"` because no pre-Reflex agent ever sets it. The rollout order is therefore fixed —
+**server upgrades before any agent build that sets `family`/`set_id`/`reflex_id` is deployed** — and
+this is a hard prerequisite, not a recommendation. `docs/user-manual/upgrading.md` gains the
+operator-facing version of this note at R6, once the server and agent changes both exist to describe.
 
 This keeps Reflex on the **same single unsolicited-event channel and the same single server-side
 ingest router chokepoint** that ADR-0021 Decision 6 established — only the event *store* is
@@ -393,18 +420,35 @@ and a future reader must not assume one implies the other.
 
 ## Generation, undeploy, and push semantics
 
-**A server-side compile refusal HOLDS the agent's last accepted generation — it is never expressed
-as a `full_sync` removal.** `full_sync=true` **replaces the agent's entire active Reflex Set
-collection with exactly what the message contains** — so a refused set silently *omitted* from a
-`full_sync=true` push is not "held," it is **disarmed fleet-wide** the moment that push lands (this
-was the design's own internal contradiction between "generation held" and "full_sync replaces": they
-cannot both be true of the same omission). The actual rule: when a compile refusal exists, the
-server does **not** advance to a new `full_sync=true` snapshot for the affected agents at all — it
-either (a) resends the prior, still-valid `full_sync` snapshot (refused set correctly absent because
-it was never in a valid snapshot to begin with) or (b) sends a `full_sync=false` delta that leaves
-the refused set's last-known-armed state untouched. R9 picks one of (a)/(b) and states it in its own
-implementation notes; this document's job is only to rule out the third, silently-broken option
-(treating omission-from-`full_sync` as equivalent to "held").
+**Refusal and removal are two different causes and MUST NOT share a mechanism — conflating them was
+the design's own internal contradiction (a compile refusal claiming to "hold" the agent's last
+accepted generation, while a consent-loss disarm needs exactly the opposite: an armed dangerous set
+must stop being armed the moment its consent basis becomes false, never stay silently held under a
+now-false basis).** The two causes are split:
+
+1. **Validation or digest-drift refusal of a NEW generation candidate (`reflex.set.compile_refused`)
+   HOLDS the agent's last accepted generation — it is never expressed as a `full_sync` removal.**
+   `full_sync=true` **replaces the agent's entire active Reflex Set collection with exactly what the
+   message contains**, so a refused set silently *omitted* from a `full_sync=true` push would be
+   *disarmed*, not held — the server therefore does **not** advance to a new `full_sync=true`
+   snapshot for the affected agents at all while a refusal is outstanding. It either (a) resends the
+   prior, still-valid `full_sync` snapshot (the refused set is correctly absent because it was never
+   in a valid snapshot to begin with) or (b) sends a `full_sync=false` delta that omits the refused
+   set_id from both `sets` and `removed_set_ids` (see below) — the delta's own omission convention
+   ("absent = untouched") leaves it held exactly as last applied. R9 picks one of (a)/(b) and states
+   it in its own implementation notes.
+2. **Consent loss (a re-tag or membership change that makes a previously-consented, already-armed
+   set's consent basis false — D4 above) or an explicit undeploy is a REMOVAL, never a hold.** The
+   server sends an explicit removal push that **advances the generation** and disarms exactly that
+   set: either a `full_sync=true` snapshot containing every other currently-valid set (including any
+   set independently held under rule 1, at its last-accepted content) minus the now-unconsented or
+   undeployed one, or, when only the removal is needed and resending the whole snapshot is wasteful, a
+   `full_sync=false` delta naming the set_id in `removed_set_ids`. **A refusal (rule 1) and a
+   legitimate removal of a different set (rule 2) can both be honoured in the same delta**, because
+   they use disjoint parts of the message: the refused set_id appears in neither `sets` nor
+   `removed_set_ids` (untouched), while the removed set_id appears only in `removed_set_ids` — no
+   choice between "hold everything" and "replace everything" is forced on the server just because two
+   different causes are active on the same agent at once.
 
 - **Identical generation is a no-op.** If the agent's already-applied generation matches the
   incoming push's generation, the agent applies nothing and re-arms nothing — an ordinary reconnect
@@ -573,16 +617,24 @@ from starving Guardian, and Guardian's own enforcement evidence, of that shared,
 ## HA — background-job classification and readiness
 
 Reflex introduces four pieces of server background work; each gets an explicit
-`BackgroundJobClass` (`server/core/src/background_jobs.hpp` — the live per-surface registry the
+`BackgroundJobClass` — one of exactly three enumerators (`ReplicaSafe`, `FencedLeaderOnly`,
+`DisabledUntilFixed`; `server/core/src/background_jobs.hpp` — the live per-surface registry the
 Fenced-leader-election routed concern requires every loop to consult, **never a second
-"which loops are leader-only" list**):
+"which loops are leader-only" list**). At implementation time (R9/R10/R13) each of these four
+passes gets its own named row in `kBackgroundJobs` (a new side-effecting pass is a diff against
+that array, never a silent addition, per its own header contract) and its dispatch site wraps in
+`leader_gate_permits<background_job_class("<pass>")>(leader_elector_.get())` — the same pattern
+`command_outbox.deliver` and `schedule_runner.tick` use today at their call sites in
+`server.cpp`'s scheduling thread — so the Reflex push/compile loop's fenced claim write is that
+call-site wrapper around the `push_sets` dispatch in the (future) reflex-push background thread,
+not a separate primitive:
 
 | Loop | `BackgroundJobClass` | Why |
 |---|---|---|
-| `reflex_outcomes` TTL sweep (R10) | `FencedLeaderOnly` | A bulk delete — needs the ADR-0012 advisory-locked SHARED clock/dedup rows on Postgres per `docs/clock-guarded-retention.md`'s single-writer rule, exactly like every other clock-guarded reaper. |
-| Compile + `push_sets` dispatch (R9) | leader-only | Two replicas independently pushing *different* generations of a dangerous Reflex Set to the same agent is a double-dispatch risk on a destructive surface — the same class of hazard the Fenced-leader-election concern exists to prevent for deployment/quarantine/policy-remediation. |
-| `get_status` reconcile-on-heartbeat (R9) | per-replica | Read-only census refresh; safe for every replica to do independently (mirrors `PolicyEvaluator::collect_ready`'s per-replica classification, not its leader-gated `dispatch_due`). |
-| Fleet-metric delta tracking (R13) | per-replica, with the double-count rule stated at R13 | Each replica computes its own last-seen delta; R13 must state how a multi-replica deployment avoids double-counting a delta two replicas both observe. |
+| `reflex_outcomes` TTL sweep (R10) | `ReplicaSafe` | A clock-guarded, advisory-locked SINGLE-WRITER retention pass (ADR-0012 per `docs/clock-guarded-retention.md`) is the textbook `ReplicaSafe` case per the enum's own definition — it matches every existing clock-guarded reaper in `kBackgroundJobs` (`response_store.reap_expired`, `guaranteed_state_store.reap_expired`, `session_store.reap_expired`, `app_perf_fleet_store.run_retention_prune`, `preflight_run_store.run_retention_prune`, `deployment_run_store.run_retention_prune`, `audit_store.cleanup_once` — all `ReplicaSafe`), none of which is `FencedLeaderOnly`. |
+| Compile + `push_sets` dispatch (R9) | `FencedLeaderOnly` | Side-effecting singleton dispatch — two replicas independently pushing *different* generations of a dangerous Reflex Set to the same agent is a double-dispatch risk on a destructive surface, the same shape `schedule_runner.tick`/`command_outbox.deliver` are `FencedLeaderOnly` for today. |
+| `get_status` reconcile-on-heartbeat (R9) | `ReplicaSafe` | Read-only census refresh; safe for every replica to do independently (mirrors `policy_evaluator.collect_ready`'s `ReplicaSafe` classification, not its sibling `policy_evaluator.dispatch_due`'s `FencedLeaderOnly`). |
+| Fleet-metric delta tracking (R13) | `ReplicaSafe`, with the double-count rule stated at R13 | Each replica computes its own last-seen delta (mirrors `health_store.recompute_metrics`'s per-replica read-only gauge pattern); R13 must state how a multi-replica deployment avoids double-counting a delta two replicas both observe. |
 
 **Both new Postgres stores join the server's `/readyz` conjunction** — `ReflexSetStore` (R3) and the
 `reflex_outcomes` table (R10, inside the same store) are not readiness-invisible; a degraded Reflex

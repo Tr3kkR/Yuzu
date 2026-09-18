@@ -821,11 +821,19 @@ An unreadable `TagStore` read at evaluation time is treated as a consent-gate **
 implicit consent — the compiler refuses to compile a Reflex Set whose consent could not be
 positively established, rather than defaulting to "allowed."
 
-**Symptom: a Reflex Set audits `reflex.set.compile_refused` and stops updating.** The most common
-cause is a target device whose `device_class` is missing or not exactly `"server"`, with no chain
-consent covering the dangerous Reaction. Check the device's tags and, if it genuinely has no end
-user, tag it `device_class=server`; if it does, add an `interaction.*` Reaction gated `on_success`
-before the dangerous step instead.
+**Symptom: a Reflex Set audits `reflex.set.compile_refused` and stops updating (HOLD, not disarm).**
+This is the outcome for a *new* Reflex Set, or an edit to an existing one, that never establishes
+consent — the set is held at its last accepted generation (or never deployed at all, if it has none)
+rather than being pushed. The most common cause is a target device whose `device_class` is missing
+or not exactly `"server"`, with no chain consent covering the dangerous Reaction. Check the device's
+tags and, if it genuinely has no end user, tag it `device_class=server`; if it does, add an
+`interaction.*` Reaction gated `on_success` before the dangerous step instead. **This is a different
+case from an already-armed set LOSING consent** (re-tagging a device from `server` to `workstation`,
+or a membership change that pulls a workstation into an all-server assignment) — that recompile does
+not hold anything; it **disarms** the affected device(s) via an explicit, generation-advancing
+removal push (`docs/reflex-design.md` "Generation, undeploy, and push semantics"), because leaving a
+dangerous set armed under a now-false consent basis is the exact failure this gate exists to
+prevent.
 
 ---
 
