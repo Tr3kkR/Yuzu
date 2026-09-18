@@ -301,6 +301,31 @@ struct DeniedCopy {
     return name;
 }
 
+/// WARN-skips (never fails) a case that relies on the REAL, un-overridden
+/// console-owner check (::stat("/dev/console")) matching this process's own
+/// uid -- true on an interactive dev Mac (this process IS the console user),
+/// not guaranteed on a headless CI runner, where /dev/console may be owned
+/// by a different account or no session at all. Every OTHER console-owner
+/// case in this file sidesteps this by explicitly overriding
+/// CONSOLE_OWNER_UID_OVERRIDE to std::to_string(::getuid()) rather than
+/// relying on the real stat() call -- this helper exists for the one case
+/// that deliberately tests the empty-override fall-through path itself,
+/// which cannot use that same sidestep (CI failure: PR #4539, macOS leg).
+[[nodiscard]] bool real_console_owner_matches_self_or_skip() {
+    struct stat console_st {};
+    if (::stat("/dev/console", &console_st) != 0) {
+        WARN("could not stat /dev/console -- skipping the real-console-owner case");
+        return false;
+    }
+    if (console_st.st_uid != ::getuid()) {
+        WARN("this process's uid (" << ::getuid() << ") does not own /dev/console (uid "
+             << console_st.st_uid << ") -- skipping the real-console-owner case "
+             "(expected on a headless runner, not just an interactive session)");
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 // ── Cases 1-6: SecItem sentinel vectors, store=System ───────────────────────
@@ -654,6 +679,13 @@ TEST_CASE("list: an empty CONSOLE_OWNER_UID_OVERRIDE is ignored, falling through
     }
     auto me = console_username_or_skip();
     if (!me)
+        return;
+    // This case, uniquely among the console-owner cases, relies on the REAL
+    // ::stat("/dev/console") answer matching ::getuid() -- every sibling
+    // case sidesteps that by overriding CONSOLE_OWNER_UID_OVERRIDE
+    // explicitly. Not guaranteed on a headless CI runner (CI failure: PR
+    // #4539, macOS leg -- console user reported "changed" there).
+    if (!real_console_owner_matches_self_or_skip())
         return;
 
     yuzu::test::ScopedEnv user_override("YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE", *me);
