@@ -202,39 +202,89 @@ remote_agent_loop() ->
 %% be a distributed node — `rebar3 eunit' runs a plain, non-distributed
 %% `erl' by default, so this must turn the test runner itself into a
 %% distributed node (once; idempotent) before the first peer starts.
+%%
+%% GOVERNANCE FINDING, ROUND 2 (external PR review): the first fix here
+%% (replacing a blocking `os:cmd("epmd -daemon")` with a non-blocking
+%% `open_port/2` spawn) did NOT fully resolve the Windows CI hang — a
+%% second Windows CI run, after that fix, still hung for the FULL 600s
+%% meson-level suite timeout with zero test progress printed (vs. the
+%% FIRST failure's clean 70s-fixture-timeout with partial progress
+%% visible). Something in this bootstrap sequence still blocks
+%% indefinitely on Windows, and it could not be reproduced or diagnosed
+%% locally (no Windows box in this environment; every local rebar3/
+%% dialyzer/eunit run and a standalone escript reproducing the exact
+%% cold-start sequence passed clean on Linux both before and after the
+%% first fix).
+%%
+%% Rather than guess again at which specific platform primitive is
+%% still wrong and spend another ~15-minute CI round-trip finding out,
+%% this bootstrap now runs inside a SEPARATELY MONITORED process under
+%% a hard wall-clock bound. If it does not complete within the bound —
+%% for ANY reason, on ANY current or future platform — `ensure_distributed/0`
+%% raises a normal `error/1` (a fast, clearly-diagnosed FAILURE of just
+%% this module's 4 tests, reported in seconds) instead of the calling
+%% test hanging until an OUTER timeout (a per-fixture timeout, or worse,
+%% the full suite-level meson timeout) cancels the whole eunit run and
+%% takes every OTHER gateway test down with it. `node()` becoming
+%% distributed is a VM-GLOBAL effect, not a property of the calling
+%% process, so doing the actual `net_kernel:start/2` inside a throwaway
+%% worker process is safe — the effect persists after that worker exits.
 ensure_distributed() ->
     case node() of
         nonode@nohost ->
-            ensure_epmd_running(),
-            %% `erlang:unique_integer/1` alone is unique per-VM, not across
-            %% VMs — on a shared CI box running multiple runner agents as one
-            %% OS identity (#1871), two concurrent `rebar3 eunit` invocations
-            %% could mint the same node name. Salt with `os:getpid/0` too,
-            %% matching `peer:random_name/1`'s own pattern below.
-            Name = list_to_atom("yuzu_gw_multinode_test_" ++ os:getpid() ++ "_" ++
-                                integer_to_list(erlang:unique_integer([positive]))),
-            {ok, _} = await_net_kernel_start(Name, 100),
-            ok;
+            %% 10s, not the full per-test 30s budget (`{timeout, 30, ...}`
+            %% on every test in this module) — leaves headroom for the
+            %% REST of a test (peer connection, lookup propagation waits)
+            %% to still run and fail cleanly within that 30s budget rather
+            %% than racing this bound against the outer eunit timeout.
+            case bounded_bootstrap_distribution(10000) of
+                ok -> ok;
+                {error, Reason} -> error({distribution_bootstrap_failed, Reason})
+            end;
         _ ->
             ok
     end.
 
-%% GOVERNANCE FINDING (external PR review, BLOCKING): the original
-%% `os:cmd("epmd -daemon")` HANGS Windows CI. `os:cmd/1` waits for the
-%% spawned process's output stream to close before returning — on POSIX,
-%% `epmd -daemon` detaches (closes inherited handles) once it's up, so the
-%% pipe closes and `os:cmd` returns promptly; `epmd.exe -daemon` on Windows
-%% does not detach the same way, so the pipe never closes and `os:cmd`
-%% blocks forever, hanging the enclosing test's timeout fixture (confirmed:
-%% an orphaned `epmd.exe` process was found still running at Windows CI job
-%% cleanup, and the eunit run's own "One or more tests were cancelled"
-%% message with a 277→249 passed-count drop matches exactly).
-%%
-%% `open_port/2` is fire-and-forget on every platform — nothing here reads
-%% from or waits on the port, so it returns immediately regardless of
-%% whether the child process detaches. `nouse_stdio` avoids setting up a
-%% pipe at all, sidestepping the hang class entirely rather than trying to
-%% detect and work around Windows' different detachment semantics.
+bounded_bootstrap_distribution(TimeoutMs) ->
+    Parent = self(),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        ensure_epmd_running(),
+        %% `erlang:unique_integer/1` alone is unique per-VM, not across
+        %% VMs — on a shared CI box running multiple runner agents as one
+        %% OS identity (#1871), two concurrent `rebar3 eunit` invocations
+        %% could mint the same node name. Salt with `os:getpid/0` too,
+        %% matching `peer:random_name/1`'s own pattern below.
+        Name = list_to_atom("yuzu_gw_multinode_test_" ++ os:getpid() ++ "_" ++
+                            integer_to_list(erlang:unique_integer([positive]))),
+        Result = await_net_kernel_start(Name, 100),
+        Parent ! {self(), Result}
+    end),
+    receive
+        {Pid, {ok, _}} ->
+            demonitor(Ref, [flush]),
+            ok;
+        {Pid, {error, _} = Err} ->
+            demonitor(Ref, [flush]),
+            Err;
+        {'DOWN', Ref, process, Pid, DownReason} ->
+            {error, {bootstrap_process_died, DownReason}}
+    after TimeoutMs ->
+        exit(Pid, kill),
+        demonitor(Ref, [flush]),
+        {error, timeout}
+    end.
+
+%% `os:cmd("epmd -daemon")` (the FIRST fix's predecessor) HANGS Windows
+%% CI: `os:cmd/1` waits for the spawned process's output stream to
+%% close before returning — on POSIX, `epmd -daemon` detaches (closes
+%% inherited handles) once it's up, so the pipe closes and `os:cmd`
+%% returns promptly; `epmd.exe -daemon` on Windows does not detach the
+%% same way, so the pipe never closes and `os:cmd` blocks forever.
+%% `open_port/2` is fire-and-forget on every platform — nothing here
+%% reads from or waits on the port. `nouse_stdio` avoids setting up a
+%% pipe at all. Whatever is STILL blocking on Windows after this change
+%% (see the governance-finding-round-2 comment above `ensure_distributed/0`)
+%% is now bounded by that function's timeout regardless.
 %%
 %% NOTE: `net_kernel:start/2` does NOT start epmd itself if it isn't
 %% already running — `erl_epmd` is a pure TCP CLIENT to an already-running
@@ -254,9 +304,12 @@ ensure_epmd_running() ->
 
 %% epmd needs a moment to actually bind its port after `ensure_epmd_running/0`
 %% returns (which doesn't wait for that) — retry rather than a fixed sleep,
-%% matching this module's other await_* helpers.
+%% matching this module's other await_* helpers. Bounded by the CALLER's
+%% (`bounded_bootstrap_distribution/1`'s) own wall-clock timeout, not just
+%% this retry count, so a per-retry stall (e.g. `net_kernel:start/2` itself
+%% blocking rather than returning `{error, _}` promptly) is still caught.
 await_net_kernel_start(_Name, 0) ->
-    error(epmd_never_became_ready);
+    {error, epmd_never_became_ready};
 await_net_kernel_start(Name, Retries) ->
     case net_kernel:start(Name, #{name_domain => shortnames}) of
         {ok, _} = Ok -> Ok;
