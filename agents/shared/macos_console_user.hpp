@@ -480,6 +480,14 @@ inline std::vector<std::string> build_login_keychain_read_argv(std::string_view 
 // fabricates a value: any failure to determine a real console user, or a
 // build without SystemConfiguration, yields std::nullopt rather than a
 // guess.
+// saf3-1 (governance A0 fix round, NICE): unlike most of this header, a
+// caller missing -DYUZU_HAVE_SYSTEMCONFIGURATION for this ONE function gets
+// no build-time signal at all -- it compiles clean and console_user()
+// silently returns nullopt forever, indistinguishable at the call site from
+// "genuinely no console user right now". Latent only today (the sole
+// caller, the users plugin, does define the macro) but worth knowing before
+// adding a second caller: verify the macro reaches your TU, don't assume a
+// missing definition would be loud.
 inline std::optional<std::string> console_user() {
 #if defined(__APPLE__) && defined(YUZU_HAVE_SYSTEMCONFIGURATION)
     // Own the CFStringRef via unique_ptr from the moment it's acquired so a
