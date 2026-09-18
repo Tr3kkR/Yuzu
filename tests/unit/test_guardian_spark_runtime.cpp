@@ -8,6 +8,7 @@
 
 #include "guardian_spark_runtime.hpp"
 
+#include "guardian_arm_ack.hpp" // rung 9c PR-5e (#4221): ledger-level insertion-gate regression
 #include "guardian_convergence_scheduler.hpp" // up-5 (#4221): scheduler integration test
 #include "guardian_lifecycle_journal.hpp"
 
@@ -7782,6 +7783,36 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
     CHECK(rt->expire_overdue_claims() == 1); // only r2 - r1 already compensated and popped.
 
+    // rung 9c PR-5e (#4221, K-bound closeout): this is EXACTLY the unsettled window
+    // receipt_wedge_k_eligible() exists to exclude - receipt_status() already reads
+    // Wedged (checked below, unchanged from before this PR), but r2's own `dispatch`
+    // is still Dispatching (this test's own comment above), not yet Dispatched - a
+    // K-waiver predicate relying on receipt_status() alone would treat this as
+    // K-eligible one tick before dispatch_arm_off_lock's own re-lock corrects it.
+    CHECK(rt->receipt_status(res2->receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
+
+    // Adversarial review finding (Kimi K3 + Codex Sol independently converging,
+    // mutation-proven): GuardianArmAckLedger::drain_locked()'s own PRIMARY per-pending
+    // loop must ALSO gate on receipt_wedge_k_eligible() before inserting into
+    // failed_receipts - not just the recovery-scan loop that re-validates EXISTING
+    // entries a tick later. Drive a real ledger drain WHILE r2 sits in this exact
+    // unsettled window (receipt_status() already Wedged, receipt_wedge_k_eligible()
+    // still false) - deleting that insertion-site gate leaves every test in this file
+    // and in test_guardian_arm_ack.cpp green (proven by mutation during review), since
+    // none of them reach this specific window through a real ledger drain. This is
+    // that missing regression test.
+    {
+        GuardianArmAckLedger ledger;
+        ledger.begin_application(1, std::string(64, 'r'), false, 1);
+        ledger.add_pending("r2", res2->receipt);
+        CHECK(ledger.drain_locked(*rt, 10) == 1); // resolved (Wedged), but NOT K-eligible yet
+        CHECK(ledger.failed_receipt_count_for_test() == 0); // must NOT be inserted while unsettled
+        const auto s = ledger.arm_stats();
+        REQUIRE(s.has_value());
+        CHECK(s->failed == 1); // still counted as an ordinary failure - resolved_failed unaffected
+    }
+
     // Let admission resolve for real, as an ORDINARY (non-Stopped) refusal.
     rt->set_io_executor_fail_launch_for_test(true);
     released_by_test = true;
@@ -7796,6 +7827,16 @@ TEST_CASE("rung 9c PR-5c (#4221): the Dispatching-window race no longer misclass
         },
         std::chrono::seconds(10)));
     rt->set_io_executor_fail_launch_for_test(false);
+
+    // rung 9c PR-5e (#4221, K-bound closeout): post-correction, receipt_status() has
+    // moved to Failed (checked below, unchanged) - receipt_wedge_k_eligible() must
+    // stay false too, for the OPPOSITE reason now: `dispatch` never reaches
+    // Dispatched on this synchronous-admission-failure path (dispatch_arm_off_lock()
+    // only ever writes Dispatched on a successful submission), so the strict
+    // `dispatch == Dispatched` clause excludes it just as it did in the unsettled
+    // window above - the two checks together never produce a false-eligible window
+    // on either side of the correction.
+    CHECK_FALSE(rt->receipt_wedge_k_eligible(res2->receipt));
 
     // Pre-fix: fail_all_claims_locked()'s guard could not overwrite the stale
     // WaiterTimedOutDispatched already on r2, so this stayed Wedged even though

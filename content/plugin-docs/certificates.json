@@ -84,7 +84,7 @@
     "**The login keychain read is a registered exception, not a rung-1 promotion.** System.keychain/SystemRootCertificates.keychain are read in-process via `SecItemCopyMatching`, bounded to 15 seconds per keychain via agent-core's `read_keychain_bounded` and abandoned (not cancelled) on timeout (`certificates_plugin.cpp:708,792-806`); the login keychain stays on the `launchctl asuser` + `sudo -u` + `security find-certificate` subprocess (rung 2, #3406) because the LaunchDaemon has no login keychain of its own (`certificates_plugin.cpp:16-23`) — do not \"fix\" this to a direct API call. Immediately before that subprocess spawn the plugin re-reads `/dev/console`'s owner in-process and refuses to spawn on a mismatch, shrinking (not eliminating) the fast-user-switch race window from tens of seconds to microseconds (`certificates_plugin.cpp:1250-1261`).",
     "**SystemRootCertificates.keychain delete is permanently rejected.** It is sealed under System Integrity Protection; `delete_cert_macos` rejects `store=root` outright before ever shelling out (`certificates_plugin.cpp:2234-2244`) — a hard OS limitation, not a bug to fix.",
     "**A macOS delete self-verifies before reporting success.** `delete_cert_macos` re-enumerates the target keychain after `security delete-certificate` exits 0 and only reports `status|deleted` on a positively-proven absence; a keychain that can't be re-read or still shows the certificate reports `error|...`, never a false `status|deleted` (`certificates_plugin.cpp:2336-2373`).",
-    "**The macOS sample was captured unprivileged and shows the login-keychain leg degrading live.** At euid 501 with no console session reachable via `launchctl asuser` without root, `list`'s login-keychain read failed and the result carries `CONSTRAINED`/`PARTIAL`/`login-keychain` (`macos.txt:164-165`) — expected under the capture harness, but it means this sample never exercises a successful login-keychain read."
+    "**The macOS sample was captured unprivileged and shows the login-keychain leg degrading live, and test-only environment overrides exist on the macOS path that must never be set in production.** At euid 501 with no console session reachable via `launchctl asuser` without root, `list`'s login-keychain read failed and the result carries `CONSTRAINED`/`PARTIAL`/`login-keychain` (`macos.txt:164-165`) — expected under the capture harness, but it means this sample never exercises a successful login-keychain read. Separately, `YUZU_CERTIFICATES_SYSTEM_KEYCHAIN_PATH_OVERRIDE` / `YUZU_CERTIFICATES_ROOT_KEYCHAIN_PATH_OVERRIDE` (absolute paths; `agents/shared/macos_console_user.hpp`, `system_keychain_path`/`root_keychain_path`) redirect the System/root keychain reads of `list`/`details` to a fixture keychain — `delete` never consults them: `resolve_delete_keychain_path` returns the fixed literal paths regardless, so a destructive action can never be pointed at a substituted keychain. `YUZU_CERTIFICATES_CONSOLE_USER_OVERRIDE` replaces the `stat -f%Su /dev/console` console-user lookup with a fixed username (still validated and resolved through the bounded passwd lookup); `YUZU_CERTIFICATES_CONSOLE_OWNER_UID_OVERRIDE` replaces the in-process `/dev/console` owner recheck's uid (an unparsable value is a failed recheck); `YUZU_CERTIFICATES_LOGIN_KEYCHAIN_READ_FAIL_OVERRIDE` makes the login-keychain read report a failed read carrying that value instead of spawning `security`. They exist so `tests/unit/test_certificates_macos_actions.cpp` can drive the real plugin's SecItem-failure sentinels and the console-owner recheck end to end (#4374); each is read on every call, never cached, and is ignored when unset."
   ],
   "definitions": [
     {
@@ -753,7 +753,8 @@
       "changelog.d/3245-certificates-linux-delete-toctou.fixed.md",
       "changelog.d/3246-certificates-bounded-keychain-read.fixed.md",
       "changelog.d/3247-certificates-windows-thumbprint-case.fixed.md",
-      "changelog.d/3406-certificates-login-keychain-argv.changed.md"
+      "changelog.d/3406-certificates-login-keychain-argv.changed.md",
+      "changelog.d/4374-certificates-macos-orchestration-tests.added.md"
     ],
     "definitions": [
       "content/definitions/certificates.yaml"
@@ -766,6 +767,7 @@
     "privilege_row": true,
     "tests": [
       "tests/unit/test_certificates_macos.cpp",
+      "tests/unit/test_certificates_macos_actions.cpp",
       "tests/unit/test_certificates_store_honesty.cpp",
       "tests/unit/test_certificates_x509.cpp"
     ]
