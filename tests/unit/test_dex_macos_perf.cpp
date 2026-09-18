@@ -204,6 +204,13 @@ TEST_CASE("read_cpu_ticks reads two valid, monotonic snapshots", "[dex][macos][p
     CHECK(b.system >= a.system);
     CHECK(b.nice >= a.nice);
     CHECK(b.idle >= a.idle);
+    // The loop above breaks on a strict total increase (or exhausts its 30 x 100ms
+    // budget) — assert that outcome explicitly. Without this, a reader that is VALID but
+    // FROZEN (every field >= a's, none of them ever actually advancing) still passes the
+    // four per-field CHECKs above, and the only place that would notice is the
+    // conditional busy% check below, which this test deliberately tolerates a nullopt
+    // from — so a genuinely frozen reader would otherwise go undetected.
+    CHECK(b.user + b.system + b.nice + b.idle > a.user + a.system + a.nice + a.idle);
 
     // Conditional rather than REQUIRE: even after polling, an unlucky window can still
     // land on dt==0 (cpu_busy_pct's own contract) — that is not itself a failure here.
