@@ -46,6 +46,7 @@
 #include "response_store.hpp"
 #include "test_offload_target_store_pg_helper.hpp"
 #include "test_webhook_store_pg_helper.hpp"
+#include "typed_inventory_sources.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
@@ -2958,4 +2959,17 @@ TEST_CASE("Webhook/offload delivery counters: all 6 pre-seeded to 0 at boot",
     for (const char* name : names) {
         CHECK(reg.counter(name).value() == 0.0);
     }
+}
+
+TEST_CASE("typed_inventory_sources: app_usage is a typed source (PR7b.3 guard)",
+          "[server][inventory][typed]") {
+    // Pins the byte-identical hunk this package and ws-7b2's p2.2 both add to
+    // typed_inventory_sources.hpp — a distinct TEST_CASE name from ws-7b2's
+    // own gateway-composition case so both survive the trivial merge when
+    // the second of the two lands.
+    CHECK(yuzu::server::is_typed_inventory_source("app_usage"));
+    CHECK(yuzu::server::is_typed_inventory_source("installed_software"));
+    CHECK(yuzu::server::is_typed_inventory_source("app_perf"));
+    CHECK(yuzu::server::is_typed_inventory_source("device_ci"));
+    CHECK(yuzu::server::is_typed_inventory_source("software_licensing"));
 }
