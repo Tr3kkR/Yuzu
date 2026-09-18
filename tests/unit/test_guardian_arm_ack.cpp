@@ -16,6 +16,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <memory>
@@ -1235,6 +1236,14 @@ TEST_CASE("GuardianArmAckLedger::drain_locked(): a genuinely dispatched claim th
           "later resolves to a real backend refusal leaves the K-eligible set - the "
           "\"still-claimed\" requirement (rung 9c PR-5e, #4221)",
           "[spark][ack]") {
+    // Scope note (PR #4529 review finding): this test drives the refusal to
+    // completion, THEN reads - a settled-ordering check, not a concurrent one.
+    // It proves the eligibility transition happens correctly once observed, but
+    // a `drain_locked()` call issued WHILE the transition is still in flight is
+    // never raced here. See the genuinely concurrent test below
+    // ("receipt_status_wedge_aware(): a real concurrent poller...") for that
+    // property - a real background reader racing the actual production
+    // completion path, not this test's own sequential ordering.
     auto r = std::make_shared<FakeReader>();
     auto b = std::make_shared<FakeBackend>();
     b->hang_next_arm.store(true);
@@ -1395,4 +1404,78 @@ TEST_CASE("GuardianArmAckLedger::can_advance(): K-eligibility linearizes at the 
     CHECK(ledger.drain_locked(*rt, 10) == 0); // nothing new in `pending`
     CHECK(ledger.failed_receipt_count_for_test() == 0);
     CHECK_FALSE(ledger.can_advance());
+}
+
+TEST_CASE("GuardianSparkRuntime::receipt_status_wedge_aware(): a real concurrent "
+          "poller racing the actual production completion path never observes an "
+          "inconsistent (status, wedge_eligible) pair (rung 9c PR-5e, #4221, PR "
+          "#4529 review finding)",
+          "[spark][ack]") {
+    // Unlike the sequential test above, this races a REAL background reader
+    // against the REAL production completion path (a genuine backend refusal
+    // resolving on its own detached worker) - no test hook stands in for the
+    // race, so this exercises actual concurrency, not settled-then-read
+    // ordering. The only two invariants a correct atomic combined-read can ever
+    // provide, and that a reverted two-separate-lock-acquisitions version could
+    // violate: (1) `status` never regresses from Wedged back to Pending once
+    // observed Wedged (`end` is sticky by design - a poll catching a stale
+    // Pending after a later poll already saw Wedged is impossible either way,
+    // but the reverse - Wedged then a LATER poll reading Pending - would mean
+    // the two sub-reads came from different instants entirely); (2) once a
+    // poll observes `status == Wedged && !wedge_eligible` (settled to a genuine
+    // refusal, no longer still-claimed), no LATER poll on the same receipt ever
+    // observes `wedge_eligible == true` again - eligibility only ever narrows
+    // for one episode, it cannot un-settle.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    b->hang_next_arm.store(true);
+    auto rt = make_rt(r, b, GuardianSparkRuntime::Config{.backend_op_deadline =
+                                                         std::chrono::milliseconds(50)});
+
+    auto receipt = accept(*rt, "r1");
+    REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    REQUIRE(rt->expire_overdue_claims() == 1);
+    REQUIRE(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged);
+    REQUIRE(rt->receipt_wedge_k_eligible(receipt));
+
+    std::atomic<bool> stop{false};
+    std::atomic<int> poll_count{0};
+    std::atomic<bool> saw_pending_after_wedged{false};
+    std::atomic<bool> saw_eligible_after_settled_ineligible{false};
+    std::thread poller{[&] {
+        bool ever_settled_ineligible = false;
+        bool ever_wedged = false;
+        while (!stop.load(std::memory_order_relaxed)) {
+            const auto wa = rt->receipt_status_wedge_aware(receipt);
+            poll_count.fetch_add(1, std::memory_order_relaxed);
+            if (ever_wedged && wa.status == GuardianSparkRuntime::ReceiptStatus::Pending)
+                saw_pending_after_wedged.store(true, std::memory_order_relaxed);
+            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged)
+                ever_wedged = true;
+            if (ever_settled_ineligible && wa.wedge_eligible)
+                saw_eligible_after_settled_ineligible.store(true, std::memory_order_relaxed);
+            if (wa.status == GuardianSparkRuntime::ReceiptStatus::Wedged && !wa.wedge_eligible)
+                ever_settled_ineligible = true;
+        }
+    }};
+
+    // The real completion, racing the poller above on its own detached worker -
+    // not test-hook-gated.
+    b->fail_arm.store(true);
+    b->release_hang();
+    REQUIRE(yuzu::test::spin_until([&] { return !rt->receipt_wedge_k_eligible(receipt); },
+                                   std::chrono::seconds(10)));
+    // Let a further batch of polls land against the now-settled state before
+    // stopping, so the "stays false" half of invariant (2) is actually
+    // exercised, not just the single instant of transition.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    stop.store(true, std::memory_order_relaxed);
+    poller.join();
+
+    CHECK(poll_count.load(std::memory_order_relaxed) > 0);
+    CHECK_FALSE(saw_pending_after_wedged.load(std::memory_order_relaxed));
+    CHECK_FALSE(saw_eligible_after_settled_ineligible.load(std::memory_order_relaxed));
+    CHECK(rt->receipt_status(receipt) == GuardianSparkRuntime::ReceiptStatus::Wedged); // still sticky
+    CHECK_FALSE(rt->receipt_wedge_k_eligible(receipt));
 }
