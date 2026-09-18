@@ -675,10 +675,18 @@ Fleet Prometheus families (R13): gauges
 `docs/observability-conventions.md`'s standard bounded-label, pre-seeded-to-0 convention (the same
 shape as `yuzu_nvd_sync_failures_total{reason}` and the `InstructionStore`/`RuntimeConfigStore`
 degrade families), one series per named `reflex.aborted{<reason>}` cause used elsewhere in this
-document (`restart`, `undeploy`, `unresolvable_fact` today; the set is open the same way the causes
-themselves are, so a later slice adding a new abort cause adds its series here rather than leaving
-it uncounted) — this is what makes the "every fire produces exactly one terminal row, or the loss is
-signaled" guarantee below actually hold for a plain watchdog/timeout abort that follows no sequence
+document (`restart`, `undeploy`, `unresolvable_fact` today). **`reason` is drawn from a fixed,
+code-defined enum of named abort causes, mirrored server-side as its own `constexpr` array — the
+same discipline as `kQuarantineGateOutcomes` and `kSystemReservedPushResults` in
+`server/core/src/dispatch_confined_arms.hpp` — and is never a raw agent-reported string copied into
+the label.** The abort cause arrives from the agent inside the event's `detail_json`, so the server
+normalizes any value outside the known enum to a fixed `unrecognized` bucket before it can become a
+Prometheus label; a later slice adding an abort cause extends the enum and the array in a code
+change, never by accepting a new string at runtime. **The `os` dimension follows the fleet-rollup
+absent-not-zero rule exactly as its `{os}`-only siblings do:** a given `os` has no `reason` series
+at all until at least one agent of that OS reports an abort, and once that `os` is present every
+known `reason` value is pre-seeded to 0 for it. This counter is what makes the "every fire produces
+exactly one terminal row, or the loss is signaled" guarantee below actually hold for a plain watchdog/timeout abort that follows no sequence
 gap, which previously had no fleet-level signal at all
 (server-held, last-seen-delta with reset detection — a genuinely new fleet-metric shape this
 document introduces, not a precedented one; R13 documents it in
