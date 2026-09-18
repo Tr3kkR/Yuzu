@@ -239,6 +239,12 @@ start_chan(Name, Port, Ca, Dir, Leaf) ->
         _ -> Base ++ [{certfile, filename:join(Dir, Leaf ++ ".pem")},
                       {keyfile, filename:join(Dir, Leaf ++ ".key")}]
     end,
+    %% sync_start: register the endpoint in gproc_pool before start_child
+    %% returns. Without it, init/1 replies while still `idle` and queues
+    %% the internal `connect` event that calls start_workers/4 -- the very
+    %% next RPC in this suite can race that event and see {error,
+    %% no_endpoints} from grpcbox_channel:pick/2 (CI flake, shared runner
+    %% box widens the window).
     {ok, _} = grpcbox_channel_sup:start_child(
-                Name, [{https, "localhost", Port, SslOpts}], #{}),
+                Name, [{https, "localhost", Port, SslOpts}], #{sync_start => true}),
     Name.
