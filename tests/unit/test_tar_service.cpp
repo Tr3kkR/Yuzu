@@ -139,7 +139,9 @@ TEST_CASE("parse_launchctl_list: empty input yields empty output", "[tar_service
 
 TEST_CASE("parse_launchctl_list: header-only input yields empty output", "[tar_service]") {
     std::vector<std::string> lines = {"PID\tStatus\tLabel"};
-    CHECK(parse_launchctl_list(lines).entries.empty());
+    auto result = parse_launchctl_list(lines);
+    CHECK(result.entries.empty());
+    CHECK_FALSE(result.malformed); // a present, valid header with zero data rows is genuine, not corrupt
 }
 
 TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
@@ -152,7 +154,9 @@ TEST_CASE("parse_launchctl_list: real macOS host capture", "[tar_service]") {
         "93175\t-9\tcom.apple.knowledgeconstructiond",
     };
 
-    auto services = parse_launchctl_list(lines).entries;
+    auto result = parse_launchctl_list(lines);
+    CHECK_FALSE(result.malformed);
+    auto services = result.entries;
     REQUIRE(services.size() == 3);
 
     CHECK(services[0].name == "com.apple.SafariHistoryServiceAgent");
@@ -338,6 +342,26 @@ TEST_CASE("enumerate_services_impl (macOS/launchctl leg): invokes the exact "
     CHECK(services[0].status == "stopped");
     CHECK(services[1].name == "com.apple.progressd");
     CHECK(services[1].status == "running");
+}
+
+TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a clean exit-0 capture "
+          "with zero output lines throws IncompleteCaptureError, never a silent "
+          "empty snapshot",
+          "[tar_service][enumerate]") {
+    // UP2-2 (governance A0 fix round, HIGH): classify_subprocess_capture sees
+    // tool_ran=true/exit_code=0/no timeout/no truncation and reports
+    // "complete" regardless of `lines` content -- the storm-prevention check
+    // lives in parse_launchctl_list's own malformed=true for zero lines
+    // (previous commit), exercised here end-to-end through the real
+    // collector entry point.
+    auto fake_run = [](const std::vector<std::string>&, const yuzu::agent::SubprocessOptions&) {
+        yuzu::agent::SubprocessResult res;
+        res.tool_ran = true;
+        res.exit_code = 0;
+        res.lines = {}; // exit-0 but genuinely empty stdout
+        return res;
+    };
+    REQUIRE_THROWS_AS(enumerate_services_impl(fake_run), yuzu::tar::IncompleteCaptureError);
 }
 
 TEST_CASE("enumerate_services_impl (macOS/launchctl leg): a spawn failure "
