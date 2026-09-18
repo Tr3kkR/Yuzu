@@ -10,6 +10,7 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/storage/IOBlockStorageDriver.h>
+#include <IOKit/storage/IOStorageProtocolCharacteristics.h>
 #include <mach/mach_host.h>
 #include <mach/mach_init.h>
 #include <mach/machine.h>
@@ -205,14 +206,45 @@ DriverStatOutcome read_driver_stats(CFDictionaryRef dict, DiskTotals& out) {
     return DriverStatOutcome::kAccumulated;
 }
 
+// True iff `driver`'s provider (the IOBlockStorageDevice one step up the kIOServicePlane —
+// providers are parents, drivers are their clients/children) advertises a "Physical
+// Interconnect" OTHER than kIOPropertyPhysicalInterconnectTypeVirtual ("Virtual
+// Interface" — the marker hdiutil-mounted disk images and other synthesized block
+// devices carry). Missing provider, missing "Protocol Characteristics" dict, or a
+// missing/malformed key are all treated as NOT physical: the same "omit an unrecognised
+// source rather than mis-aggregate it" bias yuzu::agent::lnx::is_whole_disk documents for
+// its own analogous choice — an unreadable classification degrades the sample (fewer
+// bytes counted) rather than silently blending a pseudo-device's service time into the
+// real disks' denominator (governance C-1: a mounted DMG at ~108us/op pulled a live
+// probe's derived service time down against the SSD's ~267us/op).
+bool is_physical_storage_driver(io_object_t driver) {
+    io_registry_entry_t raw_provider = 0;
+    if (IORegistryEntryGetParentEntry(driver, kIOServicePlane, &raw_provider) != KERN_SUCCESS)
+        return false;
+    ScopedIOObject provider{raw_provider};
+    ScopedCFRef<CFTypeRef> proto{IORegistryEntryCreateCFProperty(
+        provider.get(), CFSTR(kIOPropertyProtocolCharacteristicsKey), kCFAllocatorDefault, 0)};
+    if (!proto || CFGetTypeID(proto.get()) != CFDictionaryGetTypeID())
+        return false;
+    auto interconnect = static_cast<CFStringRef>(CFDictionaryGetValue(
+        static_cast<CFDictionaryRef>(proto.get()), CFSTR(kIOPropertyPhysicalInterconnectTypeKey)));
+    if (!interconnect || CFGetTypeID(interconnect) != CFStringGetTypeID())
+        return false;
+    return !CFEqual(interconnect, CFSTR(kIOPropertyPhysicalInterconnectTypeVirtual));
+}
+
 // File-private: read_disk_totals() below is the only PRODUCTION caller (the test-only
 // sum_block_storage_stats_empty_iterator_for_test() is the walk's other caller). Sums every
-// IOBlockStorageDriver's "Statistics" dict reachable from `it` via read_driver_stats().
+// PHYSICAL IOBlockStorageDriver's "Statistics" dict reachable from `it` via
+// read_driver_stats() — a driver classified NOT physical by is_physical_storage_driver()
+// is skipped exactly like a missing Statistics dict (not fatal to the sample).
 DiskTotals sum_block_storage_stats(io_iterator_t it) {
     DiskTotals out;
     bool any = false;
     for (io_object_t raw_obj; (raw_obj = IOIteratorNext(it));) {
         ScopedIOObject obj{raw_obj};
+        if (!is_physical_storage_driver(obj.get()))
+            continue; // a disk image / other virtual device — never blend it in
         ScopedCFRef<CFTypeRef> stats{IORegistryEntryCreateCFProperty(
             obj.get(), CFSTR(kIOBlockStorageDriverStatisticsKey), kCFAllocatorDefault, 0)};
         if (!stats || CFGetTypeID(stats.get()) != CFDictionaryGetTypeID())

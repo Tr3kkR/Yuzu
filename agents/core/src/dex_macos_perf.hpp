@@ -73,9 +73,13 @@ YUZU_EXPORT std::uint64_t mach_abs_to_100ns(std::uint64_t t, std::uint32_t numer
 /// correct, safe behaviour, not a bug in this check.
 YUZU_EXPORT std::optional<double> cpu_busy_pct(const CpuTicks& prev, const CpuTicks& cur);
 
-/// Aggregate IOBlockStorageDriver "Statistics" counters, summed over every driver
-/// instance in the IOKit registry — the macOS analogue of yuzu::agent::lnx::DiskIoTotals.
-/// Time fields are nanoseconds from kIOBlockStorageDriverStatisticsTotal{Read,Write}
+/// Aggregate IOBlockStorageDriver "Statistics" counters, summed over every PHYSICAL
+/// driver instance in the IOKit registry — the macOS analogue of
+/// yuzu::agent::lnx::DiskIoTotals, which restricts to whole physical disks via
+/// `is_whole_disk`; this restricts the same way via `is_physical_storage_driver`
+/// (governance C-1 — a disk-image-backed driver blended into the aggregate pulls the
+/// derived service time down, so a genuinely slow physical disk reads healthier than it
+/// is). Time fields are nanoseconds from kIOBlockStorageDriverStatisticsTotal{Read,Write}
 /// TimeKey ("Total Time (Read/Write)") — the driver's SERVICE time, deliberately NOT
 /// kIOBlockStorageDriverStatisticsLatent{Read,Write}TimeKey ("Latency Time", queue/wait
 /// time), which is never read here.
@@ -138,13 +142,15 @@ YUZU_EXPORT CpuTicks read_cpu_ticks();
 /// calls) or on every other platform.
 YUZU_EXPORT VmSnapshot read_vm_snapshot();
 
-/// Darwin: sums the "Statistics" dictionary of every IOBlockStorageDriver in the IOKit
-/// registry (IOServiceGetMatchingServices(kIOBlockStorageDriverClass)). A driver with no
-/// Statistics dict, or missing one of the 6 keys read, is SKIPPED (does not invalidate
-/// the sample — an idle/uninitialized driver legitimately has none yet); a NEGATIVE
-/// value on any key present invalidates the WHOLE sample immediately (kernel-counter
-/// corruption, not a benign gap). All-invalid on lookup failure or on every other
-/// platform. The walk itself (`sum_block_storage_stats`/`read_driver_stats`) is
+/// Darwin: sums the "Statistics" dictionary of every PHYSICAL IOBlockStorageDriver in the
+/// IOKit registry (IOServiceGetMatchingServices(kIOBlockStorageDriverClass), filtered by
+/// `is_physical_storage_driver` — a disk-image/virtual driver is SKIPPED exactly like a
+/// driver with no Statistics dict, never blended in). A driver with no Statistics dict,
+/// or missing one of the 6 keys read, is SKIPPED (does not invalidate the sample — an
+/// idle/uninitialized driver legitimately has none yet); a NEGATIVE value on any key
+/// present invalidates the WHOLE sample immediately (kernel-counter corruption, not a
+/// benign gap). All-invalid on lookup failure or on every other platform. The walk itself
+/// (`sum_block_storage_stats`/`read_driver_stats`/`is_physical_storage_driver`) is
 /// file-private to dex_macos_perf.cpp — this is its only PRODUCTION caller (the
 /// test-only seam below is the walk's other caller).
 YUZU_EXPORT DiskTotals read_disk_totals();
