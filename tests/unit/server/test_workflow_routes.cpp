@@ -795,7 +795,7 @@ TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
 // "fault" was hitting a transient outage. get_execution_checked's outer
 // std::expected now distinguishes the two; the degrade branch returns
 // BEFORE any denial audit is recorded.
-TEST_CASE("executions detail: a transient tracker degrade is 503, not a false 404, "
+TEST_CASE("executions detail: a transient tracker degrade is 503 (not a false 404) "
           "and records no denial audit (#2146 A2-R1 Gate 8 fix)",
           "[pg][workflow][executions][detail]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -1692,7 +1692,7 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
 // "fault" was hitting a transient outage. get_execution_checked's outer
 // std::expected now distinguishes the two; the degrade branch returns
 // BEFORE any denial audit is recorded.
-TEST_CASE("SSE handler: a transient tracker degrade is 503, not a false 404, and "
+TEST_CASE("SSE handler: a transient tracker degrade is 503 (not a false 404) and "
           "records no denial audit (#2146 A2-R1 Gate 8 fix)",
           "[pg][workflow][executions][pr3]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

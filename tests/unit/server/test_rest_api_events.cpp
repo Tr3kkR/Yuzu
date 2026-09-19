@@ -543,7 +543,7 @@ TEST_CASE("GET /api/v1/events: unknown execution → 404 A4", "[pg][events][notf
 // "fault" was hitting a transient outage. get_execution_checked's outer
 // std::expected now distinguishes the two; the degrade branch returns
 // BEFORE any denial audit is recorded.
-TEST_CASE("GET /api/v1/events: a transient tracker degrade is 503, not a false 404, "
+TEST_CASE("GET /api/v1/events: a transient tracker degrade is 503 (not a false 404) "
           "and records no denial audit (#2146 A2-R1 Gate 8 fix)",
           "[pg][events][notfound]") {
     RestEventsHarness h;

@@ -822,7 +822,7 @@ TEST_CASE("ExecutionTracker: get_children_checked truncates and flags a parent o
 // dispatcher must still return it, and truncated must be false (the
 // caller's OWN visible row set -- one row -- is nowhere near the cap).
 TEST_CASE("ExecutionTracker: get_children_checked pushes the scope into SQL "
-          "before the cap, so an invisible sibling cannot displace a visible "
+          "before the cap -- an invisible sibling cannot displace a visible "
           "child out of the capped window (#2146 A2-R1 Gate 8 fix)",
           "[pg][execution_tracker][security]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -873,7 +873,7 @@ TEST_CASE("ExecutionTracker: get_children_checked pushes the scope into SQL "
 // siblings so the boundary genuinely exercises the scoped SQL path rather
 // than degenerating into the unscoped test above.
 TEST_CASE("ExecutionTracker: get_children_checked's cap boundary is the "
-          "caller's VISIBLE child count, not the raw row count "
+          "caller's VISIBLE child count -- not the raw row count "
           "(#2146 A2-R1 Gate 8 fix)",
           "[pg][execution_tracker][security]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
