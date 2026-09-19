@@ -102,6 +102,32 @@ TEST_CASE("PgPool exhaustion", "[pg][pool][pg-smoke]") {
     CHECK(static_cast<bool>(granted));
 }
 
+TEST_CASE("PgPool try_acquire_for fails fast once already saturated instead "
+          "of blocking the caller's full timeout "
+          "(#2146 gov sre up-2146-a2r1-httplib-worker-cascade)",
+          "[pg][pool]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 1}};
+
+    auto held = pool.acquire();
+    REQUIRE(static_cast<bool>(held));
+
+    // The pool is now fully saturated (size 1, the one connection leased,
+    // none idle) -- exactly the "no idle connection, no spare capacity to
+    // open one" condition the fast-fail clamp (Options::saturated_fast_fail,
+    // default 500ms) keys off. A caller passing a timeout far longer than
+    // that default should still be turned away well under it, never
+    // anywhere near the requested timeout -- proving the clamp actually
+    // fired rather than the acquire loop blocking to the full deadline. 3s
+    // requested vs. a <1.5s bound leaves a wide margin either side of the
+    // 500ms default for a loaded CI box.
+    const auto t0 = std::chrono::steady_clock::now();
+    auto denied = pool.try_acquire_for(3000ms);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    CHECK_FALSE(static_cast<bool>(denied));
+    CHECK(elapsed < 1500ms);
+}
+
 TEST_CASE("PgPool size 0 clamps to 1", "[pg][pool]") {
     YUZU_REQUIRE_PG_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 0}};

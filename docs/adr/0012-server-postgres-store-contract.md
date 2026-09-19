@@ -151,3 +151,27 @@ interval) must pin that relationship with a `static_assert`, not a comment.
   no backend abstraction (ADR-0007/0008 compliant). This is an implementation follow-up.
 - The step-by-step recipe an author follows is `docs/postgres-store-playbook.md`; this ADR is
   the *why* it cites.
+
+## Update (2026-09-20) -- fast-fail-on-saturation refines rule 2(a)'s bound
+
+Rule 2(a) ("Runtime acquires are always bounded") let a caller's own timeout run to completion
+even when the shared pool was ALREADY fully saturated at the moment of acquire -- no idle
+connection and no spare capacity to open one. Governance finding `up-2146-a2r1-httplib-worker-
+cascade` (#2146 A2-R1 Gate 8) found the shared pool's default worker-to-connection ratio
+(~264:16 httplib workers per pool `size`) makes that saturation a foreseeable steady state, not
+a rare edge case -- so every `try_acquire_for`/`with_txn_for` caller blocking up to its own
+`kReadTimeout`/`kWriteTimeout` (1500ms-4000ms across stores) while saturated can, at volume,
+exhaust the httplib worker pool itself and stall unrelated routes (auth included), not just the
+route that happened to hit the saturated pool.
+
+`PgPool::try_acquire_for` (`pg_pool.hpp`) now clamps the wait to
+`min(caller's own timeout, Options::saturated_fast_fail)` (default 500ms) once it observes that
+saturated state at entry -- never for a caller that arrives before saturation, and never for the
+unbounded `acquire()`/`with_txn()` (construction-only, rule 2(a)'s existing carve-out). This does
+not weaken rule 2(a) ("always bounded") -- it tightens the bound precisely when the caller's own
+timeout is very unlikely to be honoured by an actual release in time anyway, freeing the calling
+httplib worker for other routes instead of pinning it. The default (500ms) is chosen to sit above
+every currently-deliberately-short acquire/retry timeout already in the codebase (e.g.
+`auth_db.cpp`'s `#2396` login-resilience retry) so this refinement only compresses the long
+budgets the finding is about; see `Options::saturated_fast_fail`'s doc comment in `pg_pool.hpp`
+for the full reasoning and the audited value table behind the 500ms choice.

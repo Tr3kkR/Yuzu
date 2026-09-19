@@ -130,6 +130,42 @@ public:
         /// not blocked). A successful connect resets the breaker.
         std::chrono::milliseconds connect_backoff_base{200};
         std::chrono::milliseconds connect_backoff_cap{5000};
+        /// Fast-fail-on-saturation ceiling for a bounded acquire (#2146 gov
+        /// sre finding `up-2146-a2r1-httplib-worker-cascade`). Checked ONCE,
+        /// at entry, inside `try_acquire_for`/`with_txn_for` (never the
+        /// unbounded `acquire()`/`with_txn()`): if the pool is ALREADY
+        /// saturated at that instant (no idle connection, no spare capacity
+        /// to open a new one -- exactly the condition under which the
+        /// acquire loop would otherwise block a caller), the wait is clamped
+        /// to `min(caller's own timeout, this value)`, so a caller that
+        /// arrives after saturation gets its degrade response back quickly
+        /// rather than pinning its thread (an httplib worker, for a REST
+        /// route) for the full timeout waiting on a connection that is very
+        /// unlikely to free up in time anyway. A caller that arrives BEFORE
+        /// saturation is unaffected -- this never shortens a wait that would
+        /// otherwise have succeeded quickly.
+        ///
+        /// Default 500ms, not a smaller "near-zero" value, DELIBERATELY:
+        /// this is a SHARED chokepoint every bounded acquire in the codebase
+        /// goes through, and several callers already pick a short timeout on
+        /// purpose for reasons unrelated to this finding -- most notably
+        /// `auth_db.cpp`'s `#2396` login-resilience retry
+        /// (`kAcquireRetryTimeout{150}`), whose own doc comment explains it
+        /// is sized to be >= its retry backoff SPECIFICALLY so a retry has
+        /// time to catch a just-freed connection, after a prior review
+        /// (Gate 4 UP-3) rejected a narrower window for causing false
+        /// `StoreBusy` under mere contention. 500ms sits above every
+        /// deliberately-short acquire/retry timeout already in this codebase
+        /// at the time of writing (audited: the largest is
+        /// `kCreateAcquireTimeout`/`kIngestAcquireTimeout`/gateway_route_
+        /// store's `kWriteTimeout`, all 500ms) so this fix only compresses
+        /// the LONG budgets (kReadTimeout/kWriteTimeout-class, 1500ms+) the
+        /// finding is actually about, never an already-tuned short one. It
+        /// mirrors `kContainmentReadSlotWait` (server.cpp)'s own reasoning
+        /// for the same number: a healthy store's read is milliseconds, so
+        /// 500ms is unobservable there, while a stalled one is rejected
+        /// quickly instead of pinning a worker.
+        std::chrono::milliseconds saturated_fast_fail{500};
         /// Observability hooks; see Observer. All optional.
         Observer observer;
     };
@@ -206,8 +242,15 @@ public:
     /// As `acquire()`, but gives up after `timeout` when the pool is
     /// exhausted and nothing is released in time. Bound caveat: a fresh
     /// connection attempt is only STARTED before the deadline, but once
-    /// started it runs to completion — worst case is roughly
+    /// started it runs to completion -- worst case is roughly
     /// `timeout + connect_timeout_s`.
+    ///
+    /// Fast-fail-on-saturation (Options::saturated_fast_fail): when the pool
+    /// is ALREADY saturated at the moment this is called, the effective wait
+    /// is `min(timeout, saturated_fast_fail)`, not the full `timeout` --
+    /// see the option's doc comment. A caller depending on the full
+    /// `timeout` being honoured under saturation (there should be none --
+    /// that is the failure mode this exists to close) needs to know this.
     [[nodiscard]] Lease try_acquire_for(std::chrono::milliseconds timeout);
 
     /// Pin one connection for a transaction: BEGIN, run `fn`, COMMIT when it
@@ -235,6 +278,8 @@ public:
     /// writes (e.g. the inventory full-payload replace) MUST use this so a
     /// saturated pool — e.g. a fleet-wide need_full storm — cannot block a gRPC
     /// worker indefinitely (ADR-0012 bounded-acquire discipline; gov UP-3).
+    /// Inherits `try_acquire_for`'s fast-fail-on-saturation clamp
+    /// (Options::saturated_fast_fail) since it acquires through that call.
     bool with_txn_for(std::chrono::milliseconds timeout,
                       const std::function<bool(PGconn*)>& fn);
 
@@ -324,6 +369,7 @@ private:
     bool conninfo_has_options_{false};
     bool conninfo_has_keepalives_{false};
     bool conninfo_has_tcp_user_timeout_{false};
+    std::chrono::milliseconds saturated_fast_fail_{500};
     Observer observer_;
 
     mutable std::mutex mu_;

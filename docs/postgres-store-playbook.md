@@ -170,7 +170,11 @@ The substrate code is `server/core/src/pg/`: `pg_raii.hpp` (`PgConn`/`PgResult`/
    (`try_acquire_for(deadline)`) — pick the deadline from posture (hot-path fail-soft: short,
    e.g. 250 ms; user-facing authoritative: longer, e.g. 2 s). Unbounded `acquire()` is
    construction-only. Never hold a lease across network/disk/external work. Never call another
-   store while holding a lease (one lease per logical operation).
+   store while holding a lease (one lease per logical operation). Your chosen deadline is a
+   ceiling, not a guarantee of how long a saturated pool will hold you: `try_acquire_for` itself
+   clamps the wait once it observes the pool already saturated at entry (`Options::
+   saturated_fast_fail`, ADR-0012's 2026-09-20 Update), so a caller arriving after saturation has
+   its httplib worker freed quickly rather than pinned for your deadline's full length.
 
    *Caching an authoritative read?* Do not invent the rules — **ADR-0012 §4** ("Read caching on
    an authoritative store") encodes the five that this seam demands: positive-only, invalidate
