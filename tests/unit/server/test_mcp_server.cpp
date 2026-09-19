@@ -7902,6 +7902,58 @@ TEST_CASE("MCP list_schedules: enabled_only narrows the result set (#2146 A2-R1)
     CHECK_FALSE(found_disabled);
 }
 
+// Governance fix (#2146 A2-R1, this branch's own re-review): the pre-fix
+// `args.contains("enabled_only") && args["enabled_only"].is_boolean()` idiom
+// had no `else` branch, so a present-but-wrong-type value (the JSON string
+// "true", what a loosely-typed client sends) was silently treated as ABSENT
+// -- the filter was dropped rather than rejected, and the caller who thought
+// they narrowed to only-enabled schedules got both back with no error.
+// param_bool_strict (mcp_server.cpp, sibling of the pre-existing
+// param_int_strict/#2970B) closes this the same way that fix closed the
+// equivalent integer-typed defect: present+wrong-type is now kInvalidParams,
+// not a silently dropped filter.
+TEST_CASE("MCP list_schedules: enabled_only wrong JSON type is rejected, not silently "
+          "dropped (#2146 A2-R1)",
+          "[pg][mcp][integration][schedule]") {
+    yuzu::test::ScheduleEnginePg engine_bundle;
+    yuzu::server::ScheduleEngine& engine = *engine_bundle;
+
+    yuzu::server::InstructionSchedule enabled_sched;
+    enabled_sched.name = "sched-enabled-strict";
+    enabled_sched.definition_id = "def-2146-mcp-strict-enabled";
+    enabled_sched.frequency_type = "once";
+    enabled_sched.enabled = true;
+    enabled_sched.created_by = "admin";
+    auto enabled_id = engine.create_schedule(enabled_sched);
+    REQUIRE(enabled_id.has_value());
+
+    yuzu::server::InstructionSchedule disabled_sched;
+    disabled_sched.name = "sched-disabled-strict";
+    disabled_sched.definition_id = "def-2146-mcp-strict-disabled";
+    disabled_sched.frequency_type = "once";
+    disabled_sched.enabled = false;
+    disabled_sched.created_by = "admin";
+    auto disabled_id = engine.create_schedule(disabled_sched);
+    REQUIRE(disabled_id.has_value());
+
+    McpTestServer ts;
+    ts.schedule_engine_for_test = &engine;
+    ts.start("operator");
+
+    auto res = ts.call(
+        R"({"jsonrpc":"2.0","method":"tools/call","id":772,"params":{"name":"list_schedules",)"
+        R"("arguments":{"enabled_only":"true"}}})");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    // Pre-fix: this was a `result` with `structuredContent.schedules`
+    // containing BOTH ids (the filter silently dropped) and no error at all.
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == kInvalidParams);
+    CHECK(body["error"]["message"].get<std::string>().find("must be a JSON boolean") !=
+          std::string::npos);
+}
+
 // #3290 Phase 2: query_installed_software's per-tool blanket
 // deny_fleet_wide_service_scoped call (the guardian-confinement-2298 Gate
 // 2/4/6 finding this test used to pin) is RETIRED — confinement is now

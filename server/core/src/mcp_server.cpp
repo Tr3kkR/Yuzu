@@ -273,6 +273,30 @@ std::optional<int64_t> param_int_strict(const nlohmann::json& params, const char
     return params[key].get<int64_t>();
 }
 
+/// Boolean sibling of `param_int_strict` above (#2146 A2-R1 governance
+/// finding, same defect class as #2970B): the plain `args.contains(key) &&
+/// args[key].is_boolean()` idiom used across most `*_only` filters silently
+/// treats a present-but-wrong-type value (the JSON string `"true"`, a
+/// number) as ABSENT -- the filter is dropped rather than rejected, so a
+/// caller who thinks they narrowed the query gets the unfiltered result
+/// instead. Same nullopt-on-present-wrong-type contract as `param_int_strict`:
+/// present+boolean -> the value; present+wrong-type -> `nullopt` (caller
+/// answers `kInvalidParams`); absent -> `def` (omitted is not malformed).
+///
+/// Deliberately a NEW helper rather than a fix to the existing ad hoc idiom
+/// everywhere it appears -- that idiom has many call sites across this file,
+/// several of which are known instances of this exact defect class but are
+/// OUT OF SCOPE for this fix (tracked separately, not silently swept in
+/// here): `list_definitions`'s `enabled_only` (~L7996) and
+/// `list_license_alerts`'s `unacknowledged_only` (~L20700).
+std::optional<bool> param_bool_strict(const nlohmann::json& params, const char* key, bool def) {
+    if (!params.contains(key))
+        return def;
+    if (!params[key].is_boolean())
+        return std::nullopt;
+    return params[key].get<bool>();
+}
+
 int param_int32(const nlohmann::json& params, const char* key, int def = 0) {
     return static_cast<int>(param_int(params, key, def));
 }
@@ -10752,8 +10776,23 @@ McpServer::HandlerFn McpServer::build_handler(
                 // GET /api/schedules route already populate.
                 ScheduleQuery sq;
                 sq.definition_id = param_str(args, "definition_id");
-                if (args.contains("enabled_only") && args["enabled_only"].is_boolean())
-                    sq.enabled_only = args["enabled_only"].get<bool>();
+                // Governance fix (#2146 A2-R1): was the bare
+                // `args.contains(...) && args[...].is_boolean()` idiom, which
+                // silently treats a present-but-wrong-type value (e.g. the
+                // JSON string "true") as absent -- the filter is dropped
+                // instead of the caller being told their input was rejected.
+                // param_bool_strict (above) gives this the same
+                // nullopt-on-wrong-type contract param_int_strict already
+                // gives `limit` elsewhere in this file.
+                const auto enabled_only_opt =
+                    param_bool_strict(args, "enabled_only", sq.enabled_only);
+                if (!enabled_only_opt) {
+                    res.set_content(
+                        error_response(id, kInvalidParams, "enabled_only must be a JSON boolean"),
+                        "application/json");
+                    return;
+                }
+                sq.enabled_only = *enabled_only_opt;
                 auto schedules_result = schedule_engine->query_schedules_checked(sq);
                 if (!schedules_result) {
                     res.set_content(
