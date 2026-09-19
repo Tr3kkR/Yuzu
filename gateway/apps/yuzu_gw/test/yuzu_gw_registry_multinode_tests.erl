@@ -27,6 +27,13 @@
 -module(yuzu_gw_registry_multinode_tests).
 -include_lib("eunit/include/eunit.hrl").
 
+%% ensure_distributed/0 is the hard-won, Windows-CI-safe distribution
+%% bootstrap (see its own doc comment below for the 3-round history) —
+%% exported so other multinode test suites (e.g.
+%% yuzu_gw_cluster_formation_multinode_tests.erl, HA WS-4 #4555) reuse this
+%% ONE implementation instead of re-deriving it.
+-export([ensure_distributed/0]).
+
 -define(PG_SCOPE, yuzu_gw).
 
 %%%===================================================================
