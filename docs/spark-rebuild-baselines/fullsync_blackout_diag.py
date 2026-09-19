@@ -3,11 +3,11 @@
 
 One-time rig-scoped instrument, not production tooling (see the plan's
 "Sol feedback declined" section for why this stays simple rather than
-production-hardened). Measures B = T1 - T0, the synchronous full_sync
-apply-window proxy, on a single Windows agent under two detection backends
-(legacy IGuard vs spark), triggered two ways: a baseline (re)deploy, and a
-bare rule-create in no baseline (the heartbeat-reconcile trigger that is
-#3990's own literal shape).
+production-hardened). Measures B = T1 - T0 (log interval, continuity only)
+and C = T2_last - T0 (primary measurand, R5.7) on a single Windows agent
+under two detection backends (legacy IGuard vs spark), triggered two ways:
+a baseline (re)deploy, and a bare rule-create in no baseline (the
+heartbeat-reconcile trigger that is #3990's own literal shape).
 
 See docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md for the
 measurand definitions, void rules, and decision criterion this implements -
@@ -28,34 +28,44 @@ the vendored header, not assumed - so a log line's embedded timestamp is accurat
 time, but the underlying bytes can sit unflushed for an unpredictable period (measured live:
 from ~2s up to ~108s) before becoming visible to ANY external reader, this script included.
 Widened ROOT_CAUSED_T0_TIMEOUT/ROOT_CAUSED_T1_TIMEOUT to compensate - a bounded workaround for
-this one-time measurement, NOT a proven-reliable fix: even at 240s, 3 of 8 legacy Phase B
-attempts and 2 of 3 controlled-pilot attempts still voided `t1_not_found` in the 2026-09-07
-re-run. Treat this as the established dominant cause, not an exhaustively-confirmed one.
+this one-time measurement, NOT a proven-reliable fix.
 
-FIXED 2026-09-07 (Dave: "Fix cmd_run's functional_valid wiring and re-run"): `run_repeat()`
-now folds `functional_valid` into `void_reason` itself (as `"functional_invalid"`) for the
-clean-verdict phases (B/B2), so `cmd_run()`'s existing `if not r.get("void_reason")` counting
-loop naturally excludes a functionally-invalid repeat - no change needed in `cmd_run()` itself,
-the bug was that `run_repeat()` computed the precondition but never folded it into the one
-field the counting loop actually reads. Previously: ALL 16 of the 2026-09-07 re-run's counted
-repeats had `functional_valid=False` and were still counted as valid - see the run doc's
-"Decision rule and outcome" section for that history.
+FIXED 2026-09-07: `run_repeat()` folds `functional_valid` into `void_reason` itself for the
+clean-verdict phases (B/B2). Cohort service-watch targets use `BLACKOUT_SVC_OVERRIDE` (5
+services confirmed live, replacing 5 confirmed Stopped on DGRHP).
 
-Also fixed the same day, same commit: the cohort's service-watch targets included 5 services
-(Spooler, Themes, BITS, wuauserv, W32Time - `SERVICE_NAMES` indices 1/2/4/5/15) confirmed
-Stopped on DGRHP (3 consistently across all 16 prior repeats, 2 intermittently) - `guard.compliant`
-can never fire for a service that never transitions to Running, which made `functional_valid`
-unsatisfiable BY COHORT DESIGN regardless of the wiring fix above. Replaced with 5 services
-confirmed live (`Get-Service`, 2026-09-07) as Running + Automatic-start and not already used
-elsewhere in the 20-name cohort: LSM, DcomLaunch, RpcEptMapper, nsi, SamSs - see
-`BLACKOUT_SVC_OVERRIDE` below. This overrides `G.SERVICE_NAMES` locally for this script's own
-cohort only; `generate_resgate_load.py`'s own list is untouched (out of scope, used elsewhere).
+R5.7 T2 RE-MEASUREMENT (2026-09-19, rung 9c PR-6 item 2 - see
+docs/spark-stage2-guardian-consumer-design.md "R5.7 - Re-measurement methodology"):
+Window B alone is no longer a valid proxy for spark's real arm-completion latency on current
+`origin/dev` - rung 9c PR-2 added `pending=` to the `apply_rules ok` line and moved
+`reconcile_rule_locked()` to a NonWaiting attach model, so T1 no longer waits for every rule's
+arm to commit. This round adds:
+  - dev-shape T1_RE (six groups, `pending=` included).
+  - T0D_RE: a new runtime log line, `Guardian spark: detach_all complete (epoch=,
+    incarnation_floor=, detached_rules=, withdrawn_claims=)`, emitted as the LAST statement of
+    `GuardianSparkRuntime::detach_all()`'s locked block. `epoch` is a monotonic per-application
+    counter (`detach_epoch_`), `incarnation_floor` is `gen_counter_` at teardown time.
+  - T2_RE: a new runtime log line, `Guardian spark: arm committed for rule '<id>' (epoch=,
+    incarnation=, type=, via=, attach_to_commit_ms=)`, the LAST statement of
+    `GuardianSparkRuntime::commit_new_generation_locked()` - the only valid log-side proxy for
+    "this rule is armed" under spark. `epoch` names which application (full_sync teardown) the
+    commit belongs to; membership is decided by EPOCH IDENTITY, never by timestamp order (a
+    previous application's stale in-flight callback can otherwise land between the new
+    `full_sync cleared` line and `detach_all()` and get miscounted - found by an Astra
+    adversarial review of this round's design, independently confirmed against source before
+    being folded in).
+  - C = T2_last - T0 is now the HEADLINE measurand; B is reported for continuity only and no
+    longer brackets synchronous arm completion under the NonWaiting model - a drop in B versus
+    the historical clean-v2 numbers is a MODEL CHANGE, not an improvement, and must not be
+    reported as one.
+  - Two-class void taxonomy (instrument-invalid vs genuine failure), `run_id`-scoped Phase B2
+    trigger ids (closes a real trigger-ID-reuse trap the existing run doc already documented),
+    bounded functional-validity polling, and an offline `selftest` subcommand (run BEFORE any
+    server login) covering the fence logic end to end.
 
-KNOWN BUG, NOT FIXED: `cmd_report`'s grouping key is (label, backend, phase) only - it cannot
-distinguish rows from two different `run` invocations that both used the same label (e.g. two
-separate attempts both run with label="clean"). Re-running `report` against a results file
-containing more than one such attempt silently pools their rows together. Add a run
-identifier before trusting `report`'s output across multiple attempts.
+KNOWN BUG, FIXED THIS ROUND: `cmd_report`'s grouping previously could not distinguish rows from
+two different `run` invocations sharing the same label. Every row now carries `run_id` and
+`comparison_id`; grouping and the printed report key on both.
 
 This is a real property of the agent's --log-file output worth flagging as its own product
 finding (live-tailing --log-file for near-real-time diagnostics is unreliable without a flush
@@ -74,7 +84,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import generate_resgate_load as G  # noqa: E402
@@ -107,14 +117,44 @@ LOG_TS_RE = re.compile(
 )
 T0_RE = re.compile(r"Guardian: full_sync cleared (\d+) prior rule\(s\)")
 T0_FALLBACK_RE = re.compile(r"Received command: plugin=__guard__, action=push_rules")
+PUSH_CMD_RE = T0_FALLBACK_RE  # same line; R5.7 role: an OBSERVED push command, not a T0
 T1_RE = re.compile(
-    r"Guardian: apply_rules ok \(applied=(\d+), failed=(\d+), full_sync=(true|false), "
-    r"generation=(\d+), total=(\d+)\)"
+    r"Guardian: apply_rules ok \(applied=(\d+), failed=(\d+), pending=(\d+), "
+    r"full_sync=(true|false), generation=(\d+), total=(\d+)\)"
+)
+T0D_RE = re.compile(
+    r"Guardian spark: detach_all complete \(epoch=(\d+), incarnation_floor=(\d+), "
+    r"detached_rules=(\d+), withdrawn_claims=(\d+)\)"
+)
+T2_RE = re.compile(
+    r"Guardian spark: arm committed for rule '([^']+)' \(epoch=(\d+), "
+    r"incarnation=(\d+), type=([\w-]+), via=([\w-]+), attach_to_commit_ms=(\d+)\)"
 )
 ARM_LEGACY_RE = re.compile(r"(?:file|service|registry) guard armed for rule '([^']+)'")
 ARM_SPARK_RE = re.compile(r"SparkEngine: armed '([^']+)'")
 BACKEND_RE = re.compile(r"detection backend = (\w+)")
 NETWORK_CONNECTED_RE = re.compile(r"Guardian engine network-connected")
+
+# Void taxonomy (R5.7 round 2, §2.2 item 3). Instrument-invalid: the instrument, not the
+# system, failed - reported, never counted, never held against reliability. Genuine failure:
+# the system did not do what the push asked - counts against the phase's reliability gate AND
+# is a product finding. `trigger_failed:*` is matched by prefix, not listed here.
+INSTRUMENT_INVALID_REASONS = frozenset({
+    "t0_not_found", "t0d_not_found", "t1_not_found", "t2_incomplete", "t2_late",
+    "log_rotated_mid_window", "trigger_not_created", "repush_confound",
+    "applied_ne_total", "double_full_sync", "cohort_composition", "teardown_size_mismatch",
+})
+GENUINE_FAILURE_REASONS = frozenset({
+    "failed_gt_0", "arm_never_confirmed", "functional_invalid", "fence_violation",
+})
+
+
+def void_class_for(reason):
+    if reason is None:
+        return None
+    if reason in GENUINE_FAILURE_REASONS:
+        return "genuine"
+    return "instrument"
 
 
 # --------------------------------------------------------------------------
@@ -138,10 +178,6 @@ def ssh_ps(cmd_ps1, timeout=30):
     import base64
     encoded = base64.b64encode(cmd_ps1.encode("utf-16-le")).decode("ascii")
     argv = _ssh_argv() + ["powershell.exe", "-NoProfile", "-EncodedCommand", encoded]
-    # capture_output as bytes, not text=True: PowerShell 5.1's console output
-    # to a redirected (non-tty) pipe is NOT reliably UTF-8 (observed a stray
-    # non-UTF-8 byte from log content); decode leniently since only ASCII
-    # patterns are matched against this output downstream.
     r = subprocess.run(argv, capture_output=True, timeout=timeout)
     stdout = r.stdout.decode("utf-8", errors="replace")
     stderr = r.stderr.decode("utf-8", errors="replace")
@@ -154,94 +190,43 @@ _DGRHP_UTC_OFFSET = None  # timedelta, lazily computed once - see dgrhp_utc_offs
 
 
 def dgrhp_utc_offset():
-    """DGRHP's local-clock UTC offset (a timedelta), e.g. +1h under BST.
-
-    CRITICAL bug this exists to fix: spdlog's `%Y-%m-%d %H:%M:%S.%e` pattern
-    logs LOCAL time (agent.log timestamps are DGRHP-local, i.e. BST/GMT, not
-    UTC), but parse_log_line() tags every parsed timestamp with
-    tzinfo=timezone.utc for convenience. That mislabeling is HARMLESS for any
-    same-host comparison (B = T1-T0, T0-ordering, arm-event bracketing all
-    cancel the constant offset in subtraction) but WRONG for any cross-host
-    comparison: a python-side `datetime.now(timezone.utc)` used as a window
-    start marker would sit an hour "in the past" relative to log lines that
-    are actually only a few seconds old, once BOTH are naively compared as if
-    they were the same clock - which is exactly what caused every Phase B
-    repeat to falsely detect a "second T0" (it was really re-finding much
-    older history, not a genuine second full_sync). Confirmed empirically:
-    DGRHP raw `Get-Date` reads exactly 1h ahead of true UTC on 2026-09-06
-    (BST). Compute the offset live rather than hardcoding +1h so this stays
-    correct across a DST boundary.
-
-    Fix strategy: any timestamp compared AGAINST agent-log timestamps must be
-    expressed in the SAME (local-labeled-as-UTC) convention - see
-    dgrhp_now(). Any timestamp that must be compared against a TRUE-UTC
-    source (an event_id's embedded system_clock epoch ms, which IS real UTC
-    regardless of display timezone) must have this offset subtracted back out
-    - see cohort_events_d()."""
+    """DGRHP's local-clock UTC offset (a timedelta), e.g. +1h under BST. See the
+    original docstring history in git blame for why this is computed live rather
+    than hardcoded - unchanged this round."""
     global _DGRHP_UTC_OFFSET
     if _DGRHP_UTC_OFFSET is None:
         out = ssh_ps(
             "[System.TimeZoneInfo]::Local.GetUtcOffset([DateTime]::Now).TotalSeconds"
         ).strip()
-        from datetime import timedelta
         _DGRHP_UTC_OFFSET = timedelta(seconds=float(out))
     return _DGRHP_UTC_OFFSET
 
 
 def dgrhp_now():
     """'Now', expressed in the SAME local-labeled-as-UTC convention
-    parse_log_line() uses - the correct thing to pass as a window-start
-    marker for comparison against agent-log timestamps.
-
-    SECOND bug this exists to fix, found live: the original implementation
-    was `datetime.now(timezone.utc) + dgrhp_utc_offset()` - i.e. THIS host's
-    (BigColin's) clock plus DGRHP's UTC offset. That's only correct if
-    BigColin's and DGRHP's system clocks are perfectly synchronized, which
-    they are NOT - measured ~200ms-1s of cross-host drift (BigColin running
-    ahead), never zero. At N=62 a full_sync completes in well under a
-    second, so that drift alone was enough for a repeat's own window_start_ts
-    to land AFTER its own trigger's T0 line, in log-timestamp terms - every
-    single Phase B/B2 repeat reported "t0_not_found" even though the trigger
-    visibly worked (generation kept incrementing) and the T0 line was
-    sitting right there in the tail. Fix: read DGRHP's OWN clock directly
-    (one ssh round trip) instead of doing cross-host arithmetic - both the
-    window marker and the log lines then come from the exact same clock, so
-    no drift, of any size, can matter. A small backward safety margin
-    absorbs the round-trip time between reading the clock and actually
-    issuing the trigger (window_start_ts must precede the trigger, never
-    equal or follow it)."""
+    parse_log_line() uses - read DGRHP's own clock directly (one ssh round
+    trip) rather than doing cross-host arithmetic, which drifts. A small
+    backward safety margin absorbs the round-trip time between reading the
+    clock and actually issuing the trigger. Unchanged this round."""
     out = ssh_ps("Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'").strip()
     ts = datetime.strptime(out, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
-    from datetime import timedelta
     return ts - timedelta(seconds=2)
 
 
 TAIL_LINES = 20000  # generous: observed peak ~115 lines/sec from the leftover riga-* outbox
-                     # storm, so this covers several minutes even in the noisy pre-purge phase
+                     # storm, so this covers several minutes even in the noisy pre-purge phase.
+                     # R5.7: also ample for the clean-cohort B/B2 burst (~62 SparkEngine armed
+                     # + 62 T2 + T0/T0d/T1 + evals); NOT ample at the Phase-A storm rate - see
+                     # tail_saturated tracking in observe_t0().
 
-# ROOT CAUSE (2026-09-07, found by deliberate live reproduction - see the run doc's "T1
-# detection: the real root cause" section): the residual t0_not_found/t1_not_found false
-# voids were NEVER a bug in this script's window/timestamp logic. `agents/core/src/main.cpp`
-# never calls `logger->flush_on(...)` on the --log-file sink, and spdlog's own default
-# `flush_level_` is `level::off` (spdlog/logger.h:311, confirmed against the vendored header,
-# not assumed) - so a log LINE's embedded timestamp is recorded at message-construction time,
-# but the underlying bytes can sit unflushed in the sink's buffered ofstream for an
-# unpredictable period before becoming visible to ANY external reader, this driver included.
-# Measured live: one repeat's T1 was visible within ~2s of being written; a later one took
-# ~108s for a burst of ~93 lines (arm events + apply_rules ok) to appear on disk at once, all
-# stamped within the same real-world second they were actually logged. The FIX is patience,
-# not different search logic - these timeouts must comfortably exceed the worst observed
-# flush lag, not the true (near-instant) completion time. A generous but still-bounded margin;
-# if the real agent process ever hangs for genuinely longer than this, that IS a real void.
 ROOT_CAUSED_T0_TIMEOUT = 240
 ROOT_CAUSED_T1_TIMEOUT = 240
+ROOT_CAUSED_T0D_TIMEOUT = 240
+ROOT_CAUSED_T2_VISIBILITY_TIMEOUT = 240
 
 
 def agent_log_size():
-    """Cheap O(1) file-length probe, used only to detect rotation - counting
-    lines on a several-hundred-thousand-line file every poll (the original
-    -Skip-based design) gets slower every call as the file grows; timestamp
-    filtering on a fixed -Tail read (below) avoids that entirely."""
+    """Cheap O(1) file-length probe, used only to detect rotation."""
     out = ssh_ps(f"(Get-Item -LiteralPath '{AGENT_LOG}').Length")
     out = out.strip()
     return int(out) if out else 0
@@ -249,9 +234,7 @@ def agent_log_size():
 
 def agent_log_tail():
     """Fixed-size tail read. Callers filter to their own window by comparing
-    each line's OWN embedded timestamp against a Python-side start marker -
-    no line-count/byte-offset bookkeeping needed, and it stays O(TAIL_LINES)
-    regardless of how large the file has grown."""
+    each line's OWN embedded timestamp against a Python-side start marker."""
     out = ssh_ps(f"Get-Content -Path '{AGENT_LOG}' -Tail {TAIL_LINES}")
     return out.splitlines()
 
@@ -263,6 +246,16 @@ def parse_log_line(raw):
     ts_str, level, thread, msg = m.groups()
     ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
     return {"ts": ts, "level": level, "thread": thread, "msg": msg, "raw": raw}
+
+
+def _ev(ts_str, msg, raw=None):
+    """Construct a parsed-event-shaped dict directly, for selftest fixtures -
+    bypasses parse_log_line/LOG_TS_RE so fixtures don't need a fully-formed
+    `[ts] [level] [thread] msg` line, just the two fields the classification
+    logic actually reads (ts, msg), plus an optional distinct `raw` for
+    identity-based tests (F9's same-ms-tie case)."""
+    ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S.%f").replace(tzinfo=timezone.utc)
+    return {"ts": ts, "level": "info", "thread": "1", "msg": msg, "raw": raw if raw is not None else msg}
 
 
 # --------------------------------------------------------------------------
@@ -291,6 +284,11 @@ def get_metrics(op):
 
 def metric_sum(metrics, prefix):
     return sum(v for k, v in metrics.items() if k.startswith(prefix))
+
+
+# --------------------------------------------------------------------------
+# cohort / rule builders
+# --------------------------------------------------------------------------
 
 
 def cohort_rule(kind, i):
@@ -339,23 +337,19 @@ def cohort_rules():
     return rules
 
 
+def expected_rule_ids():
+    """R5.7: the closed 62-member set every full_sync in this diagnostic's
+    cohort should re-arm (60 cohort + trigger + the pre-existing protected
+    rule, which rides along on every full_sync regardless of what this
+    diagnostic itself created)."""
+    return set(r["rule_id"] for r in cohort_rules()) | {TRIGGER_RULE_ID} | set(PROTECTED_RULE_IDS)
+
+
 def trigger_rule():
     path = f"{SCRATCH_DIR_WIN}\\trigger.txt"
     return {
         "rule_id": TRIGGER_RULE_ID, "name": TRIGGER_RULE_ID, "enabled": True,
         "enforcement_mode": "audit", "severity": "low", "os_target": "windows", "scope": "",
-        "spark": {"type": "file-change", "params": {"path": path}},
-        "assertion": {"type": "file-exists", "params": {"path": path, "expected": "present"}},
-        "remediation": {"type": "alert-only", "params": {}},
-    }
-
-
-def hbr_rule(n):
-    rid = f"{COHORT_PREFIX}hbr-{n:02d}"
-    path = f"{SCRATCH_DIR_WIN}\\hbr-{n:02d}.txt"
-    return {
-        "rule_id": rid, "name": rid, "enabled": True, "enforcement_mode": "audit",
-        "severity": "low", "os_target": "windows", "scope": "",
         "spark": {"type": "file-change", "params": {"path": path}},
         "assertion": {"type": "file-exists", "params": {"path": path, "expected": "present"}},
         "remediation": {"type": "alert-only", "params": {}},
@@ -468,11 +462,10 @@ def cmd_purge(op, apply=False):
 
 def prepare_cohort_targets():
     """Pre-create every watched target in its EXPECTED-compliant state before
-    arming - without this, file/registry rules never reach `guard.compliant`
-    (found live: cmd_ensure originally skipped this, unlike
-    generate_resgate_load.py's own cmd_arm, so D's functional-validity check
-    could never pass). Service rules need no setup - they watch real,
-    near-universally-running Windows services."""
+    arming. R5.7: no longer statically pre-creates hbr-NN.txt files here -
+    hbr rule ids/paths are now run_id-scoped (hbr_rule()), unknown until
+    cmd_run() mints a run_id, so their watch files are touched per-repeat in
+    run_repeat() instead (_touch_win_file())."""
     ps = f"""
 New-Item -ItemType Directory -Force -Path '{SCRATCH_DIR_WIN}' | Out-Null
 for ($i=1; $i -le {COHORT_N}; $i++) {{
@@ -483,14 +476,18 @@ for ($i=1; $i -le {COHORT_N}; $i++) {{
     New-ItemProperty -Path $key -Name 'Flag' -Value 1 -PropertyType DWord -Force | Out-Null
 }}
 New-Item -ItemType File -Force -Path "{SCRATCH_DIR_WIN}\\trigger.txt" | Out-Null
-for ($n=1; $n -le 3; $n++) {{
-    New-Item -ItemType File -Force -Path ("{SCRATCH_DIR_WIN}\\hbr-{{0:00}}.txt" -f $n) | Out-Null
-}}
 Write-Output "prepared"
 """
     out = ssh_ps(ps, timeout=30)
     if "prepared" not in out:
         raise RuntimeError(f"prepare_cohort_targets failed: {out[:500]}")
+
+
+def _touch_win_file(path):
+    out = ssh_ps(f"New-Item -ItemType File -Force -Path '{path}' | Out-Null; Write-Output done",
+                 timeout=15)
+    if "done" not in out:
+        raise RuntimeError(f"_touch_win_file failed for {path}: {out[:300]}")
 
 
 def cmd_ensure(op):
@@ -516,8 +513,15 @@ def cmd_teardown_cohort(op):
     for r in cohort_rules():
         G.delete_rule(op, r["rule_id"])
     G.delete_rule(op, TRIGGER_RULE_ID)
-    for n in range(1, 4):
-        G.delete_rule(op, f"{COHORT_PREFIX}hbr-{n:02d}")
+    # R5.7: sweep EVERY blackout-hbr-* rule by catalogue query, not a fixed id range -
+    # run_id-scoped ids from possibly several invocations (including void attempts) can
+    # otherwise be left behind (the exact class of leftover the existing run doc's
+    # "hbr-01..03 -> hbr-04..06" teardown miss already documented).
+    rules = get_json(op, "/api/v1/guaranteed-state/rules?limit=1000")["data"]
+    hbr_ids = sorted(r["rule_id"] for r in rules if r["rule_id"].startswith(f"{COHORT_PREFIX}hbr-"))
+    for rid in hbr_ids:
+        G.delete_rule(op, rid)
+    print(f"[teardown] deleted {len(hbr_ids)} blackout-hbr-* rule(s): {hbr_ids}")
     try:
         ssh_ps(
             f"Remove-Item -Recurse -Force -Path '{SCRATCH_DIR_WIN}' -ErrorAction SilentlyContinue; "
@@ -531,20 +535,31 @@ def cmd_teardown_cohort(op):
     return 0
 
 
-# --------------------------------------------------------------------------
-# measurement
-# --------------------------------------------------------------------------
+def hbr_rule(run_id, n):
+    """R5.7 fix: rule_id (and watched path) are now run_id-scoped
+    (`blackout-hbr-<run_id>-NN`), closing a real trigger-ID-reuse trap the
+    existing run doc already documented (hbr_counter resets to 1 every
+    cmd_run invocation, so two invocations used to collide on the same
+    rule_id and a 409 silently meant "no new rule created")."""
+    rid = f"{COHORT_PREFIX}hbr-{run_id}-{n:02d}"
+    path = f"{SCRATCH_DIR_WIN}\\hbr-{run_id}-{n:02d}.txt"
+    return {
+        "rule_id": rid, "name": rid, "enabled": True, "enforcement_mode": "audit",
+        "severity": "low", "os_target": "windows", "scope": "",
+        "spark": {"type": "file-change", "params": {"path": path}},
+        "assertion": {"type": "file-exists", "params": {"path": path, "expected": "present"}},
+        "remediation": {"type": "alert-only", "params": {}},
+    }
 
 
-def find_baseline_id(op, name):
-    return G.find_baseline_id(G.list_baselines_html(op), name)
+# --------------------------------------------------------------------------
+# measurement - pure functions (no SSH/HTTP; directly selftest-able)
+# --------------------------------------------------------------------------
 
 
 def _fetch_window(window_start_ts):
     """Fetch the current fixed tail, parse it, and return only lines whose OWN
-    embedded timestamp is >= window_start_ts, sorted by that timestamp. A
-    fresh full re-derivation each poll (not an incremental skip) - simpler and
-    avoids offset bugs; O(TAIL_LINES) regardless of total file size. Also
+    embedded timestamp is >= window_start_ts, sorted by that timestamp. Also
     returns the current file size, for the caller's rotation check."""
     size = agent_log_size()
     raw_lines = agent_log_tail()
@@ -557,206 +572,542 @@ def _fetch_window(window_start_ts):
     return parsed, size
 
 
-def observe_window(window_start_ts, t0_timeout_s, t1_timeout_s, poll=2.0):
-    """Poll the agent log for the first T0/T0' at or after window_start_ts,
-    then the first T1 after that. Returns a dict with t0, t0_source, t1,
-    arm_events, void_reason (or None)."""
-    size0 = agent_log_size()
-    deadline_t0 = time.time() + t0_timeout_s
-    t0 = t0_source = None
-    while time.time() < deadline_t0 and t0 is None:
-        events, size = _fetch_window(window_start_ts)
-        if size < size0:
-            return {"void_reason": "log_rotated_mid_window"}
-        for p in events:
-            if T0_RE.search(p["msg"]):
-                t0, t0_source = p, "cleared"
-                break
-        if t0 is None:
-            for p in events:
-                if T0_FALLBACK_RE.search(p["msg"]):
-                    t0, t0_source = p, "fallback"
-                    break
-        if t0 is not None:
-            break
-        time.sleep(poll)
-    if t0 is None:
-        return {"void_reason": "t0_not_found"}
+def _find_first(events, regex, at_or_after=None, strictly_after=None):
+    for p in events:
+        if at_or_after is not None and p["ts"] < at_or_after:
+            continue
+        if strictly_after is not None and p["ts"] <= strictly_after:
+            continue
+        m = regex.search(p["msg"])
+        if m:
+            return p, m
+    return None, None
 
-    deadline_t1 = time.time() + t1_timeout_s
-    t1 = t1_groups = None
-    arm_events = []
-    second_t0 = False
-    while time.time() < deadline_t1 and t1 is None:
-        events, size = _fetch_window(window_start_ts)
-        if size < size0:
-            return {"void_reason": "log_rotated_mid_window"}
-        after_t0 = [p for p in events if p["ts"] >= t0["ts"]]
-        if any(T0_RE.search(p["msg"]) and p["ts"] > t0["ts"] for p in after_t0):
-            second_t0 = True
-        arm_events = [p for p in after_t0
-                      if ARM_LEGACY_RE.search(p["msg"]) or ARM_SPARK_RE.search(p["msg"])]
-        for p in after_t0:
-            m = T1_RE.search(p["msg"])
-            if m:
-                t1, t1_groups = p, m.groups()
-                break
-        if t1 is not None:
-            break
-        time.sleep(poll)
-    if second_t0:
-        return {"void_reason": "double_full_sync"}
-    if t1 is None:
-        return {"void_reason": "t1_not_found"}
-    # keep only arm events that precede t1 (a poll can race past t1's own instant)
-    arm_events = [p for p in arm_events if p["ts"] <= t1["ts"]]
 
-    applied, failed, full_sync, generation, total = t1_groups
+def find_own_push_cmd_raw(events, t0_ts):
+    """The trigger's own `Received command: ... push_rules` line, identified
+    as the LAST such line at/before T0 - excluded from repush_confound
+    accounting by RAW LINE CONTENT (not timestamp value), so a genuinely
+    distinct second push command landing at the identical millisecond (F9)
+    is still counted."""
+    candidates = [p for p in events if p["ts"] <= t0_ts and PUSH_CMD_RE.search(p["msg"])]
+    return candidates[-1]["raw"] if candidates else None
+
+
+def classify_t2(events, epoch, floor, expected_rule_ids, own_push_raw, backend, t0_ts, t0d_ts):
+    """Pure classification over an already-fetched event list (any order -
+    does not assume sorted input). Membership is decided by EPOCH IDENTITY
+    for spark (never by timestamp order - the R5.7 round-2 fence, closing
+    the stale-prior-application gap Astra's adversarial review found in
+    round 1's timestamp-only design) and by the T0d BOUNDARY for legacy
+    (which has no epoch field of its own).
+
+    Returns: selected{rid: {...}}, rejected[{line,reason}], adopt_lines[...],
+    push_lines[event,...] (excluding the trigger's own line), missing[rid,...],
+    legacy_before_t0d[raw,...], next_t0d_ts (the next application's T0d
+    timestamp if one appears, else None - `double_full_sync` by EVENT, never
+    by a bare timestamp comparison)."""
+    remaining = set(expected_rule_ids)
+    selected, rejected, adopt_lines, push_lines, legacy_before_t0d = {}, [], [], [], []
+    next_t0d_ts = None
+    own_excluded = False
+    for p in sorted(events, key=lambda p: p["ts"]):
+        if p["ts"] < t0_ts:
+            continue
+        m0d = T0D_RE.search(p["msg"])
+        if m0d:
+            epoch2 = int(m0d.group(1))
+            if epoch2 != epoch and p["ts"] > t0d_ts:
+                if next_t0d_ts is None or p["ts"] < next_t0d_ts:
+                    next_t0d_ts = p["ts"]
+                continue
+        if next_t0d_ts is not None and p["ts"] >= next_t0d_ts:
+            continue
+        mpush = PUSH_CMD_RE.search(p["msg"])
+        if mpush:
+            if not own_excluded and own_push_raw is not None and p["raw"] == own_push_raw:
+                own_excluded = True
+                continue
+            push_lines.append(p)
+            continue
+        if backend == "spark":
+            m2 = T2_RE.search(p["msg"])
+            if not m2:
+                continue
+            rid, epoch_s, inc_s, typ, via, ms_s = m2.groups()
+            epoch_v, inc_v, ms_v = int(epoch_s), int(inc_s), int(ms_s)
+            if epoch_v != epoch:
+                rejected.append({"line": p["raw"], "reason": "wrong_epoch"})
+                continue
+            if rid not in expected_rule_ids:
+                rejected.append({"line": p["raw"], "reason": "unexpected_rule"})
+                continue
+            if via == "callback-adopt":
+                adopt_lines.append({"rule_id": rid, "ts": p["ts"], "incarnation": inc_v,
+                                     "type": typ, "attach_to_commit_ms": ms_v})
+            if inc_v <= floor and via != "callback-adopt":
+                rejected.append({"line": p["raw"], "reason": "fence_violation_below_floor"})
+                continue
+            if rid in selected:
+                rejected.append({"line": p["raw"], "reason": "duplicate_rule"})
+                continue
+            selected[rid] = {"ts": p["ts"], "incarnation": inc_v, "type": typ, "via": via,
+                              "attach_to_commit_ms": ms_v,
+                              "reobserved_adopt": inc_v <= floor and via == "callback-adopt"}
+            remaining.discard(rid)
+        else:
+            mL = ARM_LEGACY_RE.search(p["msg"])
+            if not mL:
+                continue
+            rid = mL.group(1)
+            if p["ts"] < t0d_ts:
+                legacy_before_t0d.append(p["raw"])
+                continue
+            if rid not in expected_rule_ids or rid in selected:
+                continue
+            selected[rid] = {"ts": p["ts"]}
+            remaining.discard(rid)
     return {
-        "void_reason": None,
-        "t0": t0, "t0_source": t0_source, "t1": t1,
-        "applied": int(applied), "failed": int(failed),
-        "full_sync": full_sync, "generation": int(generation), "total": int(total),
-        "arm_events": arm_events,
+        "selected": selected, "rejected": rejected, "adopt_lines": adopt_lines,
+        "push_lines": push_lines, "legacy_before_t0d": legacy_before_t0d,
+        "missing": sorted(remaining), "next_t0d_ts": next_t0d_ts,
     }
 
 
-def cohort_events_d(op, rule_ids, t0_dt, deadline_ms):
-    # t0_dt is a log-native timestamp (local-labeled-as-UTC, see
-    # dgrhp_utc_offset()) but event_id's embedded ms is a REAL UTC epoch
-    # (std::chrono::system_clock, unaffected by display timezone) - subtract
-    # the offset back out before comparing, or every lookup here silently
-    # searches the wrong hour and reports "not_observed" for everything.
-    t0_ms = int(t0_dt.timestamp() * 1000) - int(dgrhp_utc_offset().total_seconds() * 1000)
-    by_rule = {}
-    for rid in rule_ids:
-        try:
-            data = get_json(op, f"/api/v1/guaranteed-state/events?rule_id={rid}&limit=10")["data"]
-        except Exception:  # noqa: BLE001
-            by_rule[rid] = "not_observed"
+def check_teardown_size(t0d, backend, expected_n):
+    expected_detached = expected_n if backend == "spark" else 0
+    return "teardown_size_mismatch" if t0d["detached_rules"] != expected_detached else None
+
+
+def sweep_row_pure(events, epoch, missing_rule_ids, backend, t0d_ts):
+    """Post-invocation sweep core: a second, patient look at a fuller log
+    span for rule_ids a repeat's own bounded T2 collection never found.
+    Same epoch-identity rule as classify_t2. Returns (found{rid:{...}},
+    still_missing[rid,...])."""
+    found = {}
+    for p in events:
+        if p["ts"] < t0d_ts:
             continue
-        found = None
-        for ev in data:
-            if ev.get("event_type") != "guard.compliant":
+        if backend == "spark":
+            m2 = T2_RE.search(p["msg"])
+            if m2:
+                rid, epoch_s, inc_s, typ, via, ms_s = m2.groups()
+                if (int(epoch_s) == epoch and rid in missing_rule_ids
+                        and via != "callback-adopt"
+                        and (rid not in found or p["ts"] < found[rid]["ts"])):
+                    found[rid] = {"ts": p["ts"], "incarnation": int(inc_s), "type": typ,
+                                   "via": via, "attach_to_commit_ms": int(ms_s)}
+        else:
+            mL = ARM_LEGACY_RE.search(p["msg"])
+            if mL and mL.group(1) in missing_rule_ids:
+                rid = mL.group(1)
+                if rid not in found or p["ts"] < found[rid]["ts"]:
+                    found[rid] = {"ts": p["ts"]}
+    still_missing = sorted(set(missing_rule_ids) - set(found))
+    return found, still_missing
+
+
+def compute_window_math(t0_ts, t0d_ts, t1_ts, selected):
+    """C/B window arithmetic from an already-classified `selected` dict.
+    Pure - directly selftest-able (F6)."""
+    items = sorted(selected.items(), key=lambda kv: kv[1]["ts"])
+    ts_list = [v["ts"] for _, v in items]
+    t2_first, t2_last = ts_list[0], ts_list[-1]
+    c_ms = (t2_last - t0_ts).total_seconds() * 1000
+    c_first_ms = (t2_first - t0_ts).total_seconds() * 1000
+    c_from_t0d_ms = (t2_last - t0d_ts).total_seconds() * 1000
+    t2_spread_ms = (t2_last - t2_first).total_seconds() * 1000
+    t1_to_t2_last_ms = (t2_last - t1_ts).total_seconds() * 1000
+    n_before = sum(1 for ts in ts_list if ts < t1_ts)
+    n_tie = sum(1 for ts in ts_list if ts == t1_ts)
+    n_after = sum(1 for ts in ts_list if ts > t1_ts)
+    n_adopt = sum(1 for _, v in items if v.get("via") == "callback-adopt")
+    n_shared = sum(1 for _, v in items if v.get("via") in ("inline-shared", "callback-shared"))
+    attach_vals = [v["attach_to_commit_ms"] for _, v in items if "attach_to_commit_ms" in v]
+    by_type = {}
+    for _, v in items:
+        if "type" in v:
+            by_type.setdefault(v["type"], []).append((v["ts"] - t0_ts).total_seconds() * 1000)
+    return {
+        "c_ms": c_ms, "c_first_ms": c_first_ms, "c_from_t0d_ms": c_from_t0d_ms,
+        "t2_spread_ms": t2_spread_ms, "t1_to_t2_last_ms": t1_to_t2_last_ms,
+        "n_t2": len(items), "n_t2_before_t1": n_before, "n_t2_tie_t1": n_tie,
+        "n_t2_after_t1": n_after, "n_adopt": n_adopt, "n_shared": n_shared,
+        "attach_to_commit_ms_max": max(attach_vals) if attach_vals else None,
+        "t2_by_type_max_ms": {k: max(vs) for k, vs in by_type.items()},
+    }
+
+
+def compute_verdict(legacy_rows, spark_rows, floor):
+    """§7 two-gate verdict: reliability (ALL attempts, both cells) then
+    latency (counted repeats only), margin = max(1000ms, legacy median)."""
+    legacy_valid = [r for r in legacy_rows if not r.get("void_reason")]
+    spark_valid = [r for r in spark_rows if not r.get("void_reason")]
+    genuine = any(r.get("void_class") == "genuine" for r in legacy_rows + spark_rows)
+    if genuine:
+        return "FAIL-RELIABILITY"
+    if len(legacy_valid) < floor or len(spark_valid) < floor:
+        return "INCONCLUSIVE"
+    legacy_c = statistics.median(r["c_ms"] for r in legacy_valid)
+    spark_c = statistics.median(r["c_ms"] for r in spark_valid)
+    margin = max(1000.0, legacy_c)
+    return "PASS" if spark_c <= legacy_c + margin else "FAIL-LATENCY"
+
+
+# --------------------------------------------------------------------------
+# measurement - live (SSH-polling) stage wrappers around the pure functions
+# --------------------------------------------------------------------------
+
+
+def observe_t0(window_start_ts, allow_fallback_t0, t0_timeout_s, poll=2.0):
+    size0 = agent_log_size()
+    deadline = time.time() + t0_timeout_s
+    while time.time() < deadline:
+        events, size = _fetch_window(window_start_ts)
+        if size < size0:
+            return None, None, "log_rotated_mid_window", False
+        tail_saturated = bool(events) and events[0]["ts"] > window_start_ts
+        p, m = _find_first(events, T0_RE, at_or_after=window_start_ts)
+        if p:
+            return p, "cleared", None, tail_saturated
+        if allow_fallback_t0:
+            p, m = _find_first(events, PUSH_CMD_RE, at_or_after=window_start_ts)
+            if p:
+                return p, "fallback", None, tail_saturated
+        time.sleep(poll)
+    return None, None, "t0_not_found", False
+
+
+def observe_t0d(window_start_ts, t0_ts, t0d_timeout_s, poll=2.0):
+    size0 = agent_log_size()
+    deadline = time.time() + t0d_timeout_s
+    while time.time() < deadline:
+        events, size = _fetch_window(window_start_ts)
+        if size < size0:
+            return None, "log_rotated_mid_window"
+        p, m = _find_first(events, T0D_RE, at_or_after=t0_ts)
+        if p:
+            epoch, floor, detached, withdrawn = (int(x) for x in m.groups())
+            return {"ts": p["ts"], "epoch": epoch, "floor": floor,
+                    "detached_rules": detached, "withdrawn_claims": withdrawn}, None
+        time.sleep(poll)
+    return None, "t0d_not_found"
+
+
+def observe_t1(window_start_ts, t0d_ts, t1_timeout_s, poll=2.0):
+    size0 = agent_log_size()
+    deadline = time.time() + t1_timeout_s
+    while time.time() < deadline:
+        events, size = _fetch_window(window_start_ts)
+        if size < size0:
+            return None, "log_rotated_mid_window"
+        p, m = _find_first(events, T1_RE, at_or_after=t0d_ts)
+        if p:
+            return {"ts": p["ts"], "groups": m.groups()}, None
+        time.sleep(poll)
+    return None, "t1_not_found"
+
+
+def collect_t2(t0_ts, t0d, window_start_ts, own_push_raw, expected_rule_ids, backend,
+               visibility_timeout_s=ROOT_CAUSED_T2_VISIBILITY_TIMEOUT, poll=2.0):
+    """Live S4: poll until classify_t2() reports nothing missing, a next-
+    application T0d appears, or the visibility deadline expires. Returns
+    (classify_t2 result dict, void_reason or None, last fetched events -
+    the latter reused by the caller for the n_arm_lines continuity field)."""
+    deadline = time.time() + visibility_timeout_s
+    result, last_events = None, []
+    while time.time() < deadline:
+        events, size = _fetch_window(window_start_ts)
+        last_events = events
+        result = classify_t2(events, t0d["epoch"], t0d["floor"], expected_rule_ids,
+                              own_push_raw, backend, t0_ts, t0d["ts"])
+        if result["next_t0d_ts"] is not None:
+            return result, "double_full_sync", last_events
+        if not result["missing"]:
+            break
+        time.sleep(poll)
+    if result is None:
+        result = classify_t2([], t0d["epoch"], t0d["floor"], expected_rule_ids,
+                              own_push_raw, backend, t0_ts, t0d["ts"])
+    if result["legacy_before_t0d"] or any(
+            r["reason"] == "fence_violation_below_floor" for r in result["rejected"]):
+        return result, "fence_violation", last_events
+    if result["missing"]:
+        return result, "t2_incomplete", last_events
+    if result["push_lines"]:
+        return result, "repush_confound", last_events
+    return result, None, last_events
+
+
+def sweep_incomplete(rows, window_start_ts):
+    """R5.7 §2.2 item 8: one final, patient read of the whole log span at the
+    end of a cmd_run() invocation, reclassifying every t2_incomplete row
+    into t2_late (found on the second look - instrument-invalid) or
+    arm_never_confirmed (still missing - genuine)."""
+    incomplete = [r for r in rows if r.get("void_reason") == "t2_incomplete"]
+    if not incomplete:
+        return rows
+    events, _ = _fetch_window(window_start_ts)
+    for r in incomplete:
+        t0d_ts = datetime.fromisoformat(r["t0d"]["ts"])
+        found, still_missing = sweep_row_pure(
+            events, r["t0d"]["epoch"], set(r["missing_rule_ids"]), r["backend"], t0d_ts)
+        if not still_missing:
+            for rid, v in found.items():
+                r["t2_selected"][rid] = {**v, "ts": v["ts"].isoformat()}
+            r["missing_rule_ids"] = []
+            r["void_class"], r["void_reason"] = "instrument", "t2_late"
+        else:
+            r["missing_rule_ids"] = still_missing
+            r["void_class"], r["void_reason"] = "genuine", "arm_never_confirmed"
+    return rows
+
+
+def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
+    """Bounded functional-validity polling (R5.7 §2.2 item 6, replacing the
+    prior one-shot lookup): poll every `poll` seconds until every rule has a
+    `guard.compliant` event whose embedded ms falls in [t0_ms, t0_ms +
+    deadline_ms], or until that event-time deadline plus a 60s ingestion
+    grace has elapsed on the driver clock. t0_dt is log-native
+    (local-labeled-as-UTC); event_id's embedded ms is real UTC - the offset
+    is subtracted back out before comparing, same correction as before."""
+    t0_ms = int(t0_dt.timestamp() * 1000) - int(dgrhp_utc_offset().total_seconds() * 1000)
+    grace_deadline = time.time() + (deadline_ms / 1000.0) + 60.0
+    by_rule = {rid: "not_observed" for rid in rule_ids}
+    while time.time() < grace_deadline:
+        pending = [rid for rid, v in by_rule.items() if v == "not_observed"]
+        if not pending:
+            break
+        for rid in pending:
+            try:
+                data = get_json(op, f"/api/v1/guaranteed-state/events?rule_id={rid}&limit=100")["data"]
+            except Exception:  # noqa: BLE001
                 continue
-            m = re.search(r"-(\d{13})-\d+$", ev.get("event_id", ""))
-            if not m:
-                continue
-            ms = int(m.group(1))
-            if t0_ms <= ms <= t0_ms + deadline_ms:
-                if found is None or ms < found:
-                    found = ms
-        by_rule[rid] = (found - t0_ms) if found is not None else "not_observed"
+            found = None
+            for ev in data:
+                if ev.get("event_type") != "guard.compliant":
+                    continue
+                m = re.search(r"-(\d{13})-\d+$", ev.get("event_id", ""))
+                if not m:
+                    continue
+                ms = int(m.group(1))
+                if t0_ms <= ms <= t0_ms + deadline_ms:
+                    if found is None or ms < found:
+                        found = ms
+            if found is not None:
+                by_rule[rid] = found - t0_ms
+        if any(v == "not_observed" for v in by_rule.values()):
+            time.sleep(poll)
     return by_rule
 
 
-def run_repeat(op, phase, backend, trigger_kind, cohort_ids, repeat_idx, trigger_id_cache):
+# --------------------------------------------------------------------------
+# measurement - per-repeat orchestration
+# --------------------------------------------------------------------------
+
+
+def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repeat_idx,
+                trigger_id_cache, run_id, comparison_id):
+    """One trigger-and-observe cycle. Always returns a row dict, built up
+    incrementally from S0 onward, with as much evidence populated as was
+    actually observed before any void - R5.7 §2.2 item 7 (evidence retained
+    on every row, void or not)."""
+    row = {
+        "phase": phase, "backend": backend, "repeat": repeat_idx,
+        "run_id": run_id, "comparison_id": comparison_id,
+        "void_class": None, "void_reason": None,
+    }
     m0 = get_metrics(op)
-    window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
-    trig_ts = time.time()
+    window_start_ts = dgrhp_now()
     http_status = None
     if trigger_kind == "deploy":
         try:
             G.deploy_baseline_form(op, trigger_id_cache["trigger_baseline_id"])
             http_status = 200
         except Exception as e:  # noqa: BLE001
-            return {"phase": phase, "backend": backend, "repeat": repeat_idx,
-                     "void_reason": f"trigger_failed:{e}"}
-        t0_timeout, t1_timeout = ROOT_CAUSED_T0_TIMEOUT, ROOT_CAUSED_T1_TIMEOUT
+            row.update(trigger_http_status=None, void_class="instrument",
+                       void_reason=f"trigger_failed:{e}")
+            return row
     else:
         n = trigger_id_cache["hbr_counter"]
         trigger_id_cache["hbr_counter"] += 1
-        rule = hbr_rule(n)
+        rule = hbr_rule(run_id, n)
         try:
+            _touch_win_file(rule["spark"]["params"]["path"])
             _, existed = G.post_rule(op, rule)
-            http_status = 200 if existed else 201
         except Exception as e:  # noqa: BLE001
-            return {"phase": phase, "backend": backend, "repeat": repeat_idx,
-                     "void_reason": f"trigger_failed:{e}"}
-        t0_timeout, t1_timeout = ROOT_CAUSED_T0_TIMEOUT, ROOT_CAUSED_T1_TIMEOUT
+            row.update(trigger_http_status=None, void_class="instrument",
+                       void_reason=f"trigger_failed:{e}")
+            return row
+        http_status = 409 if existed else 201
+        if existed:
+            row.update(trigger_http_status=http_status, void_class="instrument",
+                       void_reason="trigger_not_created")
+            return row
+    row["trigger_http_status"] = http_status
 
-    obs = observe_window(window_start_ts, t0_timeout, t1_timeout)
-    if obs.get("void_reason"):
-        return {"phase": phase, "backend": backend, "repeat": repeat_idx,
-                "trigger_http_status": http_status, "void_reason": obs["void_reason"]}
+    allow_fallback_t0 = False  # R5.7: B/B2 never accept the fallback T0 (round-2 correction)
+    t0, t0_source, reason, tail_saturated = observe_t0(
+        window_start_ts, allow_fallback_t0, ROOT_CAUSED_T0_TIMEOUT)
+    row["tail_saturated"] = tail_saturated
+    if reason:
+        row.update(void_class=void_class_for(reason), void_reason=reason)
+        return row
+    row["t0"], row["t0_source"] = t0["ts"].isoformat(), t0_source
 
-    t0, t1 = obs["t0"], obs["t1"]
-    b_ms = (t1["ts"] - t0["ts"]).total_seconds() * 1000
-    arm_events = obs["arm_events"]
-    first_arm = arm_events[0] if arm_events else None
-    last_arm = arm_events[-1] if arm_events else None
-    pre_first_arm_ms = (first_arm["ts"] - t0["ts"]).total_seconds() * 1000 if first_arm else None
-    first_to_last_arm_ms = (
-        (last_arm["ts"] - first_arm["ts"]).total_seconds() * 1000
-        if first_arm and last_arm and last_arm is not first_arm else 0.0
-    ) if first_arm else None
-    post_last_arm_ms = (
-        (t1["ts"] - last_arm["ts"]).total_seconds() * 1000 if last_arm else None
+    own_events, _ = _fetch_window(window_start_ts)
+    own_push_raw = find_own_push_cmd_raw(own_events, t0["ts"])
+
+    expected_detached = len(exp_rule_ids) if backend == "spark" else 0
+    t0d, reason = observe_t0d(window_start_ts, t0["ts"], ROOT_CAUSED_T0D_TIMEOUT)
+    if reason:
+        row.update(void_class=void_class_for(reason), void_reason=reason)
+        return row
+    row["t0d"] = {"ts": t0d["ts"].isoformat(), "epoch": t0d["epoch"], "floor": t0d["floor"],
+                  "detached_rules": t0d["detached_rules"], "withdrawn_claims": t0d["withdrawn_claims"]}
+    size_reason = check_teardown_size(t0d, backend, len(exp_rule_ids))
+    if size_reason:
+        row.update(void_class=void_class_for(size_reason), void_reason=size_reason)
+        return row
+
+    t1, reason = observe_t1(window_start_ts, t0d["ts"], ROOT_CAUSED_T1_TIMEOUT)
+    if reason:
+        row.update(void_class=void_class_for(reason), void_reason=reason)
+        return row
+    applied, failed, pending, full_sync, generation, total = (
+        int(t1["groups"][0]), int(t1["groups"][1]), int(t1["groups"][2]),
+        t1["groups"][3], int(t1["groups"][4]), int(t1["groups"][5]),
     )
+    row.update(t1=t1["ts"].isoformat(), applied=applied, failed=failed, pending=pending,
+               total=total, generation=generation)
+    b_ms = (t1["ts"] - t0["ts"]).total_seconds() * 1000
+    row["b_ms"] = b_ms
 
+    # m1: sampled on DGRHP's own clock (never local time.time() - see dgrhp_now()'s own
+    # docstring for the cross-host drift this avoids), immediately after T1 becomes visible.
+    m1_observed_dgrhp = dgrhp_now()
     m1 = get_metrics(op)
+    row["m1_observed_wall"] = m1_observed_dgrhp.isoformat()
+    row["m1_lag_ms"] = (m1_observed_dgrhp - t1["ts"]).total_seconds() * 1000
+
+    if total != len(exp_rule_ids):
+        row.update(void_class=void_class_for("cohort_composition"), void_reason="cohort_composition")
+        return row
+
+    result, reason, last_events = collect_t2(t0["ts"], t0d, window_start_ts, own_push_raw,
+                                              exp_rule_ids, backend)
+    row["t2_selected"] = {rid: {**v, "ts": v["ts"].isoformat()} for rid, v in result["selected"].items()}
+    row["t2_rejected"] = result["rejected"]
+    row["missing_rule_ids"] = result["missing"]
+    row["push_cmd_lines_in_window"] = [p["raw"] for p in result["push_lines"]]
+    row["legacy_lines_before_t0d"] = result["legacy_before_t0d"]
+    row["n_reobserved_adopt"] = sum(1 for v in result["selected"].values() if v.get("reobserved_adopt"))
+    row["n_arm_lines"] = (
+        sum(1 for p in last_events if p["ts"] >= t0["ts"] and ARM_SPARK_RE.search(p["msg"]))
+        if backend == "spark" else len(result["selected"])
+    )
+    if reason:
+        row.update(void_class=void_class_for(reason), void_reason=reason)
+        return row
+
+    wm = compute_window_math(t0["ts"], t0d["ts"], t1["ts"], result["selected"])
+    row.update(wm)
+
     reconcile_sent_delta = metric_sum(m1, 'yuzu_server_guardian_reconciles_total{result="sent"}') \
         - metric_sum(m0, 'yuzu_server_guardian_reconciles_total{result="sent"}')
     pushes_policy_change_delta = (
         metric_sum(m1, 'yuzu_server_guardian_pushes_dispatched_total{reason="policy_change"}')
         - metric_sum(m0, 'yuzu_server_guardian_pushes_dispatched_total{reason="policy_change"}')
     )
+    row["reconcile_sent_delta"] = reconcile_sent_delta
+    row["pushes_policy_change_delta"] = pushes_policy_change_delta
 
     phase_is_clean_verdict = phase in ("B", "B2")
-    void_reason = None
     if phase_is_clean_verdict:
-        if obs["failed"] > 0:
-            void_reason = "failed_gt_0"
-        elif obs["applied"] != obs["total"]:
-            void_reason = "applied_ne_total"
-        elif not arm_events:
-            void_reason = "zero_arm_lines"
-        elif phase == "B" and (reconcile_sent_delta != 0 or pushes_policy_change_delta != 1):
-            void_reason = (f"push_counter_mismatch(reconcile_sent_delta="
-                            f"{reconcile_sent_delta},pushes_delta={pushes_policy_change_delta})")
-        elif phase == "B2" and (reconcile_sent_delta != 1 or pushes_policy_change_delta != 0):
-            void_reason = (f"push_counter_mismatch(reconcile_sent_delta="
-                            f"{reconcile_sent_delta},pushes_delta={pushes_policy_change_delta})")
+        if failed > 0:
+            row.update(void_class="genuine", void_reason="failed_gt_0")
+            return row
+        if applied != total:
+            row.update(void_class="instrument", void_reason="applied_ne_total")
+            return row
+        if phase == "B" and (reconcile_sent_delta != 0 or pushes_policy_change_delta != 1):
+            row.update(void_class="instrument",
+                       void_reason=f"push_counter_mismatch(reconcile_sent_delta="
+                                   f"{reconcile_sent_delta},pushes_delta={pushes_policy_change_delta})")
+            return row
+        if phase == "B2" and (reconcile_sent_delta != 1 or pushes_policy_change_delta != 0):
+            row.update(void_class="instrument",
+                       void_reason=f"push_counter_mismatch(reconcile_sent_delta="
+                                   f"{reconcile_sent_delta},pushes_delta={pushes_policy_change_delta})")
+            return row
 
-    deadline_ms = max(2 * b_ms, 30000)
+    c_ms = row["c_ms"]
+    deadline_ms = max(2 * c_ms, 30000)
     d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
     functional_valid = all(v != "not_observed" for v in d_by_rule.values())
-    d_ms = max((v for v in d_by_rule.values() if isinstance(v, (int, float))), default=None)
-    if phase_is_clean_verdict and void_reason is None and not functional_valid:
-        void_reason = "functional_invalid"
+    row["compliant_restored_ms_by_rule"] = d_by_rule
+    row["functional_valid"] = functional_valid
+    if phase_is_clean_verdict and not functional_valid:
+        row.update(void_class="genuine", void_reason="functional_invalid")
+        return row
 
-    # t0["ts"] is log-native (local-labeled-as-UTC); trig_ts is a true
-    # time.time() epoch from this (BigColin) host - convert t0 back to true
-    # UTC before diffing, same correction as cohort_events_d. Still an
-    # uncalibrated cross-host interval (informational only, not
-    # verdict-bearing) - two different machines' clocks, not two
-    # differently-labeled reads of the same one.
-    t0_true_epoch = t0["ts"].timestamp() - dgrhp_utc_offset().total_seconds()
-    create_to_t0_lag_ms = ((t0_true_epoch - trig_ts) * 1000) if trigger_kind == "rule-create" else None
+    row.update(void_class=None, void_reason=None)
+    return row
 
-    return {
-        "phase": phase, "backend": backend, "repeat": repeat_idx,
-        "t0_source": obs["t0_source"], "t0": t0["ts"].isoformat(), "t1": t1["ts"].isoformat(),
-        "generation": obs["generation"], "cleared": None, "applied": obs["applied"],
-        "failed": obs["failed"], "total": obs["total"], "b_ms": b_ms,
-        "pre_first_arm_ms": pre_first_arm_ms, "first_to_last_arm_ms": first_to_last_arm_ms,
-        "post_last_arm_ms": post_last_arm_ms, "n_arm_lines": len(arm_events),
-        "compliant_restored_ms_by_rule": d_by_rule, "d_ms_max": d_ms,
-        "functional_valid": functional_valid,
-        "reconcile_sent_delta": reconcile_sent_delta,
-        "pushes_policy_change_delta": pushes_policy_change_delta,
-        "trigger_http_status": http_status,
-        "create_to_t0_lag_ms": create_to_t0_lag_ms,
-        "void_reason": void_reason,
-    }
+
+def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, comparison_id):
+    if phase in ("B", "B2") and not comparison_id:
+        print("[run] --comparison is required for phase B/B2", file=sys.stderr)
+        return 1
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    trigger_id_cache = {"hbr_counter": 1}
+    if trigger_kind == "deploy":
+        tb = find_baseline_id(op, TRIGGER_BASELINE)
+        if not tb:
+            raise RuntimeError(f"trigger baseline '{TRIGGER_BASELINE}' not found - run 'ensure' first")
+        trigger_id_cache["trigger_baseline_id"] = tb
+    cohort_ids = [r["rule_id"] for r in cohort_rules()]
+    exp_rule_ids = expected_rule_ids()
+    window_start_for_sweep = dgrhp_now()
+
+    results = []
+    valid = 0
+    attempts = 0
+    max_attempts = repeats * 2
+    while valid < repeats and attempts < max(max_attempts, 10):
+        attempts += 1
+        r = run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, attempts,
+                       trigger_id_cache, run_id, comparison_id)
+        results.append(r)
+        status = "VOID:" + r["void_reason"] if r.get("void_reason") else f"c_ms={r.get('c_ms', '?')}"
+        print(f"[run] {label} {backend} {phase} attempt={attempts} {status}")
+        if not r.get("void_reason"):
+            valid += 1
+        if valid < repeats:
+            time.sleep(gap)
+
+    results = sweep_incomplete(results, window_start_for_sweep)
+    inconclusive = valid < repeats
+    with open(out_path, "a") as f:
+        for r in results:
+            f.write(json.dumps({**r, "label": label}) + "\n")
+    void_final = sum(1 for r in results if r.get("void_reason"))
+    print(f"[run] {label} {backend} {phase} DONE valid={valid}/{repeats} "
+          f"attempts={attempts} void={void_final} inconclusive={inconclusive} "
+          f"run_id={run_id} comparison_id={comparison_id}")
+    return 0
+
+
+def find_baseline_id(op, name):
+    return G.find_baseline_id(G.list_baselines_html(op), name)
 
 
 def observe_phase_a_window(window_start_ts):
-    """Phase A: no trigger, no clean-cohort void rules - observe ONE naturally
-    occurring T0->T1 window from the leftover riga-* storm. failed>0 and
-    applied!=total are EXPECTED data here, never a void."""
+    """Phase A: no trigger, no clean-cohort void rules, no fence machinery -
+    context-only, NOT verdict-bearing (unchanged this round except the
+    dev-shape T1_RE unpack, which now needs a `pending` slot)."""
     size0 = agent_log_size()
-    deadline_t0 = time.time() + 1200  # 20 min hard cap handled by the caller's own loop budget
+    deadline_t0 = time.time() + 1200
     t0 = t0_source = None
     while time.time() < deadline_t0 and t0 is None:
         events, size = _fetch_window(window_start_ts)
@@ -768,7 +1119,7 @@ def observe_phase_a_window(window_start_ts):
                 break
         if t0 is None:
             for p in events:
-                if T0_FALLBACK_RE.search(p["msg"]):
+                if PUSH_CMD_RE.search(p["msg"]):
                     t0, t0_source = p, "fallback"
                     break
         if t0 is not None:
@@ -799,29 +1150,26 @@ def observe_phase_a_window(window_start_ts):
         return {"void_reason": "t1_not_found_within_120s_of_t0"}
     arm_events = [p for p in arm_events if p["ts"] <= t1["ts"]]
 
-    applied, failed, full_sync, generation, total = t1_groups
+    applied, failed, pending, full_sync, generation, total = t1_groups
     b_ms = (t1["ts"] - t0["ts"]).total_seconds() * 1000
     return {
         "void_reason": None, "t0_source": t0_source, "t0": t0["ts"].isoformat(),
         "t1": t1["ts"].isoformat(), "generation": int(generation), "applied": int(applied),
-        "failed": int(failed), "total": int(total), "b_ms": b_ms, "n_arm_lines": len(arm_events),
-        "next_window_start": t1["ts"],
+        "failed": int(failed), "total": int(total), "pending": int(pending), "b_ms": b_ms,
+        "n_arm_lines": len(arm_events), "next_window_start": t1["ts"],
     }
 
 
 def cmd_run_phase_a(op, backend, label, out_path, cap_seconds=1200, target_windows=3):
-    """Storm-observed windows on the leftover uncontrolled catalogue - no
-    deploy trigger (would never settle: failed riga-* rules hold the
-    generation, so the server reconcile-pushes on its own ~every 25s)."""
     start = time.time()
     results = []
-    window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    window_start_ts = dgrhp_now()
     while len(results) < target_windows and (time.time() - start) < cap_seconds:
         obs = observe_phase_a_window(window_start_ts)
         window_start_ts = obs.get("next_window_start") or dgrhp_now()
         obs.pop("next_window_start", None)
         obs.update({"phase": "A", "backend": backend, "label": label,
-                     "repeat": len(results) + 1})
+                    "repeat": len(results) + 1})
         results.append(obs)
         status = "VOID:" + obs["void_reason"] if obs.get("void_reason") else \
             f"b_ms={obs['b_ms']:.1f} applied={obs['applied']} failed={obs['failed']} total={obs['total']}"
@@ -837,38 +1185,54 @@ def cmd_run_phase_a(op, backend, label, out_path, cap_seconds=1200, target_windo
     return 0
 
 
-def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path):
-    trigger_id_cache = {"hbr_counter": 1}
-    if trigger_kind == "deploy":
-        tb = find_baseline_id(op, TRIGGER_BASELINE)
-        if not tb:
-            raise RuntimeError(f"trigger baseline '{TRIGGER_BASELINE}' not found - run 'ensure' first")
-        trigger_id_cache["trigger_baseline_id"] = tb
-    cohort_ids = [r["rule_id"] for r in cohort_rules()]
+# --------------------------------------------------------------------------
+# reporting
+# --------------------------------------------------------------------------
 
-    results = []
-    valid = 0
-    attempts = 0
-    max_attempts = repeats * 2  # cap: 10 for K=5, 6 for K=3 - "up to a cap of 10 attempts" for K=5
-    while valid < repeats and attempts < max(max_attempts, 10):
-        attempts += 1
-        r = run_repeat(op, phase, backend, trigger_kind, cohort_ids, attempts, trigger_id_cache)
-        results.append(r)
-        status = "VOID:" + r["void_reason"] if r.get("void_reason") else \
-            f"b_ms={r['b_ms']:.1f}"
-        print(f"[run] {label} {backend} {phase} attempt={attempts} {status}")
-        if not r.get("void_reason"):
-            valid += 1
-        if valid < repeats:
-            time.sleep(gap)
 
-    inconclusive = valid < repeats
-    with open(out_path, "a") as f:
-        for r in results:
-            f.write(json.dumps({**r, "label": label}) + "\n")
-    print(f"[run] {label} {backend} {phase} DONE valid={valid}/{repeats} "
-          f"attempts={attempts} inconclusive={inconclusive}")
-    return 0
+def build_report_lines(rows):
+    groups = {}
+    for r in rows:
+        key = (r.get("comparison_id"), r.get("run_id"), r["label"], r["backend"], r["phase"])
+        groups.setdefault(key, []).append(r)
+    lines = ["| Comparison | Run | Label | Backend | Phase | Attempted | Valid | Floor reached | "
+             "B median (ms) | C median (ms) | Void breakdown |",
+             "|---|---|---|---|---|---|---|---|---|---|---|"]
+    for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
+        comparison_id, run_id, label, backend, phase = key
+        rs = groups[key]
+        valid = [r for r in rs if not r.get("void_reason")]
+        floor = 5 if phase == "B" else 3
+        reached = "Y" if len(valid) >= floor else "N"
+        void_counts = {}
+        for r in rs:
+            if r.get("void_reason"):
+                void_counts[r["void_reason"]] = void_counts.get(r["void_reason"], 0) + 1
+        void_str = ", ".join(f"{k}={v}" for k, v in sorted(void_counts.items())) or "-"
+        b_vals = [r["b_ms"] for r in valid if "b_ms" in r]
+        c_vals = [r["c_ms"] for r in valid if "c_ms" in r]
+        b_med = f"{statistics.median(b_vals):.1f}" if b_vals else "-"
+        c_med = f"{statistics.median(c_vals):.1f}" if c_vals else "-"
+        lines.append(f"| {comparison_id} | {run_id} | {label} | {backend} | {phase} | "
+                      f"{len(rs)} | {len(valid)} | {reached} | {b_med} | {c_med} | {void_str} |")
+    return lines
+
+
+def build_verdict_lines(rows):
+    groups = {}
+    for r in rows:
+        if r["phase"] not in ("B", "B2"):
+            continue
+        key = (r.get("comparison_id"), r.get("run_id"), r["label"], r["phase"])
+        groups.setdefault(key, {}).setdefault(r["backend"], []).append(r)
+    lines = ["| Comparison | Run | Label | Phase | Verdict |", "|---|---|---|---|---|"]
+    for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
+        comparison_id, run_id, label, phase = key
+        cells = groups[key]
+        floor = 5 if phase == "B" else 3
+        verdict = compute_verdict(cells.get("legacy", []), cells.get("spark", []), floor)
+        lines.append(f"| {comparison_id} | {run_id} | {label} | {phase} | {verdict} |")
+    return lines
 
 
 def cmd_report(in_path, out_md_path):
@@ -876,23 +1240,301 @@ def cmd_report(in_path, out_md_path):
     with open(in_path) as f:
         for line in f:
             rows.append(json.loads(line))
-    groups = {}
-    for r in rows:
-        if r.get("void_reason"):
-            continue
-        key = (r["label"], r["backend"], r["phase"])
-        groups.setdefault(key, []).append(r["b_ms"])
-    lines = ["| Label | Backend | Phase | valid N | B min (ms) | B median (ms) | B max (ms) |",
-             "|---|---|---|---|---|---|---|"]
-    for (label, backend, phase), vals in sorted(groups.items()):
-        lines.append(
-            f"| {label} | {backend} | {phase} | {len(vals)} | {min(vals):.1f} | "
-            f"{statistics.median(vals):.1f} | {max(vals):.1f} |"
-        )
+    lines = build_report_lines(rows) + [""] + build_verdict_lines(rows)
     with open(out_md_path, "w") as f:
         f.write("\n".join(lines) + "\n")
     print("\n".join(lines))
     return 0
+
+
+# --------------------------------------------------------------------------
+# selftest - offline, no rig, no server. Run BEFORE any login (see main()).
+# Fixtures F1-F14 per the R5.7 round-2 plan §2.2 item 11 - this is the check
+# that would have caught the dev-shape T1_RE drift before a rig round, and
+# the actual correctness test for the epoch-fence design Astra's adversarial
+# review found round 1's timestamp-only version unsound against.
+# --------------------------------------------------------------------------
+
+
+def _f1():
+    dev_line = "Guardian: apply_rules ok (applied=62, failed=0, pending=3, full_sync=true, generation=5, total=62)"
+    old_line = "Guardian: apply_rules ok (applied=62, failed=0, full_sync=true, generation=5, total=62)"
+    ok1 = bool(T1_RE.search(dev_line))
+    ok2 = not bool(T1_RE.search(old_line))
+    return ok1 and ok2, f"dev_match={ok1} old_rejected={ok2}"
+
+
+def _f2():
+    lines = {
+        "t0": "Guardian: full_sync cleared 62 prior rule(s)",
+        "t0d": "Guardian spark: detach_all complete (epoch=3, incarnation_floor=100, "
+               "detached_rules=62, withdrawn_claims=0)",
+        "t1": "Guardian: apply_rules ok (applied=62, failed=0, pending=0, full_sync=true, "
+              "generation=5, total=62)",
+        "t2": "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, "
+              "incarnation=101, type=registry, via=inline-arm, attach_to_commit_ms=12)",
+        "legacy": "Guardian: file guard armed for rule 'blackout-file-01'",
+        "sparkengine": r"SparkEngine: armed 'reg:HKCU\SOFTWARE\YuzuBlackout\Key01'",
+    }
+    regexes = {"t0": T0_RE, "t0d": T0D_RE, "t1": T1_RE, "t2": T2_RE,
+               "legacy": ARM_LEGACY_RE, "sparkengine": ARM_SPARK_RE}
+    ok, detail = True, []
+    for name, line in lines.items():
+        matched = {r for r, rx in regexes.items() if rx.search(line)}
+        if matched != {name}:
+            ok = False
+            detail.append(f"{name}: matched={matched}")
+    m = T0D_RE.search(lines["t0d"])
+    if not m or [int(x) for x in m.groups()] != [3, 100, 62, 0]:
+        ok = False
+        detail.append("t0d field mismatch")
+    m = T2_RE.search(lines["t2"])
+    if not m or m.groups() != ("blackout-reg-01", "3", "101", "registry", "inline-arm", "12"):
+        ok = False
+        detail.append("t2 field mismatch")
+    return ok, "; ".join(detail) or "all regexes pairwise-exclusive, fields parsed correctly"
+
+
+def _f3():
+    events = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.020",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=2, incarnation=50, "
+            "type=registry, via=callback-arm, attach_to_commit_ms=5)"),  # STALE, epoch E-1
+        _ev("2026-09-19 10:00:00.050", "Guardian spark: detach_all complete (epoch=3, "
+            "incarnation_floor=100, detached_rules=1, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.100", "Guardian: apply_rules ok (applied=1, failed=0, "
+            "pending=0, full_sync=true, generation=5, total=1)"),
+        _ev("2026-09-19 10:00:00.150",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=101, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=8)"),
+    ]
+    result = classify_t2(events, epoch=3, floor=100, expected_rule_ids={"blackout-reg-01"},
+                          own_push_raw=None, backend="spark",
+                          t0_ts=events[0]["ts"], t0d_ts=events[2]["ts"])
+    stale_rejected = any(r["reason"] == "wrong_epoch" for r in result["rejected"])
+    completed = not result["missing"] and "blackout-reg-01" in result["selected"]
+    return stale_rejected and completed, f"stale_rejected={stale_rejected} completed={completed}"
+
+
+def _f4():
+    events = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=3, "
+            "incarnation_floor=100, detached_rules=1, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.030",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=42, "
+            "type=registry, via=callback-adopt, attach_to_commit_ms=3)"),  # incarnation <= floor
+    ]
+    result = classify_t2(events, epoch=3, floor=100, expected_rule_ids={"blackout-reg-01"},
+                          own_push_raw=None, backend="spark",
+                          t0_ts=events[0]["ts"], t0d_ts=events[1]["ts"])
+    v = result["selected"].get("blackout-reg-01")
+    ok = v is not None and v["reobserved_adopt"] is True and not result["missing"]
+    no_fv = not any(r["reason"] == "fence_violation_below_floor" for r in result["rejected"])
+    return ok and no_fv, f"selected_reobserved={ok} no_fence_violation={no_fv}"
+
+
+def _f5():
+    events = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=3, "
+            "incarnation_floor=100, detached_rules=1, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.030",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=3, incarnation=42, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=3)"),  # NOT adopt, below floor
+    ]
+    result = classify_t2(events, epoch=3, floor=100, expected_rule_ids={"blackout-reg-01"},
+                          own_push_raw=None, backend="spark",
+                          t0_ts=events[0]["ts"], t0d_ts=events[1]["ts"])
+    flagged = any(r["reason"] == "fence_violation_below_floor" for r in result["rejected"])
+    not_selected = "blackout-reg-01" not in result["selected"]
+    return flagged and not_selected, f"flagged={flagged} not_selected={not_selected}"
+
+
+def _f6():
+    t0 = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t1 = _ev("2026-09-19 10:00:00.100", "x")["ts"]
+    selected = {
+        "r1": {"ts": _ev("2026-09-19 10:00:00.050", "x")["ts"], "via": "inline-arm"},
+        "r2": {"ts": t1, "via": "inline-arm"},
+        "r3": {"ts": _ev("2026-09-19 10:00:00.150", "x")["ts"], "via": "inline-arm"},
+    }
+    wm = compute_window_math(t0, t0, t1, selected)
+    ok = (wm["n_t2_before_t1"] == 1 and wm["n_t2_tie_t1"] == 1 and wm["n_t2_after_t1"] == 1
+          and abs(wm["c_ms"] - 150.0) < 1e-6)
+    return ok, (f"before={wm['n_t2_before_t1']} tie={wm['n_t2_tie_t1']} "
+                f"after={wm['n_t2_after_t1']} c_ms={wm['c_ms']}")
+
+
+def _f7():
+    events = [
+        _ev("2026-09-19 10:00:00.030",
+            "Guardian spark: arm committed for rule 'blackout-reg-02' (epoch=1, incarnation=11, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 2 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=5, detached_rules=2, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.020",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
+    ]
+    t0_ts = min(e["ts"] for e in events if T0_RE.search(e["msg"]))
+    t0d_ev = [e for e in events if T0D_RE.search(e["msg"])][0]
+    result = classify_t2(events, epoch=1, floor=5,
+                          expected_rule_ids={"blackout-reg-01", "blackout-reg-02"},
+                          own_push_raw=None, backend="spark", t0_ts=t0_ts, t0d_ts=t0d_ev["ts"])
+    ok = not result["missing"] and len(result["selected"]) == 2
+    return ok, f"missing={result['missing']} selected={sorted(result['selected'])}"
+
+
+def _f8():
+    events = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=5, detached_rules=1, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.500", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.510", "Guardian spark: detach_all complete (epoch=2, "
+            "incarnation_floor=10, detached_rules=1, withdrawn_claims=0)"),
+    ]
+    result = classify_t2(events, epoch=1, floor=5, expected_rule_ids={"blackout-reg-01"},
+                          own_push_raw=None, backend="spark",
+                          t0_ts=events[0]["ts"], t0d_ts=events[1]["ts"])
+    ok = result["next_t0d_ts"] is not None
+    return ok, f"next_t0d_ts={result['next_t0d_ts']}"
+
+
+def _f9():
+    # "Same-ms tie" case: the trigger's OWN push-command line and a genuinely
+    # DIFFERENT extra push both land at the identical millisecond, at-or-after
+    # t0_ts (a line strictly before t0_ts is out of classify_t2's window
+    # entirely, by construction - not what this fixture is testing). Identity
+    # (raw line content), not timestamp value, is what must tell them apart.
+    own_line = "Received command: plugin=__guard__, action=push_rules"
+    own_raw = "OWN:" + own_line
+    extra_raw = "EXTRA:" + own_line
+    events = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.000", own_line, raw=own_raw),      # tie with T0
+        _ev("2026-09-19 10:00:00.000", own_line, raw=extra_raw),    # same ms, DIFFERENT raw
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=5, detached_rules=1, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.030",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
+    ]
+    result = classify_t2(events, epoch=1, floor=5, expected_rule_ids={"blackout-reg-01"},
+                          own_push_raw=own_raw, backend="spark",
+                          t0_ts=events[0]["ts"], t0d_ts=events[3]["ts"])
+    ok = len(result["push_lines"]) == 1 and result["push_lines"][0]["raw"] == extra_raw
+    return ok, f"push_lines={[p['raw'] for p in result['push_lines']]}"
+
+
+def _f10():
+    t0 = _ev("2026-09-19 10:00:00.000", "x")["ts"]
+    t0d = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    base = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=5, detached_rules=1, withdrawn_claims=0)"),
+    ]
+    late = base + [
+        _ev("2026-09-19 10:00:00.090",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
+    ]
+    r1 = classify_t2(base, epoch=1, floor=5, expected_rule_ids={"blackout-reg-01"},
+                      own_push_raw=None, backend="spark", t0_ts=t0, t0d_ts=t0d)
+    r2 = classify_t2(late, epoch=1, floor=5, expected_rule_ids={"blackout-reg-01"},
+                      own_push_raw=None, backend="spark", t0_ts=t0, t0d_ts=t0d)
+    ok = bool(r1["missing"]) and not r2["missing"]
+    return ok, f"early_missing={r1['missing']} late_missing={r2['missing']}"
+
+
+def _f11():
+    t0d_ts = _ev("2026-09-19 10:00:00.010", "x")["ts"]
+    events_found = [
+        _ev("2026-09-19 10:00:05.000",
+            "Guardian spark: arm committed for rule 'blackout-reg-01' (epoch=1, incarnation=10, "
+            "type=registry, via=inline-arm, attach_to_commit_ms=3)"),
+    ]
+    found, still_missing = sweep_row_pure(events_found, epoch=1,
+                                           missing_rule_ids={"blackout-reg-01"},
+                                           backend="spark", t0d_ts=t0d_ts)
+    ok1 = "blackout-reg-01" in found and not still_missing
+    found2, still_missing2 = sweep_row_pure([], epoch=1, missing_rule_ids={"blackout-reg-01"},
+                                             backend="spark", t0d_ts=t0d_ts)
+    ok2 = not found2 and still_missing2 == ["blackout-reg-01"]
+    return ok1 and ok2, f"found_case={ok1} never_found_case={ok2}"
+
+
+def _f12():
+    rows = [
+        {"comparison_id": "cmp1", "run_id": "run1", "label": "t2-v1", "backend": "legacy",
+         "phase": "B", "repeat": 1, "void_class": "instrument", "void_reason": "t0_not_found"},
+        {"comparison_id": "cmp1", "run_id": "run1", "label": "t2-v1", "backend": "spark",
+         "phase": "B", "repeat": 1, "void_class": "instrument", "void_reason": "t1_not_found"},
+    ]
+    lines = build_report_lines(rows)
+    printed = any("cmp1" in ln and "t2-v1" in ln for ln in lines)
+    verdicts = build_verdict_lines(rows)
+    inconclusive = any("INCONCLUSIVE" in ln for ln in verdicts)
+    return printed and inconclusive, f"cell_printed={printed} inconclusive_verdict={inconclusive}"
+
+
+def _f13():
+    events_ok = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=5, detached_rules=0, withdrawn_claims=0)"),
+        _ev("2026-09-19 10:00:00.050", "Guardian: file guard armed for rule 'blackout-file-01'"),
+    ]
+    r_ok = classify_t2(events_ok, epoch=1, floor=5, expected_rule_ids={"blackout-file-01"},
+                        own_push_raw=None, backend="legacy",
+                        t0_ts=events_ok[0]["ts"], t0d_ts=events_ok[1]["ts"])
+    ok1 = not r_ok["missing"] and not r_ok["legacy_before_t0d"]
+
+    events_bad = [
+        _ev("2026-09-19 10:00:00.000", "Guardian: full_sync cleared 1 prior rule(s)"),
+        _ev("2026-09-19 10:00:00.005", "Guardian: file guard armed for rule 'blackout-file-01'"),
+        _ev("2026-09-19 10:00:00.010", "Guardian spark: detach_all complete (epoch=1, "
+            "incarnation_floor=5, detached_rules=0, withdrawn_claims=0)"),
+    ]
+    r_bad = classify_t2(events_bad, epoch=1, floor=5, expected_rule_ids={"blackout-file-01"},
+                         own_push_raw=None, backend="legacy",
+                         t0_ts=events_bad[0]["ts"], t0d_ts=events_bad[2]["ts"])
+    ok2 = bool(r_bad["legacy_before_t0d"])
+    return ok1 and ok2, f"ok_case={ok1} before_t0d_case={ok2}"
+
+
+def _f14():
+    t0d = {"epoch": 1, "floor": 5, "detached_rules": 60, "withdrawn_claims": 0}
+    ok1 = check_teardown_size(t0d, "spark", 62) == "teardown_size_mismatch"
+    t0d_ok = {"epoch": 1, "floor": 5, "detached_rules": 62, "withdrawn_claims": 0}
+    ok2 = check_teardown_size(t0d_ok, "spark", 62) is None
+    t0d_legacy = {"epoch": 1, "floor": 5, "detached_rules": 0, "withdrawn_claims": 0}
+    ok3 = check_teardown_size(t0d_legacy, "legacy", 62) is None
+    return ok1 and ok2 and ok3, f"mismatch_detected={ok1} ok_spark={ok2} ok_legacy={ok3}"
+
+
+def cmd_selftest():
+    fixtures = [
+        ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
+        ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
+        ("F13", _f13), ("F14", _f14),
+    ]
+    failures = 0
+    for name, fn in fixtures:
+        try:
+            ok, detail = fn()
+        except Exception as e:  # noqa: BLE001
+            ok, detail = False, f"EXCEPTION: {e!r}"
+        status = "PASS" if ok else "FAIL"
+        if not ok:
+            failures += 1
+        print(f"[selftest] {name}: {status} - {detail}")
+    print(f"[selftest] {len(fixtures) - failures}/{len(fixtures)} passed")
+    return 1 if failures else 0
 
 
 # --------------------------------------------------------------------------
@@ -904,6 +1546,7 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
 
+    sub.add_parser("selftest")
     sub.add_parser("inventory")
 
     p = sub.add_parser("purge")
@@ -920,6 +1563,9 @@ def main():
     p.add_argument("--repeats", type=int, default=5)
     p.add_argument("--gap", type=int, default=45)
     p.add_argument("--label", required=True)
+    p.add_argument("--comparison", default=None,
+                   help="required for phase B/B2 - groups the 4 invocations of one "
+                        "legacy/spark x B/B2 comparison together in `report`")
     p.add_argument("--out", default=os.path.join(SCRATCH_DIR, "results.jsonl"))
 
     p = sub.add_parser("report")
@@ -927,6 +1573,11 @@ def main():
     p.add_argument("--out", default=os.path.join(SCRATCH_DIR, "report.md"))
 
     args = ap.parse_args()
+
+    # R5.7: selftest runs BEFORE any server login - it needs no rig, no server, no SSH.
+    if args.cmd == "selftest":
+        return cmd_selftest()
+
     op = G.make_opener()
     G.login(op)
 
@@ -943,7 +1594,7 @@ def main():
         if args.phase == "A":
             return cmd_run_phase_a(op, args.backend, args.label, args.out)
         return cmd_run(op, args.phase, args.backend, args.trigger, args.repeats, args.gap,
-                        args.label, args.out)
+                       args.label, args.out, args.comparison)
     if args.cmd == "report":
         return cmd_report(args.in_path, args.out)
     return 1
