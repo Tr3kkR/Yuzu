@@ -744,6 +744,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
+#include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -1459,10 +1460,18 @@ private:
         // no-op for every pre-existing test.
         mcp.set_response_visible_set_fn(response_visible_set_fn_for_test);
 
-        // #4035: same setter idiom, reads dex_fleet_for_test LIVE at request
-        // time (see that field's doc comment) — unconditional, no-op-shaped
-        // default for every pre-existing test.
-        mcp.set_dex_fleet_fn([this]() { return dex_fleet_for_test; });
+        // ADR-0031 WS-A4 (fifth family): McpServer::set_dex_fleet_fn is retired
+        // (the DEX tools get the fleet through the DexApi seam's own FleetFn,
+        // wired below). `dex_fleet_for_test` now flows via make_local_dex_api.
+        // ADR-0031 WS-A4 (fifth family): wire the REAL DexApi seam over this
+        // test's GuaranteedStateStore + fleet, so the DEX signal MCP tools
+        // exercise the SEAM path (production wires it identically). Gated on
+        // store presence exactly like server.cpp — no store → null api → the
+        // tools' harmonized `!dex_api_` readiness guard returns the
+        // store-unavailable error.
+        if (guaranteed_state_store_for_test)
+            mcp.set_dex_api(yuzu::server::make_local_dex_api(
+                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
 
         // #4035 hardening (governance): same setter idiom, reads
         // dex_visible_for_test LIVE at request time (see that field's doc
