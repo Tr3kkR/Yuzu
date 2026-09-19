@@ -1025,7 +1025,18 @@ def sweep_incomplete(rows, window_start_ts):
     incomplete = [r for r in rows if r.get("void_reason") == "t2_incomplete"]
     if not incomplete:
         return rows
-    events, _ = _fetch_window(window_start_ts)
+    # Governance (this round, b-lite): worst-positioned unguarded SSH call in this file -
+    # this fetch runs ONCE, after every attempt in the cell has already completed. On
+    # failure, skip the reclassification pass entirely rather than crash: every
+    # t2_incomplete row simply stays t2_incomplete (already instrument-invalid, never
+    # counted toward PASS, can only push a cell toward INCONCLUSIVE via the existing
+    # >50%-void ceiling) - the same honest outcome as if the run had been killed here.
+    try:
+        events, _ = _fetch_window(window_start_ts)
+    except Exception as e:  # noqa: BLE001
+        print(f"[sweep] log fetch failed, skipping reclassification for {len(incomplete)} "
+              f"t2_incomplete row(s): {type(e).__name__}:{str(e)[:200]}", file=sys.stderr)
+        return rows
     for r in incomplete:
         t0_ts = datetime.fromisoformat(r["t0"])
         t0d_ts = datetime.fromisoformat(r["t0d"]["ts"])
@@ -1045,6 +1056,53 @@ def sweep_incomplete(rows, window_start_ts):
             r["missing_rule_ids"] = still_missing
             r["void_class"], r["void_reason"] = "genuine", "arm_never_confirmed"
     return rows
+
+
+def replace_run_rows(lines, run_id, swept_rows):
+    """Pure: rewrites a results-file's lines (each a raw string WITH its
+    trailing newline, as returned by readlines()) so every row belonging to
+    `run_id` is replaced by its corresponding entry in `swept_rows` (matched
+    by `repeat`, each row's per-attempt index within a run - unique within
+    one run_id, stable across the write-through/sweep boundary), and every
+    OTHER line - a different run's already-committed evidence, possibly
+    from a prior invocation entirely - passes through completely unchanged,
+    as the original raw string, never a json.loads()/dumps() round-trip
+    (which can reorder keys or reformat a float and produce a spurious diff
+    in committed evidence this function has no business touching). A line
+    that fails to parse as JSON, or has no matching `repeat` in this run,
+    also passes through unchanged.
+
+    Exists because cmd_run() writes each row through to disk as soon as
+    it's produced (governance, R5.7 driver-merge follow-on round: a mid-run
+    SSH/rig hiccup must not discard an already-completed repeat), but
+    sweep_incomplete() can only correctly reclassify t2_incomplete rows
+    once every attempt in the cell is in hand - so the file's pre-sweep
+    (conservative) rows for THIS run need a targeted, in-place correction
+    afterward, not a full-file rewrite. `swept_rows` are dicts built as
+    `{**r, "label": label}` from the SAME row objects the write-through
+    pass already dumped, so a row sweep_incomplete() left untouched
+    re-serializes byte-identical to what's already on disk (sweep only
+    reassigns existing keys' values, never adds a new top-level key, so key
+    insertion order - and therefore json.dumps output - is unaffected) -
+    replacing every row of this run unconditionally is therefore safe and
+    correct even when zero rows actually changed, not just when some did.
+
+    Returns the new full line list; the caller does the actual atomic file
+    swap (temp file + os.replace(), so a kill mid-rewrite can't corrupt
+    already-committed evidence from other runs sharing this file)."""
+    by_repeat = {r["repeat"]: json.dumps(r) + "\n" for r in swept_rows}
+    out = []
+    for line in lines:
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            out.append(line)
+            continue
+        if parsed.get("run_id") == run_id and parsed.get("repeat") in by_repeat:
+            out.append(by_repeat[parsed["repeat"]])
+        else:
+            out.append(line)
+    return out
 
 
 def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
@@ -1108,7 +1166,8 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     try:
         m0 = get_metrics(op)
     except Exception as e:  # noqa: BLE001
-        row.update(void_class="instrument", void_reason=f"metrics_unavailable:{e}")
+        row.update(void_class="instrument",
+                   void_reason=f"metrics_unavailable:{type(e).__name__}:{str(e)[:200]}")
         return row
     # Governance Gate 8 (unhappy-path, second pass, ported): dgrhp_now() is its own unguarded
     # ssh_ps() round trip, and the single most frequent SSH call site in this function (once
@@ -1126,7 +1185,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
             http_status = 200
         except Exception as e:  # noqa: BLE001
             row.update(trigger_http_status=None, void_class="instrument",
-                       void_reason=f"trigger_failed:{e}")
+                       void_reason=f"trigger_failed:{type(e).__name__}:{str(e)[:200]}")
             return row
     else:
         n = trigger_id_cache["hbr_counter"]
@@ -1137,7 +1196,7 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
             _, existed = G.post_rule(op, rule)
         except Exception as e:  # noqa: BLE001
             row.update(trigger_http_status=None, void_class="instrument",
-                       void_reason=f"trigger_failed:{e}")
+                       void_reason=f"trigger_failed:{type(e).__name__}:{str(e)[:200]}")
             return row
         http_status = 409 if existed else 201
         if existed:
@@ -1263,8 +1322,18 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         row.update(void_class=void_class_for("cohort_composition"), void_reason="cohort_composition")
         return row
 
-    result, reason, last_events = collect_t2(t0["ts"], t0d, window_start_ts, own_push_raw,
-                                              exp_rule_ids, backend)
+    # Governance (this round, b-lite): collect_t2()'s own _fetch_window() polls every 2s
+    # for up to ROOT_CAUSED_T2_VISIBILITY_TIMEOUT (240s), doing repeated SSH round trips -
+    # the longest single SSH-exposure window per attempt in this file. An unguarded blip
+    # anywhere in that span used to crash the whole cmd_run loop instead of voiding just
+    # this one attempt, same UP-2 symptom class as every other guard in this function.
+    try:
+        result, reason, last_events = collect_t2(t0["ts"], t0d, window_start_ts, own_push_raw,
+                                                  exp_rule_ids, backend)
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument",
+                   void_reason=f"t2_collect_failed:{type(e).__name__}:{str(e)[:200]}")
+        return row
     row["t2_selected"] = {rid: {**v, "ts": v["ts"].isoformat()} for rid, v in result["selected"].items()}
     row["t2_rejected"] = result["rejected"]
     row["missing_rule_ids"] = result["missing"]
@@ -1368,6 +1437,15 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
         r = run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, attempts,
                        trigger_id_cache, run_id, comparison_id)
         results.append(r)
+        # Governance (R5.7 driver-merge follow-on, b-lite): write through per attempt, same
+        # reasoning cmd_run_phase_a already has - a mid-run SSH/rig hiccup must not discard
+        # every already-completed repeat (this happened for real on this branch's own DGRHP
+        # run). This row is PRE-SWEEP (conservative); sweep_incomplete() below still needs
+        # the full in-memory `results` list to reclassify t2_incomplete rows by re-scanning
+        # the whole log span, so any row it changes gets corrected in place afterward via
+        # replace_run_rows() rather than losing the write-through property by batching again.
+        with open(out_path, "a") as f:
+            f.write(json.dumps({**r, "label": label}) + "\n")
         status = "VOID:" + r["void_reason"] if r.get("void_reason") else f"c_ms={r.get('c_ms', '?')}"
         print(f"[run] {label} {backend} {phase} attempt={attempts} {status}")
         if not r.get("void_reason"):
@@ -1377,9 +1455,14 @@ def cmd_run(op, phase, backend, trigger_kind, repeats, gap, label, out_path, com
 
     results = sweep_incomplete(results, window_start_for_sweep)
     inconclusive = valid < repeats
-    with open(out_path, "a") as f:
-        for r in results:
-            f.write(json.dumps({**r, "label": label}) + "\n")
+    swept_rows = [{**r, "label": label} for r in results]
+    with open(out_path, "r") as f:
+        lines = f.readlines()
+    lines = replace_run_rows(lines, run_id, swept_rows)
+    tmp_path = f"{out_path}.tmp-{os.getpid()}"
+    with open(tmp_path, "w") as f:
+        f.writelines(lines)
+    os.replace(tmp_path, out_path)
     void_final = sum(1 for r in results if r.get("void_reason"))
     print(f"[run] {label} {backend} {phase} DONE valid={valid}/{repeats} "
           f"attempts={attempts} void={void_final} inconclusive={inconclusive} "
@@ -2094,12 +2177,54 @@ def _f20():
             f"t2_late_when_clean={ok3} arm_never_confirmed_when_missing={ok4}")
 
 
+def _f21():
+    # replace_run_rows() (R5.7 driver-merge follow-on, b-lite persistence fix): the
+    # per-attempt write-through means cmd_run() must correct only the rows
+    # sweep_incomplete() actually changed, in place, without disturbing any other run's
+    # already-committed evidence sharing the same file - a foreign line must survive
+    # completely byte-identical (no json.loads/dumps round-trip), a matching line must be
+    # replaced, and a matching line sweep_incomplete left UNCHANGED must still round-trip
+    # byte-identical too (the "zero rows changed" case is not a special case skipped
+    # entirely, it's the same code path producing the same bytes).
+    foreign_line = '{"run_id": "OTHER_RUN", "repeat": 1, "weird_float": 1.10, "extra": "kept"}\n'
+    this_run_r1_before = {"run_id": "THIS_RUN", "repeat": 1, "label": "t2-v1",
+                           "void_reason": "t2_incomplete"}
+    this_run_r2_before = {"run_id": "THIS_RUN", "repeat": 2, "label": "t2-v1",
+                           "void_reason": None, "c_ms": 92.0}
+    lines = [
+        foreign_line,
+        json.dumps(this_run_r1_before) + "\n",
+        json.dumps(this_run_r2_before) + "\n",
+    ]
+    # r1 was reclassified by sweep_incomplete (t2_incomplete -> t2_late); r2 was left
+    # untouched (same dict content - the "zero rows changed" case, for THIS row).
+    r1_after = {**this_run_r1_before, "void_reason": "t2_late", "void_class": "instrument"}
+    swept_rows = [r1_after, dict(this_run_r2_before)]
+
+    out = replace_run_rows(lines, "THIS_RUN", swept_rows)
+
+    ok_count = len(out) == len(lines)
+    ok_foreign_untouched = out[0] == foreign_line
+    ok_r1_replaced = json.loads(out[1])["void_reason"] == "t2_late"
+    ok_r2_noop_byte_identical = out[2] == lines[2]
+
+    empty_out = replace_run_rows([foreign_line], "THIS_RUN", [])
+    ok_no_matching_run_is_noop = empty_out == [foreign_line]
+
+    ok = (ok_count and ok_foreign_untouched and ok_r1_replaced and ok_r2_noop_byte_identical
+          and ok_no_matching_run_is_noop)
+    return (ok,
+            f"line_count_preserved={ok_count} foreign_line_byte_identical={ok_foreign_untouched} "
+            f"matching_row_replaced={ok_r1_replaced} unchanged_row_byte_identical={ok_r2_noop_byte_identical} "
+            f"no_matching_run_is_noop={ok_no_matching_run_is_noop}")
+
+
 def cmd_selftest():
     fixtures = [
         ("F1", _f1), ("F2", _f2), ("F3", _f3), ("F4", _f4), ("F5", _f5), ("F6", _f6),
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
-        ("F19", _f19), ("F20", _f20),
+        ("F19", _f19), ("F20", _f20), ("F21", _f21),
     ]
     failures = 0
     for name, fn in fixtures:
