@@ -252,6 +252,56 @@ public:
                                                     const std::vector<std::string>& members);
     void mark_failed(const std::string& id, const std::string& reason);
 
+    /// #4493 heal path for a row `mark_failed` cannot reach: `mark_failed`'s
+    /// SELECT/UPDATE are both gated on `status = 'pending'`, so a
+    /// `materialized` (or `failed`) row whose `source_payload` nests past
+    /// `kMcpMaxJsonDepth` had no way back to a safe, dumpable payload. This
+    /// method is status-agnostic on purpose: unlike `mark_failed`, whose job
+    /// IS the pending -> failed transition, this NEVER writes `status`, since
+    /// a `materialized` row's members are real and still scope-walkable
+    /// (`member_set_owned` never filters on status), so forcing it to
+    /// `failed` would misrepresent a working set as having produced nothing
+    /// to every status-reading consumer (REST/MCP response body, the
+    /// dashboard badge). Re-checks the raw text itself (never trusts a
+    /// caller's prior check) and is a no-op (returns false, writes nothing)
+    /// when the payload is not actually poisoned, so it can never silently
+    /// overwrite a healthy row's provenance. Returns true only when the
+    /// UPDATE below actually affected exactly one row -- a poisoned payload
+    /// was found and replaced with the same fixed `note` text `mark_failed`
+    /// writes for its own poisoned-pending case (not the same full object --
+    /// `mark_failed`'s also carries a caller-supplied `failure` reason this
+    /// method has no equivalent argument for).
+    ///
+    /// `false` is overloaded across seven distinct causes: the store is not
+    /// open, no connection lease was available, the initial SELECT failed
+    /// (a genuine read error, connection already held), the row was already
+    /// gone at that SELECT, the payload was never actually poisoned (the
+    /// no-op case), the UPDATE itself failed (a genuine write error,
+    /// connection already held), or the row was deleted between the SELECT
+    /// and the UPDATE (#4540 -- a concurrent `delete_set`/GC sweep on an
+    /// independent connection lease with no shared lock, caught via
+    /// `RETURNING id` + an affected-row check, same idiom as `materialize`'s
+    /// own UPDATE) -- a caller needing to distinguish a genuine write failure
+    /// from a harmless no-op cannot do so from the return value alone
+    /// (#4524).
+    ///
+    /// Deliberately has NO owner check of its own -- same shape as
+    /// `mark_failed`. Both of this method's only two production callers
+    /// (REST `/re-eval`, MCP `reevaluate_result_set`) call it only after
+    /// their own `load_owned`/`rs_load_owned` has already confirmed the
+    /// caller owns `id`; a future caller must do the same before invoking
+    /// this method directly.
+    ///
+    /// Invariant this method's safety depends on and that is NOT enforced by
+    /// any type or assertion: today, REST's `/re-eval` and MCP
+    /// `reevaluate_result_set` are the ONLY code paths that ever parse
+    /// `source_payload` back into JSON, and both already depth-check it
+    /// first. A future consumer of `source_payload` (a dashboard/lineage
+    /// view, a list endpoint) that parses it WITHOUT its own depth check
+    /// would reopen the #2437 SIGSEGV class this guard exists to close --
+    /// healing on read here does not protect a consumer that never calls it.
+    bool heal_poisoned_payload(const std::string& id);
+
     // ── GC ───────────────────────────────────────────────────────────────────
     /// Delete unpinned rows past TTL; cascades to members. Returns count removed.
     int gc_sweep();
