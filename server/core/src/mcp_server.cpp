@@ -986,8 +986,12 @@ static const ToolDef kTools[] = {
      "contract as the create_result_set_from_* producers) — confined to the caller's derived "
      "visible device set. A manual_curate or inventory_query source set returns an error "
      "(re-eval of those source kinds is not yet supported; sync sources are a tracked "
-     "follow-up). REST v1 twin: POST /api/v1/result-sets/{id}/re-eval. NEVER re-send this "
-     "call on a timeout or error.",
+     "follow-up). If the stored source_payload nests past the JSON depth guard (#4493), the "
+     "row is healed in place (payload discarded, status/members untouched) as a side effect "
+     "of the rejection, so a later re-eval attempt is refused for a different reason (no "
+     "re-runnable source) instead of repeating the same depth error. REST v1 twin: POST "
+     "/api/v1/result-sets/{id}/re-eval. "
+     "NEVER re-send this call on a timeout or error.",
      R"({"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":64,"description":"The result set to re-evaluate"}},"required":["id"]})",
      R"j({"type":"object","properties":{)j" R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"})j"
      R"j(},"required":[)j" R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count")j" R"j(]})j"},
@@ -11836,10 +11840,31 @@ McpServer::HandlerFn McpServer::build_handler(
                 // the STORED text before parse (same ordering as REST's twin
                 // guard on this route); on rejection, never reach rs_run_async.
                 if (json_exceeds_depth(orig->source_payload, kMcpMaxJsonDepth)) {
+                    // #4493: heal the row in place so it is never a live
+                    // grenade for a future read again - this specific re-eval
+                    // attempt still cannot proceed (the original query is
+                    // unrecoverably gone), but every future read of this row
+                    // (this tool included) hits the safe placeholder instead
+                    // of repeating the same depth-check dance forever.
+                    // Gate 2/4 governance finding (#4493 re-review): this is
+                    // the only rejection branch in the whole result-set family
+                    // that performs a real write to an otherwise
+                    // immutable-by-design table (scope-walking-design.md), so
+                    // audit BOTH outcomes explicitly (REST's twin does the
+                    // same) rather than silently mutating on an error path -
+                    // and never claim the payload "has been discarded" unless
+                    // the write actually committed.
+                    const bool healed = result_set_store_->heal_poisoned_payload(rs_id);
+                    audit_fn(req, "result_set.heal", healed ? "success" : "failure",
+                             "ResultSet", rs_id, "");
                     res.set_content(
-                        error_response(
-                            id, kInvalidParams,
-                            "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply"),
+                        error_response(id, kInvalidParams,
+                                       healed ? "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                                "nested too deeply and has been discarded; "
+                                                "re-eval is unavailable for this set"
+                                              : "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                                "nested too deeply; heal attempt failed, try "
+                                                "again"),
                         "application/json");
                     return;
                 }
