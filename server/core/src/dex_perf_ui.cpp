@@ -247,8 +247,8 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
     if (now.reporting == 0) {
         h += placeholder("No perf telemetry yet",
                          "No device reported a perf heartbeat this cycle. Perf telemetry is "
-                         "collected by Windows agents (TAR perf capture source); devices appear "
-                         "here within a heartbeat of coming online.");
+                         "collected on Windows and Linux (TAR perf capture source; macOS support "
+                         "is planned); devices appear here within a heartbeat of coming online.");
     } else {
         h += "<div class=\"gp-tiles\">";
         if (now.cpu)
@@ -263,15 +263,21 @@ std::string render_dex_perf_fragment(const DexPerfSnapshot& snap, int window_day
             h += fleet_card("Disk I/O latency (avg)", fmt_lat(now.disk_lat->avg),
                             stat_strip(*now.disk_lat, true), "metric=disk_lat&window=" + w,
                             "worst devices by disk latency");
+        const int64_t collecting_online = now.windows_online + now.linux_online + now.macos_online;
         h += fleet_card("Reporting", std::to_string(now.reporting),
-                        "of " + std::to_string(now.windows_online) + " Windows online",
+                        "of " + std::to_string(collecting_online) + " online (Windows " +
+                            std::to_string(now.windows_online) + " &middot; Linux " +
+                            std::to_string(now.linux_online) + " &middot; macOS " +
+                            std::to_string(now.macos_online) + ")",
                         "filter=not_reporting&window=" + w, "devices not reporting");
         h += "</div>";
-        h += "<div class=\"gp-note\">Perf telemetry is collected by <b>Windows agents only</b> "
-             "today &mdash; macOS and Linux devices are absent from these numbers, not zero. "
-             "The Reporting card is the denominator for every stat above. The same numbers are "
-             "exported as the <span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> "
-             "Prometheus gauges.</div>";
+        h += "<div class=\"gp-note\">Perf telemetry is collected on <b>Windows and Linux</b> "
+             "today (macOS support is planned; macOS devices show as online above but never "
+             "reporting). The Reporting card is the denominator for every stat above. The same "
+             "numbers are exported as the "
+             "<span style=\"font-family:var(--mono)\">yuzu_fleet_perf_*</span> and per-OS "
+             "<span style=\"font-family:var(--mono)\">yuzu_fleet_perf_os_*</span> Prometheus "
+             "gauges.</div>";
     }
 
     // ── Cohort benchmarking ──
@@ -457,7 +463,7 @@ std::string render_dex_perf_devices_fragment(const DexPerfSnapshot& snap, DexPer
     if (rows.empty())
         return h + placeholder(not_reporting ? "Everyone is reporting" : "No devices",
                                not_reporting
-                                   ? "Every online Windows agent contributed a perf sample "
+                                   ? "Every online Windows/Linux agent contributed a perf sample "
                                      "this cycle."
                                    : "No reporting devices match this view.");
 

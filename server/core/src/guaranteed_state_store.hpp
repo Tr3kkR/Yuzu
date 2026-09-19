@@ -80,6 +80,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "dex_types.hpp" // ADR-0031 WS-A4: DEX leaf value types relocated here (pure, store-free)
+
 namespace yuzu {
 class MetricsRegistry;
 }
@@ -182,101 +184,10 @@ struct GuardianAgentRuleStatus {
     std::string updated_at;  // ISO-8601 of the event that set it
 };
 
-struct GuardianObservationRow {
-    std::string event_id;          // shares the event journal dedup key
-    std::string agent_id;
-    std::string observed_at;       // ISO-8601 (= event timestamp)
-    std::string obs_type;          // = event_type, e.g. "process.crashed", "os.boot"
-    std::string subject;           // e.g. "notepad.exe", "Spooler", "HP LaserJet"
-    std::string reason;            // e.g. "0xC0000005", "0x80070643", "timeout"
-    std::string symbolic;          // e.g. "ACCESS_VIOLATION", "WIFI_DISCONNECT"
-    std::string component;         // e.g. "ntdll.dll" (faulting module)
-    std::string version;           // crashed/hung app's file version "a.b.c.d", "" if unknown
-    double metric{0.0};            // numeric payload (boot duration ms); 0 = none
-    std::string platform;          // "windows" | "linux" | "macos"
-};
-
-// ── DEX read-model aggregations over guardian_observations ───────────────────
-struct DexCrashSummary {
-    int64_t total_crashes{0};
-    int64_t distinct_devices{0};   // devices impacted (crash-free numerator)
-    int64_t distinct_apps{0};
-};
-struct DexAppCrashCount {          // top unreliable apps + blast radius
-    std::string subject;           // process name
-    std::string version;           // app file version, "" = unknown/all (version-blind query)
-    int64_t crashes{0};
-    int64_t hangs{0};
-    int64_t distinct_devices{0};   // blast radius = distinct devices, not event count
-    std::string last_seen;
-};
-struct DexModuleCrashCount {       // top faulting modules (crash-scoped)
-    std::string component;         // module name
-    int64_t crashes{0};
-    int64_t distinct_apps{0};
-};
-struct DexDeviceCrashCount {       // most-affected devices (crash-scoped)
-    std::string agent_id;
-    int64_t crashes{0};
-    std::string last_seen;
-};
-struct DexOsCrashCount {           // per-OS split (coverage-normalised at the route)
-    std::string platform;
-    int64_t crashes{0};
-    int64_t distinct_devices{0};
-};
-struct DexDayCrashCount {          // crashes-per-day trend
-    std::string day;               // YYYY-MM-DD
-    int64_t crashes{0};
-};
-struct DexExceptionCount {         // top failure reasons (per-app drill-down)
-    std::string reason;            // e.g. "0xC0000005"
-    std::string symbolic;          // e.g. "ACCESS_VIOLATION"
-    int64_t crashes{0};
-};
-struct DexEntitySummary {          // per-app / per-device drill-down summary
-    int64_t crashes{0};
-    int64_t hangs{0};
-    int64_t signals{0};            // ALL observation rows for the entity (any type)
-    int64_t distinct_devices{0};
-    int64_t distinct_apps{0};
-    std::string first_seen;
-    std::string last_seen;
-};
-struct DexSignalCount {            // the whole-catalogue rollup (overview panel)
-    std::string obs_type;
-    int64_t count{0};
-    int64_t distinct_devices{0};
-    std::string last_seen;
-};
-struct DexSubjectCount {           // top subjects for ONE obs_type (signal drill-down)
-    std::string subject;
-    int64_t count{0};
-    int64_t distinct_devices{0};
-    std::string last_seen;
-};
-struct DexOsScope {                // per-OS coverage: how many types each OS collects
-    std::string platform;
-    int64_t distinct_types{0};
-    int64_t total_events{0};
-};
-struct DexDaySignal {              // one (day, obs_type) cell of the trends matrix
-    std::string day;               // YYYY-MM-DD
-    std::string obs_type;
-    int64_t count{0};
-};
-struct DexBootStats {              // boot-performance rollup (os.boot metric, ms)
-    int64_t boots{0};
-    double avg_ms{0.0};
-    double max_ms{0.0};
-    int64_t distinct_devices{0};
-};
-struct DexDeviceBoot {             // slowest-booting devices
-    std::string agent_id;
-    double avg_ms{0.0};
-    double max_ms{0.0};
-    int64_t boots{0};
-};
+// The DEX read-model value types (GuardianObservationRow + the Dex* observation
+// aggregations) were relocated verbatim to the pure "dex_types.hpp" (included
+// above) for the ADR-0031 WS-A4 DexApi seam; they remain in namespace
+// yuzu::server and every includer keeps seeing them transitively.
 
 // Hard upper bound on `GuaranteedStateEventQuery::limit` and every DEX
 // `limit` parameter. Defence-in-depth: materialising millions of rows into a
