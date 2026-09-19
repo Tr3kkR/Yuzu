@@ -2150,7 +2150,9 @@ before acting on any "open" / "in progress" claim:
    before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`
    thread — or a fleet-triggered emit double-delivers). That gate is procedural: nothing in code
    refuses a 2nd replica today. See
-   `docs/ha-delivery-matrix.md`; re-verify before acting — this cluster of PRs merged within a 4-day
+   `docs/ha-delivery-matrix.md`; re-verify before acting — its own boxed "Gate" callout hasn't caught
+   up to WS-11/WS-13 yet, so read the per-row exit-criteria notes too, not the callout alone
+   (Tr3kkR/Yuzu#4618). This cluster of PRs merged within a 4-day
    window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
    itself is 2026-09-07 11:01, between #4011 and #4092).
 3. **Guardian hardening (Phase 16).** 16.A Windows-first soak continues (Spark engine, BaselineStore,
