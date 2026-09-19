@@ -1174,7 +1174,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                             commit_new_generation_locked(claim->rule_id, claim->generation,
                                                          claim->guard_type, claim->rule_name,
                                                          fresh, claim->rg, claim->attach_now,
-                                                         waker, outbox_waker);
+                                                         waker, outbox_waker,
+                                                         CommitPath::CallbackAdopt);
                         } catch (...) {
                             rules_.erase(claim->rule_id);
                             fresh->pending_initial.erase(claim->rule_id);
@@ -1285,7 +1286,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                     commit_new_generation_locked(c->rule_id, c->generation,
                                                                  c->guard_type, c->rule_name,
                                                                  fresh, std::move(c->rg),
-                                                                 c->attach_now, waker, outbox_waker);
+                                                                 c->attach_now, waker, outbox_waker,
+                                                                 CommitPath::CallbackArm);
                                 } catch (...) {
                                     rules_.erase(c->rule_id);
                                     fresh->pending_initial.erase(c->rule_id);
@@ -1321,7 +1323,8 @@ void GuardianSparkRuntime::on_arm_complete(const std::string& key,
                                 commit_new_generation_locked(c->rule_id, c->generation,
                                                              c->guard_type, c->rule_name, pk,
                                                              std::move(c->rg), c->attach_now,
-                                                             waker, outbox_waker);
+                                                             waker, outbox_waker,
+                                                             CommitPath::CallbackShared);
                                 c->index_held = false;
                                 stage(c, c->generation, nullptr, ClaimEnd::Committed);
                             } catch (...) {
@@ -1577,11 +1580,16 @@ std::size_t GuardianSparkRuntime::claim_queue_depth_for_test(const std::string& 
     return eit == claims_.end() ? 0 : eit->second.fifo.size();
 }
 
+std::pair<std::uint64_t, std::uint64_t> GuardianSparkRuntime::application_fence_for_test() const {
+    std::lock_guard<std::mutex> lk{registry_mu_};
+    return {detach_epoch_, gen_counter_};
+}
+
 void GuardianSparkRuntime::commit_new_generation_locked(
     const std::string& rule_id, std::uint64_t gen, const char* guard_type,
     const std::string& rule_name, const std::shared_ptr<PerKey>& pk,
     std::shared_ptr<RuleGeneration> rg, std::chrono::steady_clock::time_point attach_now,
-    std::function<void()>& waker, std::function<void()>& outbox_waker) {
+    std::function<void()>& waker, std::function<void()>& outbox_waker, CommitPath via) {
     rules_.insert_or_assign(rule_id, std::move(rg));
     pk->pending_initial.insert_or_assign(rule_id, PendingState{attach_now, 0, false});
     // Copy the wakers (throwing std::function copies) BEFORE the lifecycle enqueue so
@@ -1590,6 +1598,48 @@ void GuardianSparkRuntime::commit_new_generation_locked(
     waker = pending_initial_waker_;
     outbox_waker = outbox_enqueue_waker_;
     enqueue_lifecycle_locked(rule_id, gen, "armed", guard_type, rule_name);
+    // R5.7 T2 (docs/spark-stage2-guardian-consumer-design.md): the runtime's own
+    // arm-confirmation commit - the ONLY valid log-side proxy for "this rule is
+    // armed" under spark (SparkEngine's own "armed" line fires before the OS
+    // watch exists - see spark_engine.cpp). `epoch` is detach_epoch_ read under
+    // the registry_mu_ this function already holds - it names which application
+    // (full_sync teardown) this commit belongs to; `incarnation` is `gen`, this
+    // attach's own gen_counter_ token, NOT the server policy generation. Fully
+    // firewalled INCLUDING the clock read and the duration math: this runs after
+    // the lifecycle enqueue above, and an escaping throw here would leave an
+    // "armed" audit record enqueued while every caller's own rollback (a
+    // catch(...) at the callback sites, a GuardianRollback guard at the inline
+    // sites) undoes rules_/pending_initial. Same firewall shape as the lifecycle
+    // window-raise log above and spark_engine.cpp's own armed-log site.
+    // FIELD ORDER IS PINNED by the #3990 driver's own regex
+    // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T2_RE) - change
+    // both together.
+    try {
+        const auto attach_to_commit_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             clock_() - attach_now).count();
+        spdlog::info("Guardian spark: arm committed for rule '{}' (epoch={}, incarnation={}, "
+                     "type={}, via={}, attach_to_commit_ms={})",
+                     rule_id, detach_epoch_, gen, guard_type, commit_path_name(via),
+                     attach_to_commit_ms);
+    } catch (...) {
+    }
+}
+
+const char* commit_path_name(GuardianSparkRuntime::CommitPath path) {
+    using P = GuardianSparkRuntime::CommitPath;
+    switch (path) {
+    case P::InlineArm:
+        return "inline-arm";
+    case P::InlineShared:
+        return "inline-shared";
+    case P::CallbackArm:
+        return "callback-arm";
+    case P::CallbackShared:
+        return "callback-shared";
+    case P::CallbackAdopt:
+        return "callback-adopt";
+    }
+    return "Unknown"; // unreachable if the switch above is kept exhaustive
 }
 
 std::expected<std::uint64_t, std::string>
@@ -2494,7 +2544,7 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
             keys_.emplace(key, pk);
 
             commit_new_generation_locked(rule_id, gen, guard_type, rule_name, pk, std::move(rg),
-                                         attach_now, waker, outbox_waker);
+                                         attach_now, waker, outbox_waker, CommitPath::InlineArm);
             rollback.committed = true;
         } else {
             // An existing, COMMITTED shared watcher for this key: reaching here with
@@ -2512,7 +2562,8 @@ GuardianSparkRuntime::attach_core(const std::string& key, std::string rule_id, S
                 pk->pending_initial.erase(rule_id);
             };
             commit_new_generation_locked(rule_id, gen, guard_type, rule_name, pk, std::move(rg),
-                                         attach_now, waker, outbox_waker);
+                                         attach_now, waker, outbox_waker,
+                                         CommitPath::InlineShared);
             rollback.committed = true;
         }
         new_gen = gen;
@@ -2582,6 +2633,14 @@ void GuardianSparkRuntime::detach_all() {
     std::vector<std::shared_ptr<KeyClaim>> works;
     {
         std::lock_guard<std::mutex> lk{registry_mu_};
+        // R5.7 application fence (docs/spark-stage2-guardian-consumer-design.md):
+        // bumped FIRST, before any of this block's own mutation, so every commit
+        // this teardown's own re-arm eventually produces carries an epoch strictly
+        // greater than whatever a still-in-flight PRIOR application's callback
+        // could log - see the T0d line at the end of this block for the full
+        // reasoning (both share registry_mu_, so no commit can interleave between
+        // this increment and that line).
+        ++detach_epoch_;
         // rung 9c PR-5d (concern 1): every currently-wedged claim loses its
         // adoption candidacy too - a full sync that omits a wedged rule_id must
         // not let its eventual late success resurrect it, and the per-rule
@@ -2632,6 +2691,29 @@ void GuardianSparkRuntime::detach_all() {
             if (auto work = detach_rule_locked(rid))
                 works.push_back(std::move(work));
         outbox_waker = outbox_enqueue_waker_;
+        // R5.7 T0d (docs/spark-stage2-guardian-consumer-design.md): the runtime's
+        // own teardown-complete marker - the #3990 diagnostic's T0d line. Logged
+        // LAST in this locked block so its timestamp means "registry cleared for
+        // this application" and every commit this application goes on to produce
+        // is guaranteed to log AFTER it. `incarnation_floor` is gen_counter_ NOW:
+        // every attach this application makes gets an incarnation strictly above
+        // it (ordinary paths) or, for a Reobserved wedge adoption specifically,
+        // AT OR BELOW it (the diagnostic's own epoch-fence design treats that as
+        // the one legal exception - see the design doc's R5.7 section). Firewalled:
+        // an escaping throw here is caught by this function's own caller
+        // (GuardianEngine's full_sync teardown catch, which counts a reconcile
+        // failure and proceeds to re-arm what it can) - a missing T0d line for an
+        // epoch that then produces commits anyway is the diagnostic's own signal
+        // to void that repeat, not a correctness problem for the engine itself.
+        // FIELD ORDER IS PINNED by the #3990 driver's own regex
+        // (docs/spark-rebuild-baselines/fullsync_blackout_diag.py's T0D_RE) -
+        // change both together.
+        try {
+            spdlog::info("Guardian spark: detach_all complete (epoch={}, incarnation_floor={}, "
+                         "detached_rules={}, withdrawn_claims={})",
+                         detach_epoch_, gen_counter_, rule_ids.size(), claimed.size());
+        } catch (...) {
+        }
     }
     // rung 9c PR-2 Unit 3: submitted sequentially, off-lock, through
     // submit_disarm_off_lock() - each returns as soon as its disarm is ADMITTED, not

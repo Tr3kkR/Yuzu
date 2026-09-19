@@ -692,6 +692,12 @@ public:
     }
     /// Test seam: claims currently queued on `key` (0 when the key has no entry).
     [[nodiscard]] std::size_t claim_queue_depth_for_test(const std::string& key) const;
+    /// Test seam (R5.7): {detach_epoch_, gen_counter_} snapshot, registry_mu_
+    /// held internally. Lets a test assert the fence invariant directly -
+    /// detach_all() bumps the epoch by exactly one, and every attach after it
+    /// returns an incarnation strictly greater than the floor it reported -
+    /// without needing log capture.
+    [[nodiscard]] std::pair<std::uint64_t, std::uint64_t> application_fence_for_test() const;
     /// #3816 / rung 9c R5.2: an arm's completion callback found a live subscription
     /// nobody was left to adopt - the head's caller had already timed out and no
     /// queued sibling was still waiting - so it disarmed it (a bounded run() on the
@@ -1242,6 +1248,21 @@ public:
         Pending, Committed, Failed, CongestionExpired, Wedged, Withdrawn, Stopped
     };
 
+    /// R5.7 (docs/spark-stage2-guardian-consumer-design.md): which path reached
+    /// commit_new_generation_locked(). A closed set - the T2 log line tags every
+    /// commit with it so the #3990 diagnostic can tell a real backend arm() from
+    /// a shared-watcher join or a wedge late-success adoption. Adding a sixth
+    /// caller means adding a value here (enforced by review + -Wswitch, not by
+    /// the build - werror=false repo-wide).
+    enum class CommitPath {
+        InlineArm,       ///< attach_core: inline type, synchronous backend_->arm() just returned
+        InlineShared,    ///< attach_core: joins an already-committed watcher, no backend call
+        CallbackArm,     ///< on_arm_complete: first SURVIVING live claim adopts the
+                         ///< subscription and creates the PerKey (a withdrawn head is skipped)
+        CallbackShared,  ///< on_arm_complete: a later live claim joins that watcher
+        CallbackAdopt,   ///< on_arm_complete: a retained wedge's late success adopted (PR-5d)
+    };
+
     /// registry_mu_ taken internally (short critical section, allocation-free). A
     /// default-constructed (empty) receipt reports Failed - there is nothing to
     /// observe.
@@ -1755,7 +1776,8 @@ private:
                                       std::shared_ptr<RuleGeneration> rg,
                                       std::chrono::steady_clock::time_point attach_now,
                                       std::function<void()>& waker,
-                                      std::function<void()>& outbox_waker);
+                                      std::function<void()>& outbox_waker,
+                                      CommitPath via);
     EvalOutcome eval_rule(const SparkSpec& spec, const RuleAssertion& a, RuleEvalState& state,
                           std::chrono::steady_clock::time_point now, bool edge,
                           const ReadResult<FileSnapshot>* file,
@@ -1813,6 +1835,16 @@ private:
     /// re-threaded piecemeal.
     const Config cfg_;
     std::uint64_t gen_counter_{0};   ///< registry_mu_-guarded monotonic generation source
+    /// registry_mu_-guarded; +1 as the FIRST statement of detach_all()'s locked
+    /// block (R5.7 fence, docs/spark-stage2-guardian-consumer-design.md). Names
+    /// which full_sync APPLICATION a commit belongs to - the #3990 diagnostic's
+    /// T2 measurement rejects any commit whose logged epoch doesn't match the
+    /// application currently being measured, closing a real gap an Astra
+    /// adversarial review found in an earlier timestamp-only design (a prior
+    /// application's ordinary in-flight callback could otherwise land between
+    /// the new full_sync's own teardown-start and detach_all() and be
+    /// miscounted as belonging to the new one).
+    std::uint64_t detach_epoch_{0};
     std::uint64_t event_seq_{0};     ///< registry_mu_-guarded event_id source
     std::string boot_nonce_;         ///< random, fixed at construction; disambiguates event_ids across
                                      ///< process restarts (wall_ms + seq alone are not restart-unique)
@@ -2180,5 +2212,14 @@ private:
                                                          ///< priority lane (pending_demote_sweeps /
                                                          ///< pending_demote_ms). Lock-free, same call site.
 };
+
+/// R5.7 (docs/spark-stage2-guardian-consumer-design.md): human-readable rendering
+/// of a GuardianSparkRuntime::CommitPath, for the T2 log line
+/// commit_new_generation_locked() emits. Declared here (not in
+/// guardian_arm_ack.hpp, which already includes this header) so
+/// guardian_spark_runtime.cpp names its own enum without a reverse include.
+/// Exported so the mapping stays directly unit-testable, mirroring
+/// receipt_status_name()'s own convention (guardian_arm_ack.hpp).
+YUZU_EXPORT const char* commit_path_name(GuardianSparkRuntime::CommitPath path);
 
 } // namespace yuzu::agent

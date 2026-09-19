@@ -3450,6 +3450,201 @@ TEST_CASE("detach_all also clears pending-initial bookkeeping (no stale schedule
     SUCCEED("sweeping a detached key after detach_all did not crash");
 }
 
+TEST_CASE("R5.7: application_fence_for_test() - epoch starts at 0, detach_all() bumps it by "
+          "exactly 1, and incarnations straddle the reported floor correctly",
+          "[spark][runtime]") {
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+
+    auto [epoch0, floor0] = rt->application_fence_for_test();
+    CHECK(epoch0 == 0);
+
+    rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true);
+    auto [epoch_before, floor_before] = rt->application_fence_for_test();
+    CHECK(epoch_before == 0); // no detach_all() yet
+    CHECK(floor_before > 0); // r1's own attach already minted an incarnation
+
+    rt->detach_all();
+    auto [epoch1, floor1] = rt->application_fence_for_test();
+    CHECK(epoch1 == epoch0 + 1);
+    CHECK(floor1 == floor_before); // detach_all() reports gen_counter_ as-is, never bumps it
+
+    rt->attach_rule("r2", file_spec("/b"), file_exists_rule("r2"), true);
+    auto [epoch_after, floor_after] = rt->application_fence_for_test();
+    CHECK(epoch_after == epoch1); // only detach_all() bumps the epoch, not an attach
+    CHECK(floor_after > floor1); // r2's own attach minted an incarnation strictly above the floor
+
+    rt->detach_all();
+    auto [epoch2, floor2] = rt->application_fence_for_test();
+    CHECK(epoch2 == epoch1 + 1);
+    CHECK(floor2 == floor_after);
+}
+
+TEST_CASE("R5.7: commit_path_name() renders every CommitPath value distinctly",
+          "[spark][runtime]") {
+    using P = GuardianSparkRuntime::CommitPath;
+    const std::string inline_arm = commit_path_name(P::InlineArm);
+    const std::string inline_shared = commit_path_name(P::InlineShared);
+    const std::string callback_arm = commit_path_name(P::CallbackArm);
+    const std::string callback_shared = commit_path_name(P::CallbackShared);
+    const std::string callback_adopt = commit_path_name(P::CallbackAdopt);
+
+    CHECK(inline_arm == "inline-arm");
+    CHECK(inline_shared == "inline-shared");
+    CHECK(callback_arm == "callback-arm");
+    CHECK(callback_shared == "callback-shared");
+    CHECK(callback_adopt == "callback-adopt");
+
+    // Honest scope (werror=false repo-wide): this pins the five known names, it does
+    // not make a sixth CommitPath value fail to compile - that is a -Wswitch warning
+    // only, per commit_path_name()'s own header comment.
+    const std::set<std::string> names = {inline_arm, inline_shared, callback_arm,
+                                         callback_shared, callback_adopt};
+    CHECK(names.size() == 5);
+}
+
+TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for registry_mu_ "
+          "never leaves a stale live rule or a double epoch bump (TSan checkpoint)",
+          "[spark][runtime][tsan]") {
+    // Doomgoose review (PR #4614), corrected in a follow-up round after cpp-safety
+    // AND quality-engineer independently found the same false-assurance gap: this
+    // test's own comment used to claim protection against a regression that moved
+    // the epoch bump "to the wrong place inside detach_all()'s locked block". Two
+    // separate proofs showed that claim cannot hold. (1) detach_all()'s entire body
+    // (guardian_spark_runtime.cpp) runs under ONE unbroken registry_mu_ acquisition
+    // - a pure reordering WITHIN that single critical section is unobservable to
+    // any other thread by construction, so no concurrency test can ever detect it.
+    // (2) Even the more realistic regression - SPLITTING that one lock scope into
+    // two separately-locked sections - was reproduced directly (a temporary mutant
+    // built and run 3000 iterations, plain AND under a real -Db_sanitize=thread
+    // build, both 100% green): the callback landing in the gap still gets cleaned
+    // up by the second lock scope's own rules_ walk, so rule_count()/
+    // armed_key_count()/the epoch counter all still converge correctly, and TSan
+    // does not flag a compositional atomicity violation across two individually
+    // well-locked sections the way it flags a raw unsynchronized access. Neither
+    // this test nor any runtime test can enforce that invariant - it is enforced by
+    // detach_all()'s own single lock_guard scope today, and by code review on any
+    // future change to it, not by this file.
+    //
+    // What THIS test does verify, and does so via a genuine two-OS-thread race for
+    // registry_mu_ (not the fully-sequenced "detach_all withdraws a rule that is
+    // still only CLAIMED" test below, which always calls detach_all() only after
+    // confirming the arm is parked, so detach_all() deterministically wins): that
+    // BOTH legal resolutions of that race - the claim being withdrawn before its
+    // callback can commit, or the callback committing before detach_all() begins
+    // its walk - leave the runtime in a fully-converged, self-consistent state
+    // (no double-commit, no stale live rule, exactly one epoch bump). As originally
+    // written the timing meant detach_all() won every single time (150/150 and
+    // 3000/3000 runs respectively, per cpp-safety's and quality-engineer's own
+    // independent sampling) - the "commit wins" branch and its cleanup path were
+    // never actually exercised despite the loop. A small deliberate stagger on
+    // alternating iterations now biases the race the other way often enough that
+    // this test asserts BOTH outcomes were actually observed, not merely legal in
+    // theory.
+    auto r = std::make_shared<FakeReader>();
+    auto b = std::make_shared<FakeBackend>();
+    auto rt = make_rt(r, b);
+    const auto key = spark_key(file_spec("/a"));
+
+    bool saw_withdrawn = false;
+    bool saw_committed = false;
+    constexpr int kIters = 30;
+    for (int i = 0; i < kIters; ++i) {
+        REQUIRE(rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1"), true));
+        const auto epoch_before = rt->application_fence_for_test().first;
+
+        // A same-key re-attach disarms the live subscription and queues a fresh arm
+        // behind it (confirmed by the "same-id re-attach" test above: armed,
+        // disarmed, armed) - park THAT fresh arm, not the initial one. reset_hang()
+        // is required before each REUSE of the hang gate on the same FakeBackend
+        // (its own doc comment: entered_hang_/released_ latch permanently true
+        // after one release_hang() cycle) - without it, wait_entered_hang() below
+        // returns immediately-true on iteration 1+ from the STALE prior cycle's
+        // flag, before the redeploy's own claim even exists yet, which raced
+        // detach_all() against nothing and produced a false failure here.
+        b->reset_hang();
+        b->hang_next_arm.store(true);
+        auto fut = std::async(std::launch::async, [&] {
+            return rt->attach_rule("r1", file_spec("/a"), file_exists_rule("r1", false), true);
+        });
+        // cpp-safety Gate-3 finding (this review round): a Cleanup guard between
+        // `fut`'s declaration and the throwing REQUIRE below, matching the
+        // established idiom elsewhere in this file (see the "detach_all withdraws
+        // a rule that is still only CLAIMED" test below) - without it, a REQUIRE
+        // failure here would unwind straight into fut's destructor, which blocks
+        // until the parked worker resolves; nothing on that path ever calls
+        // release_hang(), so the worker - and the whole runtime/backend graph its
+        // completion closure keeps alive - would leak for the rest of the process.
+        // cpp-expert Gate-3 finding (this review round): `releaser` is declared
+        // default-constructed HERE, alongside `cleanup`, rather than at its
+        // construction point below - `detach_all()` is not noexcept, and a
+        // joinable `std::thread` destroyed mid-unwind is std::terminate(), not a
+        // catchable exception. `cleanup`'s destructor now joins it too (harmless
+        // no-op if never started, or already joined on the normal path), matching
+        // this file's own "stop_everything" precedent (declare the thread first,
+        // the guard after, so the guard's destructor - which runs first - can
+        // safely join a still-live thread before that thread's own destructor
+        // would otherwise abort the process).
+        std::thread releaser;
+        struct Cleanup {
+            FakeBackend* backend;
+            std::thread* releaser_thread;
+            ~Cleanup() {
+                backend->release_hang();
+                if (releaser_thread->joinable())
+                    releaser_thread->join();
+            }
+        } cleanup{b.get(), &releaser};
+        REQUIRE(b->wait_entered_hang(std::chrono::seconds(30)));
+
+        // Race: release the parked arm (letting its completion callback try to
+        // commit) on one thread while detach_all() runs on this one. On odd
+        // iterations, give the callback thread a small head start so it sometimes
+        // wins registry_mu_ instead of detach_all() always winning by default
+        // timing - both orderings are legal (a clean withdraw-then-disarm, or a
+        // legitimate commit-then-detach); what must never happen is either thread
+        // observing torn/partial state.
+        releaser = std::thread([&] { b->release_hang(); });
+        if (i % 2 == 1)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        rt->detach_all();
+        releaser.join();
+        const auto fut_result = fut.get(); // either a real generation or "withdrawn" is valid here
+        if (fut_result.has_value()) {
+            saw_committed = true;
+        } else {
+            // cpp-expert Gate-3 finding (this review round): check the SPECIFIC
+            // error, matching the precedent this comment cites (the "detach_all
+            // withdraws a rule that is still only CLAIMED" test's own
+            // CHECK(gen.error() == "withdrawn")) - a bare has_value()==false would
+            // silently misclassify a future, different error class (e.g. a
+            // deadline timeout, unreachable today per Config::backend_op_deadline's
+            // 5s default and this race resolving in milliseconds) as the expected
+            // "withdrawn" outcome instead of catching the drift.
+            CHECK(fut_result.error() == "withdrawn");
+            saw_withdrawn = true;
+        }
+
+        const auto epoch_after = rt->application_fence_for_test().first;
+        INFO("iteration " << i << " epoch_before=" << epoch_before << " epoch_after=" << epoch_after
+                          << " rule_count=" << rt->rule_count()
+                          << " armed_key_count=" << rt->armed_key_count());
+        CHECK(epoch_after == epoch_before + 1); // detach_all() ran exactly once, bumped exactly once
+        // Both race outcomes settle asynchronously off-lock (submit_disarm_off_lock /
+        // the executor's own completion dispatch) - spin rather than a bare CHECK
+        // immediately after detach_all() returns.
+        REQUIRE(yuzu::test::spin_until([&] { return rt->rule_count() == 0 && rt->armed_key_count() == 0; },
+                                       std::chrono::seconds(10)));
+        REQUIRE(yuzu::test::spin_until([&] { return rt->claim_queue_depth_for_test(key) == 0; },
+                                       std::chrono::seconds(10)));
+    }
+    // The claim this test actually makes - both orderings converge safely - is
+    // only checked if both orderings actually happened at least once.
+    CHECK(saw_withdrawn);
+    CHECK(saw_committed);
+}
+
 TEST_CASE("status_for_rule reflects the last committed verdict; nullopt for an unattached rule",
           "[spark][runtime]") {
     auto r = std::make_shared<FakeReader>();
