@@ -3507,7 +3507,7 @@ TEST_CASE("R5.7: commit_path_name() renders every CommitPath value distinctly",
 TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for registry_mu_ "
           "never leaves a stale live rule or a double epoch bump (TSan checkpoint)",
           "[spark][runtime][tsan]") {
-    // Governance Gate-8 external review (PR #4614): the two R5.7 tests above pin the
+    // Doomgoose review (PR #4614): the two R5.7 tests above pin the
     // epoch counter and commit_path_name() sequentially, single-threaded - neither
     // leaves an arm-completion callback genuinely in flight ACROSS a detach_all()
     // call, so neither would catch a regression that moved the epoch bump (or the
@@ -3556,7 +3556,11 @@ TEST_CASE("R5.7: a redeploy's in-flight arm callback racing detach_all() for reg
         std::thread releaser([&] { b->release_hang(); });
         rt->detach_all();
         releaser.join();
-        (void)fut.get(); // either a real generation or "withdrawn" is a valid outcome here
+        auto fut_result = fut.get(); // either a real generation or "withdrawn" is a valid outcome here
+        std::cerr << "[DGRDIAG] iter=" << i << " outcome="
+                  << (fut_result.has_value() ? std::string("armed:") + std::to_string(*fut_result)
+                                              : std::string("error:") + fut_result.error())
+                  << std::endl;
 
         const auto epoch_after = rt->application_fence_for_test().first;
         INFO("iteration " << i << " epoch_before=" << epoch_before << " epoch_after=" << epoch_after

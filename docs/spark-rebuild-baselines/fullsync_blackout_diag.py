@@ -1229,7 +1229,7 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
     RECENT poll attempt raised (never_fetched) is an instrument failure (our
     last look at it, right before giving up, was unreliable), not a genuine
     "the guard never fired" - the caller must not fold the two together
-    (governance Gate-8 external review, PR #4614: a bare `except Exception:
+    (Doomgoose review, PR #4614: a bare `except Exception:
     continue` here used to launder a REST-fetch failure for the whole
     polling window into the same "not_observed" state a genuinely-never-
     fired guard produces). Deliberately LATEST-attempt, not EVER-succeeded:
@@ -2337,8 +2337,8 @@ def _f19():
     # t2_collect_failed - the last one found missing from this list by
     # quality-engineer, a fixture-completeness gap only: void_class_for's default-
     # instrument fallback already classified it correctly, this list just didn't
-    # pin it), plus cohort_fetch_never_succeeded (governance Gate-8 external review,
-    # PR #4614: cohort_events_d()'s bare `except Exception: continue` used to
+    # pin it), plus cohort_fetch_never_succeeded (Doomgoose review, PR #4614:
+    # cohort_events_d()'s bare `except Exception: continue` used to
     # launder a REST-fetch failure for the whole polling window into the same
     # "not_observed" a genuinely-never-fired guard produces, folding it into
     # functional_invalid's genuine bucket - see cohort_events_d()'s own docstring).
@@ -2550,10 +2550,10 @@ def _f23():
 
 
 def _f24():
-    # cohort_events_d() (governance Gate-8 external review, PR #4614, corrected in
-    # a follow-up round after unhappy-path found the first version credited a
-    # rule's ALWAYS-EMPTY first sweep - guaranteed by deadline_ms's own sizing -
-    # and stayed permanently "ok" even if every later attempt then failed for the
+    # cohort_events_d() (Doomgoose review, PR #4614, corrected in a follow-up
+    # round after unhappy-path found the first version credited a rule's
+    # ALWAYS-EMPTY first sweep - guaranteed by deadline_ms's own sizing - and
+    # stayed permanently "ok" even if every later attempt then failed for the
     # rest of the grace window): a rule whose MOST RECENT poll attempt raised must
     # come back in `never_fetched` - not "ever raised", not "ever succeeded".
     # Three rules pin the three cases: always fails (never_fetched); succeeds
@@ -2561,8 +2561,10 @@ def _f24():
     # case, previously wrongly excluded); fails early then recovers and
     # succeeds on its last attempt (excluded - the LAST look is what counts).
     # Mutation: reverting the fix (dropping `last_fetch_ok`/`never_fetched` and
-    # returning bare `by_rule`) makes this fixture fail with a TypeError
-    # unpacking the return value.
+    # returning bare `by_rule`) makes this fixture fail with a ValueError
+    # unpacking the return value - three rule_ids into a two-variable unpack,
+    # not the ambiguous "succeeds silently, fails two lines later" shape a
+    # 2-rule cohort would produce (verified empirically both ways).
     global get_json, time, _DGRHP_UTC_OFFSET
     orig_get_json = get_json
     orig_sleep = time.sleep

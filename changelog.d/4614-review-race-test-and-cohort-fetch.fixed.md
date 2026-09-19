@@ -9,4 +9,6 @@
   the whole polling window into the same "not_observed" state a genuinely
   never-fired guard produces, folding an instrument failure into the genuine
   `functional_invalid` void bucket. Selftest extended 23 to 24 fixtures,
-  mutation-tested (F24 fails when the fix is reverted).
+  mutation-tested (F24 fails when the fix is reverted). No production
+  agent/server code changed in this commit - test and internal-diagnostic-tool
+  only.
