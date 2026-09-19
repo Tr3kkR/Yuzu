@@ -1198,6 +1198,24 @@ def _foreign_fingerprint(lines, run_id):
     return len(foreign), digest
 
 
+def resolve_cohort_void(d_by_rule, never_fetched):
+    """Row-level void classification for a cohort whose functional-validity poll
+    (`cohort_events_d()`) left at least one rule "not_observed". Genuine ALWAYS
+    wins, unconditionally (governance Gate-4 unhappy-path, PR #4614 review round)
+    - the same asymmetric-cost doctrine `void_class_for()`'s own docstring states
+    and `resolve_post_t2_void()` already applies elsewhere in this file: a false
+    instrument silently discards real evidence, a false genuine costs one
+    unnecessary look. A single never-fetched rule out of a whole cohort must NOT
+    void every OTHER rule's reliable, genuinely-never-restored evidence - only
+    when EVERY still-not-observed rule's last look was fetch-tainted is there
+    zero reliable genuine signal at all."""
+    reliably_not_observed = {rid for rid, v in d_by_rule.items() if v == "not_observed"} \
+        - never_fetched
+    if reliably_not_observed:
+        return "genuine", "functional_invalid"
+    return "instrument", "cohort_fetch_never_succeeded:" + ",".join(sorted(never_fetched))
+
+
 def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
     """Bounded functional-validity polling (R5.7 §2.2 item 6, replacing the
     prior one-shot lookup): poll every `poll` seconds until every rule has a
@@ -1207,17 +1225,26 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
     (local-labeled-as-UTC); event_id's embedded ms is real UTC - the offset
     is subtracted back out before comparing, same correction as before.
 
-    Returns (by_rule, never_fetched): a rule left "not_observed" whose EVERY
-    poll attempt raised (never_fetched) is an instrument failure (we have
-    zero evidence about it), not a genuine "the guard never fired" - the
-    caller must not fold the two together (governance Gate-8 external
-    review, PR #4614: a bare `except Exception: continue` here used to
-    launder a REST-fetch failure for the whole polling window into the
-    same "not_observed" state a genuinely-never-fired guard produces)."""
+    Returns (by_rule, never_fetched): a rule left "not_observed" whose MOST
+    RECENT poll attempt raised (never_fetched) is an instrument failure (our
+    last look at it, right before giving up, was unreliable), not a genuine
+    "the guard never fired" - the caller must not fold the two together
+    (governance Gate-8 external review, PR #4614: a bare `except Exception:
+    continue` here used to launder a REST-fetch failure for the whole
+    polling window into the same "not_observed" state a genuinely-never-
+    fired guard produces). Deliberately LATEST-attempt, not EVER-succeeded:
+    `deadline_ms` is sized (`max(2 * c_ms, 30000)`, the caller's own
+    comment) so the FIRST sweep is expected to find nothing for nearly
+    every rule - an ever-succeeded flag would credit that always-empty
+    first sweep and stay permanently true even if every later attempt (the
+    ones actually covering the window the real event would land in) then
+    failed for the rest of the grace period, silently reproducing the same
+    laundering this fix exists to close via a different mechanism
+    (unhappy-path Gate-4 finding, this same review round)."""
     t0_ms = int(t0_dt.timestamp() * 1000) - int(dgrhp_utc_offset().total_seconds() * 1000)
     grace_deadline = time.time() + (deadline_ms / 1000.0) + 60.0
     by_rule = {rid: "not_observed" for rid in rule_ids}
-    fetch_ever_succeeded = {rid: False for rid in rule_ids}
+    last_fetch_ok = {rid: False for rid in rule_ids}
     while time.time() < grace_deadline:
         pending = [rid for rid, v in by_rule.items() if v == "not_observed"]
         if not pending:
@@ -1228,8 +1255,9 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
             except Exception as e:  # noqa: BLE001
                 print(f"[cohort_events_d] fetch failed for rule '{rid}': "
                       f"{type(e).__name__}: {e}", file=sys.stderr)
+                last_fetch_ok[rid] = False
                 continue
-            fetch_ever_succeeded[rid] = True
+            last_fetch_ok[rid] = True
             found = None
             for ev in data:
                 if ev.get("event_type") != "guard.compliant":
@@ -1246,7 +1274,7 @@ def cohort_events_d(op, rule_ids, t0_dt, deadline_ms, poll=5.0):
         if any(v == "not_observed" for v in by_rule.values()):
             time.sleep(poll)
     never_fetched = {rid for rid in rule_ids
-                     if by_rule[rid] == "not_observed" and not fetch_ever_succeeded[rid]}
+                     if by_rule[rid] == "not_observed" and not last_fetch_ok[rid]}
     return by_rule, never_fetched
 
 
@@ -1514,15 +1542,8 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["compliant_restored_ms_by_rule"] = d_by_rule
     row["functional_valid"] = functional_valid
     if phase_is_clean_verdict and not functional_valid:
-        if cohort_never_fetched:
-            # At least one rule's cohort-event poll never once succeeded for the
-            # whole grace window - we have zero evidence about it, not evidence
-            # the guard never fired. Instrument failure, not a genuine void.
-            row.update(void_class="instrument",
-                       void_reason="cohort_fetch_never_succeeded:" +
-                                   ",".join(sorted(cohort_never_fetched)))
-        else:
-            row.update(void_class="genuine", void_reason="functional_invalid")
+        void_class, void_reason = resolve_cohort_void(d_by_rule, cohort_never_fetched)
+        row.update(void_class=void_class, void_reason=void_reason)
         return row
 
     row.update(void_class=None, void_reason=None)
@@ -2529,22 +2550,26 @@ def _f23():
 
 
 def _f24():
-    # cohort_events_d() (governance Gate-8 external review, PR #4614): a rule
-    # whose EVERY poll attempt raises must come back in `never_fetched` (we have
-    # zero evidence about it - instrument failure), distinct from a rule that
-    # fetched successfully at least once and simply never saw a matching event
-    # (genuine - the guard never fired). Mutation: reverting the fix (dropping
-    # `fetch_ever_succeeded`/`never_fetched` and returning bare `by_rule`) makes
-    # this fixture fail with a TypeError unpacking the return value - the
-    # strongest possible signal the caller no longer has the distinction to
-    # consult at all.
+    # cohort_events_d() (governance Gate-8 external review, PR #4614, corrected in
+    # a follow-up round after unhappy-path found the first version credited a
+    # rule's ALWAYS-EMPTY first sweep - guaranteed by deadline_ms's own sizing -
+    # and stayed permanently "ok" even if every later attempt then failed for the
+    # rest of the grace window): a rule whose MOST RECENT poll attempt raised must
+    # come back in `never_fetched` - not "ever raised", not "ever succeeded".
+    # Three rules pin the three cases: always fails (never_fetched); succeeds
+    # once early then fails for good (now ALSO never_fetched - the corrected
+    # case, previously wrongly excluded); fails early then recovers and
+    # succeeds on its last attempt (excluded - the LAST look is what counts).
+    # Mutation: reverting the fix (dropping `last_fetch_ok`/`never_fetched` and
+    # returning bare `by_rule`) makes this fixture fail with a TypeError
+    # unpacking the return value.
     global get_json, time, _DGRHP_UTC_OFFSET
     orig_get_json = get_json
     orig_sleep = time.sleep
     orig_time = time.time
     orig_offset = _DGRHP_UTC_OFFSET
     fake_now = [1_800_000_000.0]
-    seen_once = {"once_ok_then_fails": False}
+    attempts = {"ok_then_always_fails": 0, "fails_then_ok_at_end": 0}
     try:
         time.time = lambda: fake_now[0]  # noqa: E731
         time.sleep = lambda s: fake_now.__setitem__(0, fake_now[0] + s)  # noqa: E731
@@ -2553,17 +2578,23 @@ def _f24():
         def fake_get_json(_op, path):
             if "rule_id=always_fails" in path:
                 raise RuntimeError("simulated REST failure")
-            if "rule_id=once_ok_then_fails" in path:
-                if not seen_once["once_ok_then_fails"]:
-                    seen_once["once_ok_then_fails"] = True
-                    return {"data": []}  # one real, empty fetch - no matching event
+            if "rule_id=ok_then_always_fails" in path:
+                attempts["ok_then_always_fails"] += 1
+                if attempts["ok_then_always_fails"] == 1:
+                    return {"data": []}  # one real, empty fetch, then breaks for good
                 raise RuntimeError("simulated REST failure")
+            if "rule_id=fails_then_ok_at_end" in path:
+                attempts["fails_then_ok_at_end"] += 1
+                if attempts["fails_then_ok_at_end"] < 3:
+                    raise RuntimeError("simulated REST failure")
+                return {"data": []}  # recovers - the LAST attempt succeeds
             return {"data": []}
 
         get_json = fake_get_json
         t0_dt = datetime(2026, 9, 19, 10, 0, 0, tzinfo=timezone.utc)
         by_rule, never_fetched = cohort_events_d(
-            "op", ["always_fails", "once_ok_then_fails"], t0_dt, deadline_ms=1000, poll=1.0)
+            "op", ["always_fails", "ok_then_always_fails", "fails_then_ok_at_end"],
+            t0_dt, deadline_ms=1000, poll=1.0)
     finally:
         get_json = orig_get_json
         time.sleep = orig_sleep
@@ -2571,12 +2602,37 @@ def _f24():
         _DGRHP_UTC_OFFSET = orig_offset
 
     always_fails_never_fetched = "always_fails" in never_fetched
-    once_ok_excluded = "once_ok_then_fails" not in never_fetched
-    both_not_observed = (by_rule["always_fails"] == "not_observed"
-                         and by_rule["once_ok_then_fails"] == "not_observed")
-    ok = always_fails_never_fetched and once_ok_excluded and both_not_observed
+    ok_then_fails_now_never_fetched = "ok_then_always_fails" in never_fetched
+    recovered_excluded = "fails_then_ok_at_end" not in never_fetched
+    all_not_observed = all(by_rule[r] == "not_observed" for r in by_rule)
+    ok = (always_fails_never_fetched and ok_then_fails_now_never_fetched
+          and recovered_excluded and all_not_observed)
     return (ok, f"always_fails_never_fetched={always_fails_never_fetched} "
-                f"once_ok_excluded={once_ok_excluded} both_not_observed={both_not_observed}")
+                f"ok_then_fails_now_never_fetched={ok_then_fails_now_never_fetched} "
+                f"recovered_excluded={recovered_excluded} all_not_observed={all_not_observed}")
+
+
+def _f25():
+    # resolve_cohort_void() (governance Gate-4 unhappy-path, PR #4614 review
+    # round): genuine ALWAYS wins - a single never-fetched rule must not void
+    # every other rule's reliable, genuinely-never-restored evidence. Three
+    # cases: a mixed cohort (one reliable, one tainted) must still classify
+    # genuine; an all-tainted cohort must classify instrument; a clean cohort
+    # (nothing never-fetched) must also classify genuine.
+    mixed = resolve_cohort_void(
+        {"r1": "not_observed", "r2": "not_observed"}, {"r2"})
+    all_tainted = resolve_cohort_void(
+        {"r1": "not_observed", "r2": "not_observed"}, {"r1", "r2"})
+    none_tainted = resolve_cohort_void({"r1": "not_observed"}, set())
+
+    mixed_is_genuine = mixed == ("genuine", "functional_invalid")
+    all_tainted_is_instrument = (all_tainted[0] == "instrument"
+                                 and "r1" in all_tainted[1] and "r2" in all_tainted[1])
+    none_tainted_is_genuine = none_tainted == ("genuine", "functional_invalid")
+    ok = mixed_is_genuine and all_tainted_is_instrument and none_tainted_is_genuine
+    return (ok, f"mixed_is_genuine={mixed_is_genuine} "
+                f"all_tainted_is_instrument={all_tainted_is_instrument} "
+                f"none_tainted_is_genuine={none_tainted_is_genuine}")
 
 
 def cmd_selftest():
@@ -2585,6 +2641,7 @@ def cmd_selftest():
         ("F7", _f7), ("F8", _f8), ("F9", _f9), ("F10", _f10), ("F11", _f11), ("F12", _f12),
         ("F13", _f13), ("F14", _f14), ("F15", _f15), ("F16", _f16), ("F17", _f17), ("F18", _f18),
         ("F19", _f19), ("F20", _f20), ("F21", _f21), ("F22", _f22), ("F23", _f23), ("F24", _f24),
+        ("F25", _f25),
     ]
     failures = 0
     for name, fn in fixtures:
