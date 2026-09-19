@@ -59,6 +59,11 @@
     [yuzu, gw, cluster, peers_resolved],
     [yuzu, gw, cluster, peers_connected],
     [yuzu, gw, cluster, connect_failed],
+    %% Fires when the lifetime distinct-address cap is reached and a
+    %% genuinely new address is refused (never atomized) — the actual
+    %% atom-table-exhaustion defense, distinct from the per-call
+    %% sanitize_addrs/1 cap warning (#4555 review round 2).
+    [yuzu, gw, cluster, address_cap_exceeded],
 
     %% BEAM VM
     [yuzu, gw, vm, process_count],
@@ -209,6 +214,9 @@ handle_event([yuzu, gw, cluster, peers_connected], #{count := N}, _Meta, _Config
 handle_event([yuzu, gw, cluster, connect_failed], #{count := N}, _Meta, _Config) ->
     prometheus_counter:inc(yuzu_gw_cluster_connect_failures_total, [], N);
 
+handle_event([yuzu, gw, cluster, address_cap_exceeded], #{count := N}, _Meta, _Config) ->
+    prometheus_counter:inc(yuzu_gw_cluster_address_cap_exceeded_total, [], N);
+
 handle_event([yuzu, gw, vm, process_count], #{count := N}, _Meta, _Config) ->
     prometheus_gauge:set(yuzu_gw_beam_process_count, [node()], N);
 
@@ -283,6 +291,15 @@ declare_metrics() ->
                "discovery redial loop (#4555) — a sustained non-zero rate "
                "alongside a resolved/connected gap most often means a "
                "distribution-cookie mismatch across replicas"}]),
+    prometheus_counter:declare([
+        {name, yuzu_gw_cluster_address_cap_exceeded_total},
+        {labels, []},
+        {help, "Total times the cluster discovery redial loop's lifetime "
+               "distinct-address cap (1024) refused to atomize a "
+               "never-before-seen address (#4555 review round 2) — any "
+               "non-zero value means the seed DNS name is returning an "
+               "unexpectedly large or rotating/hostile answer set and "
+               "should be investigated immediately, not just noted"}]),
     prometheus_counter:declare([
         {name, yuzu_gw_registration_replay_total},
         {labels, []},

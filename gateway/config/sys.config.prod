@@ -94,7 +94,12 @@
         %% Always-on redial loop interval (ms) — fixed, no backoff. `connect_all`
         %% is `false` below, so this loop is what forms AND maintains the mesh.
         %% Override: YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS.
-        {cluster_redial_interval_ms, 5000}
+        {cluster_redial_interval_ms, 5000},
+
+        %% Lifetime cap on DISTINCT peer addresses ever atomized — see
+        %% config/sys.config's identical setting for the full rationale
+        %% (PR #4604 review round 2, atom-table exhaustion).
+        {cluster_max_lifetime_addrs, 1024}
     ]},
 
     {grpcbox, [

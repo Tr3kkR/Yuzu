@@ -40,27 +40,55 @@
 -export([start_link/0]).
 %% exported for testing
 -export([resolve_targets/0, targets_from_addrs/1, sanitize_addrs/1,
-         own_short_name/0, own_short_name/1, do_tick/1]).
+         own_short_name/0, own_short_name/1, do_tick/1,
+         clamp_interval/1, seen_addrs_count/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2, code_change/3]).
 
 -define(SERVER, ?MODULE).
 -define(DEFAULT_INTERVAL_MS, 5000).
 
-%% Cap on resolved/configured peer addresses processed per tick (BLOCKING
-%% fix, PR review — FortitudeEtc/Kimi+Codex, empirically reproduced:
-%% 10,000 distinct addresses -> +10,000 permanent atoms, no reclaim, OTP
-%% 28.4.2). `targets_from_addrs/1` atomizes one address per entry, and
-%% Erlang atoms are NEVER garbage-collected — a hostile or misconfigured
-%% seed-name DNS answer that rotates through fresh, syntactically-VALID
-%% A-records on every 5s tick (this module's own threat model already
-%% treats hostile DNS as adversarial, see `?MIN_COOKIE_LENGTH` in
-%% `yuzu_gw_app.erl`) would otherwise permanently grow the VM-global atom
-%% table (default cap ~1,048,576) until the whole gateway aborts, dropping
-%% every connected agent, recurring on every restart while DNS stays
-%% hostile. 64 is generously above any realistic cluster size
-%% (`docs/erlang-gateway-blueprint.md` sizes ~1M AGENTS per gateway NODE,
-%% so a cluster of dozens of nodes is already a large deployment).
+%% Cap on resolved/configured peer addresses processed IN ONE CALL
+%% (round-1 PR review fix). This alone is NOT sufficient to prevent
+%% atom-table exhaustion — round-2 review (FortitudeEtc/Kimi+Codex)
+%% correctly re-escalated: a hostile/misconfigured seed-name DNS answer
+%% returning a FRESH set of <=64 never-before-seen addresses on EVERY
+%% tick still grows the atom table unboundedly, just over hours instead
+%% of instantly (no single call ever exceeds this cap, so this warning
+%% alone would never fire). This constant rate-limits a single
+%% oversized answer; `cluster_max_lifetime_addrs` (`?DEFAULT_MAX_LIFETIME_ADDRS` below) is the actual bound
+%% that stops unbounded growth. 64 is generously above any realistic
+%% cluster size (`docs/erlang-gateway-blueprint.md` sizes ~1M AGENTS per
+%% gateway NODE, so a cluster of dozens of nodes is already large).
 -define(MAX_TARGET_ADDRS, 64).
+
+%% Lifetime cap on DISTINCT addresses this VM will EVER turn into an
+%% atom, across every tick, for the life of the process (the actual
+%% atom-table-exhaustion fix — BLOCKING, PR review round 2). Erlang
+%% atoms are NEVER garbage-collected; `?MAX_TARGET_ADDRS` above only
+%% rate-limits a single call, so it does nothing against a hostile DNS
+%% answer that stays under that cap per tick while rotating through an
+%% unbounded total set over time (this module's own threat model already
+%% treats hostile/misconfigured DNS as adversarial, see
+%% `?MIN_COOKIE_LENGTH` in `yuzu_gw_app.erl`). `?SEEN_ADDRS_TABLE` records
+%% every address string ever accepted; once this many DISTINCT addresses
+%% have been atomized, any genuinely new address is refused outright
+%% (never dialed that tick) rather than atomized — degraded, not
+%% catastrophic. Runtime-configurable (`cluster_max_lifetime_addrs`,
+%% default below) rather than a compile-time constant specifically so a
+%% test can exercise the refusal path with a small temporary cap instead
+%% of having to permanently exhaust the real one against the
+%% process-global, shared `?SEEN_ADDRS_TABLE` (a table sized to the
+%% production default would otherwise poison every other test sharing
+%% this eunit VM's table for the rest of the run). The production
+%% default, 1024, is generously above any realistic deployment's
+%% lifetime address churn (container restarts, IP reassignment across
+%% the life of one gateway process) and negligible next to the VM's
+%% ~1,048,576-entry atom table. A gateway restart resets this counter
+%% (the table is process-owned, not persisted) — an attacker forcing
+%% restarts to reset it is already bounded by `yuzu_gw_sup`'s own
+%% restart-intensity limits.
+-define(DEFAULT_MAX_LIFETIME_ADDRS, 1024).
+-define(SEEN_ADDRS_TABLE, yuzu_gw_cluster_discovery_seen_addrs).
 
 -record(state, {interval :: pos_integer()}).
 
@@ -76,12 +104,8 @@ start_link() ->
 %%%===================================================================
 
 init([]) ->
-    %% Clamped to a 1s floor (PR review finding): an unvalidated
-    %% `YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS=0` would hot-loop DNS lookups
-    %% every tick, and a negative value would raise `badarg` in
-    %% `erlang:send_after/3`.
     RawInterval = application:get_env(yuzu_gw, cluster_redial_interval_ms, ?DEFAULT_INTERVAL_MS),
-    Interval = max(RawInterval, 1000),
+    Interval = clamp_interval(RawInterval),
     %% Non-distributed VM (a plain unit-test run, or a hand-run `rebar3 shell`
     %% without `-name`) has no distribution to form a mesh over — idle rather
     %% than crash `net_kernel:monitor_nodes/1` with `{error, not_alive}`.
@@ -125,6 +149,13 @@ code_change(_OldVsn, State, _Extra) ->
 %%%===================================================================
 %%% Internal
 %%%===================================================================
+
+%% @doc Pure: clamps to a 1s floor (PR review finding). An unvalidated
+%% `YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS=0` would hot-loop DNS lookups
+%% every tick, and a negative value would raise `badarg` in
+%% `erlang:send_after/3`. Exported for testing.
+-spec clamp_interval(integer()) -> pos_integer().
+clamp_interval(RawInterval) -> max(RawInterval, 1000).
 
 do_tick() ->
     do_tick(resolve_targets()).
@@ -193,19 +224,45 @@ do_tick(Targets) ->
 %% "who do I still need to dial". Exported for testing.
 -spec resolve_targets() -> [node()].
 resolve_targets() ->
-    RawAddrs = case application:get_env(yuzu_gw, cluster_seed_nodes, []) of
-        [] -> resolve_seed_dns_addrs();
-        Addrs -> [addr_to_string(A) || A <- Addrs]
-    end,
-    targets_from_addrs(sanitize_addrs(RawAddrs)).
+    case application:get_env(yuzu_gw, cluster_seed_nodes, []) of
+        [] ->
+            targets_from_addrs(sanitize_addrs(resolve_seed_dns_addrs()));
+        ConfiguredAddrs ->
+            RawAddrs = lists:filtermap(fun addr_to_string/1, ConfiguredAddrs),
+            Sanitized = sanitize_addrs(RawAddrs),
+            %% K-2 (PR review, round 2): an operator who configured a
+            %% static override that ends up entirely unusable (every
+            %% entry malformed or of an unsupported type) gets NO signal
+            %% otherwise that this node silently fell back to standalone
+            %% — indistinguishable from "genuinely no override configured".
+            case {ConfiguredAddrs, Sanitized} of
+                {[_ | _], []} ->
+                    logger:warning(
+                        "Cluster discovery: cluster_seed_nodes/YUZU_GW_SEED_NODES is "
+                        "configured with ~p entries but NONE resolved to a usable "
+                        "peer address — this node will run standalone until the "
+                        "configuration is fixed.",
+                        [length(ConfiguredAddrs)]);
+                _ ->
+                    ok
+            end,
+            targets_from_addrs(Sanitized)
+    end.
 
 %% @private A `cluster_seed_nodes` entry is a binary via the
 %% `YUZU_GW_SEED_NODES` env-override path, but a hand-edited `sys.config`
 %% written in ordinary Erlang string style (`["10.0.0.1"]`) is equally
-%% valid config syntax — accept both rather than crashing this gen_server
-%% every tick on the string form (PR review finding).
-addr_to_string(A) when is_binary(A) -> binary_to_list(A);
-addr_to_string(A) when is_list(A)   -> A.
+%% valid config syntax — accept both. An entry of any OTHER type (e.g. a
+%% quoted atom) is logged and skipped rather than crashing this
+%% gen_server every tick (K-3, PR review round 2). `lists:filtermap/2`
+%% shape: `{true, Value}` keeps it, `false` drops it.
+addr_to_string(A) when is_binary(A) -> {true, binary_to_list(A)};
+addr_to_string(A) when is_list(A)   -> {true, A};
+addr_to_string(A) ->
+    logger:warning(
+        "Cluster discovery: cluster_seed_nodes entry ~p is neither a binary "
+        "nor a string — skipping it.", [A]),
+    false.
 
 %% @private A records for the configured seed name, as dotted-decimal
 %% strings. `inet_res:lookup/3` returns `[]` on any resolution failure
@@ -221,25 +278,91 @@ resolve_seed_dns_addrs() ->
         []
     end.
 
-%% @doc Pure: every gateway node shares the SAME short name — nodes are
-%% interchangeable and distinguished only by address (ADR-2002 §7b) — so a
-%% dialed node atom is always `<my own short name>@<peer address>`, never a
-%% hardcoded literal duplicated between this module and `vm.args.src`.
-%% Callers MUST route candidate addresses through `sanitize_addrs/1` first
-%% (`resolve_targets/0` does) — this function itself does not re-validate,
-%% so it stays a simple, directly-testable map. Exported for testing.
+%% @doc NOT pure (despite the name pattern of its siblings) — every
+%% gateway node shares the SAME short name (nodes are interchangeable,
+%% distinguished only by address, ADR-2002 §7b), so a dialed node atom is
+%% always `<my own short name>@<peer address>`, but each address is now
+%% routed through the lifetime-bounded `?SEEN_ADDRS_TABLE` (round-2 PR
+%% review BLOCKING fix — see `?DEFAULT_MAX_LIFETIME_ADDRS`'s comment) rather than
+%% atomized unconditionally: an address seen before REUSES its existing
+%% atom (no growth), a genuinely new address is atomized and recorded
+%% ONLY while under the lifetime cap, and a new address past the cap is
+%% dropped from the result outright (not dialed that tick) rather than
+%% ever reaching `list_to_atom/1`. Callers MUST route candidate addresses
+%% through `sanitize_addrs/1` first (`resolve_targets/0` does) — this
+%% function does not re-validate address FORMAT, only bounds atom
+%% creation. Exported for testing.
 -spec targets_from_addrs([string()]) -> [node()].
 targets_from_addrs(AddrStrs) ->
     Short = own_short_name(),
-    [list_to_atom(Short ++ "@" ++ AddrStr) || AddrStr <- AddrStrs].
+    lists:filtermap(fun(AddrStr) -> bounded_target_atom(Short, AddrStr) end, AddrStrs).
 
-%% @doc Pure: the SINGLE chokepoint both the DNS and static-override paths
-%% in `resolve_targets/0` funnel through before any address becomes an
-%% atom (BLOCKING PR review fix — see `?MAX_TARGET_ADDRS`'s comment for the
-%% atom-table-exhaustion threat this closes). Validates each entry is a
-%% well-formed IPv4 literal (rejects a garbage/typo'd static-override entry
-%% too, not just a hostile DNS answer), dedupes, and caps the count.
-%% Exported for testing.
+%% @private `{true, Node}` for an address already atomized before (the
+%% existing atom is reused, no new atom is created) or one accepted
+%% because the lifetime cap has not been reached yet (a new atom is
+%% created and recorded so it counts against the cap from now on);
+%% `false` (dropped — not dialed this tick) once the cap is reached for a
+%% genuinely new address. The refusal is logged and telemetered via its
+%% OWN counter, distinct from `sanitize_addrs/1`'s per-call cap warning —
+%% this is the condition actually worth alerting on.
+bounded_target_atom(Short, AddrStr) ->
+    ensure_seen_addrs_table(),
+    Key = Short ++ "@" ++ AddrStr,
+    case ets:lookup(?SEEN_ADDRS_TABLE, Key) of
+        [{Key, Node}] ->
+            {true, Node};
+        [] ->
+            Cap = application:get_env(yuzu_gw, cluster_max_lifetime_addrs,
+                                       ?DEFAULT_MAX_LIFETIME_ADDRS),
+            case ets:info(?SEEN_ADDRS_TABLE, size) of
+                Size when Size >= Cap ->
+                    logger:error(
+                        "Cluster discovery: lifetime address cap (~p) reached — "
+                        "refusing to create a new atom for a never-before-seen "
+                        "address. This VM has atomized ~p distinct addresses "
+                        "since boot; if this keeps happening, the seed DNS name "
+                        "may be returning a rotating/hostile answer set. A "
+                        "gateway restart resets this counter.",
+                        [Cap, Size]),
+                    telemetry:execute([yuzu, gw, cluster, address_cap_exceeded],
+                                       #{count => 1}, #{}),
+                    false;
+                _ ->
+                    Node = list_to_atom(Key),
+                    ets:insert(?SEEN_ADDRS_TABLE, {Key, Node}),
+                    {true, Node}
+            end
+    end.
+
+%% @private Idempotent and callable from any process (including directly
+%% from a test that exercises `targets_from_addrs/1` without starting
+%% this gen_server) — `public` so any caller can read/insert; the
+%% `badarg` catch handles losing a creation race to another process (two
+%% processes both observing `undefined` and racing `ets:new/2`).
+ensure_seen_addrs_table() ->
+    case ets:info(?SEEN_ADDRS_TABLE) of
+        undefined ->
+            try ets:new(?SEEN_ADDRS_TABLE, [named_table, public, set])
+            catch error:badarg -> ?SEEN_ADDRS_TABLE
+            end;
+        _ ->
+            ?SEEN_ADDRS_TABLE
+    end,
+    ok.
+
+%% @doc Current count of distinct addresses this VM has ever atomized.
+%% Exported for testing only.
+-spec seen_addrs_count() -> non_neg_integer().
+seen_addrs_count() ->
+    ensure_seen_addrs_table(),
+    ets:info(?SEEN_ADDRS_TABLE, size).
+
+%% @doc Pure: rate-limits a SINGLE call to at most `?MAX_TARGET_ADDRS`
+%% entries (see its comment — this does NOT by itself prevent lifetime
+%% atom-table growth; `targets_from_addrs/1`'s lifetime cap is what
+%% does). Validates each entry is a well-formed IPv4 literal (rejects a
+%% garbage/typo'd static-override entry too, not just a hostile DNS
+%% answer) and dedupes within the call. Exported for testing.
 -spec sanitize_addrs([string()]) -> [string()].
 sanitize_addrs(AddrStrs) ->
     Valid = lists:filter(fun is_valid_ipv4_literal/1, AddrStrs),

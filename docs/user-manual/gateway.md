@@ -279,7 +279,14 @@ The gateway is configured via `gateway/config/sys.config`. Key settings:
 
     %% Always-on redial loop interval (ms), fixed, no backoff. Override:
     %% YUZU_GW_CLUSTER_REDIAL_INTERVAL_MS
-    {cluster_redial_interval_ms, 5000}
+    {cluster_redial_interval_ms, 5000},
+
+    %% Lifetime cap on distinct peer addresses ever turned into an Erlang
+    %% atom (atoms are never garbage-collected) — defends against a
+    %% hostile/misconfigured seed DNS name rotating through fresh
+    %% addresses forever. No env override; edit sys.config directly if a
+    %% real deployment's lifetime address churn needs a higher ceiling.
+    {cluster_max_lifetime_addrs, 1024}
 ]}
 ```
 
@@ -669,6 +676,7 @@ that are actually emitted are listed.
 | `yuzu_gw_cluster_peers_resolved` | gauge | Peer addresses found by the cluster-formation redial loop's most recent tick (label `node`; HA WS-4 `#4555`). 0 is expected for a genuinely single-node deployment. |
 | `yuzu_gw_cluster_peers_connected` | gauge | Distribution-connected peer nodes as of the most recent redial tick (label `node`; `#4555`). Compare against `peers_resolved` — a sustained gap most often means a distribution-cookie mismatch across replicas. |
 | `yuzu_gw_cluster_connect_failures_total` | counter | Total `net_kernel:connect_node/1` failures from the redial loop (`#4555`). |
+| `yuzu_gw_cluster_address_cap_exceeded_total` | counter | Total times the lifetime distinct-address cap (`cluster_max_lifetime_addrs`) refused a never-before-seen address (`#4555` review round 2). Any non-zero value should be investigated immediately — it means the seed DNS name is returning an unexpectedly large or rotating/hostile answer set. |
 
 The full set of gateway metrics (BEAM scheduler/memory gauges, fan-out and
 queue-length histograms, circuit-breaker and cluster counters) is registered in

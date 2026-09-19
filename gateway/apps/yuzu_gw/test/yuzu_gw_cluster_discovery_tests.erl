@@ -86,6 +86,86 @@ sanitize_addrs_caps_at_max_target_addrs_test() ->
     ?assert(lists:all(fun(A) -> lists:member(A, ManyAddrs) end, Result)).
 
 %%%===================================================================
+%%% targets_from_addrs/1 — lifetime atom cap (BLOCKING PR review fix,
+%%% round 2: a per-call cap alone does not stop UNBOUNDED growth across
+%%% many calls each individually under that cap)
+%%%===================================================================
+
+%% IMPORTANT: `?SEEN_ADDRS_TABLE` is a process-global, SHARED ETS table —
+%% every test below uses `cluster_max_lifetime_addrs` to TEMPORARILY
+%% lower the cap to just above the table's CURRENT size (queried fresh
+%% each time, never a hardcoded 1024) rather than ever driving the table
+%% up to the real production cap. Filling the table to 1024 would
+%% permanently poison every OTHER test sharing this eunit VM for the
+%% rest of the run (every subsequent call needing a genuinely new
+%% address would be refused) — this bit a first draft of this test file
+%% and was caught before merge, not after.
+
+%% Feeds a handful of NEW, never-before-seen addresses through
+%% targets_from_addrs/1 with the cap temporarily set to just above the
+%% current count, until that temporary cap is exactly reached, then
+%% asserts one more brand-new address is refused.
+targets_from_addrs_enforces_lifetime_cap_test_() ->
+    {setup,
+     fun() -> application:get_env(yuzu_gw, cluster_max_lifetime_addrs) end,
+     fun restore_max_lifetime_addrs/1,
+     fun(_Prev) ->
+         [{"refuses a genuinely new address once the (temporary) cap is reached",
+           fun() ->
+               StartCount = yuzu_gw_cluster_discovery:seen_addrs_count(),
+               SmallCap = StartCount + 3,
+               application:set_env(yuzu_gw, cluster_max_lifetime_addrs, SmallCap),
+               _ = yuzu_gw_cluster_discovery:targets_from_addrs(
+                       [unique_test_addr() || _ <- lists:seq(1, 3)]),
+               ?assertEqual(SmallCap, yuzu_gw_cluster_discovery:seen_addrs_count()),
+               Accepted = yuzu_gw_cluster_discovery:targets_from_addrs([unique_test_addr()]),
+               ?assertEqual([], Accepted),
+               ?assertEqual(SmallCap, yuzu_gw_cluster_discovery:seen_addrs_count())
+           end}]
+     end}.
+
+%% An address already accepted keeps resolving even with the cap set to
+%% (or below) the current count — reuse of an existing atom never
+%% consults the cap at all (the ets:lookup hit returns before the cap
+%% check is ever reached).
+targets_from_addrs_reuses_already_seen_address_past_cap_test_() ->
+    {setup,
+     fun() -> application:get_env(yuzu_gw, cluster_max_lifetime_addrs) end,
+     fun restore_max_lifetime_addrs/1,
+     fun(_Prev) ->
+         [{"reuse of an already-accepted address is never refused, even at the cap",
+           fun() ->
+               ExistingAddr = unique_test_addr(),
+               [ExistingNode] = yuzu_gw_cluster_discovery:targets_from_addrs([ExistingAddr]),
+               StartCount = yuzu_gw_cluster_discovery:seen_addrs_count(),
+               application:set_env(yuzu_gw, cluster_max_lifetime_addrs, StartCount),
+               ?assertEqual([ExistingNode],
+                   yuzu_gw_cluster_discovery:targets_from_addrs([ExistingAddr]))
+           end}]
+     end}.
+
+restore_max_lifetime_addrs(undefined) ->
+    application:unset_env(yuzu_gw, cluster_max_lifetime_addrs);
+restore_max_lifetime_addrs({ok, Value}) ->
+    application:set_env(yuzu_gw, cluster_max_lifetime_addrs, Value).
+
+unique_test_addr() ->
+    "cap-test-" ++ integer_to_list(erlang:unique_integer([positive])).
+
+%%%===================================================================
+%%% clamp_interval/1 — pure
+%%%===================================================================
+
+clamp_interval_floors_zero_test() ->
+    ?assertEqual(1000, yuzu_gw_cluster_discovery:clamp_interval(0)).
+
+clamp_interval_floors_negative_test() ->
+    ?assertEqual(1000, yuzu_gw_cluster_discovery:clamp_interval(-500)).
+
+clamp_interval_passes_through_valid_value_test() ->
+    ?assertEqual(5000, yuzu_gw_cluster_discovery:clamp_interval(5000)).
+
+%%%===================================================================
 %%% resolve_targets/0 — static-override path (deterministic; no network)
 %%%===================================================================
 
@@ -148,6 +228,51 @@ resolve_targets_filters_malformed_static_entry_test_() ->
                Short = yuzu_gw_cluster_discovery:own_short_name(),
                ?assertEqual([list_to_atom(Short ++ "@10.1.2.3")],
                              yuzu_gw_cluster_discovery:resolve_targets())
+           end}]
+     end}.
+
+%% K-3 (PR review round 2): a cluster_seed_nodes entry that is neither a
+%% binary nor a string (e.g. a quoted atom from a hand-edited sys.config)
+%% is skipped with a log, not crashed on every tick.
+resolve_targets_skips_non_string_static_entry_test_() ->
+    {setup,
+     fun() ->
+         Prev = application:get_env(yuzu_gw, cluster_seed_nodes, []),
+         application:set_env(yuzu_gw, cluster_seed_nodes,
+                              [<<"10.1.2.3">>, an_atom_not_a_string, 42]),
+         Prev
+     end,
+     fun(Prev) -> application:set_env(yuzu_gw, cluster_seed_nodes, Prev) end,
+     fun(_Prev) ->
+         [{"skips non-binary/non-string entries instead of crashing",
+           fun() ->
+               Short = yuzu_gw_cluster_discovery:own_short_name(),
+               ?assertEqual([list_to_atom(Short ++ "@10.1.2.3")],
+                             yuzu_gw_cluster_discovery:resolve_targets())
+           end}]
+     end}.
+
+%% K-2 (PR review round 2): a static override that is configured but
+%% ends up entirely unusable (every entry malformed or unsupported)
+%% must not be silently indistinguishable from "no override configured
+%% at all" -- it logs a warning. This test only exercises that the
+%% function still returns cleanly ([] -- resolve_targets/0 never raises
+%% on this path); the warning log itself is asserted by inspection
+%% (logger output), not captured here, matching this test file's
+%% existing convention of not asserting on log text.
+resolve_targets_all_invalid_static_override_returns_empty_test_() ->
+    {setup,
+     fun() ->
+         Prev = application:get_env(yuzu_gw, cluster_seed_nodes, []),
+         application:set_env(yuzu_gw, cluster_seed_nodes,
+                              [<<"not-an-address">>, <<"also-not-one">>]),
+         Prev
+     end,
+     fun(Prev) -> application:set_env(yuzu_gw, cluster_seed_nodes, Prev) end,
+     fun(_Prev) ->
+         [{"returns an empty list rather than crashing or silently defaulting",
+           fun() ->
+               ?assertEqual([], yuzu_gw_cluster_discovery:resolve_targets())
            end}]
      end}.
 
