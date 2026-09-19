@@ -141,8 +141,11 @@ NETWORK_CONNECTED_RE = re.compile(r"Guardian engine network-connected")
 # Void taxonomy (R5.7 round 2, §2.2 item 3). Instrument-invalid: the instrument, not the
 # system, failed - reported, never counted, never held against reliability. Genuine failure:
 # the system did not do what the push asked - counts against the phase's reliability gate AND
-# is a product finding. `void_class_for` has no prefix matching: `trigger_failed:<msg>` (like
-# any other reason not listed in GENUINE_FAILURE_REASONS) classifies instrument by default.
+# is a product finding. `void_class_for` has no prefix matching for most dynamic reasons:
+# `trigger_failed:<msg>` (like any other reason not listed in GENUINE_FAILURE_REASONS or
+# matched below) classifies instrument by default. ONE deliberate exception:
+# `not_full_sync(<v>)` (D1, driver-merge follow-on review) - see void_class_for's own
+# docstring for why this one dynamic-prefix reason classifies genuine.
 INSTRUMENT_INVALID_REASONS = frozenset({
     "t0_not_found", "t0d_not_found", "t1_not_found", "t2_incomplete", "t2_late",
     "log_rotated_mid_window", "trigger_not_created", "repush_confound",
@@ -154,9 +157,22 @@ GENUINE_FAILURE_REASONS = frozenset({
 
 
 def void_class_for(reason):
+    """`not_full_sync(<v>)` is a deliberate exception to the no-prefix-matching rule
+    (D1, driver-merge follow-on review, 2026-09-19): T0 only logs inside
+    `if (push.full_sync())` (guardian_engine.cpp), and apply_rules is mtx_-serialised,
+    so a T1 line matched for this application with full_sync=false almost always means
+    a real mid-reconcile failure (guardian_engine.cpp's per-rule persist-failure path
+    latches after teardown, before re-arming) rather than an instrument problem -
+    exactly the blackout this diagnostic exists to detect. Classified genuine on
+    asymmetric cost: a false genuine costs one unnecessary look, a false instrument
+    silently discards real evidence. Known false-genuine risk, accepted: an ordinary
+    agent restart between T0d and the ok line produces the same log signature; the
+    detector that would disambiguate (BACKEND_RE/NETWORK_CONNECTED_RE) is dead code
+    (#4610). The row retains its own `full_sync` field independent of void_reason, so
+    this classification can be reversed without re-deriving anything from the string."""
     if reason is None:
         return None
-    if reason in GENUINE_FAILURE_REASONS:
+    if reason in GENUINE_FAILURE_REASONS or (reason and reason.startswith("not_full_sync(")):
         return "genuine"
     return "instrument"
 
@@ -2136,9 +2152,7 @@ def _f19():
     # governance round (2026-09-19): the ported per-site SSH/REST guards each
     # mint their own dynamic-prefix reason (metrics_unavailable/
     # dgrhp_clock_unavailable/observe_t0_failed/own_events_fetch_failed/
-    # observe_t0d_failed/observe_t1_failed/m1_unavailable/cohort_events_failed),
-    # plus not_full_sync(...) (D1 in that round's review - currently instrument
-    # by this same default; revisit this fixture if that classification changes).
+    # observe_t0d_failed/observe_t1_failed/m1_unavailable/cohort_events_failed).
     dynamic_prefix_reasons = [
         "trigger_failed:some error",
         "push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)",
@@ -2150,13 +2164,20 @@ def _f19():
         "observe_t1_failed:TimeoutExpired:cmd timed out",
         "m1_unavailable:TimeoutExpired:cmd timed out",
         "cohort_events_failed:TimeoutExpired:cmd timed out",
-        "not_full_sync(false)",
     ]
     ok6 = all(void_class_for(r) == "instrument" for r in dynamic_prefix_reasons)
-    return (ok1 and ok2 and ok3 and ok4 and ok5 and ok6,
+    # not_full_sync(...) is the ONE deliberate exception (D1, driver-merge follow-on
+    # review, applied 2026-09-19) - see void_class_for's own docstring for the full
+    # reasoning. Pinned both ways: it must NOT be in the plain-instrument set above,
+    # and it must classify genuine regardless of the embedded value.
+    ok7 = (void_class_for("not_full_sync(false)") == "genuine"
+           and void_class_for("not_full_sync(true)") == "genuine"
+           and "not_full_sync(false)" not in dynamic_prefix_reasons)
+    return (ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7,
             f"genuine_set_matches={ok1} instrument_set_matches={ok2} "
             f"zero_overlap={ok3} genuine_classify_correct={ok4} "
-            f"instrument_classify_correct={ok5} dynamic_prefix_default_instrument={ok6}")
+            f"instrument_classify_correct={ok5} dynamic_prefix_default_instrument={ok6} "
+            f"not_full_sync_is_genuine_exception={ok7}")
 
 
 def _f20():
