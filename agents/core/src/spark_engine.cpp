@@ -242,13 +242,15 @@ void wait_teardown_leases_forever(const std::atomic<std::uint64_t>& count) noexc
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
 }
 
-/// #2050: unconditional-fire-on-destruction guard, identical in shape to the one in
-/// agent.cpp (and its byte-identical sibling in api_token_store.cpp) — a third copy
-/// of this trivial idiom rather than a shared header, per that comment's own
-/// reasoning: every use is a single local RAII variable, never copied or moved out
-/// of its declaring scope, so there is no double-fire hazard a deleted copy/move
-/// would need to guard against. Conditional arming (run-or-don't) is the CALLER's
-/// job — the lambda handed in checks its own captured flag — not this type's.
+/// #2050: unconditional-fire-on-destruction guard, identical in shape to the ones in
+/// agent.cpp and server/core/src/api_token_store.cpp — a third copy of this trivial
+/// idiom rather than a shared header, because the type is five lines with no natural
+/// shared-header home spanning agent-core and server-core. Every use across all three
+/// files is a single local RAII variable, never copied or moved out of its declaring
+/// scope, so there is no double-fire hazard a deleted copy/move would need to guard
+/// against — that (separate) question is answered identically in the two sibling
+/// files' own comments. Conditional arming (run-or-don't) is the CALLER's job — the
+/// lambda handed in checks its own captured flag — not this type's.
 template <typename F> struct ScopeExit {
     F fn;
     ~ScopeExit() { fn(); }

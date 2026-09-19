@@ -1543,3 +1543,67 @@ TEST_CASE("a cleanup throw during start()'s rollback does not replace the origin
     SUCCEED("the rollback's own cleanup failure did not mask the original exception, "
             "and the destructor's retry completed without hanging or crashing");
 }
+
+namespace {
+/// Gate 5 chaos-injector, CH-1 (2026-09-20): the mechanism-start loop
+/// (`for (auto& [type, m] : mechs) m->start(...)`) stops at the FIRST throw, so a
+/// mechanism registered AFTER the throwing one in map order (SparkType's enum
+/// value) never has start() called at all. The rollback's teardown_locked() then
+/// iterates the AUTHORITATIVE `mechanisms_` map unconditionally — every registered
+/// mechanism gets stop() called, including one whose start() was never invoked.
+/// This exact shape (stop() without a preceding start()) is not new to #2050: the
+/// pre-existing B1 fix already established that a mechanism must guard stop() on
+/// RESOURCE OWNERSHIP, not a `started_` bool, precisely so stop() tolerates this —
+/// what #2050 changes is only that it can now happen synchronously, immediately,
+/// rather than "eventually, whenever ~SparkEngine next ran". No test previously
+/// exercised 3+ mechanisms with one genuinely never-started sibling; this one does.
+struct NeverStartedTrackingMechanism : ISparkMechanism {
+    bool& start_called;
+    bool& stop_called;
+    explicit NeverStartedTrackingMechanism(bool& started, bool& stopped)
+        : start_called(started), stop_called(stopped) {}
+    void start(SparkEmitFn, SparkFaultFn) override { start_called = true; }
+    std::expected<void, std::string> watch(const std::string&, const SparkParams&) override {
+        return {};
+    }
+    void unwatch(const std::string&) override {}
+    void stop() override { stop_called = true; }
+    [[nodiscard]] SparkMechanismStats stats() const override { return {}; }
+};
+} // namespace
+
+TEST_CASE("start()'s rollback stops a sibling mechanism whose start() was never "
+          "reached, without crashing or misreporting it as started",
+          "[spark][teardown]") {
+    // SparkType::File(3) < Service(4) < Registry(5) — map/iteration order. File
+    // starts cleanly; Service throws; Registry must never see start() but must
+    // still see a clean stop() from the rollback.
+    auto engine = std::make_unique<SparkEngine>();
+
+    bool file_started = false, file_stopped = false;
+    REQUIRE(engine
+                ->register_mechanism(SparkType::File,
+                                     std::make_unique<NeverStartedTrackingMechanism>(
+                                         file_started, file_stopped))
+                .has_value());
+    REQUIRE(engine->register_mechanism(SparkType::Service, std::make_unique<ThrowingStartMechanism>())
+                .has_value());
+    bool registry_started = false, registry_stopped = false;
+    REQUIRE(engine
+                ->register_mechanism(SparkType::Registry,
+                                     std::make_unique<NeverStartedTrackingMechanism>(
+                                         registry_started, registry_stopped))
+                .has_value());
+
+    CHECK_THROWS(engine->start());
+
+    CHECK(file_started);
+    CHECK(file_stopped); // cleanly-started sibling still torn down by rollback
+    CHECK_FALSE(registry_started); // never reached — start() aborted at Service
+    CHECK(registry_stopped); // rollback still calls stop() on it — must not crash
+                             // or skip it just because start() never ran
+
+    engine.reset(); // must not hang, double-stop, or crash on retry
+    SUCCEED("rollback correctly tore down both the started and the never-started "
+            "sibling mechanisms without distinguishing them incorrectly");
+}
