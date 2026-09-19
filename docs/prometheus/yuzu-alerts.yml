@@ -254,6 +254,68 @@ groups:
             routing directory sections. INITIAL threshold, not yet tuned
             against real fleet data.
 
+      # HA WS-4 #4555 — gateway multi-node cluster FORMATION (ADR-2002 §7b).
+      # Fail-open boot semantics (a node that resolves zero peers still boots
+      # and serves its own agents fine) mean a misconfigured seed name fails
+      # SILENTLY by design — this is the one alert closing that gap. A
+      # sustained resolved>connected gap most often means a distribution-
+      # cookie mismatch across replicas (connect_node/1 reports failure only
+      # as a bare `false`, no reason code) — see
+      # yuzu_gw_cluster_connect_failures_total for the corroborating signal.
+      # `resolved == 0` is NOT itself alerted here — it is the expected,
+      # correct state for a genuinely single-node deployment.
+      - alert: YuzuGatewayClusterPartiallyFormed
+        expr: |
+          yuzu_gw_cluster_peers_resolved - yuzu_gw_cluster_peers_connected > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Gateway cluster partially formed on {{ $labels.node }} ({{ $value }} peer(s) resolved but not connected)"
+          description: >-
+            The cluster-formation redial loop (yuzu_gw_cluster_discovery) has
+            resolved more peer addresses than it has successfully connected
+            to for at least 10 minutes on {{ $labels.node }}. FIRST
+            REMEDIATION: check yuzu_gw_cluster_connect_failures_total's rate
+            — a non-zero rate alongside this gap most often means a
+            distribution cookie mismatch across replicas (YUZU_GW_COOKIE must
+            be IDENTICAL across every node in the cluster); otherwise check
+            network reachability to the unconnected peer(s) on the
+            distribution port range (default 9100-9105, config/sys.config's
+            inet_dist_listen_min/max) and epmd (4369). See ADR-2002 §7b.
+
+      # HA WS-4 #4555 review round 2 — the actual atom-table-exhaustion
+      # defense (a per-tick cap alone does not stop unbounded growth from
+      # a hostile DNS answer that stays under that cap per tick while
+      # rotating through an unbounded total set over time). ANY
+      # occurrence means the lifetime cap (cluster_max_lifetime_addrs,
+      # default 1024) has already been reached — this is not a "trending
+      # toward a problem" signal, it IS the problem, hence no `for:` delay.
+      - alert: YuzuGatewayClusterAddressCapExceeded
+        expr: |
+          increase(yuzu_gw_cluster_address_cap_exceeded_total[5m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: "Gateway cluster discovery lifetime address cap exceeded on {{ $labels.node }}"
+          description: >-
+            yuzu_gw_cluster_discovery has refused to atomize a
+            never-before-seen peer address because the lifetime distinct-
+            address cap was already reached. INVESTIGATE IMMEDIATELY: this
+            means the configured seed DNS name is returning an
+            unexpectedly large, rotating, or hostile answer set — check
+            what YUZU_GW_SEED_DNS_NAME/YUZU_GW_SEED_NODES actually
+            resolves to right now, and whether DNS for that name is
+            compromised or misconfigured. Only a FULL gateway restart
+            (the whole OS process) resets this counter — an internal
+            yuzu_gw_cluster_discovery worker crash-and-restart does NOT,
+            since its lifetime table is owned by the long-lived
+            yuzu_gw_sup supervisor, not the worker (round-3 review
+            fix). Either way, restarting does NOT fix a still-hostile
+            DNS answer — it will simply refill the cap again. See
+            ADR-2002 §7b and docs/user-manual/gateway.md's Prometheus
+            Metrics section.
+
   - name: yuzu-security
     rules:
       - alert: YuzuOnBehalfAssertionRejected
