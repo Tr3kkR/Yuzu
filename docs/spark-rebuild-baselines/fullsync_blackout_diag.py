@@ -958,17 +958,34 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     own_events, _ = _fetch_window(window_start_ts)
     own_push_raw = find_own_push_cmd_raw(own_events, t0["ts"])
 
-    expected_detached = len(exp_rule_ids) if backend == "spark" else 0
-    t0d, reason = observe_t0d(window_start_ts, t0["ts"], ROOT_CAUSED_T0D_TIMEOUT)
-    if reason:
-        row.update(void_class=void_class_for(reason), void_reason=reason)
-        return row
+    if backend == "spark":
+        t0d, reason = observe_t0d(window_start_ts, t0["ts"], ROOT_CAUSED_T0D_TIMEOUT)
+        if reason:
+            row.update(void_class=void_class_for(reason), void_reason=reason)
+            return row
+        size_reason = check_teardown_size(t0d, backend, len(exp_rule_ids))
+        if size_reason:
+            row.update(void_class=void_class_for(size_reason), void_reason=size_reason)
+            return row
+    else:
+        # R5.7 wrinkle, found live on the rig (2026-09-19): GuardianEngine::
+        # wire_spark_engine() returns BEFORE constructing spark_runtime_ when
+        # spark_disabled_by_config is true (the --spark-disable branch, checked
+        # before the "!engine" branch) - so under legacy, spark_runtime_ stays
+        # null for the agent's whole lifetime and detach_all()'s `if
+        # (spark_runtime_)` guard makes it a permanent no-op: the T0d line NEVER
+        # fires for a --spark-disable agent, contradicting this plan's original
+        # assumption that detach_all() runs regardless of backend. Legacy never
+        # needed the epoch fence in the first place - its arms are SYNCHRONOUS
+        # under apply_rules()'s own mtx_, same thread as T0/T1, so there is no
+        # stale-prior-application race to guard against. Synthesize t0d = t0
+        # (epoch/floor/detached_rules/withdrawn_claims are meaningless for
+        # legacy and recorded as 0) so collect_t2's shared membership logic
+        # (legacy branch: "after t0d_ts" == "after t0_ts", a no-op restriction)
+        # needs no separate code path.
+        t0d = {"ts": t0["ts"], "epoch": 0, "floor": 0, "detached_rules": 0, "withdrawn_claims": 0}
     row["t0d"] = {"ts": t0d["ts"].isoformat(), "epoch": t0d["epoch"], "floor": t0d["floor"],
                   "detached_rules": t0d["detached_rules"], "withdrawn_claims": t0d["withdrawn_claims"]}
-    size_reason = check_teardown_size(t0d, backend, len(exp_rule_ids))
-    if size_reason:
-        row.update(void_class=void_class_for(size_reason), void_reason=size_reason)
-        return row
 
     t1, reason = observe_t1(window_start_ts, t0d["ts"], ROOT_CAUSED_T1_TIMEOUT)
     if reason:
@@ -1219,19 +1236,27 @@ def build_report_lines(rows):
 
 
 def build_verdict_lines(rows):
+    # R5.7 bug fix (found live, 2026-09-19): legacy and spark are separate
+    # cmd_run() invocations and therefore carry DIFFERENT run_id values by
+    # construction - grouping on run_id (as an earlier version of this
+    # function did) can never pair them for the SAME comparison, and every
+    # verdict silently read INCONCLUSIVE (each backend saw 0 rows for the
+    # other side). The pairing key is (comparison_id, label, phase) only;
+    # run_id is per-backend provenance, reported per cell in
+    # build_report_lines, not part of how cells are paired for a verdict.
     groups = {}
     for r in rows:
         if r["phase"] not in ("B", "B2"):
             continue
-        key = (r.get("comparison_id"), r.get("run_id"), r["label"], r["phase"])
+        key = (r.get("comparison_id"), r["label"], r["phase"])
         groups.setdefault(key, {}).setdefault(r["backend"], []).append(r)
-    lines = ["| Comparison | Run | Label | Phase | Verdict |", "|---|---|---|---|---|"]
+    lines = ["| Comparison | Label | Phase | Verdict |", "|---|---|---|---|"]
     for key in sorted(groups, key=lambda k: tuple(str(x) for x in k)):
-        comparison_id, run_id, label, phase = key
+        comparison_id, label, phase = key
         cells = groups[key]
         floor = 5 if phase == "B" else 3
         verdict = compute_verdict(cells.get("legacy", []), cells.get("spark", []), floor)
-        lines.append(f"| {comparison_id} | {run_id} | {label} | {phase} | {verdict} |")
+        lines.append(f"| {comparison_id} | {label} | {phase} | {verdict} |")
     return lines
 
 
@@ -1469,17 +1494,40 @@ def _f11():
 
 
 def _f12():
-    rows = [
+    # All-void cell (both backends, one void row each) - must still print and
+    # must read INCONCLUSIVE (floor not reached).
+    void_rows = [
         {"comparison_id": "cmp1", "run_id": "run1", "label": "t2-v1", "backend": "legacy",
          "phase": "B", "repeat": 1, "void_class": "instrument", "void_reason": "t0_not_found"},
         {"comparison_id": "cmp1", "run_id": "run1", "label": "t2-v1", "backend": "spark",
          "phase": "B", "repeat": 1, "void_class": "instrument", "void_reason": "t1_not_found"},
     ]
-    lines = build_report_lines(rows)
+    lines = build_report_lines(void_rows)
     printed = any("cmp1" in ln and "t2-v1" in ln for ln in lines)
-    verdicts = build_verdict_lines(rows)
+    verdicts = build_verdict_lines(void_rows)
     inconclusive = any("INCONCLUSIVE" in ln for ln in verdicts)
-    return printed and inconclusive, f"cell_printed={printed} inconclusive_verdict={inconclusive}"
+
+    # R5.7 bug (found live, 2026-09-19): legacy and spark are SEPARATE cmd_run()
+    # invocations and therefore carry DIFFERENT run_id values in real data - an
+    # earlier build_verdict_lines() grouped on run_id and could never pair them,
+    # so every verdict silently read INCONCLUSIVE regardless of how much valid
+    # data existed. This fixture uses realistic DIFFERENT run_ids per backend
+    # and enough valid repeats to clear the floor - the verdict must NOT be
+    # INCONCLUSIVE (it should resolve the actual latency/reliability gates).
+    def _valid(backend, run_id, n, c_ms):
+        return [{"comparison_id": "cmp2", "run_id": run_id, "label": "t2-v1", "backend": backend,
+                 "phase": "B", "repeat": i, "void_class": None, "void_reason": None,
+                 "c_ms": c_ms, "b_ms": c_ms} for i in range(1, n + 1)]
+    paired_rows = (_valid("legacy", "legacy-run-1", 5, 70.0) +
+                   _valid("spark", "spark-run-1", 5, 80.0))
+    paired_verdicts = build_verdict_lines(paired_rows)
+    paired_not_inconclusive = (
+        len(paired_verdicts) > 2 and "INCONCLUSIVE" not in paired_verdicts[2]
+    )
+    return (printed and inconclusive and paired_not_inconclusive,
+            f"cell_printed={printed} all_void_inconclusive={inconclusive} "
+            f"cross_run_id_paired={paired_not_inconclusive} "
+            f"paired_verdict_line={paired_verdicts[2] if len(paired_verdicts) > 2 else None}")
 
 
 def _f13():
