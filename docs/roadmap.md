@@ -1626,7 +1626,7 @@ Extend the connector framework with additional integrations:
 
 > **Superseded by ADR-2002 (High Availability Architecture).** The active-passive-over-shared-SQLite/NFS design sketched below is explicitly disavowed by the ADR itself as "pre-Postgres and now wrong." The current HA design targets **active-active** on the Postgres substrate (both self-managed on-prem and future SaaS), decomposed into workstreams WS-0…WS-14 tracked in `docs/ha-delivery-matrix.md`. **As of dev @ `d295db964` (2026-09-07, pinned 12:01 UTC+1 / 11:01 UTC)** — verified by `git merge-base --is-ancestor <merge-sha> d295db964`, not `gh pr view` state (a PR's current state can postdate the pin): WS-0, WS-1, WS-7, and **WS-2a (both 2a-1 and 2a-2, #3924 — cross-replica SSE delivery, merged 2026-09-03, IS an ancestor)** are done; **WS-3 slice 3.1** (fenced `LeaderElector` primitive, #4011, merged 2026-09-06, IS an ancestor) is done but inert — no loop wired yet, no runtime behaviour change. **WS-10 is NOT done at the pin** — #4092 (background-job replica-safety classification) merged 2026-09-07 **12:58 UTC**, roughly an hour *after* the pin, and is confirmed NOT an ancestor of `d295db964`; at the pin, WS-10 remains **PR #4092 open**, matching `docs/ha-delivery-matrix.md`'s own state at the pin (which also still records WS-2a-2 outstanding and WS-3 as merely "planned" — that file's own re-stamp commits landed on `dev` after this pin too; the roadmap follows verified PR-ancestry facts over the matrix file's stamp date, and the matrix will catch up on its own schedule). The remaining workstreams (WS-2b, WS-3 3.2/3.3/3.4, WS-4, WS-5, WS-6, WS-8-readyz, WS-9, WS-10, WS-11…WS-14) are not started at the pin. See "Delivered outside the roadmap" above and the Dependency Graph below.
 
-> **Since the pin (re-verified against dev @ `c7f3a5bed`, 2026-09-13):** WS-10 is **done** (#4092, merged 2026-09-07). WS-3 3.2 (#4134, the elector now gates the four `FencedLeaderOnly` background loops — not the `DisabledUntilFixed` passes, see the gate note below), 3.3 (#4169, durable command outbox — a fifth `FencedLeaderOnly` pass, `command_outbox.deliver`, sharing 3.2's `schedule_tick_thread_` loop with `schedule_runner.tick` rather than adding a loop) and 3.4 (#4194, remediation CAS) are **done**, and WS-4 slice 4.1 (fenced `GatewayRouteStore`, #4245) is done but **inert** — nothing reads it for dispatch until 4.2. `docs/ha-delivery-matrix.md` is the live record. Live active-active HA is still not delivered.
+> **Since the pin (re-verified against dev @ `c7f3a5bed`, 2026-09-13):** WS-10 is **done** (#4092, merged 2026-09-07). WS-3 3.2 (#4134, the elector now gates `FencedLeaderOnly` passes — not `DisabledUntilFixed` ones, see the gate note below), 3.3 (#4169, durable command outbox — a fifth `FencedLeaderOnly` pass, `command_outbox.deliver`, sharing 3.2's `schedule_tick_thread_` loop with `schedule_runner.tick` rather than adding one; five passes across four background loops in total) and 3.4 (#4194, remediation CAS) are **done**, and WS-4 slice 4.1 (fenced `GatewayRouteStore`, #4245) is done but **inert** — nothing reads it for dispatch until 4.2. `docs/ha-delivery-matrix.md` is the live record. Live active-active HA is still not delivered.
 
 <details><summary>Original active-passive design (superseded — kept for history)</summary>
 
@@ -2132,21 +2132,24 @@ before acting on any "open" / "in progress" claim:
    roadmap here follows verified ancestry, not the matrix file's stamp date or `gh pr view`'s live
    state. **Since the pin (re-verified 2026-09-13 @ `c7f3a5bed`):** WS-10 and WS-3 3.2/3.3/3.4 are done
    (#4092, #4134, #4169, #4194) and WS-4 4.1 is done (#4245; inert — nothing reads it for dispatch until
-   4.2), so the 2nd-replica gate is now the rest of WS-4 plus WS-5, WS-6, WS-8-readyz and WS-13. Three
-   more items belong in that gate and are easy to miss because each shows "done" at a coarser grain:
-   the two `DisabledUntilFixed` named fixes (`nvd_sync`'s engine-tier migration, the concurrency-claims
-   reconciler's PG-clock fix #4093) that `leader_gate.hpp` holds out of the safe-to-scale set regardless
-   of WS-10's status; WS-2a's own unshipped precondition (loss-free cross-replica reconnect via durable
-   outbox replay `ORDER BY event_id` — WS-2a shows "done" at the row-status level, but its own row text
-   in `docs/ha-delivery-matrix.md`'s WS-2 row names this the outstanding 2nd-replica precondition,
-   corroborated by `docs/executions-history-ladder.md`'s replica-local `Last-Event-ID` mechanism); and
+   4.2), so the 2nd-replica gate is now at least the rest of WS-4 plus WS-5, WS-6, WS-8-readyz and
+   WS-13 — see below, four more items belong in that gate too. Those four are easy to miss because
+   each shows "done" at a coarser grain: the two `DisabledUntilFixed` named fixes (`nvd_sync`'s
+   engine-tier migration, the concurrency-claims reconciler's PG-clock fix #4093) that
+   `background_jobs.hpp`'s classification holds out of the safe-to-scale set regardless of WS-10's
+   status — `leader_gate.hpp` deliberately lets both keep running today; the hold is the deployment
+   safe-to-scale gate, procedural only, never this runtime gate; WS-2a's own
+   unshipped precondition (loss-free cross-replica reconnect via durable outbox replay `ORDER BY
+   event_id` — WS-2a shows "done" at the row-status level, but its own row text in
+   `docs/ha-delivery-matrix.md`'s WS-2 row names this the outstanding 2nd-replica precondition,
+   corroborated by `docs/executions-history-ladder.md`'s replica-local `Last-Event-ID` mechanism);
    #4014 (WS-11 leader identity/epoch + CRL-freshness-staleness metrics + split-brain alert + the
    `/readyz` decision), which the WS-3 3.2 exit-criteria note names a **hard prerequisite before a 2nd
    replica or any WS-9 failover scenario** and which is distinct from WS-8-readyz's per-tier health
-   contract already listed above. Also fold in #4098 (verify webhook/offload emit sites are
-   per-replica-origin before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s
-   `StoreWorkerPool::workers_` thread — or a fleet-triggered emit double-delivers). That gate is
-   procedural: nothing in code refuses a 2nd replica today. See
+   contract already listed above; and #4098 (verify webhook/offload emit sites are per-replica-origin
+   before a 2nd replica — tracked against `store_worker_pool.worker_loop`'s `StoreWorkerPool::workers_`
+   thread — or a fleet-triggered emit double-delivers). That gate is procedural: nothing in code
+   refuses a 2nd replica today. See
    `docs/ha-delivery-matrix.md`; re-verify before acting — this cluster of PRs merged within a 4-day
    window straddling the pin (#3924 2026-09-03, #4011 2026-09-06, #4092 2026-09-07 12:58 — the pin
    itself is 2026-09-07 11:01, between #4011 and #4092).
