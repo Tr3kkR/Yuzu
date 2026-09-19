@@ -12,6 +12,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 
 gateway_dir = sys.argv[1]
 env = None
@@ -36,6 +37,15 @@ if sys.platform == "win32":
     env["TEMP"] = real_temp
     env["TMP"] = real_temp
     env["TMPDIR"] = real_temp
+    # IDE-launched Ninja processes can have unusable console input handles.
+    # -noshell alone still initializes cooked input in OTP 28's user_drv,
+    # causing SetConsoleModeInitIn / nouser failures. -noinput disables that
+    # input path while preserving build output. Append it last so it takes
+    # precedence over any inherited -noshell flag.
+    erl_flags = env.get("ERL_FLAGS", "")
+    if "-noshell" not in erl_flags.split():
+        env["ERL_FLAGS"] = (erl_flags + " -noshell").strip()
+    env["ERL_FLAGS"] = (env.get("ERL_FLAGS", "") + " -noinput").strip()
 
     # Resolve the Erlang toolchain WITHOUT hardcoding one host's layout. The
     # proven-good invocation is `<real escript.exe> <rebar3 escript file>
@@ -125,7 +135,21 @@ except ValueError:
     timeout_s = 900
 
 popen_kwargs = {"cwd": gateway_dir, "env": env}
-if sys.platform != "win32":
+build_log = None
+if sys.platform == "win32":
+    # OTP can still initialize Windows console handles with -noinput, and an
+    # IDE-launched Ninja (CLion) hands its children stdio handles Erlang cannot
+    # use: the VM exits 1 before it can print anything, so the failure is also
+    # invisible. Give the child NO inherited handles at all: null stdin, a
+    # private hidden console, and stdout+stderr on a pipe we own and relay
+    # (and tee to a log file, so the real Erlang error survives even when the
+    # IDE's own output handle cannot show it).
+    popen_kwargs["stdin"] = subprocess.DEVNULL
+    popen_kwargs["stdout"] = subprocess.PIPE
+    popen_kwargs["stderr"] = subprocess.STDOUT
+    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    build_log = os.path.join(real_temp, "yuzu_gateway_build.log")
+else:
     # New session so the whole tree shares a process group we can signal.
     popen_kwargs["start_new_session"] = True
 
@@ -144,9 +168,63 @@ def _kill_tree(p):
             p.kill()
 
 
-proc = subprocess.Popen(cmd, **popen_kwargs)
+def _relay(p, log_path):
+    """Drain the child's merged stdout/stderr to our stdout and a log file.
+
+    Runs until the pipe closes. A failing write to either sink (an IDE handle
+    that cannot take output) must never stop the drain — the child would block
+    on a full pipe and the build would hang until the timeout.
+    """
+    log = None
+    if log_path:
+        try:
+            log = open(log_path, "wb")
+        except OSError:
+            log = None
+    out = getattr(sys.stdout, "buffer", None)
+    while True:
+        chunk = p.stdout.read1(65536)
+        if not chunk:
+            break
+        if log:
+            try:
+                log.write(chunk)
+                log.flush()
+            except OSError:
+                log = None
+        if out:
+            try:
+                out.write(chunk)
+                out.flush()
+            except (OSError, ValueError):
+                out = None
+    if log:
+        log.close()
+
+
+print(f"build_gateway: running {cmd!r} in {gateway_dir}", flush=True)
 try:
-    sys.exit(proc.wait(timeout=timeout_s if timeout_s > 0 else None))
+    proc = subprocess.Popen(cmd, **popen_kwargs)
+except OSError as exc:
+    print(f"build_gateway: could not launch child: {exc}", file=sys.stderr, flush=True)
+    sys.exit(1)
+relay = None
+if proc.stdout is not None:
+    relay = threading.Thread(target=_relay, args=(proc, build_log), daemon=True)
+    relay.start()
+try:
+    returncode = proc.wait(timeout=timeout_s if timeout_s > 0 else None)
+    if relay:
+        relay.join(timeout=30)
+    if returncode:
+        print(
+            f"build_gateway: child exited with code {returncode} "
+            f"(0x{returncode & 0xffffffff:08X}); command: {cmd!r}"
+            + (f"\n  full child output: {build_log}" if build_log else ""),
+            file=sys.stderr,
+            flush=True,
+        )
+    sys.exit(returncode)
 except subprocess.TimeoutExpired:
     sys.stderr.write(
         f"\nbuild_gateway: rebar3 compile exceeded {timeout_s}s "

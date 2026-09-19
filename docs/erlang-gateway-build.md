@@ -36,6 +36,22 @@ The helper probes kerl → asdf → Homebrew (macOS) → MSYS2 installer (Window
 
 ## Standing Erlang pitfalls
 
+**Windows IDE builds: `SetConsoleModeInitIn` / invalid handle.** This is an
+Erlang runtime startup failure before gateway compilation. IDE-launched Ninja
+can inherit unusable console input handles. `scripts/build_gateway.py` appends
+`-noinput` to `ERL_FLAGS` on Windows: `-noshell` alone still initializes console
+input in OTP 28. Because OTP can still initialize Windows console handles with
+`-noinput`, the wrapper also supplies null stdin, uses `CREATE_NO_WINDOW`, and
+gives the child **no inherited stdio at all**: stdout+stderr go to a pipe the
+wrapper relays to its own stdout and tees to
+`%TEMP%\yuzu_gateway_build.log` (`RUNNER_TEMP` on CI). An IDE-launched Ninja can hand
+Erlang handles it cannot use, in which case the VM exits 1 having printed
+nothing — so the log file, not the IDE's Build window, is where the real Erlang
+error lives. The wrapper prints the resolved child command and reports any
+nonzero child exit code, including its hexadecimal Windows status and the log
+path. **If a CLion gateway build fails with exit 1 and no Erlang output, read
+that log first.**
+
 | Area | Issue |
 |---|---|
 | `ctx` dependency | `ctx:background/0` is used for grpcbox RPC calls. `ctx` is a transitive dep of `grpcbox` but must be listed in `yuzu_gw.app.src` `applications` since we call it directly — otherwise dialyzer can't find it in the PLT. **Rule: if you call a function from a transitive dependency, add it to the applications list.** |

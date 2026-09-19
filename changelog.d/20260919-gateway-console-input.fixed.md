@@ -1,0 +1,1 @@
+- Isolate Windows gateway builds from IDE stdio handles (null stdin, hidden console, piped-and-logged output) so a CLion/Ninja-launched `rebar3 compile` no longer dies silently with exit 1; the wrapper now reports the child command, exit code, and a full-output log path.
