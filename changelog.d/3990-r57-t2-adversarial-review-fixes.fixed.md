@@ -9,8 +9,11 @@
   manifested in the committed data: `collect_t2()` could let a later, unrelated `double_full_sync`
   mask an earlier genuine `fence_violation` (fixed via `resolve_collect_t2_reason()`), and
   `sweep_incomplete()` could drop a fence-violation signal `sweep_row_pure()` turned up on its
-  second look, declaring the row `t2_late` (instrument) instead (fixed via
-  `resolve_sweep_reclassification()`). The post-invocation sweep's membership rule also diverged
+  second look, declaring the row `t2_late` (instrument) instead. This round extracted the branch
+  logic into `resolve_sweep_reclassification()` and added F20 to test it in isolation - but
+  `sweep_incomplete()`, the function's only real caller, kept a catch-all `else` that still
+  overwrote `fence_violation` after this fix; that caller-level bug wasn't actually closed until a
+  later round (see the independent-governance-hardening entry below). The post-invocation sweep's membership rule also diverged
   from the primary classifier's in both directions (no next-application boundary on legacy, no
   floor/adopt handling on spark); it now reuses the primary classifier directly. `compute_verdict()`
   was missing the pre-registered rule that a cell whose instrument-invalid voids exceed 50% of its
