@@ -10569,6 +10569,57 @@ TEST_CASE("#4508 CH-2: candidate reads follow claim outcomes and dispatch state"
         }, 10s));
         CHECK(rt->rule_count() == 0);
     }
+    SECTION("a withdrawn but still-Dispatching claim is not re-abandoned by expiry (m-f)") {
+        auto a = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
+        REQUIRE(a.has_value());
+        REQUIRE(gate->wait_entered(10s));
+        // Still Dispatching (parked, never resolved) - withdraw it now, before it
+        // ever wedges. Case 0 matches it (not yet waiter_abandoned, no outcome
+        // yet) and sets outcome=Withdrawn/end=Withdrawn, but leaves it as the
+        // key's fifo head (only a Queued claim is erased there).
+        rt->detach_rule("r1");
+        CHECK(rt->receipt_status(a->receipt) == RT::ReceiptStatus::Withdrawn);
+        CHECK(rt->wedge_candidate_count_for_test("r1") == 0);
+        CHECK_FALSE(rt->receipt_wedge_candidate_for_test(a->receipt));
+        // Let its original deadline elapse while it's STILL parked (unresolved)
+        // and already carries a terminal outcome. expire_overdue_claims's
+        // outcome-check must skip it - re-abandoning it here would overwrite
+        // `end` back to WaiterTimedOutDispatched and set waiter_abandoned=true,
+        // resurrecting it as a wedge candidate for a rule just withdrawn (m-f).
+        std::this_thread::sleep_for(200ms);
+        CHECK(rt->expire_overdue_claims() == 0);
+        CHECK(rt->receipt_status(a->receipt) == RT::ReceiptStatus::Withdrawn);
+        CHECK(rt->wedge_candidate_count_for_test("r1") == 0);
+        CHECK_FALSE(rt->receipt_wedge_candidate_for_test(a->receipt));
+        gate->release();
+        REQUIRE(yuzu::test::spin_until([&] {
+            return b->disarmed_ids().size() == 1 && rt->claim_queue_depth_for_test(key) == 0;
+        }, 10s));
+        CHECK(rt->rule_count() == 0);
+    }
+    SECTION("a rollback whose claim was already withdrawn mid-dispatch is not re-abandoned (m-h)") {
+        rt->set_dispatch_entry_hook_for_test([&] {
+            rt->detach_rule("r1");
+            throw std::runtime_error{"m-h hook"};
+        });
+        REQUIRE_THROWS_AS(
+            rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true),
+            std::runtime_error);
+        rt->set_dispatch_entry_hook_for_test({});
+        // claim_rollback.fn fired during the throw's unwind and must have seen
+        // arm_claim->outcome already set (by detach_rule's own Case 0,
+        // synchronously, inside the hook) and returned without touching it
+        // again - a second abandon_claim_locked call would overwrite `end` back
+        // to WaiterTimedOutDispatched and set waiter_abandoned=true, wrongly
+        // resurrecting candidacy for a rule already withdrawn (m-h).
+        CHECK(rt->claim_queue_depth_for_test(key) == 1);
+        CHECK(rt->wedge_candidate_count_for_test("r1") == 0);
+        auto r2 = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
+        REQUIRE(r2.has_value());
+        CHECK(r2->kind == RT::ArmOutcomeKind::Accepted);
+        CHECK(rt->receipt_status(r2->receipt) == RT::ReceiptStatus::Pending);
+        CHECK(rt->wedge_candidate_count_for_test("r1") == 0);
+    }
     for (const bool throws : {false, true}) {
         DYNAMIC_SECTION("wedged backend failure, throws=" << throws) {
             auto a = rt->attach_rule(RT::NonWaiting{}, "r1", file_spec("/a"), file_exists_rule("r1"), true);
