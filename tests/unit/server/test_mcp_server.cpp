@@ -744,6 +744,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #include "mcp_input_bounds.hpp"        // kExecInstr* (#2437)
+#include "dex_api_local.hpp"            // ADR-0031 WS-A4: wire the real DexApi seam for the DEX MCP tools
 #include "mcp_server.hpp"
 #include "mcp_server_testonly.hpp"      // tool_*_for_test() accessors (issue #2385)
 
@@ -1459,10 +1460,18 @@ private:
         // no-op for every pre-existing test.
         mcp.set_response_visible_set_fn(response_visible_set_fn_for_test);
 
-        // #4035: same setter idiom, reads dex_fleet_for_test LIVE at request
-        // time (see that field's doc comment) — unconditional, no-op-shaped
-        // default for every pre-existing test.
-        mcp.set_dex_fleet_fn([this]() { return dex_fleet_for_test; });
+        // ADR-0031 WS-A4 (fifth family): McpServer::set_dex_fleet_fn is retired
+        // (the DEX tools get the fleet through the DexApi seam's own FleetFn,
+        // wired below). `dex_fleet_for_test` now flows via make_local_dex_api.
+        // ADR-0031 WS-A4 (fifth family): wire the REAL DexApi seam over this
+        // test's GuaranteedStateStore + fleet, so the DEX signal MCP tools
+        // exercise the SEAM path (production wires it identically). Gated on
+        // store presence exactly like server.cpp — no store → null api → the
+        // tools' harmonized `!dex_api_` readiness guard returns the
+        // store-unavailable error.
+        if (guaranteed_state_store_for_test)
+            mcp.set_dex_api(yuzu::server::make_local_dex_api(
+                guaranteed_state_store_for_test, [this]() { return dex_fleet_for_test; }));
 
         // #4035 hardening (governance): same setter idiom, reads
         // dex_visible_for_test LIVE at request time (see that field's doc
@@ -7841,7 +7850,7 @@ yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     auto dev = [](std::string id, double cpu, const char* cohort) {
         yuzu::server::DexPerfDevice d;
         d.agent_id = std::move(id);
-        d.is_windows = true;
+        d.os = "windows";
         d.cpu_pct = cpu;
         d.commit_pct = 50.0;
         d.disk_lat_ms = 1.0;
@@ -7875,6 +7884,12 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK(fleet["cpu_pct"]["n"] == 16);
     CHECK(fleet["reporting"] == 16);
     CHECK(fleet["windows_online"] == 16);
+    // Additive per-OS fields (C1) — every fixture device is "windows".
+    CHECK(fleet["linux_online"] == 0);
+    CHECK(fleet["macos_online"] == 0);
+    CHECK(fleet["reporting_windows"] == 16);
+    CHECK(fleet["reporting_linux"] == 0);
+    CHECK(fleet["reporting_macos"] == 0);
 
     auto cohorts = mcp_tool_payload(
         ts.call(
@@ -8133,6 +8148,7 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
               R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})")
             ->body);
     CHECK(all.size() == 16);
+    CHECK(all[0]["os"] == "windows"); // additive (C1); mcp_perf_snapshot's fixture
 
     // cohort_value present-but-empty = the untagged residual (none here).
     auto untagged = mcp_tool_payload(

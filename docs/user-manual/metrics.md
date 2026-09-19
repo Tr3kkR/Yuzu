@@ -1205,6 +1205,24 @@ out-of-range readings are rejected).
 | `yuzu_fleet_perf_commit_pct{stat}` | gauge | Fleet memory commit % of limit, same `stat` labels |
 | `yuzu_fleet_perf_disk_lat_ms{stat}` | gauge | Fleet per-IO disk service time (ms), same `stat` labels |
 
+**Per-OS breakdown (C1)** — the same rollup, additionally split by the
+agent's OS (`os` = `windows` / `linux` / `darwin` / `unknown` / `other`,
+same allowlist `yuzu_fleet_agents_by_os` uses). Published alongside the
+fleet-wide families above, cleared and rebuilt every sweep (absent, never a
+stale 0, for an OS nobody reported this cycle). Windows and Linux both have
+a real heartbeat perf collector today; a `darwin` agent can be online
+(`yuzu_fleet_agents_by_os{os="darwin"}` > 0) while never appearing in any
+`yuzu_fleet_perf_os_*` series — that is honest absence, not a bug, until the
+macOS collector ships. Never blend these into a cross-OS aggregate — that is
+exactly what the fleet-wide families above already are:
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_fleet_perf_os_reporting{os}` | gauge | Devices of that OS contributing at least one perf metric this sweep |
+| `yuzu_fleet_perf_os_cpu_pct{stat,os}` | gauge | Per-OS CPU busy % |
+| `yuzu_fleet_perf_os_commit_pct{stat,os}` | gauge | Per-OS memory commit % of limit |
+| `yuzu_fleet_perf_os_disk_lat_ms{stat,os}` | gauge | Per-OS per-IO disk service time (ms) |
+
 **Per-cohort export (opt-in)** — published only when a cohort export tag key
 is configured (Settings → DEX alerts; `runtime_config` key
 `dex_cohort_export_key`):
