@@ -853,24 +853,24 @@ diagnostic, ruling-13 on #3850)
   epoch-fenced runtime-commit measurand (C = T2_last - T0, `docs/spark-stage2-guardian-consumer-
   design.md` §R5.7) as the headline instead. **Phase B (baseline re-deploy trigger): PASS** -
   legacy C median 74.0ms vs spark 98.0ms (margin 1074.0ms), 5/5 valid both backends, zero voids
-  either side. **Phase B2 (bare rule-create trigger, #3990's own literal shape): FAIL-RELIABILITY**
-  - legacy 3/3 valid (C median 66.0ms); spark reached only 2/3 valid across its full 10-attempt
-    budget, and one of the remaining 8 attempts (repeat 3) recorded a GENUINE arm failure
-    (`applied=61, failed=1`, one rule, `blackout-file-03`) that this round's own
-    `/adversarial-review` (Kimi K3 + Codex Sol, both independently) found had been misclassified
-    as an instrument-invalid void by a driver bug (a collection-stage void reason was checked
-    before the T1-reported `failed>0` check) - fixed same-session, the committed row's
-    classification corrected, and the phase's true verdict is FAIL-RELIABILITY, not the
-    INCONCLUSIVE first reported. That arm failure is itself unroot-caused (the rig was
-    unreachable by the time the misclassification was found, so the underlying `agent.log`
-    error line for `blackout-file-03` could not be pulled) - an open product-level finding, not
-    dismissed as instrumentation. Full detail, hypothesis resolution, and raw per-repeat data
-    (same `fullsync-blackout-results.jsonl`, `label="t2-v1"`) are in the run doc's own "R5.7 T2
-    re-run results" section, not restated here. **Do not read this entry's PASS as reopening or
-    superseding the `clean-v2` entry above - they measure different builds under different
-    attach models**, and #3990's own Phase B2 shape now has a genuine, unroot-caused reliability
-    failure under the current model, not merely a floor miss - a re-run needs the underlying
-    arm-failure finding investigated first, not just repeated.
+  either side. **Phase B2 (bare rule-create trigger, #3990's own literal shape): FAIL-RELIABILITY** -
+  legacy 3/3 valid (C median 66.0ms); spark reached only 2/3 valid across its full 10-attempt
+  budget, and one of the remaining 8 attempts (repeat 3) recorded a genuine arm failure
+  (`applied=61, failed=1`, one rule, `blackout-file-03`) that this round's own
+  `/adversarial-review` (Kimi K3 + Codex Sol, both independently) found had been misclassified
+  as an instrument-invalid void by a driver bug (a collection-stage void reason was checked
+  before the T1-reported `failed>0` check) - fixed same-session, the committed row's
+  classification corrected, and the phase's true verdict is FAIL-RELIABILITY, not the
+  INCONCLUSIVE first reported. That arm failure is itself unroot-caused (the rig was
+  unreachable by the time the misclassification was found, so the underlying `agent.log`
+  error line for `blackout-file-03` could not be pulled) - an open product-level finding, not
+  dismissed as instrumentation. Full detail, hypothesis resolution, and raw per-repeat data
+  (same `fullsync-blackout-results.jsonl`, `label="t2-v1"`) are in the run doc's own "R5.7 T2
+  re-run results" section, not restated here. **Do not read this entry's PASS as reopening or
+  superseding the `clean-v2` entry above - they measure different builds under different
+  attach models**, and #3990's own Phase B2 shape now has a genuine, unroot-caused reliability
+  failure under the current model, not merely a floor miss - a re-run needs the underlying
+  arm-failure finding investigated first, not just repeated.
 - Owner: not assigned in source material.
 - Milestone: not specified. Nothing found by this diagnostic changes this row's own
   #2278/#2469/#2279 package - the two are not shown to be related.

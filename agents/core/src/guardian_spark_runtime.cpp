@@ -1639,7 +1639,7 @@ const char* commit_path_name(GuardianSparkRuntime::CommitPath path) {
     case P::CallbackAdopt:
         return "callback-adopt";
     }
-    return "unknown";
+    return "Unknown"; // unreachable if the switch above is kept exhaustive
 }
 
 std::expected<std::uint64_t, std::string>

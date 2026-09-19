@@ -868,5 +868,8 @@ that cell FAILS the reliability gate outright on a genuine, unroot-caused spark 
 re-run before any verdict can be reached for this trigger shape. Does NOT reopen or restate the
 clean-v2 waiting-model result above, which stands as its own record for that build.
 
-This section's own commit is the results record; see the driver-fix commit (`5a833f4ff`) and
-the T2 instrumentation commit (`0a4a605d6`) for the code these results depend on.
+This section's own commit is the results record; see the driver-fix commits (`5a833f4ff`,
+`2dbb9c7d1`), the T2 instrumentation commit (`0a4a605d6`), and this section's own correction
+commit (`a8d37feac`) for the code and the classification fix these results depend on -
+`5a833f4ff` alone still reproduces the retracted INCONCLUSIVE verdict (`2dbb9c7d1` is what fixes
+the precedence bug that caused it).

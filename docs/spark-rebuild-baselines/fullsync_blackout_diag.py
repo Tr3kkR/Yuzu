@@ -169,6 +169,31 @@ def genuine_t1_failure(phase, failed):
     return "failed_gt_0" if phase in ("B", "B2") and failed > 0 else None
 
 
+def resolve_post_t2_void(t1_genuine_reason, collection_reason):
+    """Pure: the WHOLE precedence decision `run_repeat` needs once both
+    signals are available - a T1-genuine failure reason (from
+    genuine_t1_failure(), known before T2 collection even starts) and
+    collect_t2()'s own collection-stage void `reason` (known only after).
+    Genuine ALWAYS wins, unconditionally.
+
+    This function exists (rather than leaving the two sequential `if`s inline
+    in `run_repeat`) because `run_repeat` does live SSH/network I/O and has no
+    offline selftest coverage - a first version of this fix's own regression
+    test (selftest F15) handed a pre-labeled `void_class="genuine"` row
+    straight to `compute_verdict()`, which never exercises this precedence
+    decision at all and would have passed unchanged had the fix never
+    shipped (found by quality-engineer during /governance, confirmed by
+    reverting the fix and re-running selftest - it still passed 17/17).
+    Extracting the decision itself into a pure function lets a fixture
+    supply BOTH signals at once and assert genuine wins, which is what
+    actually regression-tests the bug. Returns (void_class, void_reason)."""
+    if t1_genuine_reason:
+        return "genuine", t1_genuine_reason
+    if collection_reason:
+        return void_class_for(collection_reason), collection_reason
+    return None, None
+
+
 # --------------------------------------------------------------------------
 # ssh / agent-log helpers
 # --------------------------------------------------------------------------
@@ -1049,13 +1074,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     )
     # A collection-stage instrument-invalid `reason` (e.g. double_full_sync,
     # t2_incomplete) must never suppress an ALREADY-known genuine failure -
-    # genuine_t1_failure()'s own docstring has the full rationale.
-    t1_genuine_reason = genuine_t1_failure(phase, failed)
-    if t1_genuine_reason:
-        row.update(void_class="genuine", void_reason=t1_genuine_reason)
-        return row
-    if reason:
-        row.update(void_class=void_class_for(reason), void_reason=reason)
+    # resolve_post_t2_void()'s own docstring has the full rationale, including
+    # why the precedence decision itself, not just genuine_t1_failure()'s
+    # value, needs to be a separately fixture-testable pure function.
+    void_class, void_reason = resolve_post_t2_void(genuine_t1_failure(phase, failed), reason)
+    if void_reason:
+        row.update(void_class=void_class, void_reason=void_reason)
         return row
 
     wm = compute_window_math(t0["ts"], t0d["ts"], t1["ts"], result["selected"])
@@ -1070,10 +1094,12 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["reconcile_sent_delta"] = reconcile_sent_delta
     row["pushes_policy_change_delta"] = pushes_policy_change_delta
 
-    # failed>0 is handled above (hoisted ahead of collect_t2's reason check) -
-    # by this point every remaining row has failed==0.
     phase_is_clean_verdict = phase in ("B", "B2")
     if phase_is_clean_verdict:
+        # failed>0 is handled above for B/B2 (hoisted ahead of collect_t2's reason
+        # check via genuine_t1_failure()) - by this point every remaining B/B2 row
+        # has failed==0. Phase A rows never go through that check and are not
+        # phase_is_clean_verdict, so this guard is what scopes the invariant.
         if applied != total:
             row.update(void_class="instrument", void_reason="applied_ne_total")
             return row
@@ -1606,27 +1632,33 @@ def _f15():
     ok3 = genuine_t1_failure("B2", 0) is None
     ok4 = genuine_t1_failure("A", 1) is None
 
-    # Integration shape of the bug found live (R5.7 T2 re-run, Phase B2 spark
-    # repeat 3): a row with failed=1 that ALSO carries a collection-stage
-    # instrument void reason. Pre-fix, compute_verdict never saw genuine=True
-    # for this row (run_repeat returned "instrument" before ever reaching the
-    # failed>0 check) and the cell's floor was met by other valid rows, so the
-    # phase read PASS. Post-fix, run_repeat now classifies this row
-    # void_class="genuine" up front - verify compute_verdict then reports
-    # FAIL-RELIABILITY regardless of how many other rows are valid.
-    laundered_row = {"comparison_id": "c", "run_id": "r", "phase": "B2", "backend": "spark",
-                      "repeat": 1, "applied": 61, "failed": 1, "total": 62,
-                      "void_class": "genuine", "void_reason": "failed_gt_0"}
-    other_valid = [{"comparison_id": "c", "run_id": "r", "phase": "B2", "backend": "spark",
-                     "repeat": i, "void_class": None, "void_reason": None, "c_ms": 90.0}
-                   for i in range(2, 5)]
-    legacy_valid = [{"comparison_id": "c", "run_id": "rl", "phase": "B2", "backend": "legacy",
-                      "repeat": i, "void_class": None, "void_reason": None, "c_ms": 70.0}
-                     for i in range(1, 4)]
-    verdict = compute_verdict(legacy_valid, [laundered_row] + other_valid, floor=3)
-    ok5 = verdict == "FAIL-RELIABILITY"
-    return (ok1 and ok2 and ok3 and ok4 and ok5,
-            f"phase_gate={ok1 and ok2 and ok3 and ok4} laundering_fixed={ok5} verdict={verdict}")
+    # resolve_post_t2_void() with BOTH signals present at once - the actual
+    # shape of the bug found live (R5.7 T2 re-run, Phase B2 spark repeat 3):
+    # a T1-genuine failure reason AND a collection-stage instrument reason on
+    # the SAME attempt. Genuine must win regardless of argument order or
+    # which signal is falsy.
+    #
+    # quality-engineer found, during /governance, that an earlier version of
+    # this fixture handed a PRE-LABELED void_class="genuine" row straight to
+    # compute_verdict() - which never calls resolve_post_t2_void() (or
+    # run_repeat) at all, so it passed unchanged even with the actual fix
+    # reverted (confirmed empirically: reverting the run_repeat precedence
+    # fix and re-running selftest still passed 17/17). This version calls
+    # resolve_post_t2_void() directly with both raw signals, which DOES fail
+    # if the precedence is wrong - confirmed the other way too: swapping the
+    # two `if` bodies (collection-reason-first) makes this fixture fail.
+    both_signals = resolve_post_t2_void("failed_gt_0", "double_full_sync")
+    ok5 = both_signals == ("genuine", "failed_gt_0")
+    only_collection = resolve_post_t2_void(None, "t1_not_found")
+    ok6 = only_collection == ("instrument", "t1_not_found")
+    only_genuine = resolve_post_t2_void("failed_gt_0", None)
+    ok7 = only_genuine == ("genuine", "failed_gt_0")
+    neither = resolve_post_t2_void(None, None)
+    ok8 = neither == (None, None)
+    return (ok1 and ok2 and ok3 and ok4 and ok5 and ok6 and ok7 and ok8,
+            f"phase_gate={ok1 and ok2 and ok3 and ok4} genuine_wins_over_collection={ok5} "
+            f"collection_only={ok6} genuine_only={ok7} neither={ok8} "
+            f"both_signals_result={both_signals}")
 
 
 def _f16():
