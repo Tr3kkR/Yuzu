@@ -40,6 +40,18 @@ start_pg() ->
 %%--------------------------------------------------------------------
 
 init([]) ->
+    %% HA WS-4 #4555, round-3 PR review fix: own the cluster-discovery
+    %% lifetime address-cap ETS table HERE, before starting any child, so
+    %% the long-lived SUPERVISOR (not the `yuzu_gw_cluster_discovery`
+    %% worker below, a `permanent`-restart CHILD) is the table's owner.
+    %% A worker restart is an ordinary event over a long operational
+    %% lifetime (unrelated bugs, deploys, transient faults) and must NOT
+    %% silently reset the atom-table-exhaustion defense — only this
+    %% supervisor dying (i.e. the whole `yuzu_gw` application) should.
+    %% See yuzu_gw_cluster_discovery.erl's `?DEFAULT_MAX_LIFETIME_ADDRS`
+    %% comment for the full rationale.
+    ok = yuzu_gw_cluster_discovery:ensure_seen_addrs_table(),
+
     SupFlags = #{
         strategy  => one_for_one,
         intensity => 10,

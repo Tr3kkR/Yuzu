@@ -37,7 +37,7 @@
 -module(yuzu_gw_cluster_discovery).
 -behaviour(gen_server).
 
--export([start_link/0]).
+-export([start_link/0, ensure_seen_addrs_table/0]).
 %% exported for testing
 -export([resolve_targets/0, targets_from_addrs/1, sanitize_addrs/1,
          own_short_name/0, own_short_name/1, do_tick/1,
@@ -62,31 +62,49 @@
 -define(MAX_TARGET_ADDRS, 64).
 
 %% Lifetime cap on DISTINCT addresses this VM will EVER turn into an
-%% atom, across every tick, for the life of the process (the actual
-%% atom-table-exhaustion fix — BLOCKING, PR review round 2). Erlang
-%% atoms are NEVER garbage-collected; `?MAX_TARGET_ADDRS` above only
-%% rate-limits a single call, so it does nothing against a hostile DNS
-%% answer that stays under that cap per tick while rotating through an
-%% unbounded total set over time (this module's own threat model already
-%% treats hostile/misconfigured DNS as adversarial, see
-%% `?MIN_COOKIE_LENGTH` in `yuzu_gw_app.erl`). `?SEEN_ADDRS_TABLE` records
-%% every address string ever accepted; once this many DISTINCT addresses
-%% have been atomized, any genuinely new address is refused outright
-%% (never dialed that tick) rather than atomized — degraded, not
-%% catastrophic. Runtime-configurable (`cluster_max_lifetime_addrs`,
-%% default below) rather than a compile-time constant specifically so a
-%% test can exercise the refusal path with a small temporary cap instead
-%% of having to permanently exhaust the real one against the
-%% process-global, shared `?SEEN_ADDRS_TABLE` (a table sized to the
-%% production default would otherwise poison every other test sharing
-%% this eunit VM's table for the rest of the run). The production
-%% default, 1024, is generously above any realistic deployment's
-%% lifetime address churn (container restarts, IP reassignment across
-%% the life of one gateway process) and negligible next to the VM's
-%% ~1,048,576-entry atom table. A gateway restart resets this counter
-%% (the table is process-owned, not persisted) — an attacker forcing
-%% restarts to reset it is already bounded by `yuzu_gw_sup`'s own
-%% restart-intensity limits.
+%% atom, across every tick, for the life of the OWNING PROCESS (the
+%% actual atom-table-exhaustion fix — BLOCKING, PR review rounds 2-3).
+%% Erlang atoms are NEVER garbage-collected; `?MAX_TARGET_ADDRS` above
+%% only rate-limits a single call, so it does nothing against a hostile
+%% DNS answer that stays under that cap per tick while rotating through
+%% an unbounded total set over time (this module's own threat model
+%% already treats hostile/misconfigured DNS as adversarial, see
+%% `?MIN_COOKIE_LENGTH` in `yuzu_gw_app.erl`). `?SEEN_ADDRS_TABLE`
+%% records every address string ever accepted; once this many DISTINCT
+%% addresses have been atomized, any genuinely new address is refused
+%% outright (never dialed that tick) rather than atomized — degraded,
+%% not catastrophic.
+%%
+%% ROUND-3 CORRECTION: an earlier version of this comment claimed the
+%% cap held "for the life of the process" and that an attacker forcing
+%% restarts to reset it "is already bounded by yuzu_gw_sup's own
+%% restart-intensity limits" — NEITHER claim was accurate. `ets:new/2`
+%% ties a table's automatic-cleanup-on-owner-death to whichever process
+%% CALLS `ensure_seen_addrs_table/0` first; if that were still this
+%% gen_server (a `permanent`-restart CHILD, not the supervisor), a
+%% worker crash-and-restart (an ordinary event over a long operational
+%% lifetime — unrelated bugs, deploys, transient faults, NOT
+%% specifically rate-limited by `yuzu_gw_sup`'s `intensity => 10, period
+%% => 60`, which only throttles BURSTS, not a slower sustained cadence)
+%% would silently reset the count to 0 while the atoms already created
+%% stayed permanently allocated — narrowing the finding each round
+%% without actually closing it. FIXED: `yuzu_gw_sup:init/1` now calls
+%% `ensure_seen_addrs_table/0` itself, BEFORE starting any child, so the
+%% SUPERVISOR (which outlives every child restart, and only dies if the
+%% whole `yuzu_gw` application does) owns the table. This gen_server's
+%% own call to the same idempotent function later just finds the table
+%% already exists.
+%%
+%% Runtime-configurable (`cluster_max_lifetime_addrs`, default below)
+%% rather than a compile-time constant specifically so a test can
+%% exercise the refusal path with a small temporary cap instead of
+%% having to permanently exhaust the real one against the process-
+%% global, shared `?SEEN_ADDRS_TABLE` (a table sized to the production
+%% default would otherwise poison every other test sharing this eunit
+%% VM's table for the rest of the run). The production default, 1024,
+%% is generously above any realistic deployment's lifetime address
+%% churn (container restarts, IP reassignment) and negligible next to
+%% the VM's ~1,048,576-entry atom table.
 -define(DEFAULT_MAX_LIFETIME_ADDRS, 1024).
 -define(SEEN_ADDRS_TABLE, yuzu_gw_cluster_discovery_seen_addrs).
 
@@ -294,38 +312,55 @@ resolve_seed_dns_addrs() ->
 %% creation. Exported for testing.
 -spec targets_from_addrs([string()]) -> [node()].
 targets_from_addrs(AddrStrs) ->
+    ensure_seen_addrs_table(),
     Short = own_short_name(),
-    lists:filtermap(fun(AddrStr) -> bounded_target_atom(Short, AddrStr) end, AddrStrs).
+    Cap = application:get_env(yuzu_gw, cluster_max_lifetime_addrs,
+                               ?DEFAULT_MAX_LIFETIME_ADDRS),
+    {Accepted, RefusedCount} = lists:foldr(
+        fun(AddrStr, {AccAcc, RefAcc}) ->
+            case bounded_target_atom(Short, AddrStr, Cap) of
+                {true, Node} -> {[Node | AccAcc], RefAcc};
+                false        -> {AccAcc, RefAcc + 1}
+            end
+        end, {[], 0}, AddrStrs),
+    %% Logged/telemetered ONCE per call with a COUNT, not once per
+    %% refused address (K4, PR review round 3) — under sustained hostile
+    %% DNS past the cap this could otherwise be up to ?MAX_TARGET_ADDRS
+    %% error-level log lines every tick indefinitely, well after the
+    %% dedicated CRITICAL alert has already made the condition known.
+    case RefusedCount of
+        0 -> ok;
+        _ ->
+            Size = ets:info(?SEEN_ADDRS_TABLE, size),
+            logger:error(
+                "Cluster discovery: lifetime address cap (~p) reached — "
+                "refused ~p never-before-seen address(es) this tick. This "
+                "process has atomized ~p distinct addresses since it started; "
+                "if this keeps happening, the seed DNS name may be returning "
+                "a rotating/hostile answer set. A yuzu_gw_cluster_discovery "
+                "worker restart does NOT reset this counter (the table is "
+                "owned by the long-lived yuzu_gw_sup supervisor).",
+                [Cap, RefusedCount, Size]),
+            telemetry:execute([yuzu, gw, cluster, address_cap_exceeded],
+                               #{count => RefusedCount}, #{})
+    end,
+    Accepted.
 
 %% @private `{true, Node}` for an address already atomized before (the
 %% existing atom is reused, no new atom is created) or one accepted
 %% because the lifetime cap has not been reached yet (a new atom is
 %% created and recorded so it counts against the cap from now on);
 %% `false` (dropped — not dialed this tick) once the cap is reached for a
-%% genuinely new address. The refusal is logged and telemetered via its
-%% OWN counter, distinct from `sanitize_addrs/1`'s per-call cap warning —
-%% this is the condition actually worth alerting on.
-bounded_target_atom(Short, AddrStr) ->
-    ensure_seen_addrs_table(),
+%% genuinely new address. Purely mechanical — no logging/telemetry here,
+%% see `targets_from_addrs/1`'s aggregated call site (K4, round 3).
+bounded_target_atom(Short, AddrStr, Cap) ->
     Key = Short ++ "@" ++ AddrStr,
     case ets:lookup(?SEEN_ADDRS_TABLE, Key) of
         [{Key, Node}] ->
             {true, Node};
         [] ->
-            Cap = application:get_env(yuzu_gw, cluster_max_lifetime_addrs,
-                                       ?DEFAULT_MAX_LIFETIME_ADDRS),
             case ets:info(?SEEN_ADDRS_TABLE, size) of
                 Size when Size >= Cap ->
-                    logger:error(
-                        "Cluster discovery: lifetime address cap (~p) reached — "
-                        "refusing to create a new atom for a never-before-seen "
-                        "address. This VM has atomized ~p distinct addresses "
-                        "since boot; if this keeps happening, the seed DNS name "
-                        "may be returning a rotating/hostile answer set. A "
-                        "gateway restart resets this counter.",
-                        [Cap, Size]),
-                    telemetry:execute([yuzu, gw, cluster, address_cap_exceeded],
-                                       #{count => 1}, #{}),
                     false;
                 _ ->
                     Node = list_to_atom(Key),
@@ -334,11 +369,18 @@ bounded_target_atom(Short, AddrStr) ->
             end
     end.
 
-%% @private Idempotent and callable from any process (including directly
-%% from a test that exercises `targets_from_addrs/1` without starting
-%% this gen_server) — `public` so any caller can read/insert; the
-%% `badarg` catch handles losing a creation race to another process (two
-%% processes both observing `undefined` and racing `ets:new/2`).
+%% @doc Idempotent and callable from any process — `yuzu_gw_sup:init/1`
+%% calls this BEFORE starting any child specifically so the long-lived
+%% SUPERVISOR owns the table rather than the `yuzu_gw_cluster_discovery`
+%% worker (a `permanent`-restart CHILD whose restart would otherwise
+%% silently reset the lifetime cap — round-3 PR review finding, see
+%% `?DEFAULT_MAX_LIFETIME_ADDRS`'s comment). `public` so any caller
+%% (a test exercising `targets_from_addrs/1` directly, this gen_server's
+%% own later idempotent call) can read/insert regardless of who owns it;
+%% the `badarg` catch handles losing a creation race to another process
+%% (two processes both observing `undefined` and racing `ets:new/2`).
+%% Exported so `yuzu_gw_sup` can call it.
+-spec ensure_seen_addrs_table() -> ok.
 ensure_seen_addrs_table() ->
     case ets:info(?SEEN_ADDRS_TABLE) of
         undefined ->

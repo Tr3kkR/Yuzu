@@ -306,11 +306,15 @@ groups:
             unexpectedly large, rotating, or hostile answer set — check
             what YUZU_GW_SEED_DNS_NAME/YUZU_GW_SEED_NODES actually
             resolves to right now, and whether DNS for that name is
-            compromised or misconfigured. A gateway restart resets the
-            counter (the safeguard's table is process-owned, not
-            persisted) but does NOT fix a still-hostile DNS answer — it
-            will simply refill the cap again. See ADR-2002 §7b and
-            docs/user-manual/gateway.md's Prometheus Metrics section.
+            compromised or misconfigured. Only a FULL gateway restart
+            (the whole OS process) resets this counter — an internal
+            yuzu_gw_cluster_discovery worker crash-and-restart does NOT,
+            since its lifetime table is owned by the long-lived
+            yuzu_gw_sup supervisor, not the worker (round-3 review
+            fix). Either way, restarting does NOT fix a still-hostile
+            DNS answer — it will simply refill the cap again. See
+            ADR-2002 §7b and docs/user-manual/gateway.md's Prometheus
+            Metrics section.
 
   - name: yuzu-security
     rules:

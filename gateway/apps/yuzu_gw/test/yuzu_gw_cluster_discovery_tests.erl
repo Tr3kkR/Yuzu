@@ -153,6 +153,53 @@ unique_test_addr() ->
     "cap-test-" ++ integer_to_list(erlang:unique_integer([positive])).
 
 %%%===================================================================
+%%% Table ownership survives a transient user's death (round-3 PR
+%%% review: the lifetime cap must be scoped to the OWNING process, not
+%%% reset by an unrelated process merely USING the table)
+%%%===================================================================
+
+%% This does NOT start the real yuzu_gw_sup tree (whose other children
+%% have real port/network side effects unsuited to a plain eunit run) --
+%% it instead proves the invariant that actually matters directly:
+%% calling targets_from_addrs/1 (exactly what yuzu_gw_cluster_discovery's
+%% gen_server does on every tick) from a transient process never makes
+%% that process the table's owner, so that process dying (a worker
+%% crash-and-restart, in production) cannot delete the table or reset
+%% the count. Deliberately spawns and KEEPS ALIVE a dedicated
+%% "simulated supervisor" process to establish (or confirm) ownership
+%% first, rather than relying on which process happens to own the
+%% table already — plain eunit test functions each run in their OWN
+%% short-lived process, so which process "incidentally" owns a
+%% lazily-created table depends on eunit's own scheduling and is not
+%% something this test may assume either way.
+worker_process_death_does_not_affect_seen_addrs_table_test() ->
+    Self = self(),
+    FakeSup = spawn(fun() ->
+        ok = yuzu_gw_cluster_discovery:ensure_seen_addrs_table(),
+        Self ! sup_ready,
+        receive stop -> ok end
+    end),
+    receive sup_ready -> ok after 2000 -> error(fake_sup_did_not_start) end,
+    Owner = ets:info(yuzu_gw_cluster_discovery_seen_addrs, owner),
+    ?assert(is_pid(Owner)),
+    Addr = unique_test_addr(),
+    {WorkerPid, WorkerRef} = spawn_monitor(fun() ->
+        [_Node] = yuzu_gw_cluster_discovery:targets_from_addrs([Addr]),
+        ok
+    end),
+    receive
+        {'DOWN', WorkerRef, process, WorkerPid, normal} -> ok
+    after 2000 ->
+        error(worker_did_not_finish)
+    end,
+    ?assertEqual(Owner, ets:info(yuzu_gw_cluster_discovery_seen_addrs, owner)),
+    FakeSup ! stop,
+    %% The address the now-dead transient WORKER process atomized is
+    %% still resolvable — the table (and the atom it created) survived
+    %% the worker's death, independent of the (still-alive) owner.
+    ?assertMatch([_], yuzu_gw_cluster_discovery:targets_from_addrs([Addr])).
+
+%%%===================================================================
 %%% clamp_interval/1 — pure
 %%%===================================================================
 
