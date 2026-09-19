@@ -863,7 +863,8 @@ diagnostic, ruling-13 on #3850)
   classification corrected, and the phase's true verdict is FAIL-RELIABILITY, not the
   INCONCLUSIVE first reported. That arm failure is itself unroot-caused (the rig was
   unreachable by the time the misclassification was found, so the underlying `agent.log`
-  error line for `blackout-file-03` could not be pulled) - an open product-level finding, not
+  error line for `blackout-file-03` could not be pulled) - an open product-level finding,
+  filed as [#4607](https://github.com/Tr3kkR/Yuzu/issues/4607), not
   dismissed as instrumentation. Full detail, hypothesis resolution, and raw per-repeat data
   (same `fullsync-blackout-results.jsonl`, `label="t2-v1"`) are in the run doc's own "R5.7 T2
   re-run results" section, not restated here. **Do not read this entry's PASS as reopening or

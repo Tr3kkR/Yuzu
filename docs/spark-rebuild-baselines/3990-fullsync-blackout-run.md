@@ -829,9 +829,8 @@ DGRHP rig was unreachable by the time this was found (SSH session had already en
 raw `agent.log` line for that specific failure (which would name the underlying error) could
 not be pulled. Recorded as an open, unresolved product-level finding per the pre-registered
 rule ("any genuine failure... is filed as its own product finding separate from this
-diagnostic") - not root-caused, not dismissed as instrumentation. **Not filed as its own issue
-yet** - a draft is ready (governance `enterprise-readiness` finding, this run) but issue creation
-needs operator action; cross-reference the issue number here once filed. **Observability gap,
+diagnostic") - not root-caused, not dismissed as instrumentation. **Filed as
+[#4607](https://github.com/Tr3kkR/Yuzu/issues/4607).** **Observability gap,
 noted here for whoever picks this up (governance `sre` finding, this run)**: `yuzu.guardian_arm_failed`
 (`yuzu_fleet_guardian_arm_failed`) is an existing production metric that would have counted
 exactly this failure, but no alert rule exists on it in `docs/prometheus/yuzu-alerts.yml` today -
