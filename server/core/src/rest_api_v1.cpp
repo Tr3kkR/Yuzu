@@ -15149,7 +15149,27 @@ void RestApiV1::register_routes(
             return;
         }
 
-        auto exec_opt = execution_tracker->get_execution(exec_id);
+        // Governance fix (#2146 A2-R1 Gate 8 re-review): was the plain
+        // get_execution(), which collapses "row genuinely absent" and "read
+        // degraded" (pool/query failure) to the same nullopt -- a transient
+        // degrade here fell through to the not-found + denial-audit branch
+        // below, producing a FALSE 404 for a legitimate owner and a
+        // permanently wrong CC7.2 audit trail for a non-owner.
+        // get_execution_checked's outer std::expected distinguishes the two;
+        // the degrade branch below matches this same route's own agents_opt
+        // degrade handling a few lines down.
+        auto exec_r = execution_tracker->get_execution_checked(exec_id);
+        if (!exec_r) {
+            res.status = 503;
+            res.set_content(
+                detail::error_json_a4(503, "execution tracker degraded", cid,
+                                      /*retry_after_ms=*/5000,
+                                      "retry shortly; the execution read failed "
+                                      "transiently"),
+                "application/json");
+            return;
+        }
+        auto exec_opt = *exec_r;
         // #1634 perf (governance Gate 3 finding): only fetch/scan agent
         // statuses when confined — an unrestricted subscriber is always
         // visible regardless, so this indexed lookup would be pure waste on

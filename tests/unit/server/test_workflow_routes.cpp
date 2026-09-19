@@ -107,6 +107,19 @@ fs::path uniq(const std::string& prefix) {
     return yuzu::test::unique_temp_path(prefix + "-");
 }
 
+// Fault-injection helper for the #2146 A2-R1 Gate 8 degrade tests below: runs
+// a raw statement over a fresh side connection (never the harness's own
+// pool, so the tracker's `open_`/pool state stays otherwise healthy -- only
+// the ONE targeted query fails). Mirrors test_rest_executions_v1_twins.cpp's
+// identical `exec_sql` idiom.
+void exec_sql(const std::string& dsn, const std::string& sql) {
+    PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    PgResult r{PQexec(conn.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE(r.ok());
+}
+
 struct ExecHarness {
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
@@ -771,6 +784,48 @@ TEST_CASE("executions detail: unwired fleet_read_fn -> 503, fail closed",
     // the wrong branch. Match the dashboard sibling's body-substring check
     // (test_dashboard_results_fragment.cpp) to pin the actual branch.
     CHECK(res->body.find("Service unavailable") != std::string::npos);
+}
+
+// Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
+// get_execution(), which collapses "execution genuinely absent" and "read
+// degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a
+// genuine absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("executions detail: a transient tracker degrade is 503, not a false 404, "
+          "and records no denial audit (#2146 A2-R1 Gate 8 fix)",
+          "[pg][workflow][executions][detail]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-2146b", "2146b");
+    auto eid = h.make_exec("def-2146b", "completed", 1, 1, 0);
+    // Engage a confined scope so the OLD code's denial-audit branch would
+    // have fired on the false 404 this fix closes -- an unconfined caller
+    // never reaches that branch at all.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-0"}};
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault.
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146b");
+    auto res = h.sink.Get("/fragments/executions/" + eid + "/detail");
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions_hidden_2146b RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    CHECK(res->body.find("Execution tracker degraded") != std::string::npos);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // execution.detail.view/denied here.
+    for (const auto& c : h.audit_calls)
+        CHECK(c.target_id != eid);
 }
 
 // #3565: this codebase has a documented prior incident (authz_model.hpp's
@@ -1626,6 +1681,47 @@ TEST_CASE("SSE handler: 410 Gone for terminal execution", "[pg][workflow][execut
     auto res = h.sink.Get("/sse/executions/" + exec_id);
     REQUIRE(res);
     CHECK(res->status == 410);
+}
+
+// Governance fix (#2146 A2-R1 Gate 8 re-review): this route used the plain
+// get_execution(), which collapses "execution genuinely absent" and "read
+// degraded" (a transient pool/query failure) to the same nullopt -- a
+// degrade fell through to the SAME not-found + denial-audit branch a
+// genuine absence takes, producing a FALSE 404 for a legitimate owner and a
+// permanently wrong CC7.2 denial audit row for a confined caller whose only
+// "fault" was hitting a transient outage. get_execution_checked's outer
+// std::expected now distinguishes the two; the degrade branch returns
+// BEFORE any denial audit is recorded.
+TEST_CASE("SSE handler: a transient tracker degrade is 503, not a false 404, and "
+          "records no denial audit (#2146 A2-R1 Gate 8 fix)",
+          "[pg][workflow][executions][pr3]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecHarness h(pool);
+    h.make_def("def-2146c", "2146c");
+    auto exec_id = h.make_exec("def-2146c", "running", 1, 0, 0);
+    // Engage a confined scope so the OLD code's denial-audit branch would
+    // have fired on the false 404 this fix closes.
+    h.fleet_read_scope = yuzu::server::authz::VisibleSet{std::unordered_set<std::string>{"agent-0"}};
+
+    // Break ONLY the get_execution_checked query -- a raw statement over a
+    // side connection, never the harness's own pool, so the tracker stays
+    // "open" and this is a genuine single-call fault.
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions RENAME TO executions_hidden_2146c");
+    auto res = h.sink.Get("/sse/executions/" + exec_id);
+    exec_sql(db.dsn(),
+             "ALTER TABLE execution_tracker.executions_hidden_2146c RENAME TO executions");
+
+    REQUIRE(res);
+    // (a) 503, never the old false 404.
+    CHECK(res->status == 503);
+    CHECK(res->body.find("tracker degraded") != std::string::npos);
+
+    // (b) no denial audit row for this execution -- pre-fix, this recorded
+    // execution.live_subscribe/denied here.
+    for (const auto& c : h.audit_calls)
+        CHECK(c.target_id != exec_id);
 }
 
 TEST_CASE("SSE handler: invisible terminal execution collapses to the missing-id 404",
