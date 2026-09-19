@@ -843,7 +843,9 @@ diagnostic, ruling-13 on #3850)
   spark 127.0ms (threshold 1070.0ms); Phase B2 legacy 86.0ms vs spark 140.0ms (threshold
   1086.0ms) - both within the predeclared non-inferiority margin. Full detail, all three
   corrections, and the raw per-repeat data for every round (`fullsync-blackout-results.jsonl`,
-  the clean pass under `label="clean-v2"`) are in the run doc, not restated here.
+  the clean pass under `label="clean-v2"`) are in the run doc, not restated here. **This
+  `clean-v2` PASS was measured on the WAITING attach model** (`origin/dev@65f2938156a19`,
+  pre-rung-9c-PR-2) and stands unedited as its own record for that build.
 - Owner: not assigned in source material.
 - Milestone: not specified. Nothing found by this diagnostic changes this row's own
   #2278/#2469/#2279 package - the two are not shown to be related.
