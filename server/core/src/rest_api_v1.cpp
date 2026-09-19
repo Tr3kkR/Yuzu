@@ -1472,9 +1472,14 @@ const std::string& openapi_spec() {
     "/result-sets/{id}": {
       "get": {"summary": "Get one result set's metadata", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped (non-owner is indistinguishable from missing — existence-oracle-safe 404). Service-scoped API tokens are denied outright (403).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}>"}, "403": {"description": "Result-set detail denied to a service-scoped token"}, "404": {"description": "Not found, or not owned by the caller"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership"}}},
       "delete": {"summary": "Delete a result set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Owner-scoped; service-scoped API tokens are denied outright (403). A pinned set must be unpinned first.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"200": {"description": "{deleted: true}"}, "403": {"description": "Result-set delete denied to a service-scoped token"}, "404": {"description": "Not found or not owned by the caller, OR the delete itself failed after ownership was confirmed (e.g. a store write error) — that failure is not currently distinguished from not-found"}, "409": {"description": "RESULT_SET_PINNED — unpin the set first"}, "503": {"description": "RESULT_SET_STORE_UNAVAILABLE — could not verify ownership (read stage only)"}}}
-    },
+    },)json"
+        // Fresh literal split (MSVC C2026 16,380-byte cap) -- #4540 fix: the
+        // #4493 /re-eval description addition below pushed the prior literal
+        // back over the cap; split immediately before it, same idiom as the
+        // #3992 F2 split just below.
+        R"json(
     "/result-sets/{id}/re-eval": {
-      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
+      "post": {"summary": "Re-run a result set's own source query into a sibling set", "tags": ["Result Sets"], "description": "Only available when ResultSetStore is configured (construction fails closed if Postgres is unreachable at boot, ADR-0006/0036) — a store that fails to construct is a fatal startup error (ADR-0012 §1) that halts the process, not a degraded-serving state; in a running server this route is always registered. Requires Execution:Execute. Re-runs the ORIGINAL set's source query (tar_query or instruction_result only — other source kinds return 400, sync sources are deferred) and creates a SIBLING (same parent_id as the original, NOT a child). Async, same pending/materialise contract as the from-* producers. Re-run fields are capped at the same bounds the MCP producer tools enforce (#4373).", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^rs_[0-9a-f]+$"}}], "responses": {"202": {"description": "<ResultSet {id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}> with status=pending"}, "400": {"description": "Checked in order: the stored source_payload nests past the JSON depth guard (#4493) - the row is healed in place (source_payload discarded, status/members untouched) as a side effect of this rejection, so a later re-eval attempt is refused for a different reason instead of repeating the same depth error; otherwise, the original carries no re-runnable source (missing/type-mismatched sql or instruction_id), a re-run field exceeds its bound (#4373), or the source_kind is unsupported for re-eval"}, "404": {"description": "Not found, or not owned by the caller"}, "429": {"description": "Owner is at the per-owner set cap"}, "500": {"description": "RESULT_SET_GATE_UNCONFIGURED — dispatch-visibility gate not wired"}, "503": {"description": "RESULT_SET_NO_AGENTS, dispatch unavailable/failed, or the instruction store is unavailable"}}}
     },)json"
         // Fresh literal split (MSVC C2026 16,380-byte cap) — #3992 F2 backfill
         // continues: remaining result-set / software-deployment / license CRUD.
@@ -9862,8 +9867,8 @@ void RestApiV1::register_routes(
         // dispatch and land a new pending row; sync sources are deferred to
         // PR-G (their re-eval needs the inventory evaluator on this path).
         sink.Post(R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)",
-                  [auth_fn, perm_fn, rs_err, load_owned, run_async, instruction_store](
-                      const httplib::Request& req, httplib::Response& res) {
+                  [auth_fn, perm_fn, audit_fn, rs_err, load_owned, run_async, instruction_store,
+                   result_set_store](const httplib::Request& req, httplib::Response& res) {
                       auto session = auth_fn(req, res);
                       if (!session)
                           return;
@@ -9891,8 +9896,32 @@ void RestApiV1::register_routes(
                       // guards above; on rejection, never reach run_async (no
                       // re-dispatch of a row we can't safely re-serialise).
                       if (mcp::json_exceeds_depth(orig->source_payload, mcp::kMcpMaxJsonDepth)) {
+                          // #4493: heal the row in place so it is never a live
+                          // grenade for a future read again -- this specific
+                          // re-eval attempt still cannot proceed (the original
+                          // query is unrecoverably gone), but every future read
+                          // of this row (this route included) hits the safe
+                          // placeholder instead of repeating the same
+                          // depth-check dance against the poisoned text forever.
+                          // Gate 2/4 governance finding (#4493 re-review): this
+                          // is the only rejection branch in the whole result-set
+                          // family that performs a real write to an otherwise
+                          // immutable-by-design table (scope-walking-design.md),
+                          // so audit BOTH outcomes explicitly rather than
+                          // silently mutating on an error path -- and never
+                          // claim the payload "has been discarded" unless the
+                          // write actually committed (a naive unconditional
+                          // audit_fn("success",...) here would fabricate a
+                          // durable record of a write that never happened).
+                          const bool healed = result_set_store->heal_poisoned_payload(id);
+                          audit_fn(req, "result_set.heal", healed ? "success" : "failure",
+                                   "ResultSet", id, "");
                           rs_err(res, 400,
-                                 "RESULT_SET_BAD_REQUEST: stored source_payload nests too deeply");
+                                 healed ? "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                          "nested too deeply and has been discarded; re-eval "
+                                          "is unavailable for this set"
+                                        : "RESULT_SET_BAD_REQUEST: stored source_payload "
+                                          "nested too deeply; heal attempt failed, try again");
                           return;
                       }
                       auto sp = nlohmann::json::parse(orig->source_payload, nullptr, false);

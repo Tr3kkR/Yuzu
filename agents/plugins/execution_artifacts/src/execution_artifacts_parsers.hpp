@@ -49,6 +49,7 @@
 #include <expected>
 #include <format>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <span>
@@ -729,6 +730,47 @@ inline Result<PrefetchResult> parse_prefetch(std::span<const uint8_t> in) {
     }
 
     return out;
+}
+
+// Prefetch absence tokens (#4391) -- emitted by the impure shell in place of
+// the old single "prefetch_disabled" literal when FindFirstFileW sees zero
+// `.pf` files, distinguishing three forensically distinct situations:
+inline constexpr std::string_view kPrefetchDisabled = "prefetch_disabled";
+inline constexpr std::string_view kPrefetchEvidenceAbsent = "prefetch_evidence_absent";
+inline constexpr std::string_view kPrefetchStateUnknown = "prefetch_state_unknown";
+
+/// Maps the registry's `EnablePrefetcher` DWORD (PrefetchParameters) to one
+/// of the three tokens above. Called ONLY when the enumeration of
+/// `C:\Windows\Prefetch\*.pf` saw zero files.
+///
+///  - `nullopt` (the registry value/key could not be read at all, for any
+///    reason -- missing, wrong type, access denied) -> `prefetch_state_unknown`:
+///    we have no idea whether prefetching is even configured on.
+///  - `0` -> `prefetch_disabled`: the prefetcher is off; zero `.pf` files is
+///    exactly what a correctly-functioning system produces.
+///  - `1`, `2`, or `3` -- Microsoft's documented settings (1 = application
+///    prefetching only, 2 = boot prefetching only, 3 = both) -- ->
+///    `prefetch_evidence_absent`: prefetching is configured ON, so `.pf`
+///    files should exist; their absence is CONSISTENT WITH, but not proof
+///    of, removal after the fact. This does not consult the SysMain service
+///    state: a disabled SysMain leaves the directory empty with the value
+///    still 3, which also maps here.
+///  - any other value -> `prefetch_state_unknown`: an undocumented setting
+///    has no established meaning and must never be turned into an
+///    evidence claim.
+constexpr std::string_view prefetch_absence_token(std::optional<uint32_t> enable_prefetcher) noexcept {
+    if (!enable_prefetcher)
+        return kPrefetchStateUnknown;
+    switch (*enable_prefetcher) {
+        case 0:
+            return kPrefetchDisabled;
+        case 1:
+        case 2:
+        case 3:
+            return kPrefetchEvidenceAbsent;
+        default:
+            return kPrefetchStateUnknown;
+    }
 }
 
 } // namespace yuzu::execution_artifacts

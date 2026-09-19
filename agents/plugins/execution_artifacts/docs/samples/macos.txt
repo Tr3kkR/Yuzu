@@ -1,16 +1,16 @@
-captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-15 · euid 501 · leg-hash 421f7d82a099
+captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-17 · euid 501 · leg-hash 421f7d82a099
 == action=shimcache
-unsupported|windows_only_artefact
+shimcache|unsupported|windows_only_artefact
 [result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
 [rc] 1
 
 == action=amcache
-unsupported|windows_only_artefact
+amcache|unsupported|windows_only_artefact
 [result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
 [rc] 1
 
 == action=prefetch
-unsupported|windows_only_artefact
+prefetch|unsupported|windows_only_artefact
 [result_status] UNAVAILABLE / PARTIAL / windows_only_artefact
 [rc] 1
 
