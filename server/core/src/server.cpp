@@ -15656,14 +15656,10 @@ private:
                     continue;
                 DexPerfDevice d;
                 d.agent_id = id;
-                std::string os = s->os;
-                for (auto& c : os)
-                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                // starts_with, NOT find: "darwin" CONTAINS "win" — a substring
-                // match classifies every macOS agent as Windows (G4 UP-1
-                // BLOCKING). Agents report "windows" / "darwin" / "linux"
-                // (agents/core/src/agent.cpp kAgentOs).
-                d.is_windows = os.starts_with("win");
+                // Normalization (incl. the "darwin contains win" G4 UP-1 fix)
+                // is the ONE shared dex_perf_os_from_session — see its doc
+                // comment in dex_perf_rules.hpp for the full rationale.
+                d.os = detail::dex_perf_os_from_session(s->os);
                 if (auto it = by_id.find(id); it != by_id.end()) {
                     const auto& tags = it->second->status_tags;
                     auto get = [&](const char* k) -> std::string {
@@ -15913,18 +15909,19 @@ private:
                     std::string os = s->os;
                     for (auto& c : os)
                         c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-                    // starts_with, NOT find — "darwin" contains "win"
-                    // (G4 UP-1; pre-existing here, fixed with the sibling).
-                    if (os.starts_with("win"))
-                        ++f.windows_online;
+                    // The shared normalizer (dex_perf_rules.hpp) folds the
+                    // "darwin contains win" G4 UP-1 fix into one place instead
+                    // of a duplicate copy of the comment at every call site.
+                    const std::string norm_os = detail::dex_perf_os_from_session(os);
                     // Per-OS online denominators (#1746) — same coverage-honest
                     // count as windows_online, so the Catalogue's single-OS
                     // filter can score a family against THAT OS's own fleet.
-                    if (os.starts_with("lin"))
+                    if (norm_os == "windows")
+                        ++f.windows_online;
+                    else if (norm_os == "linux")
                         ++f.linux_online;
-                    if (os.starts_with("darwin") || os.starts_with("macos"))
-                        ++f.macos_online; // prefix, like win/lin — keep in
-                                          // step with the store's write canon
+                    else if (norm_os == "macos")
+                        ++f.macos_online;
                     // Distinct connected OS tokens → the Catalogue's "All
                     // connected" coverage scope (render normalises darwin→macos).
                     if (!os.empty() && std::find(f.connected_os.begin(),

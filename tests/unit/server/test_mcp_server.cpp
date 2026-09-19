@@ -7841,7 +7841,7 @@ yuzu::server::DexPerfSnapshot mcp_perf_snapshot(const std::string& key) {
     auto dev = [](std::string id, double cpu, const char* cohort) {
         yuzu::server::DexPerfDevice d;
         d.agent_id = std::move(id);
-        d.is_windows = true;
+        d.os = "windows";
         d.cpu_pct = cpu;
         d.commit_pct = 50.0;
         d.disk_lat_ms = 1.0;
@@ -7875,6 +7875,12 @@ TEST_CASE("MCP DEX perf: fleet stats + cohorts (floor + untagged-key honesty)",
     CHECK(fleet["cpu_pct"]["n"] == 16);
     CHECK(fleet["reporting"] == 16);
     CHECK(fleet["windows_online"] == 16);
+    // Additive per-OS fields (C1) — every fixture device is "windows".
+    CHECK(fleet["linux_online"] == 0);
+    CHECK(fleet["macos_online"] == 0);
+    CHECK(fleet["reporting_windows"] == 16);
+    CHECK(fleet["reporting_linux"] == 0);
+    CHECK(fleet["reporting_macos"] == 0);
 
     auto cohorts = mcp_tool_payload(
         ts.call(
@@ -8133,6 +8139,7 @@ TEST_CASE("MCP DEX perf: devices — cohort_value presence semantics + limit par
               R"({"jsonrpc":"2.0","method":"tools/call","id":52,"params":{"name":"list_dex_perf_devices","arguments":{"cohort_key":"model"}}})")
             ->body);
     CHECK(all.size() == 16);
+    CHECK(all[0]["os"] == "windows"); // additive (C1); mcp_perf_snapshot's fixture
 
     // cohort_value present-but-empty = the untagged residual (none here).
     auto untagged = mcp_tool_payload(
