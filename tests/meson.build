@@ -347,6 +347,7 @@ agent_test_exe = executable(
                                           # macos_console_user.hpp already reachable via the agents/shared
                                           # include_directories entry below.
     'unit/test_certificates_store_honesty.cpp',  # WS-A: pure Windows/Linux store-honesty + #3245 delete-recheck decision vectors (certificates_macos_parsers.hpp)
+    'unit/test_certificates_linux_store.cpp',  # WS-A a1: real syscall-level delete against a TempDir (certificates_linux_store.hpp; POSIX-guarded, runs on macOS too)
     'unit/test_certificates_macos_actions.cpp',  # WS-B: action-level LocalDispatcher tests for the SecItem
                                                   # sentinel + console-owner recheck orchestration (#4374 fix
                                                   # shape 2 + 3); __APPLE__-guarded, empty TU elsewhere.
