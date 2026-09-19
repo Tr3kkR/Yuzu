@@ -75,12 +75,14 @@ describes "so many chances over so much time, then act, or don't" as the target 
 only the cooldown/hourly-cap primitives above. A future escalation-policy field is additive to this
 grammar; do not treat its absence here as an oversight.
 
-**`fire_on_arm` on a monostate spark type (`interval`, `startup`, and — with no state to compare —
-effectively always-on for `disk`'s threshold check) fires the Reflex once, immediately, the first
-time it is armed** (there is no "prior state" for these types to compare against, so "already true
-at arm time" is trivially the arm event itself); on an edge-producing type (`service`, `plist`,
-`process`) it fires only if the persisted condition is already in the "true" state at arm time,
-exactly as described earlier in this document.
+**`fire_on_arm` on a monostate spark type (`interval`, `startup`, `file`, `registry` — `SparkData` is
+`std::monostate` for all four) fires the Reflex once, immediately, the first time it is armed** (there
+is no "prior state" for these types to compare against, so "already true at arm time" is trivially the
+arm event itself); on an edge-producing type (`service`, `disk`, `plist`, `process` — the types whose
+`SparkData` carries a real payload, `ServiceSparkData`/`DiskSparkData` today) it fires only if the
+persisted condition is already in the "true" state at arm time — `disk` fires only on a valid
+`Breach` reading, never unconditionally at arm, exactly like every other edge type — as described
+earlier in this document.
 
 ## Substitution tokens (closed list)
 
