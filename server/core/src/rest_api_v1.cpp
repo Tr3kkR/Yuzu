@@ -1153,7 +1153,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Responses for one execution (#4030)", "tags": ["Events"], "description": "REST v1 twin of MCP query_responses' execution_id-scoped filter (no new MCP tool: query_responses already covers this shape). A DISTINCT route from GET /executions/{id}, not a query param on it — response bodies are gated on Response:Read, a different securable than the detail route's Execution:Read. Scope pushdown mirrors query_responses exactly: distinct_agent_ids_by_execution -> in_scope filter -> pushed into the store query BEFORE limit (ADR-0017 INV-3). No offset parameter, matching query_responses exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is non-terminal, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400, not silently ignored (#4030 Gate 8 fix). Audited as execution.detail.fetch, REST fail-closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows for this execution", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}/children": {
-      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}]})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read. The underlying query is hard-capped at 500 rows (governance re-review fix, #2146 A2-R1; no caller-visible limit/cursor); when the parent has more children than that, result_truncated_by_cap:true is added so the response is never presented as the complete child list -- the cap applies to the fleet-wide row set before confinement, so a truncated:false confined response still means every child THIS caller can see was returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}], result_truncated_by_cap?: true})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
         // Executions/Workflows/Schedules read-twin routes (#4030) grew this
@@ -8440,8 +8440,8 @@ void RestApiV1::register_routes(
                 // enumerating every child -- each independently passes
                 // execution_visible. One batched statuses call, not N+1.
                 std::vector<std::string> child_ids;
-                child_ids.reserve(children_opt->size());
-                for (const auto& c : *children_opt)
+                child_ids.reserve(children_opt->children.size());
+                for (const auto& c : children_opt->children)
                     child_ids.push_back(c.id);
                 auto child_statuses_opt =
                     execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
@@ -8453,7 +8453,7 @@ void RestApiV1::register_routes(
                     return;
                 }
                 static const std::vector<AgentExecStatus> kEmptyStatuses;
-                for (const auto& c : *children_opt) {
+                for (const auto& c : children_opt->children) {
                     auto it = child_statuses_opt->find(c.id);
                     const auto& c_statuses =
                         it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
@@ -8462,10 +8462,24 @@ void RestApiV1::register_routes(
                     arr.add_raw(execution_child_row_json(c).dump());
                 }
             } else {
-                for (const auto& c : *children_opt)
+                for (const auto& c : children_opt->children)
                     arr.add_raw(execution_child_row_json(c).dump());
             }
-            res.set_content(ok_json(JObj().raw("children", arr.str()).str()), "application/json");
+            // #2146 A2-R1 (governance re-review, blocking): get_children_checked
+            // is now hard-capped (kExecutionChildrenCap, execution_tracker.cpp)
+            // -- previously unbounded. Present-only-when-true, matching MCP
+            // list_schedules/query_responses' result_truncated_by_cap
+            // convention -- top-level next to `children` since this route
+            // has no `pagination` envelope to nest it under (unlike GET
+            // /api/v1/schedules). Applies before the confinement filter
+            // above (ExecutionChildrenResult's doc comment): reports the
+            // fleet-wide row set being capped, not this caller's visible
+            // slice.
+            JObj result_obj;
+            result_obj.raw("children", arr.str());
+            if (children_opt->truncated)
+                result_obj.add("result_truncated_by_cap", true);
+            res.set_content(ok_json(result_obj.str()), "application/json");
         });
 
     // ── GET /api/v1/approvals/{id} — single approval status (A4 status_url) ──

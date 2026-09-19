@@ -5428,7 +5428,11 @@ twin: `get_execution_children`. An invisible or nonexistent parent returns `404`
 oracle; under a confined grant, each child is checked against the caller's visibility
 **independently** of the parent's own visibility - a visible parent does not by itself disclose a
 child dispatched by, or targeting, someone else (#3789). Not audited on a successful read (matches
-the legacy route's own posture); a confined denial is audited as `execution.read`.
+the legacy route's own posture); a confined denial is audited as `execution.read`. The underlying
+query is hard-capped at 500 rows (governance re-review fix, #2146 A2-R1; no caller-visible
+limit/cursor) - `data.result_truncated_by_cap: true` is added when the parent has more children
+than the cap dropped, applied before the per-child confinement filter above (a `false`/absent flag
+under a confined grant still means every child THAT caller can see was returned).
 
 **Response:**
 
@@ -5438,6 +5442,18 @@ the legacy route's own posture); a confined denial is audited as `execution.read
     "children": [
       { "id": "exec-2", "status": "completed", "dispatched_at": 1735689700 }
     ]
+  },
+  "meta": { "api_version": "v1" }
+}
+```
+
+When the 500-row cap drops rows, `data.result_truncated_by_cap` is added (`true`):
+
+```json
+{
+  "data": {
+    "children": [ { "id": "exec-2", "status": "completed", "dispatched_at": 1735689700 } ],
+    "result_truncated_by_cap": true
   },
   "meta": { "api_version": "v1" }
 }
@@ -8892,7 +8908,9 @@ visible agents under a confined grant. **Response (404):** unknown or outside-sc
 **Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
 child is independently checked against the caller's visibility — a visible parent does not by
 itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
-outside-scope parent id.
+outside-scope parent id. The underlying query is hard-capped at 500 rows (governance re-review
+fix, #2146 A2-R1; no caller-visible limit/cursor) - `result_truncated_by_cap: true` is added
+alongside `children` when the parent has more children than the cap dropped.
 
 #### `POST /api/executions/{id}/rerun`
 

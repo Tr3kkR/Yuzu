@@ -795,8 +795,8 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             // child passes the same owner-or-visible-agent predicate
             // independently. One batched statuses call, not N+1.
             std::vector<std::string> child_ids;
-            child_ids.reserve(children_opt->size());
-            for (const auto& c : *children_opt)
+            child_ids.reserve(children_opt->children.size());
+            for (const auto& c : children_opt->children)
                 child_ids.push_back(c.id);
             auto child_statuses_opt =
                 deps.execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
@@ -808,7 +808,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             static const std::vector<AgentExecStatus> kEmptyStatuses;
-            for (const auto& c : *children_opt) {
+            for (const auto& c : children_opt->children) {
                 auto it = child_statuses_opt->find(c.id);
                 const auto& c_statuses =
                     it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
@@ -821,11 +821,24 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                 arr.push_back(execution_child_row_json(c));
             }
         } else {
-            for (const auto& c : *children_opt) {
+            for (const auto& c : children_opt->children) {
                 arr.push_back(execution_child_row_json(c));
             }
         }
-        res.set_content(nlohmann::json({{"children", arr}}).dump(), "application/json");
+        nlohmann::json body{{"children", arr}};
+        // #2146 A2-R1 (governance re-review, blocking): get_children_checked
+        // is now hard-capped (execution_tracker.cpp's kExecutionChildrenCap)
+        // -- previously unbounded. Present-only-when-true, matching MCP
+        // list_schedules/query_responses' result_truncated_by_cap
+        // convention -- this route has no `pagination` envelope object to
+        // nest it under (unlike GET /api/v1/schedules), so it sits
+        // top-level next to `children`. The cap applies before the
+        // confinement filter above (see ExecutionChildrenResult's doc
+        // comment), so this reports the fleet-wide row set being capped,
+        // not this caller's visible slice being capped.
+        if (children_opt->truncated)
+            body["result_truncated_by_cap"] = true;
+        res.set_content(body.dump(), "application/json");
     });
 }
 

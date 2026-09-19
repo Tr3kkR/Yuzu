@@ -332,8 +332,9 @@ TEST_CASE("ExecutionTracker: get_children_checked distinguishes genuinely-no-chi
     auto id = tracker.create_execution(make_execution());
     REQUIRE(id.has_value());
     auto checked = tracker.get_children_checked(*id);
-    REQUIRE(checked.has_value()); // not degraded
-    CHECK(checked->empty());      // genuinely no children
+    REQUIRE(checked.has_value());       // not degraded
+    CHECK(checked->children.empty());   // genuinely no children
+    CHECK_FALSE(checked->truncated);
 }
 
 // ── Update Agent Status ────────────────────────────────────────────────────
@@ -750,6 +751,60 @@ TEST_CASE("ExecutionTracker: get_children empty for execution without children",
 
     auto children = tracker.get_children(*id_result);
     CHECK(children.empty());
+}
+
+// #2146 A2-R1 governance re-review (blocking): get_children_checked's query
+// had NO LIMIT at all before this fix -- kExecutionChildrenCap
+// (execution_tracker.cpp) queries one row PAST the cap so a parent with
+// EXACTLY the cap's worth of children is never misreported as truncated
+// (same +1-row sentinel idiom as ScheduleEngine::query_schedules_checked's
+// own boundary tests, test_schedule_engine.cpp).
+TEST_CASE("ExecutionTracker: get_children_checked at exactly the cap is not "
+          "misreported as truncated (#2146 A2-R1 boundary)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto parent_result = tracker.create_execution(make_execution());
+    REQUIRE(parent_result.has_value());
+
+    for (int i = 0; i < 500; ++i) {
+        Execution child = make_execution("def-child-" + std::to_string(i));
+        child.parent_id = *parent_result;
+        REQUIRE(tracker.create_execution(child).has_value());
+    }
+
+    auto checked = tracker.get_children_checked(*parent_result);
+    REQUIRE(checked.has_value());
+    CHECK(checked->children.size() == 500);
+    CHECK_FALSE(checked->truncated);
+}
+
+// Sibling of the exact-cap test above: one child OVER the cap must come back
+// capped at 500 rows WITH result.truncated == true -- the honest signal REST
+// v1, the legacy route, and MCP all surface as result_truncated_by_cap.
+// Before this fix there was no cap at all, so this scenario could not be
+// distinguished from "the parent genuinely has 501 children" either --
+// worse, an unbounded read.
+TEST_CASE("ExecutionTracker: get_children_checked truncates and flags a parent one "
+          "over the cap (#2146 A2-R1 boundary)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto parent_result = tracker.create_execution(make_execution());
+    REQUIRE(parent_result.has_value());
+
+    for (int i = 0; i < 501; ++i) {
+        Execution child = make_execution("def-child-" + std::to_string(i));
+        child.parent_id = *parent_result;
+        REQUIRE(tracker.create_execution(child).has_value());
+    }
+
+    auto checked = tracker.get_children_checked(*parent_result);
+    REQUIRE(checked.has_value());
+    CHECK(checked->children.size() == 500);
+    CHECK(checked->truncated);
 }
 
 // ── Rerun ──────────────────────────────────────────────────────────────────

@@ -198,6 +198,21 @@ struct EventOutboxReapOutcome {
     bool clock_anomaly{false};
 };
 
+/// #2146 A2-R1 governance re-review (blocking): `get_children_checked`'s
+/// underlying query was unbounded (no LIMIT at all), unlike its sibling
+/// `ScheduleEngine::query_schedules_checked` (`schedule_engine.hpp`'s
+/// `ScheduleListResult`, whose shape this mirrors exactly). `truncated` is
+/// `true` when the row cap (`kExecutionChildrenCap`, execution_tracker.cpp)
+/// dropped rows past the newest `dispatched_at`-ordered window -- REST v1
+/// `GET /api/v1/executions/{id}/children`, the legacy
+/// `GET /api/executions/{id}/children`, and MCP `get_execution_children` all
+/// surface it as `result_truncated_by_cap` so a capped response is never
+/// presented as the parent's complete child list.
+struct ExecutionChildrenResult {
+    std::vector<Execution> children;
+    bool truncated{false};
+};
+
 class ExecutionTracker {
 public:
     explicit ExecutionTracker(pg::PgPool& pool);
@@ -302,8 +317,18 @@ public:
     /// #3789: degrade-distinguishable twin of `get_children`, for the
     /// migrated `/api/executions/{id}/children` route — `nullopt` on a
     /// pool/query failure, an empty vector means the parent genuinely has
-    /// no children.
-    std::optional<std::vector<Execution>> get_children_checked(const std::string& parent_id) const;
+    /// no children. #2146 A2-R1 (governance re-review, blocking): the query
+    /// is now hard-capped at `kExecutionChildrenCap` rows (execution_tracker.cpp)
+    /// -- previously unbounded, unlike every other list-shaped read in this
+    /// class -- so `ExecutionChildrenResult::truncated` tells all three
+    /// callers (REST v1, the legacy route, MCP) when the cap dropped rows.
+    /// The cap applies to the raw `parent_id`-matched row set, BEFORE any
+    /// caller-side `execution_visible` confinement filter -- `truncated`
+    /// answers "did the fleet-wide row set exceed the cap", not "did
+    /// confinement hide anything", so it stays honest under confinement:
+    /// `truncated == false` still means every child THIS CALLER can see was
+    /// returned to it.
+    std::optional<ExecutionChildrenResult> get_children_checked(const std::string& parent_id) const;
 
     // Mutation
     std::expected<std::string, std::string> create_execution(const Execution& exec);

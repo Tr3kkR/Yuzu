@@ -34,6 +34,19 @@ constexpr const char* kStoreName = "execution_tracker";
 constexpr std::chrono::milliseconds kReadTimeout{1500};
 constexpr std::chrono::milliseconds kWriteTimeout{2000};
 
+// get_children_checked()'s row cap (#2146 A2-R1 governance re-review,
+// blocking): the query had no LIMIT at all before this fix. No
+// creation-side ceiling exists on how many children an execution can
+// accumulate, so a fleet can legitimately exceed this -- get_children_checked()
+// detects and reports it via ExecutionChildrenResult::truncated, mirroring
+// ScheduleEngine::query_schedules_checked's identical kScheduleListCap
+// pattern (schedule_engine.cpp). 500, not 100, to match this file's own
+// directly analogous cap: MCP list_executions clamps its caller-supplied
+// limit to `std::min(..., 500)` (mcp_server.cpp) for the same
+// execution-list-shaped read; get_children has no caller-supplied limit
+// param to clamp, so it gets the same ceiling as a fixed cap instead.
+constexpr int kExecutionChildrenCap = 500;
+
 std::string generate_id() {
     static thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<uint64_t> dist;
@@ -827,10 +840,11 @@ ExecutionTracker::get_agent_statuses_for_executions_checked(
 }
 
 std::vector<Execution> ExecutionTracker::get_children(const std::string& parent_id) const {
-    return get_children_checked(parent_id).value_or(std::vector<Execution>{});
+    auto checked = get_children_checked(parent_id);
+    return checked ? std::move(checked->children) : std::vector<Execution>{};
 }
 
-std::optional<std::vector<Execution>>
+std::optional<ExecutionChildrenResult>
 ExecutionTracker::get_children_checked(const std::string& parent_id) const {
     if (!open_) {
         spdlog::warn("ExecutionTracker::get_children_checked degraded: tracker not open");
@@ -844,20 +858,30 @@ ExecutionTracker::get_children_checked(const std::string& parent_id) const {
 
     // get_children is used by workflow drill-down — opt out of the
     // error-detail subquery to keep the workflow-step expansion cheap.
+    // #2146 A2-R1 (governance re-review, blocking): query one row PAST the
+    // cap so a parent with EXACTLY kExecutionChildrenCap children is never
+    // misreported as truncated -- same +1-row sentinel idiom as
+    // ScheduleEngine::query_schedules_checked (schedule_engine.cpp), trimmed
+    // back off below and never returned to the caller.
     auto sql = std::string("SELECT ") + kSelectBase + kSelectErrorDetailEmpty +
-               " FROM execution_tracker.executions WHERE parent_id = $1 ORDER BY dispatched_at DESC";
-    pg::PgResult res = pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{parent_id});
+               " FROM execution_tracker.executions WHERE parent_id = $1 "
+               "ORDER BY dispatched_at DESC LIMIT $2";
+    pg::PgResult res = pg::exec_params(
+        lease.get(), sql.c_str(),
+        std::vector<std::string>{parent_id, std::to_string(kExecutionChildrenCap + 1)});
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ExecutionTracker::get_children_checked degraded: query failed");
         return std::nullopt;
     }
 
-    std::vector<Execution> results;
+    ExecutionChildrenResult out;
     const int rows = PQntuples(res.get());
-    results.reserve(static_cast<std::size_t>(rows));
-    for (int i = 0; i < rows; ++i)
-        results.push_back(row_to_exec(res.get(), i));
-    return results;
+    out.truncated = rows > kExecutionChildrenCap;
+    const int take = out.truncated ? kExecutionChildrenCap : rows;
+    out.children.reserve(static_cast<std::size_t>(take));
+    for (int i = 0; i < take; ++i)
+        out.children.push_back(row_to_exec(res.get(), i));
+    return out;
 }
 
 // ---------------------------------------------------------------------------

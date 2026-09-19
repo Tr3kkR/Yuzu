@@ -841,9 +841,14 @@ static const ToolDef kTools[] = {
      "independently passes the same visible-agent-or-owner test the parent "
      "did. Mirrors GET /api/v1/executions/{id}/children and the legacy "
      "GET /api/executions/{id}/children (same shared row builder, "
-     "docs/api-twin-recipe.md Rule 1).",
+     "docs/api-twin-recipe.md Rule 1). The underlying query is hard-capped "
+     "at 500 rows (governance re-review fix, #2146 A2-R1) with no caller-"
+     "visible limit/cursor; result_truncated_by_cap:true means the parent "
+     "has more children than the cap dropped -- applied before the "
+     "per-child visibility filter, so a truncated:false confined response "
+     "still means every child this caller can see was returned.",
      R"({"type":"object","properties":{"execution_id":{"type":"string","minLength":1,"description":"Parent execution ID"}},"required":["execution_id"]})",
-     R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}}},"required":["children"]})j"},
+     R"j({"type":"object","properties":{"children":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"dispatched_at":{"type":"integer"}},"required":["id","status","dispatched_at"]}}},"result_truncated_by_cap":{"type":"boolean","description":"Present (true) only when the 500-row cap dropped rows; absent otherwise."}},"required":["children"]})j"},
 
     {"list_executions", "List recent command executions. Confined by management group: a "
      "caller admitted through a management-group grant (rather than a global permission) "
@@ -10480,8 +10485,8 @@ McpServer::HandlerFn McpServer::build_handler(
                     // execution_visible. One batched statuses call, not N+1
                     // (ADR-0017 INV-10).
                     std::vector<std::string> child_ids;
-                    child_ids.reserve(children_opt->size());
-                    for (const auto& c : *children_opt)
+                    child_ids.reserve(children_opt->children.size());
+                    for (const auto& c : children_opt->children)
                         child_ids.push_back(c.id);
                     auto child_statuses_opt =
                         execution_tracker->get_agent_statuses_for_executions_checked(child_ids);
@@ -10493,7 +10498,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         return;
                     }
                     static const std::vector<AgentExecStatus> kEmptyStatuses;
-                    for (const auto& c : *children_opt) {
+                    for (const auto& c : children_opt->children) {
                         auto it = child_statuses_opt->find(c.id);
                         const auto& c_statuses =
                             it != child_statuses_opt->end() ? it->second : kEmptyStatuses;
@@ -10502,7 +10507,7 @@ McpServer::HandlerFn McpServer::build_handler(
                         arr.add_raw(execution_child_row_json(c).dump());
                     }
                 } else {
-                    for (const auto& c : *children_opt)
+                    for (const auto& c : children_opt->children)
                         arr.add_raw(execution_child_row_json(c).dump());
                 }
                 // gov security-guardian fix round (#2146 A2-R1): success-audit
@@ -10512,9 +10517,21 @@ McpServer::HandlerFn McpServer::build_handler(
                 // otherwise mirrors doesn't transfer to MCP's established
                 // per-tool audit convention).
                 mcp_audit("success", exec_id);
+                // Governance re-review fix (#2146 A2-R1, blocking):
+                // get_children_checked is now hard-capped (kExecutionChildrenCap,
+                // execution_tracker.cpp) -- previously unbounded. Present-only-
+                // when-true, matching list_schedules' result_truncated_by_cap
+                // convention on this same tool surface (declared in the output
+                // schema above). Applies before the confinement filter above
+                // (ExecutionChildrenResult's doc comment): reports the
+                // fleet-wide row set being capped, not this caller's visible
+                // slice.
+                JObj result_obj;
+                result_obj.raw("children", arr.str());
+                if (children_opt->truncated)
+                    result_obj.add("result_truncated_by_cap", true);
                 res.set_content(
-                    success_response(id, tool_result(JObj().raw("children", arr.str()).str(),
-                                                     kObjectOutputSchema)),
+                    success_response(id, tool_result(result_obj.str(), kObjectOutputSchema)),
                     "application/json");
                 return;
             }
