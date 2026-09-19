@@ -1153,7 +1153,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Responses for one execution (#4030)", "tags": ["Events"], "description": "REST v1 twin of MCP query_responses' execution_id-scoped filter (no new MCP tool: query_responses already covers this shape). A DISTINCT route from GET /executions/{id}, not a query param on it — response bodies are gated on Response:Read, a different securable than the detail route's Execution:Read. Scope pushdown mirrors query_responses exactly: distinct_agent_ids_by_execution -> in_scope filter -> pushed into the store query BEFORE limit (ADR-0017 INV-3). No offset parameter, matching query_responses exactly: the result set orders by a non-unique, actively-growing timestamp while an execution is non-terminal, so offset-based paging would silently skip or duplicate rows -- a caller-supplied offset is rejected with 400, not silently ignored (#4030 Gate 8 fix). Audited as execution.detail.fetch, REST fail-closed.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}, {"name": "agent_id", "in": "query", "required": false, "schema": {"type": "string"}}, {"name": "status", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "since", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "until", "in": "query", "required": false, "schema": {"type": "integer"}}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 100, "maximum": 1000}}], "responses": {"200": {"description": "Response rows for this execution", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "400": {"description": "Invalid numeric query parameter, or offset supplied (not supported on this route)"}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Response:Read)"}, "503": {"description": "Response store not initialised/degraded, or the execution.detail.fetch audit row could not persist; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     },
     "/executions/{id}/children": {
-      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read. The underlying query is hard-capped at 500 rows (governance re-review fix, #2146 A2-R1; no caller-visible limit/cursor); when the parent has more children than that, result_truncated_by_cap:true is added so the response is never presented as the complete child list -- the cap applies to the fleet-wide row set before confinement, so a truncated:false confined response still means every child THIS caller can see was returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}], result_truncated_by_cap?: true})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
+      "get": {"summary": "List an execution's child executions (#2146 A2-R1)", "tags": ["Events"], "description": "REST v1 twin of the legacy GET /api/executions/{id}/children and MCP get_execution_children (docs/api-twin-recipe.md Rule 1 -- all three call the same execution_child_row_json builder). Gated on the ADR-0017 fleet-read primitive (Execution:Read via fleet_read_fn), same confinement rules as GET /executions/{id}: an invisible or nonexistent parent 404s identically to a nonexistent one, and -- per #3789 -- each child is checked against the caller's visibility independently of the parent's own visibility (a visible parent does not by itself disclose a child dispatched by, or targeting, someone else). Not audited on a successful read; a confined denial is audited as execution.read. The underlying query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible limit/cursor). #2146 A2-R1 Gate 8 fix: the cap is now pushed down TOGETHER WITH the caller's own visibility scope, before LIMIT -- a confined caller's cap applies to their OWN visible children, not the fleet-wide raw row set, so an invisible sibling can no longer displace a visible child out of the capped window. result_truncated_by_cap:true means that scoped row set exceeded the cap; a truncated:false confined response means every child THIS caller can see was returned.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_-]{1,128}$"}}], "responses": {"200": {"description": "Child execution list ({children: [{id, status, dispatched_at}], result_truncated_by_cap?: true})", "headers": {"X-Correlation-Id": {"schema": {"type": "string"}}}}, "401": {"description": "Authentication required"}, "403": {"description": "Insufficient permission (Execution:Read)"}, "404": {"description": "Execution not found (unknown id, or outside the caller's fleet-read scope)", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}, "503": {"description": "Execution tracker not initialised/degraded; envelope includes retry_after_ms.", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/A4ErrorEnvelope"}}}}}}
     })json"
         // Split here (MSVC C2026 ~16,380-byte per-literal cap): the
         // Executions/Workflows/Schedules read-twin routes (#4030) grew this
@@ -8382,6 +8382,7 @@ void RestApiV1::register_routes(
 
             auto exec_id = req.matches[1].str();
             std::string username;
+            yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
             if (gate.scope) {
                 auto session = auth_fn(req, res);
                 if (!session)
@@ -8401,6 +8402,16 @@ void RestApiV1::register_routes(
                         "application/json");
                     return;
                 }
+                // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-visible-
+                // agent admission predicate into get_children_checked's SQL
+                // below (this file's own LIST handler precedent) -- closes
+                // the cap-before-scope defect where an invisible sibling
+                // could displace this caller's own visible children out of
+                // the capped window.
+                yuzu::server::ExecutionListScope s;
+                s.owner = username;
+                s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                scope_arg = std::move(s);
             }
 
             auto exec_r = execution_tracker->get_execution_checked(exec_id);
@@ -8444,7 +8455,7 @@ void RestApiV1::register_routes(
                 return;
             }
 
-            auto children_opt = execution_tracker->get_children_checked(exec_id);
+            auto children_opt = execution_tracker->get_children_checked(exec_id, scope_arg);
             if (!children_opt) {
                 res.status = 503;
                 res.set_content(
@@ -8491,10 +8502,13 @@ void RestApiV1::register_routes(
             // list_schedules/query_responses' result_truncated_by_cap
             // convention -- top-level next to `children` since this route
             // has no `pagination` envelope to nest it under (unlike GET
-            // /api/v1/schedules). Applies before the confinement filter
-            // above (ExecutionChildrenResult's doc comment): reports the
-            // fleet-wide row set being capped, not this caller's visible
-            // slice.
+            // /api/v1/schedules). #2146 A2-R1 Gate 8 fix: scope_arg above is
+            // now pushed into the SQL BEFORE the cap (ExecutionChildrenResult's
+            // doc comment), so for a confined caller this reports THEIR OWN
+            // visible row set exceeding the cap, not the fleet-wide one --
+            // the per-child confinement filter above is now
+            // redundant-but-safe defense in depth over an already-scoped
+            // result, never the primary admission decision.
             JObj result_obj;
             result_obj.raw("children", arr.str());
             if (children_opt->truncated)

@@ -515,6 +515,75 @@ TEST_CASE("GET /api/v1/executions/:id/children: each child is confined independe
     CHECK_FALSE(found_invisible);
 }
 
+// #2146 A2-R1 Gate 8 fix: the exact bug the SQL scope-fold closes -- the
+// 100-row cap used to apply to the RAW `parent_id`-matched row set BEFORE
+// the caller-side confinement filter, so an invisible sibling dispatched
+// more recently could displace this caller's own visible child entirely out
+// of the capped `dispatched_at DESC` window, with `result_truncated_by_cap`
+// absent (a false "this is your complete visible list"). This is a
+// ROUTE-level test, not just a tracker-level one: it proves the REST v1
+// handler actually threads its real confinement scope into
+// get_children_checked, not merely that the tracker's SQL fold works in
+// isolation (a caller that forgot to pass its scope would stay green here
+// too if this test only asserted at the tracker layer).
+TEST_CASE("GET /api/v1/executions/:id/children: an invisible sibling cannot displace a "
+          "visible child out of the capped window (#2146 A2-R1 Gate 8 fix)",
+          "[pg][rest][executions][v1][children][security]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ExecV1Harness h(pool);
+    auto parent_id = h.make_exec_with_agents("def-children-displace");
+
+    Execution visible_child;
+    visible_child.definition_id = "def-children-displace";
+    visible_child.dispatched_by = "someone-else";
+    visible_child.status = "completed";
+    visible_child.dispatched_at = 1000;
+    visible_child.parent_id = parent_id;
+    auto visible_child_id = h.execution_tracker->create_execution(visible_child);
+    REQUIRE(visible_child_id.has_value());
+    AgentExecStatus visible_status;
+    visible_status.agent_id = "agent-A";
+    visible_status.status = "success";
+    h.execution_tracker->update_agent_status(*visible_child_id, visible_status);
+
+    // 105 invisible siblings, all dispatched strictly AFTER the visible
+    // child -- every one of these sorts ahead of it in the dispatched_at
+    // DESC window the pre-fix cap-before-scope defect used to apply the cap
+    // to.
+    for (int i = 0; i < 105; ++i) {
+        Execution invisible_child;
+        invisible_child.definition_id = "def-children-displace";
+        invisible_child.dispatched_by = "someone-else";
+        invisible_child.status = "completed";
+        invisible_child.dispatched_at = 2000 + i;
+        invisible_child.parent_id = parent_id;
+        auto invisible_id = h.execution_tracker->create_execution(invisible_child);
+        REQUIRE(invisible_id.has_value());
+        AgentExecStatus invisible_status;
+        invisible_status.agent_id = "agent-invisible-" + std::to_string(i);
+        invisible_status.status = "success";
+        h.execution_tracker->update_agent_status(*invisible_id, invisible_status);
+    }
+
+    h.fleet_read_scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-A"}};
+
+    auto res = h.sink.Get("/api/v1/executions/" + parent_id + "/children");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    auto body = nlohmann::json::parse(res->body);
+    REQUIRE(body["data"]["children"].is_array());
+    bool found_visible = false;
+    for (const auto& c : body["data"]["children"]) {
+        if (c["id"] == *visible_child_id)
+            found_visible = true;
+    }
+    CHECK(found_visible);
+    // The caller's OWN visible row set is one row -- nowhere near the cap --
+    // so this must never be reported as truncated.
+    CHECK_FALSE(body["data"].contains("result_truncated_by_cap"));
+}
+
 TEST_CASE("GET /api/v1/executions/:id/children: fleet_read_fn denial -> 403",
           "[pg][rest][executions][v1][children][security]") {
     YUZU_REQUIRE_PG_DB_TPL(db, execv1_responsestore_tpl);

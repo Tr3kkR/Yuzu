@@ -716,6 +716,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         std::string username;
+        yuzu::server::ExecutionScope scope_arg; // nullopt = unrestricted
         if (gate.scope) {
             auto session = deps.resolve_session_fn(req);
             username = session ? session->username : std::string{};
@@ -735,6 +736,16 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+            // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-visible-agent
+            // admission predicate into get_children_checked's SQL below (this
+            // file's own LIST handler precedent above) -- closes the
+            // cap-before-scope defect where an invisible sibling could
+            // displace this caller's own visible children out of the capped
+            // window.
+            yuzu::server::ExecutionListScope s;
+            s.owner = username;
+            s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+            scope_arg = std::move(s);
         }
 
         auto exec_r = deps.execution_tracker->get_execution_checked(id);
@@ -777,7 +788,7 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto children_opt = deps.execution_tracker->get_children_checked(id);
+        auto children_opt = deps.execution_tracker->get_children_checked(id, scope_arg);
         if (!children_opt) {
             res.status = 503;
             res.set_content(
@@ -832,10 +843,13 @@ void register_execution_routes(HttpRouteSink& sink, Deps deps) {
         // list_schedules/query_responses' result_truncated_by_cap
         // convention -- this route has no `pagination` envelope object to
         // nest it under (unlike GET /api/v1/schedules), so it sits
-        // top-level next to `children`. The cap applies before the
-        // confinement filter above (see ExecutionChildrenResult's doc
-        // comment), so this reports the fleet-wide row set being capped,
-        // not this caller's visible slice being capped.
+        // top-level next to `children`. #2146 A2-R1 Gate 8 fix: scope_arg
+        // above is now pushed into the SQL BEFORE the cap
+        // (ExecutionChildrenResult's doc comment), so for a confined caller
+        // this reports THEIR OWN visible row set exceeding the cap, not the
+        // fleet-wide one -- the per-child confinement filter above is now
+        // redundant-but-safe defense in depth over an already-scoped result,
+        // never the primary admission decision.
         if (children_opt->truncated)
             body["result_truncated_by_cap"] = true;
         res.set_content(body.dump(), "application/json");

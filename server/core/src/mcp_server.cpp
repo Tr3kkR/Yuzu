@@ -10460,6 +10460,7 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 auto exec_id = param_str(args, "execution_id");
                 std::string username;
+                ExecutionScope scope_arg; // nullopt = unrestricted
                 if (gate.scope) {
                     // #1634/#3789 precedent (list_executions below): an empty
                     // username under an engaged scope must never silently
@@ -10473,6 +10474,16 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // #2146 A2-R1 Gate 8 fix: threads the SAME owner-or-
+                    // visible-agent admission predicate into
+                    // get_children_checked's SQL below (execution_routes.cpp's
+                    // list route precedent) -- closes the cap-before-scope
+                    // defect where an invisible sibling could displace this
+                    // caller's own visible children out of the capped window.
+                    ExecutionListScope s;
+                    s.owner = username;
+                    s.visible_agents.assign(gate.scope->begin(), gate.scope->end());
+                    scope_arg = std::move(s);
                 }
 
                 auto exec_r = execution_tracker->get_execution_checked(exec_id);
@@ -10515,7 +10526,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 }
 
-                auto children_opt = execution_tracker->get_children_checked(exec_id);
+                auto children_opt = execution_tracker->get_children_checked(exec_id, scope_arg);
                 if (!children_opt) {
                     res.set_content(
                         a4_error(kInternalError, "execution tracker degraded", {},
@@ -10568,10 +10579,13 @@ McpServer::HandlerFn McpServer::build_handler(
                 // execution_tracker.cpp) -- previously unbounded. Present-only-
                 // when-true, matching list_schedules' result_truncated_by_cap
                 // convention on this same tool surface (declared in the output
-                // schema above). Applies before the confinement filter above
-                // (ExecutionChildrenResult's doc comment): reports the
-                // fleet-wide row set being capped, not this caller's visible
-                // slice.
+                // schema above). #2146 A2-R1 Gate 8 fix: scope_arg above is now
+                // pushed into the SQL BEFORE the cap (ExecutionChildrenResult's
+                // doc comment), so for a confined caller this reports THEIR OWN
+                // visible row set exceeding the cap, not the fleet-wide one --
+                // the per-child execution_visible filter above is now
+                // redundant-but-safe defense in depth over an already-scoped
+                // result, never the primary admission decision.
                 JObj result_obj;
                 result_obj.raw("children", arr.str());
                 if (children_opt->truncated)

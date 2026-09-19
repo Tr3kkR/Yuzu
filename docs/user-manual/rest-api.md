@@ -5429,10 +5429,11 @@ oracle; under a confined grant, each child is checked against the caller's visib
 **independently** of the parent's own visibility - a visible parent does not by itself disclose a
 child dispatched by, or targeting, someone else (#3789). Not audited on a successful read (matches
 the legacy route's own posture); a confined denial is audited as `execution.read`. The underlying
-query is hard-capped at 500 rows (governance re-review fix, #2146 A2-R1; no caller-visible
-limit/cursor) - `data.result_truncated_by_cap: true` is added when the parent has more children
-than the cap dropped, applied before the per-child confinement filter above (a `false`/absent flag
-under a confined grant still means every child THAT caller can see was returned).
+query is hard-capped at 100 rows (governance Gate 8 re-review fix, #2146 A2-R1; no caller-visible
+limit/cursor), with the cap now pushed down TOGETHER WITH the caller's own visibility scope, before
+`LIMIT` - a confined caller's cap applies to their own visible children, not the fleet-wide raw row
+set, so an invisible sibling can no longer displace a visible child out of the capped window;
+`data.result_truncated_by_cap: true` means that scoped row set exceeded the cap.
 
 **Response:**
 
@@ -5447,7 +5448,7 @@ under a confined grant still means every child THAT caller can see was returned)
 }
 ```
 
-When the 500-row cap drops rows, `data.result_truncated_by_cap` is added (`true`):
+When the 100-row (scoped) cap drops rows, `data.result_truncated_by_cap` is added (`true`):
 
 ```json
 {
@@ -8908,9 +8909,11 @@ visible agents under a confined grant. **Response (404):** unknown or outside-sc
 **Permission:** `Execution:Read`. List child executions spawned from a parent execution. Each
 child is independently checked against the caller's visibility — a visible parent does not by
 itself disclose a child dispatched by, or targeting, someone else. **Response (404):** unknown or
-outside-scope parent id. The underlying query is hard-capped at 500 rows (governance re-review
-fix, #2146 A2-R1; no caller-visible limit/cursor) - `result_truncated_by_cap: true` is added
-alongside `children` when the parent has more children than the cap dropped.
+outside-scope parent id. The underlying query is hard-capped at 100 rows (governance Gate 8
+re-review fix, #2146 A2-R1; no caller-visible limit/cursor), with the cap now pushed down TOGETHER
+WITH the caller's own visibility scope, before `LIMIT` - a confined caller's cap applies to their
+own visible children, not the fleet-wide raw row set. `result_truncated_by_cap: true` is added
+alongside `children` when that scoped row set exceeded the cap.
 
 #### `POST /api/executions/{id}/rerun`
 

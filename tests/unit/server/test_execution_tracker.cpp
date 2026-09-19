@@ -9,6 +9,7 @@
 #include "execution_event_bus.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "test_execution_tracker_pg_helper.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -331,7 +332,7 @@ TEST_CASE("ExecutionTracker: get_children_checked distinguishes genuinely-no-chi
 
     auto id = tracker.create_execution(make_execution());
     REQUIRE(id.has_value());
-    auto checked = tracker.get_children_checked(*id);
+    auto checked = tracker.get_children_checked(*id, std::nullopt);
     REQUIRE(checked.has_value());       // not degraded
     CHECK(checked->children.empty());   // genuinely no children
     CHECK_FALSE(checked->truncated);
@@ -758,7 +759,11 @@ TEST_CASE("ExecutionTracker: get_children empty for execution without children",
 // (execution_tracker.cpp) queries one row PAST the cap so a parent with
 // EXACTLY the cap's worth of children is never misreported as truncated
 // (same +1-row sentinel idiom as ScheduleEngine::query_schedules_checked's
-// own boundary tests, test_schedule_engine.cpp).
+// own boundary tests, test_schedule_engine.cpp). Unrestricted (nullopt)
+// scope -- the cap value dropped 500->100 in the #2146 A2-R1 Gate 8
+// re-review (Astra opinion: ScheduleEngine's fixed no-param kScheduleListCap
+// is the closer analogue), but the RAW, unscoped shape this test exercises
+// is otherwise unchanged.
 TEST_CASE("ExecutionTracker: get_children_checked at exactly the cap is not "
           "misreported as truncated (#2146 A2-R1 boundary)",
           "[pg][execution_tracker]") {
@@ -768,23 +773,23 @@ TEST_CASE("ExecutionTracker: get_children_checked at exactly the cap is not "
     auto parent_result = tracker.create_execution(make_execution());
     REQUIRE(parent_result.has_value());
 
-    for (int i = 0; i < 500; ++i) {
+    for (int i = 0; i < 100; ++i) {
         Execution child = make_execution("def-child-" + std::to_string(i));
         child.parent_id = *parent_result;
         REQUIRE(tracker.create_execution(child).has_value());
     }
 
-    auto checked = tracker.get_children_checked(*parent_result);
+    auto checked = tracker.get_children_checked(*parent_result, std::nullopt);
     REQUIRE(checked.has_value());
-    CHECK(checked->children.size() == 500);
+    CHECK(checked->children.size() == 100);
     CHECK_FALSE(checked->truncated);
 }
 
 // Sibling of the exact-cap test above: one child OVER the cap must come back
-// capped at 500 rows WITH result.truncated == true -- the honest signal REST
+// capped at 100 rows WITH result.truncated == true -- the honest signal REST
 // v1, the legacy route, and MCP all surface as result_truncated_by_cap.
 // Before this fix there was no cap at all, so this scenario could not be
-// distinguished from "the parent genuinely has 501 children" either --
+// distinguished from "the parent genuinely has 101 children" either --
 // worse, an unbounded read.
 TEST_CASE("ExecutionTracker: get_children_checked truncates and flags a parent one "
           "over the cap (#2146 A2-R1 boundary)",
@@ -795,16 +800,203 @@ TEST_CASE("ExecutionTracker: get_children_checked truncates and flags a parent o
     auto parent_result = tracker.create_execution(make_execution());
     REQUIRE(parent_result.has_value());
 
-    for (int i = 0; i < 501; ++i) {
+    for (int i = 0; i < 101; ++i) {
         Execution child = make_execution("def-child-" + std::to_string(i));
         child.parent_id = *parent_result;
         REQUIRE(tracker.create_execution(child).has_value());
     }
 
-    auto checked = tracker.get_children_checked(*parent_result);
+    auto checked = tracker.get_children_checked(*parent_result, std::nullopt);
     REQUIRE(checked.has_value());
-    CHECK(checked->children.size() == 500);
+    CHECK(checked->children.size() == 100);
     CHECK(checked->truncated);
+}
+
+// #2146 A2-R1 Gate 8 re-review fix: the exact bug this fold closes -- the
+// cap used to apply to the RAW row set BEFORE the caller-side confinement
+// filter, so a caller's own visible child could be displaced entirely out
+// of the capped window by invisible siblings dispatched more recently
+// (dispatched_at DESC). 105 invisible children (dispatched strictly AFTER
+// the visible one, so they occupy the top of the DESC-ordered window) plus
+// one visible child; a confined scope naming only the visible child's
+// dispatcher must still return it, and truncated must be false (the
+// caller's OWN visible row set -- one row -- is nowhere near the cap).
+TEST_CASE("ExecutionTracker: get_children_checked pushes the scope into SQL "
+          "before the cap, so an invisible sibling cannot displace a visible "
+          "child out of the capped window (#2146 A2-R1 Gate 8 fix)",
+          "[pg][execution_tracker][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto parent_result = tracker.create_execution(make_execution());
+    REQUIRE(parent_result.has_value());
+
+    Execution visible_child = make_execution("def-visible", "", "someone-else");
+    visible_child.parent_id = *parent_result;
+    visible_child.dispatched_at = 1000;
+    auto visible_id = tracker.create_execution(visible_child);
+    REQUIRE(visible_id.has_value());
+    AgentExecStatus visible_status;
+    visible_status.agent_id = "agent-visible";
+    visible_status.status = "success";
+    tracker.update_agent_status(*visible_id, visible_status);
+
+    for (int i = 0; i < 105; ++i) {
+        Execution invisible_child = make_execution("def-invisible-" + std::to_string(i), "",
+                                                    "someone-else");
+        invisible_child.parent_id = *parent_result;
+        // Strictly newer than the visible child -> every one of these sorts
+        // ahead of it in the dispatched_at DESC window the old, unscoped cap
+        // used to apply.
+        invisible_child.dispatched_at = 2000 + i;
+        auto invisible_id = tracker.create_execution(invisible_child);
+        REQUIRE(invisible_id.has_value());
+        AgentExecStatus invisible_status;
+        invisible_status.agent_id = "agent-invisible-" + std::to_string(i);
+        invisible_status.status = "success";
+        tracker.update_agent_status(*invisible_id, invisible_status);
+    }
+
+    yuzu::server::ExecutionListScope scope;
+    scope.owner = "nobody-owns-these"; // not the dispatcher of any child here
+    scope.visible_agents = {"agent-visible"};
+
+    auto checked = tracker.get_children_checked(*parent_result, scope);
+    REQUIRE(checked.has_value());
+    REQUIRE(checked->children.size() == 1);
+    CHECK(checked->children[0].id == *visible_id);
+    CHECK_FALSE(checked->truncated);
+}
+
+// At-cap boundary for the SCOPED (visible) count, not the raw count: exactly
+// 100 vs 101 children visible to the caller, each mixed in among invisible
+// siblings so the boundary genuinely exercises the scoped SQL path rather
+// than degenerating into the unscoped test above.
+TEST_CASE("ExecutionTracker: get_children_checked's cap boundary is the "
+          "caller's VISIBLE child count, not the raw row count "
+          "(#2146 A2-R1 Gate 8 fix)",
+          "[pg][execution_tracker][security]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto make_visible_batch = [&](const std::string& parent_id, int count) {
+        for (int i = 0; i < count; ++i) {
+            Execution child = make_execution("def-vis-" + std::to_string(i), "", "someone-else");
+            child.parent_id = parent_id;
+            child.dispatched_at = 1000 + i;
+            auto id = tracker.create_execution(child);
+            REQUIRE(id.has_value());
+            AgentExecStatus s;
+            s.agent_id = "agent-visible";
+            s.status = "success";
+            tracker.update_agent_status(*id, s);
+        }
+    };
+    auto make_invisible_batch = [&](const std::string& parent_id, int count) {
+        for (int i = 0; i < count; ++i) {
+            Execution child = make_execution("def-inv-" + std::to_string(i), "", "someone-else");
+            child.parent_id = parent_id;
+            child.dispatched_at = 5000 + i;
+            auto id = tracker.create_execution(child);
+            REQUIRE(id.has_value());
+            AgentExecStatus s;
+            s.agent_id = "agent-invisible-" + std::to_string(i);
+            s.status = "success";
+            tracker.update_agent_status(*id, s);
+        }
+    };
+
+    yuzu::server::ExecutionListScope scope;
+    scope.owner = "nobody-owns-these";
+    scope.visible_agents = {"agent-visible"};
+
+    SECTION("exactly 100 visible children, plus invisible noise, is not truncated") {
+        auto parent_result = tracker.create_execution(make_execution());
+        REQUIRE(parent_result.has_value());
+        make_visible_batch(*parent_result, 100);
+        make_invisible_batch(*parent_result, 20);
+
+        auto checked = tracker.get_children_checked(*parent_result, scope);
+        REQUIRE(checked.has_value());
+        CHECK(checked->children.size() == 100);
+        CHECK_FALSE(checked->truncated);
+    }
+
+    SECTION("101 visible children, plus invisible noise, is truncated at 100") {
+        auto parent_result = tracker.create_execution(make_execution());
+        REQUIRE(parent_result.has_value());
+        make_visible_batch(*parent_result, 101);
+        make_invisible_batch(*parent_result, 20);
+
+        auto checked = tracker.get_children_checked(*parent_result, scope);
+        REQUIRE(checked.has_value());
+        CHECK(checked->children.size() == 100);
+        CHECK(checked->truncated);
+    }
+}
+
+// #2146 A2-R1 Gate 8 fix: get_children_checked's `WHERE parent_id = $1` query
+// had no supporting index. Asserts the migration actually created it, rather
+// than trusting the migration literal by inspection.
+TEST_CASE("ExecutionTracker: migration creates a supporting index on "
+          "executions(parent_id) (#2146 A2-R1 Gate 8 fix)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    REQUIRE(tracker_bundle->is_open()); // forces the migration ladder to run
+
+    pg::PgConn conn{PQconnectdb(tracker_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    pg::PgResult res =
+        pg::exec_params(conn.get(),
+                        "SELECT 1 FROM pg_indexes WHERE schemaname = 'execution_tracker' "
+                        "AND indexname = 'idx_executions_parent_id'",
+                        std::vector<std::string>{});
+    REQUIRE(res.status() == PGRES_TUPLES_OK);
+    CHECK(PQntuples(res.get()) == 1);
+}
+
+// #2146 A2-R1 Gate 8 fix: get_children_checked's query ran under the pool's
+// 30s default statement_timeout, vastly exceeding the ~1.5s acquire budget
+// every other reader of this shared pool assumes (rbac_store included). Hold
+// an ACCESS EXCLUSIVE lock on `executions` from a SEPARATE side connection
+// (never the tracker's own pool, so the tracker stays "open" and this is a
+// genuine single-statement stall, not a pool/connection outage) and confirm
+// get_children_checked returns degraded (nullopt) at roughly the SET LOCAL
+// statement_timeout (~1.5s), never blocking anywhere near the pool's 30s
+// default or the connection-level 10s lock_timeout (pg_pool.hpp) -- both of
+// which are strictly larger, so the SET LOCAL override must be the one that
+// actually fires.
+TEST_CASE("ExecutionTracker: get_children_checked's statement_timeout fires "
+          "well under the pool's 30s default (#2146 A2-R1 Gate 8 fix)",
+          "[pg][execution_tracker]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto parent_result = tracker.create_execution(make_execution());
+    REQUIRE(parent_result.has_value());
+
+    pg::PgConn locker{PQconnectdb(tracker_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    {
+        pg::PgResult begin = pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{});
+        REQUIRE(begin.status() == PGRES_COMMAND_OK);
+        pg::PgResult lock = pg::exec_params(
+            locker.get(), "LOCK TABLE execution_tracker.executions IN ACCESS EXCLUSIVE MODE",
+            std::vector<std::string>{});
+        REQUIRE(lock.status() == PGRES_COMMAND_OK);
+    }
+
+    const auto t0 = std::chrono::steady_clock::now();
+    auto checked = tracker.get_children_checked(*parent_result, std::nullopt);
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+    // Release the lock regardless of the assertion outcome below.
+    pg::PgResult rollback =
+        pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+    (void)rollback;
+
+    CHECK_FALSE(checked.has_value());
+    CHECK(elapsed < std::chrono::seconds(8));
 }
 
 // ── Rerun ──────────────────────────────────────────────────────────────────
@@ -1013,7 +1205,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     auto exec_checked = closed.get_execution_checked("exec-1");
     REQUIRE_FALSE(exec_checked.has_value());
     CHECK(exec_checked.error() == "execution tracker not open");
-    CHECK_FALSE(closed.get_children_checked("exec-1").has_value());
+    CHECK_FALSE(closed.get_children_checked("exec-1", std::nullopt).has_value());
     CHECK_FALSE(
         closed.get_agent_statuses_for_executions_checked({"exec-1"}).has_value());
     // Engaged-empty still short-circuits on a closed store — zero requested
