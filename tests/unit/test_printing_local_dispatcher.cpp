@@ -210,8 +210,9 @@ TEST_CASE("printing plugin: printers action — live read over the real per-OS l
 // Case 1 (live read, unconditional) — jobs half. Same shape rules as
 // printers above, but a populated job row is 8 fields: job|printer|
 // job_id|owner|document|status|submitted_at|size_bytes; a read failure
-// still surfaces as "printer|unavailable|<token>" (this plugin's existing
-// do_jobs shape, not a bug in this test).
+// surfaces as "job|unavailable|<token>" (round-3 review Minor: do_jobs
+// previously emitted the printers action's "printer|" discriminator by
+// copy-paste, fixed on both the Windows and POSIX legs).
 TEST_CASE("printing plugin: jobs action — live read over the real per-OS leg, rc 0 and a "
           "well-formed row, unconditional whenever a CUPS socket exists",
           "[printing][actions]") {
@@ -235,7 +236,7 @@ TEST_CASE("printing plugin: jobs action — live read over the real per-OS leg, 
     REQUIRE_FALSE(rows.empty());
     for (const auto& r : rows) {
         const auto f = split_fields(r);
-        REQUIRE((f[0] == "job" || f[0] == "printer"));
+        REQUIRE(f[0] == "job");
         REQUIRE((f.size() == 2 || f.size() == 3 || f.size() == 8));
     }
 }

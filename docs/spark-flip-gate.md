@@ -465,7 +465,8 @@ flip, with a red-first test each:
   through the failure result so the caller only cleans up when there is genuinely something to
   clean up. A third Gate 8 re-review round (8 agents) on round 2's fix found no further blocking
   residuals. Two small non-blocking follow-ups were identified and deliberately NOT fixed here,
-  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload still discards the
+  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload (what the `#3990`
+  §5 entry below calls "the WAITING attach model") still discards the
   preservation signal, currently harmless since it has zero production callers today; and two
   pre-existing raw-API-level tests could usefully assert `prior_state_preserved`'s value directly
   for extra regression-locking. Separately, #4415 tracks the pre-existing (not introduced by this

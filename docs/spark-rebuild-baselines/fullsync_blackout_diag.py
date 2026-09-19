@@ -13,7 +13,8 @@ See docs/spark-rebuild-baselines/3990-fullsync-blackout-run.md for the
 measurand definitions, void rules, and decision criterion this implements -
 this file is the mechanism, that doc is the record of what it measured.
 
-Environment: YUZU_BASE (default http://127.0.0.1:8130), YUZU_ADMIN_USER,
+Environment: YUZU_BASE (default http://localhost:8080, inherited from
+generate_resgate_load.py's own G.BASE), YUZU_ADMIN_USER,
 YUZU_ADMIN_PASS (defaults match generate_resgate_load.py's UAT defaults -
 override for a non-default rig). YUZU_DGRHP_SSH (ssh destination for the
 agent-log reads, e.g. "-S /tmp/sock -i ~/.ssh/key user@host" as a single
@@ -67,9 +68,11 @@ KNOWN BUG, FIXED THIS ROUND: `cmd_report`'s grouping previously could not distin
 two different `run` invocations sharing the same label. Every row now carries `run_id` and
 `comparison_id`; grouping and the printed report key on both.
 
-This is a real property of the agent's --log-file output worth flagging as its own product
-finding (live-tailing --log-file for near-real-time diagnostics is unreliable without a flush
-policy) - not filed as an issue by this diagnostic; left for whoever picks that up next.
+The flush-lag gap above is a real property of the agent's --log-file output worth flagging as
+its own product finding (live-tailing --log-file for near-real-time diagnostics is unreliable
+without a flush policy) - filed as https://github.com/Tr3kkR/Yuzu/issues/4608 (2026-09-19,
+after a later re-measurement round on this same diagnostic's methodology hit the identical
+gap a second time).
 """
 
 import argparse
@@ -470,19 +473,28 @@ def cmd_purge(op, apply=False):
         return 1
 
     failed_baselines, failed_rules = [], []
-    for i, bid in enumerate(fresh["riga_baseline_ids"], 1):
-        try:
-            G.delete_baseline_form(op, bid)
-        except Exception as e:  # noqa: BLE001
-            print(f"[purge] baseline delete FAILED {bid}: {e}", file=sys.stderr)
-            failed_baselines.append(bid)
-        if i % 10 == 0 or i == len(fresh["riga_baseline_ids"]):
-            print(f"[purge] baselines {i}/{len(fresh['riga_baseline_ids'])}")
-    for i, rid in enumerate(fresh["riga_rule_ids"], 1):
-        if not G.delete_rule(op, rid):
-            failed_rules.append(rid)
-        if i % 500 == 0 or i == len(fresh["riga_rule_ids"]):
-            print(f"[purge] rules {i}/{len(fresh['riga_rule_ids'])}")
+    # Governance (unhappy-path UP-9): `except Exception` deliberately does NOT catch
+    # KeyboardInterrupt (a Ctrl-C should interrupt, not be swallowed as a delete failure) -
+    # but a mid-loop interrupt used to lose the "what got deleted this run" tally entirely,
+    # only printed at the end. try/finally prints the partial tally on any exit path,
+    # interrupted or not; a subsequent --apply re-verifies against a fresh dry-run regardless.
+    try:
+        for i, bid in enumerate(fresh["riga_baseline_ids"], 1):
+            try:
+                G.delete_baseline_form(op, bid)
+            except Exception as e:  # noqa: BLE001
+                print(f"[purge] baseline delete FAILED {bid}: {e}", file=sys.stderr)
+                failed_baselines.append(bid)
+            if i % 10 == 0 or i == len(fresh["riga_baseline_ids"]):
+                print(f"[purge] baselines {i}/{len(fresh['riga_baseline_ids'])}")
+        for i, rid in enumerate(fresh["riga_rule_ids"], 1):
+            if not G.delete_rule(op, rid):
+                failed_rules.append(rid)
+            if i % 500 == 0 or i == len(fresh["riga_rule_ids"]):
+                print(f"[purge] rules {i}/{len(fresh['riga_rule_ids'])}")
+    finally:
+        print(f"[purge] tally so far: failed_baselines={len(failed_baselines)} "
+              f"failed_rules={len(failed_rules)}")
 
     post = cmd_inventory(op, out_path=None)
     ok = (
@@ -545,20 +557,63 @@ def cmd_ensure(op):
 
 
 def cmd_teardown_cohort(op):
-    G.teardown_deployed_baseline(op, TRIGGER_BASELINE)
-    G.teardown_deployed_baseline(op, COHORT_BASELINE)
+    # Governance (unhappy-path UP-8): per-item try/except + tally, same pattern cmd_purge's
+    # own delete loops already use - a bare call here only caught HTTPError (via delete_rule's
+    # own internals) not URLError, so a REST connectivity blip mid-sequence used to abort with
+    # no record of what was actually removed; safety on re-run was incidental (404-idempotent
+    # deletes), not by design.
+    failed = []
+    for label, fn in (
+        (f"baseline {TRIGGER_BASELINE}", lambda: G.teardown_deployed_baseline(op, TRIGGER_BASELINE)),
+        (f"baseline {COHORT_BASELINE}", lambda: G.teardown_deployed_baseline(op, COHORT_BASELINE)),
+    ):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001
+            print(f"[teardown] {label} delete FAILED: {e}", file=sys.stderr)
+            failed.append(label)
     for r in cohort_rules():
-        G.delete_rule(op, r["rule_id"])
-    G.delete_rule(op, TRIGGER_RULE_ID)
+        try:
+            if not G.delete_rule(op, r["rule_id"]):
+                failed.append(r["rule_id"])
+        except Exception as e:  # noqa: BLE001
+            print(f"[teardown] rule {r['rule_id']} delete FAILED: {e}", file=sys.stderr)
+            failed.append(r["rule_id"])
+    try:
+        if not G.delete_rule(op, TRIGGER_RULE_ID):
+            failed.append(TRIGGER_RULE_ID)
+    except Exception as e:  # noqa: BLE001
+        print(f"[teardown] trigger rule delete FAILED: {e}", file=sys.stderr)
+        failed.append(TRIGGER_RULE_ID)
     # R5.7: sweep EVERY blackout-hbr-* rule by catalogue query, not a fixed id range -
     # run_id-scoped ids from possibly several invocations (including void attempts) can
     # otherwise be left behind (the exact class of leftover the existing run doc's
     # "hbr-01..03 -> hbr-04..06" teardown miss already documented).
-    rules = get_json(op, "/api/v1/guaranteed-state/rules?limit=1000")["data"]
-    hbr_ids = sorted(r["rule_id"] for r in rules if r["rule_id"].startswith(f"{COHORT_PREFIX}hbr-"))
+    # Governance Gate 8 (quality-engineer, second pass, ported from v1's own #3990 driver
+    # fix round): guard this scan itself - an unguarded call here would abort AFTER
+    # baselines/cohort-rules/trigger-rule are already deleted but skip the failed-tally
+    # print and the SSH scratch cleanup below, self-inconsistent with the per-rule guards
+    # just above.
+    try:
+        rules = get_json(op, "/api/v1/guaranteed-state/rules?limit=1000")["data"]
+        hbr_ids = sorted(r["rule_id"] for r in rules if r["rule_id"].startswith(f"{COHORT_PREFIX}hbr-"))
+    except Exception as e:  # noqa: BLE001
+        print(f"[teardown] hbr rule scan FAILED, skipping hbr cleanup this run: {e}",
+              file=sys.stderr)
+        hbr_ids = []
+        failed.append("hbr-scan")
     for rid in hbr_ids:
-        G.delete_rule(op, rid)
-    print(f"[teardown] deleted {len(hbr_ids)} blackout-hbr-* rule(s): {hbr_ids}")
+        try:
+            if not G.delete_rule(op, rid):
+                failed.append(rid)
+        except Exception as e:  # noqa: BLE001
+            print(f"[teardown] hbr rule {rid} delete FAILED: {e}", file=sys.stderr)
+            failed.append(rid)
+    if hbr_ids:
+        print(f"[teardown] deleted {len(hbr_ids)} blackout-hbr-* rule(s): {', '.join(hbr_ids)}")
+    if failed:
+        print(f"[teardown] {len(failed)} item(s) failed to delete, safe to re-run: "
+              f"{', '.join(failed)}", file=sys.stderr)
     try:
         ssh_ps(
             f"Remove-Item -Recurse -Force -Path '{SCRATCH_DIR_WIN}' -ErrorAction SilentlyContinue; "
@@ -1046,8 +1101,24 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         "run_id": run_id, "comparison_id": comparison_id,
         "void_class": None, "void_reason": None,
     }
-    m0 = get_metrics(op)
-    window_start_ts = dgrhp_now()
+    # Governance (unhappy-path UP-3, chaos CH-2, ported from v1's own #3990 driver fix
+    # round): guarded like the trigger call just below - an unguarded REST blip here used
+    # to crash the whole cmd_run loop instead of voiding one attempt, asymmetric with every
+    # other REST call in this function.
+    try:
+        m0 = get_metrics(op)
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument", void_reason=f"metrics_unavailable:{e}")
+        return row
+    # Governance Gate 8 (unhappy-path, second pass, ported): dgrhp_now() is its own unguarded
+    # ssh_ps() round trip, and the single most frequent SSH call site in this function (once
+    # per attempt) - a bare call here still crashes the whole cmd_run loop on an SSH blip.
+    try:
+        window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument",
+                    void_reason=f"dgrhp_clock_unavailable:{type(e).__name__}:{str(e)[:200]}")
+        return row
     http_status = None
     if trigger_kind == "deploy":
         try:
@@ -1076,19 +1147,48 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["trigger_http_status"] = http_status
 
     allow_fallback_t0 = False  # R5.7: B/B2 never accept the fallback T0 (round-2 correction)
-    t0, t0_source, reason, tail_saturated = observe_t0(
-        window_start_ts, allow_fallback_t0, ROOT_CAUSED_T0_TIMEOUT)
+    # Governance (unhappy-path UP-2, ported): observe_t0 polls over SSH for up to
+    # ROOT_CAUSED_T0_TIMEOUT seconds; an uncaught subprocess.TimeoutExpired or SSH
+    # control-socket failure from ssh_ps() (via _fetch_window/agent_log_size) used to
+    # propagate all the way out and crash the whole cmd_run loop instead of voiding this
+    # one attempt the way trigger_failed/metrics_unavailable already do.
+    try:
+        t0, t0_source, reason, tail_saturated = observe_t0(
+            window_start_ts, allow_fallback_t0, ROOT_CAUSED_T0_TIMEOUT)
+    except Exception as e:  # noqa: BLE001
+        # Governance Gate 8 (quality-engineer, second pass, ported): this exception domain
+        # can include subprocess.TimeoutExpired from ssh_ps() - its str() embeds the full
+        # argv (SSH destination/user/key path, the base64-encoded PowerShell payload). Name
+        # and truncate rather than embed raw, so a committed JSONL row never carries rig
+        # connection details or a multi-KB payload dump.
+        row.update(void_class="instrument",
+                    void_reason=f"observe_t0_failed:{type(e).__name__}:{str(e)[:200]}")
+        return row
     row["tail_saturated"] = tail_saturated
     if reason:
         row.update(void_class=void_class_for(reason), void_reason=reason)
         return row
     row["t0"], row["t0_source"] = t0["ts"].isoformat(), t0_source
 
-    own_events, _ = _fetch_window(window_start_ts)
+    # Governance (unhappy-path UP-2 class, ported/extended): a direct _fetch_window() call,
+    # same failure mode as every other SSH-polling call in this function.
+    try:
+        own_events, _ = _fetch_window(window_start_ts)
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument",
+                    void_reason=f"own_events_fetch_failed:{type(e).__name__}:{str(e)[:200]}")
+        return row
     own_push_raw = find_own_push_cmd_raw(own_events, t0["ts"])
 
     if backend == "spark":
-        t0d, reason = observe_t0d(window_start_ts, t0["ts"], ROOT_CAUSED_T0D_TIMEOUT)
+        # Governance (unhappy-path UP-2, ported): observe_t0d is the same class of
+        # SSH-polling call as observe_t0 just above.
+        try:
+            t0d, reason = observe_t0d(window_start_ts, t0["ts"], ROOT_CAUSED_T0D_TIMEOUT)
+        except Exception as e:  # noqa: BLE001
+            row.update(void_class="instrument",
+                        void_reason=f"observe_t0d_failed:{type(e).__name__}:{str(e)[:200]}")
+            return row
         if reason:
             row.update(void_class=void_class_for(reason), void_reason=reason)
             return row
@@ -1116,7 +1216,14 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
     row["t0d"] = {"ts": t0d["ts"].isoformat(), "epoch": t0d["epoch"], "floor": t0d["floor"],
                   "detached_rules": t0d["detached_rules"], "withdrawn_claims": t0d["withdrawn_claims"]}
 
-    t1, reason = observe_t1(window_start_ts, t0d["ts"], ROOT_CAUSED_T1_TIMEOUT)
+    # Governance (unhappy-path UP-2, ported): observe_t1 is the same class of SSH-polling
+    # call as observe_t0/observe_t0d above.
+    try:
+        t1, reason = observe_t1(window_start_ts, t0d["ts"], ROOT_CAUSED_T1_TIMEOUT)
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument",
+                    void_reason=f"observe_t1_failed:{type(e).__name__}:{str(e)[:200]}")
+        return row
     if reason:
         row.update(void_class=void_class_for(reason), void_reason=reason)
         return row
@@ -1125,14 +1232,30 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
         t1["groups"][3], int(t1["groups"][4]), int(t1["groups"][5]),
     )
     row.update(t1=t1["ts"].isoformat(), applied=applied, failed=failed, pending=pending,
-               total=total, generation=generation)
+               total=total, generation=generation, full_sync=full_sync)
+    # Governance (unhappy-path UP-5, ported): full_sync is captured by T1_RE but was never
+    # asserted - an apply_rules ok line with full_sync=false still matched and was silently
+    # accepted as this measurement's T1. Void on it instead of silently accepting it.
+    if full_sync != "true":
+        row.update(void_class=void_class_for(f"not_full_sync({full_sync})"),
+                    void_reason=f"not_full_sync({full_sync})")
+        return row
     b_ms = (t1["ts"] - t0["ts"]).total_seconds() * 1000
     row["b_ms"] = b_ms
 
     # m1: sampled on DGRHP's own clock (never local time.time() - see dgrhp_now()'s own
     # docstring for the cross-host drift this avoids), immediately after T1 becomes visible.
-    m1_observed_dgrhp = dgrhp_now()
-    m1 = get_metrics(op)
+    # Governance (unhappy-path UP-3, ported and extended to this m1 site to match the
+    # guarding already applied to every other SSH/REST call in this function - m0's
+    # get_metrics() call above has the identical failure mode): an unguarded blip here
+    # would otherwise crash the whole cmd_run loop for the sake of a metrics snapshot.
+    try:
+        m1_observed_dgrhp = dgrhp_now()
+        m1 = get_metrics(op)
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument",
+                   void_reason=f"m1_unavailable:{type(e).__name__}:{str(e)[:200]}")
+        return row
     row["m1_observed_wall"] = m1_observed_dgrhp.isoformat()
     row["m1_lag_ms"] = (m1_observed_dgrhp - t1["ts"]).total_seconds() * 1000
 
@@ -1196,7 +1319,20 @@ def run_repeat(op, phase, backend, trigger_kind, cohort_ids, exp_rule_ids, repea
 
     c_ms = row["c_ms"]
     deadline_ms = max(2 * c_ms, 30000)
-    d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
+    # Governance Gate 8 (self-review, third pass, ported - same UP-2 class already applied
+    # to observe_t0/observe_t0d/observe_t1 above): cohort_events_d() calls
+    # dgrhp_utc_offset() which, on a cache miss (the common case - it's lazily computed once
+    # per process, and this is the FIRST call site reached on the B/B2 path), makes its own
+    # unguarded ssh_ps() round trip - a failure here used to crash the whole cmd_run loop
+    # after T0/T0d/T1 had already been successfully observed, discarding real data. No
+    # pre-existing void_reason to preserve at this point in this branch's flow (every earlier
+    # void condition above already returns immediately), unlike v1's flatter structure.
+    try:
+        d_by_rule = cohort_events_d(op, cohort_ids, t0["ts"], deadline_ms)
+    except Exception as e:  # noqa: BLE001
+        row.update(void_class="instrument",
+                    void_reason=f"cohort_events_failed:{type(e).__name__}:{str(e)[:200]}")
+        return row
     functional_valid = all(v != "not_observed" for v in d_by_rule.values())
     row["compliant_restored_ms_by_rule"] = d_by_rule
     row["functional_valid"] = functional_valid
@@ -1315,25 +1451,48 @@ def observe_phase_a_window(window_start_ts):
 
 def cmd_run_phase_a(op, backend, label, out_path, cap_seconds=1200, target_windows=3):
     start = time.time()
-    results = []
-    window_start_ts = dgrhp_now()
-    while len(results) < target_windows and (time.time() - start) < cap_seconds:
-        obs = observe_phase_a_window(window_start_ts)
-        window_start_ts = obs.get("next_window_start") or dgrhp_now()
+    n_windows = 0
+    # Governance Gate 8 (unhappy-path, second pass): Phase A never got UP-2's SSH-exception
+    # guarding at all - only Phase B/B2's observe_window() was wrapped. Phase A is context-only
+    # (never verdict-bearing, see the run doc), but an unguarded SSH blip here still crashed
+    # the whole cmd_run_phase_a invocation rather than ending the observation early or voiding
+    # one window, same UP-2 symptom class.
+    try:
+        window_start_ts = dgrhp_now()  # NOT datetime.now(timezone.utc) - see dgrhp_utc_offset()
+    except Exception as e:  # noqa: BLE001
+        print(f"[run-a] {label} {backend} ABORT: dgrhp clock unavailable before first window: "
+              f"{type(e).__name__}:{str(e)[:200]}", file=sys.stderr)
+        return 1
+    while n_windows < target_windows and (time.time() - start) < cap_seconds:
+        try:
+            obs = observe_phase_a_window(window_start_ts)
+        except Exception as e:  # noqa: BLE001
+            obs = {"void_reason": f"observe_failed:{type(e).__name__}:{str(e)[:200]}"}
+        try:
+            window_start_ts = obs.get("next_window_start") or dgrhp_now()
+        except Exception as e:  # noqa: BLE001
+            n_windows += 1
+            obs.pop("next_window_start", None)
+            obs.update({"phase": "A", "backend": backend, "label": label, "repeat": n_windows})
+            with open(out_path, "a") as f:
+                f.write(json.dumps(obs) + "\n")
+            print(f"[run-a] {label} {backend} window={n_windows} dgrhp clock unavailable for "
+                  f"next window, ending observation early: {type(e).__name__}:{str(e)[:200]}",
+                  file=sys.stderr)
+            break
         obs.pop("next_window_start", None)
-        obs.update({"phase": "A", "backend": backend, "label": label,
-                    "repeat": len(results) + 1})
-        results.append(obs)
+        n_windows += 1
+        obs.update({"phase": "A", "backend": backend, "label": label, "repeat": n_windows})
+        # Governance (unhappy-path UP-1): write through per window, same reasoning as cmd_run.
+        with open(out_path, "a") as f:
+            f.write(json.dumps(obs) + "\n")
         status = "VOID:" + obs["void_reason"] if obs.get("void_reason") else \
             f"b_ms={obs['b_ms']:.1f} applied={obs['applied']} failed={obs['failed']} total={obs['total']}"
-        print(f"[run-a] {label} {backend} window={len(results)} {status}")
+        print(f"[run-a] {label} {backend} window={n_windows} {status}")
         if obs.get("void_reason") in ("log_rotated_mid_window",):
             break
     elapsed = time.time() - start
-    with open(out_path, "a") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
-    print(f"[run-a] {label} {backend} DONE windows={len(results)} elapsed_s={elapsed:.0f} "
+    print(f"[run-a] {label} {backend} DONE windows={n_windows} elapsed_s={elapsed:.0f} "
           f"cap_hit={elapsed >= cap_seconds}")
     return 0
 
@@ -1888,12 +2047,29 @@ def _f19():
     ok3 = not (GENUINE_FAILURE_REASONS & INSTRUMENT_INVALID_REASONS)
     ok4 = all(void_class_for(r) == "genuine" for r in genuine_literals)
     ok5 = all(void_class_for(r) == "instrument" for r in instrument_literals)
-    # the two documented dynamic-prefix reasons classify instrument by
-    # default (the comment above INSTRUMENT_INVALID_REASONS's own definition
-    # describes this; not a set-membership case).
-    ok6 = (void_class_for("trigger_failed:some error") == "instrument"
-           and void_class_for("push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)")
-           == "instrument")
+    # The documented dynamic-prefix reasons classify instrument by default (the
+    # comment above INSTRUMENT_INVALID_REASONS's own definition describes this;
+    # not a set-membership case). Grown from 2 to 10 in the R5.7-driver-merge
+    # governance round (2026-09-19): the ported per-site SSH/REST guards each
+    # mint their own dynamic-prefix reason (metrics_unavailable/
+    # dgrhp_clock_unavailable/observe_t0_failed/own_events_fetch_failed/
+    # observe_t0d_failed/observe_t1_failed/m1_unavailable/cohort_events_failed),
+    # plus not_full_sync(...) (D1 in that round's review - currently instrument
+    # by this same default; revisit this fixture if that classification changes).
+    dynamic_prefix_reasons = [
+        "trigger_failed:some error",
+        "push_counter_mismatch(reconcile_sent_delta=1,pushes_delta=0)",
+        "metrics_unavailable:some error",
+        "dgrhp_clock_unavailable:TimeoutExpired:cmd timed out",
+        "observe_t0_failed:TimeoutExpired:cmd timed out",
+        "own_events_fetch_failed:TimeoutExpired:cmd timed out",
+        "observe_t0d_failed:TimeoutExpired:cmd timed out",
+        "observe_t1_failed:TimeoutExpired:cmd timed out",
+        "m1_unavailable:TimeoutExpired:cmd timed out",
+        "cohort_events_failed:TimeoutExpired:cmd timed out",
+        "not_full_sync(false)",
+    ]
+    ok6 = all(void_class_for(r) == "instrument" for r in dynamic_prefix_reasons)
     return (ok1 and ok2 and ok3 and ok4 and ok5 and ok6,
             f"genuine_set_matches={ok1} instrument_set_matches={ok2} "
             f"zero_overlap={ok3} genuine_classify_correct={ok4} "
@@ -1987,7 +2163,10 @@ def main():
         cmd_inventory(op, out_path=os.path.join(SCRATCH_DIR, "inventory.json"))
         return 0
     if args.cmd == "purge":
-        return cmd_purge(op, apply=args.apply)
+        # Governance (happy-path Finding 4): --dry-run was parsed but never read, so
+        # `purge --apply --dry-run` together still deleted with no override protection.
+        # --dry-run now wins if both are given.
+        return cmd_purge(op, apply=args.apply and not args.dry_run)
     if args.cmd == "ensure":
         return cmd_ensure(op)
     if args.cmd == "teardown-cohort":

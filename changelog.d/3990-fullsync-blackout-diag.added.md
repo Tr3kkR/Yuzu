@@ -14,5 +14,8 @@
   bug, and the 5 affected service targets replaced with ones confirmed stable) and the
   diagnostic re-run clean same day: Phase B median 70ms (legacy) vs 127ms (spark), Phase B2
   86ms vs 140ms, all 16 counted repeats independently satisfying the full pre-registered rule -
-  a genuine PASS, within the predeclared non-inferiority margin. Raw per-repeat data for all
-  three attempts committed alongside the run doc.
+  a genuine PASS, within the predeclared non-inferiority margin. This result was measured on
+  the pre-rung-9c-PR-2 WAITING attach model (`origin/dev@65f2938156a19`) and stands as its own
+  record for that build; a separate re-measurement under the current NonWaiting model is
+  tracked independently. Raw per-repeat data for all three attempts committed alongside the
+  run doc.

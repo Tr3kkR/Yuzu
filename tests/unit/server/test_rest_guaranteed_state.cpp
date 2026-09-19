@@ -30,6 +30,7 @@
 #include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
+#include "dex_api_local.hpp" // ADR-0031 WS-A4: wire the real DexApi seam so the DEX REST cases exercise it
 #include "rest_api_v1.hpp"
 #include "test_network_api_double.hpp"
 #include "test_route_sink.hpp"
@@ -517,6 +518,15 @@ struct RestGsHarness {
                       int) -> std::optional<yuzu::server::CohortRead> { return cohort_read_; });
         }
 
+        // ADR-0031 WS-A4: the REAL DexApi seam over this harness's live
+        // GuaranteedStateStore + fleet override, so the DEX signal REST cases
+        // exercise the SEAM path (production wires it identically). Gated on
+        // store presence exactly like server.cpp — null store → null api → 503.
+        std::shared_ptr<yuzu::server::DexApi> dex_api_local;
+        if (store)
+            dex_api_local = yuzu::server::make_local_dex_api(
+                store.get(), [this]() { return dex_fleet_override_; });
+
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac_,
                             /*mgmt_store=*/&mgmt_,
@@ -573,9 +583,10 @@ struct RestGsHarness {
                             // unwired defaults (fail-closed / legacy-open
                             // respectively) are correct no-ops here.
                             /*agents_fn=*/{}, /*response_visible_set_fn=*/{},
-                            // #4035: reads dex_fleet_override_ LIVE at request
-                            // time (see that field's doc comment).
-                            RestApiV1::DexFleetFn{[this]() { return dex_fleet_override_; }},
+                            // ADR-0031 WS-A4 (fifth family): the dex_fleet_fn
+                            // register_routes param is retired — the DEX handlers
+                            // get the fleet via the DexApi seam (dex_api_local
+                            // above, wired with dex_fleet_override_).
                             // #4035 hardening (governance): reads
                             // dex_visible_override_ LIVE at request time
                             // (ignores `username` — this stub doesn't model
@@ -586,7 +597,10 @@ struct RestGsHarness {
                             // ADR-0031 WS-A4 #4250: the shared VerifyApi seam backing
                             // GET /api/v1/dex/perf/compare (see verify_api_'s doc
                             // comment above).
-                            verify_api_);
+                            verify_api_,
+                            // ADR-0031 WS-A4: device_api unused by this harness;
+                            // dex_api_local is the real DEX signals seam (above).
+                            /*device_api=*/nullptr, dex_api_local);
     }
 
     // The fleet /status route's real AuthRoutes::require_list_read gate needs
