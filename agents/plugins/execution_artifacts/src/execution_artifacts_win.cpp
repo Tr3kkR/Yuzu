@@ -125,6 +125,7 @@
 #include <format>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <system_error>
 #include <utility>
@@ -524,6 +525,9 @@ std::string copy_amcache_via_backup_semantics(const wchar_t* dest) {
 
 constexpr wchar_t kPrefetchGlob[] = L"C:\\Windows\\Prefetch\\*.pf";
 constexpr wchar_t kPrefetchDir[] = L"C:\\Windows\\Prefetch\\";
+constexpr wchar_t kPrefetchParamsSubkey[] =
+    L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management\\PrefetchParameters";
+constexpr wchar_t kEnablePrefetcherValue[] = L"EnablePrefetcher";
 constexpr size_t kPrefetchMaxFiles = 2048;
 constexpr uint64_t kPrefetchPerFileMaxBytes = 8ull * 1024 * 1024;   // 8 MiB
 constexpr uint64_t kPrefetchTotalMaxBytes = 256ull * 1024 * 1024;   // 256 MiB
@@ -892,14 +896,33 @@ int collect_amcache(yuzu::CommandContext& ctx, std::string_view data_dir) {
 
 // ═══════════════════════════════════════════════════════════════ Prefetch ═
 
+/// Best-effort read of `EnablePrefetcher` (PrefetchParameters). Returns
+/// nullopt on ANY failure -- missing key/value, wrong type, access denied --
+/// never throws, never logs above debug. Used only to classify an already-
+/// empty Prefetch directory (#4391); a populated directory never calls this.
+std::optional<uint32_t> read_enable_prefetcher() {
+    DWORD value = 0;
+    DWORD size = sizeof(value);
+    LONG rc = RegGetValueW(HKEY_LOCAL_MACHINE, kPrefetchParamsSubkey, kEnablePrefetcherValue,
+                           RRF_RT_REG_DWORD, nullptr, &value, &size);
+    if (rc != ERROR_SUCCESS)
+        return std::nullopt;
+    return value;
+}
+
 int collect_prefetch(yuzu::CommandContext& ctx) {
     try {
         WIN32_FIND_DATAW find_data{};
         ScopedFindHandle find(FindFirstFileW(kPrefetchGlob, &find_data));
         if (!find) {
             const DWORD err = GetLastError();
+            // Zero files could mean the prefetcher is off (expected), configured
+            // on but with no evidence (prefetch_evidence_absent), or unknown
+            // (registry unreadable / undocumented value) -- see
+            // prefetch_absence_token's doc comment for the forensic distinction.
             if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
-                return emit_constrained(ctx, "prefetch_disabled");
+                return emit_constrained(
+                    ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
             return emit_constrained(ctx, "prefetch_enum_" + std::to_string(err));
         }
 
@@ -1003,7 +1026,8 @@ int collect_prefetch(yuzu::CommandContext& ctx) {
         }
 
         if (files_seen == 0 && !acc.any_failure())
-            return emit_constrained(ctx, "prefetch_disabled");
+            return emit_constrained(
+                ctx, std::string{prefetch_absence_token(read_enable_prefetcher())});
 
         if (acc.incomplete())
             ctx.write_output("constrained|" + acc.reason());

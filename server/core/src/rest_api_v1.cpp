@@ -10,7 +10,8 @@
 #include "bundle_orchestrator.hpp" // live-query bundle (ADR-0011): dispatch + collate
 #include "bundle_service.hpp"      // validate_bundle_steps / aggregate_to_json
 #include "engine_principal_store.hpp" // PR 4.2: engine role-assignment authoring surface
-#include "dex_read_model.hpp" // #4035: shared REST+MCP builders (device score, device app-perf, ...)
+#include "dex_read_builders.hpp" // #4035: dex_device_app_perf_json (app-perf drill serializer, store-reaching)
+#include "dex_read_model.hpp" // #4035: shared REST+MCP model structs + serializers (device score, ...)
 #include "dex_routes.hpp" // dex_window_to_days / dex_iso_since (shared window resolver)
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
@@ -1195,7 +1196,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Per-device app performance over time (B1 drill)", "tags": ["DEX"], "description": "Requires GuaranteedState:Read, scoped to the device's management group. This device's retained daily per-app-version performance series from the Postgres B1 store — the 'over time, on THIS box' companion to the fleet trend GET /dex/perf/app. One row per (app, version, UTC day) over the B1 retention (up to 31 days): cpu_avg/cpu_max are share-of-capacity %, ws_avg_bytes/ws_max_bytes are working-set bytes, samples is the hourly-bucket count, instances_max the peak concurrent process count. No percentiles — a single device's daily averages ARE the series. Optional app query parameter narrows to one app name. Individual-identifying behavioral data, so every call emits a dex.device.app_perf.view audit event and FAILS CLOSED (503 + Sec-Audit-Failed: true) when that row cannot persist. Covers only resource-significant app-versions (procperf top-N), NOT every installed app.", "parameters": [{"name": "id", "in": "path", "required": true, "schema": {"type": "string"}}, {"name": "app", "in": "query", "required": false, "schema": {"type": "string"}, "description": "Exact app-name filter (optional)."}], "responses": {"200": {"description": "{data:{agent_id, app, rows[].{app_name, version, day, samples, instances_max, cpu_avg, cpu_max, ws_avg_bytes, ws_max_bytes}}}"}, "403": {"description": "outside the caller's management scope"}, "503": {"description": "Service unavailable, the app-perf store read degraded, OR the dex.device.app_perf.view audit row could not persist (carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural-PII was withheld because the access-audit row failed to persist."}}}}}
     },
     "/dex/perf/fleet": {
-      "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators. Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online)"}, "503": {"description": "service unavailable"}}}
+      "get": {"summary": "Fleet device-performance now-stats", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Current-cycle fleet stats (avg/p50/p90/max + n) for CPU utilization %, memory commit % and disk I/O latency ms, computed at request time over registry heartbeat state — the same numbers as the yuzu_fleet_perf_* Prometheus gauges and the /dex Performance tab. A metric nobody reported is null (absent, never 0); reporting and windows_online carry the honest denominators (windows_online: historically the only OS with a perf collector). linux_online/macos_online are the same online-count per OS, and reporting_windows/reporting_linux/reporting_macos split the reporting population by OS — macos_online is real (agents connect) but reporting_macos is always 0 today (no macOS perf collector yet). Fleet aggregate — NOT audited.", "responses": {"200": {"description": "Fleet now object (cpu_pct|null, commit_pct|null, disk_lat_ms|null, reporting, windows_online, linux_online, macos_online, reporting_windows, reporting_linux, reporting_macos)"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/cohorts": {
       "get": {"summary": "Fleet-relative performance percentiles per cohort", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Cohorts are the distinct values of an operator-chosen tag key (default model). Cohorts under the 10-device statistical floor return suppressed=true with their population and no stats; devices without the key form the explicit cohort=\"\" (untagged) residual, never a silent omission. available_keys lists the fleet's tag keys for picker UIs. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}], "responses": {"200": {"description": "Cohort table (key, floor, cohorts[].{cohort, devices, suppressed, cpu_pct?, commit_pct?, disk_lat_ms?}, available_keys[])"}, "400": {"description": "Invalid tag key"}, "503": {"description": "service unavailable"}}}
@@ -1204,7 +1205,7 @@ const std::string& openapi_spec() {
       "get": {"summary": "Direct cohort-vs-cohort performance comparison", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. F2c (BRD 99/103): diffs two cohorts (values of the chosen tag key, default model) head-to-head — e.g. image_type vanilla vs layered — where /dex/perf/cohorts benchmarks each cohort against the fleet. Both cohort values a and b are required (an empty value is the untagged residual). delta_pct.<metric> is A's p50 relative to B's p50 (B the baseline), null unless BOTH cohorts expose the metric (neither suppressed below the 10-device floor). found_a/found_b are false when a cohort has no reporting devices. Aggregate — NOT audited.", "parameters": [{"name": "key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "a", "in": "query", "required": true, "schema": {"type": "string"}, "description": "First cohort value (empty string = untagged residual)."}, {"name": "b", "in": "query", "required": true, "schema": {"type": "string"}, "description": "Second cohort value (the baseline)."}], "responses": {"200": {"description": "Diff object (key, floor, found_a, found_b, a|null, b|null, delta_pct{cpu_pct|null, commit_pct|null, disk_lat_ms|null})"}, "400": {"description": "Invalid tag key, or missing cohort params"}, "503": {"description": "service unavailable"}}}
     },
     "/dex/perf/devices": {
-      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id, no per-device data.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
+      "get": {"summary": "Device list behind every fleet-performance drill", "tags": ["DEX"], "description": "Requires GuaranteedState:Read. Worst devices by a metric (default), devices NOT reporting perf this cycle (filter=not_reporting), or one cohort's members. The cohort key always resolves (default model) so rows carry real cohort values; filtering applies only when cohort_value is present (empty string = the untagged residual). fleet_pctile is the device's nearest-rank position among all reported values of the sort metric. Each row names an agent_id fleet-wide, so every call emits a dex.perf.device.view audit event and a service-scoped API token is denied outright (403) — there is no single agent_id to confine the token's own service-tag scope against. FAILS CLOSED (503 + Sec-Audit-Failed: true header) when the dex.perf.device.view audit row cannot persist, so the device list is never served without durable evidence. (The three aggregate DEX-perf endpoints — fleet, cohorts, cohort-diff — stay unaudited: no agent_id, no per-device data.)", "parameters": [{"name": "metric", "in": "query", "required": false, "schema": {"type": "string", "enum": ["cpu", "commit", "disk_lat"], "default": "cpu"}}, {"name": "filter", "in": "query", "required": false, "schema": {"type": "string", "enum": ["not_reporting"]}}, {"name": "cohort_key", "in": "query", "required": false, "schema": {"type": "string", "pattern": "^[A-Za-z0-9_.:-]{1,64}$", "default": "model"}}, {"name": "cohort_value", "in": "query", "required": false, "schema": {"type": "string"}, "description": "When present, restrict to this cohort; empty string selects the untagged residual."}, {"name": "limit", "in": "query", "required": false, "schema": {"type": "integer", "default": 50, "maximum": 500}}], "responses": {"200": {"description": "Device rows (data[].agent_id, cohort, cpu_pct?, commit_pct?, disk_lat_ms?, fleet_pctile?, os)"}, "400": {"description": "Invalid cohort_key or limit"}, "403": {"description": "Service-scoped API token — this fleet-wide read cannot be confined to the token's service."}, "503": {"description": "Service unavailable OR the dex.perf.device.view audit row could not persist (the latter carries Sec-Audit-Failed: true).", "headers": {"Sec-Audit-Failed": {"schema": {"type": "string", "enum": ["true"]}, "description": "Present when behavioural data was withheld because the access-audit row failed to persist."}}}}}
     },
     )json"
         // Split again (MSVC C2026 ~16 KB per-literal cap); concatenated at compile.
@@ -1795,8 +1796,9 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
+    DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
+    std::shared_ptr<const DexApi> dex_api) {
     HttplibRouteSink sink(svr);
     register_routes(sink, std::move(auth_fn), std::move(perm_fn), std::move(audit_fn), rbac_store,
                     mgmt_store, token_store, quarantine_store, response_store, instruction_store,
@@ -1812,8 +1814,9 @@ void RestApiV1::register_routes(
                     std::move(app_perf_providers), engine_principal_store, access_review_store,
                     auth_db, directory_sync, stream_budget, std::move(exec_visible_fn),
                     std::move(list_read_fn), std::move(fleet_read_fn), std::move(agents_fn),
-                    std::move(response_visible_set_fn), std::move(dex_fleet_fn),
-                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api));
+                    std::move(response_visible_set_fn),
+                    std::move(dex_visible_fn), std::move(verify_api), std::move(device_api),
+                    std::move(dex_api));
 }
 
 void RestApiV1::register_routes(
@@ -1837,8 +1840,9 @@ void RestApiV1::register_routes(
     AuthDB* auth_db, DirectorySync* directory_sync, detail::StreamBudget* stream_budget,
     ExecVisibleFn exec_visible_fn, ListReadFn list_read_fn, FleetReadFn fleet_read_fn,
     AgentsJsonFn agents_fn, ResponseVisibleSetFn response_visible_set_fn,
-    DexFleetFn dex_fleet_fn, DexVisibleFn dex_visible_fn,
-    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api) {
+    DexVisibleFn dex_visible_fn,
+    std::shared_ptr<const VerifyApi> verify_api, std::shared_ptr<const DeviceApi> device_api,
+    std::shared_ptr<const DexApi> dex_api) {
 
     spdlog::info("REST API v1: registering routes");
 
@@ -1959,7 +1963,7 @@ void RestApiV1::register_routes(
     // deny_fleet_wide_service_scoped above — that closes the service-scoped
     // -API-token axis, this closes the management-group-confined-OPERATOR
     // axis; neither substitutes for the other (see the SCOPING NOTE on
-    // server.cpp's dex_fleet_fn provider). nullopt = unfiltered (global read
+    // server.cpp's dex_visible_fn provider). nullopt = unfiltered (global read
     // / RBAC off, unresolved session, or dex_visible_fn unwired).
     auto resolve_dex_visible =
         [auth_fn, dex_visible_fn](const httplib::Request& req) -> std::optional<std::set<std::string>> {
@@ -12024,23 +12028,21 @@ void RestApiV1::register_routes(
 
     // GET /dex/signals — whole-catalogue rollup (every obs_type in the window,
     // with event count + blast radius). Aggregate; not audited.
-    sink.Get("/api/v1/dex/signals", [perm_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                      httplib::Response& res) {
+    sink.Get("/api/v1/dex/signals", [perm_fn, dex_api](const httplib::Request& req,
+                                                       httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
-        const std::string since = dex_iso_since(dex_window_to_days(window));
         // A1 parity: `os=windows|linux|macos` narrows the rollup to one OS's own
         // signals (anything else = all-OS), matching the dashboard catalogue's
         // OS filter so the machine surface can never drift from what the page shows.
-        const std::string os_scope =
-            dex_normalize_os_filter(req.has_param("os") ? req.get_param_value("os") : "");
-        auto rows = guaranteed_state_store->dex_signal_summary(since, os_scope);
+        const std::string os_raw = req.has_param("os") ? req.get_param_value("os") : "";
+        auto rows = dex_api->signals(window, os_raw);
         JArr arr;
         for (const auto& r : rows) {
             arr.add(JObj()
@@ -12061,8 +12063,8 @@ void RestApiV1::register_routes(
     // same posture as /fragments/device/dex.
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+))",
-        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [scoped_perm_fn, audit_fn, dex_api](const httplib::Request& req,
+                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             // Echo the correlation id on EVERY response path (success + error), the
@@ -12080,7 +12082,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return; // the gate wrote its own 401/403
-            if (!guaranteed_state_store) {
+            if (!dex_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -12119,12 +12121,10 @@ void RestApiV1::register_routes(
                              agent_id);
                 return;
             }
-            const std::string since = dex_iso_since(dex_window_to_days(window));
-            // #4035: shared builder (dex_read_model.hpp) -- the MCP twin
-            // get_dex_device_score calls the SAME two functions so the two
-            // response shapes cannot drift (docs/api-twin-recipe.md Rule 1).
-            const auto model =
-                build_dex_device_score_model(guaranteed_state_store, agent_id, window, since);
+            // #4035: shared model (dex_read_model.hpp), now assembled behind the
+            // DexApi seam (ADR-0031 WS-A4) -- the MCP twin get_dex_device_score
+            // consumes the SAME api so the two response shapes cannot drift.
+            const auto model = dex_api->device_score(agent_id, window);
             res.set_content(ok_json(dex_device_score_json(model)), "application/json");
         });
 
@@ -12414,18 +12414,17 @@ void RestApiV1::register_routes(
 
     // GET /dex/scope — per-OS signal coverage (how many distinct obs_types each
     // platform reports, and total events). Aggregate; not audited.
-    sink.Get("/api/v1/dex/scope", [perm_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+    sink.Get("/api/v1/dex/scope", [perm_fn, dex_api](const httplib::Request& req,
+                                                     httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
             return;
         }
         const std::string window = req.has_param("window") ? req.get_param_value("window") : "7d";
-        const std::string since = dex_iso_since(dex_window_to_days(window));
-        auto rows = guaranteed_state_store->dex_os_signal_scope(since);
+        auto rows = dex_api->scope(window);
         JArr arr;
         for (const auto& r : rows) {
             arr.add(JObj()
@@ -12447,7 +12446,7 @@ void RestApiV1::register_routes(
     // 404 route-miss; a valid-but-absent type yields 200 with empty arrays (the
     // read-model has no such observations — it is not an entity-not-found).
     sink.Get(R"(/api/v1/dex/signals/([^/]+))",
-             [perm_fn, audit_fn, guaranteed_state_store, deny_fleet_wide_service_scoped](
+             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api](
                  const httplib::Request& req, httplib::Response& res) {
                  // Fleet-wide identity-linked disclosure (sibling of the SEC-3 gap
                  // closed on GET /guaranteed-state/events): the devices[] array
@@ -12471,7 +12470,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::a4_error(res, "service unavailable"), "application/json");
                      return;
@@ -12492,7 +12491,6 @@ void RestApiV1::register_routes(
                  }
                  const std::string window =
                      req.has_param("window") ? req.get_param_value("window") : "7d";
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
                  int limit = 50;
                  if (req.has_param("limit")) {
                      int v = 0;
@@ -12509,8 +12507,8 @@ void RestApiV1::register_routes(
                  // A1 parity: `os=windows|linux|macos` scopes the drilldown detail
                  // lists to one OS (anything else = all-OS), matching the dashboard
                  // catalogue drilldown. by_os stays cross-OS (it IS the split).
-                 const std::string os_scope =
-                     dex_normalize_os_filter(req.has_param("os") ? req.get_param_value("os") : "");
+                 const std::string os_raw = req.has_param("os") ? req.get_param_value("os") : "";
+                 const std::string os_scope = dex_normalize_os_filter(os_raw);
                  // Behavioral-PII access audit: the devices[] list below names the
                  // agent_ids exhibiting this signal. Emit the same verb the
                  // dashboard per-signal view does so a SIEM filter catches both.
@@ -12538,9 +12536,13 @@ void RestApiV1::register_routes(
                      return;
                  }
 
+                 // ADR-0031 WS-A4: the four raw signal-detail reads, bundled by
+                 // the DexApi seam (the impl derives since + normalizes os the
+                 // same way; os_scope below still feeds the response "os" field).
+                 const DexSignalDetailModel detail =
+                     dex_api->signal_detail(obs_type, window, os_raw, limit);
                  JArr subjects;
-                 for (const auto& s : guaranteed_state_store->dex_signal_subjects(obs_type, since,
-                                                                                  limit, os_scope)) {
+                 for (const auto& s : detail.subjects) {
                      subjects.add(JObj()
                                       .add("subject", s.subject)
                                       .add("count", s.count)
@@ -12548,7 +12550,7 @@ void RestApiV1::register_routes(
                                       .add("last_seen", s.last_seen));
                  }
                  JArr by_os;
-                 for (const auto& o : guaranteed_state_store->dex_signal_by_os(obs_type, since)) {
+                 for (const auto& o : detail.by_os) {
                      // DexOsCrashCount.crashes carries the generic event count for
                      // the generalised per-obs_type read (see the store header).
                      by_os.add(JObj()
@@ -12557,16 +12559,14 @@ void RestApiV1::register_routes(
                                    .add("distinct_devices", o.distinct_devices));
                  }
                  JArr devices;
-                 for (const auto& d : guaranteed_state_store->dex_signal_devices(obs_type, since,
-                                                                                 limit, os_scope)) {
+                 for (const auto& d : detail.devices) {
                      devices.add(JObj()
                                      .add("agent_id", d.agent_id)
                                      .add("count", d.crashes)
                                      .add("last_seen", d.last_seen));
                  }
                  JArr by_day;
-                 for (const auto& d :
-                      guaranteed_state_store->dex_signal_by_day(obs_type, since, os_scope)) {
+                 for (const auto& d : detail.by_day) {
                      by_day.add(JObj().add("day", d.day).add("count", d.crashes));
                  }
                  res.set_content(ok_json(JObj()
@@ -12633,6 +12633,14 @@ void RestApiV1::register_routes(
                                              .raw("disk_lat_ms", perf_stat_json(now.disk_lat))
                                              .add("reporting", now.reporting)
                                              .add("windows_online", now.windows_online)
+                                             // Additive per-OS denominators (C1) — appended
+                                             // after the original fields, which stay
+                                             // byte-identical for existing callers.
+                                             .add("linux_online", now.linux_online)
+                                             .add("macos_online", now.macos_online)
+                                             .add("reporting_windows", now.reporting_windows)
+                                             .add("reporting_linux", now.reporting_linux)
+                                             .add("reporting_macos", now.reporting_macos)
                                              .str()),
                                  "application/json");
              });
@@ -12899,6 +12907,8 @@ void RestApiV1::register_routes(
                          o.add("disk_lat_ms", *r.disk_lat_ms);
                      if (r.fleet_pctile >= 0)
                          o.add("fleet_pctile", static_cast<int64_t>(r.fleet_pctile));
+                     // Additive (C1): the row's normalized OS token, trailing.
+                     o.add("os", r.os);
                      arr.add(std::move(o));
                  }
                  res.set_content(list_json(arr.str(), static_cast<int64_t>(rows.size()), 0),
@@ -13625,13 +13635,14 @@ void RestApiV1::register_routes(
 
     // ── #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ──
     //
-    // Every builder call below is the SAME shared pure function
-    // (dex_read_model.hpp) the MCP twins in mcp_server.cpp call — Rule 1
-    // (docs/api-twin-recipe.md): REST/MCP/the HTML fragment build their
-    // response DATA from one function, never three independently-maintained
-    // copies. `dex_fleet_fn` is the SAME DexFleet provider DexRoutes already
-    // uses for the dashboard fragments (server.cpp wires the identical
-    // lambda to both).
+    // Every read below routes through the SAME in-process `DexApi` seam
+    // (dex_api.hpp) the MCP twins in mcp_server.cpp also call — Rule 1
+    // (docs/api-twin-recipe.md): REST/MCP build their response DATA from one
+    // API, never independently-maintained copies. The fleet denominator is
+    // obtained INSIDE the seam via its own FleetFn (server.cpp wires it into
+    // make_local_dex_api); these handlers no longer receive a dex_fleet_fn of
+    // their own. (The dashboard fragments still use DexRoutes' fleet provider
+    // directly — that rewire is deferred, ISSUE #4576.)
     //
     // Audit posture (per capability, matching each fragment's OWN posture --
     // #4035 AC): `apps`/`catalogue/group`/`health`/`trends` are fleet
@@ -13656,10 +13667,9 @@ void RestApiV1::register_routes(
     // faulting modules + exceptions + affected devices). Fleet-wide
     // identity-linked device list -> deny_fleet_wide_service_scoped +
     // fail-closed success audit (dex.app.view), per the posture note above.
-    sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, guaranteed_state_store,
-                                 deny_fleet_wide_service_scoped,
+    sink.Get("/api/v1/dex/app", [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api,
                                  resolve_dex_visible](const httplib::Request& req,
-                                                       httplib::Response& res) {
+                                                      httplib::Response& res) {
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
         if (deny_fleet_wide_service_scoped(
@@ -13670,7 +13680,7 @@ void RestApiV1::register_routes(
             return;
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                             "application/json");
@@ -13704,7 +13714,6 @@ void RestApiV1::register_routes(
             spdlog::warn("dex.app.view audit fail-closed (503) cid={}", cid);
             return;
         }
-        const std::string since = dex_iso_since(dex_window_to_days(window));
         // #4035 hardening (governance): confine the affected-devices list to
         // the caller's management-group scope (ADR-0017 World A) — the
         // service-scoped-token axis is already closed above by
@@ -13712,21 +13721,20 @@ void RestApiV1::register_routes(
         // confined-OPERATOR axis the equivalent /fragments/dex/app fragment
         // already applies via resolve_visible (dex_routes.cpp).
         const auto vis = resolve_dex_visible(req);
-        const auto model = build_dex_app_model(guaranteed_state_store, name, window, since,
-                                               vis ? &*vis : nullptr);
+        const auto model = dex_api->app(name, window, vis ? &*vis : nullptr);
         res.set_content(ok_json(dex_app_json(model)), "application/json");
     });
 
     // GET /dex/apps?window= -- app-centric stability list. No per-agent
     // identity (a distinct-device COUNT per app, never an agent_id) -- no
     // audit, matching the fragment's own posture.
-    sink.Get("/api/v1/dex/apps", [perm_fn, guaranteed_state_store](const httplib::Request& req,
-                                                                    httplib::Response& res) {
+    sink.Get("/api/v1/dex/apps", [perm_fn, dex_api](const httplib::Request& req,
+                                                    httplib::Response& res) {
         if (!perm_fn(req, res, "GuaranteedState", "Read"))
             return;
         const auto cid = detail::make_correlation_id();
         res.set_header("X-Correlation-Id", cid);
-        if (!guaranteed_state_store) {
+        if (!dex_api) {
             res.status = 503;
             res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                             "application/json");
@@ -13740,8 +13748,7 @@ void RestApiV1::register_routes(
                 "application/json");
             return;
         }
-        const std::string since = dex_iso_since(dex_window_to_days(window));
-        const auto model = build_dex_apps_model(guaranteed_state_store, window, since);
+        const auto model = dex_api->apps(window);
         res.set_content(ok_json(dex_apps_json(model)), "application/json");
     });
 
@@ -13749,13 +13756,12 @@ void RestApiV1::register_routes(
     // member signals (Catalogue View 2). No per-agent identity -- no audit,
     // matching the fragment's own posture.
     sink.Get("/api/v1/dex/catalogue/group",
-             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
-                                                             httplib::Response& res) {
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13779,10 +13785,7 @@ void RestApiV1::register_routes(
                      return;
                  }
                  const std::string os = req.has_param("os") ? req.get_param_value("os") : "all";
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
-                 auto model = build_dex_catalogue_group_model(guaranteed_state_store, name, os,
-                                                              fleet, window, since);
+                 auto model = dex_api->catalogue_group(name, os, window);
                  if (!model) {
                      res.status = 404;
                      res.set_content(
@@ -13796,13 +13799,12 @@ void RestApiV1::register_routes(
     // GET /dex/health?weighting=&window= -- the derived composite health
     // score. No per-agent identity -- no audit, matching the fragment.
     sink.Get("/api/v1/dex/health",
-             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
-                                                             httplib::Response& res) {
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13819,23 +13821,19 @@ void RestApiV1::register_routes(
                  }
                  const std::string weighting =
                      req.has_param("weighting") ? req.get_param_value("weighting") : "default";
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
-                 const auto model = build_dex_health_model(guaranteed_state_store, fleet, weighting,
-                                                            window, since);
+                 const auto model = dex_api->health(weighting, window);
                  res.set_content(ok_json(dex_health_json(model)), "application/json");
              });
 
     // GET /dex/trends?window= -- cross-OS comparison + per-family
     // small-multiples/heatmap source data. No per-agent identity -- no audit.
     sink.Get("/api/v1/dex/trends",
-             [perm_fn, guaranteed_state_store, dex_fleet_fn](const httplib::Request& req,
-                                                             httplib::Response& res) {
+             [perm_fn, dex_api](const httplib::Request& req, httplib::Response& res) {
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13850,10 +13848,7 @@ void RestApiV1::register_routes(
                          "application/json");
                      return;
                  }
-                 const std::string since = dex_iso_since(dex_window_to_days(window));
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
-                 const auto model =
-                     build_dex_trends_model(guaranteed_state_store, fleet, window, since);
+                 const auto model = dex_api->trends(window);
                  res.set_content(ok_json(dex_trends_json(model)), "application/json");
              });
 
@@ -13861,10 +13856,9 @@ void RestApiV1::register_routes(
     // Fleet-wide identity-linked top-devices list -> deny_fleet_wide_service_scoped
     // + fail-closed success audit (dex.overview.view), per the posture note above.
     sink.Get("/api/v1/dex/overview",
-             [perm_fn, audit_fn, guaranteed_state_store, dex_fleet_fn,
-              deny_fleet_wide_service_scoped,
+             [perm_fn, audit_fn, deny_fleet_wide_service_scoped, dex_api,
               resolve_dex_visible](const httplib::Request& req,
-                                    httplib::Response& res) {
+                                   httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid);
                  if (deny_fleet_wide_service_scoped(
@@ -13876,7 +13870,7 @@ void RestApiV1::register_routes(
                      return;
                  if (!perm_fn(req, res, "GuaranteedState", "Read"))
                      return;
-                 if (!guaranteed_state_store) {
+                 if (!dex_api) {
                      res.status = 503;
                      res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                      "application/json");
@@ -13884,7 +13878,6 @@ void RestApiV1::register_routes(
                  }
                  const std::string window =
                      req.has_param("window") ? req.get_param_value("window") : "7d";
-                 const int window_days = dex_window_to_days(window);
                  if (window != "24h" && window != "7d" && window != "30d" && window != "all") {
                      res.status = 400;
                      res.set_content(
@@ -13906,15 +13899,11 @@ void RestApiV1::register_routes(
                      spdlog::warn("dex.overview.view audit fail-closed (503) cid={}", cid);
                      return;
                  }
-                 const std::string since = dex_iso_since(window_days);
-                 const DexFleet fleet = dex_fleet_fn ? dex_fleet_fn() : DexFleet{};
                  // #4035 hardening (governance): confine the top-devices list
                  // to the caller's management-group scope (ADR-0017 World A) —
                  // same independent second belt as GET /api/v1/dex/app above.
                  const auto vis = resolve_dex_visible(req);
-                 const auto model = build_dex_overview_model(guaranteed_state_store, fleet, window,
-                                                              window_days, since,
-                                                              vis ? &*vis : nullptr);
+                 const auto model = dex_api->overview(window, vis ? &*vis : nullptr);
                  res.set_content(ok_json(dex_overview_json(model)), "application/json");
              });
 
@@ -13927,8 +13916,8 @@ void RestApiV1::register_routes(
     // fragment's ground truth rather than inventing a second verb).
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/history)",
-        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [scoped_perm_fn, audit_fn, dex_api](const httplib::Request& req,
+                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const auto cid = detail::make_correlation_id();
             res.set_header("X-Correlation-Id", cid);
@@ -13940,7 +13929,7 @@ void RestApiV1::register_routes(
             }
             if (!scoped_perm_fn(req, res, "GuaranteedState", "Read", agent_id))
                 return;
-            if (!guaranteed_state_store) {
+            if (!dex_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -13968,9 +13957,7 @@ void RestApiV1::register_routes(
                              agent_id);
                 return;
             }
-            const std::string since = dex_iso_since(dex_window_to_days(window));
-            const auto model =
-                build_dex_device_history_model(guaranteed_state_store, agent_id, window, since);
+            const auto model = dex_api->device_history(agent_id, window);
             res.set_content(ok_json(dex_device_history_json(model)), "application/json");
         });
 
@@ -13979,8 +13966,8 @@ void RestApiV1::register_routes(
     // per-device SCOPED, fail-closed audit (dex.observation.view).
     sink.Get(
         R"(/api/v1/dex/devices/([^/]+)/observations/([^/]+))",
-        [scoped_perm_fn, guaranteed_state_store, audit_fn](const httplib::Request& req,
-                                                           httplib::Response& res) {
+        [scoped_perm_fn, audit_fn, dex_api](const httplib::Request& req,
+                                            httplib::Response& res) {
             const std::string agent_id = req.matches[1].str();
             const std::string event_id = req.matches[2].str();
             const auto cid = detail::make_correlation_id();
@@ -13999,7 +13986,7 @@ void RestApiV1::register_routes(
             // as "no such observation" — storage-layer failure masked as
             // not-found (build_dex_observation_model folds !store into
             // nullopt, same as the not-found/foreign-device cases).
-            if (!guaranteed_state_store) {
+            if (!dex_api) {
                 res.status = 503;
                 res.set_content(detail::error_json_a4(503, "service unavailable", cid),
                                 "application/json");
@@ -14009,7 +13996,7 @@ void RestApiV1::register_routes(
             // (dex_routes.cpp:2916): a guessed/foreign event_id and a
             // genuinely-absent one both resolve to the SAME 404, so neither
             // reveals anything beyond what the scope gate already allowed.
-            auto obs = build_dex_observation_model(guaranteed_state_store, agent_id, event_id);
+            auto obs = dex_api->observation(agent_id, event_id);
             if (!obs) {
                 res.status = 404;
                 res.set_content(detail::error_json_a4(404, "observation not found", cid),

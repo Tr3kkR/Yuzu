@@ -29,7 +29,7 @@
  * single-OS build, and execute() branches on _WIN32 only to choose between
  * the real Windows legs (P32's execution_artifacts_win.cpp, declared in
  * execution_artifacts_legs.hpp) and the fixed non-Windows
- * "unsupported|windows_only_artefact" outcome every action reports there.
+ * "<action>|unsupported|windows_only_artefact" outcome every action reports there.
  */
 
 #include <yuzu/plugin.hpp>
@@ -155,7 +155,10 @@ public:
         if (action == "shimcache" || action == "amcache" || action == "prefetch") {
             ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL,
                                   "windows_only_artefact");
-            ctx.write_output(std::string{"unsupported|"} +
+            // `action` is safe to write raw here (unlike the unknown-action row below):
+            // this branch is reachable only when it string-equals one of the three
+            // literals just checked above, never request-supplied free text.
+            ctx.write_output(std::string{action} + "|unsupported|" +
                              std::string{yuzu::execution_artifacts::kUnsupportedWindowsOnly});
             return 1;
         }

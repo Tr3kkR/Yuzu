@@ -465,7 +465,8 @@ flip, with a red-first test each:
   through the failure result so the caller only cleans up when there is genuinely something to
   clean up. A third Gate 8 re-review round (8 agents) on round 2's fix found no further blocking
   residuals. Two small non-blocking follow-ups were identified and deliberately NOT fixed here,
-  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload still discards the
+  tracked as #4416: the blocking (non-`NonWaiting`) `attach_rule` overload (what the `#3990`
+  §5 entry below calls "the WAITING attach model") still discards the
   preservation signal, currently harmless since it has zero production callers today; and two
   pre-existing raw-API-level tests could usefully assert `prior_state_preserved`'s value directly
   for extra regression-locking. Separately, #4415 tracks the pre-existing (not introduced by this
@@ -814,7 +815,47 @@ that is stated explicitly rather than inferred or invented.
   captures the CURRENT target content as its baseline on every arm, and `#3990`'s `full_sync`
   re-arms every rule unconditionally on any unrelated mutation, a genuinely-still-drifted such
   rule can be silently reclassified as compliant with no remediation having happened - filed
-  as **#4021**, also not risk-accepted here.
+  as **#4021**, also not risk-accepted here. See the new **#3990** entry immediately below for
+  the ruling-13 diagnostic this package's own milestone re-weighing should be read alongside.
+
+**#3990** (fleet-wide `full_sync` storm on any rule mutation - legacy-vs-spark blackout
+diagnostic, ruling-13 on #3850)
+- Detection signal: not specified in source; `yuzu_server_guardian_pushes_dispatched_total`
+  rate and agent `full_sync=true` log frequency are the closest existing signals, neither
+  purpose-built for this.
+- Operator action: not specified in source; not established by this diagnostic either - no
+  system-side effect was found for a mitigation to target.
+- Compensating control: this diagnostic (`docs/spark-rebuild-baselines/
+  3990-fullsync-blackout-run.md`), run 2026-09-06/07 on DGRHP, re-run 2026-09-07, clean re-run
+  same day. **Corrected THREE times on review before landing here** - first a fabricated
+  "pile-up effect" claim (retracted: every `full_sync` actually confirmed to run completed in
+  8.3s or less, most under 100ms at the clean cohort; the real cause of the low first-attempt
+  sample count was an agent `--log-file` flush-lag interacting with the driver's polling
+  timeout), then an overclaimed "reached the pre-registered floor / within margin" framing on
+  the first 2026-09-07 re-run (an external review found the driver computed `functional_valid`
+  but never gated its sample count on it - confirmed by reading the code; formal outcome
+  corrected to INCONCLUSIVE/INVALID BY COHORT DESIGN). **Current, accurate state: a genuine
+  pre-registered PASS.** Both defects behind the INCONCLUSIVE outcome were fixed at the source
+  (the `functional_valid` wiring, and 5 of 20 service-watch cohort targets swapped for services
+  confirmed live and stable, replacing ones confirmed permanently or intermittently Stopped on
+  the rig) and the diagnostic re-run clean. Every one of the 16 counted repeats (5+3 legacy,
+  5+3 spark) independently satisfies `failed=0` AND functional-validity - the full
+  pre-registered rule, not a partial check. Numeric result: Phase B legacy median 70.0ms vs
+  spark 127.0ms (threshold 1070.0ms); Phase B2 legacy 86.0ms vs spark 140.0ms (threshold
+  1086.0ms) - both within the predeclared non-inferiority margin. Full detail, all three
+  corrections, and the raw per-repeat data for every round (`fullsync-blackout-results.jsonl`,
+  the clean pass under `label="clean-v2"`) are in the run doc, not restated here. **This
+  `clean-v2` PASS was measured on the WAITING attach model** (`origin/dev@65f2938156a19`,
+  pre-rung-9c-PR-2) and stands unedited as its own record for that build.
+- Owner: not assigned in source material.
+- Milestone: not specified. Nothing found by this diagnostic changes this row's own
+  #2278/#2469/#2279 package - the two are not shown to be related.
+- Revisit trigger: before the PR-5 flip head re-run (CH-5-UAT's own driver, once its threshold
+  work lands) - this diagnostic's pass is on one rig, one cohort, two trigger shapes, not fleet
+  scale; before this diagnostic's "accepted-neutral" citation is relied upon for a flip decision.
+- The pre-registered pass above is evidence FOR #3990 being cited in §5 as "accepted-neutral"
+  per ruling-13's own wording, but whether it is sufficient on its own (one rig, one cohort) and
+  how to word the citation is Dave's call to make, not a conclusion reached by this entry.
 
 **#2815 + #2818 + #2833 + #2839** (teardown UAF-class; #2797's legacy half and #2012/#2011
 tracked separately below)
